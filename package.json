@@ -97,17 +97,16 @@
     "@types/react-dom": "^19.2.3",
     "@types/three": "0.165.0",
     "electrobun": "^1.18.1",
-    "gloom-asx": "github:caelyx/gloom-asx#bd13e937028224dba64cb0424549b5eb5415f953",
     "gloom-fear-greed": "github:gloom-sh/gloom-fear-greed",
     "gloom-hackernews": "github:gloom-sh/gloom-hackernews#6447013f526daedf73699334958672645024dc8c",
     "gloom-ipo-calendar": "github:gloom-sh/gloom-ipo-calendar",
-    "gloom-newsmap": "github:caelyx/gloom-newsmap#f27e6950f6bfb1070ea25a0d4f8ce2ffda34aa2f",
     "gloom-polls": "github:gloom-sh/gloom-polls",
     "gloom-prediction-markets": "github:gloom-sh/gloom-prediction-markets",
     "happy-dom": "^20.11.1",
     "png-to-ico": "^2.1.8",
     "rcedit": "^4.0.1",
     "typescript": "^5.9.2",
+    "unpdf": "1.8.1",
     "wrangler": "^4.0.0"
   },
   "dependencies": {

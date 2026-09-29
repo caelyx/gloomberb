@@ -42,8 +42,8 @@ anonymous state without closing the workspace.
 
 | # | Change | Files |
 |---|---|---|
-| 1 | Three more web-bundled plugins, pinned by commit | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated) |
-| 1a | The web build also reads each plugin's `gloom.json` (hosts; id and `web` target must agree) | `scripts/web-plugins.ts`, `scripts/build-web.ts`, `scripts/generate-web-proxy-hosts.ts` |
+| 1 | Three more web-bundled plugins: Hacker News pinned by commit, Newsmap and ASX vendored | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated), `vendor/`, `scripts/vendor-plugin.sh`, `bunfig.toml` |
+| 1a | The web build also reads each plugin's `gloom.json` (hosts; id and `web` target must agree), and compiles `vendor/<name>` when present | `scripts/web-plugins.ts`, `scripts/build-web.ts`, `scripts/generate-web-proxy-hosts.ts` |
 | 2 | Gloom session restore reports unexpected errors instead of swallowing them (it was already non-blocking) | `src/renderers/browser/cloud-transport.ts`, `src/renderers/browser/main.tsx` |
 | 3 | Plugin proxy policy switch, redirect re-validation, credential stripping, early size check; Access credentials stripped from `/api/*` | `src/renderers/cloudflare/http-proxy.ts`, `src/renderers/cloudflare/worker.ts` |
 | 4 | Private first-visit layout | `src/renderers/browser/private-default-config.ts`, `src/renderers/browser/config-host.ts` |
@@ -91,8 +91,8 @@ the limit is refused before the body is read.
 | gloom-polls | `github:gloom-sh/gloom-polls` | `90a780e` (bun.lock) | polls | api.votehub.com |
 | gloom-prediction-markets | `github:gloom-sh/gloom-prediction-markets` | `1d8036f` (bun.lock) | prediction-markets | gamma-api / clob / data-api.polymarket.com, api.elections.kalshi.com |
 | **gloom-hackernews** | `github:gloom-sh/gloom-hackernews` | `6447013f526daedf73699334958672645024dc8c` | hackernews | hacker-news.firebaseio.com (declared in its gloom.json only) |
-| **gloom-newsmap** | `github:caelyx/gloom-newsmap` | `f27e6950f6bfb1070ea25a0d4f8ce2ffda34aa2f` | newsmap | news.google.com |
-| **gloom-asx** | `github:caelyx/gloom-asx` | `bd13e937028224dba64cb0424549b5eb5415f953` | asx-announcements | asx.api.markitdigital.com, cdn-api.markitdigital.com |
+| **gloom-newsmap** | `vendor/gloom-newsmap` (from private `caelyx/gloom-newsmap`) | `f27e6950f6bfb1070ea25a0d4f8ce2ffda34aa2f` | newsmap | news.google.com |
+| **gloom-asx** | `vendor/gloom-asx` (from private `caelyx/gloom-asx`) | `bd13e937028224dba64cb0424549b5eb5415f953` | asx-announcements | asx.api.markitdigital.com, cdn-api.markitdigital.com |
 
 Market Heatmap (api.nasdaq.com, query1/query2/fc.yahoo.com) and Market Halts
 (nasdaqtrader.com) are built-in plugins, not bundled packages.
@@ -103,7 +103,8 @@ package in `WEB_BUNDLED_PLUGIN_PACKAGES`; `bun run web:proxy-hosts:check` (CI)
 fails when it is stale, and `bun run web:build` fails when a bundled plugin
 declares a host that is not in it.
 
-To bump a plugin: change its commit in `package.json`, `bun install`, then
+To bump an installed plugin: change its commit in `package.json` (or
+`bun update <package>` for the unpinned upstream ones), `bun install`, then
 `bun run web:proxy-hosts` if its hosts changed, and commit `bun.lock`.
 
 The build fails (no bypass flag) when a listed plugin is not installed, does not
@@ -111,20 +112,43 @@ bundle, cannot be evaluated, exports no valid plugin, does not declare `web` in
 its module or in `gloom.json`, has a `gloom.json` whose id differs from the
 module's, or declares a host that is not a bare domain.
 
-### Private plugin repositories and CI
+### Vendored private plugins
 
-`gloom-newsmap` and `gloom-asx` are private. Bun 1.3.11 downloads `github:`
-dependencies from `api.github.com/repos/<owner>/<repo>/tarball/<sha>` **without
-credentials** (the tarball task is created with `.no_authorization`; neither
-`GITHUB_TOKEN` nor URL userinfo is sent), so `bun install --frozen-lockfile`
-cannot fetch private repositories in CI. Until that is resolved, CI will fail at
-the install step. Options, simplest first:
+`gloom-newsmap` and `gloom-asx` live in private repositories, which Bun cannot
+install from in CI (it downloads `github:` dependencies without credentials).
+Their code is copied into this repository under `vendor/` instead, with
+`git subtree --squash`, by `scripts/vendor-plugin.sh`. The plugin repositories
+stay private; only the files copied here are public.
 
-1. Make the two plugin repositories public. Nothing else changes.
-2. Publish them as private packages to a registry Bun can authenticate to (npm or
-   GitHub Packages via `bunfig.toml` scopes), and change the dependency specs.
-3. Vendor them into this repository (e.g. `vendor/gloom-asx`, as `file:` or
-   workspace dependencies). Deterministic, but plugin updates become copies.
+- The script leaves out `CLAUDE.md`, `AGENTS.md`, `.claude` and `docs/research`
+  (the list is `EXCLUDED_PATHS` at the top of the script). The plugins' own
+  history never enters this repository: the import is a squashed, filtered
+  snapshot.
+- They are not package dependencies. `scripts/web-plugins.ts` compiles
+  `vendor/<name>` directly when it exists, because installing a folder
+  dependency makes Bun install its devDependencies too (for gloom-asx, that
+  includes the published `gloomberb` package). A vendored plugin's runtime
+  dependencies are devDependencies of this repository instead: `unpdf` (for
+  gloom-asx). A missing one fails the web build.
+- `bunfig.toml` keeps `vendor/**` out of `bun test`; the plugins' tests run in
+  their own repositories. The typecheck projects list their files explicitly and
+  do not include `vendor/`.
+- Do not edit files under `vendor/` here; change the plugin repository and
+  update the copy.
+
+To update one (needs read access to the private repository, and a clean tree):
+
+```sh
+scripts/vendor-plugin.sh gloom-asx https://github.com/caelyx/gloom-asx.git <commit-or-branch>
+scripts/vendor-plugin.sh gloom-newsmap https://github.com/caelyx/gloom-newsmap.git <commit-or-branch>
+```
+
+Each run adds a merge commit whose message records the source commit
+(`vendor-plugin-source: <sha>`). Then: if the plugin's `package.json`
+`dependencies` changed, mirror them in this repository's devDependencies and
+`bun install`; `bun run web:proxy-hosts` if its hosts changed; and the checks
+below. Note that gloom-asx's test fixtures include two ASX responses that are
+byte-identical to files in its excluded `docs/research/samples/`.
 
 ### ASX PDF extracts on the web
 
@@ -227,8 +251,11 @@ Files most likely to conflict on a merge from upstream, in order of risk:
 5. `src/renderers/browser/cloud-transport.ts`, `main.tsx` - the session-restore
    function and its one call.
 6. `scripts/web-plugins.ts`, `build-web.ts`, `generate-web-proxy-hosts.ts` - the
-   `hosts` field on compiled plugins.
+   `hosts` field on compiled plugins and the `vendor/` lookup.
 7. `src/plugins/web-bundled.ts` - three list entries.
+
+`vendor/`, `scripts/vendor-plugin.sh` and `bunfig.toml` are downstream-only and
+do not conflict.
 
 After each merge: `bun install`, `bun run web:proxy-hosts`, the test and build
 commands above, and a fresh-profile check of the signed-out workspace.

@@ -36,6 +36,12 @@ export interface CompiledWebPlugin {
 }
 
 function pluginPackageDir(packageName: string): string {
+  // Downstream: private plugins are vendored (scripts/vendor-plugin.sh) rather
+  // than installed, so Bun does not also install their devDependencies. Their
+  // runtime dependencies are devDependencies of this package instead; one that
+  // is missing fails the bundle below.
+  const vendored = join(process.cwd(), "vendor", packageName);
+  if (existsSync(join(vendored, "package.json"))) return vendored;
   const dir = join(process.cwd(), "node_modules", packageName);
   if (!existsSync(join(dir, "package.json"))) {
     throw new Error(
