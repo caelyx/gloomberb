@@ -1,0 +1,409 @@
+{
+  "data": {
+    "items": [
+      {
+        "announcementTypes": [
+          "Ceasing to be a substantial holder"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CAR"
+          },
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CAR",
+            "xid": "20525895",
+            "ASXSecurityType": 1,
+            "displayName": "CAR GROUP LIMITED",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CAR3",
+            "xidEntity": 204286903,
+            "sector": "Communication Services",
+            "industryGroup": "Media & Entertainment",
+            "industry": "Interactive Media & Services",
+            "subIndustry": "Interactive Media & Services"
+          }
+        ],
+        "date": "2026-09-29T03:25:25.000Z",
+        "documentKey": "2924-03141253-3A702773",
+        "fileSize": "257KB",
+        "headline": "Ceasing to be a substantial holder from CBA",
+        "isPriceSensitive": false,
+        "symbol": "CAR",
+        "symbolsSecondary": [
+          "CAR",
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Becoming a substantial holder"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CAR"
+          },
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CAR",
+            "xid": "20525895",
+            "ASXSecurityType": 1,
+            "displayName": "CAR GROUP LIMITED",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CAR3",
+            "xidEntity": 204286903,
+            "sector": "Communication Services",
+            "industryGroup": "Media & Entertainment",
+            "industry": "Interactive Media & Services",
+            "subIndustry": "Interactive Media & Services"
+          }
+        ],
+        "date": "2026-09-25T03:17:52.000Z",
+        "documentKey": "2924-03139958-3A702557",
+        "fileSize": "2694KB",
+        "headline": "Becoming a substantial holder from CBA",
+        "isPriceSensitive": false,
+        "symbol": "CAR",
+        "symbolsSecondary": [
+          "CAR",
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Dividend Reinvestment Plan",
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CBA",
+            "xid": "70547",
+            "ASXSecurityType": 1,
+            "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CBA7",
+            "xidEntity": 204245597,
+            "sector": "Financials",
+            "industryGroup": "Banks",
+            "industry": "Banks",
+            "subIndustry": "Diversified Banks"
+          }
+        ],
+        "date": "2026-09-21T06:36:16.000Z",
+        "documentKey": "2924-03137724-2A1698216",
+        "fileSize": "19KB",
+        "headline": "Update - Dividend/Distribution - CBA",
+        "isPriceSensitive": false,
+        "symbol": "CBA",
+        "symbolsSecondary": [
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CBA",
+            "xid": "70547",
+            "ASXSecurityType": 1,
+            "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CBA7",
+            "xidEntity": 204245597,
+            "sector": "Financials",
+            "industryGroup": "Banks",
+            "industry": "Banks",
+            "subIndustry": "Diversified Banks"
+          }
+        ],
+        "date": "2026-09-17T05:18:29.000Z",
+        "documentKey": "2924-03136601-2A1697711",
+        "fileSize": "12KB",
+        "headline": "Dividend/Distribution - CBAPM",
+        "isPriceSensitive": false,
+        "symbol": "CBA",
+        "symbolsSecondary": [
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CBA",
+            "xid": "70547",
+            "ASXSecurityType": 1,
+            "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CBA7",
+            "xidEntity": 204245597,
+            "sector": "Financials",
+            "industryGroup": "Banks",
+            "industry": "Banks",
+            "subIndustry": "Diversified Banks"
+          }
+        ],
+        "date": "2026-09-17T05:15:54.000Z",
+        "documentKey": "2924-03136598-2A1697710",
+        "fileSize": "12KB",
+        "headline": "Dividend/Distribution - CBAPL",
+        "isPriceSensitive": false,
+        "symbol": "CBA",
+        "symbolsSecondary": [
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CBA",
+            "xid": "70547",
+            "ASXSecurityType": 1,
+            "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CBA7",
+            "xidEntity": 204245597,
+            "sector": "Financials",
+            "industryGroup": "Banks",
+            "industry": "Banks",
+            "subIndustry": "Diversified Banks"
+          }
+        ],
+        "date": "2026-09-17T05:12:04.000Z",
+        "documentKey": "2924-03136597-2A1697708",
+        "fileSize": "12KB",
+        "headline": "Dividend/Distribution - CBAPK",
+        "isPriceSensitive": false,
+        "symbol": "CBA",
+        "symbolsSecondary": [
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CBA",
+            "xid": "70547",
+            "ASXSecurityType": 1,
+            "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CBA7",
+            "xidEntity": 204245597,
+            "sector": "Financials",
+            "industryGroup": "Banks",
+            "industry": "Banks",
+            "subIndustry": "Diversified Banks"
+          }
+        ],
+        "date": "2026-09-17T05:09:44.000Z",
+        "documentKey": "2924-03136595-2A1697706",
+        "fileSize": "12KB",
+        "headline": "Dividend/Distribution - CBAPJ",
+        "isPriceSensitive": false,
+        "symbol": "CBA",
+        "symbolsSecondary": [
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CBA",
+            "xid": "70547",
+            "ASXSecurityType": 1,
+            "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CBA7",
+            "xidEntity": 204245597,
+            "sector": "Financials",
+            "industryGroup": "Banks",
+            "industry": "Banks",
+            "subIndustry": "Diversified Banks"
+          }
+        ],
+        "date": "2026-09-17T04:57:54.000Z",
+        "documentKey": "2924-03136591-2A1697704",
+        "fileSize": "12KB",
+        "headline": "Dividend/Distribution - CBAPI",
+        "isPriceSensitive": false,
+        "symbol": "CBA",
+        "symbolsSecondary": [
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Issued Capital - Other",
+          "Disclosure Document"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CBA",
+            "xid": "70547",
+            "ASXSecurityType": 1,
+            "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CBA7",
+            "xidEntity": 204245597,
+            "sector": "Financials",
+            "industryGroup": "Banks",
+            "industry": "Banks",
+            "subIndustry": "Diversified Banks"
+          }
+        ],
+        "date": "2026-09-16T00:45:14.000Z",
+        "documentKey": "2924-03136024-2A1697387",
+        "fileSize": "514KB",
+        "headline": "Issue of U.S.$1.25 billion worth of Subordinated Notes",
+        "isPriceSensitive": false,
+        "symbol": "CBA",
+        "symbolsSecondary": [
+          "CBA",
+          ""
+        ],
+        "url": ""
+      },
+      {
+        "announcementTypes": [
+          "Issued Capital - Other"
+        ],
+        "companies": [
+          {
+            "symbolDisplay": "CBA"
+          }
+        ],
+        "companyInfo": [
+          {
+            "symbol": "CBA",
+            "xid": "70547",
+            "ASXSecurityType": 1,
+            "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+            "issueType": "CS",
+            "issueTypeName": "Common Stock",
+            "issueTypeCode": 1,
+            "isin": "AU000000CBA7",
+            "xidEntity": 204245597,
+            "sector": "Financials",
+            "industryGroup": "Banks",
+            "industry": "Banks",
+            "subIndustry": "Diversified Banks"
+          }
+        ],
+        "date": "2026-09-14T23:29:39.000Z",
+        "documentKey": "2924-03135543-2A1697171",
+        "fileSize": "156KB",
+        "headline": "CommBank PERLS XIII Capital Notes Redemption Notice",
+        "isPriceSensitive": false,
+        "symbol": "CBA",
+        "symbolsSecondary": [
+          "CBA",
+          ""
+        ],
+        "url": ""
+      }
+    ],
+    "count": 7773
+  }
+}

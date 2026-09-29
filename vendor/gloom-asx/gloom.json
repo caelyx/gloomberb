@@ -1,0 +1,16 @@
+{
+  "id": "asx-announcements",
+  "name": "ASX Announcements",
+  "tagline": "ASX company announcements beside your research",
+  "description": "ASX company announcements for the selected ticker, with an extract of each PDF and a link to open it.",
+  "categories": ["filings", "news"],
+  "targets": ["cli", "tui", "desktop", "web"],
+  "hosts": ["asx.api.markitdigital.com", "cdn-api.markitdigital.com"],
+  "contributes": {
+    "panes": ["asx-announcements"],
+    "shortcuts": [
+      { "code": "ASX", "name": "ASX announcements", "description": "ASX company announcements for the selected ticker." }
+    ]
+  },
+  "minGloom": "0.15.0"
+}
