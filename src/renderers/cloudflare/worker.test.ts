@@ -151,6 +151,24 @@ describe("static Cloudflare host", () => {
     expect(await upstream?.text()).toBe('{"content":"hello"}');
   });
 
+  // Downstream: behind Cloudflare Access, the Access token must not reach Gloom.
+  test("does not pass Cloudflare Access credentials on to api.gloom.sh", async () => {
+    const { env } = fixture();
+    let upstream: Request | undefined;
+    await handleRequest(new Request("https://term.example/api/auth/get-session", {
+      headers: {
+        Cookie: "CF_Authorization=access-jwt; __Secure-gloomberb.session_token=gloom; CF_AppSession=s",
+        "Cf-Access-Jwt-Assertion": "access-jwt",
+      },
+    }), env, async (request) => {
+      upstream = request;
+      return Response.json({ user: null });
+    });
+
+    expect(upstream?.headers.get("cookie")).toBe("__Secure-gloomberb.session_token=gloom");
+    expect(upstream?.headers.has("cf-access-jwt-assertion")).toBe(false);
+  });
+
   test("rejects cross-origin API requests before proxying", async () => {
     const { env } = fixture();
     let proxied = false;
@@ -173,6 +191,31 @@ describe("static Cloudflare host", () => {
     }), env);
     expect(response.status).toBe(405);
     expect(requests).toHaveLength(0);
+  });
+});
+
+// Downstream: the deployment policy reaches the plugin proxy from the env var.
+// The target is deliberately unlisted, so neither case leaves the worker.
+describe("plugin proxy deployment policy", () => {
+  function pluginRequest(): Request {
+    return new Request("https://term.example/http-proxy", {
+      method: "POST",
+      headers: { origin: "https://term.example" },
+      body: JSON.stringify({ url: "https://unlisted.example/x" }),
+    });
+  }
+
+  test("the public deployment requires a Gloom session", async () => {
+    const response = await handleRequest(pluginRequest(), fixture().env);
+    expect(response.status).toBe(401);
+  });
+
+  test("a private deployment skips only the session check", async () => {
+    const { env } = fixture();
+    const response = await handleRequest(pluginRequest(), { ...env, PRIVATE_WEB_DEPLOYMENT: "true" });
+    // Past the session check, and refused by the allowlist instead.
+    expect(response.status).toBe(403);
+    expect(response.headers.get("content-security-policy")).toBe(SECURITY_HEADERS["content-security-policy"]);
   });
 });
 

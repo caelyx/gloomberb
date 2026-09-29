@@ -1,4 +1,5 @@
 import { apiClient, setCloudApiFetchTransport } from "../../api-client";
+import { ApiRequestError } from "../../api-client/errors";
 import { settleWithin } from "../../utils/async-deadline";
 import { setHttpFetchTransport } from "../../utils/http-transport";
 import { createBrowserHttpProxyTransport } from "./http-proxy-transport";
@@ -42,6 +43,36 @@ export function installBrowserFetchTransports(): void {
   setHttpFetchTransport(createBrowserHttpProxyTransport(), { streaming: true });
 }
 
-export async function restoreBrowserCloudSession(budgetMs = 5_000): Promise<void> {
-  await settleWithin(apiClient.getSession(), budgetMs);
+const FETCH_FAILURE = /failed to fetch|networkerror|load failed|fetch failed/i;
+
+/**
+ * Failures that only mean "carry on signed out": the API answered that there is
+ * no usable session (401, expired, revoked), the request was aborted or timed
+ * out, the network failed, or something in front of the API (such as a
+ * Cloudflare Access login page) answered with a page that is not JSON.
+ */
+function isExpectedSessionFailure(error: unknown): boolean {
+  if (error instanceof ApiRequestError || error instanceof SyntaxError) return true;
+  if (!(error instanceof Error)) return false;
+  if (error.name === "AbortError" || error.name === "TimeoutError") return true;
+  return error instanceof TypeError && FETCH_FAILURE.test(error.message);
+}
+
+/**
+ * Restores a Gloom Cloud session when there is one. A Gloom session is optional
+ * in the browser: without one the workspace opens anonymously and Cloud-backed
+ * panes show their own sign-in state. So this never rejects and never waits
+ * longer than `budgetMs`, but a failure that is not an expected auth or network
+ * outcome is handed to `onUnexpected` rather than silently treated as
+ * "signed out".
+ */
+export async function restoreBrowserCloudSession(
+  budgetMs = 5_000,
+  onUnexpected: (error: unknown) => void = (error) => console.error("Gloom session restore failed", error),
+): Promise<void> {
+  const restore = apiClient.getSession().catch((error: unknown) => {
+    if (!isExpectedSessionFailure(error)) onUnexpected(error);
+    throw error;
+  });
+  await settleWithin(restore, budgetMs);
 }

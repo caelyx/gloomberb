@@ -1,4 +1,5 @@
-import { handleHttpProxy } from "./http-proxy";
+import { PROXY_ALLOWED_HOSTS } from "../../utils/plugin-proxy-hosts";
+import { handleHttpProxy, proxyPolicyFor } from "./http-proxy";
 
 interface StaticAssetsBinding {
   fetch(request: Request): Promise<Response>;
@@ -6,6 +7,11 @@ interface StaticAssetsBinding {
 
 export interface WorkerEnv {
   ASSETS: StaticAssetsBinding;
+  /**
+   * Downstream: "true" only on a private deployment behind Cloudflare Access,
+   * where plugin requests do not need a Gloom session. See `proxyPolicyFor`.
+   */
+  PRIVATE_WEB_DEPLOYMENT?: string;
 }
 
 const SHARE_PATH = /^\/s\/[a-f0-9]{32}\/?$/;
@@ -71,6 +77,36 @@ export function withSecurityHeaders(response: Response, options: { share?: boole
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
+/**
+ * Downstream: Cloudflare Access attaches its own credentials to every request
+ * that reaches a private deployment. They authenticate the user to this
+ * deployment, not to Gloom, so they are not passed on to api.gloom.sh. The
+ * Gloom session cookie and everything else still go through unchanged.
+ */
+const ACCESS_COOKIE_NAMES = new Set(["CF_Authorization", "CF_AppSession"]);
+
+function withoutAccessCredentials(request: Request): Request {
+  const headers = new Headers(request.headers);
+  let changed = false;
+  for (const name of [...headers.keys()]) {
+    if (name.startsWith("cf-access-")) {
+      headers.delete(name);
+      changed = true;
+    }
+  }
+  const cookie = headers.get("cookie");
+  if (cookie) {
+    const kept = cookie.split(";").map((part) => part.trim())
+      .filter((part) => part && !ACCESS_COOKIE_NAMES.has(part.split("=")[0]!.trim()));
+    if (kept.length !== cookie.split(";").filter((part) => part.trim()).length) {
+      if (kept.length) headers.set("cookie", kept.join("; "));
+      else headers.delete("cookie");
+      changed = true;
+    }
+  }
+  return changed ? new Request(request, { headers }) : request;
+}
+
 async function proxyApi(request: Request, fetchApi: ApiFetch): Promise<Response> {
   const url = new URL(request.url);
   if (!API_METHODS.has(request.method)) {
@@ -84,7 +120,7 @@ async function proxyApi(request: Request, fetchApi: ApiFetch): Promise<Response>
     return Response.json({ error: "Origin not allowed" }, { status: 403 });
   }
   const upstreamUrl = new URL(`${url.pathname.slice(4) || "/"}${url.search}`, API_ORIGIN);
-  return fetchApi(new Request(upstreamUrl, request));
+  return fetchApi(new Request(upstreamUrl, withoutAccessCredentials(request)));
 }
 
 export async function handleRequest(request: Request, env: WorkerEnv, fetchApi: ApiFetch = fetch): Promise<Response> {
@@ -92,7 +128,8 @@ export async function handleRequest(request: Request, env: WorkerEnv, fetchApi: 
   if (API_PATH.test(url.pathname)) return proxyApi(request, fetchApi);
   // Before the GET/HEAD gate below, since plugin requests arrive as POST.
   if (url.pathname === HTTP_PROXY_PATH) {
-    return withSecurityHeaders(await handleHttpProxy(request));
+    const policy = proxyPolicyFor(env.PRIVATE_WEB_DEPLOYMENT);
+    return withSecurityHeaders(await handleHttpProxy(request, fetch, PROXY_ALLOWED_HOSTS, policy));
   }
 
   if (request.method !== "GET" && request.method !== "HEAD") {

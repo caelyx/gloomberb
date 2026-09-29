@@ -35,10 +35,10 @@ function normalizeHost(host: string, pluginId: string): string {
  * Compiled to a scratch directory, then thrown away: this only needs each
  * plugin's declaration, and the real artifacts belong to `web:build`.
  */
-async function webBundledPlugins(): Promise<GloomPlugin[]> {
+async function webBundledPlugins(): Promise<Array<Pick<GloomPlugin, "id" | "hosts">>> {
   const scratch = await mkdtemp(join(tmpdir(), "gloom-web-plugins-"));
   try {
-    return (await compileWebBundledPlugins(scratch)).map((entry) => entry.plugin);
+    return (await compileWebBundledPlugins(scratch)).map((entry) => ({ id: entry.plugin.id, hosts: entry.hosts }));
   } finally {
     await rm(scratch, { recursive: true, force: true });
   }

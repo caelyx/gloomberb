@@ -78,7 +78,9 @@ async function boot(): Promise<void> {
   // here must not stop the app: the built-in catalog is enough to run on, and
   // the marketplace reports what broke.
   const bundledPlugins = loadWebBundledPlugins().catch(() => []);
-  await restoreBrowserCloudSession();
+  // A Gloom session is optional here: the workspace opens either way, and an
+  // unexpected failure (not "no session" or "API unreachable") is reported.
+  await restoreBrowserCloudSession(undefined, (error) => reportCrash(error, { kind: "unhandled-rejection" }));
   recordResearchActivity("workspace_opened");
   // Nothing was restored on a first visit, only the starter workspace shown.
   if (!hasSavedBrowserConfig()) recordRestoredFunctions([]);

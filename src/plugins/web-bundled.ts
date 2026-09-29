@@ -17,6 +17,10 @@ export const WEB_BUNDLED_PLUGIN_PACKAGES = [
   "gloom-ipo-calendar",
   "gloom-polls",
   "gloom-prediction-markets",
+  // Private deployment additions (downstream). Pinned by commit in package.json.
+  "gloom-hackernews",
+  "gloom-newsmap",
+  "gloom-asx",
 ] as const;
 
 /**
