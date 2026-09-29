@@ -23,7 +23,7 @@ Baseline: upstream `gloom-sh/gloomberb` at `62317c477c1ef9b8394a12eac971c5546441
 Request flow:
 
 ```
-browser ──(Access login)──▶ Cloudflare Access ──▶ Worker (gloomberb-private)
+browser ──(Access login)──▶ Cloudflare Access ──▶ Worker (main)       
                                                   ├─ static assets (dist/web)
                                                   ├─ /api/*        ──▶ api.gloom.sh   (Gloom session cookie passed through;
                                                   │                                    Access credentials stripped)
@@ -47,7 +47,7 @@ anonymous state without closing the workspace.
 | 2 | Gloom session restore reports unexpected errors instead of swallowing them (it was already non-blocking) | `src/renderers/browser/cloud-transport.ts`, `src/renderers/browser/main.tsx` |
 | 3 | Plugin proxy policy switch, redirect re-validation, credential stripping, early size check; Access credentials stripped from `/api/*` | `src/renderers/cloudflare/http-proxy.ts`, `src/renderers/cloudflare/worker.ts` |
 | 4 | Private first-visit layout | `src/renderers/browser/private-default-config.ts`, `src/renderers/browser/config-host.ts` |
-| 5 | Deployment config, CI and this document | `wrangler.private.jsonc`, `.github/workflows/private-web.yml`, `docs/private-web-deployment.md` |
+| 5 | Deployment config, CI, the manual deploy workflow and this document | `wrangler.private.jsonc`, `.github/workflows/private-web.yml`, `.github/workflows/deploy-private.yml`, `docs/private-web-deployment.md` |
 
 Tests: `src/renderers/cloudflare/http-proxy.test.ts`, `src/renderers/cloudflare/worker.test.ts`,
 `src/renderers/browser/cloud-transport.test.ts`, `src/renderers/browser/config-host.test.ts`,
@@ -190,31 +190,50 @@ private config; its output must list `env.PRIVATE_WEB_DEPLOYMENT ("true")`.
 
 ## Deploy to Cloudflare
 
-1. Edit `wrangler.private.jsonc`: replace `gloom.example.invalid` with your
-   hostname (a zone in your Cloudflare account).
-2. **Create the Access application first** (below), so the hostname is never
-   reachable unprotected.
-3. `bun run web:build && bunx wrangler deploy --config wrangler.private.jsonc`
-   with `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN` in your environment. No
-   secrets are stored in the repository.
-4. Check: `/health` without an Access session must redirect to the Access login,
-   not answer `{"status":"ok"}`.
+The deployment is the Worker `main` at `https://main.privategloom.workers.dev`
+(`<worker name>.<account's workers.dev subdomain>`), deployed by the manual
+**Deploy private web** workflow (`.github/workflows/deploy-private.yml`). It
+runs only from `main` and only when started by hand (Actions > Deploy private
+web > Run workflow). It uses two repository secrets, `CF_ACCT` (account ID) and
+`CF_TKN` (API token, "Edit Cloudflare Workers" permissions). They are named
+differently from the `CLOUDFLARE_*` secrets upstream's Verify workflow deploys
+term.gloom.sh with, so that job never picks them up. No secrets are stored in
+the repository.
 
-This fork's `private-web.yml` never deploys. Upstream's `verify.yml` still has a
-`deploy-web` job that deploys `--env production` (term.gloom.sh) on pushes to
-`main` using the `CLOUDFLARE_*` secrets. In this fork, either disable the
-"Verify" workflow in the repository's Actions settings or do not create secrets
-with those names.
+The workflow fails closed on Access:
+
+1. Before deploying, `GET /health` must redirect to a `*.cloudflareaccess.com`
+   login. If it does not (no Worker yet, Access off, or the app answering), it
+   stops without deploying.
+2. It then checks the allowlist, runs the private-deployment tests, builds, and
+   deploys `wrangler.private.jsonc`.
+3. After deploying, the same check must pass. If the site answers without
+   Access, it redeploys with the `workers.dev` route switched off (or, if that
+   fails, deletes the Worker), so the site goes offline rather than staying
+   open, and the run fails.
+
+First deploy: the Worker has to exist before Access can be switched on for its
+`workers.dev` route. In the Cloudflare dashboard, create a Hello World Worker
+named `main`, enable Access on it (below), then run the workflow; it replaces
+the Hello World code.
+
+To deploy by hand instead: `bun run web:build && bunx wrangler deploy --config
+wrangler.private.jsonc` with `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`
+set, after checking Access yourself.
 
 ### Cloudflare Access requirements
 
-- One self-hosted Access application covering the **whole hostname** (no path),
-  so static assets, `/api/*`, `/http-proxy`, `/health`, `/s/*` and `/l/*` are
-  all behind it. Do not add Bypass or Service Auth policies for `/api/*` or
-  `/http-proxy`.
-- `workers_dev` and `preview_urls` are off in `wrangler.private.jsonc`; keep
-  them off. Those hostnames are not covered by an Access application for the
-  custom domain.
+- In Workers & Pages > `main` > Settings > Domains & Routes, enable Cloudflare
+  Access on the `workers.dev` route, and edit the Access application it creates
+  so its policy allows only your identity (e.g. your email address). Do not add
+  Bypass or Service Auth policies.
+- The Access application covers the whole hostname, so static assets,
+  `/api/*`, `/http-proxy`, `/health`, `/s/*` and `/l/*` are all behind it.
+- `preview_urls` is off in `wrangler.private.jsonc`; keep it off. Preview URLs
+  are separate hostnames.
+- A custom domain later: add a `routes` entry with `custom_domain: true`, create
+  an Access application for that hostname first, and update `SITE` in the
+  deploy workflow.
 - No callback routes need special treatment: Gloom sign-in is email/password
   (`/api/auth/sign-in/email`) or a QR/device flow that polls `/api/auth/device/*`,
   both same-origin calls already behind Access; there is no OAuth redirect
@@ -225,7 +244,7 @@ with those names.
   Access. The app treats those failures like "API unreachable" and keeps the
   workspace open.
 - Optional: a WAF rate-limiting rule on `/http-proxy` limits what a compromised
-  Access identity could spend.
+  Access identity could spend (WAF rules need a zone, so not on `workers.dev`).
 
 ### Not verified here: Gloom sign-in from a non-Gloom hostname
 
