@@ -1,0 +1,27 @@
+{
+  "name": "gloom-newsmap",
+  "version": "0.1.0",
+  "description": "World news as a treemap for Gloomberb — bigger is more important, brighter is newer",
+  "type": "module",
+  "main": "index.tsx",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/caelyx/gloom-newsmap" },
+  "keywords": ["gloomberb-plugin", "news", "treemap", "heatmap"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "gloomberb": ">=0.15.0",
+    "react": ">=19"
+  },
+  "peerDependenciesMeta": {
+    "gloomberb": { "optional": true },
+    "react": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "@types/react": "^19.2.7",
+    "typescript": "^5.9.3"
+  }
+}
