@@ -1,0 +1,19 @@
+{
+  "data": {
+    "items": [
+      {
+        "displayName": "COMMONWEALTH BANK OF AUSTRALIA.",
+        "industryGroup": "Banks",
+        "issueType": "CS",
+        "marketCap": 253563016484,
+        "priceChangeOneWeekPercent": -1.352327184402286,
+        "priceLast": 150.27,
+        "securityType": 1,
+        "symbol": "CBA",
+        "xid": "70547",
+        "xidEntity": 204245597
+      }
+    ],
+    "sparkChartBaseUrl": "https://asx.api.cmfyapp.com/apiman-gateway/MOD/chartworks-image/1.0/Chart/sparkLine"
+  }
+}

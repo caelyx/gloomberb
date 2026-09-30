@@ -1,0 +1,4 @@
+# Downstream: vendored plugins (scripts/vendor-plugin.sh) keep their own tests,
+# which run in their own repositories against their own setup.
+[test]
+pathIgnorePatterns = ["vendor/**"]

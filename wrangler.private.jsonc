@@ -1,0 +1,36 @@
+{
+  // Downstream: private deployment behind Cloudflare Access. Upstream's
+  // wrangler.jsonc (term.gloom.sh) is left untouched.
+  //
+  //   bun run web:build && bunx wrangler deploy --config wrangler.private.jsonc
+  //
+  // Deployed by the manual "Deploy private web" workflow, which refuses to
+  // deploy unless Cloudflare Access already protects the hostname. See
+  // docs/private-web-deployment.md.
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Served at https://main.privategloom.workers.dev (<name>.<account subdomain>).
+  "name": "main",
+  "main": "src/renderers/cloudflare/worker.ts",
+  "compatibility_date": "2026-08-21",
+  "assets": {
+    "directory": "./dist/web",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": true
+  },
+  // The workers.dev hostname is the only one; Cloudflare Access must be enabled
+  // on it (Worker > Settings > Domains & Routes > workers.dev). Preview URLs are
+  // separate hostnames, so they stay off.
+  "workers_dev": true,
+  "preview_urls": false,
+  "vars": {
+    // Plugin HTTP proxy requests no longer need a Gloom session; everything
+    // else the proxy checks still applies. Only the exact string "true" does
+    // this. Never set it on a deployment that Access does not protect.
+    "PRIVATE_WEB_DEPLOYMENT": "true"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

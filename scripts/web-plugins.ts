@@ -1,4 +1,4 @@
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { join, relative } from "path";
 
 import { bundleExternalPlugin } from "../src/plugins/bundle";
@@ -25,11 +25,23 @@ import type { GloomPlugin } from "../src/types/plugin";
 export interface CompiledWebPlugin {
   packageName: string;
   plugin: GloomPlugin;
+  /**
+   * Hosts the worker must proxy for this plugin: what the module declares plus
+   * what its `gloom.json` manifest declares. Some plugins (Hacker News at the
+   * pinned commit) list hosts only in the manifest.
+   */
+  hosts: string[];
   /** Emitted module, relative to the directory it was compiled into. */
   file: string;
 }
 
 function pluginPackageDir(packageName: string): string {
+  // Downstream: private plugins are vendored (scripts/vendor-plugin.sh) rather
+  // than installed, so Bun does not also install their devDependencies. Their
+  // runtime dependencies are devDependencies of this package instead; one that
+  // is missing fails the bundle below.
+  const vendored = join(process.cwd(), "vendor", packageName);
+  if (existsSync(join(vendored, "package.json"))) return vendored;
   const dir = join(process.cwd(), "node_modules", packageName);
   if (!existsSync(join(dir, "package.json"))) {
     throw new Error(
@@ -63,6 +75,49 @@ async function readCompiledPlugin(outputPath: string, packageName: string): Prom
 }
 
 /**
+ * Reads the package's `gloom.json`, when it has one, and checks it agrees with
+ * the compiled module. The manifest is what the registry and the installers
+ * read, so a plugin whose manifest names another id, leaves out `web`, or lists
+ * something other than host strings is refused here rather than half-working
+ * after deploy. Returns the union of both hosts lists.
+ */
+export function mergeManifestHosts(
+  packageName: string,
+  plugin: Pick<GloomPlugin, "id" | "hosts">,
+  manifest: unknown,
+): string[] {
+  const hosts = new Set(plugin.hosts ?? []);
+  if (manifest === undefined) return [...hosts];
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
+    throw new Error(`${packageName} has a gloom.json that is not a JSON object.`);
+  }
+  const { id, targets, hosts: manifestHosts } = manifest as Record<string, unknown>;
+  if (id !== undefined && id !== plugin.id) {
+    throw new Error(`${packageName}: gloom.json id "${String(id)}" does not match the plugin id "${plugin.id}".`);
+  }
+  if (targets !== undefined && (!Array.isArray(targets) || !targets.includes("web"))) {
+    throw new Error(`${packageName}: gloom.json does not declare the "web" target.`);
+  }
+  if (manifestHosts !== undefined) {
+    if (!Array.isArray(manifestHosts) || !manifestHosts.every((host) => typeof host === "string")) {
+      throw new Error(`${packageName}: gloom.json "hosts" must be a list of host names.`);
+    }
+    for (const host of manifestHosts) hosts.add(host);
+  }
+  return [...hosts];
+}
+
+function readManifest(dir: string, packageName: string): unknown {
+  const file = join(dir, "gloom.json");
+  if (!existsSync(file)) return undefined;
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch (error) {
+    throw new Error(`${packageName} has a gloom.json that is not valid JSON: ${error}`);
+  }
+}
+
+/**
  * Compiles every web-bundled plugin into `outDir`, one directory per package.
  *
  * The per-package directory keeps the entry name the plugin chose, so nothing
@@ -73,13 +128,16 @@ export async function compileWebBundledPlugins(outDir: string): Promise<Compiled
 
   const compiled: CompiledWebPlugin[] = [];
   for (const packageName of WEB_BUNDLED_PLUGIN_PACKAGES) {
-    const result = await bundleExternalPlugin(pluginPackageDir(packageName), join(outDir, packageName), {
+    const dir = pluginPackageDir(packageName);
+    const result = await bundleExternalPlugin(dir, join(outDir, packageName), {
       minify: true,
       define: { "process.env.NODE_ENV": '"production"' },
     });
+    const plugin = await readCompiledPlugin(result.outputPath, packageName);
     compiled.push({
       packageName,
-      plugin: await readCompiledPlugin(result.outputPath, packageName),
+      plugin,
+      hosts: mergeManifestHosts(packageName, plugin, readManifest(dir, packageName)),
       file: relative(outDir, result.outputPath).replaceAll("\\", "/"),
     });
   }

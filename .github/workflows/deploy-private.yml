@@ -1,0 +1,111 @@
+name: Deploy private web
+
+# Downstream: deploys wrangler.private.jsonc to https://main.privategloom.workers.dev.
+# Manual only (Actions > Deploy private web > Run workflow), from main only.
+#
+# Fails closed on Cloudflare Access: it refuses to deploy unless the hostname
+# already redirects to an Access login, and if the site answers without Access
+# after the deploy, it redeploys with workers.dev switched off, taking the site
+# offline rather than leaving it open. Secrets: CF_ACCT (account id) and CF_TKN
+# (API token), deliberately not the CLOUDFLARE_* names upstream's Verify
+# workflow deploys term.gloom.sh with.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-private-web
+  cancel-in-progress: false
+
+env:
+  SITE: https://main.privategloom.workers.dev
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Write the Access check
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/access-check.sh" <<'SH'
+          #!/usr/bin/env bash
+          # Passes only when an unauthenticated request is sent to a Cloudflare
+          # Access login. Anything else (the app answering, 404, errors) fails.
+          set -uo pipefail
+          read -r code location < <(curl -sS -o /dev/null --max-time 20 \
+            -w '%{http_code} %{redirect_url}\n' "$SITE/health" || echo "000 -")
+          echo "GET $SITE/health -> $code ${location:-}"
+          case "$code" in
+            301|302|303|307|308)
+              if [[ "$location" =~ ^https://[a-z0-9-]+\.cloudflareaccess\.com/ ]]; then
+                echo "Cloudflare Access is protecting $SITE."
+                exit 0
+              fi ;;
+          esac
+          exit 1
+          SH
+          chmod +x "$RUNNER_TEMP/access-check.sh"
+
+      - name: Refuse to deploy unless Access already protects the site
+        shell: bash
+        run: |
+          if ! "$RUNNER_TEMP/access-check.sh"; then
+            echo "::error::$SITE is not behind Cloudflare Access, so nothing was deployed. In the Cloudflare dashboard, open Workers & Pages > main > Settings > Domains & Routes, enable Cloudflare Access on the workers.dev route, limit its policy to your email, then run this workflow again. (For the very first deploy the Worker must exist first: create a Hello World Worker named 'main'.)"
+            exit 1
+          fi
+
+      - name: Check the proxy allowlist
+        run: bun run web:proxy-hosts:check
+
+      - name: Private deployment tests
+        run: >-
+          bun test
+          src/renderers/cloudflare/http-proxy.test.ts
+          src/renderers/cloudflare/worker.test.ts
+          src/renderers/browser/cloud-transport.test.ts
+          src/renderers/browser/config-host.test.ts
+          scripts/web-plugins.test.ts
+
+      - name: Build browser app
+        run: bun run web:build
+
+      - name: Deploy
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_TKN }}
+        run: bunx wrangler deploy --config wrangler.private.jsonc --message "$GITHUB_SHA"
+
+      - name: Confirm Access still protects the site
+        id: after
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            "$RUNNER_TEMP/access-check.sh" && exit 0
+            sleep 10
+          done
+          exit 1
+
+      - name: Take the site offline if it is not protected
+        if: failure() && steps.after.conclusion == 'failure'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_TKN }}
+        shell: bash
+        run: |
+          sed 's/"workers_dev": true/"workers_dev": false/' wrangler.private.jsonc > wrangler.lockdown.jsonc
+          grep -q '"workers_dev": false' wrangler.lockdown.jsonc
+          if bunx wrangler deploy --config wrangler.lockdown.jsonc --message "lockdown $GITHUB_SHA"; then
+            echo "::error::$SITE answered without Cloudflare Access after the deploy, so its workers.dev route was switched off and the site is offline. Re-enable Access on the Worker's workers.dev route, switch the route back on, then run this workflow again."
+          else
+            bunx wrangler delete --config wrangler.private.jsonc --force
+            echo "::error::$SITE answered without Cloudflare Access after the deploy, so the Worker was deleted. Recreate a Hello World Worker named 'main', enable Access on its workers.dev route, then run this workflow again."
+          fi
+          exit 1

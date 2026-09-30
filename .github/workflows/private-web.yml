@@ -1,0 +1,72 @@
+name: Private web
+
+# Downstream: checks the private web deployment (extra web-bundled plugins,
+# private plugin-proxy policy, private default config) on every change, so an
+# upstream merge or a plugin bump that breaks it fails here, not after deploy.
+# It never deploys; see docs/private-web-deployment.md for that.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: private-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs from bun.lock with --frozen-lockfile, so every web-bundled
+      # plugin is the commit (and tarball hash) the lockfile pins.
+      - uses: ./.github/actions/setup-bun
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Compiles every web-bundled plugin, checks each declares "web" in its
+      # module and gloom.json, validates every declared host, and fails if the
+      # committed allowlist differs from what the plugins declare.
+      - name: Check the web proxy allowlist
+        run: bun run web:proxy-hosts:check
+
+      - name: Private deployment tests (proxy policy, session restore, default config, plugin manifests)
+        run: >-
+          bun test
+          src/renderers/cloudflare/http-proxy.test.ts
+          src/renderers/cloudflare/worker.test.ts
+          src/renderers/browser/cloud-transport.test.ts
+          src/renderers/browser/config-host.test.ts
+          scripts/web-plugins.test.ts
+
+      - name: Test
+        run: bun test
+
+      # Builds the browser app with every web-bundled plugin (a bundle failure
+      # or a plugin host missing from the allowlist fails the build), then runs
+      # upstream's bundle audit.
+      - name: Build and audit browser app
+        run: bun run web:audit
+
+      - name: Dry-run the private Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          bunx wrangler deploy --dry-run --config wrangler.private.jsonc | tee dry-run.log
+          # The private proxy policy is on in the private config only.
+          grep -F 'env.PRIVATE_WEB_DEPLOYMENT ("true")' dry-run.log
+          bunx wrangler deploy --dry-run --env production | tee upstream-dry-run.log
+          if grep -F PRIVATE_WEB_DEPLOYMENT upstream-dry-run.log; then
+            echo "The upstream production config must not enable the private proxy policy." >&2
+            exit 1
+          fi

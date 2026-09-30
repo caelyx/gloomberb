@@ -1,0 +1,18 @@
+{
+  "id": "newsmap",
+  "name": "News Heatmap",
+  "icon": "icon.svg",
+  "tagline": "World news as a treemap — bigger is more important, brighter is newer",
+  "description": "A treemap of the news, in the spirit of Newsmap and Newsola. Tile area follows the story's rank and how many outlets are carrying it; hue is the section it came from; vividness fades as the story ages. Arrow keys walk the tiles, Enter or o opens the article. Reads Google News for any of sixteen regional editions, or Gloomberb's own market news feed.",
+  "categories": ["news"],
+  "targets": ["cli", "tui", "desktop", "web"],
+  "hosts": ["news.google.com"],
+  "contributes": {
+    "panes": ["newsmap"],
+    "capabilities": ["news.google-news"],
+    "shortcuts": [
+      { "code": "NMAP", "name": "News Heatmap", "description": "World news as a treemap" }
+    ]
+  },
+  "minGloom": "0.15.0"
+}

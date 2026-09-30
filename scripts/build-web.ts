@@ -79,7 +79,7 @@ async function buildBundledPlugins(): Promise<WebBundledPluginDescriptor[]> {
   const pluginsDir = join(outdir, "assets", "plugins");
   const compiled = await compileWebBundledPlugins(pluginsDir);
 
-  const missing = compiled.flatMap(({ plugin }) => (plugin.hosts ?? [])
+  const missing = compiled.flatMap(({ plugin, hosts }) => hosts
     .filter((host) => !isProxiedHost(host.trim().toLowerCase(), PROXY_ALLOWED_HOSTS))
     .map((host) => `${plugin.id} -> ${host}`));
   if (missing.length) {
