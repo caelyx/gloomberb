@@ -1,6 +1,6 @@
 import type { TickerRecord } from "../types/ticker";
 import { tickerHasListingSuffix } from "../sources/listing-symbols";
-import { canonicalExchange, exchangeLabel, isUsEquityExchange, parsePublicTickerKey, publicTickerKey, resolveExchangeTimeZone } from "./exchanges";
+import { canonicalExchange, exchangeLabel, isKnownExchangeCode, isUsEquityExchange, parsePublicTickerKey, publicTickerKey, resolveExchangeTimeZone } from "./exchanges";
 import { shortListingTitle } from "../tickers/company-name";
 
 /** Order-routing destinations, not listings. */
@@ -90,9 +90,21 @@ export function isKnownNonUsListing(ticker: TickerRecord | null | undefined): bo
     .map(normalize)
     .filter((exchange) => exchange.length > 0 && !ROUTING_EXCHANGES.has(exchange));
   if (venues.length > 0) return !venues.some((exchange) => isUsEquityExchange(exchange));
-  const symbol = parsePublicTickerKey(ticker.metadata.ticker ?? "");
-  if (symbol.exchange) return !ROUTING_EXCHANGES.has(symbol.exchange) && !isUsEquityExchange(symbol.exchange);
-  return tickerHasListingSuffix(symbol.symbol);
+  return isKnownNonUsListingSymbol(ticker.metadata.ticker ?? "");
+}
+
+/**
+ * The symbol alone places the listing outside the US: an exchange key naming
+ * a known non-US venue (`BHP:ASX`) or a non-US listing suffix (`BHP.AX`,
+ * `WALMEX.MX`). A share-class dot (`BRK.B`), a bare symbol or an unknown
+ * venue key is unknown rather than foreign.
+ */
+export function isKnownNonUsListingSymbol(symbol: string): boolean {
+  const parsed = parsePublicTickerKey(symbol);
+  if (parsed.exchange) {
+    return isKnownExchangeCode(parsed.exchange) && !ROUTING_EXCHANGES.has(parsed.exchange) && !isUsEquityExchange(parsed.exchange);
+  }
+  return tickerHasListingSuffix(parsed.symbol);
 }
 
 /**
