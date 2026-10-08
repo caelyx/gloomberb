@@ -12,6 +12,12 @@ import { canonicalExchange, normalizeSymbol, parsePublicTickerKey } from "../../
 import { AmbiguousContractError, AmbiguousTickerError } from "../../../tickers/search";
 import { bareListingExchange } from "../../../tickers/listing-venues";
 import type { DataProvider } from "../../../types/data-provider";
+import {
+  hongKongListingCode,
+  listingSuffixConflictsWithExchange,
+  listingSuffixExchange,
+} from "../../../sources/listing-symbols";
+import { publicListingTarget } from "../../../sources/listing-target";
 
 export const estimateRevisionsCache =
   createPluginCache<EstimateRevisionsPayload>({
@@ -220,6 +226,34 @@ export function validateEstimates(
     return invalid();
   return data;
 }
+interface EstimateListing {
+  symbol: string;
+  exchange: string;
+}
+
+/**
+ * The bare symbol and venue the estimates route takes for a ticker key. A
+ * recognised listing suffix names the venue and outranks the saved one
+ * (`BHP.AX` is BHP on ASX), and a Hong Kong code goes out with four digits
+ * (`700.HK` is 0700 on HKEX). Null when the key names an exchange its suffix
+ * rules out (`BHP.AX:NYSE`).
+ */
+export function estimateListing(ticker: string, savedExchange: string): EstimateListing | null {
+  const qualified = parsePublicTickerKey(ticker);
+  if (qualified.exchange && listingSuffixConflictsWithExchange(qualified.symbol, qualified.exchange)) return null;
+  const target = publicListingTarget(ticker, savedExchange);
+  const exchange = canonicalExchange(target.exchange);
+  const symbol = exchange && listingSuffixExchange(target.symbol) === exchange
+    ? target.symbol.slice(0, target.symbol.indexOf("."))
+    : target.symbol;
+  return { symbol: exchange ? hongKongListingCode(symbol, exchange) : symbol, exchange };
+}
+
+function notListedOn(ticker: string): Error {
+  const { symbol, exchange } = parsePublicTickerKey(ticker);
+  return new Error(`${symbol} does not trade on ${exchange}.`);
+}
+
 /**
  * The venue the route needs for a bare symbol: the listing `quote SYM` and the
  * command bar resolve it to (`bareListingExchange`). Only a symbol whose
@@ -243,13 +277,16 @@ async function bareSymbolVenue(symbol: string, marketData: DataProvider | undefi
   throw new Error(`No ticker match found for "${typed}".`);
 }
 export async function fetchEstimates(
-  symbol: string,
-  exchange: string,
+  ticker: string,
+  savedExchange: string,
   client: Pick<typeof apiClient, "getCloudEstimateRevisions"> = apiClient,
   /** Resolves a symbol typed with no exchange; a listing named by the caller never asks it. */
   marketData?: DataProvider,
 ) {
-  const venue = canonicalExchange(exchange) || (await bareSymbolVenue(symbol, marketData));
+  const listing = estimateListing(ticker, savedExchange);
+  if (!listing) throw notListedOn(ticker);
+  const { symbol } = listing;
+  const venue = canonicalExchange(listing.exchange) || (await bareSymbolVenue(symbol, marketData));
   try {
     return validateEstimates(
       await client.getCloudEstimateRevisions(symbol, venue),
@@ -264,12 +301,18 @@ export async function fetchEstimates(
 }
 const key = (symbol: string, exchange: string) =>
   `${canonicalExchange(exchange)}:${normalizeSymbol(symbol)}`;
-export function cachedEstimates(symbol: string, exchange: string) {
+export function cachedEstimates(ticker: string, savedExchange: string) {
+  const listing = estimateListing(ticker, savedExchange);
+  if (!listing) return null;
+  const { symbol, exchange } = listing;
   return cachedCloudResource(estimateRevisionsCache, key(symbol, exchange), (payload) =>
     validateEstimates(payload, symbol, exchange || payload.exchange),
   );
 }
-export function loadEstimates(symbol: string, exchange: string, force = false, marketData?: DataProvider) {
+export function loadEstimates(ticker: string, savedExchange: string, force = false, marketData?: DataProvider) {
+  const listing = estimateListing(ticker, savedExchange);
+  if (!listing) return Promise.reject(notListedOn(ticker));
+  const { symbol, exchange } = listing;
   return loadCloudResource(
     estimateRevisionsCache,
     key(symbol, exchange),

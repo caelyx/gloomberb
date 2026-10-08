@@ -36,7 +36,6 @@ import { staticSeries } from "../../../components/chart/static/series";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
 import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
-import { canonicalExchange } from "../../../utils/exchanges";
 import { isPlainKey } from "../../../utils/keyboard";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { SignInWall } from "../cloud/auth-actions";
@@ -243,16 +242,15 @@ export function EstimateRevisionsPane({ width, height, focused }: PaneProps) {
     session = useResearchCloudSession(),
     marketData = useAssetData(),
     colors = useThemeColors();
-  const identity = listingIdentity(boundSymbol, ticker?.metadata.exchange ?? "");
-  const symbol = identity?.symbol ?? null;
+  const symbol = listingIdentity(boundSymbol)?.symbol ?? null;
+  const savedExchange = ticker?.metadata.exchange ?? "";
   useCompanyDisclosureLinks(boundSymbol);
-  const exchange = canonicalExchange(identity?.exchange ?? "");
   const loader = useCallback(
-    (force: boolean) => loadEstimates(symbol!, exchange, force, marketData ?? undefined),
-    [symbol, exchange, marketData, session.requestKey],
+    (force: boolean) => loadEstimates(boundSymbol!, savedExchange, force, marketData ?? undefined),
+    [boundSymbol, savedExchange, marketData, session.requestKey],
   );
   const resource = useAsyncResource(symbol ? loader : null, {
-    initialData: () => (symbol ? cachedEstimates(symbol, exchange) : null),
+    initialData: () => (symbol ? cachedEstimates(boundSymbol!, savedExchange) : null),
     clearOnError: clearDeniedEstimates,
   });
   const data = resource.data?.payload;
