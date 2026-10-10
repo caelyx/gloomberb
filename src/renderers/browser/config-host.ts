@@ -15,7 +15,7 @@ import {
   type LayoutConfig,
 } from "../../types/config";
 import { researchEntryFromSearch } from "./research-entry";
-import { PRIVATE_DEFAULT_LAYOUTS } from "./private-default-config";
+import { PRIVATE_DEFAULT_LAYOUTS, PRIVATE_DEFAULT_THEME } from "./private-default-config";
 import { BROWSER_STORAGE_KEYS, SafeJsonStorage, type StorageLike } from "../../data/json-storage";
 
 export const BROWSER_DATA_DIR = "browser://local";
@@ -103,6 +103,7 @@ function createBrowserDefaultConfig(dataDir: string, search = ""): AppConfig {
       config.layout = first.layout;
     }
   }
+  if (PRIVATE_DEFAULT_THEME) config.theme = PRIVATE_DEFAULT_THEME;
   return browserReady(config);
 }
 

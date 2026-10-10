@@ -1,24 +1,28 @@
 import type { SavedLayout } from "../../types/config";
 
 /**
- * Downstream (private deployment): the workspace a fresh browser opens with.
+ * Downstream (private deployment): the workspace and theme a fresh browser
+ * opens with.
  *
  * Used only when the browser has no saved config. A returning visitor's saved
- * layouts always win, and nothing here is written over them. The first layout
+ * config always wins, and nothing here is written over it. The first layout
  * opens; a research deep link (`/?ticker=...`) opens upstream's Research layout
- * first instead. Set `PRIVATE_DEFAULT_LAYOUTS` to null to go back to upstream's
- * first-visit workspace.
+ * first instead. Set `PRIVATE_DEFAULT_LAYOUTS` or `PRIVATE_DEFAULT_THEME` to
+ * null to go back to upstream's first-visit layouts or theme.
  *
- * Taken from a desktop config backup (its `layouts`, active one first). Left
- * out: gloom-abcnews's `abc-news` pane, which the web build does not have, the
- * news pane's cached headlines, and the portfolio cursor. The Sovereign board
- * is written as `cdx-board` with its `sovereign` tab, the form config version
- * 25 folds `sovr-board` into.
+ * Taken from a desktop config backup: its `layouts` (the active one first) and
+ * `theme`; nothing else in it is carried over. Left out of the layouts:
+ * gloom-abcnews's `abc-news` pane, which the web build does not have, the news
+ * pane's cached headlines and the portfolio cursor. The Sovereign board is
+ * written as `cdx-board` on its `sovereign` tab, the form config version 25
+ * folds `sovr-board` into.
  *
  * `paneId` is the pane a plugin registers; `instanceId` is any unique name of
- * the form `<paneId>:<suffix>`. Panes backed by Gloom Cloud show their sign-in
- * state until the visitor signs in.
+ * the form `<paneId>:<suffix>`. Some panes read Gloom Cloud and may ask the
+ * visitor to sign in.
  */
+export const PRIVATE_DEFAULT_THEME: string | null = "amber";
+
 export const PRIVATE_DEFAULT_LAYOUTS: readonly SavedLayout[] | null = [
   {
     name: "Home",

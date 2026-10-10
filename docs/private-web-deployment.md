@@ -110,8 +110,9 @@ Newsmap and Hacker News read linked articles in place. On the web those
 requests go through `/http-proxy`, which only reaches the hosts above, so an
 article on any other site shows the plugin's fetch error there; the allowlist
 is deliberately not widened to arbitrary hosts. Gemini summaries
-(generativelanguage.googleapis.com) need the viewer's own API key in the
-plugin's settings.
+(generativelanguage.googleapis.com) need a Gemini API key in the plugin's
+settings ("Set up Hacker News" or "Set up News Heatmap" in the command bar); it
+is stored in that browser only.
 
 Fear & Greed, IPO Calendar and Market Halts are built-in plugins upstream, not
 bundled packages. The other hosts in the generated allowlist come from
@@ -134,13 +135,13 @@ module's, or declares a host that is not a bare domain.
 
 ### Vendored plugins
 
-`gloom-au`, `gloom-acgb` and `gloom-newsmap` live in private repositories, which Bun cannot
-install from in CI (it downloads `github:` dependencies without credentials).
-`gloom-hackernews` is public but vendored the same way, so all of this fork's
-plugins update with one script.
-Their code is copied into this repository under `vendor/` instead, with
-`git subtree --squash`, by `scripts/vendor-plugin.sh`. The plugin repositories
-stay private; only the files copied here are public.
+`gloom-au`, `gloom-acgb` and `gloom-newsmap` live in private repositories,
+which Bun cannot install from in CI (it downloads `github:` dependencies without
+credentials). Their code is copied into this repository under `vendor/`
+instead, with `git subtree --squash`, by `scripts/vendor-plugin.sh`. The plugin
+repositories stay private; only the files copied here are public.
+`gloom-hackernews` is public but is vendored the same way, so every plugin this
+fork adds updates with the same script.
 
 - The script leaves out `CLAUDE.md`, `AGENTS.md`, `.claude`, `docs/research`,
   and gloom-au's working notes `STATUS.md` and `docs/australian-data-parity.md`
@@ -153,8 +154,7 @@ stay private; only the files copied here are public.
   runtime dependencies are devDependencies of this repository instead, pinned
   to the versions the plugin's own `bun.lock` resolves: `unpdf` (gloom-au),
   `papaparse` (gloom-acgb), `@mozilla/readability` and `linkedom`
-  (gloom-newsmap, gloom-hackernews). A
-  missing one fails the web build.
+  (gloom-newsmap, gloom-hackernews). A missing one fails the web build.
 - `bunfig.toml` keeps `vendor/**` out of `bun test`; the plugins' tests run in
   their own repositories. The typecheck projects list their files explicitly and
   do not include `vendor/`.
@@ -189,23 +189,46 @@ the desktop backend. Best done upstream.
 
 ## Default configuration
 
-`src/renderers/browser/private-default-config.ts` holds the first-visit layouts:
-Home, ASX, NMAP, Futures, Monitor, US, Macro and Temp, taken from a desktop
-config backup's `layouts` (the active one first). They replace upstream's
-first-visit layouts and are used only when the browser has no saved config
-(`gloomberb.web.config.v1` in `localStorage`); a saved config is always loaded
-as is and never rewritten, so a visitor who has already opened the site keeps
-their own layouts until they reset the app's data. A research deep link
-(`/?ticker=…`) opens upstream's Research layout first, with these after it.
-Set `PRIVATE_DEFAULT_LAYOUTS = null` to go back to upstream's first-visit
-workspace.
+`src/renderers/browser/private-default-config.ts` holds what a first visit
+opens with: the amber theme and eight layouts (Home, ASX, NMAP, Futures,
+Monitor, US, Macro and Temp), taken from a desktop config backup's `theme` and
+`layouts`, the backup's active layout first. They replace upstream's
+first-visit layouts and theme. A research deep link (`/?ticker=…`) opens
+upstream's Research layout first, with these after it. Set
+`PRIVATE_DEFAULT_LAYOUTS` or `PRIVATE_DEFAULT_THEME` to `null` to go back to
+upstream's.
 
-What was left out of the backup: the `abc-news` pane (gloom-abcnews has no web
-target), the news pane's cached headlines and the portfolio cursor.
+Left out of the backup: everything other than the layouts and theme (keys,
+portfolios, plugin settings, recent tickers), the `abc-news` pane (gloom-abcnews
+has no web target), the news pane's cached headlines and the portfolio cursor.
 `sovr-board` is written as `cdx-board` on its Sovereign tab, as config version
-25 folds it. Panes that read Gloom Cloud (charts, quotes, news, world indices,
-the economic calendar and the like) show their sign-in state until the visitor
-signs in; the US tab's heatmap is set to the portfolio, which starts empty.
+25 folds it. The US tab's heatmap shows the portfolio, which starts empty in a
+new browser. Some panes read Gloom Cloud and may ask the visitor to sign in.
+
+### A saved config always wins
+
+The defaults apply only when the browser has no saved config
+(`gloomberb.web.config.v1` in `localStorage`). The app saves one on the first
+visit, and a saved config is always loaded as is and never rewritten, so a
+browser that has opened the site before keeps its own layouts after a deploy
+changes the defaults. To pick up new defaults in such a browser, clear its saved
+config:
+
+- In the app: run **Reset All Data** from the command bar (Ctrl+K), confirm,
+  then reload the page. On the web the app keeps running after the reset, so
+  reload straight away. It clears everything the app keeps in that browser's
+  storage: layouts, portfolios and watchlists, plugin settings (including any
+  Gemini key) and saved pane snapshots. It does not sign you out of Gloom or
+  Cloudflare Access, which are cookies.
+- Or in the browser: open the site, open developer tools, and under
+  Application (Chrome, Edge) or Storage (Firefox) > Local Storage, delete the
+  `gloomberb.web.config.v1` entry for the site, or all the `gloomberb.web.*`
+  entries, then reload. Deleting only the config entry keeps the other saved
+  data. "Clear site data" also works, but it also clears the Cloudflare Access
+  cookie, so the next visit asks you to sign in to Access again.
+
+Clearing a saved config cannot be undone: export anything you want to keep
+first (the desktop app's Export Config; the web app has no config export).
 
 ## Build and test locally
 
@@ -319,7 +342,7 @@ Files most likely to conflict on a merge from upstream, in order of risk:
    function and its one call.
 6. `scripts/web-plugins.ts`, `build-web.ts`, `generate-web-proxy-hosts.ts` - the
    `hosts` field on compiled plugins and the `vendor/` lookup.
-7. `src/plugins/web-bundled.ts` - three list entries.
+7. `src/plugins/web-bundled.ts` - the downstream list entries.
 8. `knip.jsonc` - the downstream `ignoreDependencies` entries.
 
 `vendor/`, `scripts/vendor-plugin.sh` and `bunfig.toml` are downstream-only and

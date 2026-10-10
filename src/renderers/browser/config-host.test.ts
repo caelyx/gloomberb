@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { getDockedPaneIds } from "../../layout/pane-manager/dock-tree";
 import { BROWSER_RESEARCH_PANE_ID, createBrowserConfigStore } from "./config-host";
 import type { StorageLike } from "../../data/json-storage";
-import { PRIVATE_DEFAULT_LAYOUTS } from "./private-default-config";
+import { PRIVATE_DEFAULT_LAYOUTS, PRIVATE_DEFAULT_THEME } from "./private-default-config";
 
 function memoryStorage(): StorageLike {
   const map = new Map<string, string>();
@@ -26,10 +26,11 @@ test("a research link opens its ticker on the requested tab", async () => {
 // research link opens on research with the private layouts after it.
 const privateNames = PRIVATE_DEFAULT_LAYOUTS!.map((layout) => layout.name);
 
-test("a visit without a research link opens the private layouts", async () => {
+test("a visit without a research link opens the private layouts and theme", async () => {
   const config = await createBrowserConfigStore(memoryStorage()).loadConfig("browser://local");
   expect(config.layouts.map((layout) => layout.name)).toEqual(privateNames);
   expect(config.layout).toEqual(PRIVATE_DEFAULT_LAYOUTS![0]!.layout);
+  expect(config.theme).toBe(PRIVATE_DEFAULT_THEME!);
 });
 
 test("a research link still opens on research, with the private layouts next", async () => {
