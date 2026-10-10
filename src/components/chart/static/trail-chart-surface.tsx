@@ -1,7 +1,6 @@
 import { useMemo } from "react";
 import { Box, Text, TextAttributes, useUiCapabilities } from "../../../ui";
 import { useThemeColors } from "../../../theme/theme-context";
-import { blendHex } from "../../../theme/color-utils";
 import type { ResolvedSeries } from "../../../time-series/types";
 import { displayWidth } from "../../../utils/format";
 import { CompositeChart } from "../composite/composite-chart";
@@ -244,7 +243,7 @@ export function ScatterTrailSurface({
         ...trail,
         // Behind the selected trail, the others fade but keep their hue, so
         // every tail can still be told from its neighbours.
-        color: fadeOthers && selectedId && trail.id !== selectedId ? blendHex(trail.color, colors.bg, TRAIL_FADE) : trail.color,
+        fade: fadeOthers && selectedId && trail.id !== selectedId ? TRAIL_FADE : 0,
       })),
       center,
       colors.textDim,

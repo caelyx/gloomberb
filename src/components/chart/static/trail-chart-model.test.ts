@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { buildTrailChart, TRAIL_AGE_FADE, trailAxisTicks } from "./trail-chart-model";
+import { buildTrailChart, TRAIL_AGE_FADE, TRAIL_MAX_FADE, trailAxisTicks } from "./trail-chart-model";
 
 test("scatter trails preserve backtracking and vertical edges without changing symmetric domains", () => {
   const chart = buildTrailChart(
@@ -41,6 +41,13 @@ test("trail edges fade from the newest toward the oldest", () => {
   expect(reds.at(-1)).toBe(255);
   expect(reds[0]).toBe(Math.round(255 * (1 - TRAIL_AGE_FADE)));
   expect(chart.series.at(-1)!.color).toBe("#ff0000");
+  // A trail already faded behind the selection compounds with age, but its oldest edge stops at the cap.
+  const faded = buildTrailChart([{ id: "t", label: "T", color: "#ff0000", fade: 0.55, points }], 100, "#888888", "#000000");
+  const fadedReds = faded.series
+    .filter((series) => series.id.includes(":edge:"))
+    .map((series) => parseInt(series.color.slice(1, 3), 16));
+  expect(fadedReds[0]).toBe(Math.round(255 * (1 - TRAIL_MAX_FADE)));
+  expect(fadedReds.at(-1)).toBe(Math.round(255 * 0.45));
 });
 
 test("strength axis labels sit on round values inside the domain", () => {

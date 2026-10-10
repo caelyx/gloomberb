@@ -6,11 +6,15 @@ export interface ScatterTrail {
   id: string;
   label: string;
   color: string;
+  /** How far the whole trail already fades toward the background, 0 to 1, such as one behind the selection. */
+  fade?: number;
   points: Array<{ x: number; y: number; date: string }>;
 }
 const SCALE = 1_000_000;
 /** How far a trail's oldest edge fades toward the background; its newest keeps full colour. */
 export const TRAIL_AGE_FADE = 0.65;
+/** No edge fades past this, so a faded trail's oldest weeks stay visible. */
+export const TRAIL_MAX_FADE = 0.75;
 /**
  * Each trail is drawn edge by edge (a time-series chart sorts x), so with a
  * background colour the edges fade from the newest toward the oldest and the
@@ -63,16 +67,18 @@ export function buildTrailChart(
         trail.points.length > 2
           ? (trail.points.length - 1 - index) / (trail.points.length - 2)
           : 0;
+      // The trail's own fade and its age compound, short of the cap.
+      const fade = Math.min(
+        TRAIL_MAX_FADE,
+        1 - (1 - (trail.fade ?? 0)) * (1 - TRAIL_AGE_FADE * age),
+      );
       series.push(
         staticSeries(
           ends.map((point, i) => scalarPoint(dates[i]!, point.y)),
           {
             id: `${trail.id}:edge:${index}`,
             label: trail.label,
-            color:
-              fadeTo && age > 0
-                ? blendHex(trail.color, fadeTo, TRAIL_AGE_FADE * age)
-                : trail.color,
+            color: fadeTo && fade > 0 ? blendHex(trail.color, fadeTo, fade) : trail.color,
             calendarSpaced: true,
           },
         ),
@@ -84,7 +90,7 @@ export function buildTrailChart(
         staticSeries([scalarPoint(toDate(last.x), last.y)], {
           id: `${trail.id}:head`,
           label: trail.label,
-          color: trail.color,
+          color: fadeTo && trail.fade ? blendHex(trail.color, fadeTo, trail.fade) : trail.color,
           style: "points",
           calendarSpaced: true,
         }),

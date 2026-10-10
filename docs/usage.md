@@ -708,6 +708,7 @@ uses an explicit universe. Pane settings choose the benchmark, a linked watchlis
 or portfolio, custom symbols and a 2-12-week trail (six by default). The
 maximum is 24 instruments; a larger collection asks for a smaller scope.
 
+Each trail fades toward its oldest week; the labelled end is the latest.
 Select a coloured table row to locate its trail; open it for dated strength and
 momentum history. Click column headers to sort. Missing aligned histories remain
 in the table with unavailable values and a footer notice. CSV export uses the
