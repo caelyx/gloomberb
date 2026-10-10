@@ -3,7 +3,7 @@
 # `git subtree --squash`, leaving out paths that must not become public.
 #
 #   scripts/vendor-plugin.sh <name> <git-url> <commit-or-ref>
-#   scripts/vendor-plugin.sh gloom-asx https://github.com/caelyx/gloom-asx.git main
+#   scripts/vendor-plugin.sh gloom-au https://github.com/caelyx/gloom-au.git main
 #
 # The plugin's history never enters this repository: git subtree --squash
 # imports only the filtered tree. The first run adds vendor/<name>; later runs
@@ -15,8 +15,13 @@
 # plugin's hosts changed, and the checks in docs/private-web-deployment.md.
 set -euo pipefail
 
-# Never copied into this (public) repository.
-EXCLUDED_PATHS=(CLAUDE.md AGENTS.md .claude docs/research)
+# Never copied into this (public) repository. STATUS.md and
+# docs/australian-data-parity.md are gloom-au's working notes and plan.
+EXCLUDED_PATHS=(CLAUDE.md AGENTS.md .claude docs/research STATUS.md docs/australian-data-parity.md)
+# Part of each filtered commit's message, and so of its id, which an update has
+# to rebuild for the previous import: keep it fixed. Adding a path above that an
+# already-vendored plugin contains changes that rebuild; re-add the plugin then.
+FILTER_LABEL="CLAUDE.md AGENTS.md .claude docs/research"
 
 name="${1:?usage: $0 <name> <git-url> <commit-or-ref>}"
 url="${2:?usage: $0 <name> <git-url> <commit-or-ref>}"
@@ -46,7 +51,7 @@ filtered_commit() {
   date="$(git -C "$work/src" show -s --format=%cI "$source")"
   GIT_AUTHOR_NAME=vendor-plugin GIT_AUTHOR_EMAIL=vendor-plugin@invalid GIT_AUTHOR_DATE="$date" \
   GIT_COMMITTER_NAME=vendor-plugin GIT_COMMITTER_EMAIL=vendor-plugin@invalid GIT_COMMITTER_DATE="$date" \
-    git -C "$work/src" commit-tree "$tree" -m "${name} ${source} without ${EXCLUDED_PATHS[*]}"
+    git -C "$work/src" commit-tree "$tree" -m "${name} ${source} without ${FILTER_LABEL}"
 }
 
 filtered="$(filtered_commit "$source_commit")"
