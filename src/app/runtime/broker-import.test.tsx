@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { act } from "react";
 import { createOpenTuiTestHarness } from "../../renderers/opentui/test-utils";
 import { setConfigStoreHost, type ConfigStoreHost } from "../../data/config/store";
@@ -10,13 +10,16 @@ import type { TickerRecord } from "../../types/ticker";
 import { useBrokerImportRuntime } from "./broker-import";
 
 const saved: AppConfig[] = [];
-setConfigStoreHost({
-  saveConfig: async (config: AppConfig) => { saved.push(config); },
-} as unknown as ConfigStoreHost);
 
 const tui = createOpenTuiTestHarness();
+beforeEach(() => {
+  setConfigStoreHost({
+    saveConfig: async (config: AppConfig) => { saved.push(config); },
+  } as unknown as ConfigStoreHost);
+});
 afterEach(() => {
   saved.length = 0;
+  setConfigStoreHost(null);
 });
 
 // The startup broker sync runs while the app is already usable, and a broker
