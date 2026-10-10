@@ -51,6 +51,15 @@ export interface HeadlessPaneOptionDef {
     pluginId: string;
     key?: string;
   };
+  /** The value's name in the catalog's flag, `--expiration <YYYY-MM-DD|unix>`; the type when absent. */
+  placeholder?: string;
+  /** The option in use as typed after the function, such as `--expiration 2028-01-21`; the catalog shows it as an example. */
+  example?: string;
+  /**
+   * Checks a typed value and returns it as the pane reads it, in place of the
+   * type's own check; throws an Error that names what is wrong.
+   */
+  normalize?(value: string): string | number | boolean;
 }
 
 export interface HeadlessPaneLoadArgs {
@@ -90,8 +99,12 @@ export interface HeadlessPaneColumn {
   header: string;
   align?: "left" | "right" | "center";
   width?: number;
+  /** False keeps the column whole when the text table is fitted to a narrow width, so a time or an id is never cut. */
+  shrink?: boolean;
   description?: string;
   format?: (value: unknown, row: HeadlessPaneRow) => string;
+  /** What the text report prints when it can say more than an export should (a unit word beside a number); CSV and NDJSON keep `format`. */
+  textFormat?: (value: unknown, row: HeadlessPaneRow) => string;
 }
 
 export interface HeadlessPaneEntry {
@@ -142,6 +155,12 @@ export interface HeadlessPaneFreshness {
   delayMinutes?: number;
   /** What not-a-feed data is, in a few words: "filed data", "monthly release", "your inputs". */
   basis?: string;
+  /**
+   * How often the data is published, when its dates mark the start of a period
+   * (a monthly statistic is dated the 1st). The report then names the month,
+   * quarter or year, not a day it was never observed on.
+   */
+  periodicity?: "monthly" | "quarterly" | "annual";
   /** The newest observation is stale once it is older than this many minutes. */
   maxAgeMinutes?: number;
   /**
@@ -155,6 +174,14 @@ export interface HeadlessPaneFreshness {
    * completed session has passed after the newest (a day's lag is allowed).
    */
   cadence?: "daily";
+  /**
+   * Whose trading day a dated (`YYYY-MM-DD`) as-of is, as a reader names the
+   * market: `US` for a US trading or business day. The report then reads
+   * `US trading day Fri 9 Oct 2026`, so a reader whose day is already Saturday
+   * does not take the US Friday for theirs. Leave it out when the dates are not
+   * one market's.
+   */
+  tradingDayMarket?: string;
   /** The newest observation is stale once this time (the next scheduled release) has passed by a day. */
   nextExpectedAt?: string | number | Date | null;
 }

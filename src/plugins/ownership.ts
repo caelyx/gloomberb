@@ -97,9 +97,36 @@ const BUILTIN_PLUGIN_GROUPS: Readonly<Record<string, readonly string[]>> = {
   "ticker-research": ["ticker-core", "options-volatility", "ownership", "filings", "alt-data", "quant", "credit", "earnings"],
 };
 
+/** Every built-in that came out of a retired group: the plugins starter packs switch. */
+export function regroupedBuiltinPluginIds(): string[] {
+  return [...new Set(Object.values(BUILTIN_PLUGIN_GROUPS).flat())];
+}
+
 /** The built-ins a retired group id stands for, or null when the id is not a group. */
 export function builtinPluginGroupMembers(pluginId: string): readonly string[] | null {
   return Object.prototype.hasOwnProperty.call(BUILTIN_PLUGIN_GROUPS, pluginId) ? BUILTIN_PLUGIN_GROUPS[pluginId]! : null;
+}
+
+/**
+ * `disabledPlugins` after switching plugins on or off in one go, or null when
+ * nothing changes. A retired group id switches every member, the way
+ * `gloomberb plugin enable|disable` does. Changes apply in order, so a later
+ * one wins for a plugin two groups share.
+ */
+export function applyPluginToggles(
+  disabledPlugins: readonly string[],
+  changes: Readonly<Record<string, boolean>>,
+): string[] | null {
+  let next = [...disabledPlugins];
+  for (const [pluginId, enabled] of Object.entries(changes)) {
+    for (const memberId of builtinPluginGroupMembers(pluginId) ?? [pluginId]) {
+      if (enabled) next = next.filter((entry) => entry !== memberId);
+      else if (!next.includes(memberId)) next.push(memberId);
+    }
+  }
+  const unchanged = next.length === disabledPlugins.length
+    && next.every((pluginId, index) => pluginId === disabledPlugins[index]);
+  return unchanged ? null : next;
 }
 
 /** The one built-in that cannot be disabled; its legacy module ids normalize to it. */

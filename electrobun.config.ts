@@ -1,8 +1,12 @@
 import type { ElectrobunConfig } from "electrobun/bun";
 import pkg from "./package.json";
 
-const RELEASE_BASE_URL = "https://github.com/gloom-sh/gloomberb/releases/latest/download";
-const GENERATE_RELEASE_PATCH = process.platform !== "win32";
+// GLOOMBERB_DESKTOP_LOCAL=1 builds an unsigned app with no update feed or DMG,
+// for a Mac without Gloom's Apple signing secrets. With the feed left on, the app
+// would offer upstream's next release and replace this build with it.
+const LOCAL_BUILD = process.env.GLOOMBERB_DESKTOP_LOCAL === "1";
+const RELEASE_BASE_URL = LOCAL_BUILD ? "" : "https://github.com/gloom-sh/gloomberb/releases/latest/download";
+const GENERATE_RELEASE_PATCH = !LOCAL_BUILD && process.platform !== "win32";
 
 const config: ElectrobunConfig = {
   app: {
@@ -35,9 +39,9 @@ const config: ElectrobunConfig = {
       "node_modules/**",
     ],
     mac: {
-      codesign: true,
-      createDmg: true,
-      notarize: true,
+      codesign: !LOCAL_BUILD,
+      createDmg: !LOCAL_BUILD,
+      notarize: !LOCAL_BUILD,
       icons: "icon.iconset",
       defaultRenderer: "native",
     },

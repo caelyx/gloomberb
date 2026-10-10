@@ -18,7 +18,7 @@ import type {
   HeadlessSeriesResult,
   HeadlessSnapshotResult,
 } from "../../types/plugin";
-import { cliStyles, renderSection, renderStats, renderTable } from "../../utils/cli-output";
+import { cliStyles, renderSection, renderStats, renderTable, wrapToTerminal } from "../../utils/cli-output";
 import { humanizeCliKey } from "../result";
 import {
   exportEntriesTable,
@@ -35,7 +35,7 @@ import type { ResolvedSeries } from "../../time-series/types";
 import type { PaneFunctionReport } from "./report";
 import type { ResolvedPaneFunction } from "./resolver";
 import { isRecord } from "../../utils/guards";
-import { formatUtcTime } from "../../utils/utc-time";
+import { formatUtcTime, localTimeSuffix } from "../../utils/utc-time";
 import { deriveHeadlessFreshness, formatFreshnessLine, type ReportFreshness } from "./freshness";
 
 interface SerializableHeadlessColumn {
@@ -317,7 +317,7 @@ function displayInstant(value: string): string {
   if (!Number.isFinite(time)) return value;
   const iso = new Date(time).toISOString();
   if (iso.slice(17, 23) === "00.000") return displayTime(time);
-  return `${iso.slice(0, iso.endsWith(".000Z") ? 19 : 23).replace("T", " ")} UTC`;
+  return `${iso.slice(0, iso.endsWith(".000Z") ? 19 : 23).replace("T", " ")} UTC${localTimeSuffix(time)}`;
 }
 
 /** Drops binary floating-point noise (4.019999999999996) without rounding real digits. */
@@ -382,10 +382,12 @@ function renderRows(
       header: humanizeCliKey(column.header),
       align: column.align,
       width: column.width,
+      shrink: column.shrink,
     })),
     rows.map((row) => columns.map((column) => {
       const value = row[column.key];
-      return column.format ? column.format(value, row) : displayValue(value);
+      const format = column.textFormat ?? column.format;
+      return format ? format(value, row) : displayValue(value);
     })),
   );
 }
@@ -559,8 +561,8 @@ function reportTitle(
 /** One message stays on the label's line; several each get a line of their own, so none runs into the next. */
 function renderMessages(label: string, messages: readonly string[]): string[] {
   return messages.length === 1
-    ? [cliStyles.warning(`${label}: ${messages[0]}`)]
-    : [cliStyles.warning(`${label}:`), ...messages.map((message) => `  ${message}`)];
+    ? [cliStyles.warning(wrapToTerminal(`${label}: ${messages[0]}`))]
+    : [cliStyles.warning(`${label}:`), ...messages.map((message) => wrapToTerminal(`  ${message}`))];
 }
 
 /**
@@ -603,7 +605,7 @@ export function renderHeadlessPaneText(
   }
   if (result.notes?.length) lines.push("", ...renderMessages("Notes", result.notes));
   if (result.errors?.length) lines.push("", ...renderMessages("Errors", result.errors));
-  return [lines.join("\n").trimEnd(), "", cliStyles.muted(formatFreshnessLine(freshness))].join("\n");
+  return [lines.join("\n").trimEnd(), "", cliStyles.muted(wrapToTerminal(formatFreshnessLine(freshness)))].join("\n");
 }
 
 function resultRowCount(definition: HeadlessPaneDefinition, result: HeadlessPaneResult): number {

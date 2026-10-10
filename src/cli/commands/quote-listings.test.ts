@@ -1,0 +1,144 @@
+import { expect, test } from "bun:test";
+import type { QuoteBatchResult, QuoteSubscriptionTarget } from "../../types/data-provider";
+import { createTestCliContext, type PrintedCliResult } from "../../test-support/cli-context";
+import { createTestDataProvider, createTestQuote } from "../../test-support/data-provider";
+import { buildSearchReport } from "./search";
+import { marketDataCliCommands } from "./market";
+
+const quoteCommand = marketDataCliCommands.find((command) => command.name === "quote")!;
+
+/**
+ * A quote source that answers only the listing keys in `quoted`, and records what each batch asked for.
+ * Search lists the symbol on each venue under the company in `names`, else one fund.
+ */
+function venueSource(
+  symbol: string,
+  venues: string[],
+  quoted: Record<string, ReturnType<typeof createTestQuote>>,
+  names: Record<string, string> = {},
+) {
+  const batches: string[][] = [];
+  let searches = 0;
+  const dataProvider = createTestDataProvider({
+    search: async () => {
+      searches += 1;
+      return venues.map((exchange) => ({ providerId: "test", symbol, name: names[exchange] ?? `${symbol} Fund`, exchange, type: "ETF", currency: "EUR" }));
+    },
+    getQuotesBatch: async (targets: QuoteSubscriptionTarget[]): Promise<QuoteBatchResult[]> => {
+      batches.push(targets.map((target) => target.symbol));
+      return targets.map((target) => quoted[target.symbol]
+        ? { target, quote: quoted[target.symbol]! }
+        : { target, quote: null, error: `No quote provider available for ${target.symbol}` });
+    },
+  });
+  return { dataProvider, batches, searches: () => searches };
+}
+
+async function runQuote(args: string[], source: ReturnType<typeof venueSource>) {
+  const cli = createTestCliContext({ dataProvider: source.dataProvider });
+  let failure: { message: string; details?: string } | null = null;
+  cli.context.fail = (message: string, details?: string): never => {
+    failure = { message, details };
+    throw new Error(message);
+  };
+  await quoteCommand.execute(args, cli.context).catch(() => {});
+  const printed = cli.printed[0] as PrintedCliResult | undefined;
+  return {
+    failure: failure as { message: string; details?: string } | null,
+    rows: (printed?.result.data ?? []) as Array<{ target: QuoteSubscriptionTarget; quote: unknown }>,
+    warnings: printed?.result.warnings ?? [],
+  };
+}
+
+test("a bare symbol with no quote is asked on the venue it resolved to, then its other listings in search order; a named venue never switches", async () => {
+  const quote = createTestQuote({ symbol: "CSPX", currency: "EUR" });
+  const source = venueSource("CSPX", ["XETRA", "LSE", "AMS"], { "CSPX:LSE": quote, "CSPX:AMS": { ...quote, price: 2 } });
+
+  const bare = await runQuote(["CSPX"], source);
+  // The bare request, then the venue it resolved to on its own, then the rest together.
+  expect(source.batches).toEqual([["CSPX"], ["CSPX:XETRA"], ["CSPX:LSE", "CSPX:AMS"]]);
+  // The first listing in search order with a quote wins, and the output names it.
+  expect(bare.rows.map((row) => row.target.symbol)).toEqual(["CSPX:LSE"]);
+  expect(bare.warnings[0]).toContain("CSPX -> LSE");
+
+  // The listing it resolved to answers by key: nothing else is asked.
+  const first = venueSource("CSPX", ["XETRA", "LSE"], { "CSPX:XETRA": quote, "CSPX:LSE": quote });
+  expect((await runQuote(["CSPX"], first)).rows.map((row) => row.target.symbol)).toEqual(["CSPX:XETRA"]);
+  expect(first.batches).toEqual([["CSPX"], ["CSPX:XETRA"]]);
+
+  // XETRA was named, so its missing quote stays its own.
+  source.batches.length = 0;
+  const named = await runQuote(["CSPX:XETRA"], source);
+  expect(source.batches).toEqual([["CSPX:XETRA"]]);
+  expect(named.rows.map((row) => [row.target.symbol, row.quote])).toEqual([["CSPX:XETRA", null]]);
+
+  // A request that succeeds pays for no search.
+  const quotedBare = venueSource("CSPX", ["XETRA"], { CSPX: quote });
+  await runQuote(["CSPX"], quotedBare);
+  expect(quotedBare.searches()).toBe(0);
+
+  // With no quote anywhere, one company's listings name the venue it resolved to and the others to try.
+  const unquoted = await runQuote(["CSPX"], venueSource("CSPX", ["XETRA", "LSE"], {}));
+  expect(unquoted.failure?.message).toBe("CSPX resolved to CSPX Fund (XETRA), which has no quote.");
+  expect(unquoted.failure?.details).toContain("CSPX:LSE CSPX Fund (try: gloomberb quote CSPX:LSE)");
+});
+
+test("a code several companies list is never quoted on one of them: it asks for an exchange, and only its row fails", async () => {
+  const quote = createTestQuote({ symbol: "2222", currency: "JPY" });
+  const names = { JPX: "Kotobuki Spirits Co., Ltd.", TADAWUL: "Saudi Arabian Oil Co." };
+  // Both listings have a quote, and the first in search order is not the answer.
+  const source = venueSource("2222", ["JPX", "TADAWUL"], { "2222:JPX": quote, "2222:TADAWUL": { ...quote, price: 2 }, CSPX: quote }, names);
+
+  const alone = await runQuote(["2222"], source);
+  expect(alone.failure?.message).toBe("Choose an exchange for 2222.");
+  expect(alone.failure?.details).toContain("2222:JPX Kotobuki Spirits Co., Ltd. (try: gloomberb quote 2222:JPX)");
+  expect(alone.failure?.details).toContain("2222:TADAWUL Saudi Arabian Oil Co. (try: gloomberb quote 2222:TADAWUL)");
+  // No listing was asked for its quote.
+  expect(source.batches).toEqual([["2222"]]);
+
+  // Beside others it is one failed row; the rest still print.
+  const several = await runQuote(["2222", "CSPX"], source);
+  expect(several.failure).toBeNull();
+  expect(several.rows.map((row) => [row.target.symbol, row.quote == null])).toEqual([["2222", true], ["CSPX", false]]);
+  expect((several.rows[0] as { error?: string }).error).toBe("Choose an exchange for 2222. Listings: 2222:JPX, 2222:TADAWUL.");
+  expect(several.warnings.join("\n")).not.toContain("2222 ->");
+
+  // A named listing is its own answer.
+  expect((await runQuote(["2222:TADAWUL"], source)).rows.map((row) => [row.target.symbol, row.quote == null])).toEqual([["2222:TADAWUL", false]]);
+});
+
+test("a bare symbol the service read on its home listing abroad names the venue, without a search", async () => {
+  const listed = (symbol: string, exchangeName: string, currency = "USD") => createTestQuote({ symbol, exchangeName, listingExchangeName: exchangeName, currency });
+  const source = venueSource("SXR8", ["XETRA", "BUD"], {
+    SXR8: listed("SXR8", "XETRA", "EUR"),
+    "SXR8:XETRA": listed("SXR8", "XETRA", "EUR"),
+    AAPL: listed("AAPL", "NASDAQ"),
+    TCEHY: listed("TCEHY", "OTC MARKETS OTCPK"),
+    CL1: listed("CL1", "NY MERCANTILE"),
+    "^GDAXI": listed("^GDAXI", "XETRA", "EUR"),
+  });
+
+  const bare = await runQuote(["SXR8"], source);
+  expect(bare.rows.map((row) => row.target.symbol)).toEqual(["SXR8"]);
+  expect(bare.warnings).toEqual(["SXR8 -> XETRA"]);
+  expect(source.searches()).toBe(0);
+  // A named venue, a US or OTC listing, a futures venue and an index say nothing more.
+  for (const symbol of ["SXR8:XETRA", "AAPL", "TCEHY", "CL1", "^GDAXI"]) {
+    expect((await runQuote([symbol], source)).warnings).toEqual([]);
+  }
+});
+
+test("a bare index root points at its ^ index, whether it found nothing or another instrument", async () => {
+  const none = await runQuote(["VIX"], venueSource("VIX", [], {}));
+  expect(none.failure?.details).toContain("gloomberb quote ^VIX");
+
+  const corvex = createTestQuote({ symbol: "MOVE", name: "Corvex, Inc.", instrumentType: "EQUITY" });
+  const other = venueSource("MOVE", ["NASDAQ"], { MOVE: corvex, "MOVE:NASDAQ": corvex, "^MOVE": { ...corvex, instrumentType: "INDEX" } });
+  expect((await runQuote(["MOVE"], other)).warnings.join("\n")).toContain("^MOVE");
+  // A named listing and the index itself need no pointer.
+  expect((await runQuote(["MOVE:NASDAQ"], other)).warnings).toEqual([]);
+  expect((await runQuote(["^MOVE"], other)).warnings).toEqual([]);
+
+  expect(buildSearchReport({ query: "vix", candidates: [] })).toContain("gloomberb quote ^VIX");
+  expect(buildSearchReport({ query: "AAPL", candidates: [] })).not.toContain("^");
+});

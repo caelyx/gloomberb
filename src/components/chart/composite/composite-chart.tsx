@@ -12,7 +12,7 @@ import { AsciiText, Box, ChartSurface, Text, useUiCapabilities } from "../../../
 import { useOptionalPaneInstanceId } from "../../../state/app/context";
 import { useThemeColors, useThemeId } from "../../../theme/theme-context";
 import { themedSeriesColor, themeSeriesColors } from "../../../theme/series-colors";
-import { assignSeriesLineCues } from "./series-cues";
+import { assignSeriesLineCues, type SeriesLineCue } from "./series-cues";
 import { chartSurfaceBackground, usePaneSurface } from "../../layout/pane/surface";
 import { CHART_WATERMARK_ROLE } from "../../../utils/screenshot-watermark";
 import type { ResolvedSeries } from "../../../time-series/types";
@@ -57,6 +57,7 @@ function chartWatermarkScale(plotWidthPx: number, plotHeightPx: number): number 
   return scale >= 1 ? Math.round(scale * 4) / 4 : null;
 }
 
+const NO_LINE_CUES: ReadonlyMap<string, SeriesLineCue> = new Map();
 const NO_X_MARKERS: readonly CompositeChartXMarker[] = [];
 
 /** Default-palette series in the theme's own palette, where it has one; the same list otherwise. */
@@ -100,6 +101,7 @@ function ThemedCompositeChart({
   allowHistoricalBackfill = false,
   axisWidth = 9,
   showLegend = true,
+  lineCues: lineCuesEnabled = true,
   showLatestChangePercent = false,
   legendAccessory,
   legendAccessoryWidth,
@@ -187,8 +189,8 @@ function ThemedCompositeChart({
   // Keyed by ids and styles: a live tick hands over new series objects.
   const lineCues = useMemo(() => {
     void cueKey;
-    return assignSeriesLineCues(cueSourceRef.current);
-  }, [cueKey]);
+    return lineCuesEnabled ? assignSeriesLineCues(cueSourceRef.current) : NO_LINE_CUES;
+  }, [cueKey, lineCuesEnabled]);
   const {
     navigationFrame, activeUserViewport, effectiveViewport,
     panViewport, panViewportByRatio, zoomViewport, setViewportRange, resetViewport,

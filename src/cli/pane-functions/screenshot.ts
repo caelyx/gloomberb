@@ -1,4 +1,5 @@
 import { fetchTape } from "../../plugins/builtin/time-sales/client";
+import { isOptionsUnavailableError } from "../../market-data/options-alternatives";
 import type { TapeCapture } from "../../plugins/builtin/time-sales/snapshot-client";
 import { apiClient } from "../../api-client";
 import { snapshotInstrumentKey, type SnapshotMarketData } from "../../market-data/snapshot-provider";
@@ -9,7 +10,7 @@ import { dirname, resolve } from "path";
 import { mkdir } from "fs/promises";
 import type { PaneRuntimeState } from "../../core/state/app/state";
 import { CHART_COMPOSER_PANE_ID, type AppConfig } from "../../types/config";
-import type { OptionsChain, PricePoint, TickerFinancials } from "../../types/financials";
+import type { OptionsChain, PricePoint, Quote, TickerFinancials } from "../../types/financials";
 import type { TickerRecord } from "../../types/ticker";
 import { slugifyName } from "../../utils/slugify";
 import {
@@ -30,7 +31,7 @@ import {
   type DesktopPaneShotPayload,
   type DesktopPaneShotRenderResult,
 } from "../desktop-pane-shot";
-import { optionPaneState } from "./options";
+import { optionPaneState, SHOT_SIZE_LIMITS, type ShotSizeClamp } from "./options";
 import type { ResolvedPaneFunction } from "./resolver";
 import type { MarketContext } from "../types";
 import { capabilityPluginState } from "./capabilities";
@@ -94,7 +95,9 @@ import {
   withShotPriceHistory,
   withShotSeasonalityHistory,
 } from "./data";
-import { renderedReportNotices } from "./report-notices";
+import { renderedReportFreshness, renderedReportNotices, renderedReportObservations } from "./report-notices";
+import { deriveRenderedFreshness, statusLineVariants, type ReportFreshness } from "./freshness";
+import { quotesFreshness } from "../freshness";
 import {
   financialRatioRenderMismatches,
   financialRatioShotEvidence,
@@ -430,6 +433,8 @@ export interface PaneScreenshotResult {
   dataEvidence: PaneScreenshotDataEvidence | null;
   /** What the pane says its view leaves out, such as OMON's "21 of 145 strikes". */
   notices?: string[];
+  /** How current the captured data is, as the capture's status line says it; absent with `--no-status`. */
+  freshness?: ReportFreshness;
   outputPath: string;
   render: DesktopPaneShotRenderResult & {
     expectedText: string[];
@@ -444,6 +449,34 @@ export interface PaneScreenshotResult {
 export function defaultScreenshotPath(resolved: ResolvedPaneFunction, rawArg: string): string {
   const suffix = slugifyName([resolved.token, rawArg].filter(Boolean).join("-"), "pane");
   return resolve(process.cwd(), `gloomberb-${suffix}.png`);
+}
+
+/**
+ * The pixels of the PNG a `shot` of this size writes: the layout snapped to
+ * whole cells, drawn at the device scale factor (twice the layout size, as
+ * `--scale` trades cells for glyph size at the same output size).
+ */
+function shotImagePixels(widthPx: number, heightPx: number, scale = 1): { width: number; height: number } {
+  const device = DEFAULT_SHOT_DEVICE_SCALE_FACTOR * scale;
+  return {
+    width: Math.round(Math.max(1, Math.floor(widthPx / scale / DESKTOP_CELL_WIDTH_PX)) * DESKTOP_CELL_WIDTH_PX * device),
+    height: Math.round(Math.max(1, Math.floor(heightPx / scale / DESKTOP_CELL_HEIGHT_PX)) * DESKTOP_CELL_HEIGHT_PX * device),
+  };
+}
+
+/** What `shot` says when it drew another size than the one asked for, naming the PNG it wrote. */
+export function shotSizeWarnings(
+  clamped: readonly ShotSizeClamp[] | undefined,
+  size: { width: number; height: number; scale?: number },
+): string[] {
+  if (!clamped?.length) return [];
+  const pixels = shotImagePixels(size.width, size.height, size.scale);
+  return clamped.map(({ dimension, requested, used }) => {
+    const { min, max } = SHOT_SIZE_LIMITS[dimension];
+    const bound = requested < min ? `below the ${min} minimum` : `above the ${max} maximum`;
+    const drawn = dimension === "width" ? `${pixels.width} px wide` : `${pixels.height} px tall`;
+    return `--${dimension} ${requested} is ${bound}, so the capture used ${used} and the PNG is ${drawn}.`;
+  });
 }
 
 export async function buildDesktopShotPayload(
@@ -579,7 +612,9 @@ export async function buildDesktopShotPayload(
       ?? data.quote?.listingExchangeName
       ?? data.quote?.exchangeName
       ?? "";
-    const fiveYearsDaily = resolved.pane.id === "realized-vol" || resolved.pane.id === "iv-history" || resolved.pane.id === "macro-day";
+    const fiveYearsDaily = resolved.pane.id === "realized-vol" || resolved.pane.id === "iv-history" || resolved.pane.id === "macro-day"
+      // KELLY's History tab reads monthly returns off five years of daily closes.
+      || resolved.pane.id === "kelly-sizer";
     if (fiveYearsDaily || resolved.pane.id === "iv-screen" || resolved.pane.id === "short-watch"
       || resolved.pane.id === "backtest" || resolved.pane.id === OPTIONS_PANE_ID) {
       // Generic 5Y snapshots can contain weekly bars. The snapshot provider
@@ -597,7 +632,7 @@ export async function buildDesktopShotPayload(
     } else if (shotRatioTab(resolved)?.key === "valuation") {
       data = await withShotPeriodEndHistory(context, entry.instrument, exchange, resolved, data);
     } else if (resolved.pane.id === "seasonality") {
-      data = await withShotSeasonalityHistory(context, entry.instrument, data);
+      data = await withShotSeasonalityHistory(context, entry.instrument, resolved, data);
     } else if (requestedRange && readsDailyReturns(resolved)) {
       data = await withShotDailyReturns(context, entry.instrument, exchange, requestedRange, data);
     } else if (requestedRange) {
@@ -620,9 +655,13 @@ export async function buildDesktopShotPayload(
       tapeSnapshots.push([entry.instrument.symbol, exchange, await fetchTape(entry.instrument.symbol, exchange)]);
     }
     if (includeOptionsChains && context.dataProvider.getOptionsChain) {
+      // A future with no chain of its own is the pane's to explain (the listed alternative), not a failed shot.
       const chain = await context.dataProvider.getOptionsChain(entry.instrument.symbol, exchange, undefined,
-        context.refresh ? { cacheMode: "refresh" } : undefined);
-      optionsChains.push([symbol, chain]);
+        context.refresh ? { cacheMode: "refresh" } : undefined).catch((error: unknown) => {
+        if (isOptionsUnavailableError(error)) return null;
+        throw error;
+      });
+      if (chain) optionsChains.push([symbol, chain]);
     }
   }
   layout.instances[0] = shotInstance;
@@ -694,6 +733,60 @@ function shotPriceHistoryRange(resolved: ResolvedPaneFunction): TimeRange | null
   }
 }
 
+/** The bridge, keeping every quote it serves the page: what a pane that loads its own quotes (WEI) shows. */
+function recordBridgedQuotes(bridge: DesktopPaneShotBridge): { bridge: DesktopPaneShotBridge; quotes: Quote[] } {
+  const quotes: Quote[] = [];
+  const keep = (value: unknown) => {
+    if (isRecord(value) && typeof value.symbol === "string" && typeof value.price === "number") quotes.push(value as unknown as Quote);
+  };
+  return {
+    quotes,
+    bridge: {
+      ...bridge,
+      async marketData(operation, args) {
+        const result = await bridge.marketData(operation, args);
+        if (operation === "getQuote") keep(result);
+        if (operation === "getQuotesBatch" && Array.isArray(result)) {
+          for (const entry of result) keep(isRecord(entry) ? entry.quote : null);
+        }
+        return result;
+      },
+    },
+  };
+}
+
+/**
+ * How current a capture's data is. A pane that says what its data is (its
+ * declared status, or a feed it publishes, such as OMON's chain or the news
+ * wire's delay) is taken at its word; otherwise the quotes it shows date it,
+ * with their delay and where their markets stand; otherwise what the
+ * rendered view carries, which may be nothing.
+ */
+function shotFreshness(
+  resolved: Pick<ResolvedPaneFunction, "pane">,
+  payload: Pick<DesktopPaneShotPayload, "financials" | "instrumentFinancials">,
+  render: Pick<DesktopPaneShotRenderResult, "semanticUi" | "footerText" | "rows">,
+  bridgedQuotes: readonly Quote[],
+  now = Date.now(),
+): ReportFreshness {
+  const declared = { ...resolved.pane.reportFreshness, ...renderedReportFreshness(render.semanticUi ?? []) };
+  const quotes = [
+    ...payload.financials.map(([, financials]) => financials.quote),
+    ...(payload.instrumentFinancials ?? []).map(({ financials }) => financials.quote),
+    ...bridgedQuotes,
+  ];
+  // A pane that publishes the observations behind its figures (FXC's rates) dates itself.
+  const observed = renderedReportObservations(render.semanticUi ?? []);
+  const quoted = declared.status || observed.length > 0
+    ? undefined
+    : quotesFreshness(quotes, declared.source ? { source: declared.source } : undefined, now);
+  return quoted ?? deriveRenderedFreshness(declared, {
+    footerText: render.footerText ?? "",
+    cellTimes: render.rows.flatMap((row) => row.cells.flatMap((cell) => (cell.instant ? [cell.instant] : []))),
+    observed,
+  }, now);
+}
+
 export async function renderDesktopShot({
   resolved,
   context,
@@ -704,6 +797,7 @@ export async function renderDesktopShot({
   theme,
   scale,
   watermark,
+  statusLine = false,
   options,
   captureImage = true,
 }: {
@@ -716,6 +810,8 @@ export async function renderDesktopShot({
   theme?: string | null;
   scale?: number;
   watermark?: string | null;
+  /** Draw the dated status line in the capture's footer. Reports and `--no-status` leave it out. */
+  statusLine?: boolean;
   options: Record<string, string | true>;
   captureImage?: boolean;
 }): Promise<PaneScreenshotResult> {
@@ -724,6 +820,7 @@ export async function renderDesktopShot({
   const previousSessionToken = apiClient.getSessionToken();
   let payload: DesktopPaneShotPayload;
   let render: DesktopPaneShotRenderResult;
+  let freshness: ReportFreshness | undefined;
   apiClient.setSessionToken(apiProxy.sessionToken);
   try {
     payload = await buildDesktopShotPayload(
@@ -737,16 +834,24 @@ export async function renderDesktopShot({
       scale ?? 1,
       watermark ?? null,
     );
+    if (statusLine && captureImage) payload.statusLine = true;
+    const recorded = recordBridgedQuotes(createDesktopShotBridge(context));
+    const shotPayload = payload;
     render = await renderDesktopPaneScreenshot(payload, outputPath, apiProxy, {
       captureImage,
-      bridge: createDesktopShotBridge(context),
+      bridge: recorded.bridge,
+      statusLine: (rendered) => {
+        freshness = shotFreshness(resolved, shotPayload, rendered, recorded.quotes);
+        return statusLineVariants(freshness);
+      },
     });
   } finally {
     apiClient.setSessionToken(previousSessionToken);
   }
   const renderedInstance = payload.config.layout.instances.find(({ instanceId }) => instanceId === payload.paneId);
   if (renderedInstance) resolved = { ...resolved, instance: renderedInstance };
-  return assessPaneScreenshot(resolved, payload, render, rawArg, outputPath);
+  const assessed = assessPaneScreenshot(resolved, payload, render, rawArg, outputPath);
+  return freshness ? { ...assessed, freshness } : assessed;
 }
 
 /** What a rendered capture shows, and whether it is fit to use. */
