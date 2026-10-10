@@ -43,11 +43,11 @@ anonymous state without closing the workspace.
 
 | # | Change | Files |
 |---|---|---|
-| 1 | Three more web-bundled plugins, vendored: Australian Markets (gloom-au), Newsmap and Hacker News | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated), `vendor/`, `scripts/vendor-plugin.sh`, `bunfig.toml` |
+| 1 | Four more web-bundled plugins, vendored: Australian Markets (gloom-au), ACGB curve (gloom-acgb), Newsmap and Hacker News | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated), `vendor/`, `scripts/vendor-plugin.sh`, `bunfig.toml` |
 | 1a | The web build also reads each plugin's `gloom.json` (hosts; id and `web` target must agree), and compiles `vendor/<name>` when present | `scripts/web-plugins.ts`, `scripts/build-web.ts`, `scripts/generate-web-proxy-hosts.ts` |
 | 2 | Gloom session restore reports unexpected errors instead of swallowing them (it was already non-blocking) | `src/renderers/browser/cloud-transport.ts`, `src/renderers/browser/main.tsx` |
 | 3 | Plugin proxy policy switch and credential stripping; Access credentials stripped from `/api/*` | `src/renderers/cloudflare/http-proxy.ts`, `src/renderers/cloudflare/worker.ts` |
-| 4 | Private first-visit layout | `src/renderers/browser/private-default-config.ts`, `src/renderers/browser/config-host.ts` |
+| 4 | Private first-visit layouts | `src/renderers/browser/private-default-config.ts`, `src/renderers/browser/config-host.ts` |
 | 5 | Deployment config, CI, the manual deploy workflow and this document | `wrangler.private.jsonc`, `.github/workflows/private-web.yml`, `.github/workflows/deploy-private.yml`, `docs/private-web-deployment.md` |
 
 Tests: `src/renderers/cloudflare/http-proxy.test.ts`, `src/renderers/cloudflare/worker.test.ts`,
@@ -97,6 +97,7 @@ envelope.
 | gloom-polls | `github:gloom-sh/gloom-polls` | `90a780e` (bun.lock) | polls | api.votehub.com |
 | gloom-prediction-markets | `github:gloom-sh/gloom-prediction-markets` | `1d8036f` (bun.lock) | prediction-markets | gamma-api / clob / data-api.polymarket.com, api.elections.kalshi.com |
 | **gloom-au** | `vendor/gloom-au` (from private `caelyx/gloom-au`) | `be062e4ed44a2b2c3139de9a499dca90d5cdff6a` | au-markets | www.asx.com.au, asx.api.markitdigital.com, cdn-api.markitdigital.com, download.asic.gov.au, www.asic.gov.au, www.rba.gov.au, data.api.abs.gov.au, www.abs.gov.au, www.abc.net.au, api.tenders.gov.au, cdn.cboe.com, visualisations.aemo.com.au, takeovers.gov.au, www.tga.gov.au, scanner.tradingview.com, api.openelectricity.org.au |
+| **gloom-acgb** | `vendor/gloom-acgb` (from private `caelyx/gloom-acgb`) | `cbf5ab600715b02852d3af8a5ffd0cb461f7f03c` | acgb-curve | www.rba.gov.au, home.treasury.gov |
 | **gloom-newsmap** | `vendor/gloom-newsmap` (from private `caelyx/gloom-newsmap`) | `de8117446f185dbf3d73ed9bb51c3f410befebc5` | newsmap | news.google.com, generativelanguage.googleapis.com |
 | **gloom-hackernews** | `vendor/gloom-hackernews` (from public `caelyx/gloom-hackernews`, a fork of `gloom-sh/gloom-hackernews`) | `aeb2ceae33dfd6662676c485f9d705ff38400ef9` | hackernews | hacker-news.firebaseio.com, generativelanguage.googleapis.com |
 
@@ -133,10 +134,10 @@ module's, or declares a host that is not a bare domain.
 
 ### Vendored plugins
 
-`gloom-au` and `gloom-newsmap` live in private repositories, which Bun cannot
+`gloom-au`, `gloom-acgb` and `gloom-newsmap` live in private repositories, which Bun cannot
 install from in CI (it downloads `github:` dependencies without credentials).
-`gloom-hackernews` is public but vendored the same way, so all three of this
-fork's plugins update with one script.
+`gloom-hackernews` is public but vendored the same way, so all of this fork's
+plugins update with one script.
 Their code is copied into this repository under `vendor/` instead, with
 `git subtree --squash`, by `scripts/vendor-plugin.sh`. The plugin repositories
 stay private; only the files copied here are public.
@@ -151,7 +152,8 @@ stay private; only the files copied here are public.
   dependency makes Bun install its devDependencies too. A vendored plugin's
   runtime dependencies are devDependencies of this repository instead, pinned
   to the versions the plugin's own `bun.lock` resolves: `unpdf` (gloom-au),
-  `@mozilla/readability` and `linkedom` (gloom-newsmap, gloom-hackernews). A
+  `papaparse` (gloom-acgb), `@mozilla/readability` and `linkedom`
+  (gloom-newsmap, gloom-hackernews). A
   missing one fails the web build.
 - `bunfig.toml` keeps `vendor/**` out of `bun test`; the plugins' tests run in
   their own repositories. The typecheck projects list their files explicitly and
@@ -163,6 +165,7 @@ To update one (needs read access to the private repository, and a clean tree):
 
 ```sh
 scripts/vendor-plugin.sh gloom-au https://github.com/caelyx/gloom-au.git <commit-or-branch>
+scripts/vendor-plugin.sh gloom-acgb https://github.com/caelyx/gloom-acgb.git <commit-or-branch>
 scripts/vendor-plugin.sh gloom-newsmap https://github.com/caelyx/gloom-newsmap.git <commit-or-branch>
 scripts/vendor-plugin.sh gloom-hackernews https://github.com/caelyx/gloom-hackernews.git <commit-or-branch>
 ```
@@ -186,14 +189,23 @@ the desktop backend. Best done upstream.
 
 ## Default configuration
 
-`src/renderers/browser/private-default-config.ts` holds the first-visit layout
-(currently "Markets": Market Heatmap, News Heatmap, Fear & Greed). It is used
-only when the browser has no saved config (`gloomberb.web.config.v1` in
-`localStorage`); a saved config is always loaded as is and never rewritten. A
-research deep link (`/?ticker=…`) still opens on upstream's Research layout, with
-Markets next. Set `PRIVATE_DEFAULT_LAYOUT = null` to go back to upstream's
-first-visit workspace. Hacker News (`HN`), the Australian Markets panes (`ASXA`
-or `ASX`, `ASXM`, `RBA`, `NEM` and the rest) open from the command bar.
+`src/renderers/browser/private-default-config.ts` holds the first-visit layouts:
+Home, ASX, NMAP, Futures, Monitor, US, Macro and Temp, taken from a desktop
+config backup's `layouts` (the active one first). They replace upstream's
+first-visit layouts and are used only when the browser has no saved config
+(`gloomberb.web.config.v1` in `localStorage`); a saved config is always loaded
+as is and never rewritten, so a visitor who has already opened the site keeps
+their own layouts until they reset the app's data. A research deep link
+(`/?ticker=…`) opens upstream's Research layout first, with these after it.
+Set `PRIVATE_DEFAULT_LAYOUTS = null` to go back to upstream's first-visit
+workspace.
+
+What was left out of the backup: the `abc-news` pane (gloom-abcnews has no web
+target), the news pane's cached headlines and the portfolio cursor.
+`sovr-board` is written as `cdx-board` on its Sovereign tab, as config version
+25 folds it. Panes that read Gloom Cloud (charts, quotes, news, world indices,
+the economic calendar and the like) show their sign-in state until the visitor
+signs in; the US tab's heatmap is set to the portfolio, which starts empty.
 
 ## Build and test locally
 
