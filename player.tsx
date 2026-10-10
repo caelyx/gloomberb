@@ -241,7 +241,8 @@ export function VideoPlayer({ paneId, focused, width, height, source, openUrl, a
             // URL, so `r` needs the resolution time to reload it.
             key={`${video.mediaUrl}|${video.resolvedAt}`}
             src={video.mediaUrl}
-            title={video.title}
+            // The frame's accessible name: on the web a story resolves without one.
+            title={story?.title ?? video.title}
             poster={video.posterUrl}
             autoPlay
             muted={muted}
