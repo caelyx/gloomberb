@@ -1,0 +1,36 @@
+{
+  "name": "gloom-acgb",
+  "version": "0.1.0",
+  "description": "Australian Government bond yield curve for Gloomberb, from the Reserve Bank of Australia",
+  "type": "module",
+  "main": "index.ts",
+  "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "probe": "bun run scripts/probe-live.ts"
+  },
+  "dependencies": {
+    "papaparse": "^5.7.0"
+  },
+  "peerDependencies": {
+    "gloomberb": ">=0.15.4",
+    "react": ">=19"
+  },
+  "peerDependenciesMeta": {
+    "gloomberb": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "@types/papaparse": "^5.5.2",
+    "@types/react": "^19.3.0",
+    "gloomberb": "0.15.5",
+    "react": "^19.2.0",
+    "typescript": "^5.9.3"
+  }
+}
