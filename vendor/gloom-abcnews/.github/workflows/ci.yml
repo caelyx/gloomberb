@@ -1,0 +1,29 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # v0.15.8, the host this plugin was built against.
+      GLOOMBERB_REVISION: 3b25b94240b3cd96f5a30dcb180b05dfd7851287
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install
+      - name: Link the Gloomberb host
+        run: |
+          git init "$RUNNER_TEMP/gloomberb"
+          git -C "$RUNNER_TEMP/gloomberb" remote add origin https://github.com/gloom-sh/gloomberb.git
+          git -C "$RUNNER_TEMP/gloomberb" fetch --depth 1 origin "$GLOOMBERB_REVISION"
+          git -C "$RUNNER_TEMP/gloomberb" checkout --detach FETCH_HEAD
+          bun install --cwd "$RUNNER_TEMP/gloomberb"
+          mkdir -p node_modules
+          ln -sfn "$RUNNER_TEMP/gloomberb" node_modules/gloomberb
+          ln -sfn "$RUNNER_TEMP/gloomberb/node_modules/react" node_modules/react
+      - run: bun run typecheck
+      - run: bun test

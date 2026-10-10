@@ -3,6 +3,7 @@ import Hls from "hls.js";
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import type { MediaSurfaceHandle, MediaSurfaceProps } from "../../../ui/host";
 import { cleanDomProps, commonStyle } from "./style";
+import { readYoutubeEmbedMessage, YOUTUBE_EMBED_ORIGIN } from "./youtube-embed";
 
 function postYoutubeCommand(frame: HTMLIFrameElement | null, func: string, args: unknown[] = []): void {
   frame?.contentWindow?.postMessage(JSON.stringify({ event: "command", func, args }), "*");
@@ -122,6 +123,35 @@ export const WebMediaSurface = forwardRef<HTMLVideoElement, MediaSurfaceProps>(f
       if (timer !== null) clearTimeout(timer);
     };
   }, [youtubeEmbed]);
+
+  // Downstream: the embed answers the listening handshake (sent on load) with
+  // its real state, mute and errors. Without this the surface assumes autoplay
+  // worked, so a story the browser would not start with sound read "playing",
+  // and `p` and `m` drifted from the player after a click on its own controls.
+  useEffect(() => {
+    if (!youtubeEmbed) return;
+    const handleMessage = (event: MessageEvent) => {
+      const frame = iframeRef.current;
+      if (!frame || event.source !== frame.contentWindow || !YOUTUBE_EMBED_ORIGIN.test(event.origin)) return;
+      const report = readYoutubeEmbedMessage(event.data);
+      if (!report) return;
+      if (report.state) {
+        youtubePlayingRef.current = report.state !== "paused";
+        onPlaybackStateChange?.(report.state);
+      }
+      if (report.muted !== undefined && report.muted !== youtubeMutedRef.current) {
+        youtubeMutedRef.current = report.muted;
+        onMutedChange?.(report.muted);
+      }
+      if (report.error) {
+        setFailed(true);
+        onPlaybackStateChange?.("error");
+        onError?.(report.error);
+      }
+    };
+    window.addEventListener("message", handleMessage);
+    return () => window.removeEventListener("message", handleMessage);
+  }, [onError, onMutedChange, onPlaybackStateChange, youtubeEmbed]);
 
   useEffect(() => {
     youtubeMutedRef.current = muted;

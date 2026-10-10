@@ -1,0 +1,38 @@
+{
+  "id": "abc-news",
+  "name": "ABC News",
+  "tagline": "ABC News Australia live, and its latest stories",
+  "description": "The ABC NEWS Australia live channel and its latest video stories, played in the pane or opened in the browser.",
+  "categories": [
+    "news",
+    "media"
+  ],
+  "targets": [
+    "cli",
+    "tui",
+    "desktop",
+    "web"
+  ],
+  "hosts": [
+    "youtube.com",
+    "www.youtube.com",
+    "googlevideo.com",
+    "ytimg.com"
+  ],
+  "contributes": {
+    "panes": [
+      "abc-news"
+    ],
+    "capabilities": [
+      "abcnews.video"
+    ],
+    "shortcuts": [
+      {
+        "code": "TVABC",
+        "name": "ABC News",
+        "description": "ABC NEWS Australia live, and its latest stories."
+      }
+    ]
+  },
+  "minGloom": "0.15.8"
+}

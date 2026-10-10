@@ -19,6 +19,7 @@ export const WEB_BUNDLED_PLUGIN_PACKAGES = [
   // scripts/vendor-plugin.sh rather than installed.
   "gloom-au",
   "gloom-acgb",
+  "gloom-abcnews",
   "gloom-newsmap",
   "gloom-hackernews",
 ] as const;

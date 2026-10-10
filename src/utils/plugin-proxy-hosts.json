@@ -16,6 +16,7 @@
     "efts.sec.gov",
     "gamma-api.polymarket.com",
     "generativelanguage.googleapis.com",
+    "googlevideo.com",
     "hacker-news.firebaseio.com",
     "home.treasury.gov",
     "nasdaqtrader.com",
@@ -29,6 +30,9 @@
     "www.asic.gov.au",
     "www.asx.com.au",
     "www.rba.gov.au",
-    "www.tga.gov.au"
+    "www.tga.gov.au",
+    "www.youtube.com",
+    "youtube.com",
+    "ytimg.com"
   ]
 }

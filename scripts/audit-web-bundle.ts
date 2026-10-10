@@ -74,11 +74,18 @@ for (const path of outputFiles) {
  */
 const appBundle = await readFile(join(root, "assets", "app", "main.js"), "utf8");
 for (const packageName of WEB_BUNDLED_PLUGIN_PACKAGES) {
-  const module = `assets/plugins/${packageName}/index.js`;
-  if (!outputFiles.includes(join(root, ...module.split("/")))) {
-    failures.push(`${module}: missing bundled plugin module`);
-  } else if (!appBundle.includes(`/${module}`)) {
-    failures.push(`${module}: built but not referenced by the app bundle`);
+  // Downstream: the build keeps the entry name each plugin chose (see
+  // compileWebBundledPlugins), so a plugin with a separate browser entry
+  // emits index.browser.js, not index.js. Look for the one module the
+  // package's directory holds instead of assuming its name.
+  const dir = join(root, "assets", "plugins", packageName);
+  const modules = outputFiles
+    .filter((file) => dirname(file) === dir && file.endsWith(".js") && !file.endsWith(".chunk.js"))
+    .map((file) => relative(root, file).replaceAll("\\", "/"));
+  if (modules.length !== 1) {
+    failures.push(`assets/plugins/${packageName}: ${modules.length === 0 ? "missing bundled plugin module" : `expected one plugin module, found ${modules.join(", ")}`}`);
+  } else if (!appBundle.includes(`/${modules[0]}`)) {
+    failures.push(`${modules[0]}: built but not referenced by the app bundle`);
   }
 }
 
