@@ -245,6 +245,12 @@ export interface CompositeChartProps {
   /** Tick gutter budget. Cursor values can widen it; zero hides both axes. */
   axisWidth?: number;
   showLegend?: boolean;
+  /**
+   * Tell lines apart by dash pattern as well as colour (default). Off for a
+   * chart whose lines are pieces of one shape, such as a trail drawn edge by
+   * edge, where a pattern per piece would read as meaning something.
+   */
+  lineCues?: boolean;
   /** Show the regular-session percentage beside latest eligible legend values. */
   showLatestChangePercent?: boolean;
   legendAccessory?: ReactNode;
