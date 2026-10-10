@@ -3,6 +3,7 @@ import { deriveHeadlessFreshness, formatFreshnessLine } from "../../../cli/pane-
 import { createTestHeadlessArgs, createTestHeadlessContext } from "../../../test-support/headless";
 import type { HeadlessBundleResult, HeadlessPaneApiClient } from "../../../types/headless";
 import type { IvMethod, IvScreenPayload, IvScreenRow } from "./client";
+import { VCA_DEFINITIONS } from "./format";
 import { ivScreenHeadless } from "./headless";
 
 const reading = (date: string, method: IvMethod, iv30: number) => ({
@@ -40,7 +41,7 @@ describe("VCA dates", () => {
     expect(title).not.toContain("live");
     expect(keys).not.toContain("date");
     expect(keys).not.toContain("rankDate");
-    expect(footer).toBe("Source: Gloom Cloud | As of 2026-10-09 | Not a live feed (daily implied volatility)");
+    expect(footer).toBe("Source: Gloom Cloud · Fri 9 Oct 2026 · not a live feed (daily implied volatility)");
   });
 
   test("a trade-close reading on its rank date says so once", async () => {
@@ -59,7 +60,7 @@ describe("VCA dates", () => {
     expect(keys).toContain("rankDate");
     expect([0, 1, 2].map((index) => cell("date", index))).toEqual(["2026-10-09 quote", "2026-10-09 close", "2026-10-08 quote"]);
     expect([0, 1, 2].map((index) => cell("rankDate", index))).toEqual(["2026-10-09 close", "2026-10-09 close", "2026-10-08 close"]);
-    expect(footer).toContain("As of 2026-10-09 |");
+    expect(footer).toContain(" · Fri 9 Oct 2026 · ");
   });
 
   test("a quote ahead of its rank says which close the rank is on", async () => {
@@ -85,8 +86,12 @@ describe("VCA dates", () => {
   test("skew from an older capture than the reading is dated", async () => {
     const stale = { ...row("NVDA", reading("2026-10-09", "trade-close", 0.293), "2026-10-09"),
       skew: { date: "2026-10-08", put25: 0.3, call25: 0.28, skew: 0.02 } };
-    const { keys, cell } = await load([stale]);
+    const { keys, cell, result } = await load([stale]);
     expect(keys).toContain("skewDate");
     expect(cell("skewDate", 0)).toBe("2026-10-08");
+    // Puts at 30% against calls at 28% read +2.0, and the report says which side is subtracted and in what unit.
+    expect(cell("skew", 0)).toBe("+2.0");
+    expect(result.notes).toEqual([...VCA_DEFINITIONS]);
+    expect(result.notes?.[0]).toContain("25-delta put IV minus 25-delta call IV, in vol points; positive means puts are richer");
   });
 });

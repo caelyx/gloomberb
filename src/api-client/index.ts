@@ -741,6 +741,7 @@ class GloomApiClient {
   getCloudHistory = this.data.getCloudHistory.bind(this.data);
   getCloudExchangeRate = this.data.getCloudExchangeRate.bind(this.data);
   getCloudEconomicCalendar = this.data.getCloudEconomicCalendar.bind(this.data);
+  getCloudMacroReleaseDays = this.data.getCloudMacroReleaseDays.bind(this.data);
   getCloudEquityDiagnostic = this.data.getCloudEquityDiagnostic.bind(this.data);
   getCloudEarningsCalendar = this.data.getCloudEarningsCalendar.bind(this.data);
   getCloudEarningsHistory = this.data.getCloudEarningsHistory.bind(this.data);
@@ -774,6 +775,7 @@ class GloomApiClient {
   getCloudSocialMentionPosts = this.data.getCloudSocialMentionPosts.bind(this.data);
   getCloudFuturesCurve = this.data.getCloudFuturesCurve.bind(this.data);
   getCloudFuturesCurveAsOf = this.data.getCloudFuturesCurveAsOf.bind(this.data);
+  getCloudFuturesContract = this.data.getCloudFuturesContract.bind(this.data);
   getCloudRatePath = this.data.getCloudRatePath.bind(this.data);
   getCloudShiller = this.data.getCloudShiller.bind(this.data);
   getCloudCotBoard = this.data.getCloudCotBoard.bind(this.data);

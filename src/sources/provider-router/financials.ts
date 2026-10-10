@@ -4,9 +4,9 @@ import { hasLikelyQuoteUnitMismatch } from "../../utils/currency-units";
 import { coalesceFinancialPeriodAliases, mergeFinancialStatementRows } from "../../utils/financial-statements";
 import { normalizePriceHistory, normalizeTickerFinancialsPriceHistory } from "../../utils/price-history";
 import { redactUnavailableFundamentals, RETRACTABLE_VALUATION_FIELDS } from "../../utils/fundamentals";
-import { isExtendedHoursExchange, isQuoteStaleForCurrentSession } from "../../market-data/quotes/freshness";
+import { hasValidQuoteObservationTime, isExtendedHoursExchange, isQuoteStaleForCurrentSession } from "../../market-data/quotes/freshness";
 import { mergeQuoteMetadata, quoteMetadataFromQuote, quoteMetadataMatchesTarget } from "../../market-data/quotes/metadata";
-import { parsePublicTickerKey } from "../../utils/exchanges";
+import { canonicalExchange, parsePublicTickerKey } from "../../utils/exchanges";
 import {
   activeUsMarketSession,
   delayedFeedLagMs,
@@ -147,7 +147,8 @@ const OPENING_AUCTION_MS = 15 * 60_000;
  * - the quote is delayed. The service bounds a delayed quote's feed age itself
  *   but not a real-time one's, so real-time quotes keep the age bound;
  * - it reports the regular session, the venue's session is in progress as
- *   the delayed feed shows it, and the trade belongs to that session; or
+ *   the delayed feed shows it, and the trade belongs to that session; a
+ *   currency pair's session is the service's to judge; or
  * - it reports a US extended-hours session and the trade is no older than
  *   the regular session that session extends: after the close, today's
  *   regular session or its after-hours; before the open, the previous
@@ -163,6 +164,10 @@ function isVouchedCurrentByService(quote: Quote, exchange: string | undefined, n
     return isUsExtendedHoursSessionPrint(quote.lastUpdated, exchange, quote.marketState, now);
   }
   if (quote.marketState !== "REGULAR") return false;
+  // A currency pair trades around the clock through the week, and the service
+  // measures its silence against how often that pair prints: a pegged or
+  // exotic pair such as SAR=X goes hours without a print while its feed is fine.
+  if (canonicalExchange(exchange) === "CCY") return true;
   const feedTime = now - delayedFeedLagMs(exchange);
   if (isRegularSessionTime(exchange, feedTime) !== true) return false;
   const open = latestRegularSessionOpen(exchange, feedTime);
@@ -224,19 +229,38 @@ export function isProviderQuoteUsableForCurrentSession(
   const normalized = quoteWithFreshnessExchange(quote, exchange);
   if (isQuoteStaleForCurrentSession(normalized)) return false;
   if (isActiveProviderQuoteTooOld(normalized, Date.now(), options.recentAnswer === true)) return false;
+  return hasQuotedPrice(normalized);
+}
+
+function hasQuotedPrice(quote: Quote): boolean {
   // Futures may trade or settle at zero or negative prices. Require explicit
   // source type metadata; an alias alone cannot establish the price domain.
-  const futures = ["FUT", "FUTURE", "FUTURES"].includes(normalized.instrumentType?.trim().toUpperCase() ?? "");
+  const futures = ["FUT", "FUTURE", "FUTURES"].includes(quote.instrumentType?.trim().toUpperCase() ?? "");
   return [
-    normalized.price,
-    normalized.preMarketPrice,
-    normalized.postMarketPrice,
-    normalized.bid,
-    normalized.ask,
-    normalized.mark,
+    quote.price,
+    quote.preMarketPrice,
+    quote.postMarketPrice,
+    quote.bid,
+    quote.ask,
+    quote.mark,
   ].some((value) => futures
     ? typeof value === "number" && Number.isFinite(value)
     : finitePositiveNumber(value));
+}
+
+/**
+ * A source's answer for the target that is priced and dated but not current
+ * for its session, flagged stale: the last price there is, for when no source
+ * has a current one. It keeps its own observation time, which dates it
+ * wherever it is shown, and the flag keeps it out of anything that needs a
+ * current price. Null for an answer that names another listing, carries no
+ * price or no valid time.
+ */
+export function lastKnownProviderQuote(quote: Quote | null | undefined, exchange?: string, symbol?: string): Quote | null {
+  if (!providerQuoteMatchesTarget(quote, symbol, exchange)) return null;
+  const normalized = quoteWithFreshnessExchange(quote, exchange);
+  if (!hasValidQuoteObservationTime(normalized) || !hasQuotedPrice(normalized)) return null;
+  return { ...quote, stale: true };
 }
 
 export function providerFinancialsMatchTarget(value: TickerFinancials, symbol: string, exchange?: string): boolean {

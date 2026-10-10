@@ -164,6 +164,21 @@ describe("GloomberbCloudProvider", () => {
     expect(failure.message).toBe("UPSTREAM");
   });
 
+  test("only the NOT_FOUND reason code marks a miss as a symbol no listing carries", async () => {
+    const provider = new GloomberbCloudProvider();
+    const answer = (reasonCode: string, status: "empty" | "unsupported" = "empty") => ({ status, data: null, reasonCode });
+    for (const [reasonCode, notFound] of [["NOT_FOUND", true], ["NO_DATA", false], ["UNSUPPORTED_RANGE", false]] as const) {
+      const empty = answer(reasonCode);
+      apiClient.getCloudQuote = async () => empty;
+      apiClient.getCloudQuotesBatch = async () => ({ status: "partial", data: { items: [{ symbol: "APPLE", exchange: "", ...empty }] } });
+      const misses = [
+        await provider.getQuote("APPLE").catch((error) => error),
+        (await provider.getQuotesBatch([{ symbol: "APPLE" }]))[0]!.error,
+      ];
+      for (const miss of misses) expect([reasonCode, (miss as ProviderMissError).notFound]).toEqual([reasonCode, notFound]);
+    }
+  });
+
   test("uses host venue aliases at the cloud boundary without losing suffix or non-equity identity", async () => {
     const requests: Array<[string, string | undefined]> = [];
     apiClient.getCloudQuote = async (symbol, exchange) => {
@@ -299,7 +314,7 @@ describe("GloomberbCloudProvider", () => {
     expect([batchCalls, streamCalls, authCalls]).toEqual([2, 1, 1]);
   });
 
-  test("stale items in a successful quote batch cannot bypass single-quote freshness checks", async () => {
+  test("stale items in a successful quote batch and a stale single quote cannot pass as current", async () => {
     const targets = [{ symbol: "VOD", exchange: "NASDAQ" }, { symbol: "VOD:XLON", exchange: "LSE" }];
     const quote = { symbol: "VOD", price: 118, currency: "GBp", change: 1, changePercent: 0.85, lastUpdated: 1, stale: false };
     for (const status of ["success", "partial"] as const) {
@@ -315,7 +330,8 @@ describe("GloomberbCloudProvider", () => {
       expect(results[0]?.error?.message).toContain("stale");
       expect(results[1]?.target).toBe(targets[0]!);
       expect(results[1]?.quote).toMatchObject({ symbol: "VOD", currency: "USD", price: 15 });
-      await expect(provider.getQuote("VOD:XLON", "LSE")).rejects.toThrow("stale");
+      // A single stale answer comes back as the last price the service has, flagged stale.
+      expect(await provider.getQuote("VOD:XLON", "LSE")).toMatchObject({ price: 1.18, stale: true });
     }
   });
 
