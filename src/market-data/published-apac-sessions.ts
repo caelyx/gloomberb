@@ -18,6 +18,8 @@
 // MSX closes on the holidays its site lists (msx.om exchange holidays, read 10 Oct 2026).
 //   Its week is Sunday to Thursday.
 // ASX: https://www.asx.com.au/markets/market-resources/trading-hours-calendar/cash-market-trading-hours/trading-calendar
+//   (2026 and 2027; 2024 and 2025 are the weekdays missing from ASX daily bars, checked 2026-10-08).
+//   ASX stays open on substitute public holidays it does not list, such as Monday 26 April 2027.
 // EGX closes on Egypt's public holidays, often moved to the Thursday of their
 // week (Armed Forces Day, Tuesday 6 Oct 2026, to Thursday 8 Oct, by the
 // exchange's statement of 5 Oct). Its week is Sunday to Thursday.
@@ -79,6 +81,8 @@ export const PUBLISHED_APAC_CLOSURES: Readonly<Record<string, Record<number, rea
     2026: ["01-15", "01-18", "03-19", "03-22", "03-23", "05-26", "05-27", "05-28", "06-18", "08-27", "11-25", "11-26"],
   },
   ASX: {
+    2024: ["01-01", "01-26", "03-29", "04-01", "04-25", "06-10", "12-25", "12-26"],
+    2025: ["01-01", "01-27", "04-18", "04-21", "04-25", "06-09", "12-25", "12-26"],
     2026: ["01-01", "01-26", "04-03", "04-06", "06-08", "12-25", "12-28"],
     2027: ["01-01", "01-26", "03-26", "03-29", "06-14", "12-27", "12-28"],
   },
@@ -108,7 +112,8 @@ const ASX_EARLY_CLOSE = 14 * 60 + 15;
  *   the MOM holidays above).
  * - ASX closes at 14:10 with its closing auction on the last business day
  *   before Christmas and the last of the year (ASX Notice 1245.26, Oct 2026,
- *   and the trading calendar above).
+ *   and the trading calendar above); 2024 and 2025 by the same rule, so price
+ *   history before 2026 does not read those afternoons as missing sessions.
  */
 const PUBLISHED_APAC_EARLY_CLOSES: Readonly<Record<string, Record<number, Readonly<Record<string, number>>>>> = {
   HKEX: {
@@ -120,6 +125,8 @@ const PUBLISHED_APAC_EARLY_CLOSES: Readonly<Record<string, Record<number, Readon
     2027: { "02-05": SGX_HALF_DAY_CLOSE, "12-24": SGX_HALF_DAY_CLOSE, "12-31": SGX_HALF_DAY_CLOSE },
   },
   ASX: {
+    2024: { "12-24": ASX_EARLY_CLOSE, "12-31": ASX_EARLY_CLOSE },
+    2025: { "12-24": ASX_EARLY_CLOSE, "12-31": ASX_EARLY_CLOSE },
     2026: { "12-24": ASX_EARLY_CLOSE, "12-31": ASX_EARLY_CLOSE },
     2027: { "12-24": ASX_EARLY_CLOSE, "12-31": ASX_EARLY_CLOSE },
   },
