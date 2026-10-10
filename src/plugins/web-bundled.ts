@@ -18,6 +18,7 @@ export const WEB_BUNDLED_PLUGIN_PACKAGES = [
   // Private deployment additions (downstream), vendored under vendor/ by
   // scripts/vendor-plugin.sh rather than installed.
   "gloom-au",
+  "gloom-acgb",
   "gloom-newsmap",
   "gloom-hackernews",
 ] as const;

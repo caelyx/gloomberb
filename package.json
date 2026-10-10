@@ -107,6 +107,7 @@
     "gloom-prediction-markets": "github:gloom-sh/gloom-prediction-markets",
     "happy-dom": "^20.11.1",
     "linkedom": "0.18.13",
+    "papaparse": "5.7.0",
     "png-to-ico": "^2.1.8",
     "rcedit": "^4.0.1",
     "typescript": "^5.9.2",
