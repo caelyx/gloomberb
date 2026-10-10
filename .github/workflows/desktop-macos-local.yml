@@ -1,0 +1,55 @@
+name: Build macOS desktop (unsigned)
+
+# Downstream: builds Gloomberb.app for Apple Silicon from the selected branch,
+# for installing this fork's changes in place of the upstream release.
+# Manual only (Actions > Build macOS desktop (unsigned) > Run workflow).
+#
+# The app is ad-hoc signed, not signed with a Developer ID or notarised, and
+# has no update feed (GLOOMBERB_DESKTOP_LOCAL in electrobun.config.ts), so it
+# never offers upstream's releases. After downloading, clear the quarantine
+# flag before first launch:
+#   xattr -dr com.apple.quarantine /Applications/Gloomberb.app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Build desktop app
+        env:
+          GLOOMBERB_DESKTOP_LOCAL: "1"
+        run: bun run desktop:release
+
+      - name: Package Gloomberb.app
+        run: |
+          set -euo pipefail
+          brew install zstd
+          out="$RUNNER_TEMP/app"
+          mkdir -p "$out"
+          zstd -d -o "$out/Gloomberb.app.tar" artifacts/stable-macos-arm64-Gloomberb.app.tar.zst
+          tar -xf "$out/Gloomberb.app.tar" -C "$out"
+          app="$out/Gloomberb.app"
+          test -x "$app/Contents/Resources/gloomberb"
+          test -f "$app/Contents/Resources/gloomberb-tui/tui-entry.js"
+          test -f "$app/Contents/Resources/gloomberb-tui/node_modules/@opentui/core-darwin-arm64/libopentui.dylib"
+          # Apple Silicon refuses to run unsigned code; an ad-hoc signature is enough.
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          "$app/Contents/Resources/gloomberb" help
+          version="$(node -p 'require("./package.json").version')"
+          ditto -c -k --keepParent "$app" "$out/Gloomberb-$version-${GITHUB_SHA::7}-macos-arm64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gloomberb-desktop-macos-arm64-unsigned
+          path: ${{ runner.temp }}/app/*.zip
+          retention-days: 30
