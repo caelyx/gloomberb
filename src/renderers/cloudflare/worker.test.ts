@@ -259,4 +259,16 @@ describe("content security policy", () => {
 
     expect(connectSrc).toContain(REGISTRY_ORIGIN);
   });
+
+  // Downstream: gloom-abcnews plays in YouTube's embed. Without frame-src the
+  // frame falls back to default-src 'self' and is blocked; anything wider
+  // would let any page be framed.
+  test("frames YouTube's embedded player and nothing else", () => {
+    const frameSrc = SECURITY_HEADERS["content-security-policy"]
+      .split(";")
+      .map((directive) => directive.trim())
+      .filter((directive) => directive.startsWith("frame-src"));
+
+    expect(frameSrc).toEqual(["frame-src https://www.youtube.com"]);
+  });
 });
