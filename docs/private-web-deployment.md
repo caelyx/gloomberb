@@ -50,8 +50,11 @@ anonymous state without closing the workspace.
 | 4 | Private first-visit layouts | `src/renderers/browser/private-default-config.ts`, `src/renderers/browser/config-host.ts` |
 | 5 | Deployment config, CI, the manual deploy workflow and this document | `wrangler.private.jsonc`, `.github/workflows/private-web.yml`, `.github/workflows/deploy-private.yml`, `docs/private-web-deployment.md` |
 | 6 | The CSP admits YouTube's embedded player as a frame (`frame-src https://www.youtube.com`), for ABC News | `src/renderers/cloudflare/worker.ts` |
+| 7 | YouTube embeds report their real state: the media surface reads the player's own messages (playing, paused, buffering, muted, errors) instead of assuming autoplay worked | `src/renderers/dom/host/media-surface.tsx`, `src/renderers/dom/host/youtube-embed.ts` |
+| 8 | The bundle audit finds each plugin's emitted module whatever its entry is named (a plugin with a browser entry emits `index.browser.js`, not `index.js`) | `scripts/audit-web-bundle.ts` |
 
 Tests: `src/renderers/cloudflare/http-proxy.test.ts`, `src/renderers/cloudflare/worker.test.ts`,
+`src/renderers/dom/host/media-surface.test.tsx`, `src/renderers/dom/host/youtube-embed.test.ts`,
 `src/renderers/browser/cloud-transport.test.ts`, `src/renderers/browser/config-host.test.ts`,
 `scripts/web-plugins.test.ts`.
 
@@ -118,9 +121,16 @@ plugin declares all four of its hosts for the desktop and terminal, which do
 reach googlevideo.com and ytimg.com, and the allowlist takes them all. That is
 a deliberate choice: the extra hosts are reachable only past Cloudflare Access,
 and narrowing them would mean a per-plugin override here or an understated
-declaration in the plugin. Embedded playback was checked only in headless
-Chromium (the player loads, live resolves to the current stream); confirm
-sound and picture in a real browser after deploying.
+declaration in the plugin.
+
+The pane's status and its `p` and `m` keys follow what the embedded player
+reports (change 7), so a story reopened after a reload, which a browser usually
+will not start with sound until you press `p`, reads as paused rather than
+playing. An upload whose owner does not allow embedding fails in the pane
+with that reason; `o` opens it on YouTube. Embedded playback was checked only
+in headless Chromium (the player loads, live resolves to the current stream,
+and the player's messages are the ones change 7 reads); confirm sound and
+picture in a real browser after deploying.
 
 Newsmap and Hacker News read linked articles in place. On the web those
 requests go through `/http-proxy`, which only reaches the hosts above, so an
@@ -363,6 +373,9 @@ Files most likely to conflict on a merge from upstream, in order of risk:
    `hosts` field on compiled plugins and the `vendor/` lookup.
 7. `src/plugins/web-bundled.ts` - the downstream list entries.
 8. `knip.jsonc` - the downstream `ignoreDependencies` entries.
+9. `src/renderers/dom/host/media-surface.tsx` - the embed `message` listener
+   (`youtube-embed.ts` beside it is downstream-only).
+10. `scripts/audit-web-bundle.ts` - the plugin module lookup.
 
 `vendor/`, `scripts/vendor-plugin.sh` and `bunfig.toml` are downstream-only and
 do not conflict.
