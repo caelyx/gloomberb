@@ -2,13 +2,15 @@ import type { PricePoint } from "../../../types/financials";
 import { canonicalExchange, resolveExchangeTimeZone } from "../../../utils/exchanges";
 import { getPricePointTimestamp } from "../../../utils/price-history";
 import type { DatedReturn } from "./metrics";
-import { getPublishedUsEquityCalendarDay, getPublishedUsEquityCalendarYears, getPublishedUsEquitySession, PUBLISHED_US_EQUITY_SESSION_BASIS } from "../../../market-data/published-us-sessions";
+import { getPublishedCalendarDay, getPublishedCalendarYears } from "../../../market-data/published-sessions";
+import { getPublishedUsEquityCalendarYears, getPublishedUsEquitySession, PUBLISHED_US_EQUITY_SESSION_BASIS } from "../../../market-data/published-us-sessions";
 
 const DAY_MS = 86_400_000;
 const sessionClocks = new Map<string, Intl.DateTimeFormat>();
 const SHARPE_SESSION_BASIS = {
   ...PUBLISHED_US_EQUITY_SESSION_BASIS,
   timestampConvention: "Each source uses midnight-UTC date labels, a consistent declared-venue wall-clock time on the labelled date, or verified regular/early session-close timestamps.",
+  otherVenues: "Venues outside the US qualify sessions against their own published full-day closures; with no verified close-time schedule, their sources must use date labels or a consistent local clock.",
 } as const;
 
 export interface ReturnTimestampResult {
@@ -31,7 +33,7 @@ function dateTimestamp(value: string): number | null {
 }
 
 function isSession(time: number, exchange: string): boolean {
-  return getPublishedUsEquityCalendarDay(exchange, new Date(time).toISOString().slice(0, 10)) === "session";
+  return getPublishedCalendarDay(exchange, new Date(time).toISOString().slice(0, 10)) === "session";
 }
 
 /** Last verified session in a Monday-Friday week, or null outside published coverage. */
@@ -39,7 +41,7 @@ export function publishedWeekClose(friday: string, venue: string): string | null
   const time = dateTimestamp(friday);
   if (time == null || new Date(time).getUTCDay() !== 5) return null;
   const exchange = canonicalExchange(venue);
-  const years = getPublishedUsEquityCalendarYears(exchange) ?? [];
+  const years = getPublishedCalendarYears(exchange) ?? [];
   for (let offset = 0; offset < 5; offset++) {
     const candidate = time - offset * DAY_MS;
     if (!years.includes(new Date(candidate).getUTCFullYear())) return null;
@@ -115,7 +117,7 @@ export function qualifySharpeCadence(
   for (const holding of holdings) {
     // The declared listing venue supplies calendar identity; routing SMART does not.
     const exchange = canonicalExchange(holding.exchange);
-    const years = getPublishedUsEquityCalendarYears(exchange);
+    const years = getPublishedCalendarYears(exchange);
     const identity = { symbol: holding.symbol, exchange };
     if (!years) return failure("Daily calendar unavailable", { ...identity, kind: "unsupported-venue" });
     for (const point of returns) {
