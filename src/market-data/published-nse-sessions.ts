@@ -33,3 +33,8 @@ const NSE_SPECIAL_SESSIONS: Record<string, { open: number; close: number }> = {
 export function publishedNseSpecialSession(date: string): { open: number; close: number } | undefined {
   return NSE_SPECIAL_SESSIONS[date];
 }
+
+/** The years whose closures are published. */
+export function publishedYearsNse(): readonly number[] {
+  return Object.keys(NSE_CLOSURES).map(Number);
+}
