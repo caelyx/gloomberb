@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { PricePoint } from "../../../types/financials";
 import { resolveDatedReturns } from "./metrics";
-import { qualifySharpeCadence, qualifyReturnTimestamps } from "./sharpe-cadence";
+import { publishedWeekClose, qualifySharpeCadence, qualifyReturnTimestamps } from "./sharpe-cadence";
 import { buildBenchmarkReturnSeries, buildPortfolioBetaResult, buildPortfolioChartTargets, buildPortfolioReturnSeries, PORTFOLIO_BENCHMARK } from "./pane-model";
 import { buildChartKey } from "../../../market-data/selectors";
 import type { TickerRecord } from "../../../types/ticker";
@@ -36,6 +36,18 @@ test("unknown venue and year cannot borrow a supported calendar", () => {
   expect(qualify(["2024-12-30", "2024-12-31"]).issue?.kind).toBe("unsupported-year");
   expect(qualify(["2029-06-01", "2029-06-04"], "NASDAQ").issue?.kind).toBe("unsupported-year");
   expect(qualify(["2027-06-01", "2027-06-02"], "NASDAQ").supported).toBe(true);
+});
+
+test("venues with published closures qualify their sessions across their own holidays", () => {
+  // ASX Easter 2026: Good Friday 3 April and Easter Monday 6 April are closed.
+  expect(qualify(["2026-04-01", "2026-04-02", "2026-04-07"], "ASX").supported).toBe(true);
+  expect(qualify(["2026-04-02", "2026-04-03"], "XASX").issue?.kind).toBe("closed-session");
+  expect(qualify(["2026-03-31", "2026-04-02"], "ASX").issue?.kind).toBe("missing-session");
+  expect(qualify(["2023-06-01", "2023-06-02"], "ASX").issue?.kind).toBe("unsupported-year");
+  expect(qualify(["2026-06-01", "2026-06-02"], "JPX").supported).toBe(true);
+  // A Good Friday week closes on Thursday on the venue's own calendar.
+  expect(publishedWeekClose("2026-04-03", "ASX")).toBe("2026-04-02");
+  expect(publishedWeekClose("2023-04-07", "ASX")).toBeNull();
 });
 
 test("Carter closure is included and Saturday New Year's Day does not invent a Friday closure", () => {
