@@ -22,11 +22,15 @@ import {
   type CliStatEntry,
 } from "../../utils/cli-output";
 import {
+  EXTENDED_SESSION_LABELS,
   exchangeShortName,
   getExtendedSessionDisplay,
+  getQuoteSessionFields,
   getRegularSessionDisplay,
   marketStateLabel,
 } from "../../market-data/market/status";
+import { apiClient } from "../../api-client";
+import type { FuturesContractTermsPayload } from "../../api-client/futures-curve";
 import type { AppConfig } from "../../types/config";
 import type { FinancialStatement, TickerFinancials } from "../../types/financials";
 import { computeTickerPriceReturns } from "../../market-data/ticker-price-returns";
@@ -52,6 +56,7 @@ import { NotesFiles } from "../../plugins/builtin/notes/files";
 import { isKnownNonUsListing } from "../../utils/sec";
 import { canonicalExchange, exchangeLabel, isKnownExchangeCode } from "../../utils/exchanges";
 import { failIfNotTraded, ListingArgError, listingIdentity, resolveCliListing, type CliListing } from "../listing-arg";
+import { isNotATickerMessage } from "../not-a-ticker";
 import { sharesOutstandingInReceipts } from "../../utils/depositary-receipt";
 import { cliFreshnessFooter } from "../result";
 import { providerMissReason } from "../../sources/provider-errors";
@@ -71,6 +76,39 @@ interface TickerCommandDependencies {
   initMarketData?: () => Promise<MarketContext>;
   fail?: (message: string, details?: string) => never;
   printResult?: CliCommandContext["printResult"];
+  /** A futures symbol's contract terms and settlement; a failure leaves them out of the report. */
+  futuresContract?: (symbol: string) => Promise<FuturesContractTermsPayload | null>;
+}
+
+/** Whether a quote is a futures contract, an alias (GC=F) or a generic, whose contract terms the report reads. */
+function isFuturesQuote(symbol: string, quote: TickerFinancials["quote"]): boolean {
+  return quote?.instrumentType?.trim().toUpperCase() === "FUTURE" || /=F$/i.test(symbol.trim());
+}
+
+/** A tick at its own precision and what it makes on one contract: "0.10 = $10.00", "0.015625 = $15.625". */
+function futuresTickText(spec: NonNullable<FuturesContractTermsPayload["spec"]>): string {
+  const decimals = (value: number) => value.toFixed(10).replace(/0+$/, "").split(".")[1]?.length ?? 0;
+  return `${spec.tick.toFixed(Math.max(2, decimals(spec.tick)))} = $${spec.tickValue.toLocaleString("en-US",
+    { minimumFractionDigits: 2, maximumFractionDigits: Math.max(2, decimals(spec.tickValue)) })}`;
+}
+
+/** What one futures contract is: the terms a hedge is sized on, and the dates a long faces delivery. */
+function futuresContractMetrics(terms: FuturesContractTermsPayload, symbol: string): Array<[string, string]> {
+  const spec = terms.spec;
+  const notice = terms.firstNotice
+    ? terms.inDelivery ? cliStyles.warning(`${terms.firstNotice} (passed)`) : terms.firstNotice
+    : "—";
+  return [
+    // An alias or a generic names the month it prices; a listed contract already is one.
+    ["Contract", terms.contract && terms.contract !== symbol.trim().toUpperCase().replace(/\.[A-Z]+$/, "") ? terms.contract : "—"],
+    ["Unit", spec?.unit ?? "—"],
+    ["Size", spec?.size ?? "—"],
+    ["Tick", spec ? futuresTickText(spec) : "—"],
+    ["Point Value", spec ? `$${spec.pointValue.toLocaleString("en-US")}` : "—"],
+    ["Settlement", spec ? spec.settlement === "cash" ? "Cash settled" : "Physical delivery" : "—"],
+    ["First Notice", notice],
+    ["Last Trade", terms.lastTrade ?? "—"],
+  ];
 }
 
 function appendMetricSection(lines: string[], title: string, metrics: Array<[string, string]>) {
@@ -443,10 +481,13 @@ export async function buildTickerReport({
   quoteNote,
   recentNews = [],
   recentSecFilings = [],
+  futuresContract = null,
 }: {
   symbol: string;
   /** The exchange the command named, as a canonical code. */
   listingExchange?: string;
+  /** A futures symbol's contract terms and latest confirmed settlement. */
+  futuresContract?: FuturesContractTermsPayload | null;
   tickerFile: TickerRecord | null;
   financials: TickerFinancials;
   config: AppConfig;
@@ -534,8 +575,11 @@ export async function buildTickerReport({
         extended.change,
       )
       : "—";
+    // A futures price is its latest trade; the exchange settlement is its own row, dated by its session.
+    const settlement = futuresContract?.settlement;
     appendMetricSection(lines, "Quote", [
       ["Last", colorBySign(formatMarketPriceWithCurrency(session.price, quote.currency, quoteOptions), session.change)],
+      ...settlement ? [["Settle", `${formatMarketPriceWithCurrency(settlement.price, quote.currency, quoteOptions)} (${settlement.date})`] as [string, string]] : [],
       ["Change", colorBySign(`${formatMarketChangeWithCurrency(session.change, quote.currency, quoteOptions, session.price)} (${formatPercentRaw(session.changePercent)})`, session.change)],
       ["Open", quote.open != null ? formatMarketPriceWithCurrency(quote.open, quote.currency, quoteOptions) : "—"],
       ["Day Range", quote.low != null || quote.high != null
@@ -549,9 +593,11 @@ export async function buildTickerReport({
       ["Updated", formatTimestamp(quote.lastUpdated)],
     ]);
 
+    if (futuresContract) appendMetricSection(lines, "Contract", futuresContractMetrics(futuresContract, quote.symbol ?? symbol));
+
     appendMetricSection(lines, "Extended Hours", [
-      ["Pre-Market", extendedRow("PRE")],
-      ["After Hours", extendedRow("POST")],
+      [EXTENDED_SESSION_LABELS.PRE, extendedRow("PRE")],
+      [EXTENDED_SESSION_LABELS.POST, extendedRow("POST")],
     ]);
   }
 
@@ -620,9 +666,11 @@ function buildTickerStructuredData({
   notes,
   recentNews,
   recentSecFilings,
+  futuresContract,
 }: {
   symbol: string;
   listing: CliListing;
+  futuresContract: FuturesContractTermsPayload | null;
   tickerFile: TickerRecord | null;
   financials: TickerFinancials;
   config: AppConfig;
@@ -640,10 +688,9 @@ function buildTickerStructuredData({
       symbol: quote.symbol,
       instrumentType: quote.instrumentType,
       name: quote.name,
-      price: quote.price,
+      // Last and Change as the text report reads them, then the extended print from that close.
+      ...getQuoteSessionFields(quote),
       priceBasis: quote.priceBasis ?? null,
-      change: quote.change,
-      changePercent: quote.changePercent,
       currency: quote.currency,
       marketCap: quote.marketCap ?? null,
       volume: quote.volume ?? null,
@@ -655,6 +702,8 @@ function buildTickerStructuredData({
       lastUpdated: quote.lastUpdated ? new Date(quote.lastUpdated).toISOString() : "",
     } : null,
     quoteMetadata: financials.quoteMetadata,
+    // Only for futures: the contract the symbol prices, its terms and its latest confirmed settlement.
+    ...futuresContract ? { futuresContract } : {},
     ticker: tickerFile ? {
       ticker: tickerFile.metadata.ticker,
       name: tickerFile.metadata.name ?? "",
@@ -730,7 +779,10 @@ export async function ticker(symbol: string, dependencies: TickerCommandDependen
     } catch (error) {
       // A known exchange the symbol is not listed on: say where it is.
       await failIfNotTraded(listing, { store, dataProvider }, { fail: failCommand });
-      failCommand(`Failed to fetch data for ${normalized}.`, error instanceof Error ? error.message : String(error));
+      const reason = error instanceof Error ? error.message : String(error);
+      // A symbol no listing carries is not a failed fetch, and the message already names it.
+      if (isNotATickerMessage(reason)) failCommand(reason);
+      failCommand(`Failed to fetch data for ${normalized}.`, reason);
     }
 
     const hasResearchData = financials && (
@@ -773,6 +825,9 @@ export async function ticker(symbol: string, dependencies: TickerCommandDependen
         : Promise.resolve([]),
     ]);
 
+    const futuresContract = isFuturesQuote(requestSymbol, quote)
+      ? await (dependencies.futuresContract ?? ((value: string) => apiClient.getCloudFuturesContract(value)))(quote?.symbol ?? requestSymbol).catch(() => null)
+      : null;
     const notes = notesResult.status === "fulfilled" ? notesResult.value : "";
     const recentNews = newsResult.status === "fulfilled" ? newsResult.value : [];
     const recentSecFilings = secFilingsResult.status === "fulfilled" ? secFilingsResult.value : [];
@@ -793,6 +848,7 @@ export async function ticker(symbol: string, dependencies: TickerCommandDependen
           notes,
           recentNews,
           recentSecFilings,
+          futuresContract,
         }),
       });
       return;
@@ -809,6 +865,7 @@ export async function ticker(symbol: string, dependencies: TickerCommandDependen
         quoteNote,
         recentNews,
         recentSecFilings,
+        futuresContract,
     }));
     if (freshness) console.log(`\n${cliFreshnessFooter(freshness)}`);
   });
