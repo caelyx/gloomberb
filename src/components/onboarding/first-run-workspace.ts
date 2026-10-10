@@ -24,7 +24,7 @@ export const FIRST_RUN_WATCHLIST: ReadonlyArray<Pick<TickerMetadata, "ticker" | 
   { ticker: "AMZN", name: "Amazon.com Inc.", exchange: "NASDAQ", assetCategory: "STK" },
   { ticker: "TSLA", name: "Tesla Inc.", exchange: "NASDAQ", assetCategory: "STK" },
 ];
-export const FIRST_RUN_WATCHLIST_SIZE = 7;
+const FIRST_RUN_WATCHLIST_SIZE = 7;
 
 export const FIRST_RUN_PANE_IDS = {
   heatmap: "portfolio-list:home-heatmap",
@@ -33,6 +33,7 @@ export const FIRST_RUN_PANE_IDS = {
   news: "news-top:home",
   indices: "world-indices:home",
   sentiment: "fear-greed:home",
+  trending: "attention-trending:home",
 } as const;
 
 export interface FirstRunWatchlistPlan {
@@ -152,11 +153,17 @@ export function buildFirstRunLayout({
         ? { instanceId: FIRST_RUN_PANE_IDS.indices, paneId: "world-indices", binding: { kind: "none" as const } }
         : null;
   if (secondary) instances.push(secondary);
+  const trending = hasPane("attention-trending");
+  if (trending) instances.push({ instanceId: FIRST_RUN_PANE_IDS.trending, paneId: "attention-trending", binding: { kind: "none" } });
+  const lower = secondary && trending ? { kind: "split" as const, axis: "horizontal" as const, ratio: 0.6,
+    first: { kind: "pane" as const, instanceId: secondary.instanceId }, second: { kind: "pane" as const, instanceId: FIRST_RUN_PANE_IDS.trending } }
+    : { kind: "pane" as const, instanceId: secondary?.instanceId ?? FIRST_RUN_PANE_IDS.trending };
 
-  // The float is a market read that stands on its own: sentiment when the
-  // plugin is installed, else the indices. The shell clamps floats into the
-  // window, so an off-screen origin lands it in the bottom-right corner on
-  // any size, over the news list rather than the chart.
+  // The float is a market read that stands on its own: the Fear & Greed
+  // gauge, else the indices where a host has no gauge. The shell clamps floats
+  // into the window, so an off-screen origin lands it in the bottom-right
+  // corner on any size, over the news list rather than the chart. The gauge
+  // takes 16 rows to reach its reading in the terminal, under the prior scores.
   const floatingPaneId = hasPane("fear-greed")
     ? "fear-greed"
     : secondary?.paneId !== "world-indices" && hasPane("world-indices")
@@ -164,9 +171,10 @@ export function buildFirstRunLayout({
       : null;
   const floating: LayoutConfig["floating"] = [];
   if (floatingPaneId) {
-    const instanceId = floatingPaneId === "fear-greed" ? FIRST_RUN_PANE_IDS.sentiment : FIRST_RUN_PANE_IDS.indices;
+    const gauge = floatingPaneId === "fear-greed";
+    const instanceId = gauge ? FIRST_RUN_PANE_IDS.sentiment : FIRST_RUN_PANE_IDS.indices;
     instances.push({ instanceId, paneId: floatingPaneId, binding: { kind: "none" } });
-    floating.push({ instanceId, x: 9999, y: 9999, width: floatingPaneId === "fear-greed" ? 46 : 60, height: 12 });
+    floating.push({ instanceId, x: 9999, y: 9999, width: gauge ? 46 : 60, height: gauge ? 16 : 12 });
   }
 
   const layout: LayoutConfig = {
@@ -181,13 +189,13 @@ export function buildFirstRunLayout({
         first: { kind: "pane", instanceId: FIRST_RUN_PANE_IDS.heatmap },
         second: { kind: "pane", instanceId: FIRST_RUN_PANE_IDS.watchlist },
       },
-      second: secondary
+      second: secondary || trending
         ? {
           kind: "split",
           axis: "vertical",
           ratio: 0.62,
           first: { kind: "pane", instanceId: FIRST_RUN_PANE_IDS.chart },
-          second: { kind: "pane", instanceId: secondary.instanceId },
+          second: lower,
         }
         : { kind: "pane", instanceId: FIRST_RUN_PANE_IDS.chart },
     },

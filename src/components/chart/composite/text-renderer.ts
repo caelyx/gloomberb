@@ -3,6 +3,9 @@ import { compositeAxisTicks, compositeGridRatios, type CompositeAxisValueFormatt
 import { resolveCompositeObservationWidth } from "./rasterizer";
 import { buildCompositeColumnLayout, type CompositeColumnLayout } from "./column-layout";
 import { projectCompositeValue } from "./scene";
+import { writeVolumeProfileText } from "./volume-profile-paint";
+import { writeSessionBreaksText } from "./session-shading";
+import type { SeriesLineCue } from "./series-cues";
 import type {
   CompositeAxisDomain,
   CompositePanelScene,
@@ -57,19 +60,23 @@ function renderLineLike(
   series: CompositeProjectedSeries,
   width: number,
   height: number,
+  cue?: SeriesLineCue,
 ): void {
   const points = series.points.map((point) => ({ ...cellPoint(point, width, height), point }));
   if (points.length === 0) return;
   const step = series.source.style === "step" || series.source.interpolation === "step-after";
+  // Beside other lines, each line keeps its own mark the whole way, steps
+  // included, since cell text has no colour of its own here.
+  const mark = cue && cue.id !== "solid" ? cue.glyph : null;
   for (let index = 1; index < points.length; index += 1) {
     const previous = points[index - 1]!;
     const current = points[index]!;
     if (current.point.breakBefore) continue;
     if (step) {
-      drawLine(rows, previous.x, previous.y, current.x, previous.y, "─");
-      drawLine(rows, current.x, previous.y, current.x, current.y, "│");
+      drawLine(rows, previous.x, previous.y, current.x, previous.y, mark ?? "─");
+      drawLine(rows, current.x, previous.y, current.x, current.y, mark ?? "│");
     } else {
-      drawLine(rows, previous.x, previous.y, current.x, current.y, "•");
+      drawLine(rows, previous.x, previous.y, current.x, current.y, mark ?? "•");
     }
   }
   for (let index = 0; index < points.length; index += 1) {
@@ -100,6 +107,7 @@ function renderArea(
   domain: CompositeAxisDomain,
   width: number,
   height: number,
+  cue?: SeriesLineCue,
 ): void {
   const baseline = valueRow(0, domain, height) ?? height - 1;
   const points = series.points.map((point) => cellPoint(point, width, height));
@@ -108,7 +116,48 @@ function renderArea(
     const bottom = Math.max(point.y, baseline);
     for (let row = top; row <= bottom; row += 1) setCell(rows, point.x, row, "░");
   }
-  renderLineLike(rows, series, width, height);
+  renderLineLike(rows, series, width, height, cue);
+}
+
+/** A band's range as shade between its points' low and high rows, under its line. */
+function renderBand(
+  rows: string[][],
+  series: CompositeProjectedSeries,
+  domain: CompositeAxisDomain,
+  width: number,
+  height: number,
+  cue?: SeriesLineCue,
+): void {
+  const edges = series.points.map((projected) => {
+    const { high, low } = projected.point;
+    if (high == null || low == null) return null;
+    const top = valueRow(high, domain, height);
+    const bottom = valueRow(low, domain, height);
+    return top === null || bottom === null
+      ? null
+      : { x: cellPoint(projected, width, height).x, top: Math.min(top, bottom), bottom: Math.max(top, bottom) };
+  });
+  const shade = (x: number, top: number, bottom: number) => {
+    for (let row = Math.round(top); row <= Math.round(bottom); row += 1) {
+      const current = rows[row]?.[x];
+      if (current === " " || current === "·") setCell(rows, x, row, "░");
+    }
+  };
+  for (let index = 0; index < edges.length; index += 1) {
+    const current = edges[index];
+    if (!current) continue;
+    const previous = index > 0 && !series.points[index]?.breakBefore ? edges[index - 1] : null;
+    if (!previous) {
+      shade(current.x, current.top, current.bottom);
+      continue;
+    }
+    const span = Math.max(1, current.x - previous.x);
+    for (let x = previous.x; x <= current.x; x += 1) {
+      const t = (x - previous.x) / span;
+      shade(x, previous.top + (current.top - previous.top) * t, previous.bottom + (current.bottom - previous.bottom) * t);
+    }
+  }
+  renderLineLike(rows, series, width, height, cue);
 }
 
 function renderColumns(
@@ -219,18 +268,22 @@ export function renderCompositePanelText(
 
   const columnLayout = buildCompositeColumnLayout(panel);
   const orderedSeries = [...panel.series].sort((left, right) => {
-    const layerRank = (style: string) => style === "area" || style === "columns" ? 0 : 1;
+    const layerRank = (style: string) => style === "area" || style === "columns" || style === "band" ? 0 : 1;
     return layerRank(left.source.style) - layerRank(right.source.style);
   });
   for (const series of orderedSeries) {
     const domain = panel.axes[series.source.axis];
     if (!domain) continue;
+    const cue = panel.lineCues?.get(series.source.id);
     switch (series.source.style) {
       case "columns":
         renderColumns(rows, series, domain, plotWidth, height, columnLayout);
         break;
       case "area":
-        renderArea(rows, series, domain, plotWidth, height);
+        renderArea(rows, series, domain, plotWidth, height, cue);
+        break;
+      case "band":
+        renderBand(rows, series, domain, plotWidth, height, cue);
         break;
       case "candles":
       case "ohlc":
@@ -239,13 +292,16 @@ export function renderCompositePanelText(
         break;
       case "line":
       case "step":
-        renderLineLike(rows, series, plotWidth, height);
+        renderLineLike(rows, series, plotWidth, height, cue);
         break;
       case "points":
         renderPoints(rows, series, plotWidth, height);
         break;
     }
   }
+
+  if (panel.volumeProfile) writeVolumeProfileText(rows, plotWidth, panel.volumeProfile);
+  if (panel.extendedHours) writeSessionBreaksText(rows, plotWidth, panel.extendedHours);
 
   // Blank cells only, so the dashed level reads as if it ran under the marks.
   if (panel.lastPrice) {
@@ -257,6 +313,14 @@ export function renderCompositePanelText(
     for (let x = 0; x < plotWidth; x += 1) {
       const current = rows[row]?.[x];
       if (current === " " || current === "·") setCell(rows, x, row, "╌");
+    }
+  }
+  // The previous close, dotted, where the last price has not taken the row.
+  if (panel.priorClose) {
+    const row = clamp(Math.round(panel.priorClose.yRatio * Math.max(height - 1, 0)), 0, Math.max(height - 1, 0));
+    for (let x = 0; x < plotWidth; x += 1) {
+      const current = rows[row]?.[x];
+      if (current === " " || current === "·") setCell(rows, x, row, "┈");
     }
   }
 

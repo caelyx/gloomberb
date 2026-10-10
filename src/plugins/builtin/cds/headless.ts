@@ -54,7 +54,7 @@ const TRADE_COLUMNS = [
   },
 ];
 
-export function projectCdsHeadless(activity: CdsActivity, issuer: string | null): HeadlessRowsResult {
+function projectCdsHeadless(activity: CdsActivity, issuer: string | null): HeadlessRowsResult {
   if (issuer) {
     return {
       columns: TRADE_COLUMNS,
@@ -89,6 +89,8 @@ export function createCdsHeadless(
 ): HeadlessPaneDefinition<"rows"> {
   return {
     shape: "rows",
+    // Public dissemination of swap trades, held back by rule for some trades.
+    freshness: { source: "DTCC", status: "delayed" },
     argument: {
       kind: "free-text",
       placeholder: "ticker or issuer",

@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { Box, Text, Textarea, type InputRenderable, type TextareaRenderable } from "../../ui";
+import { Box, Text, Textarea, useUiCapabilities, type InputRenderable, type TextareaRenderable } from "../../ui";
 import { t } from "../../i18n";
 import { useDialogKeyboard, type PromptContext } from "../../ui/dialog";
 import { useThemeColors } from "../../theme/theme-context";
 import { Button } from "./button";
-import { TextField } from "./fields";
+import { FRAMED_TEXTAREA_DESKTOP_STYLE, TextField } from "./fields";
 import { DialogFrame } from "./frame";
 
 export interface TextPromptDialogProps extends PromptContext<string> {
@@ -19,6 +19,8 @@ export interface TextPromptDialogProps extends PromptContext<string> {
   confirmLabel?: string;
   /** Sentences rather than a name: a taller field where Shift+Enter breaks a line. */
   multiline?: boolean;
+  /** Lines the multiline field shows. */
+  rows?: number;
   /** Empty is an answer (clearing a value) rather than nothing to save. */
   allowEmpty?: boolean;
   width?: number;
@@ -40,11 +42,13 @@ export function TextPromptDialog({
   placeholder,
   confirmLabel = "Save",
   multiline = false,
+  rows = 3,
   allowEmpty = false,
   width = 72,
   footer,
 }: TextPromptDialogProps) {
   const colors = useThemeColors();
+  const { nativePaneChrome } = useUiCapabilities();
   const inputRef = useRef<InputRenderable | null>(null);
   const textareaRef = useRef<TextareaRenderable | null>(null);
   const [value, setValue] = useState(initialValue);
@@ -83,7 +87,7 @@ export function TextPromptDialog({
         ))}
         {body && body.length > 0 && <Box height={1} />}
         {multiline ? (
-          <Box height={5} border borderColor={colors.border} backgroundColor={colors.panel}>
+          <Box height={rows + 2} border borderColor={colors.border} backgroundColor={colors.panel}>
             <Textarea
               ref={textareaRef}
               initialValue={initialValue}
@@ -94,6 +98,7 @@ export function TextPromptDialog({
               backgroundColor={colors.panel}
               flexGrow={1}
               wrapText
+              {...(nativePaneChrome ? { style: FRAMED_TEXTAREA_DESKTOP_STYLE } : {})}
               keyBindings={[
                 { name: "return", action: "submit" },
                 { name: "linefeed", action: "submit" },

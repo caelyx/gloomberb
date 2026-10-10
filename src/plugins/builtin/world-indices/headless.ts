@@ -15,6 +15,7 @@ import {
   WORLD_INDICES,
   type IndexEntry,
 } from "./indices";
+import { quoteFreshnessFields } from "../shared/report-freshness";
 
 const COLUMNS = [
   { key: "shortName", header: "Index" },
@@ -54,7 +55,7 @@ const COLUMNS = [
   },
 ];
 
-export function projectWorldIndicesHeadless(
+function projectWorldIndicesHeadless(
   entries: readonly IndexEntry[],
   loaded: WorldIndexQuoteResult,
 ): HeadlessBundleResult {
@@ -69,6 +70,7 @@ export function projectWorldIndicesHeadless(
         rows: regionEntries.map((entry) => {
           const quote = loaded.quotes.get(entry.symbol);
           return {
+            ...quoteFreshnessFields(quote),
             ...entry,
             price: quote?.price ?? null,
             unit: "index points",
@@ -89,7 +91,7 @@ export function projectWorldIndicesHeadless(
   };
 }
 
-export interface WorldIndicesHeadlessDependencies {
+interface WorldIndicesHeadlessDependencies {
   load(
     args: HeadlessPaneLoadArgs,
     entries: readonly IndexEntry[],
@@ -101,7 +103,7 @@ const defaultDependencies: WorldIndicesHeadlessDependencies = {
   load: (_args, entries, provider) => loadWorldIndexQuotes(entries, provider),
 };
 
-export function createWorldIndicesHeadless(
+function createWorldIndicesHeadless(
   dependencies: WorldIndicesHeadlessDependencies = defaultDependencies,
 ): HeadlessPaneDefinition<"bundle"> {
   return {

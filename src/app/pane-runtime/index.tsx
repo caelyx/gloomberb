@@ -6,9 +6,11 @@ import {
   bringToFront,
   findDockLeaf,
   getDockedPaneIds,
+  isPaneDetached,
   isPaneInLayout,
-} from "../../plugins/pane-manager";
+} from "../../layout/pane-manager";
 import type { PluginRegistry } from "../../plugins/registry";
+import { PluginOffError, notifyPluginOff } from "../../plugins/plugin-off";
 import type { LoadedExternalPlugin } from "../../plugins/loader";
 import {
   getFocusedCollectionId,
@@ -18,6 +20,7 @@ import {
   type AppState,
 } from "../../state/app/context";
 import { scheduleConfigSave } from "../../state/config-save-scheduler";
+import { pinFollowingPane } from "../../layout/pane-follow";
 import {
   createPaneInstance,
   isTickerPaneId,
@@ -35,7 +38,6 @@ import type {
 } from "../../types/plugin";
 import type { DialogApi } from "../../ui/dialog";
 import {
-  resolvePanelForPane,
   resolvePaneShowTarget,
   resolvePaneTarget as resolvePaneTargetInLayout,
   selectEdgeAnchor,
@@ -52,6 +54,8 @@ interface AppPaneRuntimeArgs {
   dialog: DialogApi;
   dispatch: Dispatch<AppAction>;
   externalPlugins: readonly LoadedExternalPlugin[];
+  /** Desktop main window: raises a detached pane's own window. */
+  focusDetachedPane?: (paneId: string) => void;
   isDetachedWindow: boolean;
   notify: (body: string, options?: { type?: "info" | "success" | "error" }) => void;
   persistConfig: (nextConfig: AppState["config"]) => void;
@@ -67,6 +71,7 @@ export function useAppPaneRuntime({
   dialog,
   dispatch,
   externalPlugins,
+  focusDetachedPane,
   isDetachedWindow,
   notify,
   persistConfig,
@@ -83,6 +88,7 @@ export function useAppPaneRuntime({
     const currentState = stateRef.current;
     const normalizedLayout = normalizePaneLayout(layout, {
       resolveOrphanSymbol: (instanceId) => resolveTickerForPane(currentState, instanceId),
+      pinOrphan: pinFollowingPane,
     });
     if (options?.pushHistory !== false) {
       dispatch({ type: "PUSH_LAYOUT_HISTORY" });
@@ -95,18 +101,12 @@ export function useAppPaneRuntime({
       { ...currentState.config, layout: normalizedLayout },
       currentState.paneState,
       hasFocusTarget ? (options.focusedPaneId ?? null) : currentState.focusedPaneId,
-      currentState.activePanel,
     ));
   }, [dispatch, stateRef]);
 
-  const activatePane = useCallback((paneId: string, layout: LayoutConfig = state.config.layout) => {
-    dispatch({
-      type: "SET_ACTIVE_PANEL",
-      panel: resolvePanelForPane({ layout, paneId, pluginRegistry }),
-      preserveFocus: true,
-    });
+  const activatePane = useCallback((paneId: string) => {
     dispatch({ type: "FOCUS_PANE", paneId });
-  }, [dispatch, pluginRegistry, state.config.layout]);
+  }, [dispatch]);
 
   const {
     buildPaneBinding,
@@ -163,15 +163,17 @@ export function useAppPaneRuntime({
     if (nextLayout !== state.config.layout) {
       persistLayout(nextLayout, { pushHistory: false });
     }
-    activatePane(paneId, nextLayout);
-  }, [activatePane, persistLayout, state.config.layout]);
+    activatePane(paneId);
+    // Focus in this window's state alone would leave the pane's window behind this one.
+    if (isPaneDetached(nextLayout, paneId)) focusDetachedPane?.(paneId);
+  }, [activatePane, focusDetachedPane, persistLayout, state.config.layout]);
 
   const placePaneInstance = useCallback((
     instance: PaneInstanceConfig,
     paneDef: PaneDef,
     options?: PaneTemplateInstanceConfig,
   ) => {
-    const { width, height } = pluginRegistry.getTermSizeFn();
+    const { width, height } = pluginRegistry.getTermSize();
     // Templates can await ticker resolution before placing their pane, so the
     // layout from the render that started the request may be out of date.
     const { config: { layout }, focusedPaneId } = stateRef.current;
@@ -201,7 +203,7 @@ export function useAppPaneRuntime({
     }
 
     persistLayout(nextLayout);
-    activatePane(instance.instanceId, nextLayout);
+    activatePane(instance.instanceId);
   }, [
     activatePane,
     persistLayout,
@@ -214,6 +216,12 @@ export function useAppPaneRuntime({
     const target = resolvePaneShowTarget(state.config.layout, paneId);
     const paneDef = pluginRegistry.panes.get(target.paneType);
     if (!paneDef) return;
+    // Its pane would be added, or focused, hidden.
+    const owner = pluginRegistry.getDisabledPaneOwner(target.paneType, stateRef.current.config.disabledPlugins);
+    if (owner) {
+      notifyPluginOff(pluginRegistry, new PluginOffError(owner, paneDef.name), () => pluginRegistry.showPane(paneId));
+      return;
+    }
 
     if (target.paneType === TICKER_RESEARCH_PANE_ID) {
       showTickerResearchPane();
@@ -221,7 +229,7 @@ export function useAppPaneRuntime({
     }
 
     if (target.instance && isPaneInLayout(state.config.layout, target.instance.instanceId)) {
-      pluginRegistry.focusPaneFn(target.instance.instanceId);
+      pluginRegistry.focusPane(target.instance.instanceId);
       return;
     }
 
@@ -240,12 +248,12 @@ export function useAppPaneRuntime({
     pluginRegistry,
     showTickerResearchPane,
     state.config.layout,
+    stateRef,
   ]);
 
   const { createPaneFromTemplate } = useAppPaneTemplateRuntime({
     buildPaneInstance,
     dataProvider,
-    dialog,
     dispatch,
     notify,
     placePaneInstance,

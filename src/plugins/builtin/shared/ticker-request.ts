@@ -1,5 +1,7 @@
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { ApiRequestError } from "../../../api-client/errors";
+import { listingAbroad, type IssuerListingParams } from "../../../api-client/paths";
+import type { TickerRecord } from "../../../types/ticker";
 import { useAsyncResource } from "../../../react/async-resource";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
 import { parsePublicTickerKey } from "../../../utils/exchanges";
@@ -23,6 +25,28 @@ export function listingIdentity(key: string | null | undefined, savedExchange = 
 }
 
 /**
+ * The venue and company an SEC issuer read names for the pane's listing, from
+ * the pane's ticker as the SEC filings pane reads it: the key's venue, else the
+ * saved one, and the company the listing was saved as (listingAbroad). Nothing
+ * for a US listing or a symbol with no venue. A name that is only the symbol
+ * is left out, so the server falls back to the name on a quote it holds.
+ */
+function issuerListing(ticker: TickerRecord | null | undefined): IssuerListingParams {
+  if (!ticker) return {};
+  const key = ticker.metadata.ticker.trim().toUpperCase();
+  const name = ticker.metadata.name?.trim();
+  const known = !!name && ![key, parsePublicTickerKey(key).symbol].includes(name.toUpperCase());
+  const abroad = listingAbroad(key, ticker.metadata.exchange, known ? name : undefined);
+  return { exchange: abroad?.exchange, name: abroad?.name };
+}
+
+/** `issuerListing` as a stable value, for loader dependencies. */
+export function useIssuerListing(ticker: TickerRecord | null | undefined): IssuerListingParams {
+  const { exchange, name } = issuerListing(ticker);
+  return useMemo(() => ({ exchange, name }), [exchange, name]);
+}
+
+/**
  * The pane's symbol for research panes that load their own data. Identity only:
  * it does not observe the quote, so a price tick does not re-render the pane.
  */
@@ -32,7 +56,7 @@ export function useBoundTicker() {
     symbol,
     ticker,
     exchange: ticker?.metadata.exchange ?? "",
-    currency: ticker?.metadata.currency ?? "USD",
+    currency: ticker?.metadata.currency || "USD",
   };
 }
 

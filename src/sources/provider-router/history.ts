@@ -19,6 +19,7 @@ import { subtractTimeRange } from "../../time-series/date-window";
 import { clipPriceHistoryToRange } from "../../time-series/history-window";
 import { repairIsolatedIntradayOhlcOutliers } from "../../time-series/history-quality";
 import { canonicalExchange, parsePublicTickerKey, resolveExchangeTimeZone } from "../../utils/exchanges";
+import { isRoundTheClockCoin } from "../../utils/crypto-pair";
 import { zonedDateKey } from "../../utils/zoned-date-time";
 import { resolvePriceHistoryCurrencyUnit } from "../../utils/currency-units";
 import { calendarHistoryFetchState, calendarHistoryLastBarDate, dropLeadingPlaceholderBars, getPricePointTimestamp, hasUsablePriceHistory, preservePriceHistoryGaps, isPriceHistoryStaleForCurrentWindow, normalizePriceHistory, priceHistoryIntervalMs, type CalendarHistoryFetchState } from "../../utils/price-history";
@@ -40,7 +41,8 @@ type PriceHistoryCachePolicyKey = Extract<
   "priceHistoryIntraday" | "priceHistoryDaily"
 >;
 // Bumped instead of adding markers: every older record is a miss and refetches.
-const PRICE_HISTORY_CACHE_VERSION = 6;
+// Refetch source/session metadata under the current public backend contract.
+const PRICE_HISTORY_CACHE_VERSION = 7;
 interface HistoryRequestDescriptor {
   target: { symbol: string; exchange: string };
   identity: RouterRequestIdentity;
@@ -142,15 +144,17 @@ function makeHistoryRequestIdentity(
     fallbackVariantParts: Array<[string, string | number | undefined | null]>;
   },
 ): Pick<HistoryRequestDescriptor, "identity" | "cacheVariantKeys" | "exactCacheVariantKeys" | "target"> {
+  // Extended-hours bars are another history; they never answer for the regular session.
+  const session: [string, string | undefined] = ["session", input.context?.historySession];
   const identity = makeRouterRequestIdentity(deps, {
     kind: input.kind,
     ticker: input.ticker,
     context: input.context,
-    variantParts: priceHistoryVariantParts(input.variantParts, input.exchange),
+    variantParts: priceHistoryVariantParts([...input.variantParts, session], input.exchange),
   });
   const cacheVariantKeys = [
     identity.variantKey,
-    buildVariantKey(priceHistoryVariantParts(input.fallbackVariantParts, input.exchange)),
+    buildVariantKey(priceHistoryVariantParts([...input.fallbackVariantParts, session], input.exchange)),
   ];
   return {
     target: { symbol: input.ticker, exchange: input.exchange },
@@ -242,9 +246,9 @@ function normalizeRequestResult(value: PriceHistoryResult, request: HistoryReque
   };
 }
 
-function resultIsStale(value: PriceHistoryResult, exchange: string, intervalMs?: number | null): boolean {
+function resultIsStale(value: PriceHistoryResult, symbol: string, exchange: string, intervalMs?: number | null): boolean {
   return isPriceHistoryStaleForCurrentWindow(value.points, Date.now(), {
-    exchange, intervalMs: intervalMs ?? (value.resolution ? priceHistoryIntervalMs(value.resolution) : undefined), session: value.session,
+    symbol, exchange, intervalMs: intervalMs ?? (value.resolution ? priceHistoryIntervalMs(value.resolution) : undefined), session: value.session,
   });
 }
 
@@ -339,8 +343,8 @@ export class ProviderRouterHistoryRoutes {
       context,
       cachePolicyKey: intraday ? "priceHistoryIntraday" : "priceHistoryDaily",
       missingProviderError: `No history provider available for ${ticker}`,
-      isCachedValueStale: (value) => intraday && resultIsStale(value, exchange),
-      isFetchedValueStale: (value) => intraday && resultIsStale(value, exchange),
+      isCachedValueStale: (value) => intraday && resultIsStale(value, ticker, exchange),
+      isFetchedValueStale: (value) => intraday && resultIsStale(value, ticker, exchange),
       fetchBroker: async (candidate) => candidate.broker.getPriceHistory
         ? candidate.broker.getPriceHistory(
           ticker,
@@ -396,8 +400,8 @@ export class ProviderRouterHistoryRoutes {
       context,
       cachePolicyKey: intraday ? "priceHistoryIntraday" : "priceHistoryDaily",
       missingProviderError: `No resolution-aware history provider available for ${ticker}`,
-      isCachedValueStale: (value) => intraday && resultIsStale(value, exchange, intervalMs),
-      isFetchedValueStale: (value) => intraday && resultIsStale(value, exchange, intervalMs),
+      isCachedValueStale: (value) => intraday && resultIsStale(value, ticker, exchange, intervalMs),
+      isFetchedValueStale: (value) => intraday && resultIsStale(value, ticker, exchange, intervalMs),
       fetchBroker: async (candidate) => candidate.broker.getPriceHistoryForResolution
         ? candidate.broker.getPriceHistoryForResolution(
           ticker,
@@ -491,7 +495,7 @@ export class ProviderRouterHistoryRoutes {
       ["bar", barSize],
       // An ordinary Cloud cache does not identify its internal winning source.
       // Scoped recovery must only reuse a cache explicitly acquired this way.
-      ["historyRecovery", context?.historyRecovery ? "yahoo" : undefined],
+      ["historyRecovery", context?.historyRecovery ? "gloom" : undefined],
     ];
     const fallbackParts = primaryParts.slice(1);
     const identity = makeHistoryRequestIdentity(this.deps, {
@@ -512,9 +516,9 @@ export class ProviderRouterHistoryRoutes {
       context,
       cachePolicyKey: intervalMs != null && intervalMs >= 24 * 60 * 60 * 1000 ? "priceHistoryDaily" : "priceHistoryIntraday",
       isCachedValueStale: (value) => currentWindowAtLookup
-        && resultIsStale(value, exchange, intervalMs),
+        && resultIsStale(value, ticker, exchange, intervalMs),
       isFetchedValueStale: (value) => isCurrentHistoryWindow(endDate)
-        && resultIsStale(value, exchange, intervalMs),
+        && resultIsStale(value, ticker, exchange, intervalMs),
       fetchBroker: async (candidate) => candidate.broker.getDetailedPriceHistory
         ? candidate.broker.getDetailedPriceHistory(
           ticker,
@@ -565,6 +569,7 @@ export class ProviderRouterHistoryRoutes {
     const now = Date.now();
     const fetchState = (record: { fetchedAt: number; value: PriceHistoryResult }, checkedAt?: number): CalendarHistoryFetchState => currentWindow
       ? calendarHistoryFetchState(record.value.points, record.fetchedAt, now, {
+        symbol: target.symbol,
         exchange: target.exchange || request.target.exchange,
         checkedAt,
         // Bar size comes from the request: a cached weekly or monthly series
@@ -577,7 +582,7 @@ export class ProviderRouterHistoryRoutes {
     const ranked = cachedRecords.filter((record) => hasUsablePriceHistory(record.value.points)).map((record) => {
       const tier = fetchTier[fetchState(record)];
       return { record, tier, exact: request.exactCacheVariantKeys.includes(record.variantKey),
-        lastBar: tier === 0 ? "" : calendarHistoryLastBarDate(record.value.points, target.exchange || request.target.exchange) ?? "" };
+        lastBar: tier === 0 ? "" : calendarHistoryLastBarDate(record.value.points, target.exchange || request.target.exchange, target.symbol) ?? "" };
     });
     // Current copies keep their listed order. Otherwise ties go to this key's
     // own copy, then the latest fetch, rather than to row order.
@@ -654,7 +659,10 @@ export class ProviderRouterHistoryRoutes {
       throw new HistoryRetentionError(candidates[0]?.retention ?? attempts.retention, { candidates, outcomes: [...attempts.outcomes.values()] });
     }
     if (!providerResult && request.missingProviderError && !reportedGaps.some((value) => value.points.length > 0)) {
-      throw new Error(request.missingProviderError);
+      // A source answered a coin's history but it stops short of the present: say so, not that nothing answered.
+      const behind = isRoundTheClockCoin(target.symbol, target.exchange || request.target.exchange)
+        && [...attempts.outcomes.values()].some((outcome) => outcome.outcome === "stale");
+      throw new Error(behind ? `Latest history for ${target.symbol} is behind` : request.missingProviderError);
     }
     return withReportedGaps(providerResult?.value ?? { points: [], resolution: historyResolutionForInterval(request.interval) });
   }

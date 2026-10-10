@@ -8,6 +8,7 @@ import { scopedBrokerContractIdentityKey } from "../../../utils/instrument-ident
 import { tickerSelectionFromSearchResult } from "../../../tickers/selection";
 import { tickerInstrumentLabel } from "../../../tickers/instrument-label";
 import type { PluginRegistry } from "../../../plugins/registry";
+import { PluginOffError } from "../../../plugins/plugin-off";
 import { formatTickerListInput } from "../../../tickers/list";
 import { PANE_LOCK_SETTING_KEY, setPaneLocked, updatePaneInstance, setPaneSettings } from "../../../pane-settings";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
@@ -20,6 +21,9 @@ import {
 import { buildQuoteMonitorPaneTitle } from "../../../plugins/builtin/ticker-detail/settings";
 import { getPaneTemplateDisplayLabel } from "../pane-templates/items";
 import { automationActive, describeUsageFunction, recordFunctionOpen } from "../../../telemetry/usage-counts";
+import { attentionActionForPane, captureAttentionAction } from "../../../telemetry/attention-counts";
+import { publicTickerKey } from "../../../utils/exchanges";
+import { keysClearedByChange } from "./fields";
 import {
   resolveTickerInputOrThrow,
   resolveTickerListInput,
@@ -98,11 +102,52 @@ function stableKey(value: unknown): string {
 }
 
 /**
+ * A ticker pane's id names the ticker it opened on (`options:AAPL`), but a pane linked to a list
+ * since then, or unlinked on another ticker, shows something else. Typing `OMON AAPL` must not
+ * retarget it: a linked pane would silently stop following, and an unlinked one would be taken over.
+ */
+function showsOtherTicker(owner: PaneInstanceConfig, spec: PaneTemplateInstanceConfig): boolean {
+  return spec.binding?.kind === "fixed" && (
+    owner.binding?.kind === "follow"
+    || (owner.binding?.kind === "fixed" && owner.binding.symbol !== spec.binding.symbol)
+  );
+}
+
+/**
+ * When the pane holding a ticker template's id shows another ticker, the command opens its own
+ * pinned pane under a further stable id (`options:AAPL:pinned`, then `:pinned-2`), so typing it
+ * again lands on that pane rather than a new one (OMON keeps rewriting its settings, so the
+ * whole-spec match below would miss it). A pinned pane that was linked or moved on since is
+ * skipped the same way, so the ids never run out into unkeyed duplicates.
+ */
+function withFreeTickerInstanceId(
+  instances: PaneInstanceConfig[],
+  paneId: string,
+  spec: PaneTemplateInstanceConfig,
+): PaneTemplateInstanceConfig {
+  const baseId = spec.instanceId;
+  if (!baseId) return spec;
+  const byId = new Map(instances.map((instance) => [instance.instanceId, instance]));
+  const owner = byId.get(baseId);
+  if (owner?.paneId !== paneId || !showsOtherTicker(owner, spec)) return spec;
+  let free: string | null = null;
+  // One more id than there are panes is always enough to find a free one.
+  for (let index = 1; index <= instances.length + 1; index += 1) {
+    const instanceId = index === 1 ? `${baseId}:pinned` : `${baseId}:pinned-${index}`;
+    const holder = byId.get(instanceId);
+    if (!holder) free ??= instanceId;
+    else if (holder.paneId === paneId && !showsOtherTicker(holder, spec)) return { ...spec, instanceId };
+  }
+  return { ...spec, instanceId: free ?? undefined };
+}
+
+/**
  * Find the pane a template would otherwise duplicate. A template that owns a
  * stable instance id (Chat keys one pane per channel) claims that instance even
  * after its settings drifted at runtime, as long as the id still belongs to the
- * same kind of pane; everything else has to match the whole create spec, so a
- * different ticker, collection or setting still opens its own pane.
+ * same kind of pane and, for a ticker pane, still shows that ticker; everything
+ * else has to match the whole create spec, so a different ticker, collection or
+ * setting still opens its own pane.
  */
 function findReusablePaneInstance(
   instances: PaneInstanceConfig[],
@@ -111,7 +156,8 @@ function findReusablePaneInstance(
 ): PaneInstanceConfig | null {
   if (spec.instanceId) {
     const owner = instances.find((instance) => instance.instanceId === spec.instanceId);
-    return owner?.paneId === paneId ? owner : null;
+    if (!owner || owner.paneId !== paneId) return null;
+    if (!showsOtherTicker(owner, spec)) return owner;
   }
   const specKey = stableKey([spec.binding ?? { kind: "none" }, spec.params ?? {}, spec.settings ?? {}]);
   return instances.find((instance) => (
@@ -207,7 +253,7 @@ async function resolvePaneTemplateOptions(
     const rawInput = resolvedOptions?.arg ?? resolvedOptions?.values?.tickers ?? "";
     const symbols = !String(rawInput).trim() && template.shortcut?.openWithoutArg
       ? []
-      : await resolveTickerListInput(rawInput, baseContext.activeCollectionId, deps);
+      : await resolveTickerListInput(rawInput, baseContext.activeCollectionId, deps, template.shortcut?.keepArgToken);
     resolvedOptions = {
       ...resolvedOptions,
       arg: rawInput,
@@ -242,12 +288,14 @@ export async function createPaneTemplateOrThrow(
   // Read before the first await: automation that started this open may have
   // finished by the time the pane is placed.
   const openedByUser = !automationActive();
+  const recordAttention = captureAttentionAction();
 
   const state = deps.getState();
   const pluginId = deps.pluginRegistry.getPaneTemplatePluginId(templateId);
-  if (pluginId && state.config.disabledPlugins.includes(pluginId)) {
-    throw new Error("Enable this plugin before creating its pane.");
-  }
+  // The template's plugin, or the plugin of the pane it opens (CHOKE opens a
+  // chart): a pane of a switched-off plugin would be added hidden.
+  const disabledOwner = deps.pluginRegistry.getDisabledPaneTemplateOwner(templateId, state.config.disabledPlugins);
+  if (disabledOwner) throw new PluginOffError(disabledOwner, getPaneTemplateDisplayLabel(template));
 
   const { context, resolvedOptions } = await resolvePaneTemplateOptions(template, options, deps);
 
@@ -274,8 +322,23 @@ export async function createPaneTemplateOrThrow(
   if (!paneDef) {
     throw new Error(`Unknown pane "${template.paneId}".`);
   }
+  const countAttention = () => {
+    const action = attentionActionForPane(template.paneId);
+    if (!action || !openedByUser) return;
+    const primary = spec.binding?.kind === "fixed" ? spec.binding.symbol : null;
+    const symbols = template.paneId === "quote-monitor" && Array.isArray(spec.settings?.symbols)
+      ? spec.settings.symbols.filter((value): value is string => typeof value === "string")
+      : primary ? [primary] : [];
+    for (const symbol of symbols) {
+      const exchange = symbol === primary && spec.binding?.kind === "fixed"
+        ? spec.binding.listing?.exchange ?? deps.getState().tickers.get(symbol)?.metadata.exchange
+        : deps.getState().tickers.get(symbol)?.metadata.exchange;
+      recordAttention(publicTickerKey(symbol, exchange), action);
+    }
+  };
 
   const instances = deps.getState().config.layout.instances;
+  spec = withFreeTickerInstanceId(instances, template.paneId, spec);
   const existing = findReusablePaneInstance(instances, template.paneId, spec);
   if (existing) {
     const retargeted = retargetPaneInstance(existing, spec);
@@ -284,11 +347,12 @@ export async function createPaneTemplateOrThrow(
         existing.instanceId,
         () => retargeted,
       ) : undefined;
-    if (nextLayout) deps.pluginRegistry.updateLayoutFn(nextLayout);
+    if (nextLayout) deps.pluginRegistry.updateLayout(nextLayout);
     // React can batch the layout update and focus. Bringing a floating pane to
     // the front must use its retargeted settings, not the preceding render.
-    deps.pluginRegistry.focusPaneFn(existing.instanceId, nextLayout);
+    deps.pluginRegistry.focusPane(existing.instanceId, nextLayout);
     if (openedByUser) countTemplateOpen(template, pluginId, deps);
+    countAttention();
     return;
   }
 
@@ -306,6 +370,7 @@ export async function createPaneTemplateOrThrow(
 
   deps.placePaneInstance(instance, paneDef, spec);
   if (openedByUser) countTemplateOpen(template, pluginId, deps);
+  countAttention();
 }
 
 /** Every pane template the user opens, from the command bar, a menu or another pane, passes here. */
@@ -341,9 +406,9 @@ export async function applyPaneSettingFieldValue(
     return;
   }
 
-  const clearOnChange = !Object.is(descriptor.context.settings[field.key], value)
-    ? Object.fromEntries((field.clearOnChange ?? []).map((key) => [key, ""]))
-    : {};
+  const clearOnChange = Object.fromEntries(
+    keysClearedByChange(field.clearOnChange, descriptor.context.settings[field.key], value).map((key) => [key, ""]),
+  );
 
   if (field.storage === "plugin") {
     if (!descriptor.pluginId) {

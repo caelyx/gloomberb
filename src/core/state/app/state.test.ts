@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { appReducer, createInitialState, resolveCollectionForPane, resolveTickerForPane, type AppState } from "./state";
 import { cloneLayout, createBlankLayout, createDefaultConfig, createPaneInstance, findPaneInstance } from "../../../types/config";
+import { RECENT_COMMANDS_LIMIT } from "./layout";
 import type { AppSessionSnapshot } from "../session-persistence";
-import { removePane } from "../../../plugins/pane-manager";
+import { removePane } from "../../../layout/pane-manager";
 import { buildBrokerPortfolioId } from "../../../utils/broker-instances";
 import { createTestFinancials } from "../../../test-support/data-provider";
 
@@ -93,7 +94,6 @@ describe("resolveTickerForPane", () => {
         },
       },
       focusedPaneId: "ticker-detail:main",
-      activePanel: "right",
       statusBarVisible: true,
       openPaneIds: ["portfolio-list:main", "ticker-detail:main"],
       hydrationTargets: [],
@@ -132,7 +132,6 @@ describe("resolveTickerForPane", () => {
     const sessionSnapshot: AppSessionSnapshot = {
       paneState: {},
       focusedPaneId: "ticker-detail:main",
-      activePanel: "right",
       statusBarVisible: true,
       openPaneIds: ["ticker-detail:main", "chat:main"],
       hydrationTargets: [],
@@ -162,7 +161,6 @@ describe("resolveTickerForPane", () => {
         },
       },
       focusedPaneId: "portfolio-list:main",
-      activePanel: "left",
       statusBarVisible: true,
       openPaneIds: ["portfolio-list:main", "ticker-detail:main"],
       hydrationTargets: [],
@@ -212,7 +210,6 @@ describe("resolveTickerForPane", () => {
         },
       },
       focusedPaneId: "portfolio-list:main",
-      activePanel: "left",
       statusBarVisible: true,
       openPaneIds: ["portfolio-list:main", "ticker-detail:main"],
       hydrationTargets: [],
@@ -343,14 +340,12 @@ describe("pane state updates", () => {
         "ticker-detail:main": { activeTabId: "chart" },
       },
       focusedPaneId: "ticker-detail:main",
-      activePanel: "right",
     };
     const sessionSnapshot: AppSessionSnapshot = {
       paneState: {
         "ticker-detail:main": { activeTabId: "overview" },
       },
       focusedPaneId: "portfolio-list:main",
-      activePanel: "left",
       statusBarVisible: true,
       openPaneIds: ["portfolio-list:main", "ticker-detail:main"],
       hydrationTargets: [],
@@ -362,7 +357,6 @@ describe("pane state updates", () => {
 
     expect(state.paneState["ticker-detail:main"]?.activeTabId).toBe("chart");
     expect(state.focusedPaneId).toBe("ticker-detail:main");
-    expect(state.activePanel).toBe("right");
   });
 });
 
@@ -475,7 +469,7 @@ describe("quote merging", () => {
     initial.financials.set("IQE", createTestFinancials({
       quote: {
         symbol: "IQE.L",
-        providerId: "yahoo",
+        providerId: "gloom",
         price: 0.245,
         currency: "GBP",
         change: -0.021,
@@ -878,31 +872,20 @@ describe("focus restore", () => {
     expect(next.config.layouts[next.config.activeLayoutIndex]?.focusedPaneId).toBe("portfolio-list:main");
   });
 
-  test("preserves the restore source while activating a pane in another panel", () => {
+  test("the deprecated SET_ACTIVE_PANEL focuses the pane at that edge", () => {
     const config = createDefaultConfig("/tmp/gloomberb-test-focus-activation");
-    let state: AppState = {
+    const state: AppState = {
       ...createInitialState(config),
       focusedPaneId: "portfolio-list:main",
       previousFocusedPaneId: null,
-      activePanel: "left" as const,
     };
 
-    state = appReducer(state, { type: "SET_ACTIVE_PANEL", panel: "right", preserveFocus: true });
-    expect(state.activePanel).toBe("right");
-    expect(state.focusedPaneId).toBe("portfolio-list:main");
-    expect(state.previousFocusedPaneId).toBeNull();
+    expect(appReducer(state, { type: "SET_ACTIVE_PANEL", panel: "right", preserveFocus: true })).toBe(state);
 
-    state = appReducer(state, { type: "FOCUS_PANE", paneId: "ticker-detail:main" });
-    expect(state.focusedPaneId).toBe("ticker-detail:main");
-    expect(state.previousFocusedPaneId).toBe("portfolio-list:main");
-
-    const restored = appReducer(state, {
-      type: "UPDATE_LAYOUT",
-      layout: removePane(state.config.layout, "ticker-detail:main"),
-      focusedPaneId: state.previousFocusedPaneId,
-    });
-
-    expect(restored.focusedPaneId).toBe("portfolio-list:main");
+    const right = appReducer(state, { type: "SET_ACTIVE_PANEL", panel: "right" });
+    expect(right.focusedPaneId).toBe("ticker-detail:main");
+    expect(right.previousFocusedPaneId).toBe("portfolio-list:main");
+    expect(appReducer(right, { type: "SET_ACTIVE_PANEL", panel: "left" }).focusedPaneId).toBe("portfolio-list:main");
   });
 });
 
@@ -935,5 +918,40 @@ describe("update checks", () => {
 
     expect(next.updateAvailable?.version).toBe("0.3.2");
     expect(next.updateNotice).toBeNull();
+  });
+});
+
+describe("recent commands ring", () => {
+  // The ring lives in config: a pane run is followed by a layout save that
+  // writes the config as it stands, and a list kept beside it was lost.
+  test("records into config newest first, caps the ring, and promotes a repeat instead of duplicating it", () => {
+    let next = createInitialState(createDefaultConfig("/tmp/gloomberb-test"));
+    for (let index = 0; index < RECENT_COMMANDS_LIMIT + 2; index += 1) {
+      next = appReducer(next, { type: "RECORD_COMMAND", id: `cmd-${index}`, label: `Command ${index}` });
+    }
+    expect(next.config.recentCommands).toHaveLength(RECENT_COMMANDS_LIMIT);
+    expect(next.config.recentCommands[0]?.id).toBe(`cmd-${RECENT_COMMANDS_LIMIT + 1}`);
+    expect(next.config.recentCommands.at(-1)?.id).toBe("cmd-2");
+
+    next = appReducer(next, { type: "RECORD_COMMAND", id: "cmd-2", label: "Command 2" });
+    expect(next.config.recentCommands[0]?.id).toBe("cmd-2");
+    expect(next.config.recentCommands.filter((entry) => entry.id === "cmd-2")).toHaveLength(1);
+  });
+
+  test("keeps separate arguments for the same pane", () => {
+    let next = createInitialState(createDefaultConfig("/tmp/gloomberb-test"));
+    next = appReducer(next, {
+      type: "RECORD_COMMAND",
+      id: "pane-template:ticker-news-pane",
+      label: "Ticker News",
+      arg: "AAPL",
+    });
+    next = appReducer(next, {
+      type: "RECORD_COMMAND",
+      id: "pane-template:ticker-news-pane",
+      label: "Ticker News",
+      arg: "  MSFT  ",
+    });
+    expect(next.config.recentCommands.map((entry) => entry.arg)).toEqual(["MSFT", "AAPL"]);
   });
 });

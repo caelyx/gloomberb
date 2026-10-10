@@ -3,8 +3,10 @@ import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync 
 import { tmpdir } from "os";
 import { join } from "path";
 
+import type { CrashReportsPayload } from "../api-client";
+import { flushCrashReports, installCrashReporter, resetCrashReporterForTests } from "../telemetry/crash-reports";
 import { VERSION } from "../version";
-import { listPluginDirectories, loadExternalPlugin, readPluginCommit } from "./loader";
+import { listPluginDirectories, loadExternalPlugin, readPluginCommit, unresolvedSpecifier } from "./loader";
 
 const scratch: string[] = [];
 
@@ -102,11 +104,85 @@ describe("loadExternalPlugin", () => {
 });
 
 /**
- * Market Heatmap and Market Halts are built in again, and upgraded installs
- * still have their external checkouts. Loaded beside the built-in, one fails
- * on the duplicate id and reports a crash on every launch, so the loader
- * skips it before linking or importing anything, and leaves the folder as it
- * is for an older Gloomberb that may share it.
+ * An import of IBKR Gateway that ran before Interactive Brokers was linked
+ * fails, and Bun keeps that failure for the rest of the process. Loading the
+ * gateway after the sibling arrives needs a restart, not a crash report. A
+ * sibling that really lacks the module is still a failure.
+ */
+describe("a plugin whose sibling plugin was linked after its import failed", () => {
+  afterEach(() => resetCrashReporterForTests());
+
+  function setup(peerFiles: Record<string, string>) {
+    const pluginsDir = mkdtempSync(join(tmpdir(), "gloom-plugins-"));
+    scratch.push(pluginsDir);
+    const folder = (name: string, files: Record<string, string>) => {
+      mkdirSync(join(pluginsDir, name));
+      for (const [file, content] of Object.entries(files)) writeFileSync(join(pluginsDir, name, file), content);
+      return join(pluginsDir, name);
+    };
+    const gateway = folder("gloom-fixture-gateway", {
+      "package.json": JSON.stringify({ name: "gloom-fixture-gateway", main: "index.ts", peerDependencies: { "gloom-fixture-peer": ">=1.0.0" } }),
+      "index.ts": `import { label } from "./plugin";\nexport default { id: "fixture-gateway", name: label };\n`,
+      "plugin.ts": `import { bridge } from "gloom-fixture-peer/bridge";\nexport const label = bridge;\n`,
+    });
+    const addPeer = () => folder("gloom-fixture-peer", { "package.json": JSON.stringify({ name: "gloom-fixture-peer" }), ...peerFiles });
+    const sent: CrashReportsPayload[] = [];
+    resetCrashReporterForTests();
+    installCrashReporter({
+      surface: "terminal",
+      isEnabled: () => true,
+      getInstallId: () => "0f1e2d3c-4b5a-4968-8776-655443322110",
+      send: async (payload) => { sent.push(payload); },
+    });
+    return { gateway, addPeer, sent };
+  }
+
+  test("asks for a restart when the module is there now", async () => {
+    const { gateway, addPeer, sent } = setup({ "bridge.ts": `export const bridge = "Fixture Gateway";\n` });
+    await import(join(gateway, "index.ts")).catch(() => {});
+    addPeer();
+
+    const loaded = await loadExternalPlugin(gateway, "cli", { fresh: true });
+    await flushCrashReports({ timeoutMs: 500 });
+
+    expect({ needsRestart: loaded?.needsRestart, error: loaded?.error }).toEqual({ needsRestart: true, error: undefined });
+    expect(sent).toEqual([]);
+  });
+
+  test("still fails and reports a module the sibling does not have", async () => {
+    const { gateway, addPeer, sent } = setup({ "index.ts": `export default { id: "fixture-peer", name: "Fixture Peer" };\n` });
+    addPeer();
+
+    const loaded = await loadExternalPlugin(gateway, "cli", { fresh: true });
+    await flushCrashReports({ timeoutMs: 500 });
+
+    // Bun 1.3 names the module, 1.4 the package alone.
+    const unresolved = /Cannot find (?:module 'gloom-fixture-peer\/bridge'|package 'gloom-fixture-peer')/;
+    expect(loaded?.needsRestart).toBeUndefined();
+    expect(loaded?.error).toMatch(unresolved);
+    expect(sent.flatMap((payload) => payload.errors.map((error) => error.message))).toEqual([
+      expect.stringMatching(unresolved),
+    ]);
+  });
+
+  test("checks the subpath when the message names only the package", () => {
+    // Bun 1.4's wording for `import "gloom-fixture-peer/bridge"`: the peer's
+    // index exists, so judging by the package alone would ask for a restart.
+    const err = Object.assign(new Error("Cannot find package 'gloom-fixture-peer' imported from /plugins/gloom-fixture-gateway/plugin.ts"), {
+      code: "ERR_MODULE_NOT_FOUND",
+      specifier: "gloom-fixture-peer/bridge",
+    });
+    expect(unresolvedSpecifier(err, err.message)).toBe("gloom-fixture-peer/bridge");
+    expect(unresolvedSpecifier(new Error("x"), "Cannot find module 'gloom-fixture-peer/bridge' from '/plugins/a.ts'")).toBe("gloom-fixture-peer/bridge");
+  });
+});
+
+/**
+ * Market Heatmap, Market Halts and Fear & Greed are built in again, and
+ * upgraded installs still have their external checkouts. Loaded beside the
+ * built-in, one fails on the duplicate id and reports a crash on every launch,
+ * so the loader skips it before linking or importing anything, and leaves the
+ * folder as it is for an older Gloomberb that may share it.
  */
 describe("leftover checkouts of plugins that are built in now", () => {
   const imported = `throw new Error("imported");\n`;
@@ -121,13 +197,15 @@ describe("leftover checkouts of plugins that are built in now", () => {
       return join(parent, name);
     };
     folder(pluginsDir, "gloom-market-heatmap", { "index.ts": imported });
+    folder(pluginsDir, "gloom-fear-greed", { "index.ts": imported });
     folder(pluginsDir, "gloomberb-market-halts", { "index.ts": imported });
     folder(pluginsDir, "heatmap-fork", { "gloom.json": JSON.stringify({ id: "market-heatmap" }), "index.ts": imported });
     symlinkSync(folder(devDir, "gloom-market-halts", { "index.ts": imported }), join(pluginsDir, "gloom-market-halts"), "dir");
     folder(pluginsDir, "weather", { "index.ts": `export default { id: "weather", name: "Weather" };\n` });
 
     expect(await listPluginDirectories(pluginsDir)).toEqual([join(pluginsDir, "weather")]);
-    for (const name of ["gloom-market-heatmap", "gloomberb-market-halts", "heatmap-fork", "gloom-market-halts"]) {
+    const leftovers = ["gloom-market-heatmap", "gloom-fear-greed", "gloomberb-market-halts", "heatmap-fork", "gloom-market-halts"];
+    for (const name of leftovers) {
       const dir = join(pluginsDir, name);
       expect(await loadExternalPlugin(dir)).toBeNull();
       expect(existsSync(join(dir, "node_modules"))).toBe(false);

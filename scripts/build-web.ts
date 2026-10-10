@@ -1,9 +1,6 @@
 import { mkdir, readFile, rm, writeFile } from "fs/promises";
 import { join, relative } from "path";
-import { TITLEBAR_OVERLAY_HEIGHT_PX } from "../src/components/layout/titlebar-overlay";
-import {
-  electrobunViewAliasPlugin,
-} from "../src/renderers/electrobun/view/build-assets";
+import { buildViewBundle } from "../src/renderers/dom/build-assets";
 import type { WebBundledPluginDescriptor } from "../src/plugins/web-bundled";
 import { isProxiedHost, PROXY_ALLOWED_HOSTS } from "../src/utils/plugin-proxy-hosts";
 import { compileWebBundledPlugins } from "./web-plugins";
@@ -15,6 +12,25 @@ await mkdir(outdir, { recursive: true });
 // Tabs get the plain mark, like gloom.sh; the app icon tile is too small to read at 16px.
 await writeFile(join(outdir, "favicon.svg"), await readFile(join(root, "src/assets/gloomberb-mark.svg")));
 await writeFile(join(outdir, "favicon.ico"), await readFile(join(root, "src/assets/gloomberb-mark.ico")));
+// A web app manifest makes the browser offer "Install Gloomberb": the terminal
+// then gets its own window and a Dock or taskbar icon. People who start in the
+// browser come back far less often than people with the app installed.
+await writeFile(join(outdir, "app-icon-256.png"), await readFile(join(root, "icon.iconset/icon_256x256.png")));
+await writeFile(join(outdir, "app-icon-512.png"), await readFile(join(root, "icon.iconset/icon_512x512.png")));
+await writeFile(join(outdir, "manifest.webmanifest"), `${JSON.stringify({
+  name: "Gloomberb",
+  short_name: "Gloomberb",
+  description: "An open-source financial terminal.",
+  start_url: "/",
+  scope: "/",
+  display: "standalone",
+  // The loading screen's colour; the window colours follow the chosen theme.
+  background_color: "#272a34",
+  icons: [
+    { src: "/app-icon-256.png", sizes: "256x256", type: "image/png" },
+    { src: "/app-icon-512.png", sizes: "512x512", type: "image/png" },
+  ],
+}, null, 2)}\n`);
 
 async function buildPage(
   name: string,
@@ -24,29 +40,15 @@ async function buildPage(
   htmlName: string,
   extraDefines: Record<string, string> = {},
 ) {
-  const assetsDir = join(outdir, "assets", name);
-  const result = await Bun.build({
-    entrypoints: [entrypoint],
-    outdir: assetsDir,
-    target: "browser",
-    format: "esm",
-    splitting: false,
-    minify: true,
+  const { script, stylesheet } = await buildViewBundle({
+    entrypoint,
+    outdir: join(outdir, "assets", name),
     sourcemap: "none",
-    define: {
-      "process.env.NODE_ENV": '"production"',
-      __GLOOMBERB_API_URL__: "location.origin",
-      ...extraDefines,
-    },
-    plugins: [electrobunViewAliasPlugin(`browser-${name}-native-stubs`)],
+    define: { __GLOOMBERB_API_URL__: "location.origin", ...extraDefines },
+    failureMessage: `Failed to build the ${name} web page`,
+    missingEntryMessage: `${name} build did not emit JavaScript`,
   });
-  if (!result.success) throw new Error(result.logs.map((log) => log.message).join("\n"));
-  const script = result.outputs.find((output) => output.kind === "entry-point" && output.path.endsWith(".js"));
-  const stylesheet = result.outputs.find((output) => output.path.endsWith(".css"));
-  if (!script || !stylesheet) throw new Error(`${name} build did not emit JavaScript and CSS`);
-  const css = (await readFile(stylesheet.path, "utf8"))
-    .replaceAll("__TITLEBAR_OVERLAY_HEIGHT_PX__", String(TITLEBAR_OVERLAY_HEIGHT_PX));
-  await writeFile(stylesheet.path, css);
+  if (!stylesheet) throw new Error(`${name} build did not emit CSS`);
   const href = (path: string) => `/${relative(outdir, path).replaceAll("\\", "/")}`;
   await writeFile(join(outdir, htmlName), `<!doctype html>
 <html lang="en">
@@ -56,11 +58,13 @@ async function buildPage(
   <title>${title}</title>
   <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="${href(stylesheet.path)}">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/app-icon-256.png">
+  <link rel="stylesheet" href="${href(stylesheet)}">
 </head>
 <body>
   <div id="root"><div class="gloom-loading">${loadingText}</div></div>
-  <script type="module" src="${href(script.path)}"></script>
+  <script type="module" src="${href(script)}"></script>
 </body>
 </html>\n`);
 }

@@ -81,19 +81,25 @@ function getNumberFormatter(
   return formatter;
 }
 
-function getCurrencySymbol(currency: string): string {
+/** The currency's symbol as prices show it (A$, €, CHF); a code Intl rejects shows as itself. */
+export function getCurrencySymbol(currency: string): string {
   const normalizedCurrency = currency.trim().toUpperCase() || "USD";
   const cached = currencySymbols.get(normalizedCurrency);
   if (cached) return cached;
 
-  const formatter = new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: normalizedCurrency,
-    currencyDisplay: "symbol",
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 0,
-  });
-  const symbol = formatter.formatToParts(0).find((part) => part.type === "currency")?.value ?? normalizedCurrency;
+  let symbol = normalizedCurrency;
+  try {
+    const formatter = new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: normalizedCurrency,
+      currencyDisplay: "symbol",
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 0,
+    });
+    symbol = formatter.formatToParts(0).find((part) => part.type === "currency")?.value ?? normalizedCurrency;
+  } catch {
+    // A malformed code (free text typed as a position currency) has no symbol.
+  }
   currencySymbols.set(normalizedCurrency, symbol);
   return symbol;
 }
@@ -311,10 +317,33 @@ export function formatMarketQuantity(value: number | undefined, options: MarketF
   return formatVariableNumber(value, maxFractionDigits, options.maxWidth);
 }
 
+const EIGHTHS = ["", "⅛", "¼", "⅜", "½", "⅝", "¾", "⅞"];
+
+/**
+ * A Treasury future's price the way traders read it: whole points, then 32nds
+ * with the eighth-of-a-32nd tick as a fraction (104.484375 is 104-15½, ZT's
+ * 103.0078125 is 103-00¼). An adjusted generic off that grid keeps its 32nds
+ * to two decimals (104-15.37).
+ */
+export function formatThirtySeconds(value: number): string {
+  const sign = value < 0 ? "-" : "";
+  const eighths = Math.abs(value) * 256;
+  const whole = Math.round(eighths);
+  if (Math.abs(eighths - whole) > 1e-6) {
+    const points = Math.floor(Math.abs(value));
+    return `${sign}${points}-${((Math.abs(value) - points) * 32).toFixed(2).padStart(5, "0")}`;
+  }
+  const points = Math.floor(whole / 256);
+  const rest = whole - points * 256;
+  return `${sign}${points}-${String(Math.floor(rest / 8)).padStart(2, "0")}${EIGHTHS[rest % 8]}`;
+}
+
 export function formatMarketPrice(value: number | undefined, options: MarketFormatOptions = {}): string {
   if (value === undefined || value === null || Number.isNaN(value)) return "—";
   const basis = resolvePriceBasis(options.priceBasis, options.assetCategory);
   if (basis === null) return "—";
+  if (basis === "thirty-seconds") return formatThirtySeconds(value);
+  if (basis === "points") return formatMarketPrice(value, { ...options, priceBasis: "per-unit" });
   if (basis === "percent-of-par") {
     const maxWidth = options.maxWidth == null ? undefined : Math.max(1, options.maxWidth - 5);
     return `${formatMarketPrice(value, { ...options, priceBasis: "per-unit", maxWidth })}% par`;
@@ -354,6 +383,8 @@ export function formatMarketCost(value: number | undefined, options: MarketForma
   if (value === undefined || value === null || Number.isNaN(value)) return "—";
   const basis = resolvePriceBasis(options.priceBasis, options.assetCategory);
   if (basis === null) return "—";
+  if (basis === "thirty-seconds") return formatThirtySeconds(value);
+  if (basis === "points") return formatMarketCost(value, { ...options, priceBasis: "per-unit" });
   if (basis === "percent-of-par") {
     const maxWidth = options.maxWidth == null ? undefined : Math.max(1, options.maxWidth - 5);
     return `${formatMarketCost(value, { ...options, priceBasis: "per-unit", maxWidth })}% par`;

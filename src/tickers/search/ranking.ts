@@ -2,8 +2,9 @@ import type {
   TickerSearchInstrumentClass,
   TickerSearchRankableItem,
 } from "./types";
-import { getYahooSymbol, tickerHasYahooSuffix } from "../../sources/yahoo-finance/symbols";
+import { getListingSymbol, tickerHasListingSuffix } from "../../sources/listing-symbols";
 import { canonicalExchange, parsePublicTickerKey } from "../../utils/exchanges";
+import { assetClassKeeps, assetClassMarketSymbol, instrumentClassCode, parseAssetClassQuery } from "./asset-classes";
 
 const FUND_TYPES = new Set(["ETF", "ETN", "ETP", "FUND", "MUTUALFUND", "CEF", "CLOSEDEND"]);
 const DERIVATIVE_TYPES = new Set(["OPT", "OPTION", "OPTIONS", "FUT", "FUTURE", "FUTURES", "WARRANT", "WARRANTS", "RIGHT", "RIGHTS"]);
@@ -112,7 +113,7 @@ export function isCryptoInstrumentType(type?: string): boolean {
 
 function isQualifiedTickerQuery(query: string): boolean {
   const symbol = normalizeTickerSymbol(query);
-  return isExplicitMarketSymbol(symbol) || !!parsePublicTickerKey(symbol).exchange || tickerHasYahooSuffix(symbol);
+  return isExplicitMarketSymbol(symbol) || !!parsePublicTickerKey(symbol).exchange || tickerHasListingSuffix(symbol);
 }
 
 /** Futures, currency pairs, and indices use punctuation as part of their identity. */
@@ -151,7 +152,7 @@ function matchesQualifiedTicker(
     const pair = forexPair(requested.symbol);
     return candidate.symbol === requested.symbol || (pair != null && forexPair(candidate.symbol) === pair);
   }
-  return exchanges.some((exchange) => getYahooSymbol(candidate.symbol, exchange).toUpperCase() === normalized);
+  return exchanges.some((exchange) => getListingSymbol(candidate.symbol, exchange).toUpperCase() === normalized);
 }
 
 function getTickerSearchListingKey(item: Pick<TickerSearchRankableItem, "label"> & Partial<TickerSearchRankableItem>): string {
@@ -163,12 +164,23 @@ function getTickerSearchListingKey(item: Pick<TickerSearchRankableItem, "label">
 
 export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "id" | "label" | "detail" | "kind" | "category" | "right"> & Partial<TickerSearchRankableItem>>(
   items: T[],
-  query: string,
+  rawQuery: string,
 ): T[] {
+  // A trailing class code ("ES FUT") keeps only rows of that class and ranks
+  // the words before it.
+  const assetClass = parseAssetClassQuery(rawQuery);
+  const query = assetClass?.symbolQuery ?? rawQuery;
   const intent = analyzeSearchQuery(query);
   if (!intent.normalizedQuery) return items;
 
-  const ranked = items
+  const ranked = (assetClass
+    ? items.filter((item) => assetClassKeeps(assetClass.code, instrumentClassCode({
+      instrumentClass: item.instrumentClass,
+      instrumentType: item.instrumentType,
+      symbol: item.symbol || item.label,
+      exchange: item.exchangeLabel || item.right,
+    })))
+    : items)
     .map((item, index) => {
       // A saved public key replaces its provider row during deduplication.
       // Score its exact bare symbol like that row, retaining the saved identity
@@ -247,8 +259,28 @@ export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "
   promoteMuchMorePopularCompanies(filtered);
 
   type RankedEntry = (typeof ranked)[number];
+  // One exact symbol can name several companies (NET is Cloudflare in New York
+  // and Netcall in London). Saved listings come first, then each company ranks
+  // by its earliest listing position in the returned search order.
+  // Without this, a name that starts with the symbol (Netcall) or the boost for
+  // stocks over funds (GLD) put a thinly traded company first.
+  const exactIssuerRank = new Map<string, number>();
+  const exactIssuerKey = (entry: RankedEntry) => getIssuerGroupKey(entry.item.detail) || `item:${entry.index}`;
+  for (const entry of filtered) {
+    if (entry.symbolMatchRank !== 4 || entry.item.providerRank == null) continue;
+    const key = exactIssuerKey(entry);
+    exactIssuerRank.set(key, Math.min(entry.item.providerRank, exactIssuerRank.get(key) ?? Number.POSITIVE_INFINITY));
+  }
   const compareFallbackEntries = (a: RankedEntry, b: RankedEntry): number => {
     if (b.symbolMatchRank !== a.symbolMatchRank) return b.symbolMatchRank - a.symbolMatchRank;
+    if (a.symbolMatchRank === 4) {
+      const aSaved = isSavedSearchItem(a.item);
+      const bSaved = isSavedSearchItem(b.item);
+      if (aSaved !== bSaved) return aSaved ? -1 : 1;
+      const aIssuerRank = exactIssuerRank.get(exactIssuerKey(a)) ?? Number.POSITIVE_INFINITY;
+      const bIssuerRank = exactIssuerRank.get(exactIssuerKey(b)) ?? Number.POSITIVE_INFINITY;
+      if (aIssuerRank !== bIssuerRank) return aIssuerRank - bIssuerRank;
+    }
     if (b.score !== a.score) return b.score - a.score;
     const aSaved = isSavedSearchItem(a.item);
     const bSaved = isSavedSearchItem(b.item);
@@ -335,7 +367,7 @@ export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "
       if (aSynthetic !== bSynthetic) return aSynthetic ? 1 : -1;
       // A company searched by name leads with its home listing when the
       // provider types the other line as a receipt. An exact ticker search
-      // (ASML) keeps provider order, and untyped ADRs (Yahoo's TM) cannot be
+      // (ASML) keeps provider order, and untyped ADRs (Gloom's TM) cannot be
       // told apart from a second home listing, so they stay in provider order.
       if (a.nameOnly && b.nameOnly) {
         const aReceipt = isDepositaryReceiptType(a.item.instrumentType);
@@ -357,6 +389,13 @@ export function rankTickerSearchItems<T extends Pick<TickerSearchRankableItem, "
     seen.add(key);
     deduped.push(entry.item);
   }
+  // "BTC CUR" means BTC-USD, which the word ranking puts behind wrapped coins
+  // whose names contain "BTC".
+  const marketSymbol = assetClass ? assetClassMarketSymbol(assetClass) : null;
+  const marketIndex = marketSymbol
+    ? deduped.findIndex((item) => parsePublicTickerKey(item.symbol || item.label).symbol === marketSymbol)
+    : -1;
+  if (marketIndex > 0) deduped.unshift(...deduped.splice(marketIndex, 1));
   return deduped;
 }
 
@@ -630,7 +669,7 @@ function getCompanyNameKey(detail: string): string {
   return normalizeCompanyName(detail.split("|")[0] || "");
 }
 
-function getIssuerGroupKey(detail: string): string {
+export function getIssuerGroupKey(detail: string): string {
   // Listing descriptions do not create a different issuer. Strip only these
   // recognized tails for grouping, preserving full names and query relevance.
   const issuer = normalizeSearchText(detail.split("|")[0] || "")

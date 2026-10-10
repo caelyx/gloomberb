@@ -7,7 +7,7 @@
 /** Reported talks, a signed or launched deal, or its end. */
 export type MnaStatus = "talks" | "pending" | "completed" | "terminated";
 
-export type MnaConsideration = "cash" | "stock" | "mixed" | "undisclosed";
+type MnaConsideration = "cash" | "stock" | "mixed" | "undisclosed";
 
 export interface MnaParty {
   name: string;
@@ -55,6 +55,10 @@ export interface MnaDeal {
   /** One line on the latest development. */
   headline: string;
   updatedAt: string;
+  /** The last day a story or filing reported on the deal. */
+  lastReported: string;
+  /** A pending private deal with no news for six months; nothing will report it closing. */
+  stale: boolean;
 }
 
 export type MnaStatusFilter = MnaStatus | "all";
@@ -84,7 +88,7 @@ export interface MnaDealsPayload {
   asOf: string;
 }
 
-export type MnaEventKind =
+type MnaEventKind =
   | "talks"
   | "announced"
   | "amended"

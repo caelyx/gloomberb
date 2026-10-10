@@ -18,7 +18,7 @@ export interface RiskStatistic {
   rank: HistoryStatistics;
   history: Array<{ date: string; value: number | null }>;
 }
-export const RISK_WINDOW = 60;
+const RISK_WINDOW = 60;
 const interval = (point: DatedReturn) =>
   `${point.startDateKey}/${point.dateKey}`;
 const valid = (point: DatedReturn) =>
@@ -27,7 +27,7 @@ const valid = (point: DatedReturn) =>
   point.value > -1;
 export const compoundReturns = (values: readonly number[]) =>
   values.reduce((wealth, value) => wealth * (1 + value), 1) - 1;
-export function drawdownPath(values: readonly number[]) {
+function drawdownPath(values: readonly number[]) {
   let wealth = 1,
     peak = 1;
   return values.map((value) => {
@@ -36,7 +36,7 @@ export function drawdownPath(values: readonly number[]) {
     return wealth / peak - 1;
   });
 }
-export function sampleVolatility(values: readonly number[]): number | null {
+function sampleVolatility(values: readonly number[]): number | null {
   if (values.length < 2) return null;
   const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
   return (
@@ -82,26 +82,46 @@ export interface Regression {
   startDate: string;
   asOf: string;
 }
+/**
+ * A series is indexed once by interval: the correlation view regresses each
+ * basket holding against every other, and rolling betas reuse one factor for
+ * every window. Return series are never mutated after they are built.
+ */
+const intervalIndex = new WeakMap<readonly DatedReturn[], Map<string, number>>();
+function byInterval(series: readonly DatedReturn[]): Map<string, number> {
+  let index = intervalIndex.get(series);
+  if (!index) {
+    index = new Map(
+      series
+        .filter(
+          (point) =>
+            point.startDateKey < point.dateKey && Number.isFinite(point.value),
+        )
+        .map((point) => [interval(point), point.value]),
+    );
+    intervalIndex.set(series, index);
+  }
+  return index;
+}
 /** Matched start and end dates prevent pairing a multi-session return with a daily one. */
 export function regressReturns(
   asset: readonly DatedReturn[],
   factor: readonly DatedReturn[],
   minimum = 60,
 ): Regression | null {
-  const other = new Map(
-    factor
-      .filter(
-        (point) =>
-          point.startDateKey < point.dateKey && Number.isFinite(point.value),
-      )
-      .map((point) => [interval(point), point.value]),
-  );
-  const sample = asset
-    .filter(valid)
-    .filter((point) => other.has(interval(point)));
+  const other = byInterval(factor);
+  const sample: DatedReturn[] = [],
+    x: number[] = [],
+    y: number[] = [];
+  for (const point of asset) {
+    if (!valid(point)) continue;
+    const matched = other.get(interval(point));
+    if (matched === undefined) continue;
+    sample.push(point);
+    x.push(matched);
+    y.push(point.value);
+  }
   if (sample.length < minimum) return null;
-  const x = sample.map((point) => other.get(interval(point))!),
-    y = sample.map((point) => point.value);
   const meanX = x.reduce((a, b) => a + b, 0) / x.length,
     meanY = y.reduce((a, b) => a + b, 0) / y.length;
   let xx = 0,

@@ -2,6 +2,8 @@ import { resolveCanonicalQuote } from "../../../market-data/quotes/resolution";
 import { expect, test } from "bun:test";
 import type { HeadlessPaneContext, HeadlessPaneLoadArgs } from "../../../types/headless";
 import { createTestDataProvider } from "../../../test-support/data-provider";
+import { createTestHeadlessContext } from "../../../test-support/headless";
+import type { QuoteContribution } from "../../../types/financials";
 import { renderHeadlessPaneText } from "../../../cli/pane-functions/headless";
 import { financialStatementsHeadless, historicalPricesHeadless, quoteComparisonHeadless } from "./headless";
 
@@ -61,6 +63,31 @@ test("financial exports distinguish provider dates from SEC period evidence and 
   expect(result.columns?.find(({ key }) => key === "2023-08-31")?.header).toContain("provider date");
 });
 
+test("financial exports put share counts in ADRs only for the periods the service says count receipts", async () => {
+  // BHP on NYSE from Gloom Cloud: FY2026 and FY2025 on the receipts, 2 ordinary shares each.
+  const fy = (date: string, shareBasis: "depositary_receipt" | undefined, ordinarySharesNumber: number) => ({
+    date, currency: "USD", ...(shareBasis ? { shareBasis } : {}), ordinarySharesNumber, totalAssets: 100e9,
+  });
+  const load = (annualStatements: ReturnType<typeof fy>[]) => financialStatementsHeadless.load(args(["BHP:NYSE"], { period: "annual", statement: "balance" }), {
+    marketData: createTestDataProvider({ async getTickerFinancials() {
+      return { fundamentals: { isDepositaryReceipt: true, adrRatio: 2, shareBasis: "depositary_receipt" as const }, annualStatements, quarterlyStatements: [], priceHistory: [] };
+    } }),
+  } as HeadlessPaneContext);
+
+  const receipts = await load([fy("2025-06-30", "depositary_receipt", 2_536_000_000), fy("2026-06-30", "depositary_receipt", 2_540_081_549)]);
+  expect(receipts.rows.find((row) => row.id === "ordinarySharesNumber:1")?.metric).toBe("Ordinary Shares (bn ADRs)");
+  expect(receipts.metadata).toMatchObject({ shareBasis: "depositary_receipt", adrRatio: 2 });
+  expect(receipts.metadata?.notices).toContain("Share counts are in ADRs and EPS is per ADR; 1 ADR = 2 ordinary shares.");
+
+  // An older period the service left unclaimed still counts ordinaries: no label, and no growth across the bases.
+  const mixed = await load([fy("2025-06-30", undefined, 5_080_163_098), fy("2026-06-30", "depositary_receipt", 2_540_081_549)]);
+  const ordinary = mixed.rows.find((row) => row.id === "ordinarySharesNumber:1")!;
+  expect(ordinary.metric).toBe("Ordinary Shares (bn)");
+  expect((ordinary.cells as Array<{ growth: number | null }>)[0]!.growth).toBeNull();
+  expect(mixed.metadata?.shareBasis).toBeNull();
+  expect(mixed.metadata?.notices).toContain("Share counts are in ADRs and EPS is per ADR for 2026-06-30 (1 ADR = 2 ordinary shares); other periods as reported.");
+});
+
 test("quote comparison retains successful exchange-qualified inputs when a peer fails", async () => {
   const ctx = {
     signal: new AbortController().signal,
@@ -74,7 +101,7 @@ test("quote comparison retains successful exchange-qualified inputs when a peer 
     }),
   } as HeadlessPaneContext;
   const result = await quoteComparisonHeadless.load(args(["ABC", "MISSING"]), ctx);
-  expect(result.rows).toEqual([{ symbol: "ABC", name: "Company", price: 105, change: 5, changePercent: 5, currency: "USD", marketCap: null, updatedAt: 123 }]);
+  expect(result.rows).toEqual([{ symbol: "ABC", name: "Company", price: 105, change: 5, changePercent: 5, currency: "USD", marketCap: null, updatedAt: 123, stale: false }]);
   expect(result.unavailableSymbols).toEqual(["MISSING"]);
   expect(result.errors).toEqual(["MISSING: No quote"]);
 });
@@ -99,7 +126,7 @@ test("quote monitor exports retain FX precision and small changes without alteri
 
 test("historical prices use remembered exchanges and clip and sort the full OHLCV history", async () => {
   const requests: unknown[] = [];
-  const ctx = {
+  const ctx = createTestHeadlessContext({
     resolveInstrument: async () => ({ symbol: "ABC", exchange: "LSE" }),
     marketData: createTestDataProvider({
       async getPriceHistory(...request) {
@@ -111,7 +138,7 @@ test("historical prices use remembered exchanges and clip and sort the full OHLC
         ];
       },
     }),
-  } as HeadlessPaneContext;
+  });
   const result = await historicalPricesHeadless.load(args(["ABC"], { range: "1M" }), ctx);
   expect(requests).toEqual([["ABC", "LSE", "1M"]]);
   expect(result.rows.map((row) => row.close)).toEqual([18, 22]);
@@ -148,12 +175,14 @@ test("financial JSON exports preserve selected metric availability separately fr
 
 
 test("canonical missing changes survive JSON roundtrip into default Quote Monitor text beside zero and derived change", async () => {
-  const base = { symbol: "MISSING", price: 12, currency: "USD", lastUpdated: Date.now(), marketState: "CLOSED" };
-  const inputs = [base, { ...base, symbol: "ZERO", change: 0, changePercent: 0 }, { ...base, symbol: "DERIVED", previousClose: 10 }];
+  const base = { symbol: "MISSING", providerId: "test-provider", price: 12, currency: "USD", lastUpdated: Date.now(), marketState: "CLOSED" as const };
+  // A provider can leave the daily change out, which the contribution type does not model.
+  const withoutChange = (quote: Omit<QuoteContribution, "change" | "changePercent">) => quote as QuoteContribution;
+  const inputs = [withoutChange(base), { ...base, symbol: "ZERO", change: 0, changePercent: 0 }, withoutChange({ ...base, symbol: "DERIVED", previousClose: 10 })];
   const quotes = inputs.map(quote => resolveCanonicalQuote({ quote }).quote!);
   expect(quotes[0]!.change).toBeNaN();
   expect(quotes[0]!.changePercent).toBeNaN();
-  const ctx = { signal: new AbortController().signal, marketData: createTestDataProvider({ getQuote: async symbol => quotes.find(quote => quote.symbol === symbol)! }) } as HeadlessPaneContext;
+  const ctx = createTestHeadlessContext({ marketData: createTestDataProvider({ getQuote: async symbol => quotes.find(quote => quote.symbol === symbol)! }) });
   const input = args(["MISSING", "ZERO", "DERIVED"]);
   const model = await quoteComparisonHeadless.load(input, ctx);
   const transported = JSON.parse(JSON.stringify(model));

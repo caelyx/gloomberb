@@ -62,6 +62,7 @@ describe("import boundaries", () => {
       }
       if (specifier === "react-dom" || specifier.startsWith("react-dom/")) {
         return ![
+          "src/renderers/dom/",
           "src/renderers/electrobun/",
           "src/renderers/browser/",
           "src/renderers/share/",
@@ -69,6 +70,29 @@ describe("import boundaries", () => {
       }
       return false;
     });
+
+    expect(violations).toEqual([]);
+  });
+
+  test("built-in code imports the host by relative path, not through gloomberb/*", async () => {
+    // `gloomberb/*` is the external-plugin API. Bun on Linux resolves it as a
+    // package self-reference, so typecheck and tests pass, but the Windows
+    // desktop bundle cannot resolve it. The plugin host's comments and the
+    // smoke plugin's source string name these specifiers, so read the imports
+    // the bundler sees rather than matching text.
+    const transpilers = {
+      ts: new Bun.Transpiler({ loader: "ts" }),
+      tsx: new Bun.Transpiler({ loader: "tsx" }),
+    };
+    const violations: Array<{ file: string; specifier: string }> = [];
+    for (const file of await collectSourceFiles(SOURCE_ROOT)) {
+      const transpiler = file.endsWith(".tsx") ? transpilers.tsx : transpilers.ts;
+      for (const { path: specifier } of transpiler.scanImports(await Bun.file(file).text())) {
+        if (specifier === "gloomberb" || specifier.startsWith("gloomberb/")) {
+          violations.push({ file: relative(process.cwd(), file), specifier });
+        }
+      }
+    }
 
     expect(violations).toEqual([]);
   });

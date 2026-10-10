@@ -1,7 +1,7 @@
 import { createCliRenderer, type CliRenderer } from "@opentui/core";
 import { createRoot, useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { Profiler, type ReactNode } from "react";
-import { resetTerminalInputState } from "../../utils/terminal-input-reset";
+import { resetTerminalInputState } from "./terminal-input-reset";
 import type { KeyEventLike } from "../../react/input";
 import type { NativeRendererHost, PixelResolution, RendererHost } from "../../ui/host";
 import { colors } from "../../theme/colors";
@@ -9,6 +9,7 @@ import { safeExternalUrl } from "../../utils/external-url";
 import { buildTerminalMediaArgs, createTerminalMediaReaper, terminalMediaStateFile } from "./terminal-media";
 import { saveTextFileToDownloads } from "../../utils/save-text-file";
 import { installInteractionPerformanceRecorder } from "./interaction-performance";
+import { provideKittyServices } from "./kitty-services";
 import {
   createTimerFrameDriver,
   installMarketDataFrameDriver,
@@ -107,6 +108,11 @@ export async function createOpenTuiHost(): Promise<OpenTuiHost> {
     enableMouseMovement: true,
   });
   const root = createRoot(renderer);
+  // Every mounted ScrollBox listens for `selection` and many components for
+  // `resize`, so the counts grow with the panes on screen (14 and 18 with one
+  // DES open at 80x24) and fall back when they close. Node's default warning
+  // at 11 is not a leak here, and it prints over the panes.
+  renderer.setMaxListeners(0);
   installResolutionEventBridge(renderer);
   // Streamed quotes apply and notify on one clock of up to 10 Hz: every
   // visible row stays live while a burst of ticks costs one terminal redraw,
@@ -125,11 +131,17 @@ export async function createOpenTuiHost(): Promise<OpenTuiHost> {
         : process.platform === "win32"
           ? ["cmd", "/c", "start", "", url]
           : ["xdg-open", url];
-      const proc = Bun.spawn(command, {
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      await proc.exited;
+      try {
+        const proc = Bun.spawn(command, {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        if (await proc.exited === 0) return;
+      } catch {
+        // No opener installed (xdg-open is missing on minimal Linux and WSL).
+      }
+      // Leave the link on the clipboard, so it can at least be pasted.
+      renderer.copyToClipboardOSC52(url);
     },
     async copyText(text) {
       if (!text) return;
@@ -194,7 +206,7 @@ export async function createOpenTuiHost(): Promise<OpenTuiHost> {
     },
   };
 
-  const nativeRenderer: NativeRendererHost = {
+  const nativeRenderer = provideKittyServices({
     get terminalWidth() {
       return renderer.terminalWidth;
     },
@@ -257,7 +269,7 @@ export async function createOpenTuiHost(): Promise<OpenTuiHost> {
       writer.call(renderer, data);
       return true;
     },
-  };
+  });
 
   return {
     renderer,

@@ -1,7 +1,18 @@
+import { creditDocumentsModule } from "./builtin/credit-documents";
+import { attentionModule } from "./builtin/attention";
+import { companyAttentionModule } from "./builtin/company-attention";
+import { catalystsModule } from "./builtin/catalysts";
+import { companyKpisModule } from "./builtin/company-kpis";
+import { powerModule } from "./builtin/power";
+import { perpsModule } from "./builtin/perps";
+import { exposureModule } from "./builtin/exposure";
+import { supplyChainModule } from "./builtin/supply-chain";
+import { awardsModule } from "./builtin/awards";
 import { debtMaturitiesModule } from "./builtin/debt-maturities";
 import { revenueBreakdownModule } from "./builtin/revenue-breakdown";
 import { mnaModule } from "./builtin/mna";
 import { cryptoBoardModule } from "./builtin/crypto-board";
+import { shortInterestModule } from "./builtin/short-interest";
 import { shortVolumeModule } from "./builtin/short-volume";
 import { socialMentionsModule } from "./builtin/social-mentions";
 import { timeSalesModule } from "./builtin/time-sales";
@@ -18,6 +29,12 @@ import { researchSearchPlugin } from "./builtin/research-search";
 import { alertsPlugin } from "./builtin/alerts";
 import { marketHeatmapPlugin } from "./builtin/market-heatmap";
 import { marketHaltsPlugin } from "./builtin/market-halts";
+import { fearGreedPlugin } from "./builtin/fear-greed";
+import { membersPlugin } from "./builtin/members";
+import { ipoCalendarPlugin } from "./builtin/ipo-calendar";
+import { clinicalTrialsPlugin } from "./builtin/clinical-trials";
+import { commentLettersPlugin } from "./builtin/comment-letters";
+import { openFdaPlugin } from "./builtin/openfda";
 import { browserGloomberbCloudPlugin } from "./builtin/cloud/browser";
 import { changelogModule } from "./builtin/changelog";
 import { chartComposerModule } from "./builtin/chart-composer";
@@ -26,14 +43,18 @@ import { relativeRotationModule } from "./builtin/relative-rotation";
 import { equityScreenerModule } from "./builtin/equity-screener";
 import { correlationModule } from "./builtin/correlation";
 import { cdsModule } from "./builtin/cds";
+import { creditBoardsModule } from "./builtin/credit-boards";
 import { creditConditionsModule } from "./builtin/credit-conditions";
 import { marketValuationModule } from "./builtin/market-valuation";
 import { macroSharedResourcesModule } from "./builtin/macro-resources";
 import { economicCalendarModule } from "./builtin/econ";
+import { cpiModule } from "./builtin/cpi";
 import { econStatisticsModule } from "./builtin/econ-statistics";
 import { futuresModule } from "./builtin/futures";
 import { futuresCurveModule } from "./builtin/futures-curve";
 import { cotModule } from "./builtin/cot";
+import { doeModule } from "./builtin/doe";
+import { gpuModule } from "./builtin/gpu";
 import { fxMatrixModule } from "./builtin/fx-matrix";
 import { helpModule } from "./builtin/help";
 import { positionSizerModule } from "./builtin/kelly-sizer";
@@ -44,10 +65,16 @@ import { secModule } from "./builtin/sec";
 import { insiderModule } from "./builtin/insider";
 import { jobsModule } from "./builtin/jobs";
 import { optionsModule } from "./builtin/options";
+import { optionsPositioningModule } from "./builtin/options-positioning";
 import { optionsScenarioModule } from "./builtin/options-scenario";
 import { optionsCalculatorModule } from "./builtin/options-calculator";
 import { volSurfaceModule } from "./builtin/vol-surface";
 import { realizedVolModule } from "./builtin/realized-vol";
+import { seasonalityModule } from "./builtin/seasonality";
+import { earningsRippleModule } from "./builtin/earnings-ripple";
+import { reverseDcfModule } from "./builtin/reverse-dcf";
+import { peBandModule } from "./builtin/pe-band";
+import { macroDayModule } from "./builtin/macro-day";
 import { ivHistoryModule } from "./builtin/iv-history";
 import { backtestModule } from "./builtin/backtest";
 import { composeBuiltinPlugin } from "./builtin/plugin-module";
@@ -90,19 +117,34 @@ const browserTickerResearchPlugin = composeBuiltinPlugin({
     tickerDetailModule,
     chartComposerModule,
     optionsModule,
+    optionsPositioningModule,
     optionsCalculatorModule,
     optionsScenarioModule,
     volSurfaceModule,
     realizedVolModule,
+    seasonalityModule,
+    earningsRippleModule,
+    reverseDcfModule,
+    peBandModule,
+    macroDayModule,
     ivHistoryModule,
     backtestModule,
     timeSalesModule,
     estimateRevisionsModule,
     researchModule,
+    // Daily volume shares open this pane.
+    shortInterestModule,
     shortVolumeModule,
     socialMentionsModule,
     debtMaturitiesModule,
     revenueBreakdownModule,
+    supplyChainModule,
+    creditDocumentsModule,
+    companyAttentionModule,
+    catalystsModule,
+    companyKpisModule,
+    awardsModule,
+    exposureModule,
     mnaModule,
     browserDividendYieldModule,
     earningsCallsModule,
@@ -137,17 +179,23 @@ const browserMarketOverviewPlugin = composeBuiltinPlugin({
     futuresModule,
     futuresCurveModule,
     cotModule,
+    doeModule,
+    gpuModule,
+    attentionModule,
+    powerModule,
     cryptoBoardModule,
+    perpsModule,
   ],
 });
 
 const browserMacroPlugin = composeBuiltinPlugin({
   ...macroPluginMeta,
-  description: "Economic calendar, rates, volatility, credit spreads, single-name CDS, and Treasury auctions.",
+  description: "Economic calendar, rates, volatility, credit spreads, single-name, index and sovereign CDS, and Treasury auctions.",
   modules: [
     macroSharedResourcesModule,
     economicCalendarModule,
     econStatisticsModule,
+    cpiModule,
     yieldCurveModule,
     ratePathModule,
     moneyMarketsModule,
@@ -157,6 +205,7 @@ const browserMacroPlugin = composeBuiltinPlugin({
     creditConditionsModule,
     marketValuationModule,
     cdsModule,
+    creditBoardsModule,
     treasuryAuctionsModule,
   ],
 });
@@ -175,6 +224,12 @@ export const browserBuiltinPlugins: readonly GloomPlugin[] = [
   browserMarketOverviewPlugin,
   marketHeatmapPlugin,
   marketHaltsPlugin,
+  fearGreedPlugin,
+  membersPlugin,
+  ipoCalendarPlugin,
+  clinicalTrialsPlugin,
+  commentLettersPlugin,
+  openFdaPlugin,
   browserMacroPlugin,
   alertsPlugin,
   researchSearchPlugin,

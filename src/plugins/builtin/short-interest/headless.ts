@@ -58,6 +58,8 @@ export function createShortInterestHeadless(
 ): HeadlessPaneDefinition<"rows"> {
   return {
     shape: "rows",
+    // Settled twice a month and published about a week later; a month without one has missed it.
+    freshness: { source: "FINRA", status: "not-a-feed", basis: "twice-monthly settlement", observedKey: "settlementDate", oldest: null, maxAgeMinutes: 30 * 24 * 60 },
     argument: {
       kind: "ticker",
       placeholder: "ticker",
@@ -89,7 +91,7 @@ export function createShortInterestHeadless(
       const { records, source, cloudSessionRequired } = Array.isArray(loaded)
         ? { records: loaded, source: undefined, cloudSessionRequired: false }
         : loaded;
-      const yahooFallback = source === "yahoo" && records.length > 0;
+      const latestSettlements = source === "gloom" && records.length > 0;
       const preference: SortPreference = {
         columnId: "settlementDate",
         direction: args.options.order === "oldest" ? "asc" : "desc",
@@ -106,7 +108,7 @@ export function createShortInterestHeadless(
         }));
       return {
         rows,
-        ...(yahooFallback ? {
+        ...(latestSettlements ? {
           complete: false,
           errors: [cloudSessionRequired
             ? "Full history needs a Gloom Cloud sign-in; showing the latest two settlements."

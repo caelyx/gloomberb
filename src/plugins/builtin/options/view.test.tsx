@@ -3,7 +3,7 @@ import { act, useReducer, useState } from "react";
 import { Box } from "../../../ui";
 import { PaneFooterBar, PaneFooterProvider } from "../../../components/layout/pane/footer";
 import type { ScrollBoxRenderable } from "@opentui/core";
-import { takeSavedTextFile, testRender } from "../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness, takeSavedTextFile } from "../../../renderers/opentui/test-utils";
 import { exportPaneTable, hasPaneTableExporter } from "../../../state/pane-table-export-registry";
 import { MarketDataCoordinator, setSharedMarketDataCoordinator } from "../../../market-data/coordinator";
 import { appReducer, createInitialState } from "../../../state/app/context";
@@ -15,10 +15,12 @@ import { formatExpDate } from "../../../utils/options";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import { OptionsView } from "./view";
 import { TestPaneProvider, createTestTicker, createTestPaneConfig } from "../../../test-support/pane";
+import { RemoteUiRegistryProvider, createRemoteUiRegistry } from "../../../remote/semantic-tree";
+import { renderedReportFreshness, renderedReportNotices } from "../../../cli/pane-functions/report-notices";
 
 const TEST_PANE_ID = "ticker-detail:options-test";
 
-let testSetup: Awaited<ReturnType<typeof testRender>> | undefined;
+const tui = createOpenTuiTestHarness();
 let setOptionsQuotePrice: ((price: number) => void) | null = null;
 
 function makeTicker(symbol: string): TickerRecord {
@@ -59,8 +61,8 @@ function makeChain(
   };
 }
 
-function makeFinancials(price: number): TickerFinancials {
-  return createTestFinancials({ quote: createTestQuote({ price }) });
+function makeFinancials(price: number): TickerFinancials & { quote: Quote } {
+  return { ...createTestFinancials(), quote: createTestQuote({ price }) };
 }
 
 function OptionsHarness({
@@ -72,6 +74,7 @@ function OptionsHarness({
   width = 122,
   height = 14,
   nestedInTabs = false,
+  settings,
 }: {
   ticker: TickerRecord;
   quotePrice?: number;
@@ -81,11 +84,13 @@ function OptionsHarness({
   width?: number;
   height?: number;
   nestedInTabs?: boolean;
+  settings?: Record<string, unknown>;
 }) {
   const config = createTestPaneConfig("/tmp/gloomberb-options-test", {
     instanceId: TEST_PANE_ID,
     paneId: "ticker-detail",
     binding: { kind: "fixed", symbol: ticker.metadata.ticker },
+    ...(settings ? { settings } : {}),
   });
 
   const [persistedState, dispatch] = useReducer(appReducer, config, createInitialState);
@@ -122,7 +127,7 @@ async function renderSettled() {
   for (let i = 0; i < 4; i += 1) {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
   }
 }
@@ -130,14 +135,8 @@ async function renderSettled() {
 // Chain IVs are solved from the fixture's quotes against the clock, so pin it before the Jun 2026 expiry.
 beforeEach(() => { setSystemTime(new Date("2026-05-26T16:00:00Z")); });
 
-afterEach(async () => {
+afterEach(() => {
   setSystemTime();
-  if (testSetup) {
-    await act(async () => {
-      testSetup!.renderer.destroy();
-    });
-    testSetup = undefined;
-  }
   setOptionsQuotePrice = null;
   setSharedMarketDataCoordinator(null);
 });
@@ -149,7 +148,7 @@ test("exposes exactly one exportable table so CSV export stays wired up", async 
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
 
   await act(async () => {
-    testSetup = await testRender(
+    await tui.render(
       <OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} />,
       { width: 124, height: 12 },
     );
@@ -177,7 +176,7 @@ test("defaults the table around the nearest strike to the current quote", async 
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
 
   await act(async () => {
-    testSetup = await testRender(
+    await tui.render(
       <OptionsHarness ticker={makeTicker("AAPL")} quotePrice={121.2} />,
       {
         width: 124,
@@ -188,9 +187,27 @@ test("defaults the table around the nearest strike to the current quote", async 
 
   await renderSettled();
 
-  const frame = testSetup!.captureCharFrame();
+  const frame = tui.frame();
   expect(frame).toContain("120");
   expect(frame).not.toContain(" 50 ");
+});
+
+test("lists only the strikes in the saved window, and the query bar says a window narrows the chain", async () => {
+  const strikes = Array.from({ length: 25 }, (_, index) => 50 + index * 5);
+  setSharedMarketDataCoordinator(new MarketDataCoordinator(createTestDataProvider({
+    getOptionsChain: async () => makeChain(strikes, 120),
+  })));
+  await act(async () => {
+    await tui.render(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={121.2} height={16} settings={{ strikes: "1" }} />, { width: 124, height: 16 });
+  });
+  await renderSettled();
+
+  const frame = tui.frame();
+  expect(frame).toContain("Strikes ±1");
+  await exportPaneTable(TEST_PANE_ID, "window.csv");
+  const [header, ...rows] = takeSavedTextFile()!.text.trim().split(/\r?\n/).map((line) => line.split(","));
+  const strike = header!.indexOf("STRIKE");
+  expect(rows.map((row) => row[strike])).toEqual(["115", "120", "125"]);
 });
 
 test("keeps table geometry and scroll steady while a cold expiry loads", async () => {
@@ -204,16 +221,16 @@ test("keeps table geometry and scroll steady while a cold expiry loads", async (
   });
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
   await act(async () => {
-    testSetup = await testRender(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={120} />, { width: 124, height: 16 });
+    await tui.render(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={120} />, { width: 124, height: 16 });
   });
   await renderSettled();
-  const tableHeight = () => (testSetup!.renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable).height;
+  const tableHeight = () => (tui.setup().renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable).height;
   const before = tableHeight();
-  await act(async () => { testSetup!.mockInput.pressEnter(); });
+  await act(async () => { tui.setup().mockInput.pressEnter(); });
   await renderSettled();
-  await act(async () => { testSetup!.mockInput.pressKey("l"); });
+  await act(async () => { tui.setup().mockInput.pressKey("l"); });
   await renderSettled();
-  expect(testSetup!.captureCharFrame()).toContain("Loading strikes");
+  expect(tui.frame()).toContain("Loading strikes");
   expect(tableHeight()).toBe(before);
   await act(async () => { finishNext({ ...initial,
     calls: initial.calls.map((c) => ({ ...c, expiration: nextExpiry, contractSymbol: c.contractSymbol.replace("260619", "260626") })),
@@ -221,8 +238,29 @@ test("keeps table geometry and scroll steady while a cold expiry loads", async (
   }); });
   await renderSettled();
   expect(tableHeight()).toBe(before);
-  expect(testSetup!.captureCharFrame()).not.toContain("Loading strikes");
-  expect((testSetup!.renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable).scrollTop).toBeGreaterThan(0);
+  expect(tui.frame()).not.toContain("Loading strikes");
+  expect((tui.setup().renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable).scrollTop).toBeGreaterThan(0);
+});
+
+test("a typed expiry date opens that expiry, and its report names it with the chain's as-of and delay", async () => {
+  const chain: OptionsChain = { ...makeChain([100, 101], 101, [1_781_049_600, 1_782_345_600]),
+    asOf: "2026-06-01T20:00:00.000Z", dataSource: "delayed", delayMinutes: 15 };
+  const provider = createTestDataProvider({ getOptionsChain: async () => chain });
+  setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
+  const registry = createRemoteUiRegistry();
+  // `fn OMON --expiration 2026-06-25` leaves the date as text in the pane setting.
+  await act(async () => {
+    await tui.render(<RemoteUiRegistryProvider registry={registry}>
+      <OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} settings={{ expiration: "2026-06-25" }} />
+    </RemoteUiRegistryProvider>, { width: 124, height: 16 });
+  });
+  await renderSettled();
+  expect(tui.frame()).toMatch(/Expiry\s+2026-06-25\s+\(24d\)/);
+  expect(tui.frame()).not.toContain("NaN");
+  const report = renderedReportNotices(registry.snapshot());
+  expect(report.notices[0]).toBe("Expiry 2026-06-25 (24d)");
+  expect(report.facts.expiry).toEqual({ date: "2026-06-25", daysToExpiry: 24 });
+  expect(renderedReportFreshness(registry.snapshot())).toEqual({ asOf: "2026-06-01T20:00:00.000Z", status: "delayed", delayMinutes: 15 });
 });
 
 test("shows the spot, volatility statistics and the mirrored default fields", async () => {
@@ -232,14 +270,14 @@ test("shows the spot, volatility statistics and the mirrored default fields", as
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
 
   await act(async () => {
-    testSetup = await testRender(
+    await tui.render(
       <OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} />,
       { width: 124, height: 16 },
     );
   });
   await renderSettled();
 
-  const frame = testSetup!.captureCharFrame();
+  const frame = tui.frame();
   expect(frame).toMatch(/Spot\s+101\.00/);
   expect(frame).toMatch(/ATM IV\s+90\.1%/);
   expect(frame).toMatch(/HV30\s+--/);
@@ -265,7 +303,7 @@ test("streams live quotes without resetting manual scroll", async () => {
   setSharedMarketDataCoordinator(coordinator);
 
   await act(async () => {
-    testSetup = await testRender(
+    await tui.render(
       <RealtimeOptionsHarness ticker={makeTicker("AAPL")} />,
       {
         width: 124,
@@ -310,7 +348,7 @@ test("streams live quotes without resetting manual scroll", async () => {
       stale: false,
     });
     await Promise.resolve();
-    await testSetup!.renderOnce();
+    await tui.setup().renderOnce();
   });
   await renderSettled();
 
@@ -320,18 +358,18 @@ test("streams live quotes without resetting manual scroll", async () => {
       exchange: "OPTIONS",
     }).data?.mark,
   ).toBe(99.99);
-  expect(testSetup!.captureCharFrame()).toContain("99.9");
+  expect(tui.frame()).toContain("99.9");
 
-  const bodyScroll = testSetup!.renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable;
+  const bodyScroll = tui.setup().renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable;
   await act(async () => {
     bodyScroll.scrollTo(0);
-    await testSetup!.renderOnce();
+    await tui.setup().renderOnce();
   });
   await renderSettled();
 
   await act(async () => {
     setOptionsQuotePrice?.(120.3);
-    await testSetup!.renderOnce();
+    await tui.setup().renderOnce();
   });
   await renderSettled();
   expect(bodyScroll.scrollTop).toBe(0);
@@ -351,16 +389,16 @@ test("a standalone chain subscribes to its underlying and resolves ATM without a
   });
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
   await act(async () => {
-    testSetup = await testRender(<OptionsHarness ticker={makeTicker("AAPL")} />, { width: 124, height: 16 });
+    await tui.render(<OptionsHarness ticker={makeTicker("AAPL")} />, { width: 124, height: 16 });
   });
   await renderSettled();
   const underlying = targets.find((target) => target.symbol === "AAPL");
   expect(underlying).toBeDefined();
   await act(async () => { emit!(underlying!, makeFinancials(120.2).quote!); });
   await renderSettled();
-  const scrollBox = testSetup!.renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable;
+  const scrollBox = tui.setup().renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable;
   expect(scrollBox.scrollTop).toBeGreaterThan(0);
-  expect(testSetup!.captureCharFrame()).toMatch(/ATM IV\s+89\.3%/);
+  expect(tui.frame()).toMatch(/ATM IV\s+89\.3%/);
 });
 
 test("lets the expiration tab row use the full available width", async () => {
@@ -373,7 +411,7 @@ test("lets the expiration tab row use the full available width", async () => {
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
 
   await act(async () => {
-    testSetup = await testRender(
+    await tui.render(
       <OptionsHarness ticker={makeTicker("AAPL")} width={122} />,
       {
         width: 124,
@@ -384,7 +422,7 @@ test("lets the expiration tab row use the full available width", async () => {
 
   await renderSettled();
 
-  const frame = testSetup!.captureCharFrame();
+  const frame = tui.frame();
   expect(frame).toContain(formatExpDate(expirationDates.at(-1)!));
 });
 
@@ -406,7 +444,7 @@ test("keeps expiration tabs independently scrollable from a narrow strike table"
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
 
   await act(async () => {
-    testSetup = await testRender(
+    await tui.render(
       <OptionsHarness ticker={makeTicker("AAPL")} width={54} />,
       {
         width: 56,
@@ -416,14 +454,14 @@ test("keeps expiration tabs independently scrollable from a narrow strike table"
   });
 
   await renderSettled();
-  const bodyScroll = testSetup!.renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable | undefined;
+  const bodyScroll = tui.setup().renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable | undefined;
   expect(bodyScroll?.horizontalScrollBar.visible).toBe(true);
-  expect(testSetup!.captureCharFrame()).not.toContain(formatExpDate(expirationDates.at(-1)!));
+  expect(tui.frame()).not.toContain(formatExpDate(expirationDates.at(-1)!));
 
   for (let index = 1; index < expirationDates.length; index += 1) {
     await act(async () => {
-      testSetup!.mockInput.pressKey("l");
-      await testSetup!.renderOnce();
+      tui.setup().mockInput.pressKey("l");
+      await tui.setup().renderOnce();
     });
     await renderSettled();
   }
@@ -431,7 +469,7 @@ test("keeps expiration tabs independently scrollable from a narrow strike table"
   expect(bodyScroll?.horizontalScrollBar.visible).toBe(true);
   expect(bodyScroll?.scrollLeft ?? 0).toBe(0);
   expect(requestedExpirations).toContain(expirationDates.at(-1));
-  expect(testSetup!.captureCharFrame()).toContain(formatExpDate(expirationDates.at(-1)!));
+  expect(tui.frame()).toContain(formatExpDate(expirationDates.at(-1)!));
 });
 
 test("in a research tab the arrows stay with the tab strip and [ ] step the expiry", async () => {
@@ -447,20 +485,20 @@ test("in a research tab the arrows stay with the tab strip and [ ] step the expi
   });
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
   await act(async () => {
-    testSetup = await testRender(<OptionsHarness ticker={makeTicker("AAPL")} width={80} nestedInTabs />, { width: 82, height: 16 });
+    await tui.render(<OptionsHarness ticker={makeTicker("AAPL")} width={80} nestedInTabs />, { width: 82, height: 16 });
   });
   await renderSettled();
 
   // A click on the chain no longer changes what h/l and the arrows do.
-  await act(async () => { await testSetup!.mockMouse.click(8, 4); });
+  await act(async () => { await tui.setup().mockMouse.click(8, 4); });
   await renderSettled();
-  for (const press of [() => testSetup!.mockInput.pressArrow("right"), () => testSetup!.mockInput.pressKey("l")]) {
+  for (const press of [() => tui.setup().mockInput.pressArrow("right"), () => tui.setup().mockInput.pressKey("l")]) {
     await act(async () => { press(); });
     await renderSettled();
   }
   expect(requestedExpirations).not.toContain(expirationDates[1]);
 
-  await act(async () => { testSetup!.mockInput.pressKey("]"); });
+  await act(async () => { tui.setup().mockInput.pressKey("]"); });
   await renderSettled();
   expect(requestedExpirations).toContain(expirationDates[1]);
 });
@@ -496,37 +534,37 @@ test("starts at a held contract's expiry and preserves a researcher-selected rol
     return <OptionsHarness ticker={selected} />;
   }
   await act(async () => {
-    testSetup = await testRender(<SwitchingHarness />, { width: 124, height: 16 });
+    await tui.render(<SwitchingHarness />, { width: 124, height: 16 });
   });
   await renderSettled();
   expect(requestedExpirations.at(-1)).toBe(expirationDates[1]);
-  expect(testSetup!.captureCharFrame()).toContain("Position: -2 call contracts (SHORT)");
+  expect(tui.frame()).toContain("Position: -2 call contracts (SHORT)");
 
-  await act(async () => { testSetup!.mockInput.pressEnter(); });
+  await act(async () => { tui.setup().mockInput.pressEnter(); });
   await renderSettled();
-  await act(async () => { testSetup!.mockInput.pressArrow("right"); });
+  await act(async () => { tui.setup().mockInput.pressArrow("right"); });
   await renderSettled();
   expect(requestedExpirations.at(-1)).toBe(expirationDates[2]);
-  expect(testSetup!.captureCharFrame()).toContain("350");
+  expect(tui.frame()).toContain("350");
 
   // A refreshed expiry catalogue must not undo the user's chosen roll date.
   await act(async () => {
     await coordinator.loadOptions({ instrument: { symbol: "AAPL", exchange: "" } }, { forceRefresh: true });
   });
   await renderSettled();
-  expect(testSetup!.captureCharFrame()).toContain("350");
-  await act(async () => { testSetup!.mockInput.pressArrow("left"); });
+  expect(tui.frame()).toContain("350");
+  await act(async () => { tui.setup().mockInput.pressArrow("left"); });
   await renderSettled();
-  expect(testSetup!.captureCharFrame()).toContain("340");
+  expect(tui.frame()).toContain("340");
 
   // Returning before another instrument's catalogue loads must initialize the
   // holding again, rather than retain that intermediate target's index zero.
   await act(async () => { selectTicker(makeTicker("MSFT")); });
   await renderSettled();
-  expect(testSetup!.captureCharFrame()).toContain("Loading options chain");
+  expect(tui.frame()).toContain("Loading options chain");
   await act(async () => { selectTicker(ticker); });
   await renderSettled();
-  expect(testSetup!.captureCharFrame()).toMatch(/33\.95\s+34\.05\s+34\.00\s+.*340/);
+  expect(tui.frame()).toMatch(/33\.95\s+34\.05\s+34\.00\s+.*340/);
 });
 
 test("keeps the selected chain visible when its refresh fails", async () => {
@@ -540,7 +578,7 @@ test("keeps the selected chain visible when its refresh fails", async () => {
   const coordinator = new MarketDataCoordinator(provider);
   setSharedMarketDataCoordinator(coordinator);
   await act(async () => {
-    testSetup = await testRender(
+    await tui.render(
       <OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} />,
       { width: 124, height: 16 },
     );
@@ -552,7 +590,7 @@ test("keeps the selected chain visible when its refresh fails", async () => {
     expect(entry.error?.message).toContain("Options provider unavailable");
   });
   await renderSettled();
-  const frame = testSetup!.captureCharFrame();
+  const frame = tui.frame();
   expect(frame).toContain("C LAST");
   expect(frame).toContain("101");
   expect(frame).not.toContain("Options chain unavailable.");
@@ -569,10 +607,10 @@ test("stale underlying preserves contract observations but cannot seed current G
     return <OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} quoteStale={stale} showFooter height={20} width={160} />;
   }
   await act(async () => {
-    testSetup = await testRender(<FreshnessHarness />, { width: 160, height: 20 });
+    await tui.render(<FreshnessHarness />, { width: 160, height: 20 });
   });
   await renderSettled();
-  const frame = testSetup!.captureCharFrame();
+  const frame = tui.frame();
   expect(frame).toMatch(/ATM IV\s+--/);
   expect(frame).toContain("Underlying quote stale");
   expect(frame).not.toContain("[c]alc");
@@ -585,7 +623,7 @@ test("stale underlying preserves contract observations but cannot seed current G
   expect(saved).toContain("10.05,10.15,10.10");
   await act(async () => { setStale(false); });
   await renderSettled();
-  const recovered = testSetup!.captureCharFrame();
+  const recovered = tui.frame();
   expect(recovered).toMatch(/ATM IV\s+90\.1%/);
   expect(recovered).toContain("[c]alc");
   expect(recovered).not.toContain("Underlying quote stale");
@@ -607,10 +645,10 @@ test("rejected history disables HV and IV/HV without discarding healthy chain an
   });
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
   await act(async () => {
-    testSetup = await testRender(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} history={history} showFooter height={20} width={160} />, { width: 160, height: 20 });
+    await tui.render(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} history={history} showFooter height={20} width={160} />, { width: 160, height: 20 });
   });
   await renderSettled();
-  const frame = testSetup!.captureCharFrame();
+  const frame = tui.frame();
   expect(frame).toMatch(/ATM IV\s+90\.1%/);
   expect(frame).toMatch(/HV30\s+--/);
   expect(frame).toMatch(/IV\/HV\s+--/);
@@ -623,10 +661,10 @@ test("reports the contract under the cursor in the status bar instead of above t
   const provider = createTestDataProvider({ getOptionsChain: async () => makeChain([100, 101], 101) });
   setSharedMarketDataCoordinator(new MarketDataCoordinator(provider));
   await act(async () => {
-    testSetup = await testRender(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} showFooter height={20} width={160} />, { width: 160, height: 20 });
+    await tui.render(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} showFooter height={20} width={160} />, { width: 160, height: 20 });
   });
   await renderSettled();
-  const lines = testSetup!.captureCharFrame().split("\n");
+  const lines = tui.frame().split("\n");
   const status = lines.find((line) => line.includes("[c]alc"))!;
   const body = lines.filter((line) => line !== status).join("\n");
   expect(status).toContain("AAPL260619C00101000");

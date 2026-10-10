@@ -6,6 +6,7 @@ import type {
   LayoutConfig,
   OnboardingProgress,
   LayoutOrigin,
+  RecentCommand,
   SavedLayout,
   TelemetryConfig,
 } from "../../../types/config";
@@ -20,8 +21,29 @@ import { isLanguagePreference } from "../../../i18n/languages";
 import { clampFontSize } from "../../../theme/font-scale";
 import { isLayoutConfig, sanitizeLayout } from "../layout";
 import { migrateSavedConfig, type ConfigMigrationHost } from "./migrations";
+import { encodeBuiltinDisabledPluginIds, expandBuiltinPluginGroups } from "../../../plugins/ownership";
 import { sanitizeSavedPaneState } from "./pane-state";
 import { isRecord } from "../../../utils/guards";
+import { debugLog } from "../../../utils/debug-log";
+import { DEFAULT_THEME, themes } from "../../../theme/themes";
+
+const configLog = debugLog.createLogger("config");
+const reportedUnknownThemes = new Set<string>();
+
+/**
+ * A theme id this build does not know is kept, not replaced: a newer build on
+ * another device may have saved it, and writing the default back would undo
+ * that choice everywhere through sync. The app draws the default meanwhile,
+ * and says so once.
+ */
+function sanitizeTheme(value: unknown, fallback: string): string {
+  if (typeof value !== "string") return fallback;
+  if (!themes[value] && !reportedUnknownThemes.has(value)) {
+    reportedUnknownThemes.add(value);
+    configLog.warn(`Unknown theme "${value}" in config; showing ${DEFAULT_THEME}. gloomberb config themes lists the ids.`);
+  }
+  return value;
+}
 
 export function normalizeLoadedConfig(
   saved: Record<string, unknown>,
@@ -41,7 +63,10 @@ export function normalizeLoadedConfig(
       : entry
   ));
 
-  const disabledPlugins = sanitizeUniqueStringList(candidate.disabledPlugins ?? defaults.disabledPlugins);
+  // After the migrations, which read retired group ids as they were saved.
+  const disabledPlugins = expandBuiltinPluginGroups(
+    sanitizeUniqueStringList(candidate.disabledPlugins ?? defaults.disabledPlugins),
+  );
   const onboardingProgress = sanitizeOnboardingProgress(candidate.onboardingProgress);
   const onboardingComplete = onboardingProgress
     ? false
@@ -62,13 +87,15 @@ export function normalizeLoadedConfig(
     brokerInstances: sanitizeBrokerInstances(candidate.brokerInstances),
     disabledPlugins,
     seededPlugins: sanitizeUniqueStringList(candidate.seededPlugins),
+    ...(candidate.portfolioCurrenciesAdopted === true ? { portfolioCurrenciesAdopted: true } : {}),
     disabledSources: sanitizeUniqueStringList(candidate.disabledSources ?? defaults.disabledSources),
     pluginConfig: sanitizePluginConfig(candidate.pluginConfig),
-    theme: typeof candidate.theme === "string" ? candidate.theme : defaults.theme,
+    theme: sanitizeTheme(candidate.theme, defaults.theme),
     chartPreferences: sanitizeChartPreferences(candidate.chartPreferences, defaults.chartPreferences),
     valueFlashingEnabled: typeof candidate.valueFlashingEnabled === "boolean" ? candidate.valueFlashingEnabled : defaults.valueFlashingEnabled,
     fontSize: sanitizeFontSize(candidate.fontSize, defaults.fontSize),
     recentTickers: sanitizeStringArray(candidate.recentTickers, defaults.recentTickers),
+    recentCommands: sanitizeRecentCommands(candidate.recentCommands, defaults.recentCommands),
     language: isLanguagePreference(candidate.language) ? candidate.language : undefined,
     onboardingComplete,
     onboardingProgress,
@@ -119,7 +146,8 @@ export function normalizeConfigForSave(config: AppConfig): AppConfig {
     layouts,
     activeLayoutIndex,
     brokerInstances: sanitizeBrokerInstances(config.brokerInstances),
-    disabledPlugins: sanitizeUniqueStringList(config.disabledPlugins),
+    // Older apps read the retired group ids, so a group that is all off is saved as one.
+    disabledPlugins: encodeBuiltinDisabledPluginIds(sanitizeUniqueStringList(config.disabledPlugins)),
     seededPlugins: sanitizeUniqueStringList(config.seededPlugins),
     disabledSources: sanitizeUniqueStringList(config.disabledSources),
     pluginConfig: sanitizePluginConfig(config.pluginConfig),
@@ -127,6 +155,7 @@ export function normalizeConfigForSave(config: AppConfig): AppConfig {
     valueFlashingEnabled: config.valueFlashingEnabled !== false,
     fontSize: sanitizeFontSize(config.fontSize, defaults.fontSize),
     recentTickers: sanitizeStringArray(config.recentTickers, []),
+    recentCommands: sanitizeRecentCommands(config.recentCommands, []),
     onboardingComplete: onboardingProgress ? false : config.onboardingComplete,
     onboardingProgress,
   };
@@ -152,6 +181,7 @@ function sanitizeTelemetry(value: unknown): TelemetryConfig | undefined {
   const telemetry: TelemetryConfig = {
     ...(typeof value.crashReports === "boolean" ? { crashReports: value.crashReports } : {}),
     ...(typeof value.usage === "boolean" ? { usage: value.usage } : {}),
+    ...(typeof value.attention === "boolean" ? { attention: value.attention } : {}),
   };
   return Object.keys(telemetry).length > 0 ? telemetry : undefined;
 }
@@ -198,6 +228,7 @@ const ONBOARDING_STAGES = new Set<OnboardingProgress["stage"]>([
   "welcome",
   "portfolio",
   "add-ticker",
+  "desks",
   "research",
   "verify",
   "account",
@@ -228,6 +259,7 @@ function sanitizeOnboardingProgress(value: unknown): OnboardingProgress | undefi
       : undefined,
     accountStatus,
     checkoutOpenedAt: typeof value.checkoutOpenedAt === "string" ? value.checkoutOpenedAt : undefined,
+    desks: Array.isArray(value.desks) ? sanitizeUniqueStringList(value.desks) : undefined,
   };
 }
 
@@ -235,6 +267,26 @@ function sanitizeStringArray(value: unknown, fallback: string[]): string[] {
   return Array.isArray(value)
     ? value.filter((entry): entry is string => typeof entry === "string")
     : fallback;
+}
+
+function sanitizeRecentCommands(value: unknown, fallback: RecentCommand[]): RecentCommand[] {
+  if (!Array.isArray(value)) return fallback;
+  return value
+    .filter((entry): entry is RecentCommand => (
+      !!entry
+      && typeof entry === "object"
+      && typeof (entry as RecentCommand).id === "string"
+      && (entry as RecentCommand).id.length > 0
+      && typeof (entry as RecentCommand).label === "string"
+    ))
+    .map((entry) => {
+      const arg = typeof entry.arg === "string" && entry.arg.length > 0 ? entry.arg : undefined;
+      return {
+        id: entry.id,
+        label: entry.label,
+        ...(arg ? { arg } : {}),
+      };
+    });
 }
 
 function sanitizeUniqueStringList(value: unknown): string[] {
@@ -284,7 +336,23 @@ function sanitizePortfolios(value: unknown, fallback: Portfolio[]): Portfolio[] 
       && typeof (entry as Portfolio).name === "string"
       && typeof (entry as Portfolio).currency === "string",
     )
-    .map((entry) => ({ ...entry }));
+    .map(sanitizePortfolioAllocation);
+}
+
+/** Cash and target weights the portfolio commands write; anything else is dropped. */
+function sanitizePortfolioAllocation(entry: Portfolio): Portfolio {
+  const { cash, targetWeights, ...portfolio } = entry;
+  const next: Portfolio = { ...portfolio };
+  if (isRecord(cash) && typeof cash.amount === "number" && Number.isFinite(cash.amount)
+    && typeof cash.currency === "string" && /^[A-Z]{3}$/.test(cash.currency)) {
+    next.cash = { amount: cash.amount, currency: cash.currency };
+  }
+  if (isRecord(targetWeights)) {
+    const weights = Object.entries(targetWeights).filter((weight): weight is [string, number] =>
+      !!weight[0].trim() && typeof weight[1] === "number" && Number.isFinite(weight[1]) && weight[1] >= 0 && weight[1] <= 100);
+    if (weights.length > 0) next.targetWeights = Object.fromEntries(weights);
+  }
+  return next;
 }
 
 function sanitizeWatchlists(value: unknown, fallback: Watchlist[]): Watchlist[] {
@@ -390,9 +458,6 @@ function sanitizeSavedLayouts(
         focusedPaneId: typeof entry.focusedPaneId === "string"
           ? placedPaneIds.has(entry.focusedPaneId) ? entry.focusedPaneId : null
           : entry.focusedPaneId === null ? null : undefined,
-        activePanel: entry.activePanel === "right" || entry.activePanel === "left"
-          ? entry.activePanel
-          : undefined,
         ...(sanitizeLayoutOrigin(entry.origin) ? { origin: sanitizeLayoutOrigin(entry.origin) } : {}),
       };
     });

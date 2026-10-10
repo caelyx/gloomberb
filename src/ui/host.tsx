@@ -73,9 +73,15 @@ export interface ChartVectorShape {
   color: string;
   /** Closes the shape into a filled box, for range and area selections. */
   box?: boolean;
+  /** Closes the points into a filled polygon, such as a flow ribbon, with no outline. */
+  fill?: boolean;
   fillOpacity?: number;
   strokeWidth?: number;
   handles?: boolean;
+  /** Paints the fill or line left to right through these colours instead of `color`. */
+  gradient?: readonly string[];
+  /** Opacity of the whole shape, so others can recede behind a highlighted one. */
+  opacity?: number;
 }
 
 interface TextEditBuffer {
@@ -102,6 +108,16 @@ export interface SyntaxStyleLike {
   }): number;
 }
 
+/** Where a drag has a box this frame, in cells. */
+export interface LiveBoxFrame {
+  /** Offset from where the box is laid out, carried on the box's own layer. */
+  dx?: number;
+  dy?: number;
+  /** Size in place of the laid-out one: the box and what stretches inside it lay out again, nothing renders. */
+  width?: number;
+  height?: number;
+}
+
 export interface BoxRenderable {
   x?: number;
   y?: number;
@@ -111,11 +127,19 @@ export interface BoxRenderable {
   absoluteY?: number;
   absoluteBounds?: { x: number; y: number; width: number; height: number };
   getBoundingClientRect?: () => { x: number; y: number; width: number; height: number };
+  /**
+   * Desktop only: draws the box at `frame` by restyling its own element, with
+   * no render, until it is called with null. The offset rides the compositor,
+   * so it costs no layout or repaint; a size lays out the box's own subtree.
+   */
+  setLiveFrame?: (frame: LiveBoxFrame | null) => void;
   [key: string]: unknown;
 }
 
 interface ScrollBarRenderable {
   visible: boolean;
+  /** Terminal only: whether a click on the bar moves the keyboard focus to it. */
+  focusable?: boolean;
   on?(event: "change", handler: () => void): void;
   off?(event: "change", handler: () => void): void;
 }
@@ -130,7 +154,8 @@ export interface ScrollBoxRenderable {
   scrollLeftPx?: number;
   scrollHeightPx?: number;
   scrollWidthPx?: number;
-  viewport?: { width: number; height: number };
+  /** In the terminal, `y` is the viewport's top row on screen, as laid out last. */
+  viewport?: { y?: number; width: number; height: number };
   viewportPx?: { width: number; height: number };
   visible?: boolean;
   parent?: unknown;
@@ -139,6 +164,8 @@ export interface ScrollBoxRenderable {
   verticalScrollBar?: ScrollBarRenderable;
   scrollTo(target: number | { x?: number; y?: number }, y?: number): void;
   scrollToPixels?(target: number | { x?: number; y?: number }, y?: number): void;
+  /** Terminal only: the scrolled content, whose descendants carry their screen rows as laid out last. */
+  content?: { findDescendantById?(id: string): { y: number; height: number } | undefined };
 }
 
 export interface InputRenderable {
@@ -174,7 +201,10 @@ export interface NativeCursorState {
 
 export type NativePostProcessFn = (buffer: unknown, deltaTime: number) => void;
 
-/** One styled run of a rendered terminal row; colours are 0-255 RGBA. */
+/**
+ * One styled run of a rendered terminal row; colours are 0-255 RGBA.
+ * @public
+ */
 export interface NativeFrameSpan {
   text: string;
   fg: readonly [number, number, number, number];
@@ -222,6 +252,18 @@ export interface NativeRendererHost {
   copyToClipboardOSC52?(text: string): boolean;
   write?(data: string | Uint8Array): boolean;
   captureMouseRenderable?(renderable: unknown): void;
+  /**
+   * Terminal renderers only: whether kitty graphics can be drawn, `null` until
+   * the terminal answers. A host without it never draws kitty graphics.
+   */
+  getKittySupport?(): boolean | null;
+  /** Terminal renderers only: asks the terminal about kitty graphics once and keeps the answer. */
+  ensureKittySupport?(): Promise<boolean>;
+  /** Terminal renderers only: keeps kitty images clear of the panes, menus and dialogs drawn over them. */
+  nativeSurfaceManager?: Pick<
+    import("../components/chart/native/surface/manager").NativeSurfaceManager,
+    "setWindowState" | "upsertLocalOccluder" | "removeLocalOccluder"
+  >;
 }
 
 interface BoxProps {
@@ -349,6 +391,8 @@ export interface HostTabsProps {
   addLabel?: string;
   onAdd?: () => void;
   onReorder?: (fromValue: string, toValue: string) => void;
+  /** A press that moves, on a tab that is not reordered. */
+  onDrag?: () => void;
   focused?: boolean;
   palette: HostTabsPalette;
 }
@@ -433,6 +477,20 @@ export interface HostPopoverProps {
   trigger: ReactNode;
   children: ReactNode;
   anchorPoint?: { x: number; y: number } | null;
+  /**
+   * Opens beside this element instead of the trigger, such as a name the
+   * pointer is on: below it with the left edges aligned, above it when there
+   * is no room below, and kept inside the boundary. A Box ref is one. Read
+   * each time the popover places itself, so it follows the element when the
+   * page scrolls.
+   */
+  anchor?: BoxRenderable | null;
+  /** `pane` also keeps the popover inside the pane it opens from. Default `viewport`. */
+  boundary?: "viewport" | "pane";
+  /** The pointer came onto the popover, e.g. to keep a hover card open while it is used. */
+  onPointerEnter?: () => void;
+  /** The pointer left the popover. */
+  onPointerLeave?: () => void;
   placement?: "bottom-start" | "bottom-end";
   minWidth?: number | string;
   maxWidth?: number | string;
@@ -534,6 +592,7 @@ export interface UiHost {
   colorFromHex?(hex: string): unknown;
 }
 
+/** @public */
 export interface SaveTextFileRequest {
   name: string;
   text: string;

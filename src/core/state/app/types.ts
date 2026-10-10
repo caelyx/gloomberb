@@ -30,17 +30,6 @@ interface CommandBarLaunchRequestBase {
   sequence: number;
 }
 
-interface CommandBarPluginLaunchRequest extends CommandBarLaunchRequestBase {
-  kind: "plugin-command";
-  commandId: string;
-}
-
-/** Open one of the command bar's own workflows, such as `new-layout`. */
-interface CommandBarBuiltInWorkflowLaunchRequest extends CommandBarLaunchRequestBase {
-  kind: "builtin-workflow";
-  actionId: string;
-}
-
 interface CommandBarTickerSearchLaunchRequest extends CommandBarLaunchRequestBase {
   kind: "ticker-search";
   query?: string;
@@ -56,11 +45,18 @@ interface CommandBarRunQueryLaunchRequest extends CommandBarLaunchRequestBase {
   query: string;
 }
 
-export type CommandBarLaunch =
-  | { kind: "plugin-command"; commandId: string }
-  | { kind: "builtin-workflow"; actionId: string }
+/** The add row opened the bar so the chosen venue joins this collection. */
+interface CommandBarAddListingLaunchRequest extends CommandBarLaunchRequestBase {
+  kind: "add-listing";
+  collectionId: string;
+  collectionKind: "watchlist" | "portfolio";
+}
+
+/** Forms open in their own modal (`openFormModal`), so the bar launches only its own screens. */
+type CommandBarLaunch =
   | { kind: "ticker-search"; query?: string }
-  | { kind: "run-query"; query: string };
+  | { kind: "run-query"; query: string }
+  | { kind: "add-listing"; collectionId: string; collectionKind: "watchlist" | "portfolio" };
 
 export interface AppState {
   config: AppConfig;
@@ -72,7 +68,11 @@ export interface AppState {
    */
   exchangeRates: Map<string, number>;
   brokerAccounts: Record<string, BrokerAccount[]>;
-  activePanel: "left" | "right";
+  /**
+   * @deprecated Never set. The app has no left or right panel state; read
+   * `focusedPaneId` for the focused pane.
+   */
+  activePanel?: "left" | "right";
   focusedPaneId: string | null;
   previousFocusedPaneId: string | null;
   paneState: Record<string, PaneRuntimeState>;
@@ -80,10 +80,9 @@ export interface AppState {
   commandBarOpen: boolean;
   commandBarQuery: string;
   commandBarLaunchRequest:
-    | CommandBarPluginLaunchRequest
-    | CommandBarBuiltInWorkflowLaunchRequest
     | CommandBarTickerSearchLaunchRequest
     | CommandBarRunQueryLaunchRequest
+    | CommandBarAddListingLaunchRequest
     | null;
   themePreview: string | null;
   refreshing: Set<string>;
@@ -114,6 +113,10 @@ export type AppAction =
   | { type: "HYDRATE_FINANCIALS"; financials: Map<string, TickerFinancials> }
   /** @deprecated Never dispatched by the app. Recent tickers follow a pane's `cursorSymbol`. */
   | { type: "TRACK_TICKER"; symbol: string | null }
+  /**
+   * @deprecated Focuses the leftmost or rightmost docked pane, and does nothing
+   * with `preserveFocus`. Use `switchPanel` or `FOCUS_PANE`.
+   */
   | { type: "SET_ACTIVE_PANEL"; panel: "left" | "right"; preserveFocus?: boolean }
   | { type: "TOGGLE_COMMAND_BAR" }
   | {
@@ -123,6 +126,7 @@ export type AppAction =
       launch?: CommandBarLaunch | null;
     }
   | { type: "SET_COMMAND_BAR_QUERY"; query: string }
+  | { type: "RECORD_COMMAND"; id: string; label: string; arg?: string }
   | { type: "SET_REFRESHING"; symbol: string; refreshing: boolean }
   | { type: "SET_BROKER_ACCOUNTS"; instanceId: string; accounts: BrokerAccount[] }
   | { type: "SET_INITIALIZED" }
@@ -168,6 +172,14 @@ export type AppAction =
   | { type: "DELETE_LAYOUT"; index: number }
   | { type: "RENAME_LAYOUT"; index: number; name: string }
   | { type: "DUPLICATE_LAYOUT"; index: number }
+  /**
+   * Moves a pane out of the active layout into a new layout of its own, named
+   * `name` (made unique), which becomes active. `sourceLayoutId` names the
+   * layout it left when that one has no id yet, so Move Back can find it.
+   */
+  | { type: "MOVE_PANE_TO_NEW_LAYOUT"; paneId: string; name: string; sourceLayoutId: string }
+  /** Returns a pane Move to New Layout moved to the layout it came from, which becomes active. */
+  | { type: "MOVE_PANE_BACK"; paneId: string }
   | { type: "FOCUS_PANE"; paneId: string }
   | { type: "FOCUS_NEXT"; paneOrder: string[] }
   | { type: "FOCUS_PREV"; paneOrder: string[] }

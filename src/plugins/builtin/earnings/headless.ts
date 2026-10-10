@@ -3,6 +3,7 @@ import type {
   HeadlessPaneColumn,
   HeadlessPaneContext,
   HeadlessPaneDefinition,
+  HeadlessPaneFreshness,
   HeadlessPaneLoadArgs,
   HeadlessRowsResult,
 } from "../../../types/plugin";
@@ -44,7 +45,7 @@ const HISTORY_COLUMNS: HeadlessPaneColumn[] = [
   { key: "move", header: "Move", align: right, format: (value) => signedPercent(num(value)) },
 ];
 
-export interface EarningsHeadlessDependencies {
+interface EarningsHeadlessDependencies {
   calendar(query: { from: string; to: string; perDay: number; symbols: string[] }, context: HeadlessPaneContext): Promise<EarningsCalendarPayload>;
   history(symbol: string, context: HeadlessPaneContext): Promise<EarningsHistoryPayload>;
   upcoming(symbols: string[], context: HeadlessPaneContext): Promise<EarningsEvent[]>;
@@ -137,9 +138,12 @@ async function historyReport(symbol: string, context: HeadlessPaneContext, deps:
 }
 
 /** EVTS: the market board, whatever ticker is given. */
-export function createEarningsBoardHeadless(deps: EarningsHeadlessDependencies = defaultDependencies): HeadlessPaneDefinition<"rows"> {
+const EARNINGS_CALENDAR: HeadlessPaneFreshness = { status: "not-a-feed", basis: "calendar" };
+
+function createEarningsBoardHeadless(deps: EarningsHeadlessDependencies = defaultDependencies): HeadlessPaneDefinition<"rows"> {
   return {
     shape: "rows",
+    freshness: EARNINGS_CALENDAR,
     argument: { kind: "ticker", placeholder: "ticker", description: "Optional; the board is the same.", minimum: 0, maximum: 1 },
     options: [
       { key: "limit", description: "Maximum rows.", type: "integer", defaultValue: 200, minimum: 1, maximum: 1000 },
@@ -152,9 +156,10 @@ export function createEarningsBoardHeadless(deps: EarningsHeadlessDependencies =
   };
 }
 
-export function createEarningsHeadless(deps: EarningsHeadlessDependencies = defaultDependencies): HeadlessPaneDefinition<"rows"> {
+function createEarningsHeadless(deps: EarningsHeadlessDependencies = defaultDependencies): HeadlessPaneDefinition<"rows"> {
   return {
     shape: "rows",
+    freshness: EARNINGS_CALENDAR,
     argument: {
       kind: "symbol-list",
       placeholder: "tickers",

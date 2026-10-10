@@ -20,7 +20,8 @@ import {
 import { isPermanentClientError } from "../../../api-client/errors";
 import { usePluginPaneState } from "../../runtime";
 import { useFilingYearReader } from "../shared/filing-year-reader";
-import { useBoundTicker } from "../shared/ticker-request";
+import { useProFeatureWall, type ProFeatureWallCopy, type ReadGuard } from "../shared/pro-feature-wall";
+import { useBoundTicker, useIssuerListing } from "../shared/ticker-request";
 import { loadRiskReport, loadRiskReports } from "./data";
 
 export const RISK_FACTORS_PANE_ID = "risk-factors";
@@ -69,23 +70,39 @@ function RiskLine({
   );
 }
 
-export function RiskFactorsResearchTab(props: { focused: boolean; width: number; height: number }) {
-  return <RiskFactorsPane {...props} nested />;
-}
+const RISK_WALL: ProFeatureWallCopy = {
+  placement: "risk-wall",
+  action: "read risk factors",
+  title: "Risk factors are part of Gloom Cloud Pro.",
+  message: "Every 10-K's risk factors grouped by theme, with what was added, dropped or rewritten since the year before.",
+};
 
-export function RiskFactorsPane({
-  focused,
-  width,
-  nested = false,
-}: {
+interface RiskFactorsPaneProps {
   focused: boolean;
   width: number;
   height: number;
   /** Inside Ticker Research, whose own tab strip keeps h/l and the arrows. */
   nested?: boolean;
-}) {
-  const { symbol } = useBoundTicker();
+}
+
+export function RiskFactorsResearchTab(props: { focused: boolean; width: number; height: number }) {
+  return <RiskFactorsPane {...props} nested />;
+}
+
+export function RiskFactorsPane(props: RiskFactorsPaneProps) {
+  const { wall, guard } = useProFeatureWall(RISK_WALL, props);
+  return wall ?? <RiskFactorsReader {...props} guard={guard} />;
+}
+
+function RiskFactorsReader({
+  focused,
+  width,
+  nested = false,
+  guard,
+}: RiskFactorsPaneProps & { guard: ReadGuard }) {
+  const { symbol, ticker: boundTicker } = useBoundTicker();
   const ticker = symbol ? symbol.toUpperCase() : null;
+  const listing = useIssuerListing(boundTicker);
   const nativePaneChrome = useUiCapabilities().nativePaneChrome === true;
   const rendererHost = useRendererHost();
 
@@ -93,13 +110,13 @@ export function RiskFactorsPane({
   // one the pane opened with, so a restored year applies to it.
   const [selectedYear, setSelectedYear] = usePluginPaneState<number | null>("filingYear", null);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(ticker);
-  const listLoader = useCallback((force: boolean) => loadRiskReports(ticker!, { force }), [ticker]);
+  const listLoader = useCallback((force: boolean) => guard(loadRiskReports(ticker!, { force, listing })), [guard, listing, ticker]);
   const list = useAsyncResource(ticker ? listLoader : null, { clearOnError: isPermanentClientError });
   const years = useMemo(() => (list.data?.reports ?? []).map((entry) => entry.reportYear).sort((a, b) => b - a), [list.data]);
   // Null follows the newest discovered filing; an explicit choice stays on that year.
   const year = selectedTicker === ticker && selectedYear !== null
     ? selectedYear : years[0] ?? null;
-  const reportLoader = useCallback((force: boolean) => loadRiskReport(ticker!, year!, { force }), [ticker, year]);
+  const reportLoader = useCallback((force: boolean) => guard(loadRiskReport(ticker!, year!, { force, listing })), [guard, listing, ticker, year]);
   const detail = useAsyncResource(ticker && year !== null ? reportLoader : null, { clearOnError: isPermanentClientError });
   const report = detail.data;
   const listError = list.error ?? list.data?.refreshError ?? null;
@@ -150,7 +167,7 @@ export function RiskFactorsPane({
   const bodyWidth = Math.max(12, width - 2);
   const proseWidth = Math.min(bodyWidth, READING_WIDTH);
 
-  if (!ticker) return <EmptyState title="Pick a ticker to see its risk factors." />;
+  if (!ticker) return <EmptyState title="Select a ticker." />;
   if (!list.data && list.loading) return <PaneStatusBody loading align="center" loadingLabel="Loading risk factors..." />;
   if (!list.data && listError && year === null) return <PaneStatusBody error={listError} errorTitle="Could not load risk reports." />;
   if (year === null) return <EmptyState title={`No 10-K risk factors on file for ${ticker}.`} />;
@@ -202,14 +219,14 @@ export function RiskFactorsPane({
             {report.overview ? (
               <Box flexDirection="column">
                 <SectionHeading
-                  title={diff ? "WHAT THE CHANGES SAY" : "WHAT DOMINATES"}
+                  title={diff ? "What the Changes Say" : "What Dominates"}
                 />
                 <BulletList items={report.overview.split("\n")} width={proseWidth} color={colors.text} />
               </Box>
             ) : null}
             {diff ? (
               <Box flexDirection="column">
-                <SectionHeading marginTop={report.overview ? 1 : 0} title="WHAT CHANGED" />
+                <SectionHeading marginTop={report.overview ? 1 : 0} title="What Changed" />
                 {diff.added.length === 0 &&
                 diff.removed.length === 0 &&
                 diff.reworded.length === 0 ? (
@@ -252,7 +269,7 @@ export function RiskFactorsPane({
               </Box>
             ) : report.notes.top.length > 0 ? (
               <Box flexDirection="column">
-                <SectionHeading marginTop={report.overview ? 1 : 0} title="MOST SPECIFIC TO THE COMPANY" />
+                <SectionHeading marginTop={report.overview ? 1 : 0} title="Most Specific to the Company" />
                 {report.notes.top.map((note) => (
                   <RiskLine
                     key={`top-${note.index}`}
@@ -266,7 +283,7 @@ export function RiskFactorsPane({
               </Box>
             ) : null}
             <Box flexDirection="column">
-              <SectionHeading marginTop={1} title="ALL RISK FACTORS" />
+              <SectionHeading marginTop={1} title="All Risk Factors" />
               {report.risks.map((risk, index) => (
                 <Prose
                   key={`${index}-${risk.heading}`}

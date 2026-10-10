@@ -1,20 +1,18 @@
 {
   "hosts": [
     "api.elections.kalshi.com",
-    "api.nasdaq.com",
+    "api.fda.gov",
     "api.votehub.com",
     "asx.api.markitdigital.com",
     "cdn-api.markitdigital.com",
+    "clinicaltrials.gov",
     "clob.polymarket.com",
     "data-api.polymarket.com",
-    "fc.yahoo.com",
+    "efts.sec.gov",
     "gamma-api.polymarket.com",
     "hacker-news.firebaseio.com",
     "nasdaqtrader.com",
     "news.google.com",
-    "production.dataviz.cnn.io",
-    "query1.finance.yahoo.com",
-    "query2.finance.yahoo.com",
-    "stockanalysis.com"
+    "production.dataviz.cnn.io"
   ]
 }

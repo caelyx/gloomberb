@@ -3,12 +3,13 @@ import {
   addPaneFloating,
   addPaneToLayout,
   findDockLeaf,
-} from "../../plugins/pane-manager";
+} from "../../layout/pane-manager";
 import type { PluginRegistry } from "../../plugins/registry";
+import { PluginOffError, notifyPluginOff } from "../../plugins/plugin-off";
 import {
   findTickerResearchFollower,
   listVisibleTickerSourcePanes,
-} from "../../plugins/ticker-navigation";
+} from "../../layout/ticker-navigation";
 import type {
   AppAction,
   AppState,
@@ -32,7 +33,7 @@ import {
 } from "./layout-placement";
 
 interface UseAppTickerInspectorRuntimeOptions {
-  activatePane: (paneId: string, layout?: LayoutConfig) => void;
+  activatePane: (paneId: string) => void;
   dispatch: Dispatch<AppAction>;
   notify: (body: string, options?: { type?: "info" | "success" | "error" }) => void;
   persistLayout: (layout: LayoutConfig, options?: { pushHistory?: boolean }) => void;
@@ -101,7 +102,7 @@ export function useAppTickerInspectorRuntime({
       instanceId: preferredInstanceId,
       binding: { kind: "follow", sourceInstanceId: sourcePaneId },
     });
-    const { width, height } = pluginRegistry.getTermSizeFn();
+    const { width, height } = pluginRegistry.getTermSize();
     const sourceDocked = findDockLeaf(state.config.layout, sourcePaneId);
     const layout = sourceDocked && paneDef.defaultMode !== "floating"
       ? addPaneToLayout(state.config.layout, instance, { relativeTo: sourcePaneId, position: "right" })
@@ -110,6 +111,13 @@ export function useAppTickerInspectorRuntime({
   }, [pluginRegistry, resolveInspectorPane, state.config.layout]);
 
   const switchTickerResearchTab = useCallback((tabId: string, preferredPaneId?: string | null) => {
+    // The tab lives in a research pane, which stays hidden while its plugin is off.
+    const owner = pluginRegistry.getDisabledPaneOwner(TICKER_RESEARCH_PANE_ID, state.config.disabledPlugins);
+    if (owner) {
+      const tabName = pluginRegistry.tickerResearchTabs.get(tabId)?.name ?? "this tab";
+      notifyPluginOff(pluginRegistry, new PluginOffError(owner, tabName), () => pluginRegistry.switchTab(tabId, preferredPaneId ?? undefined));
+      return;
+    }
     const targetPaneId = (() => {
       const target = preferredPaneId ? resolvePaneInstance(state.config.layout, preferredPaneId) : null;
       if (target?.paneId === TICKER_RESEARCH_PANE_ID) return target.instanceId;
@@ -131,7 +139,9 @@ export function useAppTickerInspectorRuntime({
     dispatch,
     ensureInspectorPane,
     persistLayout,
+    pluginRegistry,
     resolveTickerSourcePaneId,
+    state.config.disabledPlugins,
     state.config.layout,
     state.focusedPaneId,
   ]);
@@ -159,7 +169,7 @@ export function useAppTickerInspectorRuntime({
     if (ensured.layout !== state.config.layout) {
       persistLayout(ensured.layout);
     }
-    activatePane(ensured.instance.instanceId, ensured.layout);
+    activatePane(ensured.instance.instanceId);
   }, [
     activatePane,
     ensureInspectorPane,

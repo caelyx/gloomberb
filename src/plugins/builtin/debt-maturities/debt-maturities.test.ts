@@ -1,12 +1,18 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { apiClient } from "../../../api-client";
 import type {
   DebtMaturitiesPayload,
   DebtMetric,
 } from "../../../api-client/debt-maturities";
 import { ApiRequestError } from "../../../api-client/errors";
+import type { IssuerListingParams } from "../../../api-client/paths";
+import { MemoryPluginPersistence } from "../../../test-support/plugin-persistence";
 import {
   BUCKET_IDS,
+  cachedDebtMaturities,
+  debtMaturitiesCache,
   fetchDebtMaturities,
+  loadDebtMaturities,
   validateDebtMaturities,
 } from "./client";
 import {
@@ -14,7 +20,6 @@ import {
   bucketColumns,
   bucketShare,
   datedBucketScale,
-  debtAxisAmount,
   historyAxis,
   historyBars,
   historyChartPoints,
@@ -286,6 +291,40 @@ describe("debt maturity Cloud boundary", () => {
       }),
     ).rejects.toBe(denied);
   });
+
+  test("SAN in Paris is cached apart from SAN in New York and a 404 for it is no schedule", async () => {
+    const store = new MemoryPluginPersistence();
+    debtMaturitiesCache.attach(store);
+    const requests: Array<[string, IssuerListingParams | undefined]> = [];
+    const paris = { exchange: "XPAR", name: "Sanofi" };
+    // The server answers a listing abroad for its bare symbol.
+    const spy = spyOn(apiClient, "getCloudDebtMaturities").mockImplementation(async (symbol, listing) => {
+      requests.push([symbol, listing]);
+      return { ...fixture(), symbol: "SAN", entityName: listing ? "Sanofi" : "Banco Santander" };
+    });
+    try {
+      expect((await loadDebtMaturities("SAN")).payload.entityName).toBe("Banco Santander");
+      expect((await loadDebtMaturities("SAN", paris)).payload.entityName).toBe("Sanofi");
+      // The key's own venue is the same listing, so it reads the same entry.
+      expect((await loadDebtMaturities("SAN:EPA")).payload.entityName).toBe("Sanofi");
+      expect(cachedDebtMaturities("SAN", { exchange: "EPA" })?.payload.entityName).toBe("Sanofi");
+      expect(requests).toEqual([["SAN", undefined], ["SAN", paris]]);
+      expect(store.getResource("debt-maturities", "SAN:EPA", { sourceKey: "gloom-cloud" })).not.toBeNull();
+    } finally {
+      spy.mockRestore();
+      debtMaturitiesCache.reset();
+    }
+
+    const missing = {
+      getCloudDebtMaturities: async () => {
+        throw new ApiRequestError("missing", 404);
+      },
+    };
+    const none = await fetchDebtMaturities("AI", missing, { exchange: "EPA", name: "Air Liquide" });
+    expect(none).toMatchObject({ symbol: "AI", status: "unavailable", latest: null, history: [] });
+    expect(validateDebtMaturities(none, "AI")).toBe(none);
+    await expect(fetchDebtMaturities("AI", missing)).rejects.toThrow("not available yet");
+  });
 });
 
 test("maturity sorting follows fiscal order; numeric sorts preserve missing values last", () => {
@@ -349,11 +388,3 @@ test("each filing's bar sits in its own slot with its year under it", () => {
   expect(axis.formatCursor(1)).toBe(bars.at(-1)!.asOf);
 });
 
-test("amount ticks take their decimals from the plotted range", () => {
-  const domain = (min: number, max: number) => ({ min, max }) as Parameters<typeof debtAxisAmount>[1];
-  expect(debtAxisAmount(0, domain(0, 125e9))).toBe("0");
-  expect(debtAxisAmount(50e9, domain(0, 125e9))).toBe("50B");
-  expect(debtAxisAmount(91.2e9, domain(91e9, 92e9))).toBe("91.2B");
-  expect(debtAxisAmount(91.25e9, domain(91e9, 91.5e9))).toBe("91.25B");
-  expect(debtAxisAmount(750e6, domain(0, 900e6))).toBe("750M");
-});

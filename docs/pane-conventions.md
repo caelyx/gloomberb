@@ -59,7 +59,7 @@ the pane's own name; fixed labels; generic key hints (`j/k`, `Enter to open`,
 
 **The data provider is invisible.** Never show which vendor or internal
 route served the data: no `provider:gloomberb-cloud`, `gloomberb-cloud`,
-Gloom Cloud, Yahoo, Alpaca, Twelve Data, OPRA, SIP or `entry.source` values
+raw feed names or `entry.source` values
 in a footer, status line, header meta, table column, legend, tooltip or
 headless report column. Say what the data is instead: `real-time`,
 `15m delayed`, `settlement`, `daily closes`, `trade closes since …`, `as of`
@@ -120,8 +120,10 @@ the origin of a number. The one count the kit draws is the
 
 ## 5. Lists and tables
 
-Header labels and section headings are uppercased by the kit; write them in
-any case. Pass `onHeaderClick` only when the table sorts (without it headers
+Table header labels are uppercased by the kit; write them in any case.
+Section headings read in title case, bright and bold: the kit capitalises
+lower-case words, so write acronyms in capitals and never a whole heading in
+capitals. Pass `onHeaderClick` only when the table sorts (without it headers
 are not interactive), and `selection={{ kind: "none" }}` for a static table.
 Never build a table from padded `Text` rows: the kit gives the header band,
 gutters and fill to the footer.
@@ -137,7 +139,9 @@ CSV. A table that colors its cells passes `selectedTextOverridesCellColor`
 so the selected row reads in the selection color without each cell checking
 `rowState.selected`; a cell whose tone must survive the selection sets
 `keepColorWhenSelected`. Custom `content` still takes its colors from
-`rowState`.
+`rowState`. Artwork before a label on the desktop and web, such as a flag,
+goes in a cell's `leading` or a column's `headerLeading`: the terminal skips
+it, the text keeps its own selection color, and exports read only the text.
 
 **Table + detail.** `DataTableStackView` is the "list, then open one" shape:
 Enter or click calls `onActivate`, the pane sets the open item, the stack
@@ -153,6 +157,10 @@ back button or clicking Back pops it. Rules:
 - A detail read as text sits in a `DetailScrollBody` whose ref is the
   stack's `detailScrollRef`, so j/k step it a line at a time and the next
   item starts at the top.
+- Any other scrolling body is a `ScrollBox`. Leaving `scrollY` out means it
+  scrolls vertically, with the wheel and, while the pane is focused, with the
+  arrows, j/k, PageUp, PageDown, Home and End; `scrollY={false}` turns that off.
+  A body does not bind those keys itself unless it wants to step by a line.
 - A detail the user reads and comes back from is the stack, not a dialog or
   a floating pane. A new pane (`pinTicker`, `createPaneFromTemplate`) is for
   something kept beside the list.
@@ -261,6 +269,10 @@ header, with the detail's height.
   draws `strip` as the first row of the body. Subtract `rows`. Never in the
   footer. Register `null` while a sign-in wall or any state makes every tab
   show the same thing.
+- A chart you pan and draw on sits one level below a tab strip: the strip
+  keeps Left, Right, `h` and `l`; Down, Enter, a click or a chart tool moves
+  into the chart, and Esc or Up hands the keys back, with `[Esc]tabs` in the
+  footer while inside. `Tabs` and `CompositeChart` do this; a pane adds nothing.
 - A strip inside content that already has a title-bar strip (a Ticker
   Research tab, a stack detail) becomes a `QueryBar` view (`usePaneTabs`
   with `queryBarWidth`) or inline filter on the desktop; the terminal keeps
@@ -370,17 +382,27 @@ header, with the detail's height.
   `preventDefault()` when it acts). Reserved: `j`/`k`/arrows move, Enter
   opens, Esc/Backspace back, `r` refresh, `Shift+R` refresh all, `!`
   warnings, `o` open source, `/` search, `.` pane menu, Tab/Shift+Tab next
-  pane or field, `h`/`l` tabs, `?` help, `` ` `` ticker search, `q` quit (terminal),
-  `u` install update, `$` Pro upgrade, Ctrl+P command bar. `q`, `u`, `r`,
+  pane or field, `h`/`l` tabs, `?` help, F1 the pane's help card, `` ` `` ticker search, `q` quit (terminal),
+  `u` restart into a downloaded update or retry a failed one, `$` Pro upgrade, Ctrl+P command bar. `q`, `u`, `r`,
   `Shift+R`, `?` and `` ` `` reach the app before any pane. Table keys go
   through `onRootKeyDown` and `onDetailKeyDown` (return `true` when handled);
   global shortcuts through `registerShortcut` so Help lists them.
+- Esc Esc closes the focused pane, and only an Esc nobody consumed counts
+  as the first press. Consume Esc only when it backs out of something (a
+  detail, a menu, a selection, a draft); with nothing to back out of, let it
+  through. An Esc that only leaves an empty text field still counts: call
+  `countEscapeTowardClose(event)` and consume it.
 - The pane menu (`.`, Shift+F10, the `...` button) is where the keyboard
   finds everything: it lists the footer hints with their keys, what kit
   controls add (table sort, query-bar filters, tab add/close/move, empty-state
   actions), quick settings and the pane actions. An action with no key of its
   own goes there with `usePaneMenuItems`, never in a body button row. Set a
-  hint's `title` when its key is not the action's first letter.
+  hint's `title` when its key is not the action's first letter. A pane that
+  shows one ticker sets `tickerFollower` on its `PaneDef`, and the menu gains
+  "Link to" each visible list, scanner, or other single-ticker pane and "Unlink from" the one it follows;
+  the title then reads `OPX NVDA  ⧉ Linked to Watchlist`. Such a pane changes
+  ticker while mounted, so it keys its view by symbol and keeps saved
+  per-ticker choices (expiry, strike) per symbol.
 - One component renders in the terminal, the desktop app and the web. Import
   only `gloomberb/ui`, `gloomberb/components`, `gloomberb/react`; detect the
   target with `getCurrentPluginTarget()`, not `window` or `location`. Never
@@ -403,7 +425,7 @@ header, with the detail's height.
 8. Forms use kit fields, one Save per form at its bottom, Enter/Esc, busy and result in the footer, destructive actions confirmed.
 9. Per-instance configuration is a pane setting; important toggles are `quickSettings`.
 10. Methodology and usage text is in `docs/`.
-11. Data panes have a `headless` definition; fetching is in `client.ts`.
+11. Data panes have a `headless` definition; fetching is in `client.ts`. It declares `freshness` (source, status, schedule) wherever "Gloom Cloud" and the status read from the rows would be wrong, so the report's source, as-of and status line is true.
 12. No `@opentui`, Electrobun or DOM imports; no cell-drawn chrome on the desktop.
 13. A missing repeated pattern went into the kit with its callers migrated, not into the pane.
 14. On the desktop tables and charts fill with flex, not terminal row arithmetic; nothing ends in a dead band above the footer.

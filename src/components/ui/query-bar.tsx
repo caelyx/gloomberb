@@ -69,6 +69,8 @@ export interface QueryBarMultiFilter extends QueryBarFilterBase {
 export interface QueryBarToggleFilter extends QueryBarFilterBase {
   kind: "toggle";
   value: boolean;
+  /** A shorter label for the terminal's single row. */
+  short?: string;
   onChange: (value: boolean) => void;
   /**
    * The state the pane starts in; the other one narrows and gets a reset. True
@@ -431,7 +433,12 @@ export function QueryBar({ width, search, filters = [], view, meta }: QueryBarPr
           return <Box key={filter.id} flexShrink={0}>{textNodes.get(filter.id)}</Box>;
         }
         if (filter.kind === "toggle") {
-          return <Checkbox key={filter.id} label={filter.label} checked={filter.value} onChange={filter.onChange} />;
+          // A squeezed checkbox wraps its label out of the one-row bar.
+          return (
+            <Box key={filter.id} flexShrink={0}>
+              <Checkbox label={filter.label} displayLabel={filter.short} checked={filter.value} onChange={filter.onChange} />
+            </Box>
+          );
         }
         if (filter.kind === "multi") {
           return (
@@ -476,9 +483,14 @@ export function QueryBar({ width, search, filters = [], view, meta }: QueryBarPr
         <Box onMouseDown={resetAll} cursor="pointer"><Text fg={colors.textDim}>clear</Text></Box>
       )}
       {(view || meta) && <Box flexGrow={1} />}
-      {meta && <Text fg={colors.textMuted}>{meta}</Text>}
+      {/* Context gives way before the controls when the row runs short. */}
+      {meta && (
+        <Box flexShrink={1} minWidth={0} height={1} overflow="hidden">
+          <Text fg={colors.textMuted} wrapMode="none" truncate flexShrink={1} minWidth={0}>{meta}</Text>
+        </Box>
+      )}
       {view && (
-        <>
+        <Box flexShrink={view.options.length > TERMINAL_SEGMENT_LIMIT ? 1 : 0} minWidth={0}>
           <TerminalChoiceStrip
             options={view.options.map((option) => ({ value: option.value, label: option.label, hint: option.hint, disabled: option.disabled }))}
             value={view.value}
@@ -486,7 +498,7 @@ export function QueryBar({ width, search, filters = [], view, meta }: QueryBarPr
             focused={view.focused}
             shortcutScope={view.shortcutScope}
           />
-        </>
+        </Box>
       )}
     </Box>
   );

@@ -4,10 +4,14 @@ import {
   type AccountProfile,
   type ChatUserSummary,
 } from "../../../api-client";
-import {
-  PROFILE_POPOVER_CLOSE_DELAY_MS,
-  hasPublicChatProfileInfo,
-} from "./message/profile-popover";
+import { PROFILE_POPOVER_CLOSE_DELAY_MS } from "./message/profile-popover";
+import type { ChatUserAnchor } from "./message/types";
+
+interface ProfilePopoverOptions {
+  ownProfile?: boolean;
+  /** The name or @mention it opens from; the desktop places the card beside it. */
+  anchor?: ChatUserAnchor;
+}
 
 function accountProfileToChatUser(profile: AccountProfile): ChatUserSummary {
   return {
@@ -33,18 +37,22 @@ const OPTIONAL_PROFILE_FIELDS = [
 ] as const;
 
 /** `profilePublic` is a visibility switch, not a completion test: any filled optional field counts as set up. */
-export function isAccountProfileConfigured(profile: AccountProfile): boolean {
+function isAccountProfileConfigured(profile: AccountProfile): boolean {
   return OPTIONAL_PROFILE_FIELDS.some((field) => (profile[field] ?? "").trim().length > 0);
 }
 
 export function useChatProfilePopover(trackOwnProfileUserId?: string) {
   const [profilePopoverUser, setProfilePopoverUser] = useState<ChatUserSummary | null>(null);
+  const [profilePopoverAnchor, setProfilePopoverAnchor] = useState<ChatUserAnchor>(null);
   const [ownProfileConfigured, setOwnProfileConfigured] = useState<boolean | null>(null);
   const profilePopoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ownProfileRef = useRef<ChatUserSummary | null>(null);
   const ownProfileRequestRef = useRef<Promise<void> | null>(null);
   const ownProfileLoadedAtRef = useRef(0);
   const activeRef = useRef(true);
+  const pinnedRef = useRef(false);
+  const profilePopoverUserIdRef = useRef<string | null>(null);
+  const dismissedPinnedUserIdRef = useRef<string | null>(null);
 
   const cancelProfilePopoverClose = useCallback(() => {
     if (profilePopoverCloseTimerRef.current == null) return;
@@ -54,14 +62,21 @@ export function useChatProfilePopover(trackOwnProfileUserId?: string) {
 
   const closeProfilePopover = useCallback(() => {
     cancelProfilePopoverClose();
+    pinnedRef.current = false;
+    profilePopoverUserIdRef.current = null;
     setProfilePopoverUser(null);
+    setProfilePopoverAnchor(null);
   }, [cancelProfilePopoverClose]);
 
   const scheduleProfilePopoverClose = useCallback(() => {
+    if (pinnedRef.current) return;
     cancelProfilePopoverClose();
     profilePopoverCloseTimerRef.current = setTimeout(() => {
       profilePopoverCloseTimerRef.current = null;
+      if (pinnedRef.current) return;
+      profilePopoverUserIdRef.current = null;
       setProfilePopoverUser(null);
+      setProfilePopoverAnchor(null);
     }, PROFILE_POPOVER_CLOSE_DELAY_MS);
   }, [cancelProfilePopoverClose]);
 
@@ -96,20 +111,55 @@ export function useChatProfilePopover(trackOwnProfileUserId?: string) {
 
   const showProfilePopover = useCallback((
     targetUser: ChatUserSummary,
-    options?: { ownProfile?: boolean },
+    options?: ProfilePopoverOptions & { pin?: boolean },
   ) => {
     const ownProfile = options?.ownProfile === true;
     const cachedUser = ownProfile && ownProfileRef.current?.id === targetUser.id
       ? ownProfileRef.current
       : targetUser;
-    if (!ownProfile && !hasPublicChatProfileInfo(cachedUser)) {
+    // Every name has a card: a private or empty profile gets the name-only one.
+    cancelProfilePopoverClose();
+    pinnedRef.current = options?.pin === true;
+    profilePopoverUserIdRef.current = cachedUser.id;
+    setProfilePopoverUser(cachedUser);
+    setProfilePopoverAnchor(options?.anchor ?? null);
+    if (ownProfile) refreshOwnProfile(targetUser.id);
+  }, [cancelProfilePopoverClose, refreshOwnProfile]);
+
+  /** Pointing at a name previews its card, but never over one a click pinned. */
+  const hoverProfilePopover = useCallback((targetUser: ChatUserSummary, options?: ProfilePopoverOptions) => {
+    if (pinnedRef.current) return;
+    showProfilePopover(targetUser, options);
+  }, [showProfilePopover]);
+
+  /** A click on a name pins its card until Esc, a click outside, or a second click. */
+  const toggleProfilePopover = useCallback((targetUser: ChatUserSummary, options?: ProfilePopoverOptions) => {
+    // The desktop card hears the same click first, as a click outside it.
+    if (dismissedPinnedUserIdRef.current === targetUser.id) {
+      dismissedPinnedUserIdRef.current = null;
+      return;
+    }
+    if (pinnedRef.current && profilePopoverUserIdRef.current === targetUser.id) {
       closeProfilePopover();
       return;
     }
-    cancelProfilePopoverClose();
-    setProfilePopoverUser(cachedUser);
-    if (ownProfile) refreshOwnProfile(targetUser.id);
-  }, [cancelProfilePopoverClose, closeProfilePopover, refreshOwnProfile]);
+    showProfilePopover(targetUser, { ...options, pin: true });
+  }, [closeProfilePopover, showProfilePopover]);
+
+  /**
+   * Closes the card at once, pinned or not: a click outside it or Esc. When
+   * that click lands on the name that pinned it, the name's own toggle then
+   * leaves it closed instead of pinning it again.
+   */
+  const dismissProfilePopover = useCallback(() => {
+    if (pinnedRef.current) {
+      dismissedPinnedUserIdRef.current = profilePopoverUserIdRef.current;
+      setTimeout(() => {
+        dismissedPinnedUserIdRef.current = null;
+      }, 0);
+    }
+    closeProfilePopover();
+  }, [closeProfilePopover]);
 
   useEffect(() => {
     activeRef.current = true;
@@ -129,9 +179,13 @@ export function useChatProfilePopover(trackOwnProfileUserId?: string) {
   return {
     cancelProfilePopoverClose,
     closeProfilePopover,
+    dismissProfilePopover,
     ownProfileConfigured,
+    profilePopoverAnchor,
     profilePopoverUser,
+    hoverProfilePopover,
     scheduleProfilePopoverClose,
     showProfilePopover,
+    toggleProfilePopover,
   };
 }

@@ -7,6 +7,7 @@ import type {
 import type {
   HeadlessPaneApiClient,
   HeadlessPaneDefinition,
+  HeadlessPaneFreshness,
   HeadlessPaneLoadArgs,
   HeadlessPaneOptionDef,
   HeadlessSnapshotResult,
@@ -36,7 +37,7 @@ const SCANNER_LABELS: Record<ScannerName, string> = {
  * and returned only if nothing better arrives before the deadline, since a
  * scanner warming up can pass through a stale row on its way to live.
  */
-export function loadScannerSnapshot<T extends ScannerPayload>(
+function loadScannerSnapshot<T extends ScannerPayload>(
   client: Pick<HeadlessPaneApiClient, "subscribeScanner">,
   scanner: ScannerName,
   signal: AbortSignal,
@@ -88,7 +89,18 @@ export function loadHiloSnapshot(
   return loadScannerSnapshot<ScannerHiloPayload>(client, "hilo", signal, timeoutMs);
 }
 
-export function projectHiloSnapshot(
+/**
+ * The scanner says which instance served it, real-time or the delayed one free
+ * accounts get, and whether it is running: a closed session's scan is final,
+ * and a degraded one may have fallen behind.
+ */
+function scannerFreshness(payload: Pick<ScannerHiloPayload, "access" | "delayMinutes" | "status">): HeadlessPaneFreshness {
+  if (payload.status === "closed") return { status: "not-a-feed", basis: "closed session" };
+  if (payload.status === "degraded") return { status: "stale" };
+  return payload.access === "realtime" ? { status: "live" } : { status: "delayed", delayMinutes: payload.delayMinutes };
+}
+
+function projectHiloSnapshot(
   payload: ScannerHiloPayload,
   minPrice: HiloMinPrice,
   sort: HiloSort,
@@ -99,6 +111,7 @@ export function projectHiloSnapshot(
     asOf: new Date(payload.asOf).toISOString(),
     items: [...lows, ...highs],
     ...(payload.status === "degraded" ? { errors: ["Scanner feed degraded"] } : {}),
+    freshness: scannerFreshness(payload),
     metadata: {
       ...(payload.access === "delayed" ? { notices: [`Delayed ${payload.delayMinutes} minutes`] } : {}),
       status: payload.status,
@@ -204,7 +217,7 @@ function flowOption(key: FlowHeadlessFilterKey): HeadlessPaneOptionDef {
   };
 }
 
-export function projectFlowSnapshot(
+function projectFlowSnapshot(
   payload: ScannerFlowPayload,
   filters: FlowFilters,
   now = Date.now(),
@@ -214,6 +227,7 @@ export function projectFlowSnapshot(
     asOf: new Date(payload.asOf).toISOString(),
     items: events.map((event) => ({ ...event })),
     ...(payload.status === "degraded" ? { errors: ["Scanner feed degraded"] } : {}),
+    freshness: scannerFreshness(payload),
     metadata: {
       status: payload.status,
       access: payload.access,
@@ -224,7 +238,7 @@ export function projectFlowSnapshot(
   };
 }
 
-export interface FlowHeadlessDependencies {
+interface FlowHeadlessDependencies {
   load(
     args: HeadlessPaneLoadArgs,
     client: Pick<HeadlessPaneApiClient, "subscribeScanner">,
@@ -232,7 +246,7 @@ export interface FlowHeadlessDependencies {
   ): Promise<ScannerFlowPayload>;
 }
 
-export function createFlowHeadless(
+function createFlowHeadless(
   dependencies: FlowHeadlessDependencies = {
     load: (_args, client, signal) => loadScannerSnapshot<ScannerFlowPayload>(client, "flow", signal),
   },

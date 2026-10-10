@@ -36,7 +36,6 @@ import {
   appReducer,
   createInitialState,
   getEffectiveThemeId,
-  getFocusedTickerSymbol,
   type PaneRuntimeState,
   resolveCollectionForPane,
   resolveTickerForPane,
@@ -45,6 +44,7 @@ import {
 import type { AppAction, AppState } from "../../../core/state/app/state";
 import { scheduleConfigSave } from "../../config-save-scheduler";
 import { LOW_PRIORITY_CONFIG_SAVE_DEBOUNCE_MS } from "../../persist-scheduler";
+import { fireAndForget } from "../../../utils/fire-and-forget";
 
 export {
   appReducer,
@@ -118,6 +118,19 @@ export function useAppStateRef() {
   }, [context]);
 
   return stateRef;
+}
+
+/**
+ * Reads the store at the moment of the call. Unlike `useAppStateRef`, it stays
+ * current after the component unmounts, for work that outlives it: a confirm
+ * the command bar opened and then closed behind.
+ */
+export function useAppGetState(): () => AppState {
+  const context = useRequiredAppContext();
+  return useMemo(
+    () => isAppStoreContextValue(context) ? () => context.getState() : () => context.state,
+    [context],
+  );
 }
 
 export function useAppDispatch(): Dispatch<AppAction> {
@@ -378,7 +391,7 @@ function useUpdatePaneLayout(options: { saveDelayMs?: number } = {}) {
     const layout = update(state.config.layout);
     if (layout === state.config.layout) return;
     const config = syncConfigActiveLayoutState(
-      { ...state.config, layout }, state.paneState, state.focusedPaneId, state.activePanel,
+      { ...state.config, layout }, state.paneState, state.focusedPaneId,
     );
     dispatch({ type: "SET_CONFIG", config });
     scheduleConfigSave(config, { delayMs: saveDelayMs });
@@ -443,6 +456,7 @@ export function AppProvider({
   );
   const effectiveThemeId = getEffectiveThemeId(state);
   const previousRecentTickers = useRef(state.recentTickers);
+  const previousRecentCommands = useRef(state.config.recentCommands);
   const stateRef = useRef(state);
   const listenersRef = useRef(new Set<() => void>());
   const storeRef = useRef<AppContextStoreValue | null>(null);
@@ -478,7 +492,6 @@ export function AppProvider({
     config: currentState.config,
     paneState: currentState.paneState,
     focusedPaneId: currentState.focusedPaneId,
-    activePanel: currentState.activePanel,
     statusBarVisible: currentState.statusBarVisible,
   }), []);
 
@@ -486,7 +499,6 @@ export function AppProvider({
     config: snapshot.config,
     paneState: snapshot.paneState,
     focusedPaneId: snapshot.focusedPaneId,
-    activePanel: snapshot.activePanel,
     statusBarVisible: snapshot.statusBarVisible,
   }), []);
 
@@ -518,6 +530,13 @@ export function AppProvider({
     );
   }, [state.config, state.recentTickers]);
 
+  // A recent pane run changes only config.recentCommands; nothing else saves it.
+  useEffect(() => {
+    if (previousRecentCommands.current === state.config.recentCommands) return;
+    previousRecentCommands.current = state.config.recentCommands;
+    scheduleConfigSave(() => ({ ...stateRef.current.config, recentTickers: stateRef.current.recentTickers }));
+  }, [state.config.recentCommands]);
+
   useEffect(() => {
     if (!desktopBridge) return;
     return desktopBridge.subscribeState((snapshot) => {
@@ -547,15 +566,20 @@ export function AppProvider({
     if (signature === lastMainSyncRef.current) return;
     lastMainSyncRef.current = signature;
     latestMainStateRevisionRef.current += 1;
-    void desktopBridge.syncMainState({
-      ...snapshot,
-      mainStateRevision: latestMainStateRevisionRef.current,
-    });
+    // A snapshot that did not arrive must not count as sent. Forget it, unless
+    // a newer one has replaced it, so the next effect run sends it again. The
+    // two syncs below dedupe the same way.
+    fireAndForget(
+      desktopBridge.syncMainState({ ...snapshot, mainStateRevision: latestMainStateRevisionRef.current }),
+      "desktop.syncMainState",
+      () => {
+        if (lastMainSyncRef.current === signature) lastMainSyncRef.current = null;
+      },
+    );
   }, [
     buildDesktopSnapshot,
     desktopBridge,
     serializeDesktopSnapshot,
-    state.activePanel,
     state.config,
     state.focusedPaneId,
     state.paneState,
@@ -564,9 +588,12 @@ export function AppProvider({
 
   useEffect(() => {
     if (desktopBridge?.kind !== "main" || !desktopBridge.syncThemePreview) return;
-    if (lastThemePreviewSyncRef.current === state.themePreview) return;
-    lastThemePreviewSyncRef.current = state.themePreview;
-    void desktopBridge.syncThemePreview({ theme: state.themePreview });
+    const theme = state.themePreview;
+    if (lastThemePreviewSyncRef.current === theme) return;
+    lastThemePreviewSyncRef.current = theme;
+    fireAndForget(desktopBridge.syncThemePreview({ theme }), "desktop.setThemePreview", () => {
+      if (lastThemePreviewSyncRef.current === theme) lastThemePreviewSyncRef.current = undefined;
+    });
   }, [desktopBridge, state.themePreview]);
 
   useEffect(() => {
@@ -581,7 +608,13 @@ export function AppProvider({
     const paneSignature = serializePaneState(state.paneState[desktopBridge.paneId]);
     if (paneSignature === lastDetachedPaneSyncRef.current) return;
     lastDetachedPaneSyncRef.current = paneSignature;
-    void desktopBridge.replaceDetachedPaneState(desktopBridge.paneId, state.paneState[desktopBridge.paneId] ?? {});
+    fireAndForget(
+      desktopBridge.replaceDetachedPaneState(desktopBridge.paneId, state.paneState[desktopBridge.paneId] ?? {}),
+      "desktop.replaceDetachedPaneState",
+      () => {
+        if (lastDetachedPaneSyncRef.current === paneSignature) lastDetachedPaneSyncRef.current = null;
+      },
+    );
   }, [desktopBridge, serializePaneState, state.paneState]);
 
   useLayoutEffect(() => {

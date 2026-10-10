@@ -3,19 +3,21 @@ import type { TickerRecord } from "../types/ticker";
 import type { TickerRepository } from "../data/ticker-repository";
 import { resolveTickerSearch, upsertTickerFromSearchResult } from "../tickers/search";
 import { canonicalExchange } from "../utils/exchanges";
+import { resolveCliListing } from "./listing-arg";
 
+/** The saved ticker for a symbol (`SAN:EPA`, or `SAN` with `--exchange EPA`), saving it from search first if needed. */
 export async function resolveTickerForCli(
   symbol: string,
   store: TickerRepository,
   dataProvider: DataProvider,
+  exchange?: string,
 ): Promise<TickerRecord> {
-  const normalized = symbol.trim().toUpperCase();
-  if (!normalized) {
+  if (!symbol.trim()) {
     throw new Error("Ticker symbol is required.");
   }
-
-  const localTicker = await store.loadTicker(normalized);
-  if (localTicker) return localTicker;
+  const listing = await resolveCliListing(symbol, exchange, { store, dataProvider });
+  if (listing.saved) return listing.saved;
+  const normalized = listing.key;
 
   const localTickers = new Map(
     (await store.loadAllTickers()).map((ticker) => [ticker.metadata.ticker.toUpperCase(), ticker] as const),
@@ -40,8 +42,8 @@ export async function resolveTickerForCli(
 }
 
 /**
- * Search catalogues can file a listing under another company's name: Twelve
- * Data names BAE Systems' London line (BA:LSE) after Boeing. The listing's own
+ * Search catalogues can file a listing under another company's name, such as
+ * BAE Systems' London line (BA:LSE) under Boeing. The listing's own
  * quote names the security it prices, which is the name the ticker command
  * shows, so a record created here takes it.
  */

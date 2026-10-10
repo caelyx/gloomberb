@@ -37,6 +37,21 @@ const RANGE_PRESET_RESOLUTION: Record<TimeRange, ManualChartResolution> = {
   "ALL": "1mo",
 };
 
+/**
+ * The bar size a price history for a range is served in, unlike the chart
+ * presets above: what `gloomberb history` and the historical prices pane get.
+ */
+export const RANGE_HISTORY_RESOLUTION: Readonly<Record<TimeRange, ManualChartResolution>> = {
+  "1D": "5m",
+  "1W": "1h",
+  "1M": "1d",
+  "3M": "1d",
+  "6M": "1d",
+  "1Y": "1d",
+  "5Y": "1wk",
+  "ALL": "1mo",
+};
+
 const RANGE_PRELOAD_BUFFER: Record<TimeRange, TimeRange> = {
   "1D": "1W",
   "1W": "1M",
@@ -215,7 +230,7 @@ export function normalizeChartResolutionSupport(support: readonly ChartResolutio
   );
 }
 
-/** Yahoo-shaped support used for first paint when broker/provider support is async. */
+/** provider-shaped support used for first paint when broker/provider support is async. */
 export const DEFAULT_CHART_RESOLUTION_SUPPORT: ChartResolutionSupport[] = normalizeChartResolutionSupport([
   { resolution: "5m", maxRange: "1W" },
   { resolution: "15m", maxRange: "1M" },

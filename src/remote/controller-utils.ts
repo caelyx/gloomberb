@@ -1,4 +1,4 @@
-import { getDockedPaneIds } from "../plugins/pane-manager";
+import { getDockedPaneIds } from "../layout/pane-manager";
 import type { AppState } from "../state/app/context";
 import type { LayoutConfig, PaneInstanceConfig } from "../types/config";
 import { revisionFor } from "./revision";
@@ -59,11 +59,10 @@ export function activeLayoutRev(state: AppState): string {
     layout: state.config.layout,
     paneState: state.paneState,
     focusedPaneId: state.focusedPaneId,
-    activePanel: state.activePanel,
   });
 }
 
-export function panePlacement(layout: LayoutConfig, instanceId: string): "docked" | "floating" | "detached" | "hidden" {
+function panePlacement(layout: LayoutConfig, instanceId: string): "docked" | "floating" | "detached" | "hidden" {
   if (getDockedPaneIds(layout).includes(instanceId)) return "docked";
   if (layout.floating.some((entry) => entry.instanceId === instanceId)) return "floating";
   if ((layout.detached ?? []).some((entry) => entry.instanceId === instanceId)) return "detached";
@@ -101,7 +100,7 @@ export function normalizeIncludes(
 ): RemoteStateInclude[] {
   const raw = include ?? defaults;
   if (raw.includes("all")) {
-    return ["app", "layout", "panes", "commandBar", "ui", "schema", "help"];
+    return ["app", "layout", "panes", "commandBar", "form", "ui", "schema", "help"];
   }
   return [...new Set(raw)];
 }

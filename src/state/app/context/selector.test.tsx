@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { act, useRef, useState, type Dispatch } from "react";
-import { testRender } from "../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
+import { createRpcLoopback } from "../../../test-support/rpc-loopback";
+import { crashReportsEnabled, flushCrashReports, installCrashReporter, resetCrashReporterForTests } from "../../../telemetry/crash-reports";
+import { decodeRpcValue, encodeRpcValue } from "../../../renderers/electrobun/shared/rpc-codec";
+import { nameRpcTimeout } from "../../../renderers/electrobun/view/rpc-timeout";
 import { AppContext, AppProvider, PaneInstanceProvider, createInitialState, useAppDispatch, useAppSelector, usePaneSettingValue, usePaneStateValue, usePaneTicker, usePaneTitle, type AppAction } from "./index";
 import { cloneLayout, createDefaultConfig, type AppConfig } from "../../../types/config";
 import { applyTheme } from "../../../theme/colors";
@@ -10,8 +14,8 @@ import type { DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindo
 
 const TEST_PANE_ID = "ticker-detail:test";
 
-let testSetup: Awaited<ReturnType<typeof testRender>> | undefined;
 let capturedDispatch: Dispatch<AppAction> | null = null;
+let capturedConfig: AppConfig | null = null;
 let capturedPaneSetting: ((value: string) => void) | null = null;
 
 function createTickerDetailConfig(symbol: string): AppConfig {
@@ -36,6 +40,11 @@ function createTickerDetailConfig(symbol: string): AppConfig {
 
 function DispatchCapture() {
   capturedDispatch = useAppDispatch();
+  return null;
+}
+
+function ConfigCapture() {
+  capturedConfig = useAppSelector((state) => state.config);
   return null;
 }
 
@@ -101,14 +110,11 @@ function createDesktopBridge(
 }
 
 describe("pane selectors", () => {
-  afterEach(async () => {
-    if (testSetup) {
-      await act(async () => {
-        testSetup!.renderer.destroy();
-      });
-    }
-    testSetup = undefined;
+  const tui = createOpenTuiTestHarness();
+
+  afterEach(() => {
     capturedDispatch = null;
+    capturedConfig = null;
     capturedPaneSetting = null;
     applyTheme(DEFAULT_THEME);
   });
@@ -128,30 +134,30 @@ describe("pane selectors", () => {
       currentConfig = useAppSelector((state) => state.config);
       return <text>{`${channel}:${position}`}</text>;
     }
-    testSetup = await testRender(
+    await tui.render(
       <AppProvider config={currentConfig}>
         <PaneInstanceProvider paneId={TEST_PANE_ID}><PaneModel /></PaneInstanceProvider>
       </AppProvider>,
       { width: 24, height: 4 },
     );
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
     await act(useContextId);
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
     await act(() => changeChannel("two"));
-    await testSetup.renderOnce();
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
     const pane = currentConfig.layout.instances[0]!;
     expect(pane).toMatchObject({
       instanceId: TEST_PANE_ID, title: "Feed: two", settings: { channel: "two" },
       binding: { kind: "fixed", symbol: "AAPL" },
     });
     expect(currentConfig.layouts[0]!.layout.instances[0]).toEqual(pane);
-    expect(testSetup.captureCharFrame()).toContain("two:0");
+    expect(tui.frame()).toContain("two:0");
   });
 
   test("the deprecated { state, dispatch } value still serves the hooks, for external plugin tests", async () => {
     const dispatch: Dispatch<AppAction> = () => {};
-    testSetup = await testRender(
+    await tui.render(
       <AppContext value={{ state: createInitialState(createTickerDetailConfig("MSFT")), dispatch }}>
         <PaneInstanceProvider paneId={TEST_PANE_ID}>
           <DispatchCapture />
@@ -160,13 +166,13 @@ describe("pane selectors", () => {
       </AppContext>,
       { width: 24, height: 4 },
     );
-    await testSetup.renderOnce();
-    expect(testSetup.captureCharFrame()).toContain("MSFT:1");
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain("MSFT:1");
     expect(capturedDispatch).toBe(dispatch);
   });
 
   test("does not rerender usePaneTicker consumers for unrelated app state updates", async () => {
-    testSetup = await testRender(
+    await tui.render(
       <AppProvider config={createTickerDetailConfig("AAPL")}>
         <PaneInstanceProvider paneId={TEST_PANE_ID}>
           <DispatchCapture />
@@ -176,20 +182,20 @@ describe("pane selectors", () => {
       { width: 24, height: 4 },
     );
 
-    await testSetup.renderOnce();
-    expect(testSetup.captureCharFrame()).toContain("AAPL:1");
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain("AAPL:1");
 
     await act(() => {
       capturedDispatch?.({ type: "SET_COMMAND_BAR", open: true, query: "ticker" });
     });
 
-    await testSetup.renderOnce();
-    await testSetup.renderOnce();
-    expect(testSetup.captureCharFrame()).toContain("AAPL:1");
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain("AAPL:1");
   });
 
   test("does not dispatch or rerender when a pane setting keeps its effective value", async () => {
-    testSetup = await testRender(
+    await tui.render(
       <AppProvider config={createTickerDetailConfig("AAPL")}>
         <PaneInstanceProvider paneId={TEST_PANE_ID}>
           <PaneSettingHarness />
@@ -198,20 +204,20 @@ describe("pane selectors", () => {
       { width: 24, height: 4 },
     );
 
-    await testSetup.renderOnce();
-    expect(testSetup.captureCharFrame()).toContain("table:1");
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain("table:1");
 
     await act(() => {
       capturedPaneSetting?.("table");
     });
-    await testSetup.renderOnce();
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
 
-    expect(testSetup.captureCharFrame()).toContain("table:1");
+    expect(tui.frame()).toContain("table:1");
   });
 
   test("theme hook consumers follow theme changes and previews", async () => {
-    testSetup = await testRender(
+    await tui.render(
       <AppProvider config={createTickerDetailConfig("AAPL")}>
         <DispatchCapture />
         <ThemeSelectorHarness />
@@ -219,16 +225,16 @@ describe("pane selectors", () => {
       { width: 32, height: 4 },
     );
 
-    await testSetup.renderOnce();
-    expect(testSetup.captureCharFrame()).toContain(`${TEST_PANE_ID}:${DEFAULT_THEME}`);
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain(`${TEST_PANE_ID}:${DEFAULT_THEME}`);
 
     const dispatchAndCapture = async (action: AppAction) => {
       await act(() => {
         capturedDispatch?.(action);
       });
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
-      return testSetup!.captureCharFrame();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
+      return tui.frame();
     };
 
     expect(await dispatchAndCapture({ type: "PREVIEW_THEME", theme: "green" })).toContain(`${TEST_PANE_ID}:green`);
@@ -250,15 +256,15 @@ describe("pane selectors", () => {
     const config = createTickerDetailConfig("AAPL");
     if (configTheme) config.theme = configTheme;
 
-    testSetup = await testRender(
+    await tui.render(
       <AppProvider config={config} initialThemePreview={initialThemePreview}>
         <ThemeSelectorHarness />
       </AppProvider>,
       { width: 32, height: 4 },
     );
 
-    await testSetup.renderOnce();
-    expect(testSetup.captureCharFrame()).toContain(`${TEST_PANE_ID}:green`);
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain(`${TEST_PANE_ID}:green`);
   });
 
   test("desktop committed theme changes still sync through the config snapshot", async () => {
@@ -266,7 +272,7 @@ describe("pane selectors", () => {
     const themePreviews: DesktopThemePreviewState[] = [];
     const bridge = createDesktopBridge("main", { mainSnapshots, themePreviews });
 
-    testSetup = await testRender(
+    await tui.render(
       <AppProvider config={createTickerDetailConfig("AAPL")} desktopBridge={bridge}>
         <DispatchCapture />
         <ThemeSelectorHarness />
@@ -274,7 +280,7 @@ describe("pane selectors", () => {
       { width: 32, height: 4 },
     );
 
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
     mainSnapshots.length = 0;
     themePreviews.length = 0;
 
@@ -282,11 +288,69 @@ describe("pane selectors", () => {
       capturedDispatch?.({ type: "SET_THEME", theme: "green" });
     });
 
-    await testSetup.renderOnce();
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
     expect(mainSnapshots).toHaveLength(1);
     expect(mainSnapshots[0]?.config.theme).toBe("green");
     expect(themePreviews).toHaveLength(0);
+  });
+
+  test("a main state sync that times out is no unhandled rejection, and its snapshot is sent again", async () => {
+    // The Bun side swallows the first request, so the view's own request timer gives up on it.
+    const requests: DesktopSharedStateSnapshot[] = [];
+    const firstTimedOut = Promise.withResolvers<void>();
+    const send = createRpcLoopback((request) => {
+      requests.push(decodeRpcValue<{ snapshot: DesktopSharedStateSnapshot }>((request as { payload: unknown }).payload).snapshot);
+      return requests.length === 1 ? new Promise(() => {}) : null;
+    }, { maxRequestTime: 20 });
+    const bridge: DesktopWindowBridge = {
+      ...createDesktopBridge("main"),
+      syncMainState: async (snapshot) => {
+        const payload = { snapshot };
+        await nameRpcTimeout("desktop.syncMainState", payload, () => send({
+          method: "desktop.syncMainState",
+          payload: encodeRpcValue(payload),
+        }).finally(() => firstTimedOut.resolve()));
+      },
+    };
+    const reported: string[] = [];
+    const uninstall = installCrashReporter({
+      surface: "desktop",
+      isEnabled: () => crashReportsEnabled(null),
+      getInstallId: () => "0f1e2d3c-4b5a-4968-8776-655443322110",
+      send: async (payload) => { reported.push(...payload.errors.map((error) => error.message)); },
+    });
+    try {
+      await tui.render(
+        <AppProvider config={createTickerDetailConfig("AAPL")} desktopBridge={bridge}>
+          <DispatchCapture />
+          <ConfigCapture />
+        </AppProvider>,
+        { width: 24, height: 4 },
+      );
+      await tui.setup().renderOnce();
+      await firstTimedOut.promise;
+      // Bun fails the test for a rejection nobody handled, once the timeout has run its course.
+      await Bun.sleep(10);
+      expect(requests).toHaveLength(1);
+
+      // A config with the same content gives the same snapshot, which the failed send must not suppress.
+      await act(() => {
+        capturedDispatch?.({ type: "SET_CONFIG", config: { ...capturedConfig! } });
+      });
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
+      expect(requests).toHaveLength(2);
+      expect(requests[1]!.config).toEqual(requests[0]!.config);
+      expect(requests[1]!.mainStateRevision).toBe(requests[0]!.mainStateRevision! + 1);
+
+      // A real stall is still reported, once, under the same name.
+      await flushCrashReports({ timeoutMs: 500 });
+      expect(reported).toEqual([expect.stringMatching(/^RPC request timed out: desktop\.syncMainState after ~\d+s$/)]);
+    } finally {
+      uninstall();
+      resetCrashReporterForTests();
+    }
   });
 
   test("does not hydrate a stale desktop echo after a newer layout switch", async () => {
@@ -299,7 +363,7 @@ describe("pane selectors", () => {
       },
     });
 
-    testSetup = await testRender(
+    await tui.render(
       <AppProvider config={createDefaultConfig("/tmp/gloomberb-layout-race")} desktopBridge={bridge}>
         <DispatchCapture />
         <ActiveLayoutHarness />
@@ -307,7 +371,7 @@ describe("pane selectors", () => {
       { width: 24, height: 4 },
     );
 
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
     const matchingNewerSnapshot = {
       ...mainSnapshots.at(-1)!,
       mainStateRevision: 10,
@@ -318,8 +382,8 @@ describe("pane selectors", () => {
     await act(() => {
       capturedDispatch?.({ type: "SWITCH_LAYOUT", index: 1 });
     });
-    await testSetup.renderOnce();
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
     const staleSnapshot = mainSnapshots.at(-1)!;
     expect(staleSnapshot.config.activeLayoutIndex).toBe(1);
     expect(staleSnapshot.mainStateRevision).toBe(11);
@@ -327,18 +391,18 @@ describe("pane selectors", () => {
     await act(() => {
       capturedDispatch?.({ type: "SWITCH_LAYOUT", index: 0 });
     });
-    await testSetup.renderOnce();
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
     expect(mainSnapshots.at(-1)?.config.activeLayoutIndex).toBe(0);
     expect(mainSnapshots.at(-1)!.mainStateRevision).toBeGreaterThan(staleSnapshot.mainStateRevision!);
 
     await act(() => {
       stateListener?.(staleSnapshot);
     });
-    await testSetup.renderOnce();
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
 
-    expect(testSetup.captureCharFrame()).toContain("layout:0");
+    expect(tui.frame()).toContain("layout:0");
   });
 
   test("desktop detached windows apply theme preview messages locally", async () => {
@@ -349,23 +413,23 @@ describe("pane selectors", () => {
       },
     });
 
-    testSetup = await testRender(
+    await tui.render(
       <AppProvider config={createTickerDetailConfig("AAPL")} desktopBridge={bridge}>
         <ThemeSelectorHarness />
       </AppProvider>,
       { width: 32, height: 4 },
     );
 
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
     expect(previewListener).not.toBeNull();
-    expect(testSetup.captureCharFrame()).toContain(`${TEST_PANE_ID}:${DEFAULT_THEME}`);
+    expect(tui.frame()).toContain(`${TEST_PANE_ID}:${DEFAULT_THEME}`);
 
     await act(() => {
       previewListener?.({ theme: "green" });
     });
 
-    await testSetup.renderOnce();
-    await testSetup.renderOnce();
-    expect(testSetup.captureCharFrame()).toContain(`${TEST_PANE_ID}:green`);
+    await tui.setup().renderOnce();
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain(`${TEST_PANE_ID}:green`);
   });
 });

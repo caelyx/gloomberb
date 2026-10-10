@@ -1,5 +1,5 @@
-import { Box, Text, useUiCapabilities } from "../../ui";
-import type { ReactNode } from "react";
+import { Box, Text, useUiCapabilities, type BoxRenderable } from "../../ui";
+import type { ReactNode, RefObject } from "react";
 import { colors, floatingPaneBg } from "../../theme/colors";
 import { PaneBodyFrame, getPaneWindowAttributes } from "./pane/frame";
 import { PaneHeader, type PaneHeaderQuickSetting } from "./pane/header";
@@ -31,10 +31,14 @@ interface FloatingPaneWrapperProps {
   onHeaderContextMenu?: (event: any) => void;
   onActionMouseDown?: (event: any) => void;
   onCloseMouseDown?: (event: any) => void;
+  onRestoreMouseDown?: (event: any) => void;
+  fullscreen?: boolean;
   onResizeMouseDown?: (event: any) => void;
   onResizeMouseDrag?: (event: any) => void;
   onResizeMouseDragEnd?: (event: any) => void;
   footer?: CombinedPaneFooter | null;
+  /** The pane's frame, which a desktop resize sizes outside React; its header, body and footer stretch with it. */
+  frameRef?: RefObject<BoxRenderable | null>;
   children: ReactNode;
 }
 
@@ -80,10 +84,13 @@ export function FloatingPaneWrapper({
   onHeaderContextMenu,
   onActionMouseDown,
   onCloseMouseDown,
+  onRestoreMouseDown,
+  fullscreen = false,
   onResizeMouseDown,
   onResizeMouseDrag,
   onResizeMouseDragEnd,
   footer,
+  frameRef,
   children,
 }: FloatingPaneWrapperProps) {
   const { nativePaneChrome } = useUiCapabilities();
@@ -96,6 +103,7 @@ export function FloatingPaneWrapper({
 
   return (
     <Box
+      ref={frameRef}
       position="absolute"
       top={y}
       left={x}
@@ -137,6 +145,8 @@ export function FloatingPaneWrapper({
         onHeaderContextMenu={onHeaderContextMenu}
         onActionMouseDown={onActionMouseDown}
         onCloseMouseDown={onCloseMouseDown}
+        onRestoreMouseDown={onRestoreMouseDown}
+        fullscreen={fullscreen}
       />
 
       <PaneBodyFrame layoutProps={bodyFrame.layoutProps} backgroundColor={bg}>

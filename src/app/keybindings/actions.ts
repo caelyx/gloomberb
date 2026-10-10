@@ -7,6 +7,7 @@ export type CoreKeybindingActionId =
   | "command-bar"
   | "ticker-search"
   | "help"
+  | "function-help"
   | "switch-layout"
   | "focus-next-pane"
   | "focus-prev-pane"
@@ -21,6 +22,7 @@ export type CoreKeybindingActionId =
   | "close-floating-panes"
   | "pane-settings"
   | "pane-fullscreen"
+  | "pane-new-layout"
   | "pane-float"
   | "pane-pop-out"
   | "pane-screenshot"
@@ -31,7 +33,7 @@ export type CoreKeybindingActionId =
   | "window-move-mode"
   | "window-resize-mode";
 
-export type KeybindingActionCategory = "Global Keys" | "Pane Management";
+type KeybindingActionCategory = "Global Keys" | "Pane Management";
 
 export interface KeybindingActionDef {
   id: CoreKeybindingActionId;
@@ -51,6 +53,7 @@ export const PANE_ACTION_IDS = new Set<CoreKeybindingActionId>([
   "close-floating-panes",
   "pane-settings",
   "pane-fullscreen",
+  "pane-new-layout",
   "pane-float",
   "pane-pop-out",
   "pane-screenshot",
@@ -89,6 +92,13 @@ export const KEYBINDING_ACTIONS: readonly KeybindingActionDef[] = [
     defaults: ["?"],
   },
   {
+    id: "function-help",
+    category: "Global Keys",
+    description: "Open the focused pane's help card: what it shows, its keys and how fresh its data is.",
+    // F1 is help on every platform and nothing in the app used it.
+    defaults: ["F1"],
+  },
+  {
     id: "switch-layout",
     category: "Global Keys",
     description: "Switch saved layouts by number.",
@@ -121,7 +131,7 @@ export const KEYBINDING_ACTIONS: readonly KeybindingActionDef[] = [
   {
     id: "install-update",
     category: "Global Keys",
-    description: "Install an available app update when one is shown.",
+    description: "Restart into a downloaded app update, or retry one that failed.",
     defaults: ["U"],
   },
   {
@@ -177,6 +187,14 @@ export const KEYBINDING_ACTIONS: readonly KeybindingActionDef[] = [
     category: "Pane Management",
     description: "Fill the window with the focused pane, or restore it.",
     defaults: ["CmdOrCtrl+Shift+F"],
+  },
+  {
+    id: "pane-new-layout",
+    category: "Pane Management",
+    description: "Move the focused pane to a new layout of its own, or back to the layout it came from.",
+    // N for new, and no app chord had it. Browsers keep Ctrl/Cmd+Shift+N for a
+    // private window, so on the web the pane menu and command bar carry it.
+    defaults: ["CmdOrCtrl+Shift+N"],
   },
   {
     id: "pane-float",

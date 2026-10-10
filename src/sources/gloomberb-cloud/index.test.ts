@@ -4,7 +4,7 @@ import type { NewsCapability } from "../../capabilities";
 import { apiClient, type CloudNewsPayload } from "../../api-client";
 import { cloudNewsParams } from "./news";
 import type { QuoteSubscriptionTarget } from "../../types/data-provider";
-import { ProviderMissError } from "../provider-errors";
+import { ProviderMissError, providerMissReason } from "../provider-errors";
 import { verifiedUser } from "../../test-support/cloud-api";
 
 const originalEnsureVerifiedSession = apiClient.ensureVerifiedSession.bind(apiClient);
@@ -16,11 +16,16 @@ const originalGetCloudQuotesBatch = apiClient.getCloudQuotesBatch.bind(apiClient
 const originalGetCloudFinancialsBatch = apiClient.getCloudFinancialsBatch.bind(apiClient);
 const originalGetCloudExchangeRate = apiClient.getCloudExchangeRate.bind(apiClient);
 const originalGetCloudOptionsChain = apiClient.getCloudOptionsChain.bind(apiClient);
+const originalGetCloudAnalystResearch = apiClient.getCloudAnalystResearch.bind(apiClient);
+const originalGetCloudHolders = apiClient.getCloudHolders.bind(apiClient);
+const originalGetCloudCorporateActions = apiClient.getCloudCorporateActions.bind(apiClient);
+const originalGetMarketEarningsCalendar = apiClient.getMarketEarningsCalendar.bind(apiClient);
+const originalGetCloudArticleSummary = apiClient.getCloudArticleSummary.bind(apiClient);
 const originalGetCloudNews = apiClient.getCloudNews.bind(apiClient);
 const originalGetCloudNewsStory = apiClient.getCloudNewsStory.bind(apiClient);
 const originalSubscribeQuotes = apiClient.subscribeQuotes.bind(apiClient);
 
-test("news lookup shares the canonical listing across public and Yahoo deep-link aliases", () => {
+test("news lookup shares the canonical listing across qualified and suffix-based listing aliases", () => {
   for (const ticker of ["VOD:XLON", "VOD.L"]) {
     expect(cloudNewsParams({ scope: "ticker", ticker, exchange: "LSE" }))
       .toMatchObject({ ticker: "VOD", exchange: "XLON" });
@@ -88,7 +93,12 @@ afterEach(() => {
   apiClient.getCloudFinancialsBatch = originalGetCloudFinancialsBatch;
   apiClient.getCloudExchangeRate = originalGetCloudExchangeRate;
   apiClient.getCloudOptionsChain = originalGetCloudOptionsChain;
+  apiClient.getCloudAnalystResearch = originalGetCloudAnalystResearch;
+  apiClient.getCloudHolders = originalGetCloudHolders;
+  apiClient.getCloudCorporateActions = originalGetCloudCorporateActions;
   apiClient.getCloudNews = originalGetCloudNews;
+  apiClient.getMarketEarningsCalendar = originalGetMarketEarningsCalendar;
+  apiClient.getCloudArticleSummary = originalGetCloudArticleSummary;
   apiClient.getCloudNewsStory = originalGetCloudNewsStory;
   apiClient.subscribeQuotes = originalSubscribeQuotes;
 });
@@ -120,6 +130,40 @@ describe("GloomberbCloudProvider", () => {
     }
   });
 
+  test("an empty answer carries the service's reason into the provider miss, cleaned, or none when it gave none", async () => {
+    const provider = new GloomberbCloudProvider();
+    const sentence = "Spot gold is not quoted; GC=F is the front-month future.";
+    const fixtures: Array<[string, unknown, string | undefined]> = [
+      ["present", sentence, sentence],
+      ["absent", undefined, undefined],
+      ["blank", "  \n ", undefined],
+      ["multi-line", `  ${sentence}\r\nSecond line\u001b[31m.\n`, `${sentence} Second line.`],
+      ["over-long", `${sentence} ${"More detail. ".repeat(40)}`, `${sentence} ${"More detail. ".repeat(40)}`.slice(0, 199).trimEnd() + "…"],
+    ];
+    for (const [name, message, expected] of fixtures) {
+      const empty = { status: "empty" as const, data: null, reasonCode: "NOT_FOUND", ...(message === undefined ? {} : { message: message as string }) };
+      apiClient.getCloudQuote = async () => empty;
+      apiClient.getCloudExchangeRate = async () => empty;
+      apiClient.getCloudQuotesBatch = async () => ({ status: "partial", data: { items: [{ symbol: "XAU/USD", exchange: "", ...empty }] } });
+      apiClient.getCloudFinancialsBatch = apiClient.getCloudQuotesBatch as unknown as typeof apiClient.getCloudFinancialsBatch;
+      const misses = [
+        await provider.getQuote("XAU/USD").catch((error) => error),
+        await provider.getExchangeRateSnapshot("XAU").catch((error) => error),
+        (await provider.getQuotesBatch([{ symbol: "XAU/USD" }]))[0]!.error,
+        (await provider.getTickerFinancialsBatch([{ symbol: "XAU/USD" }]))[0]!.error,
+      ];
+      for (const miss of misses) {
+        expect([name, miss instanceof ProviderMissError]).toEqual([name, true]);
+        expect([name, providerMissReason(miss)]).toEqual([name, expected]);
+      }
+    }
+    // An error status is a failure, not an empty answer: its text is not offered as a reason.
+    apiClient.getCloudQuote = async () => ({ status: "error", data: null, reasonCode: "UPSTREAM", message: sentence });
+    const failure = await provider.getQuote("XAU/USD").catch((error) => error);
+    expect(failure).not.toBeInstanceOf(ProviderMissError);
+    expect(failure.message).toBe("UPSTREAM");
+  });
+
   test("uses host venue aliases at the cloud boundary without losing suffix or non-equity identity", async () => {
     const requests: Array<[string, string | undefined]> = [];
     apiClient.getCloudQuote = async (symbol, exchange) => {
@@ -145,6 +189,37 @@ describe("GloomberbCloudProvider", () => {
       expect((await provider.getQuote(symbol!, exchange)).symbol).toBe(symbol!);
       expect(requests.at(-1)).toEqual([requestSymbol, requestExchange]);
     }
+  });
+
+  test("asks for a Hong Kong listing by its four-digit code, as brokers report it without the zeros", async () => {
+    // IBKR reports Tencent as 700 on SEHK; Cloud only knows 0700.
+    const requests: Array<[string, string, string | undefined]> = [];
+    const quote = (symbol: string) => ({ symbol, price: 424.8, currency: "HKD", change: 0, changePercent: 0, lastUpdated: 1, listingExchangeName: "HKEX" });
+    apiClient.getCloudQuote = async (symbol, exchange) => {
+      requests.push(["quote", symbol, exchange]);
+      return { status: "success", data: quote(symbol) };
+    };
+    apiClient.getCloudQuotesBatch = async (targets) => {
+      for (const target of targets) requests.push(["batch", target.symbol, target.exchange]);
+      return { status: "success", data: { items: targets.map((target) => ({ ...target, status: "success" as const, data: quote(target.symbol) })) } };
+    };
+    apiClient.getCloudHistory = async (symbol, exchange) => {
+      requests.push(["history", symbol, exchange]);
+      return { status: "success", data: [{ date: "2026-10-09", close: 424.8 }] };
+    };
+    const provider = new GloomberbCloudProvider();
+    expect((await provider.getQuote("700", "SEHK")).price).toBe(424.8);
+    const targets = [{ symbol: "700", exchange: "SEHK" }, { symbol: "1211", exchange: "HKEX" }, { symbol: "7203", exchange: "TSEJ" }];
+    const batch = await provider.getQuotesBatch(targets);
+    // The four-digit answer still lands on the target that asked for 700.
+    expect(batch.find((result) => result.target === targets[0])?.quote?.price).toBe(424.8);
+    expect(batch.every((result) => result.quote)).toBe(true);
+    expect(await provider.getPriceHistory("5", "SEHK", "1M")).toHaveLength(1);
+    expect(requests).toEqual([
+      ["quote", "0700", "HKEX"],
+      ["batch", "0700", "HKEX"], ["batch", "1211", "HKEX"], ["batch", "7203", "JPX"],
+      ["history", "0005", "HKEX"],
+    ]);
   });
 
   test("rejects contradictory qualified listings before quote, research, history or auth transport", async () => {
@@ -312,7 +387,7 @@ describe("GloomberbCloudProvider", () => {
     unsubscribe();
   });
 
-  test("uses public delayed market routes anonymously but keeps research protected", async () => {
+  test("uses market data and research routes without requiring a session", async () => {
     let sessionChecks = 0;
     apiClient.ensureVerifiedSession = async () => {
       sessionChecks += 1;
@@ -333,7 +408,7 @@ describe("GloomberbCloudProvider", () => {
     });
     apiClient.getCloudHistory = async () => ({
       status: "success",
-      providerMeta: { provider: "yahoo" },
+      providerMeta: { provider: "gloom" },
       data: [{ date: "2026-08-21", close: 200 }],
     });
     apiClient.getCloudOptionsChain = async () => ({
@@ -345,7 +420,7 @@ describe("GloomberbCloudProvider", () => {
         calls: [],
         puts: [],
         dataSource: "delayed",
-        feed: "yahoo",
+        feed: "gloom",
         delayMinutes: 15,
         realtimeEligible: false,
         asOf: "2026-08-21T20:00:00.000Z",
@@ -360,14 +435,21 @@ describe("GloomberbCloudProvider", () => {
     expect(await provider.canProvide()).toBe(true);
     expect((await provider.getQuote("AAPL", "NASDAQ")).price).toBe(200);
     expect(await provider.getPriceHistory("AAPL", "NASDAQ", "1M")).toHaveLength(1);
-    expect((await provider.getOptionsChain("AAPL", "NASDAQ")).feed).toBe("yahoo");
+    expect((await provider.getOptionsChain("AAPL", "NASDAQ")).feed).toBe("gloom");
     expect(await provider.getExchangeRate("GBP")).toBe(1.25);
     expect(sessionChecks).toBe(0);
 
-    await expect(provider.getAnalystResearch("AAPL", "NASDAQ")).rejects.toThrow(
-      "requires signup and email verification",
-    );
-    expect(sessionChecks).toBe(1);
+    apiClient.getCloudAnalystResearch = async () => ({ status: "success", data: {
+      symbol: "AAPL", recommendations: [], ratings: [], earningsEstimates: [], revenueEstimates: [],
+    } });
+    apiClient.getCloudHolders = async () => ({ status: "success", data: { symbol: "AAPL", holders: [] } });
+    apiClient.getCloudCorporateActions = async () => ({ status: "success", data: {
+      symbol: "AAPL", dividends: [], splits: [], earnings: [],
+    } });
+    expect((await provider.getAnalystResearch("AAPL", "NASDAQ")).symbol).toBe("AAPL");
+    expect((await provider.getHolders("AAPL", "NASDAQ")).symbol).toBe("AAPL");
+    expect((await provider.getCorporateActions("AAPL", "NASDAQ")).symbol).toBe("AAPL");
+    expect(sessionChecks).toBe(0);
   });
 
   test("fetches detailed intraday chart history with cloud intervals", async () => {
@@ -526,11 +608,11 @@ describe("GloomberbCloudProvider", () => {
     expect(history).toHaveLength(3);
   });
 
-  test("does not reject an explicitly Yahoo-backed cloud history response", async () => {
+  test("generic managed attribution cannot bypass malformed intraday history validation", async () => {
     apiClient.ensureVerifiedSession = async () => verifiedUser;
     apiClient.getCloudHistory = async () => ({
       status: "success",
-      providerMeta: { provider: "yahoo" },
+      providerMeta: { provider: "gloom" },
       data: [
         { date: "2026-07-29T20:46:00Z", close: 728.5 },
         {
@@ -546,14 +628,12 @@ describe("GloomberbCloudProvider", () => {
     });
 
     const provider = new GloomberbCloudProvider();
-    const history = await provider.getPriceHistoryForResolution(
+    await expect(provider.getPriceHistoryForResolution(
       "SPY",
       "NYSEARCA",
       "1W",
       "1m",
-    );
-
-    expect(history[1]?.low).toBe(686.98);
+    )).rejects.toThrow("failed OHLC validation");
   });
 
   test("normalizes daily detailed history requests to 1day", async () => {
@@ -948,4 +1028,27 @@ test("cloud SEC acceptance keeps timezone-free source values without using the m
   const rows = await new GloomberbCloudProvider().getSecFilings("FDX");
   expect(rows.map((row) => row.acceptedAtRaw)).toEqual(values);
   expect(rows.map((row) => row.acceptedAt?.toISOString())).toEqual([values[0], undefined, undefined]);
+});
+
+
+test("anonymous earnings retain estimate units and deserialize report dates across bounded batches", async () => {
+  apiClient.ensureVerifiedSession = async () => { throw new Error("Must not require a session"); };
+  const batches: string[][] = [];
+  apiClient.getMarketEarningsCalendar = async (symbols) => {
+    batches.push(symbols);
+    return { status: "success", data: symbols.map(symbol => ({ symbol, name: symbol,
+      earningsDate: "2026-11-05T21:00:00Z", earningsCallDate: "2026-11-05T22:00:00Z",
+      epsEstimate: 1.5, epsActual: null, revenueEstimate: 100, revenueActual: null, surprise: null, timing: "AMC",
+      estimateBasis: { epsEstimate: { source: "earningsTrend", sourceValue: 150, currency: "GBP", sourceCurrency: "GBp", period: "0q", periodEndDate: "2026-09-30" } },
+    })) };
+  };
+  const provider = new GloomberbCloudProvider();
+  const events = await provider.getEarningsCalendar([...Array.from({ length: 101 }, (_, i) => `S${i}`), " s0 "]);
+  expect(batches.map(batch => batch.length)).toEqual([100, 1]);
+  expect(events).toHaveLength(101);
+  expect(events[0]?.earningsDate).toEqual(new Date("2026-11-05T21:00:00Z"));
+  expect(events[0]?.earningsCallDate).toEqual(new Date("2026-11-05T22:00:00Z"));
+  expect(events[0]?.estimateBasis?.epsEstimate).toMatchObject({ currency: "GBP", sourceValue: 150, periodEndDate: "2026-09-30" });
+  apiClient.getCloudArticleSummary = async url => ({ summary: url === "https://example.com/story" ? "Story summary" : null });
+  expect(await provider.getArticleSummary("https://example.com/story")).toBe("Story summary");
 });

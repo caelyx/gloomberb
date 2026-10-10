@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { ResolvedPortfolioAccountState } from "../portfolio-list/summary";
 import type { PortfolioSummaryTotals } from "../portfolio-list/metrics";
 import type { TickerRecord } from "../../../types/ticker";
@@ -6,6 +6,15 @@ import type { PricePoint } from "../../../types/financials";
 import { buildChartKey } from "../../../market-data/selectors";
 import { buildAnalyticsRiskRows, buildAnalyticsSummaryRows, buildBenchmarkReturnSeries, buildPortfolioChartTargets, buildPortfolioReturnSeries, formatHistoryValueAxis } from "./pane-model";
 import { createTestTicker } from "../../../test-support/ticker";
+import { useRegularMarketSession } from "../../../test-support/market-session";
+import {
+  MARGIN_EXCHANGE_RATES,
+  MARGIN_PORTFOLIO,
+  MARGIN_TICKERS,
+  createMarginAccount,
+  marginQuotes,
+} from "../../../test-support/margin-account";
+import { calculatePortfolioSummaryTotals } from "../portfolio-list/metrics";
 
 function riskTicker(symbol: string): TickerRecord {
   return createTestTicker(symbol, symbol, {
@@ -23,7 +32,7 @@ function riskHistory(): PricePoint[] {
 const rejectedSpy = { date: new Date("2026-09-10"), open: 764.08, high: 758.555, low: 757.57, close: 758.15, volume: 3461376 };
 
 test("a rejected benchmark suppresses beta while the independent basket Sharpe remains available", () => {
-  const request = buildPortfolioChartTargets([riskTicker("SPY")])[0]!.request;
+  const request = buildPortfolioChartTargets([riskTicker("SPY")])[0]!.request!;
   const history = [...riskHistory().slice(0, -1), rejectedSpy];
   const entries = new Map([[buildChartKey(request), { data: history }]]);
   const result = buildBenchmarkReturnSeries(request, entries);
@@ -40,7 +49,7 @@ test("a rejected benchmark suppresses beta while the independent basket Sharpe r
 
 test("a corrupt holding cannot be silently dropped from estimated portfolio risk", () => {
   const targets = buildPortfolioChartTargets([riskTicker("SPY"), riskTicker("MSFT")]);
-  const chartEntries = new Map(targets.map(({ request }, index) => [buildChartKey(request), {
+  const chartEntries = new Map(targets.map(({ request }, index) => [buildChartKey(request!), {
     data: index === 0 ? [...riskHistory().slice(0, -1), rejectedSpy] : riskHistory(),
   }]));
   const input = { chartTargets: targets, chartEntries, financials: new Map(),
@@ -50,7 +59,7 @@ test("a corrupt holding cannot be silently dropped from estimated portfolio risk
   expect(result.historyIntegrity[0]).toMatchObject({ symbol: "SPY", integrity: { sourcePoints: [{ ...rejectedSpy, date: "2026-09-10T00:00:00.000Z" }] } });
   const rows = buildAnalyticsRiskRows({ ...result, sharpe: 2, beta: 1 });
   expect(rows.every((row) => row.value === "—" && row.detail === "Inconsistent OHLC history: SPY")).toBe(true);
-  chartEntries.set(buildChartKey(targets[0]!.request), { data: riskHistory() });
+  chartEntries.set(buildChartKey(targets[0]!.request!), { data: riskHistory() });
   expect(buildPortfolioReturnSeries(input).returns).toHaveLength(20);
   expect(buildPortfolioReturnSeries(input).historyIntegrity).toEqual([]);
 });
@@ -88,6 +97,31 @@ test("converts every account balance while keeping leverage independent of displ
   expect(rows(1).has("margin-leverage")).toBe(false);
 });
 
+describe("a margin account's summary", () => {
+  useRegularMarketSession();
+
+  const rows = (account: ReturnType<typeof createMarginAccount> | null) => new Map(buildAnalyticsSummaryRows({
+    accountState: account ? { account, sourceLabel: "Synced", sourceKind: "cloud", snapshotBasis: "marks", visibleCashBalances: [] } : null,
+    activePortfolio: MARGIN_PORTFOLIO,
+    brokerPerformance: null,
+    portfolioStats: calculatePortfolioSummaryTotals(MARGIN_TICKERS, marginQuotes(), "USD", MARGIN_EXCHANGE_RATES, true, MARGIN_PORTFOLIO.id),
+  }).map((row) => [row.id, `${row.label} ${row.value}`]));
+
+  test("states the equity, the gross and the leverage between them", () => {
+    const summary = rows(createMarginAccount());
+    expect(summary.get("net-liquidation")).toBe("Net Liq 1.00M");
+    expect(summary.get("total-value")).toBe("Gross 1.60M");
+    expect(summary.get("margin-leverage")).toBe("Margin Lev 1.6x");
+    expect(summary.get("cash")).toBe("Cash -600.0k");
+  });
+
+  test("without its account the gross is never shown as the value", () => {
+    const summary = rows(null);
+    expect(summary.get("net-liquidation")).toBe("Net Liq —");
+    expect(summary.get("total-value")).toBe("Gross 1.60M");
+  });
+});
+
 test("cash-only summary uses reported account metrics and preserves explicit zero", () => {
   const accountState: ResolvedPortfolioAccountState = {
     account: { accountId: "test", name: "Test", currency: "USD", netLiquidation: 6000, totalCashValue: 6000 },
@@ -123,7 +157,7 @@ test("does not publish portfolio risk from just the valued portion when FX is mi
   })));
   const targets = buildPortfolioChartTargets(tickers);
   const sessionDates = ["01", "02", "03", "04", "05", "08", "09", "10", "11", "12", "15", "16", "17", "18", "22", "23", "24", "25", "26", "29"];
-  const chartEntries = new Map(targets.map(({ request }) => [buildChartKey(request), {
+  const chartEntries = new Map(targets.map(({ request }) => [buildChartKey(request!), {
     data: sessionDates.map((day, index) => ({ date: new Date(`2026-06-${day}`), close: 100 + index + index % 2 })),
   }]));
   const input = {

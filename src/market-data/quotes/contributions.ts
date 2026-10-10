@@ -1,11 +1,14 @@
 import { resolvePriceBasis } from "../market/price-basis";
+import { isAlwaysOpenExchange } from "../market/freshness";
 import type {
+  MarketState,
   Quote,
   QuoteContribution,
   QuoteContributionMap,
   SessionConfidence,
   TickerFinancials,
 } from "../../types/financials";
+import { classifyInstrumentType } from "../../tickers/instrument-kind";
 import { quoteTradingDay, reconcileQuoteDayRange } from "./day-range";
 
 const RETAINED_DESCRIPTIVE_FIELDS = ["high52w", "low52w", "marketCap", "name", "instrumentType"] as const;
@@ -46,6 +49,17 @@ function inferSessionConfidence(
   if (providerId === "ibkr") return "unknown";
   if (quote.marketState) return providerId === "gloomberb-cloud" ? "derived" : "derived";
   return "unknown";
+}
+
+/**
+ * A CCC coin trades through the equity close. The live tape often leaves the
+ * session off, and a copied equity close would paint the coin shut.
+ */
+function alwaysOpenSession(quote: Pick<Quote, "listingExchangeName" | "exchangeName" | "instrumentType" | "marketState">): { marketState: MarketState; sessionConfidence: SessionConfidence } | null {
+  const open = isAlwaysOpenExchange(quote.listingExchangeName ?? quote.exchangeName)
+    || classifyInstrumentType(quote.instrumentType) === "crypto";
+  if (!open || quote.marketState === "REGULAR") return null;
+  return { marketState: "REGULAR", sessionConfidence: "derived" };
 }
 
 function normalizeListingExchange(
@@ -128,6 +142,8 @@ export function normalizeQuoteContribution(
   const { listingExchangeName, listingExchangeFullName } = normalizeListingExchange(quote, providerId);
   const routingExchangeName = quote.routingExchangeName;
   const routingExchangeFullName = quote.routingExchangeFullName ?? routingExchangeName;
+  const exchangeName = listingExchangeName ?? quote.exchangeName;
+  const session = alwaysOpenSession({ ...quote, listingExchangeName, exchangeName });
 
   return finalizeSessionFields(reconcileQuoteDayRange({
     ...quote,
@@ -136,9 +152,10 @@ export function normalizeQuoteContribution(
     listingExchangeFullName,
     routingExchangeName,
     routingExchangeFullName,
-    exchangeName: listingExchangeName ?? quote.exchangeName,
+    exchangeName,
     fullExchangeName: listingExchangeFullName ?? quote.fullExchangeName,
-    sessionConfidence: inferSessionConfidence(quote, providerId),
+    ...session,
+    sessionConfidence: session?.sessionConfidence ?? inferSessionConfidence(quote, providerId),
   }));
 }
 
@@ -151,6 +168,12 @@ export function mergeQuoteContribution(
     throw new Error("Cannot merge an empty quote contribution");
   }
   if (!current) return next;
+
+  // NAV responses are complete dated observations. Never carry an earlier
+  // date or intraday session fields into one, or its marker into a later tick.
+  if (current.priceObservation != null || next.priceObservation != null) {
+    return { ...next, name: next.name ?? current.name };
+  }
 
   const priorBasis = resolvePriceBasis(current.priceBasis, current.instrumentType);
   const samePriceBasis = priorBasis !== null && priorBasis === resolvePriceBasis(next.priceBasis, next.instrumentType || current.instrumentType);
@@ -171,6 +194,8 @@ export function mergeQuoteContribution(
     priceBasis: next.priceBasis,
     regularClose: next.regularClose,
     regularCloseSessionDate: next.regularClose != null ? next.regularCloseSessionDate : undefined,
+    regularChange: next.regularClose != null ? next.regularChange : undefined,
+    regularChangePercent: next.regularClose != null ? next.regularChangePercent : undefined,
   };
 
   if (isOtherTradingDay(current, next)) {

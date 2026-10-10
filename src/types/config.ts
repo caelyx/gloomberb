@@ -2,7 +2,7 @@ import type { Portfolio, Watchlist } from "./ticker";
 import type { BrokerContractRef, TickerListingRef } from "./instrument";
 import type { LanguagePreference } from "../i18n/languages";
 
-export const CURRENT_CONFIG_VERSION = 23;
+export const CURRENT_CONFIG_VERSION = 25;
 
 type ChartRendererPreference = "auto" | "kitty" | "braille";
 
@@ -59,6 +59,30 @@ export interface PanePlacementMemory {
   detached?: DetachedPlacementMemory;
 }
 
+/**
+ * A ticker link Move to New Layout had to cut: the pane followed another one
+ * that stayed behind (or left with the moved pane) and was pinned on `symbol`.
+ * Move Back links it again while it is still pinned there.
+ */
+export interface PaneMovedLink {
+  instanceId: string;
+  sourceInstanceId: string;
+  symbol: string;
+  /** The title before the pin renamed it ("OPX" for "OPX NVDA"), when it did. */
+  title?: string;
+}
+
+/** Where Move to New Layout took a pane from, so Move Back can return it. */
+export interface PaneMovedFrom {
+  /** `SavedLayout.id` of the layout it left. */
+  layoutId: string;
+  /** Set when it was docked there: its place in the tree and its share of the split. */
+  docked?: DockedPlacementMemory & { ratio?: number };
+  /** Set when it was floating there. */
+  floating?: FloatingPlacementMemory;
+  links?: PaneMovedLink[];
+}
+
 export interface PaneInstanceConfig {
   instanceId: string;
   paneId: string;
@@ -69,6 +93,8 @@ export interface PaneInstanceConfig {
   placementMemory?: PanePlacementMemory;
   /** Pinned by the user: the keyboard close shortcuts leave this pane alone. */
   locked?: boolean;
+  /** Set by Move to New Layout and cleared by Move Back; never published. */
+  movedFrom?: PaneMovedFrom;
 }
 
 interface DockPaneNode {
@@ -132,6 +158,10 @@ export interface SavedLayout {
   layout: LayoutConfig;
   paneState?: Record<string, Record<string, unknown>>;
   focusedPaneId?: string | null;
+  /**
+   * @deprecated Ignored on read and no longer written. The app has no left or
+   * right panel state; `focusedPaneId` is the saved focus.
+   */
   activePanel?: "left" | "right";
   origin?: LayoutOrigin;
 }
@@ -140,6 +170,7 @@ export type OnboardingStage =
   | "welcome"
   | "portfolio"
   | "add-ticker"
+  | "desks"
   | "research"
   | "verify"
   | "account"
@@ -156,6 +187,8 @@ export interface OnboardingProgress {
   positionsImported?: number;
   accountStatus?: "signed-in" | "skipped";
   checkoutOpenedAt?: string;
+  /** Desks picked at "What do you trade?", in the order picked; empty when skipped. */
+  desks?: string[];
 }
 
 /**
@@ -187,9 +220,23 @@ export interface TelemetryConfig {
   crashReports?: boolean;
   /**
    * Anonymous counts of which functions are opened and which are on screen
-   * at launch, to Gloom's API. `false` turns them off; absent means on.
+   * at launch, to Gloom's API, and, when signed in, the searches finished in
+   * the command bar, kept with the account to improve search. `false` turns
+   * both off; absent means on.
    */
   usage?: boolean;
+  /** Ticker-level research counts. Only an explicit true opts in; absent is OFF. */
+  attention?: boolean;
+}
+
+/**
+ * One recent command-bar run: `id` is `pane-template:<templateId>`, `label`
+ * its name when it ran, and `arg` a ticker it ran with (never free text).
+ */
+export interface RecentCommand {
+  id: string;
+  label: string;
+  arg?: string;
 }
 
 export interface AppConfig {
@@ -211,6 +258,11 @@ export interface AppConfig {
    * not fought with.
    */
   seededPlugins?: string[];
+  /**
+   * Manual portfolios have taken the one currency their positions share. Runs
+   * once per install, so later holdings never move a portfolio's currency.
+   */
+  portfolioCurrenciesAdopted?: boolean;
   disabledSources: string[];
   pluginConfig: Record<string, Record<string, unknown>>;
   theme: string;
@@ -218,6 +270,8 @@ export interface AppConfig {
   valueFlashingEnabled: boolean;
   fontSize: number;
   recentTickers: string[];
+  /** Pane templates recently run from the command bar, newest first. */
+  recentCommands: RecentCommand[];
   language?: LanguagePreference;
   onboardingComplete?: boolean;
   /** App version at the last launch, used to show release notes after an update. */
@@ -238,6 +292,9 @@ export function normalizePaneId(paneId: string): string {
   if (paneId === "comparison-chart" || paneId === "ticker-chart" || paneId === "fundamental-graph") {
     return CHART_COMPOSER_PANE_ID;
   }
+  // Thematic baskets became the Themes tab of Sector Performance; the saved
+  // theme param and pane state open that tab where the pane left off.
+  if (paneId === "themes") return "sectors";
   return paneId;
 }
 
@@ -256,6 +313,7 @@ const TICKER_PANE_IDS = new Set([
   "corporate-actions",
   "earnings-estimates",
   "historical-prices",
+  "returns",
   "ibkr-trading",
 ]);
 
@@ -293,9 +351,12 @@ const DEFAULT_HOME_LAYOUT: LayoutConfig = {
       first: { kind: "pane", instanceId: "portfolio-list:main" },
       second: { kind: "pane", instanceId: "chat:main" },
     },
-    second: { kind: "pane", instanceId: "ticker-detail:main" },
+    second: { kind: "split", axis: "vertical", ratio: 0.76,
+      first: { kind: "pane", instanceId: "ticker-detail:main" },
+      second: { kind: "pane", instanceId: "attention-trending:home" } },
   },
   instances: [
+    { instanceId: "attention-trending:home", paneId: "attention-trending", binding: { kind: "none" } },
     {
       instanceId: "portfolio-list:main",
       paneId: "portfolio-list",
@@ -374,6 +435,11 @@ const DEFAULT_MACRO_LAYOUT: LayoutConfig = {
       paneId: "econ-statistics",
       binding: { kind: "none" },
       settings: { stat: "cpi-yoy", range: "20Y" },
+    },
+    {
+      instanceId: "fear-greed:macro",
+      paneId: "fear-greed",
+      binding: { kind: "none" },
     },
     {
       instanceId: "volatility-term-structure:macro",
@@ -542,6 +608,17 @@ export function clonePlacementMemory(memory: PanePlacementMemory | undefined): P
   };
 }
 
+function clonePaneMovedFrom(movedFrom: PaneMovedFrom): PaneMovedFrom {
+  return {
+    layoutId: movedFrom.layoutId,
+    ...(movedFrom.docked ? {
+      docked: { ...movedFrom.docked, ...(movedFrom.docked.path ? { path: [...movedFrom.docked.path] } : {}) },
+    } : {}),
+    ...(movedFrom.floating ? { floating: { ...movedFrom.floating } } : {}),
+    ...(movedFrom.links ? { links: movedFrom.links.map((link) => ({ ...link })) } : {}),
+  };
+}
+
 function cloneUnknownValue<T>(value: T): T {
   if (Array.isArray(value)) {
     return value.map((entry) => cloneUnknownValue(entry)) as T;
@@ -681,6 +758,8 @@ export function normalizePaneLayout(
     defaultFollowSourceInstanceId?: string | null;
     /** Last resolved symbol used to pin an orphaned follower; otherwise it remains safely unlinked. */
     resolveOrphanSymbol?: (instanceId: string) => string | null;
+    /** Pins an orphaned follower on its last symbol; by default only its binding changes. */
+    pinOrphan?: (instance: PaneInstanceConfig, symbol: string | null) => PaneInstanceConfig;
   },
 ): LayoutConfig {
   const fallbackSourceId = options?.defaultFollowSourceInstanceId ?? null;
@@ -707,18 +786,18 @@ export function normalizePaneLayout(
   for (;;) {
     const validInstanceIds = new Set(nextLayout.instances.map((instance) => instance.instanceId));
     const removedIds = new Set<string>();
-    const orphanBindings = new Map<string, PaneBinding>();
+    const orphanPins = new Map<string, PaneInstanceConfig>();
 
     for (const instance of nextLayout.instances) {
       if (instance.binding?.kind === "follow" && !validInstanceIds.has(instance.binding.sourceInstanceId)) {
         // Structural helpers remove the source before the app can resolve its last ticker. Preserve
         // the dangling binding until the runtime normalizes again with a resolver.
         if (!options?.resolveOrphanSymbol) continue;
-        const orphanSymbol = options.resolveOrphanSymbol(instance.instanceId)?.trim();
-        orphanBindings.set(
-          instance.instanceId,
-          orphanSymbol ? { kind: "fixed", symbol: orphanSymbol } : { kind: "none" },
-        );
+        const orphanSymbol = options.resolveOrphanSymbol(instance.instanceId)?.trim() || null;
+        orphanPins.set(instance.instanceId, options.pinOrphan?.(instance, orphanSymbol) ?? {
+          ...instance,
+          binding: orphanSymbol ? { kind: "fixed", symbol: orphanSymbol } : { kind: "none" },
+        });
         continue;
       }
 
@@ -737,13 +816,10 @@ export function normalizePaneLayout(
       }
     }
 
-    if (orphanBindings.size > 0) {
+    if (orphanPins.size > 0) {
       nextLayout = {
         ...nextLayout,
-        instances: nextLayout.instances.map((instance) => {
-          const binding = orphanBindings.get(instance.instanceId);
-          return binding ? { ...instance, binding } : instance;
-        }),
+        instances: nextLayout.instances.map((instance) => orphanPins.get(instance.instanceId) ?? instance),
       };
     }
 
@@ -751,7 +827,7 @@ export function normalizePaneLayout(
       nextLayout = removePaneInstances(nextLayout, removedIds);
       continue;
     }
-    if (orphanBindings.size === 0) break;
+    if (orphanPins.size === 0) break;
   }
 
   const validInstanceIds = new Set(nextLayout.instances.map((instance) => instance.instanceId));
@@ -777,6 +853,7 @@ export function normalizePaneLayout(
       params: instance.params ? { ...instance.params } : undefined,
       settings: clonePaneSettings(instance.settings),
       placementMemory: clonePlacementMemory(instance.placementMemory),
+      ...(instance.movedFrom ? { movedFrom: clonePaneMovedFrom(instance.movedFrom) } : {}),
     })),
     floating: nextLayout.floating
       .filter((entry) => (
@@ -799,6 +876,7 @@ export function cloneLayout(layout: LayoutConfig): LayoutConfig {
       params: instance.params ? { ...instance.params } : undefined,
       settings: clonePaneSettings(instance.settings),
       placementMemory: clonePlacementMemory(instance.placementMemory),
+      ...(instance.movedFrom ? { movedFrom: clonePaneMovedFrom(instance.movedFrom) } : {}),
     })),
     floating: layout.floating.map((entry) => ({ ...entry })),
     detached: detached.map((entry) => ({ ...entry })),
@@ -864,6 +942,7 @@ export function createDefaultConfig(dataDir: string): AppConfig {
     valueFlashingEnabled: true,
     fontSize: 12,
     recentTickers: [],
+    recentCommands: [],
   };
 }
 

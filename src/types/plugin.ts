@@ -1,10 +1,11 @@
 import type { ReactNode } from "react";
 import type { AppTickerRepositoryPort } from "../core/app-service-ports";
-import type { HeadlessPaneDefinition } from "./headless";
+import type { HeadlessPaneDefinition, HeadlessPaneFreshness, HeadlessPaneOptionDef } from "./headless";
 
 export type {
   HeadlessBundleResult,
   HeadlessBundleSection,
+  HeadlessFreshnessStatus,
   HeadlessPaneApiClient,
   HeadlessPaneArgumentDef,
   HeadlessPaneArgumentKind,
@@ -12,6 +13,7 @@ export type {
   HeadlessPaneContext,
   HeadlessPaneDefinition,
   HeadlessPaneEntry,
+  HeadlessPaneFreshness,
   HeadlessPaneLoadArgs,
   HeadlessPaneOptionDef,
   HeadlessPaneOptionType,
@@ -114,22 +116,76 @@ export interface PaneDef {
   defaultMode?: "docked" | "floating";
   /** Pane publishes its selected symbol as pane-state `cursorSymbol`, so ticker panes can follow it. */
   tickerSource?: boolean;
+  /**
+   * Pane shows one ticker read through its binding (`usePaneTicker`, `usePaneTickerIdentity`), so
+   * its pane menu offers "Link to" each visible list, scanner, and other single-ticker pane, and
+   * it then follows that pane's selection. A function decides per instance (a chart with one
+   * security, not a comparison). A follower must never write its own `cursorSymbol`: that would
+   * win over the binding.
+   */
+  tickerFollower?: boolean | ((pane: PaneInstanceConfig) => boolean);
   /** Renderer-neutral data model used by CLI functions, automation, and hosted tools. */
   headless?: HeadlessPaneDefinition;
+  /**
+   * Source and status a rendered-view report (`fn` on a pane without a
+   * `headless` model) cites, when "Gloom Cloud" with the state the footer
+   * shows would be wrong: local data, a calculator, filed records.
+   */
+  reportFreshness?: Pick<HeadlessPaneFreshness, "source" | "status" | "basis">;
+  /**
+   * Options a rendered-view report takes (`fn FXC --currencies USD,ZAR`):
+   * each sets the pane setting of its key, is checked by its `normalize`, and
+   * is listed with its example by `gloomberb catalog`.
+   */
+  reportOptions?: readonly PaneReportOptionDef[];
+  /**
+   * Lines a rendered-view report prints above its table, from the settings it
+   * ran with: what the default view leaves out and how to see more. `--json`
+   * carries them in `data.metadata.notices`.
+   */
+  reportNotices?(settings: Readonly<Record<string, unknown>>): string[];
   /** Add an Excel-compatible CSV action for the pane's single active DataTable. */
   tableExport?: true;
   settings?: PaneSettingsDef | ((context: PaneSettingsContext) => PaneSettingsDef | null);
   /** Portable sharing is public by default; list the few pane-owned fields that must remain local. */
   portableShare?: PanePortableShareDef;
-  /** Compact controls surfaced next to the pane title. Toggle keys reference toggle fields in settings. */
+  /**
+   * Compact controls surfaced next to the pane title. A key references a
+   * toggle field in settings, or a two-option select field when `onValue` is set.
+   */
   quickSettings?: readonly PaneQuickSettingDef[];
+}
+
+/**
+ * An option of a rendered-view report, which sets the pane setting of its key,
+ * or of `settingKey` when the flag reads better than the setting's name
+ * (`--columns` for `optionColumnIds`).
+ */
+export interface PaneReportOptionDef extends Omit<HeadlessPaneOptionDef, "pluginState"> {
+  /** The value's name in the catalog's flag, `--currencies <codes>`; the type when absent. */
+  placeholder?: string;
+  /** The option in use as typed after the function, such as `--currencies USD,ZAR,NGN`; the catalog shows it as an example. */
+  example?: string;
+  /** Checks a typed value and returns it as the pane reads it; throws an Error that names what is wrong. */
+  normalize?(value: string): string;
 }
 
 export interface PaneQuickSettingDef {
   type: "toggle";
   key: string;
-  icon: "zap";
+  icon: "zap" | "sqrt";
   label?: string;
+  /**
+   * For a two-option select field: the option the control turns on. Turning
+   * it off picks the field's other option.
+   */
+  onValue?: string;
+  /**
+   * Shows the control only where it changes something, for a setting that
+   * applies to some of what the pane can show. The field stays in the
+   * settings dialog either way.
+   */
+  visible?: (context: PaneSettingsContext) => boolean;
 }
 
 export interface PaneSettingsContext {
@@ -176,11 +232,15 @@ interface PaneSettingSelectField extends PaneSettingFieldBase {
 interface PaneSettingMultiSelectField extends PaneSettingFieldBase {
   type: "multi-select";
   options: PaneSettingOption[];
+  /** A long list: a filter box, each description beside its label. */
+  searchable?: boolean;
 }
 
 interface PaneSettingOrderedMultiSelectField extends PaneSettingFieldBase {
   type: "ordered-multi-select";
   options: PaneSettingOption[];
+  /** A long list: a filter box, each description beside its label and each selection's position. */
+  searchable?: boolean;
 }
 
 export interface PaneSettingActionContext extends PaneSettingsContext {
@@ -244,6 +304,11 @@ interface PaneTemplateShortcut {
   aliases?: readonly string[];
   argPlaceholder?: string;
   argKind?: "text" | "ticker" | "ticker-list";
+  /**
+   * For a ticker list, entries kept as typed instead of resolved as tickers:
+   * CORR keeps map series (`GEO:HORMUZ`) beside its tickers.
+   */
+  keepArgToken?: (token: string) => boolean;
   argOptional?: boolean;
   /**
    * With no argument typed and none to infer from the active ticker, open
@@ -512,6 +577,7 @@ export interface CommandDef {
   description?: string;
   wizard?: WizardStep[];
   confirm?: CommandConfirmDef | ((context: CommandConfirmContext) => CommandConfirmDef | null);
+  /** @deprecated Ignored: a wizard always opens as one form with every step at once. */
   wizardLayout?: "steps" | "form";
   hidden?: () => boolean;
 }
@@ -748,6 +814,7 @@ export interface GloomPluginContext {
   removeBrokerInstance(instanceId: string): Promise<void>;
 
   selectTicker(symbol: string, paneId?: string): void;
+  /** Focus the leftmost or rightmost docked pane. */
   switchPanel(panel: "left" | "right"): void;
   switchTab(tabId: string, paneId?: string): void;
   openCommandBar(query?: string): void;
@@ -829,9 +896,8 @@ export interface GloomPlugin {
    * the rest. A plugin that leaves a host out works on the desktop and fails
    * on the web.
    *
-   * Hosts reached on the plugin's behalf count too: `YahooHttpClient` collects
-   * a cookie from `fc.yahoo.com` before any screener call, so a plugin using it
-   * declares that host even though its own code never names it.
+   * Hosts reached by a plugin's dependencies count too: declare every host
+   * contacted on the plugin's behalf, including authentication endpoints.
    */
   hosts?: readonly string[];
   /** Shown in the marketplace pane and on the website. */

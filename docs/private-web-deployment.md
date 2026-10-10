@@ -6,9 +6,10 @@ requiring a Gloom Cloud sign-in to open the workspace or use public-data
 plugins. Gloom Cloud itself is not modified or self-hosted: `/api/*` still goes
 to `https://api.gloom.sh`, and Gloom's own authentication rules still apply to it.
 
-Baseline: upstream `gloom-sh/gloomberb` at `62317c477c1ef9b8394a12eac971c5546441b76e`
-("Offer to install an official plugin when its code is typed in the command bar
-(#1212)", 29 September 2026).
+Baseline: upstream `gloom-sh/gloomberb` at `e21757bcfbcede7841f7bbd13d0526374b87379c`
+("Lay the groundwork for splitting the big built-in plugins (Linear: GLO-340)
+(#1528)", 10 October 2026), merged into this branch. Originally written against
+`62317c477c1ef9b8394a12eac971c5546441b76e` (29 September 2026).
 
 ## Two separate kinds of authentication
 
@@ -45,7 +46,7 @@ anonymous state without closing the workspace.
 | 1 | Three more web-bundled plugins: Hacker News pinned by commit, Newsmap and ASX vendored | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated), `vendor/`, `scripts/vendor-plugin.sh`, `bunfig.toml` |
 | 1a | The web build also reads each plugin's `gloom.json` (hosts; id and `web` target must agree), and compiles `vendor/<name>` when present | `scripts/web-plugins.ts`, `scripts/build-web.ts`, `scripts/generate-web-proxy-hosts.ts` |
 | 2 | Gloom session restore reports unexpected errors instead of swallowing them (it was already non-blocking) | `src/renderers/browser/cloud-transport.ts`, `src/renderers/browser/main.tsx` |
-| 3 | Plugin proxy policy switch, redirect re-validation, credential stripping, early size check; Access credentials stripped from `/api/*` | `src/renderers/cloudflare/http-proxy.ts`, `src/renderers/cloudflare/worker.ts` |
+| 3 | Plugin proxy policy switch and credential stripping; Access credentials stripped from `/api/*` | `src/renderers/cloudflare/http-proxy.ts`, `src/renderers/cloudflare/worker.ts` |
 | 4 | Private first-visit layout | `src/renderers/browser/private-default-config.ts`, `src/renderers/browser/config-host.ts` |
 | 5 | Deployment config, CI, the manual deploy workflow and this document | `wrangler.private.jsonc`, `.github/workflows/private-web.yml`, `.github/workflows/deploy-private.yml`, `docs/private-web-deployment.md` |
 
@@ -58,13 +59,18 @@ Every downstream hunk is marked with a `Downstream` comment. `git grep -n Downst
 ### Plugin proxy policy
 
 `PRIVATE_WEB_DEPLOYMENT` (a Worker variable, set only in `wrangler.private.jsonc`)
-decides one thing: whether `/http-proxy` requires a Gloom session cookie. Only
-the exact string `"true"` turns the requirement off; anything else, including
-unset, keeps upstream's behaviour (fail closed). In private mode the browser's
-`Origin` header becomes mandatory (it must equal the Worker's own origin),
-because the session check no longer vouches for the caller.
+decides one thing: whether `/http-proxy` requires a Gloom session. Upstream
+confirms that session with `api.gloom.sh` (`proxy-session.ts`, cached for a
+minute) and rate-limits each signed-in user to 300 plugin requests a minute per
+isolate. Only the exact string `"true"` skips that check; anything else,
+including unset, keeps upstream's behaviour (fail closed). Because the
+per-user rate limit hangs off the session check, private mode has no rate
+limit of its own: Cloudflare Access is what limits who can call the route (see
+the optional WAF rule below).
 
-Unchanged in both modes: POST only; same-origin `Origin`; `https:` only; default
+Unchanged in both modes: POST only; the browser's same-origin `Origin` header
+required (upstream made it mandatory, which the fork previously added only for
+private mode); request envelopes over 1 MiB refused; `https:` only; default
 port only; no credentials in the URL; no IP literals or `localhost`; host must be
 on the generated allowlist (exact or subdomain match on a label boundary);
 upstream method set (`GET HEAD POST PUT PATCH DELETE`); hop-by-hop headers
@@ -74,28 +80,29 @@ timeout; responses over 5 MiB refused; third-party `Set-Cookie` returned inside
 the JSON envelope, never as a header; the CSP and security headers on every
 response.
 
-Added in both modes (hardening): redirects are followed manually, at most 5
-hops, and every hop must pass the same target validation (upstream's
-`redirect: "follow"` would have followed an allowlisted host's redirect
-anywhere); `Authorization` and `Cookie` are dropped when a hop changes origin;
-Gloom session cookies, `CF_Authorization` and `cf-access-*` headers are removed
-even if plugin code puts them in the envelope; a declared `Content-Length` over
-the limit is refused before the body is read.
+Also upstream now, in both modes (the fork first added these, and upstream has
+since shipped its own): redirects are followed manually, at most 5 hops, and
+every hop must pass the same target validation; `Authorization`, `Cookie` and
+`Proxy-Authorization` are dropped when a hop changes origin; a declared
+`Content-Length` over the limit is refused before the body is read.
+
+Added in both modes (downstream): Gloom session cookies, `CF_Authorization` and
+`cf-access-*` headers are removed even if plugin code puts them in the
+envelope.
 
 ## Plugin inventory
 
 | Package | Source | Pinned commit | Plugin id | Hosts it adds |
 |---|---|---|---|---|
-| gloom-fear-greed | `github:gloom-sh/gloom-fear-greed` | `4493708` (bun.lock) | fear-greed | production.dataviz.cnn.io |
-| gloom-ipo-calendar | `github:gloom-sh/gloom-ipo-calendar` | `c3917c2` (bun.lock) | ipo-calendar | stockanalysis.com |
 | gloom-polls | `github:gloom-sh/gloom-polls` | `90a780e` (bun.lock) | polls | api.votehub.com |
 | gloom-prediction-markets | `github:gloom-sh/gloom-prediction-markets` | `1d8036f` (bun.lock) | prediction-markets | gamma-api / clob / data-api.polymarket.com, api.elections.kalshi.com |
 | **gloom-hackernews** | `github:gloom-sh/gloom-hackernews` | `6447013f526daedf73699334958672645024dc8c` | hackernews | hacker-news.firebaseio.com (declared in its gloom.json only) |
 | **gloom-newsmap** | `vendor/gloom-newsmap` (from private `caelyx/gloom-newsmap`) | `f27e6950f6bfb1070ea25a0d4f8ce2ffda34aa2f` | newsmap | news.google.com |
 | **gloom-asx** | `vendor/gloom-asx` (from private `caelyx/gloom-asx`) | `bd13e937028224dba64cb0424549b5eb5415f953` | asx-announcements | asx.api.markitdigital.com, cdn-api.markitdigital.com |
 
-Market Heatmap (api.nasdaq.com, query1/query2/fc.yahoo.com) and Market Halts
-(nasdaqtrader.com) are built-in plugins, not bundled packages.
+Fear & Greed, IPO Calendar and Market Halts are built-in plugins upstream, not
+bundled packages. The other hosts in the generated allowlist come from
+upstream's built-ins.
 
 The allowlist is generated, never hand-edited: `bun run web:proxy-hosts` writes
 `src/utils/plugin-proxy-hosts.json` from the built-in browser catalog plus every

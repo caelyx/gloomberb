@@ -4,6 +4,7 @@ import type {
   ASKGConversationTool,
 } from "../../../../api-client/askg";
 import type {
+  ASKGFeedback,
   ASKGLimits,
   ASKGSseEvent,
   ASKGToolCallEvent,
@@ -13,17 +14,18 @@ import type {
   ToolResultStatus,
   WriteTier,
 } from "./protocol";
+import { capToolNote } from "./notes";
 
 /** Lifecycle of one row in the tool timeline. */
-export type ASKGToolRowStatus =
+type ASKGToolRowStatus =
   | ToolResultStatus
   | "pending"
   | "awaiting-confirmation"
   | "running";
 
-export type ASKGUndoStatus = "available" | "running" | "done" | "failed";
+type ASKGUndoStatus = "available" | "running" | "done" | "failed";
 
-export interface ASKGUndoState {
+interface ASKGUndoState {
   status: ASKGUndoStatus;
   note?: string;
 }
@@ -33,6 +35,8 @@ export interface ASKGToolRow {
   name: string;
   /** One line rendering of the call arguments, e.g. `NVDA · range=5Y`. */
   argumentSummary: string;
+  /** The arguments themselves, when known, so the row can name what it read. */
+  args?: Record<string, JsonValue>;
   writeTier: WriteTier;
   /** Server tools are executed by the platform and marked as run by Gloom. */
   origin: "client" | "server";
@@ -52,7 +56,7 @@ export interface ASKGToolRow {
   expanded: boolean;
 }
 
-export type ASKGTurnStatus =
+type ASKGTurnStatus =
   | "streaming"
   | "complete"
   | "cancelled"
@@ -65,6 +69,14 @@ export interface ASKGErrorState {
   retryAfterMs?: number;
 }
 
+/** The person's rating of one answer, as the control shows it. */
+export interface ASKGTurnFeedback extends ASKGFeedback {
+  /** A request is out: the control already shows the choice it carries. */
+  pending: "rating" | "share" | null;
+  /** Asked to send, and the server had no answer left to send. */
+  shareFailed?: boolean;
+}
+
 export interface ASKGTurn {
   id: string;
   /** Server turn id, known once the stream announces itself. */
@@ -75,6 +87,8 @@ export interface ASKGTurn {
   status: ASKGTurnStatus;
   error: ASKGErrorState | null;
   startedAt: number;
+  /** Absent until rated, here or on a stored conversation. */
+  feedback?: ASKGTurnFeedback;
 }
 
 export interface ASKGConversationState {
@@ -88,6 +102,11 @@ export interface ASKGConversationState {
   turns: ASKGTurn[];
   /** Highest applied `seq`, so a resumed stream skips replayed events. */
   lastSeq: number;
+  /**
+   * The server takes answer ratings: a session or a reopened conversation
+   * said so. Until then, and on an older server, no answer shows the control.
+   */
+  feedbackAvailable: boolean;
 }
 
 export const EMPTY_ASKG_CONVERSATION: ASKGConversationState = {
@@ -98,6 +117,7 @@ export const EMPTY_ASKG_CONVERSATION: ASKGConversationState = {
   acceptedTools: [],
   turns: [],
   lastSeq: 0,
+  feedbackAvailable: false,
 };
 
 export type ASKGAction =
@@ -107,8 +127,12 @@ export type ASKGAction =
     model: string;
     limits: ASKGLimits;
     acceptedTools: string[];
+    /** The session accepted answer ratings. */
+    feedback: boolean;
   }
   | { type: "prompt"; turnId: string; prompt: string; at: number }
+  | { type: "feedback"; turnId: string; feedback: ASKGTurnFeedback | null }
+  | { type: "feedback-unavailable" }
   | { type: "event"; event: ASKGSseEvent }
   | { type: "tool-awaiting-confirmation"; toolCallId: string }
   | { type: "tool-running"; toolCallId: string }
@@ -168,6 +192,7 @@ function rowFromToolCall(event: ASKGToolCallEvent): ASKGToolRow {
     toolCallId: event.toolCallId,
     name: event.name,
     argumentSummary: summarizeToolArguments(event.args),
+    args: event.args,
     writeTier: event.writeTier,
     origin: "client",
     status: requiresLocalConfirmation(event) ? "awaiting-confirmation" : "pending",
@@ -214,12 +239,24 @@ function patchToolRow(
   return { ...state, turns };
 }
 
+function hasClientRow(state: ASKGConversationState, toolCallId: string): boolean {
+  return state.turns.some((turn) => turn.tools.some((row) => (
+    row.toolCallId === toolCallId && row.origin === "client"
+  )));
+}
+
 function appendToolRow(turn: ASKGTurn, row: ASKGToolRow): ASKGTurn {
   const existing = turn.tools.findIndex((entry) => entry.toolCallId === row.toolCallId);
   if (existing < 0) return { ...turn, tools: [...turn.tools, row] };
   const tools = [...turn.tools];
   tools[existing] = { ...tools[existing], ...row } as ASKGToolRow;
   return { ...turn, tools };
+}
+
+/** A refusal at the daily cap means none are left, whatever the count read earlier. */
+function withQuotaSpent(state: ASKGConversationState, code: ASKGClientErrorCode): ASKGConversationState {
+  if (code !== "daily_turn_cap" || !state.limits) return state;
+  return { ...state, limits: { ...state.limits, turnsRemainingToday: 0 } };
 }
 
 function applyEvent(
@@ -231,7 +268,11 @@ function applyEvent(
   const next = { ...state, lastSeq: event.seq };
 
   switch (event.type) {
-    case "session":
+    case "session": {
+      const turn = next.turns[next.turns.length - 1];
+      // The limits were read when the session opened; every turn the platform
+      // admits since then uses one of the questions they counted.
+      const admitted = !!turn && !turn.remoteTurnId && !!next.limits;
       return patchTurn(
         {
           ...next,
@@ -239,10 +280,17 @@ function applyEvent(
           model: event.model,
           // A turn that named no conversation learns here where it was filed.
           conversationId: event.conversationId ?? next.conversationId,
+          ...(admitted && next.limits ? {
+            limits: {
+              ...next.limits,
+              turnsRemainingToday: Math.max(0, next.limits.turnsRemainingToday - 1),
+            },
+          } : {}),
         },
         null,
-        (turn) => (turn.remoteTurnId ? turn : { ...turn, remoteTurnId: event.turnId }),
+        (current) => (current.remoteTurnId ? current : { ...current, remoteTurnId: event.turnId }),
       );
+    }
     case "text-delta":
       return patchTurn(next, event.turnId, (turn) => ({
         ...turn,
@@ -252,7 +300,9 @@ function applyEvent(
     case "tool-call":
       return patchTurn(next, event.turnId, (turn) => appendToolRow(turn, rowFromToolCall(event)));
     case "tool-executed": {
-      if (event.source === "server") {
+      // A call this client ran keeps its own row whatever the echo says it
+      // was: replacing it would drop its write tier, result and undo.
+      if (event.source === "server" && !hasClientRow(next, event.toolCallId)) {
         return patchTurn(next, event.turnId, (turn) => appendToolRow(turn, {
           toolCallId: event.toolCallId,
           name: event.name,
@@ -265,7 +315,7 @@ function applyEvent(
           ...(event.summary.rowCount !== undefined ? { rowCount: event.summary.rowCount } : {}),
           elapsedMs: event.summary.elapsedMs,
           truncated: event.summary.truncated,
-          ...(event.summary.note ? { note: event.summary.note } : {}),
+          ...(event.summary.note ? { note: capToolNote(event.summary.note) } : {}),
           ...(event.summary.sample !== undefined ? { result: event.summary.sample } : {}),
           expanded: false,
         }));
@@ -282,7 +332,7 @@ function applyEvent(
     case "tool-result-ack":
       return next;
     case "error":
-      return patchTurn(next, event.turnId ?? null, (turn) => ({
+      return patchTurn(withQuotaSpent(next, event.code), event.turnId ?? null, (turn) => ({
         ...turn,
         status: "error",
         error: {
@@ -335,7 +385,21 @@ export function askgReducer(
         model: action.model,
         limits: action.limits,
         acceptedTools: action.acceptedTools,
+        feedbackAvailable: action.feedback,
       };
+    case "feedback": {
+      const index = state.turns.findIndex((turn) => turn.id === action.turnId);
+      const turn = state.turns[index];
+      if (!turn) return state;
+      const next: ASKGTurn = { ...turn };
+      if (action.feedback) next.feedback = action.feedback;
+      else delete next.feedback;
+      const turns = [...state.turns];
+      turns[index] = next;
+      return { ...state, turns };
+    }
+    case "feedback-unavailable":
+      return state.feedbackAvailable ? { ...state, feedbackAvailable: false } : state;
     case "prompt":
       return {
         ...state,
@@ -368,7 +432,7 @@ export function askgReducer(
         ...(action.payload.rowCount !== undefined ? { rowCount: action.payload.rowCount } : {}),
         elapsedMs: action.payload.elapsedMs,
         truncated: action.payload.truncated,
-        ...(action.payload.note ? { note: action.payload.note } : {}),
+        ...(action.payload.note ? { note: capToolNote(action.payload.note) } : {}),
         ...(action.payload.result !== undefined ? { result: action.payload.result } : {}),
         ...(action.payload.undoToken
           ? { undoToken: action.payload.undoToken, undo: { status: "available" as const } }
@@ -382,7 +446,7 @@ export function askgReducer(
     case "undo":
       return patchToolRow(state, action.toolCallId, (row) => ({ ...row, undo: action.undo }));
     case "turn-failed":
-      return patchTurn(state, action.turnId, (turn) => ({
+      return patchTurn(withQuotaSpent(state, action.error.code), action.turnId, (turn) => ({
         ...turn,
         status: "error",
         error: action.error,
@@ -413,6 +477,9 @@ export function askgReducer(
         conversationId: action.conversation.id,
         turns: turnsFromConversation(action.conversation),
         lastSeq: 0,
+        // No session may be open yet, so the stored conversation says it too.
+        feedbackAvailable: state.feedbackAvailable
+          || action.conversation.capabilities?.feedback === 1,
       };
     case "conversation-started":
       return { ...state, conversationId: null, turns: [], lastSeq: 0 };
@@ -423,6 +490,7 @@ export function askgReducer(
         model: state.model,
         limits: state.limits,
         acceptedTools: state.acceptedTools,
+        feedbackAvailable: state.feedbackAvailable,
       };
   }
 }
@@ -439,15 +507,41 @@ function rowFromStoredTool(tool: ASKGConversationTool): ASKGToolRow {
     argumentSummary: tool.args
       ? summarizeToolArguments(tool.args as Record<string, JsonValue>)
       : (tool.note ?? ""),
+    ...(tool.args ? { args: tool.args as Record<string, JsonValue> } : {}),
     writeTier: "read",
     origin: tool.origin,
     status: (tool.status as ASKGToolRowStatus) ?? "ok",
     requiresConfirmation: false,
     ...(tool.rowCount === undefined ? {} : { rowCount: tool.rowCount }),
     ...(tool.elapsedMs === undefined ? {} : { elapsedMs: tool.elapsedMs }),
-    ...(tool.note ? { note: tool.note } : {}),
+    ...(tool.note ? { note: capToolNote(tool.note) } : {}),
     expanded: false,
   };
+}
+
+/** A stored rating, read defensively: an unknown thumb is no rating. */
+function storedFeedback(
+  feedback: ASKGFeedback | null | undefined,
+): ASKGTurnFeedback | null {
+  if (!feedback || (feedback.rating !== "up" && feedback.rating !== "down")) return null;
+  return {
+    rating: feedback.rating,
+    reason: feedback.rating === "down" ? feedback.reason ?? null : null,
+    shared: feedback.shared === true,
+    pending: null,
+  };
+}
+
+/**
+ * Whether an answer shows the rating control: a finished answer with text,
+ * filed under a server turn id, on a server that takes ratings. A failed,
+ * cancelled or still streaming turn has nothing to rate.
+ */
+export function canRateTurn(state: ASKGConversationState, turn: ASKGTurn): boolean {
+  return state.feedbackAvailable
+    && turn.status === "complete"
+    && !!turn.remoteTurnId
+    && turn.answer.trim().length > 0;
 }
 
 /**
@@ -479,6 +573,7 @@ export function turnsFromConversation(
     // still shows rather than being dropped on the floor.
     const turn = turns[turns.length - 1];
     const tools = message.tools.map(rowFromStoredTool);
+    const feedback = storedFeedback(message.feedback);
     if (!turn || turn.answer) {
       turns.push({
         id: `stored:${conversation.id}:${message.seq}`,
@@ -489,10 +584,18 @@ export function turnsFromConversation(
         status: "complete",
         error: null,
         startedAt,
+        ...(feedback ? { feedback } : {}),
       });
       continue;
     }
-    turns[turns.length - 1] = { ...turn, answer: message.text, tools };
+    turns[turns.length - 1] = {
+      ...turn,
+      // The answer's id is the one the rating was filed under.
+      remoteTurnId: message.turnId ?? turn.remoteTurnId,
+      answer: message.text,
+      tools,
+      ...(feedback ? { feedback } : {}),
+    };
   }
   return turns;
 }
@@ -516,7 +619,7 @@ export function isTurnRunning(state: ASKGConversationState): boolean {
   return activeTurn(state)?.status === "streaming";
 }
 
-export interface ASKGResultColumn {
+interface ASKGResultColumn {
   key: string;
   header: string;
   align?: "left" | "right" | "center";
@@ -703,40 +806,27 @@ export function canRetryASKGError(error: ASKGErrorState): boolean {
   return !UNRETRYABLE_ERROR_CODES.has(error.code);
 }
 
+/** "12s", "8 min", "22 h": a wait a person can picture. */
+function waitText(ms: number): string {
+  const seconds = Math.max(1, Math.round(ms / 1000));
+  if (seconds < 90) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes} min`;
+  return `${Math.round(minutes / 60)} h`;
+}
+
 /** Specific, actionable one line description of a failure. */
 export function describeASKGError(error: ASKGErrorState): string {
   const title = ERROR_TITLES[error.code] ?? "Ask Gloom failed";
-  const retry = error.retryAfterMs && error.retryAfterMs > 0
-    ? ` Try again in ${Math.max(1, Math.round(error.retryAfterMs / 1000))}s.`
-    : "";
-  const detail = error.message.trim();
+  const wait = error.retryAfterMs && error.retryAfterMs > 0 ? waitText(error.retryAfterMs) : null;
+  // The cap has one thing to say: none left, and when there will be more.
+  if (error.code === "daily_turn_cap") {
+    return `No questions left today.${wait ? ` More in ${wait}.` : ""}`;
+  }
+  const retry = wait ? ` Try again in ${wait}.` : "";
+  // A machine code the platform appends ("daily_turn_cap") is not for people.
+  const detail = error.message.replace(/\s*\b[a-z]+(?:_[a-z]+)+\b\.?/g, "").trim();
   return detail && detail.toLowerCase() !== title.toLowerCase()
     ? `${title}: ${detail}${retry}`
     : `${title}.${retry}`;
-}
-
-/** Wording for the tool row status column. */
-export function describeToolStatus(row: ASKGToolRow): string {
-  switch (row.status) {
-    case "pending":
-      return "queued";
-    case "awaiting-confirmation":
-      return "needs approval";
-    case "running":
-      return "running";
-    case "ok":
-      return row.rowCount === undefined
-        ? "done"
-        : `${row.rowCount} ${row.rowCount === 1 ? "row" : "rows"}`;
-    case "partial":
-      return row.rowCount === undefined ? "partial" : `${row.rowCount} rows · partial`;
-    case "denied":
-      return "declined";
-    case "timeout":
-      return "timed out";
-    case "cancelled":
-      return "cancelled";
-    case "error":
-      return "failed";
-  }
 }

@@ -1,13 +1,16 @@
 import { join } from "path";
 import { VERSION } from "../../version";
 import { saveConfig } from "../../data/config/store";
+import { builtinPluginGroupMembers } from "../../plugins/ownership";
 import type { TelemetryConfig } from "../../types/config";
 import type { CliCommandDef } from "../../types/plugin";
 import { withCliServices, withConfigData } from "../context";
 import { CLI_COMMAND_GROUPS } from "../help";
 import { dryRunNote, formatBytes, formatStatusCell } from "../helpers";
 import { cliStyles, cliTerminalWidth, renderSection, renderTable, wrapText } from "../../utils/cli-output";
+import { getThemeIds } from "../../theme/themes";
 import { requireArg } from "./command-utils";
+import { describeThemeId, requireThemeId, themeListNote, themeListRows, themeName } from "./themes";
 import {
   applyKeybindingCliSet,
   describeKeybindingsForCli,
@@ -19,6 +22,7 @@ const DOCTOR_COUNT_UNITS: Record<string, string> = { plugins: "loaded", capabili
 const TELEMETRY_CONFIG_KEYS = {
   "telemetry.crashReports": "crashReports",
   "telemetry.usage": "usage",
+  "telemetry.attention": "attention",
 } as const satisfies Record<string, keyof TelemetryConfig>;
 type TelemetryConfigKey = keyof typeof TELEMETRY_CONFIG_KEYS;
 const EDITABLE_CONFIG_KEYS = ["baseCurrency", "refreshIntervalMinutes", "theme", "valueFlashingEnabled", ...Object.keys(TELEMETRY_CONFIG_KEYS)];
@@ -135,6 +139,12 @@ export function createSystemCliCommands(): CliCommandDef[] {
           checks.push({ check: "database", status: "ok", detail: join(services.dataDir, ".gloomberb-cache.db") });
           checks.push({ check: "plugins", status: "ok", detail: String(services.services.pluginRegistry.allPlugins.size) });
           checks.push({ check: "capabilities", status: "ok", detail: String(services.services.pluginRegistry.capabilities.manifests().length) });
+          const theme = services.config.theme;
+          checks.push({
+            check: "theme",
+            status: themeName(theme) ? "ok" : "warn",
+            detail: themeName(theme) ? describeThemeId(theme) : `${describeThemeId(theme)}. Pick one with gloomberb config set theme <id>.`,
+          });
         });
       } catch (error) {
         checks.push({ check: "runtime", status: "error", detail: error instanceof Error ? error.message : String(error) });
@@ -159,6 +169,8 @@ export function createSystemCliCommands(): CliCommandDef[] {
         "config list",
         "config get <key>",
         "config set <key> <value>",
+        "config themes",
+        "config set theme <id>",
         "config set telemetry.crashReports false",
         "config set telemetry.usage false",
         "config get keybindings",
@@ -168,9 +180,16 @@ export function createSystemCliCommands(): CliCommandDef[] {
       sections: [{
         title: "Editable keys",
         lines: [`${EDITABLE_CONFIG_KEYS.join(", ")}, and keybindings.*`],
+      }, {
+        title: "Themes",
+        lines: [
+          `theme takes one of these ids, or its name as config themes lists it: ${getThemeIds().join(", ")}.`,
+        ],
       }],
       examples: [
         "config",
+        "config themes",
+        "config set theme colorblind",
         "config set baseCurrency EUR",
         "config get keybindings",
         "config set keybindings.actions.ticker-search \"Ctrl+T\"",
@@ -179,6 +198,24 @@ export function createSystemCliCommands(): CliCommandDef[] {
     },
     execute: async (args, ctx) => {
       const action = args[0] ?? "list";
+      // Listing the themes needs no data folder, so it works before the first run.
+      if (action === "themes") {
+        let current: string | null = null;
+        try {
+          current = await withConfigData(ctx, ({ config }) => config.theme);
+        } catch {
+          current = null;
+        }
+        ctx.printResult({ data: themeListRows(current) }, {
+          textColumns: [
+            { key: "id", header: "ID", shrink: false },
+            { key: "name", header: "Name", shrink: false },
+            { key: "appearance", header: "Look" },
+            { key: "note", header: "Note", format: (_value, row) => themeListNote(row as ReturnType<typeof themeListRows>[number]) },
+          ],
+        });
+        return;
+      }
       await withConfigData(ctx, async (context) => {
         const safeConfig: Record<string, unknown> = {
           dataDir: context.config.dataDir,
@@ -195,6 +232,7 @@ export function createSystemCliCommands(): CliCommandDef[] {
           valueFlashingEnabled: context.config.valueFlashingEnabled,
           "telemetry.crashReports": context.config.telemetry?.crashReports !== false,
           "telemetry.usage": context.config.telemetry?.usage !== false,
+          "telemetry.attention": context.config.telemetry?.attention === true,
         };
 
         if (action === "list") {
@@ -203,6 +241,7 @@ export function createSystemCliCommands(): CliCommandDef[] {
               key,
               header: key,
               ...(key === KEYBINDINGS_CONFIG_KEY ? { format: summarizeKeybindings } : {}),
+              ...(key === "theme" ? { format: (value: unknown) => describeThemeId(String(value)) } : {}),
             })),
           });
           return;
@@ -211,6 +250,13 @@ export function createSystemCliCommands(): CliCommandDef[] {
           const key = requireArg(args[1], "Usage: gloomberb config get <key>", ctx);
           if (!Object.prototype.hasOwnProperty.call(safeConfig, key)) {
             ctx.fail(`Unknown config key "${key}".`, `Keys: ${Object.keys(safeConfig).join(", ")}`);
+          }
+          if (key === "theme") {
+            const id = String(safeConfig.theme);
+            ctx.printResult({ data: { key, value: id, name: themeName(id) } }, {
+              text: () => describeThemeId(id),
+            });
+            return;
           }
           ctx.printResult({ data: { key, value: safeConfig[key] } }, {
             text: (data) => key === KEYBINDINGS_CONFIG_KEY ? renderKeybindings(data.value) : describeConfigValue(data.value),
@@ -245,21 +291,32 @@ export function createSystemCliCommands(): CliCommandDef[] {
           if (isTelemetryConfigKey(key) && value !== "true" && value !== "false") {
             ctx.fail(`Usage: gloomberb config set ${key} true|false`);
           }
-          const parsedValue = key === "refreshIntervalMinutes"
-            ? Number(value)
-            : key === "valueFlashingEnabled" || isTelemetryConfigKey(key)
-              ? value === "true"
-              : value;
+          // A display name may come unquoted: config set theme White Phosphor.
+          const parsedValue = key === "theme"
+            ? requireThemeId(args.slice(2).join(" "))
+            : key === "refreshIntervalMinutes"
+              ? Number(value)
+              : key === "valueFlashingEnabled" || isTelemetryConfigKey(key)
+                ? value === "true"
+                : value;
           const nextConfig = isTelemetryConfigKey(key)
             ? { ...context.config, telemetry: { ...context.config.telemetry, [TELEMETRY_CONFIG_KEYS[key]]: parsedValue as boolean } }
             : { ...context.config, [key]: parsedValue };
           if (!ctx.cliOptions.dryRun) await saveConfig(nextConfig);
-          ctx.printResult({ data: { changed: !ctx.cliOptions.dryRun, dryRun: ctx.cliOptions.dryRun, key, value: parsedValue } }, {
-            text: (data) => `Set ${key} to ${describeConfigValue(data.value)}.${dryRunNote(data.dryRun)}`,
+          ctx.printResult({
+            data: {
+              changed: !ctx.cliOptions.dryRun,
+              dryRun: ctx.cliOptions.dryRun,
+              key,
+              value: parsedValue,
+              ...(key === "theme" ? { name: themeName(String(parsedValue)) } : {}),
+            },
+          }, {
+            text: (data) => `Set ${key} to ${key === "theme" ? describeThemeId(String(data.value)) : describeConfigValue(data.value)}.${dryRunNote(data.dryRun)}`,
           });
           return;
         }
-        ctx.fail("Usage: gloomberb config list|get|set");
+        ctx.fail("Usage: gloomberb config list|get|set|themes");
       });
     },
   };
@@ -420,19 +477,27 @@ export function createSystemCliCommands(): CliCommandDef[] {
         }
         if (action === "enable" || action === "disable") {
           const id = requireArg(args[1], `Usage: gloomberb plugin ${action} <id>`, ctx);
-          const plugin = services.services.pluginRegistry.allPlugins.get(id);
-          if (!plugin) ctx.fail(`Plugin "${id}" is not available.`);
-          if (plugin?.toggleable !== true) ctx.fail(`Plugin "${id}" is part of the application and cannot be disabled.`);
+          // A retired id that now names a group of built-ins switches all of them.
+          const targetIds = builtinPluginGroupMembers(id) ?? [id];
+          for (const targetId of targetIds) {
+            const plugin = services.services.pluginRegistry.allPlugins.get(targetId);
+            if (!plugin) ctx.fail(`Plugin "${targetId}" is not available.`);
+            if (plugin?.toggleable !== true) ctx.fail(`Plugin "${targetId}" is part of the application and cannot be disabled.`);
+          }
           const disabled = new Set(services.config.disabledPlugins ?? []);
-          const before = disabled.has(id);
-          if (action === "enable") disabled.delete(id);
-          else disabled.add(id);
+          const isOff = () => targetIds.every((targetId) => disabled.has(targetId));
+          const isOn = () => targetIds.every((targetId) => !disabled.has(targetId));
+          const unchanged = action === "enable" ? isOn() : isOff();
+          for (const targetId of targetIds) {
+            if (action === "enable") disabled.delete(targetId);
+            else disabled.add(targetId);
+          }
           const nextConfig = { ...services.config, disabledPlugins: [...disabled] };
           if (!ctx.cliOptions.dryRun) await saveConfig(nextConfig);
-          ctx.printResult({ data: { changed: before !== disabled.has(id) && !ctx.cliOptions.dryRun, dryRun: ctx.cliOptions.dryRun, id, enabled: !disabled.has(id) } }, {
+          ctx.printResult({ data: { changed: !unchanged && !ctx.cliOptions.dryRun, dryRun: ctx.cliOptions.dryRun, id, enabled: isOn() } }, {
             text: (data) => {
               const state = data.enabled ? "on" : "off";
-              if (before === disabled.has(id)) return `${id} is already ${state}.`;
+              if (unchanged) return `${id} is already ${state}.`;
               return `Turned ${id} ${state}.${dryRunNote(data.dryRun)}`;
             },
           });

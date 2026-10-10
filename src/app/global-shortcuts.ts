@@ -6,9 +6,13 @@ import { useToastHost } from "../ui/toast";
 import type { PluginRegistry } from "../plugins/registry";
 import type { AppAction, AppState } from "../state/app/context";
 import type { TickerRecord } from "../types/ticker";
+import { findPaneInstance } from "../types/config";
 import type { ReleaseInfo } from "../updater";
-import { canSelfUpdate } from "../updater";
+import { canRestartToApply, canSelfUpdate } from "../updater";
 import { getVisiblePaneCycleOrder } from "../components/layout/pane/cycle-order";
+import { requestFunctionHelp, useFunctionHelpHost } from "../plugins/builtin/help/function-card";
+import { buildRegistryHelpIndex, helpFunctionForPane } from "../plugins/builtin/help/function-index";
+import { recordFunctionOpen } from "../telemetry/usage-counts";
 import { isMoveDownShortcut, isMoveUpShortcut } from "../components/command-bar/keyboard-handlers";
 import {
   copyActiveSelection,
@@ -30,9 +34,10 @@ import {
 const KEYBINDING_NOTICE_DURATION_MS = 15_000;
 
 /**
- * Whether the install-update key has something to do: a release this build
+ * Whether the install-update key has something to retry: a release this build
  * can install itself whose last attempt failed. A fresh one downloads on its
- * own, and a manual or managed one names its own command.
+ * own, and a manual or managed one names its own command. (A downloaded
+ * desktop update has its own use of the key: restarting into it.)
  */
 export function canRetryUpdate(
   state: Pick<AppState, "updateAvailable" | "updateProgress" | "updateCheckInProgress">,
@@ -87,6 +92,7 @@ export function useAppGlobalShortcuts({
   keybindings = getDefaultKeybindings(),
   pluginRegistry,
   refreshTicker,
+  restartToApplyUpdate,
   startUpdate,
   state,
 }: {
@@ -97,6 +103,8 @@ export function useAppGlobalShortcuts({
   keybindings?: ResolvedKeybindings;
   pluginRegistry: PluginRegistry;
   refreshTicker: (symbol: string, exchange?: string, tickerOverride?: TickerRecord | null, priority?: number) => void;
+  /** Applies a downloaded desktop update and relaunches. Runs only on the user's key press. */
+  restartToApplyUpdate: () => void;
   startUpdate: (release: ReleaseInfo) => void;
   state: AppState;
 }) {
@@ -106,6 +114,11 @@ export function useAppGlobalShortcuts({
   const uiKind = useUiHost().kind;
   const toastHost = useToastHost();
   useKeybindingIssueNotice(keybindings, pluginRegistry, state.initialized);
+  useFunctionHelpHost({
+    closeCommandBar: () => {
+      if (state.commandBarOpen) dispatch({ type: "SET_COMMAND_BAR", open: false });
+    },
+  });
 
   useShortcut((event) => {
     if (isCopyShortcut(event) && copyActiveSelection(nativeRenderer)) {
@@ -207,6 +220,18 @@ export function useAppGlobalShortcuts({
       return;
     }
 
+    // A function key is never text, so the card opens from a focused field too.
+    if (action === "function-help") {
+      event.preventDefault();
+      event.stopPropagation();
+      recordFunctionOpen({ shortcut: "HELP", externalPluginId: null });
+      const instance = state.focusedPaneId ? findPaneInstance(state.config.layout, state.focusedPaneId) : undefined;
+      const fn = instance ? helpFunctionForPane(buildRegistryHelpIndex(pluginRegistry), pluginRegistry, instance) : null;
+      if (fn && requestFunctionHelp({ kind: "function", fn })) return;
+      if (!isDetachedWindow) pluginRegistry.showPane("help");
+      return;
+    }
+
     if (state.inputCaptured) return;
 
     if (!isDetachedWindow && action === "help") {
@@ -228,9 +253,13 @@ export function useAppGlobalShortcuts({
         refreshTicker(ticker.metadata.ticker, ticker.metadata.exchange, ticker, 1);
       }
     } else if (action === "install-update") {
-      // A release that can install itself starts on its own, so the key is
-      // for the one that failed: it tries again.
-      if (canRetryUpdate(state)) {
+      // A release that can install itself downloads on its own, so the key is
+      // for the one that waits for a restart and for the one that failed.
+      if (!isDetachedWindow && canRestartToApply(state.updateProgress)) {
+        event.preventDefault();
+        event.stopPropagation();
+        restartToApplyUpdate();
+      } else if (canRetryUpdate(state)) {
         event.preventDefault();
         event.stopPropagation();
         startUpdate(state.updateAvailable!);

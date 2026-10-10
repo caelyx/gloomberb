@@ -8,6 +8,7 @@ import type {
   HeadlessPaneLoadArgs,
   HeadlessRowsResult,
 } from "../../../types/plugin";
+import { resolveHeadlessIssuerListing } from "../shared/headless-market-data";
 import {
   callStatusLabel,
   isPendingTranscript,
@@ -57,10 +58,10 @@ export interface EarningsCallsHeadlessDependencies {
 }
 
 const defaultDependencies: EarningsCallsHeadlessDependencies = {
-  loadCalls: (ticker, limit, context) => loadEarningsCallsWithClient(
+  loadCalls: async (ticker, limit, context) => loadEarningsCallsWithClient(
     context.apiClient,
     ticker,
-    { limit },
+    { limit, ...(ticker ? await resolveHeadlessIssuerListing(context, ticker) : {}) },
   ),
   loadTranscript: (callId, context) => loadTranscriptWithClient(context.apiClient, callId),
 };
@@ -87,7 +88,7 @@ function availabilityMatches(call: CloudEarningsCallPayload, availability: strin
   return availability === "transcribed" ? call.hasTranscript : !call.hasTranscript;
 }
 
-export function projectEarningsCallsHeadless(
+function projectEarningsCallsHeadless(
   result: EarningsCallsResult,
   args: HeadlessPaneLoadArgs,
 ): HeadlessRowsResult {
@@ -186,6 +187,7 @@ export function createEarningsCallsHeadless(
 ): HeadlessPaneDefinition<"rows"> {
   return {
     shape: "rows",
+    freshness: { source: "Company earnings calls", status: "not-a-feed", basis: "transcripts" },
     argument: {
       kind: "ticker",
       placeholder: "ticker",

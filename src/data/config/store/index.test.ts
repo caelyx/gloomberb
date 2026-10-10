@@ -10,8 +10,8 @@ import {
   findPaneInstance,
   type AppConfig,
 } from "../../../types/config";
-import { getDockedPaneIds } from "../../../plugins/pane-manager";
-import { EXTRACTED_PLUGINS, seedExtractedPlugins } from "../../../plugins/seed";
+import { getDockedPaneIds } from "../../../layout/pane-manager";
+import { EXTRACTED_PLUGINS, seedExtractedPlugins } from "../../../plugins/extracted-plugins";
 
 const tempDirs: string[] = [];
 const originalGloomberbHome = process.env.GLOOMBERB_HOME;
@@ -58,6 +58,40 @@ function createSavedConfig(overrides: Record<string, unknown> = {}): Record<stri
 async function writeConfigJson(dataDir: string, config: Record<string, unknown>): Promise<void> {
   await writeFile(join(dataDir, "config.json"), JSON.stringify(config), "utf-8");
 }
+
+test("recent panes survive a save and reload", async () => {
+  const dataDir = await createTempConfigDir();
+  const loaded = await loadConfig(dataDir);
+  await saveConfig({
+    ...loaded,
+    recentCommands: [
+      { id: "pane-template:ticker-news-pane", label: "Ticker News", arg: "AAPL" },
+      { id: "pane-template:chart", label: "Chart" },
+      { id: "blank-arg", label: "Blank", arg: "" },
+      { id: "", label: "drop" },
+    ],
+  });
+  expect((await loadConfig(dataDir)).recentCommands).toEqual([
+    { id: "pane-template:ticker-news-pane", label: "Ticker News", arg: "AAPL" },
+    { id: "pane-template:chart", label: "Chart" },
+    { id: "blank-arg", label: "Blank" },
+  ]);
+});
+
+test("a portfolio's cash and target weights survive a save and reload, and malformed ones are dropped", async () => {
+  const dataDir = await createTempConfigDir();
+  await writeConfigJson(dataDir, createSavedConfig({
+    portfolios: [
+      { id: "main", name: "Main", currency: "USD", cash: { amount: 500_000, currency: "USD" }, targetWeights: { VTI: 60, CASH: 40 } },
+      { id: "bad", name: "Bad", currency: "USD", cash: { amount: "lots", currency: "USD" }, targetWeights: { VTI: 140, GLD: -1, BIL: "ten" } },
+    ],
+  }));
+  const loaded = await loadConfig(dataDir);
+  await saveConfig(loaded);
+  const [main, bad] = (await loadConfig(dataDir)).portfolios;
+  expect(main).toEqual({ id: "main", name: "Main", currency: "USD", cash: { amount: 500_000, currency: "USD" }, targetWeights: { VTI: 60, CASH: 40 } });
+  expect(bad).toEqual({ id: "bad", name: "Bad", currency: "USD" });
+});
 
 test("fresh installs skip plugin restoration across config reloads", async () => {
   const dataDir = await createTempConfigDir();
@@ -775,24 +809,24 @@ describe("loadConfig", () => {
     expect(config.disabledPlugins).toEqual([
       "ticker-research",
       "market-overview",
-      // Their own plugins now (Market Heatmap built in, Fear & Greed
-      // external), so a legacy id means the plugin of that name rather than
-      // the built-in that used to contain it.
+      // Their own built-ins now, so a legacy id means the plugin of that name
+      // rather than the built-in that used to contain it.
       "market-heatmap",
       "fear-greed",
       "macro",
       "ibkr",
       "broker",
       "portfolio",
-      // Built in again, and off like the rest of Market Overview.
+      // Built in again, and off like the rest of Market Overview and Macro.
       "market-halts",
+      "ipo-calendar",
     ]);
   });
 
   /**
-   * Market Heatmap and Market Halts were Market Overview modules, then
-   * plugins the seeder did not install while Market Overview was off. Built
-   * in again, they would come back on under their own ids.
+   * Market Heatmap, Market Halts and Fear & Greed were Market Overview
+   * modules, then plugins the seeder did not install while Market Overview
+   * was off. Built in again, they would come back on under their own ids.
    */
   test("keeps the absorbed Market Overview modules off where Market Overview was off", async () => {
     // Installed by hand since, so wanted, and loaded as the built-in now.
@@ -801,9 +835,39 @@ describe("loadConfig", () => {
     const saved = createSavedConfig({ configVersion: 22, disabledPlugins: ["market-overview"] });
     await writeConfigJson(dataDir, saved);
 
-    expect((await loadConfig(dataDir)).disabledPlugins).toEqual(["market-overview", "market-halts"]);
-    // The web bundled both whatever Market Overview said.
+    const migrated = await loadConfig(dataDir);
+    expect(migrated.disabledPlugins).toEqual(["market-overview", "market-halts", "fear-greed"]);
+    // The web bundled all three whatever Market Overview said.
     expect(normalizeLoadedConfig(saved, dataDir).config.disabledPlugins).toEqual(["market-overview"]);
+
+    // Switched on since, then saved by an older build, which writes its own
+    // configVersion back: the migration runs again but leaves them on.
+    await saveConfig({ ...migrated, disabledPlugins: ["market-overview"] });
+    const persisted = JSON.parse(await readFile(join(dataDir, "config.json"), "utf-8")) as Record<string, unknown>;
+    await writeConfigJson(dataDir, { ...persisted, configVersion: 22 });
+    expect((await loadConfig(dataDir)).disabledPlugins).toEqual(["market-overview"]);
+  });
+
+  /** The IPO Calendar was a Macro module, then a plugin the seeder skipped while Macro was off. */
+  test("keeps the IPO Calendar off where Macro was off, unless a copy was installed since", async () => {
+    await usePluginCheckouts();
+    const dataDir = await createTempConfigDir();
+    await writeConfigJson(dataDir, createSavedConfig({ configVersion: 22, disabledPlugins: ["macro"] }));
+    expect((await loadConfig(dataDir)).disabledPlugins).toEqual(["macro", "ipo-calendar"]);
+
+    // Saved at 23 by a build that absorbed only the Market Overview modules.
+    const afterMarketOverview = await createTempConfigDir();
+    await writeConfigJson(afterMarketOverview, createSavedConfig({
+      configVersion: 23,
+      disabledPlugins: ["macro"],
+      seededPlugins: ["absorbed:market-heatmap", "absorbed:market-halts", "absorbed:fear-greed"],
+    }));
+    expect((await loadConfig(afterMarketOverview)).disabledPlugins).toEqual(["macro", "ipo-calendar"]);
+
+    await usePluginCheckouts("gloom-ipo-calendar");
+    const installed = await createTempConfigDir();
+    await writeConfigJson(installed, createSavedConfig({ configVersion: 22, disabledPlugins: ["macro"] }));
+    expect((await loadConfig(installed)).disabledPlugins).toEqual(["macro"]);
   });
 
   test("migrates grouped built-in plugin config keys", async () => {
@@ -924,11 +988,11 @@ describe("loadConfig", () => {
       },
     });
     expect(config.layouts[0]?.focusedPaneId).toBe("ticker-detail:main");
-    expect(config.layouts[0]?.activePanel).toBe("right");
+    expect(config.layouts[0]).not.toHaveProperty("activePanel");
 
     await saveConfig(config);
     const persisted = JSON.parse(await readFile(join(dataDir, "config.json"), "utf-8")) as {
-      layouts: Array<{ paneState?: Record<string, unknown>; focusedPaneId?: string | null; activePanel?: string }>;
+      layouts: Array<{ paneState?: Record<string, unknown>; focusedPaneId?: string | null }>;
     };
     expect(persisted.layouts[0]?.paneState).toEqual({
       "ticker-detail:main": {
@@ -939,7 +1003,7 @@ describe("loadConfig", () => {
       },
     });
     expect(persisted.layouts[0]?.focusedPaneId).toBe("ticker-detail:main");
-    expect(persisted.layouts[0]?.activePanel).toBe("right");
+    expect(persisted.layouts[0]).not.toHaveProperty("activePanel");
   });
 
   test("does not replay historical migrations for current configs or saves", async () => {

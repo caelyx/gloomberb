@@ -5,18 +5,20 @@ import { colors, priceColor } from "../../../theme/colors";
 import type { TickerFinancials, PricePoint } from "../../../types/financials";
 import type { BrokerAccount, BrokerPortfolioPerformance } from "../../../types/trading";
 import type { Portfolio, TickerRecord } from "../../../types/ticker";
-import { formatCompact, formatCompactAmount, formatNumber, formatPercentRaw } from "../../../utils/format";
+import { formatCompact, formatNumber, formatPercentRaw } from "../../../utils/format";
 import { formatRelativeAge } from "../../../utils/datetime-format";
 import type { PriceHistoryIntegrity } from "../../../utils/price-history-integrity";
 import { instrumentFromTicker, type ChartRequest, type TickerInstrumentOptions } from "../../../market-data/request-types";
 import { buildChartKey } from "../../../market-data/selectors";
 import {
   resolvePortfolioAccountMetrics,
+  resolvePortfolioLeverage,
   resolvePortfolioMarketValue,
   resolvePortfolioNetLiquidation,
 } from "../portfolio-list/account-metrics";
 import type { ColumnContext, PortfolioSummaryTotals } from "../portfolio-list/metrics";
 import type { ResolvedPortfolioAccountState } from "../portfolio-list/summary";
+import { formatPortfolioAmount } from "../portfolio-list/summary/totals";
 import { buildPerformanceChartPoints, resolvePerformanceMetric } from "./broker-performance";
 import { formatReturn } from "./display";
 import {
@@ -68,8 +70,8 @@ function formatAccountFreshness(account: ResolvedPortfolioAccountState["account"
 }
 
 function formatMarginLeverage(netLiquidation: number | undefined, totalMarketValue: number): string | null {
-  if (!isFiniteNumber(netLiquidation) || netLiquidation <= 0 || !isFiniteNumber(totalMarketValue) || totalMarketValue < 0) return null;
-  return `${(totalMarketValue / netLiquidation).toFixed(1)}x`;
+  const leverage = resolvePortfolioLeverage(totalMarketValue, netLiquidation);
+  return leverage == null ? null : `${leverage.toFixed(1)}x`;
 }
 
 export function buildPortfolioChartTargets(
@@ -204,17 +206,26 @@ export function buildPortfolioBetaResult(portfolio: PortfolioReturnSeriesResult,
 
 export function buildAnalyticsSummaryRows({
   accountState,
+  activePortfolio,
   brokerPerformance,
   portfolioStats,
   convertAccountValue = (value) => value,
+  currency = "USD",
+  baseCurrency = "USD",
 }: {
   accountState: ResolvedPortfolioAccountState | null;
   activePortfolio: Portfolio | null;
   brokerPerformance: BrokerPortfolioPerformance | null;
   portfolioStats: PortfolioSummaryTotals;
+  /** Into the totals currency. */
   convertAccountValue?: (value: number) => number;
+  /** The portfolio's totals currency, as its portfolio pane header shows it. */
+  currency?: string;
+  /** The app's base currency: amounts are bare only when both are USD. */
+  baseCurrency?: string;
 }): AnalyticsMetricRow[] {
   const rows: AnalyticsMetricRow[] = [];
+  const money = (value: number | undefined, signed = false) => formatPortfolioAmount(value, currency, { signed, baseCurrency });
   const account = accountState?.account;
   // The same live carry-forward as the portfolio header, so both show one figure.
   const basis = accountState?.snapshotBasis;
@@ -223,6 +234,8 @@ export function buildAnalyticsSummaryRows({
   const totalMarketValue = resolvePortfolioMarketValue(portfolioStats, account, convertAccountValue, basis);
   const netLiquidation = resolvePortfolioNetLiquidation(portfolioStats, account, convertAccountValue, basis);
   const hasMarketValue = portfolioStats.hasPositions || isFiniteNumber(account?.grossPositionValue);
+  // As in the portfolio header: a broker account is worth its equity, and its positions alone are its gross.
+  const broker = !!account || !!activePortfolio?.brokerInstanceId;
 
   if (portfolioStats.unavailableConversions?.length || (account && !Number.isFinite(convertAccountValue(1)))) {
     rows.push({
@@ -232,20 +245,20 @@ export function buildAnalyticsSummaryRows({
     });
   }
 
-  if (netLiquidation != null) {
+  if (netLiquidation != null || (broker && hasMarketValue)) {
     rows.push({
       id: "net-liquidation",
       label: "Net Liq",
-      value: formatCompactAmount(netLiquidation),
-      color: colors.text,
+      value: money(netLiquidation ?? Number.NaN),
+      color: netLiquidation != null ? colors.text : colors.textDim,
     });
   }
 
   if (hasMarketValue) {
     rows.push({
       id: "total-value",
-      label: "Val",
-      value: formatCompactAmount(totalMarketValue),
+      label: broker || portfolioStats.hasShorts ? "Gross" : "Val",
+      value: money(totalMarketValue),
       color: colors.text,
     });
   }
@@ -264,7 +277,7 @@ export function buildAnalyticsSummaryRows({
     rows.push({
       id: "cash",
       label: "Cash",
-      value: formatCompactAmount(convertAccountValue(account.totalCashValue)),
+      value: money(convertAccountValue(account.totalCashValue)),
       color: colors.text,
     });
   }
@@ -275,7 +288,7 @@ export function buildAnalyticsSummaryRows({
     rows.push({
       id: "day-pnl",
       label: "Day",
-      value: formatCompactAmount(accountMetrics.dailyPnl, { signed: true }),
+      value: money(accountMetrics.dailyPnl, true),
       detail: `(${formatPercentRaw(dailyPnlPct)})`,
       color: priceColor(accountMetrics.dailyPnl),
     });
@@ -284,7 +297,7 @@ export function buildAnalyticsSummaryRows({
     rows.push({
       id: "pnl",
       label: "P&L",
-      value: formatCompactAmount(accountMetrics.unrealizedPnl, { signed: true }),
+      value: money(accountMetrics.unrealizedPnl, true),
       detail: `(${formatPercentRaw(accountMetrics.unrealizedPnlPct)})`,
       color: priceColor(accountMetrics.unrealizedPnl),
     });
@@ -293,7 +306,7 @@ export function buildAnalyticsSummaryRows({
     rows.push({
       id: "realized-pnl",
       label: "Realized",
-      value: formatCompactAmount(accountMetrics.realizedPnl, { signed: true }),
+      value: money(accountMetrics.realizedPnl, true),
       color: priceColor(accountMetrics.realizedPnl),
     });
   }
@@ -315,7 +328,7 @@ export function buildAnalyticsSummaryRows({
     rows.push({
       id: "settled-cash",
       label: "Settled",
-      value: formatCompactAmount(convertAccountValue(account.settledCash)),
+      value: money(convertAccountValue(account.settledCash)),
       color: colors.text,
     });
   }
@@ -323,7 +336,7 @@ export function buildAnalyticsSummaryRows({
     rows.push({
       id: "available-funds",
       label: "Avail",
-      value: formatCompactAmount(convertAccountValue(account.availableFunds)),
+      value: money(convertAccountValue(account.availableFunds)),
       color: colors.text,
     });
   }
@@ -331,7 +344,7 @@ export function buildAnalyticsSummaryRows({
     rows.push({
       id: "excess-liquidity",
       label: "Excess",
-      value: formatCompactAmount(convertAccountValue(account.excessLiquidity)),
+      value: money(convertAccountValue(account.excessLiquidity)),
       color: colors.text,
     });
   }
@@ -339,7 +352,7 @@ export function buildAnalyticsSummaryRows({
     rows.push({
       id: "buying-power",
       label: "BP",
-      value: formatCompactAmount(convertAccountValue(account.buyingPower)),
+      value: money(convertAccountValue(account.buyingPower)),
       color: colors.text,
     });
   }
@@ -367,7 +380,7 @@ export function buildAnalyticsSummaryRows({
  * Names the slice of the portfolio the risk numbers actually describe, so a
  * Sharpe built on half the book is never presented as the whole book.
  */
-export function formatRiskCoverage(coverage: number, missingCount: number): string | null {
+function formatRiskCoverage(coverage: number, missingCount: number): string | null {
   if (missingCount <= 0 || coverage >= 0.999) return null;
   return `${formatPercentRaw(coverage * 100)} of value, ${missingCount} holding${missingCount === 1 ? "" : "s"} pending`;
 }

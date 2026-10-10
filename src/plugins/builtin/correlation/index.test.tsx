@@ -1,26 +1,30 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { act, useReducer, type ReactElement } from "react";
 import { Box } from "../../../ui";
-import { emitKeypress, testRender } from "../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { appReducer, createInitialState } from "../../../state/app/context";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import type { PluginRuntimeAccess } from "../../runtime";
 import { correlationModule } from ".";
 import { TestPaneProvider, createTestTicker, createTestPaneConfig } from "../../../test-support/pane";
+import { apiClient } from "../../../api-client";
+import { resetGeoCatalogCache } from "../../../api-client/geo";
+import { createGeoFixtureRequest } from "../../../test-support/test-fixture-geo";
 
 const TEST_PANE_ID = "correlation:test";
 
-let testSetup: Awaited<ReturnType<typeof testRender>> | undefined;
+const tui = createOpenTuiTestHarness();
 
-function CorrelationHarness({ runtime }: { runtime: PluginRuntimeAccess }) {
+function CorrelationHarness({ runtime, symbols = ["AAPL", "MSFT"] }: { runtime: PluginRuntimeAccess; symbols?: string[] }) {
   const config = createTestPaneConfig("/tmp/gloomberb-correlation-test", {
     instanceId: TEST_PANE_ID,
     paneId: "correlation",
     settings: {
-      rangePreset: "1Y",
-      symbols: ["AAPL", "MSFT"],
-      symbolsText: "AAPL, MSFT",
+      // The geo fixture's counts end on 2026-10-04; 5Y keeps them in range.
+      rangePreset: symbols.some((symbol) => symbol.startsWith("GEO:")) ? "5Y" : "1Y",
+      symbols,
+      symbolsText: symbols.join(", "),
     },
   });
   const [state, dispatch] = useReducer(appReducer, undefined, () => {
@@ -56,17 +60,70 @@ function CorrelationHarness({ runtime }: { runtime: PluginRuntimeAccess }) {
   );
 }
 
-afterEach(async () => {
-  if (testSetup) {
-    await act(async () => {
-      testSetup!.renderer.destroy();
-      await Promise.resolve();
-    });
-  }
-  testSetup = undefined;
-});
-
 describe("correlationModule", () => {
+  test("keys and cell clicks open the selected pair while diagonal and hovered symbols retain ticker navigation", async () => {
+    const opened: unknown[] = [];
+    const runtime = createTestPluginRuntime({
+      createPaneFromTemplate: (id, options) => {
+        // The app's ticker-list template workflow resolves arg before symbols;
+        // symbols alone opens its wizard instead of the pair view.
+        expect(options?.arg).toBe(options?.symbols?.join(", "));
+        opened.push([id, options?.symbols]);
+      },
+      pinTicker: (symbol) => opened.push(symbol),
+    });
+    await tui.render(<CorrelationHarness runtime={runtime} />, { width: 60, height: 8 });
+    await tui.waitForFrameToContain("MSFT");
+    const key = (name: string) => tui.emitKeypress({ name }, { trackPropagation: true, afterCommit: true });
+    await key("return"); // Default off-diagonal pair.
+    await key("left");
+    await key("return"); // AAPL diagonal.
+    await key("j");
+    await key("return"); // MSFT/AAPL.
+    await key("l");
+    await key("return"); // MSFT diagonal.
+    await key("up");
+    await key("h");
+    await key("h"); // Symbol column.
+    await key("down");
+    await key("return"); // MSFT row symbol.
+    await key("k");
+    await key("right");
+    await key("return"); // AAPL diagonal again.
+
+    const lines = tui.frame().split("\n");
+    const header = lines.findIndex((line) => line.includes("AAPL") && line.includes("MSFT") && !line.includes(","));
+    const msftColumn = lines[header]!.indexOf("MSFT");
+    await act(async () => {
+      await tui.setup().mockMouse.click(msftColumn, header + 1);
+      await tui.setup().renderOnce();
+    });
+    await key("return"); // Click selected AAPL/MSFT, without opening it on the click.
+    await act(async () => {
+      await tui.setup().mockMouse.moveTo(2, header + 2);
+      await tui.setup().renderOnce();
+    });
+    await key("return"); // Hovered MSFT header overrides the pair for Enter.
+    await key("k");
+    await key("return"); // Row keys continue from that hovered symbol.
+    expect(opened).toEqual([
+      ["relationship-graph-pane", ["AAPL", "MSFT"]], "AAPL",
+      ["relationship-graph-pane", ["MSFT", "AAPL"]], "MSFT", "MSFT", "AAPL",
+      ["relationship-graph-pane", ["AAPL", "MSFT"]], "MSFT", "AAPL",
+    ]);
+  });
+
+  test("a batch of cursor keys accumulates every move before React commits", async () => {
+    const pairs: unknown[] = [];
+    await tui.render(<CorrelationHarness runtime={createTestPluginRuntime({
+      createPaneFromTemplate: (_id, options) => pairs.push(options?.symbols),
+    })} />, { width: 60, height: 8 });
+    await tui.waitForFrameToContain("MSFT");
+    await tui.emitKeypress([{ name: "left" }, { name: "down" }], { trackPropagation: true, afterCommit: true });
+    await tui.emitKeypress({ name: "return" }, { trackPropagation: true, afterCommit: true });
+    expect(pairs).toEqual([["MSFT", "AAPL"]]);
+  });
+
   test("opens tickers from row and column labels", async () => {
     const opened: Array<{ symbol: string; options: { floating?: boolean; paneType?: string } | undefined }> = [];
     const runtime = createTestPluginRuntime({
@@ -77,18 +134,18 @@ describe("correlationModule", () => {
     });
 
     await act(async () => {
-      testSetup = await testRender(<CorrelationHarness runtime={runtime} />, {
+      await tui.render(<CorrelationHarness runtime={runtime} />, {
         width: 60,
         height: 8,
       });
     });
     await act(async () => {
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
       await Promise.resolve();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
 
-    const lines = testSetup!.captureCharFrame().split("\n");
+    const lines = tui.frame().split("\n");
     // The first AAPL+MSFT line is the in-pane ticker input, so skip comma-separated rows.
     const headerY = lines.findIndex((line) => line.includes("AAPL") && line.includes("MSFT") && !line.includes(","));
     const headerCol = lines[headerY]?.indexOf("AAPL") ?? -1;
@@ -96,9 +153,9 @@ describe("correlationModule", () => {
     expect(headerCol).toBeGreaterThanOrEqual(0);
 
     await act(async () => {
-      await testSetup!.mockMouse.click(headerCol + 1, headerY);
+      await tui.setup().mockMouse.click(headerCol + 1, headerY);
       await Promise.resolve();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
 
     const rowY = lines.findIndex((line, index) => index > headerY && line.includes("MSFT"));
@@ -107,9 +164,9 @@ describe("correlationModule", () => {
     expect(rowCol).toBeGreaterThanOrEqual(0);
 
     await act(async () => {
-      await testSetup!.mockMouse.click(rowCol + 1, rowY);
+      await tui.setup().mockMouse.click(rowCol + 1, rowY);
       await Promise.resolve();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
 
     expect(opened).toEqual([
@@ -121,28 +178,55 @@ describe("correlationModule", () => {
   test("Esc puts the ticker list back after an edit instead of emptying it to the defaults", async () => {
     const wait = (ms: number) => act(async () => {
       await new Promise((resolve) => setTimeout(resolve, ms));
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
     await act(async () => {
-      testSetup = await testRender(<CorrelationHarness runtime={createTestPluginRuntime()} />, { width: 60, height: 8 });
+      await tui.render(<CorrelationHarness runtime={createTestPluginRuntime()} />, { width: 60, height: 8 });
     });
     await wait(0);
 
-    await emitKeypress(testSetup!, { name: "/", sequence: "/" }, { trackPropagation: true, afterCommit: true });
+    await tui.emitKeypress({ name: "/", sequence: "/" }, { trackPropagation: true, afterCommit: true });
     await wait(20);
     await act(async () => {
-      await testSetup!.mockInput.typeText("X");
-      await testSetup!.renderOnce();
+      await tui.setup().mockInput.typeText("X");
+      await tui.setup().renderOnce();
     });
     // The field shows the draft, applied once typing pauses.
     await wait(600);
-    expect(testSetup!.captureCharFrame()).toMatch(/XAAPL|MSFTX/);
+    expect(tui.frame()).toMatch(/XAAPL|MSFTX/);
 
-    await emitKeypress(testSetup!, { name: "escape", sequence: "\u001B" }, { trackPropagation: true, afterCommit: true });
+    await tui.emitKeypress({ name: "escape", sequence: "\u001B" }, { trackPropagation: true, afterCommit: true });
     await wait(600);
-    const frame = testSetup!.captureCharFrame();
+    const frame = tui.frame();
     expect(frame).toContain("AAPL, MSFT");
     expect(frame).not.toMatch(/XAAPL|MSFTX/);
     expect(frame).not.toContain("NVDA");
+  });
+
+  test("a map series keeps its last values through a failed refresh", async () => {
+    let failing = false;
+    const fixture = createGeoFixtureRequest();
+    const geo = spyOn(apiClient, "geo").mockImplementation(((path: string, init?: RequestInit) => (
+      failing ? Promise.reject(new Error("Too many requests.")) : fixture(path, init)
+    )) as typeof apiClient.geo);
+    try {
+      await tui.render(<CorrelationHarness runtime={createTestPluginRuntime()} symbols={["GEO:HORMUZ", "GEO:SUEZ"]} />, { width: 60, height: 8 });
+      // The fixture's daily changes for the two straits correlate at -0.10.
+      await tui.waitForFrameToContain("-0.10");
+
+      failing = true;
+      const calls = geo.mock.calls.length;
+      await tui.emitKeypress({ name: "r", sequence: "r" }, { trackPropagation: true, afterCommit: true });
+      // Each series' lookup and points fail, then the catalog check says whether map series exist at all.
+      await act(async () => {
+        while (geo.mock.calls.length < calls + 3) await new Promise((resolve) => setTimeout(resolve, 5));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      await tui.renderFrames(2);
+      expect(tui.frame()).toContain("-0.10");
+    } finally {
+      geo.mockRestore();
+      resetGeoCatalogCache();
+    }
   });
 });

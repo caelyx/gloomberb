@@ -4,7 +4,8 @@ import { fetchSocialMentions } from "./client";
 import { socialCount, socialDayRows, socialRatio, socialStance, topPostCell } from "./model";
 
 export const socialMentionsHeadless: HeadlessPaneDefinition<"bundle"> = {
-  shape: "bundle", argument: { kind: "ticker", description: "US equity ticker.", placeholder: "ticker" },
+  shape: "bundle", argument: { kind: "ticker", description: "Ticker with a searchable cashtag (up to six letters and digits).", placeholder: "ticker" },
+  freshness: { source: "X posts", status: "not-a-feed", basis: "daily post counts" },
   discovery: { aliases: ["BUZZ"], dataRequirements: ["Gloom Cloud X mention history"],
     limitations: ["Daily $cashtag posts on X in UTC days, spam included", "Top posts and stance cover days that were looked up", "Views exist from 2022-12-22"] },
   options: [

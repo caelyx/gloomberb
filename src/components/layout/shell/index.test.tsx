@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import type { ReactNode } from "react";
 import { act, useReducer, useState } from "react";
 import type { PluginRegistry } from "../../../plugins/registry";
-import { TestDialogProvider, emitKeypress as emitTuiKeypress, testRender, type TestKeyEvent } from "../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness, TestDialogProvider, type TestKeyEvent } from "../../../renderers/opentui/test-utils";
 import { openTuiUiHost } from "../../../renderers/opentui/ui-host";
 import {
   AppContext,
@@ -26,14 +26,7 @@ import {
 } from "./index";
 import { inputCaptureAllowsPaneManagementShortcut } from "./shortcuts";
 
-let testSetup: Awaited<ReturnType<typeof testRender>> | undefined;
-
-afterEach(() => {
-  if (testSetup) {
-    testSetup.renderer.destroy();
-    testSetup = undefined;
-  }
-});
+const tui = createOpenTuiTestHarness();
 
 function createShellPluginRegistry(options?: {
   portfolioListComponent?: (props: PaneProps) => ReactNode;
@@ -65,17 +58,17 @@ function createShellPluginRegistry(options?: {
     getPluginPaneTemplateIds: () => [],
     hasPaneSettings: (paneId: string) => paneId === "portfolio-list:main",
     notify: () => {},
-    openPaneSettingsFn: () => {},
+    openPaneSettings: () => {},
     openCommandBar: () => {},
     showPane: () => {},
     openWindowMode: () => {},
-    openWindowModeFn: () => {},
-    updateLayoutFn: () => {},
+    updateLayout: () => {},
     hidePane: () => {},
+    bindHost(actions: object) { Object.assign(this, actions); return () => {}; },
   } as unknown as PluginRegistry;
 }
 
-const emitKeypress = (event: TestKeyEvent) => emitTuiKeypress(testSetup!, event, { trackPropagation: true, frames: 2 });
+const emitKeypress = (event: TestKeyEvent) => tui.emitKeypress(event, { trackPropagation: true, frames: 2 });
 
 type ShellTestAction = { type: string; [key: string]: any };
 
@@ -116,13 +109,13 @@ function floatingOverDockLayout(
 
 /** Click the "..." header action on the first row and return the frame with the menu open. */
 async function openPaneMenu() {
-  const actionCol = testSetup!.captureCharFrame().split("\n")[0]?.indexOf("...");
+  const actionCol = tui.frame().split("\n")[0]?.indexOf("...");
   expect(actionCol).toBeGreaterThanOrEqual(0);
   await act(async () => {
-    await testSetup!.mockMouse.click(actionCol! + 1, 1);
+    await tui.setup().mockMouse.click(actionCol! + 1, 1);
   });
-  await testSetup!.renderOnce();
-  return testSetup!.captureCharFrame();
+  await tui.setup().renderOnce();
+  return tui.frame();
 }
 
 /** State for `layout`; without a `focusedPaneId` the initial state picks the focus. */
@@ -151,7 +144,7 @@ async function renderShell(
 ) {
   const actions: ShellTestAction[] = [];
   const registry = options.registry ?? createShellPluginRegistry();
-  testSetup = await testRender(
+  await tui.render(
     <AppContext value={createStaticAppStore(state, options.dispatch ?? ((action) => actions.push(action)))}>
       <TestDialogProvider>
         <Shell pluginRegistry={registry} desktopWindowBridge={options.desktopWindowBridge} />
@@ -159,7 +152,7 @@ async function renderShell(
     </AppContext>,
     { width: options.width ?? 80, height: options.height ?? 24 },
   );
-  await testSetup.renderOnce();
+  await tui.setup().renderOnce();
   return { actions, registry };
 }
 
@@ -225,9 +218,9 @@ describe("Shell", () => {
       ? { tickerDetailComponent: EdgeValues }
       : { portfolioListComponent: EdgeValues });
     await renderShell(createShellStateWithLayout(config, layout, floating ? detail.instanceId : main.instanceId), { registry });
-    await testSetup!.renderOnce();
+    await tui.setup().renderOnce();
     expect(contentWidth).toBe((floating ? 50 : 80) - 2);
-    expect(testSetup!.captureCharFrame()).toContain(`49.6%${".".repeat(contentWidth - 10)}-8.5%`);
+    expect(tui.frame()).toContain(`49.6%${".".repeat(contentWidth - 10)}-8.5%`);
   });
 
   test("uses the desktop titlebar overlay height for shell chrome math", () => {
@@ -304,6 +297,96 @@ describe("Shell", () => {
     expect(frame).not.toContain("Layout Actions");
   });
 
+  test("offers Move to New Layout with its shortcut for docked and floating panes, not for a layout's only pane", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-new-layout-menu-test");
+    const mainPane = requireLayoutInstance(config, "portfolio-list:main");
+    const detailPane = requireLayoutInstance(config, "ticker-detail:main");
+    const docked: LayoutConfig = {
+      dockRoot: {
+        kind: "split",
+        axis: "horizontal",
+        ratio: 0.5,
+        first: { kind: "pane", instanceId: mainPane.instanceId },
+        second: { kind: "pane", instanceId: detailPane.instanceId },
+      },
+      instances: [{ ...mainPane }, { ...detailPane }],
+      floating: [],
+      detached: [],
+    };
+    await renderShell(createShellStateWithLayout(config, docked, mainPane.instanceId), { width: 100, height: 30 });
+    let frame = await openPaneMenu();
+    expect(frame).toMatch(/Move to New Layout +Ctrl\+Shift\+N/);
+
+    await renderShell(
+      createShellStateWithLayout(config, floatingOverDockLayout(config, [{ instanceId: "ticker-detail:main", x: 0, y: 0 }]), "ticker-detail:main"),
+      { width: 100, height: 30 },
+    );
+    frame = await openPaneMenu();
+    expect(frame).toContain("Dock Pane");
+    expect(frame).toContain("Move to New Layout");
+
+    await renderShell(createShellStateWithLayout(config, singleDockedPaneLayout(config)), { width: 60, height: 30 });
+    frame = await openPaneMenu();
+    expect(frame).toContain("Float Pane");
+    expect(frame).not.toContain("Move to New Layout");
+  });
+
+  test("the new layout shortcut moves the focused pane to a layout of its own and back", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-new-layout-shortcut-test");
+    const mainPane = requireLayoutInstance(config, "portfolio-list:main");
+    const detailPane = requireLayoutInstance(config, "ticker-detail:main");
+    const docked: LayoutConfig = {
+      dockRoot: {
+        kind: "split",
+        axis: "horizontal",
+        ratio: 0.4,
+        first: { kind: "pane", instanceId: mainPane.instanceId },
+        second: { kind: "pane", instanceId: detailPane.instanceId },
+      },
+      instances: [{ ...mainPane }, { ...detailPane }],
+      floating: [],
+      detached: [],
+    };
+    const notices: string[] = [];
+    // Local state that only survives if the pane is moved rather than mounted again.
+    let mounts = 0;
+    const PortfolioBody = () => {
+      const [mount] = useState(() => ++mounts);
+      return <text>{`Portfolio Body ${mount}`}</text>;
+    };
+    const registry = createShellPluginRegistry({ portfolioListComponent: PortfolioBody });
+    registry.notify = (notification) => { notices.push(notification.body); };
+    const controls: {
+      dispatch?: (action: ShellTestAction) => void;
+      state?: ReturnType<typeof createInitialState>;
+      transientLayout: TransientLayoutState | null;
+    } = { transientLayout: null };
+    await tui.render(
+      <ShellTransientHarness
+        initialState={createShellStateWithLayout(config, docked, mainPane.instanceId)}
+        registry={registry}
+        controls={controls}
+      />,
+      { width: 100, height: 18 },
+    );
+
+    await emitKeypress({ name: "n", ctrl: true, shift: true });
+    expect(controls.state?.config.layouts.map((entry) => entry.name)).toEqual(["Default", "Main Portfolio"]);
+    expect(controls.state?.config.layout.dockRoot).toEqual({ kind: "pane", instanceId: mainPane.instanceId });
+    expect(tui.frame()).not.toContain("Ticker Research Body");
+    expect(tui.frame()).toContain("Portfolio Body 1");
+    expect(notices).toEqual(["Moved to a layout of its own. Ctrl+Shift+N moves it back."]);
+
+    await emitKeypress({ name: "n", ctrl: true, shift: true });
+    expect(controls.state?.config.layouts.map((entry) => entry.name)).toEqual(["Default"]);
+    expect(controls.state?.config.layout.dockRoot).toEqual(docked.dockRoot);
+    await act(async () => {
+      await tui.setup().renderOnce();
+    });
+    expect(tui.frame()).toContain("Ticker Research Body");
+    expect(mounts).toBe(1);
+  });
+
   test("resolves pane management shortcuts", () => {
     const base = { ctrl: false, meta: true, super: true, shift: true, alt: false };
     expect(resolvePaneManagementShortcut({ ...base, name: ",", key: ",", shift: false })).toBe("settings");
@@ -319,7 +402,8 @@ describe("Shell", () => {
     expect(resolvePaneManagementShortcut({ ...base, name: "g", key: "g" })).toBe("gridlock-all");
     expect(resolvePaneManagementShortcut({ ...base, name: "m", key: "m" })).toBe("window-mode");
     expect(resolvePaneManagementShortcut({ ...base, name: "r", key: "r" })).toBe("window-resize-mode");
-    expect(resolvePaneManagementShortcut({ ...base, name: "n", key: "n" })).toBeNull();
+    expect(resolvePaneManagementShortcut({ ...base, name: "n", key: "n" })).toBe("new-layout");
+    expect(resolvePaneManagementShortcut({ ...base, name: "j", key: "j" })).toBeNull();
     expect(resolvePaneManagementShortcut({ ...base, name: "d", key: "d", alt: true })).toBeNull();
     expect(resolvePaneManagementShortcut({ ...base, name: "d", key: "d", meta: false, super: false })).toBeNull();
   });
@@ -366,22 +450,63 @@ describe("Shell", () => {
       { width: 80, height: 18 },
     );
 
-    expect(testSetup.captureCharFrame()).toContain("Main Portfolio");
-    expect(testSetup.captureCharFrame()).toContain("Ticker Research Body");
+    expect(tui.frame()).toContain("Main Portfolio");
+    expect(tui.frame()).toContain("Ticker Research Body");
 
     await emitKeypress({ name: "f", ctrl: true, shift: true });
-    let frame = testSetup.captureCharFrame();
+    let frame = tui.frame();
     expect(frame).toContain("Main Portfolio");
     expect(frame).not.toContain("Ticker Research Body");
     expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
 
     await emitKeypress({ name: "f", ctrl: true, shift: true });
     await act(async () => {
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
-    frame = testSetup.captureCharFrame();
+    frame = tui.frame();
     expect(frame).toContain("Main Portfolio");
     expect(frame).toContain("Ticker Research Body");
+    expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
+  });
+
+  test("the fullscreen corner restores the layout and leaves the pane open", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-fullscreen-restore-test");
+    const mainPane = requireLayoutInstance(config, "portfolio-list:main");
+    const detailPane = requireLayoutInstance(config, "ticker-detail:main");
+    const layout = cloneLayout(config.layout);
+    layout.dockRoot = { kind: "pane", instanceId: "portfolio-list:main" };
+    layout.instances = [{ ...mainPane }, { ...detailPane }];
+    layout.floating = [{ instanceId: "ticker-detail:main", x: 8, y: 2, width: 32, height: 10, zIndex: 75 }];
+    const { actions } = await renderShell(
+      createShellStateWithLayout(config, layout, "ticker-detail:main"),
+      { width: 80, height: 18 },
+    );
+
+    await emitKeypress({ name: "f", ctrl: true, shift: true });
+    await act(async () => {
+      await tui.setup().renderOnce();
+    });
+    const frame = tui.frame();
+    const rows = frame.split("\n");
+    const headerRow = rows.findIndex((row) => row.includes(" - "));
+    expect(headerRow).toBeGreaterThanOrEqual(0);
+    expect(rows[headerRow]).not.toContain(" x ");
+    expect(frame).toContain("Ticker Research Body");
+    expect(frame).not.toContain("Portfolio Body");
+
+    await act(async () => {
+      await tui.setup().mockMouse.click(rows[headerRow]!.indexOf(" - ") + 1, headerRow + 1);
+    });
+    // The mouse handler's state update lands on the next turn.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await tui.setup().renderOnce();
+    });
+
+    const restored = tui.frame();
+    expect(restored).toContain("Portfolio Body");
+    expect(restored).toContain("Ticker Research Body");
+    expect(restored).not.toContain(" - ");
     expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
   });
 
@@ -426,43 +551,58 @@ describe("Shell", () => {
 
     await emitKeypress({ name: "f", ctrl: true, shift: true });
     await act(async () => {
-      await testSetup!.mockMouse.drag(4, 0, 32, 4);
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().mockMouse.drag(4, 0, 32, 4);
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
     });
 
-    const frame = testSetup.captureCharFrame();
+    const frame = tui.frame();
     expect(frame).toContain("Main Portfolio");
     expect(frame).not.toContain("Ticker Research Body");
     expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
   });
 
-  test("updates the floating pane preview before mouse release", async () => {
+  test("moves the floating pane with the pointer without redrawing the layout behind it", async () => {
     const config = createDefaultConfig("/tmp/gloomberb-shell-live-floating-drag-test");
     const floatingLayout = cloneLayout(config.layout);
     floatingLayout.dockRoot = { kind: "pane", instanceId: "portfolio-list:main" };
     floatingLayout.floating = [{ instanceId: "ticker-detail:main", x: 8, y: 2, width: 32, height: 10, zIndex: 75 }];
+    // Every pane's chrome reads its quick settings when it renders.
+    const chromeRenders: string[] = [];
+    const registry = createShellPluginRegistry();
+    (registry as { resolvePaneQuickSettings?: (paneId: string) => [] }).resolvePaneQuickSettings = (paneId) => {
+      chromeRenders.push(paneId);
+      return [];
+    };
     await renderShell(
       createShellStateWithLayout(config, floatingLayout, "ticker-detail:main"),
-      { width: 80, height: 18 },
+      { registry, width: 80, height: 18 },
     );
 
     await act(async () => {
-      await testSetup!.mockMouse.pressDown(10, 3);
-      await testSetup!.renderOnce();
-      await testSetup!.mockMouse.moveTo(16, 6);
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().mockMouse.pressDown(10, 3);
+      await tui.setup().renderOnce();
+    });
+    chromeRenders.length = 0;
+    await act(async () => {
+      for (const [x, y] of [[12, 4], [14, 5], [16, 6]] as const) {
+        await tui.setup().mockMouse.moveTo(x, y);
+        await tui.setup().renderOnce();
+      }
+      await tui.setup().renderOnce();
     });
 
-    const frame = testSetup!.captureCharFrame();
+    const frame = tui.frame();
     const rows = frame.split("\n");
     expect(rows[2]?.indexOf(":: Main Portfolio") ?? -1).toBeLessThan(0);
     expect(rows[5]?.indexOf(":: Main Portfolio")).toBeGreaterThanOrEqual(14);
+    // A move redraws the dragged pane only: re-rendering every pane per
+    // pointer move is what made drags lag behind the pointer.
+    expect(chromeRenders).not.toContain("portfolio-list:main");
 
     await act(async () => {
-      await testSetup!.mockMouse.release(16, 6);
-      await testSetup!.renderOnce();
+      await tui.setup().mockMouse.release(16, 6);
+      await tui.setup().renderOnce();
     });
   });
 
@@ -491,9 +631,9 @@ describe("Shell", () => {
       createShellStateWithLayout(config, layout, "portfolio-list:main"),
       { registry, width: 80, height: 18 },
     );
-    await testSetup!.renderOnce();
+    await tui.setup().renderOnce();
 
-    expect(testSetup!.renderer.getCursorState().visible).toBe(true);
+    expect(tui.setup().renderer.getCursorState().visible).toBe(true);
   });
 
   test("hides the textarea cursor when a higher floating pane covers it", async () => {
@@ -521,9 +661,9 @@ describe("Shell", () => {
       createShellStateWithLayout(config, layout, "portfolio-list:main"),
       { registry, width: 80, height: 18 },
     );
-    await testSetup!.renderOnce();
+    await tui.setup().renderOnce();
 
-    expect(testSetup!.renderer.getCursorState().visible).toBe(false);
+    expect(tui.setup().renderer.getCursorState().visible).toBe(false);
   });
 
   test("keeps focused pane local detail state when maximizing a floating pane", async () => {
@@ -550,15 +690,54 @@ describe("Shell", () => {
 
     await act(async () => {
       openDetail?.();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
-    expect(testSetup.captureCharFrame()).toContain("etail State");
+    expect(tui.frame()).toContain("etail State");
 
     await emitKeypress({ name: "f", ctrl: true, shift: true });
 
-    const frame = testSetup.captureCharFrame();
+    const frame = tui.frame();
     expect(frame).toContain("etail State");
     expect(frame).not.toContain("able State");
+  });
+
+  // The focus border is drawn by the shell over the panes, from the layout's
+  // rects. In fullscreen those still hold where the pane sits when tiled or
+  // floating, and the border cut a column through the fullscreen content.
+  test.each([false, true])("draws no focus border through a fullscreen pane's content (floating=%s)", async (floating) => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-fullscreen-border-test");
+    const mainPane = requireLayoutInstance(config, "portfolio-list:main");
+    const detailPane = requireLayoutInstance(config, "ticker-detail:main");
+    const layout: LayoutConfig = floating
+      ? {
+        dockRoot: { kind: "pane", instanceId: mainPane.instanceId },
+        instances: [{ ...mainPane }, { ...detailPane }],
+        floating: [{ instanceId: detailPane.instanceId, x: 6, y: 2, width: 40, height: 10, zIndex: 50 }],
+        detached: [],
+      }
+      : {
+        dockRoot: {
+          kind: "split",
+          axis: "horizontal",
+          ratio: 0.5,
+          first: { kind: "pane", instanceId: detailPane.instanceId },
+          second: { kind: "pane", instanceId: mainPane.instanceId },
+        },
+        instances: [{ ...mainPane }, { ...detailPane }],
+        floating: [],
+        detached: [],
+      };
+    const Fill = ({ width, height }: PaneProps) => <Text>{Array.from({ length: height }, () => "#".repeat(width)).join("\n")}</Text>;
+    await renderShell(
+      createShellStateWithLayout(config, layout, detailPane.instanceId),
+      { registry: createShellPluginRegistry({ tickerDetailComponent: Fill }), width: 80, height: 18 },
+    );
+
+    await emitKeypress({ name: "f", ctrl: true, shift: true });
+
+    const filledRows = tui.frame().split("\n").filter((row) => row.includes("#"));
+    expect(filledRows.length).toBeGreaterThan(10);
+    expect(filledRows.filter((row) => !row.includes("#".repeat(80 - 2)))).toEqual([]);
   });
 
   test("allows pane fullscreen shortcut while text input is captured on desktop", async () => {
@@ -593,7 +772,7 @@ describe("Shell", () => {
       targetEditable: true,
     } as any);
 
-    const frame = testSetup.captureCharFrame();
+    const frame = tui.frame();
     expect(frame).toContain("Main Portfolio");
     expect(frame).not.toContain("Ticker Research Body");
     expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
@@ -640,15 +819,15 @@ describe("Shell", () => {
       transientLayout: TransientLayoutState | null;
     } = { transientLayout: null };
 
-    testSetup = await testRender(
+    await tui.render(
       <ShellTransientHarness initialState={initialState} registry={registry} controls={controls} />,
       { width: 100, height: 18 },
     );
 
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
     await emitKeypress({ name: "f", ctrl: true, shift: true });
 
-    let frame = testSetup.captureCharFrame();
+    let frame = tui.frame();
     expect(frame).toContain("Main Portfolio");
     expect(frame).not.toContain("Ticker Research Body");
     expect(controls.transientLayout).toMatchObject({
@@ -659,8 +838,8 @@ describe("Shell", () => {
     await act(async () => {
       controls.transientLayout?.onDeactivate?.();
       controls.dispatch?.({ type: "SWITCH_LAYOUT", index: 1 });
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
     });
 
     expect(controls.transientLayout).toMatchObject({
@@ -670,10 +849,10 @@ describe("Shell", () => {
 
     await act(async () => {
       controls.transientLayout?.onActivate?.();
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
     });
 
     expect(controls.transientLayout).toMatchObject({
@@ -733,7 +912,7 @@ describe("Shell", () => {
       transientLayout: TransientLayoutState | null;
     } = { transientLayout: null };
 
-    testSetup = await testRender(
+    await tui.render(
       <ShellTransientHarness
         initialState={createInitialState(config)}
         registry={registry}
@@ -742,17 +921,17 @@ describe("Shell", () => {
       { width: 100, height: 18 },
     );
 
-    await testSetup.renderOnce();
-    expect(testSetup.captureCharFrame()).toContain("icker:MSTR");
+    await tui.setup().renderOnce();
+    expect(tui.frame()).toContain("icker:MSTR");
 
     await emitKeypress({ name: "f", ctrl: true, shift: true });
-    expect(testSetup.captureCharFrame()).toContain("icker:MSTR");
+    expect(tui.frame()).toContain("icker:MSTR");
 
     await act(async () => {
       controls.transientLayout?.onDeactivate?.();
       controls.dispatch?.({ type: "SWITCH_LAYOUT", index: 1 });
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
     });
     expect(controls.transientLayout).toMatchObject({
       id: "pane-focus",
@@ -764,10 +943,10 @@ describe("Shell", () => {
 
     await act(async () => {
       controls.transientLayout?.onActivate?.();
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
     });
 
     expect(controls.transientLayout).toMatchObject({
@@ -800,13 +979,13 @@ describe("Shell", () => {
     );
 
     await emitKeypress({ name: "m", ctrl: true, shift: true });
-    expect(testSetup.captureCharFrame()).toContain("WINDOW MOVE");
+    expect(tui.frame()).toContain("WINDOW MOVE");
 
     await emitKeypress({ name: "enter" });
     await act(async () => {
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
-    expect(testSetup.captureCharFrame()).not.toContain("WINDOW MOVE");
+    expect(tui.frame()).not.toContain("WINDOW MOVE");
     expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
   });
 
@@ -831,13 +1010,13 @@ describe("Shell", () => {
     );
 
     await emitKeypress({ name: "r", ctrl: true, shift: true });
-    expect(testSetup.captureCharFrame()).toContain("WINDOW RESIZE");
+    expect(tui.frame()).toContain("WINDOW RESIZE");
 
     await emitKeypress({ name: "enter" });
     await act(async () => {
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
-    const frame = testSetup.captureCharFrame();
+    const frame = tui.frame();
     expect(frame).not.toContain("WINDOW RESIZE");
     expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
   });
@@ -856,10 +1035,10 @@ describe("Shell", () => {
     await emitKeypress({ name: "right" });
     await emitKeypress({ name: "enter" });
     await act(async () => {
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
 
-    expect(testSetup.captureCharFrame()).toContain("Committed");
+    expect(tui.frame()).toContain("Committed");
     const updateLayout = findUpdateLayout(actions);
     expect(actions.filter((action) => action.type === "PUSH_LAYOUT_HISTORY")).toHaveLength(1);
     expect(updateLayout?.layout.floating.find((entry: any) => entry.instanceId === "ticker-detail:main")).toEqual(expect.objectContaining({
@@ -884,7 +1063,7 @@ describe("Shell", () => {
     await emitKeypress({ name: "right" });
     await emitKeypress({ name: "enter" });
 
-    expect(testSetup.captureCharFrame()).toContain("WINDOW MOVE");
+    expect(tui.frame()).toContain("WINDOW MOVE");
 
     await emitKeypress({ name: "tab" });
     await emitKeypress({ name: "right" });
@@ -943,7 +1122,7 @@ describe("Shell", () => {
     );
 
     await emitKeypress({ name: "m", ctrl: true, shift: true });
-    expect(testSetup.captureCharFrame()).toContain("d float");
+    expect(tui.frame()).toContain("d float");
 
     await emitKeypress({ name: "d" });
     await emitKeypress({ name: "enter" });
@@ -979,10 +1158,10 @@ describe("Shell", () => {
 
     await emitKeypress({ name: "m", ctrl: true, shift: true });
     await emitKeypress({ name: "right" });
-    await testSetup.renderOnce();
+    await tui.setup().renderOnce();
 
     expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
-    expect(testSetup.captureCharFrame()).toContain("-> MSFT right");
+    expect(tui.frame()).toContain("-> MSFT right");
 
     await emitKeypress({ name: "enter" });
 
@@ -1025,12 +1204,12 @@ describe("Shell", () => {
       );
 
       await act(async () => {
-        registry.openWindowModeFn("portfolio-list:main", "move");
-        await testSetup!.renderOnce();
-        await testSetup!.renderOnce();
+        registry.openWindowMode("portfolio-list:main", "move");
+        await tui.setup().renderOnce();
+        await tui.setup().renderOnce();
       });
 
-      const frame = testSetup.captureCharFrame();
+      const frame = tui.frame();
       expect(frame).toContain("WINDOW MOVE");
       expect(frame).toContain("WINDOW MOVE · Main Portfolio");
       expect(frame).toContain("Tab window");
@@ -1047,8 +1226,8 @@ describe("Shell", () => {
     );
 
     await act(async () => {
-      testSetup!.mockInput.pressKey("w", { ctrl: true });
-      await testSetup!.renderOnce();
+      tui.setup().mockInput.pressKey("w", { ctrl: true });
+      await tui.setup().renderOnce();
     });
 
     const updateLayout = actions.find((action) => action.type === "UPDATE_LAYOUT");
@@ -1086,8 +1265,8 @@ describe("Shell", () => {
     );
 
     await act(async () => {
-      testSetup!.mockInput.pressKey("w", { ctrl: true });
-      await testSetup!.renderOnce();
+      tui.setup().mockInput.pressKey("w", { ctrl: true });
+      await tui.setup().renderOnce();
     });
 
     const updateLayout = actions.find((action) => action.type === "UPDATE_LAYOUT");

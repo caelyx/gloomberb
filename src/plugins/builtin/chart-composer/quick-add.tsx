@@ -9,7 +9,6 @@ import {
 } from "../../../ui";
 import { InlineQuickAddRow, ListView, MenuPopover, type ListViewItem } from "../../../components/ui";
 import { usePaneMenuItems } from "../../../components";
-import { getNativeSurfaceManager } from "../../../components/chart/native/surface/manager";
 import { getRenderableCellRect } from "../../../components/chart/native/surface/visibility";
 import { useShortcut } from "../../../react/input";
 import { isPlainKey } from "../../../utils/keyboard";
@@ -19,7 +18,7 @@ import { colors } from "../../../theme/colors";
 import type { ChartSpec } from "../../../time-series/types";
 import { getSharedRegistry } from "../../registry";
 import { MAX_CHART_COMPOSER_SERIES } from "./chart-spec";
-import { appendChartSeries } from "./presets";
+import { appendChartSeries } from "./chart-spec-edit";
 import type { SeriesCatalogInstrument, SeriesCatalogSuggestion } from "./series-catalog";
 import { useSeriesCatalogSuggestions } from "./use-series-catalog";
 import { clampIndex } from "../../../utils/math";
@@ -42,7 +41,7 @@ interface ClosestElementLike {
  * only reaches the element it still owns. A no-op unless this widget truly holds
  * the document focus, so a click inside a dialog leaves that dialog alone.
  */
-export function releaseQuickAddFocus(quickAddId: string): void {
+function releaseQuickAddFocus(quickAddId: string): void {
   const active = (globalThis as {
     document?: { activeElement?: { blur?: () => void } | null };
   }).document?.activeElement;
@@ -66,8 +65,8 @@ function defaultCatalogInstrument(spec: ChartSpec): SeriesCatalogInstrument {
   const instrument = security?.source.kind === "security" ? security.source.instrument : undefined;
   const symbol = instrument?.symbol ?? "AAPL";
   const registry = getSharedRegistry();
-  const saved = typeof registry?.getTickerFn === "function"
-    ? registry.getTickerFn(symbol)
+  const saved = typeof registry?.getTicker === "function"
+    ? registry.getTicker(symbol)
     : undefined;
   return {
     symbol,
@@ -144,13 +143,12 @@ export function ChartSeriesQuickAdd({
   const drawerHeight = active
     ? Math.min(maximumDrawerHeight, drawerStatus ? 1 : suggestions.length)
     : 0;
-  const nativeSurfaceManager = useMemo(
-    () => getNativeSurfaceManager(nativeRenderer),
-    [nativeRenderer],
-  );
+  const nativeSurfaceManager = nativeRenderer.nativeSurfaceManager;
   useAppInputCapture(inputFocused && focused);
 
   useEffect(() => {
+    // Only terminal hosts draw kitty images the drawer has to cut out.
+    if (!nativeSurfaceManager) return;
     const occluderId = `${quickAddId}:drawer`;
     if (domRenderer || drawerHeight <= 0 || !paneId || !drawerRef.current) {
       nativeSurfaceManager.removeLocalOccluder(occluderId);

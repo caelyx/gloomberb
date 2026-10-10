@@ -1,24 +1,46 @@
-import { Box, Text } from "../../../../ui";
+import { useRef } from "react";
+import { Box, Text, useUiCapabilities, type BoxRenderable } from "../../../../ui";
 import { t } from "../../../../i18n";
+import { displayWidth } from "../../../../utils/format";
+import { chatAuthorName, isDiscordGhost } from "../ghost-user";
 import { Button } from "../../../../components/ui";
 import { MESSAGE_ACTION_WIDTH } from "../layout";
 import type { ChatMessageRenderState } from "./render-state";
 import type { ChatMessageBaseProps } from "./types";
 
-type ChatMessageActionProps = Pick<ChatMessageBaseProps, "index" | "beginReplyTo" | "beginEditMessage"> & {
+type ChatMessageActionProps = Pick<ChatMessageBaseProps, "index" | "beginReplyTo" | "beginEditMessage" | "retryMessage"> & {
   state: ChatMessageRenderState;
 };
 
-/** Reply and Edit for one message: after the header, or floated over the first body line of a grouped message. */
+/** Reply and Edit for one message, or Retry for a failed send: after the header, or floated over the first body line of a grouped message. */
 export function ChatMessageActions({
   state,
   index,
   floating = false,
   beginReplyTo,
   beginEditMessage,
+  retryMessage,
 }: ChatMessageActionProps & { floating?: boolean }) {
-  if (!state.showReplyAction) return null;
   const variant = state.isSelected ? "primary" : "secondary";
+  if (state.showRetryAction && retryMessage) {
+    return (
+      <Box
+        {...(floating ? { position: "absolute", top: 0, right: 0 } : {})}
+        width={MESSAGE_ACTION_WIDTH}
+        height={1}
+        flexDirection="row"
+        data-gloom-role="chat-message-retry-action"
+      >
+        <Button stopPropagation
+          label={t("Retry")}
+          width={MESSAGE_ACTION_WIDTH}
+          variant={variant}
+          onPress={() => retryMessage(index)}
+        />
+      </Box>
+    );
+  }
+  if (!state.showReplyAction) return null;
   return (
     <Box
       {...(floating ? { position: "absolute", top: 0, right: 0 } : {})}
@@ -53,30 +75,52 @@ export function ChatMessageHeader({
   fitAuthorWidth = false,
   onUserHover,
   onUserHoverEnd,
+  onUserActivate,
+  onUserContextMenu,
   ...actionProps
-}: ChatMessageActionProps & Pick<ChatMessageBaseProps, "msg" | "onUserHover" | "onUserHoverEnd"> & {
+}: ChatMessageActionProps & Pick<ChatMessageBaseProps, "msg" | "onUserHover" | "onUserHoverEnd" | "onUserActivate" | "onUserContextMenu"> & {
   /** Host row props: width, background and hover or selection hooks. */
   rowProps: Record<string, unknown>;
   /** The terminal sizes the author cell to its label. */
   fitAuthorWidth?: boolean;
 }) {
-  const authorLabel = msg.user.username ?? "anon";
+  const authorLabel = chatAuthorName(msg.user);
+  // A Discord ghost has no Gloom profile to open and no one to message.
+  const hasProfile = !isDiscordGhost(msg.user);
+  const { nativeContextMenu } = useUiCapabilities();
+  // The card opens beside the name the pointer is on.
+  const nameRef = useRef<BoxRenderable | null>(null);
   return (
     <Box {...rowProps} flexDirection="row" height={1} paddingLeft={1}>
       <Box
-        width={fitAuthorWidth ? authorLabel.length : undefined}
+        ref={nameRef}
+        width={fitAuthorWidth ? displayWidth(authorLabel) : undefined}
         height={1}
-        onMouseOver={() => onUserHover(msg.user)}
-        onMouseMove={() => onUserHover(msg.user)}
-        onMouseOut={onUserHoverEnd}
-        style={{ cursor: "pointer" }}
+        {...(hasProfile
+          ? {
+            onMouseOver: () => onUserHover(msg.user, nameRef.current),
+            onMouseMove: () => onUserHover(msg.user, nameRef.current),
+            onMouseOut: onUserHoverEnd,
+            "data-gloom-context-menu-surface": "true",
+            onMouseDown: (event: { button?: number; preventDefault?: () => void; stopPropagation?: () => void }) => {
+              event.preventDefault?.();
+              event.stopPropagation?.();
+              // A native menu opens on the right-click's contextmenu event instead.
+              if (event.button === 2 && nativeContextMenu === true) return;
+              onUserActivate?.(msg.user, nameRef.current);
+            },
+            onContextMenu: (event: { preventDefault?: () => void; stopPropagation?: () => void }) => onUserContextMenu?.(msg.user, event, nameRef.current),
+            style: { cursor: "pointer" },
+          }
+          : {})}
       >
         <Text fg={state.authorColor} attributes={state.authorAttributes}>
           {authorLabel}
         </Text>
       </Box>
+      {msg.origin === "discord" && <Text fg={state.originTagColor}> Discord</Text>}
       <Text fg={state.headerStatusColor}> {state.headerStatus}</Text>
-      {state.showReplyAction && <Text fg={state.headerStatusColor}> </Text>}
+      {(state.showReplyAction || (state.showRetryAction && actionProps.retryMessage)) && <Text fg={state.headerStatusColor}> </Text>}
       <ChatMessageActions state={state} {...actionProps} />
     </Box>
   );

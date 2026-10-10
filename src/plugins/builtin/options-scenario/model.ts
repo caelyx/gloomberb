@@ -1,9 +1,9 @@
-import { daysToExpiryFrom, valueOption, type OptionValuation } from "../options-calculator/model";
+import { daysToExpiryFrom, valueOption, type OptionValuation } from "../shared/volatility";
 import { isFiniteNumber } from "../../../utils/guards";
 
 const DAY_MS = 86_400_000;
 const MAX_DATE_MS = Date.UTC(9999, 11, 31);
-export const MAX_SCENARIO_LEGS = 32;
+const MAX_SCENARIO_LEGS = 32;
 
 export interface ScenarioLeg {
   id: string;
@@ -17,6 +17,8 @@ export interface ScenarioLeg {
   price: number;
   /** Decimal annualized volatility. */
   volatility: number;
+  /** "mid" when the IV was solved from the quote midpoint rather than taken from the provider. */
+  volatilitySource?: "mid";
   multiplier: number;
 }
 
@@ -53,14 +55,14 @@ export interface ScenarioExpiryRisk {
   reason: string | null;
 }
 
-export interface ScenarioGridRow {
+interface ScenarioGridRow {
   spot: number;
   move: number | null;
   values: number[];
   /** A strike or terminal breakeven inserted between the even steps. */
   landmark?: "strike" | "breakeven";
 }
-export const SCENARIO_GRID_STEPS = 20;
+const SCENARIO_GRID_STEPS = 20;
 
 export interface ScenarioModel {
   position: ScenarioPosition;
@@ -182,9 +184,9 @@ function aggregate(prepared: PreparedPosition, spot: number, date: number, volSh
   const result: ScenarioValuation = { price: 0, pnl: 0, delta: 0, gamma: 0, thetaPerDay: 0,
     vegaPerPoint: 0, rhoPerPoint: 0 };
   for (const [index, leg] of position.legs.entries()) {
-    const value = valueOption({ symbol: position.symbol, side: leg.side, spot, strike: leg.strike,
+    const value = valueOption({ side: leg.side, spot, strike: leg.strike,
       daysToExpiry: Math.max(0, (closes[index]! - date) / DAY_MS), rate: position.rate,
-      dividendYield: position.dividendYield, volatility: Math.max(0, leg.volatility + volShift), marketPrice: 0 });
+      dividendYield: position.dividendYield, volatility: Math.max(0, leg.volatility + volShift) });
     const units = leg.quantity * leg.multiplier;
     for (const key of ["price", "delta", "gamma", "thetaPerDay", "vegaPerPoint", "rhoPerPoint"] as const) {
       result[key] += value[key] * units;

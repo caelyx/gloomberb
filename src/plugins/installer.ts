@@ -4,7 +4,8 @@ import { execFile as execFileCallback, execFileSync, spawn } from "child_process
 import { promisify } from "util";
 import { findAbsorbedPlugin, type AbsorbedPlugin } from "./absorbed";
 import type { PluginPin } from "./builtin/plugin-marketplace/store";
-import { linkHostPackages } from "./host-link";
+import { bunCommand } from "./dependencies";
+import { linkHostPackages, missingPeerPlugins } from "./host-link";
 import {
   findAbsorbedCheckout,
   getPluginsDir,
@@ -13,6 +14,7 @@ import {
   readPluginCommit,
   resolvePluginEntry,
 } from "./loader";
+import { pluginDirectoryNames } from "./plugin-names";
 import { pluginFromModule } from "./plugin-export";
 import type { GloomPlugin } from "../types/plugin";
 import { cliStyles } from "../utils/cli-output";
@@ -93,6 +95,8 @@ export interface PluginDirectoryInfo {
   path: string;
   commit: string | null;
   plugin: Pick<GloomPlugin, "id" | "name" | "version"> | null;
+  /** Sibling plugins installed along with it, by folder, each before the plugin that imports it. */
+  peers?: string[];
 }
 
 class GitError extends Error {
@@ -241,7 +245,10 @@ async function installDependencies(targetDir: string, quiet: boolean): Promise<v
   // symlinked in instead, and pulling a second full copy here would both
   // waste a lot of disk and risk a duplicate React.
   const output = quiet ? "pipe" : "inherit";
-  const result = await run("bun", ["install", "--production"], targetDir, { stdout: output, stderr: output }).catch(() => null);
+  const bun = bunCommand();
+  const result = bun
+    ? await run(bun.command, ["install", "--production"], targetDir, { stdout: output, stderr: output }, bun.env).catch(() => null)
+    : null;
   if (result?.code !== 0 && !quiet) console.error(cliStyles.warning("Warning: failed to install plugin dependencies."));
 
   // After `bun install`, which prunes links it does not know about.
@@ -253,6 +260,10 @@ async function installDependencies(targetDir: string, quiet: boolean): Promise<v
 }
 
 async function readPluginExport(targetDir: string): Promise<Pick<GloomPlugin, "id" | "name" | "version"> | null> {
+  // Not before the sibling plugins it imports are installed: the import
+  // would fail, and Bun keeps that failure for the life of the process, so
+  // loading the plugin once the sibling is there would fail the same way.
+  if (missingPeerPlugins(targetDir).length > 0) return null;
   const entryFile = await resolvePluginEntry(targetDir);
   if (!entryFile) return null;
   // Fresh so an update is validated against the new code, not the module Bun
@@ -317,6 +328,19 @@ export async function installPlugin(ref: string, options: PluginInstallOptions =
 
   await installDependencies(targetDir, quiet);
 
+  const missing = missingPeerPlugins(targetDir);
+  if (missing.length > 0) {
+    say(cliStyles.muted(`Needs the ${missing.join(", ")} plugin.`));
+    return describe(targetDir, name, null);
+  }
+  return validateInstall(targetDir, name, quiet);
+}
+
+/** Reads the export of a checkout that was just installed, and says what it is. */
+async function validateInstall(targetDir: string, name: string, quiet: boolean): Promise<PluginDirectoryInfo> {
+  const say = (message: string) => {
+    if (!quiet) console.log(message);
+  };
   try {
     const plugin = await readPluginExport(targetDir);
     if (plugin) {
@@ -513,20 +537,45 @@ export async function loadRegistryListings(): Promise<Map<string, RegistryListin
 
 /**
  * Installs a plugin the way the marketplace does: a listed one at the commit
- * the registry reviewed, and not at all on a Gloomberb too old to run it.
- * An unlisted repository follows its default branch. A caller installing
- * several passes `listings` so the registry is read once.
+ * the registry reviewed (or at `options.pin`, the one the user was shown), and
+ * not at all on a Gloomberb too old to run it. An unlisted repository follows
+ * its default branch. A caller installing several passes `listings` so the
+ * registry is read once.
  */
 export async function installListedPlugin(
   ref: string,
-  options: Omit<PluginInstallOptions, "pin"> = {},
+  options: PluginInstallOptions = {},
   listings?: ReadonlyMap<string, RegistryListing>,
 ): Promise<PluginDirectoryInfo> {
+  const { pin, ...shared } = options;
   const repo = parseGitHubRef(ref).repo.toLowerCase();
-  const listing = (listings ?? await loadRegistryListings()).get(repo);
+  const known = listings ?? await loadRegistryListings();
+  const listing = known.get(repo);
   const required = requiredGloomberb(listing?.minGloomberb);
   if (required) fail(`${ref} needs Gloomberb ${required}, this is ${VERSION}.`, "Update Gloomberb first.");
-  return installPlugin(ref, { ...options, ...(listing?.pin ? { pin: listing.pin } : {}) });
+  const reviewed = pin ?? listing?.pin;
+  const installed = await installPlugin(ref, { ...shared, ...(reviewed ? { pin: reviewed } : {}) });
+  const missing = missingPeerPlugins(installed.path);
+  if (missing.length === 0) return installed;
+
+  // A plugin that imports a sibling plugin (IBKR Gateway imports Interactive
+  // Brokers) brings it along, from the same registry. One that cannot be
+  // installed leaves the plugin waiting for it, never imported.
+  const peers: string[] = [];
+  for (const peer of missing) {
+    const peerRepo = [...known.keys()].find((candidate) => pluginDirectoryNames(peer).includes(candidate.split("/")[1] ?? ""));
+    if (!peerRepo) continue;
+    try {
+      const added = await installListedPlugin(peerRepo, shared, known);
+      peers.push(...(added.peers ?? []), added.directory);
+    } catch (error) {
+      if (!shared.quiet) console.error(cliStyles.warning(`Could not install ${peer}: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }
+  const withPeers = peers.length > 0 ? { peers } : {};
+  if (missingPeerPlugins(installed.path).length > 0) return { ...installed, ...withPeers };
+  linkHostPackages(installed.path);
+  return { ...await validateInstall(installed.path, installed.directory, shared.quiet === true), ...withPeers };
 }
 
 /** Folder names of every installed plugin, clones and links alike. */

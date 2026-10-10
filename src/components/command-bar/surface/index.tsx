@@ -2,11 +2,12 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 import type { DataProvider } from "../../../types/data-provider";
 import type { AppTickerRepositoryPort } from "../../../core/app-service-ports";
 import type { PluginRegistry } from "../../../plugins/registry";
-import type { LayoutBounds } from "../../../plugins/pane-manager";
+import type { LayoutBounds } from "../../../layout/pane-manager";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import { buildAssistCommandInventory } from "../assist/inventory";
 import { useCommandBarAssist } from "../assist/runtime";
 import { shouldAutoAskAssist, type AssistRowHandlers } from "../assist/model";
+import { automationActive, usageTelemetryAllowed } from "../../../telemetry/usage-counts";
 
 /** Command-bar prefix of the assistant pane. */
 const ASKG_SHORTCUT_PREFIX = "ASKG";
@@ -14,12 +15,16 @@ import {
   getAvailableCommandBarSearchProviders,
   useCommandBarSearchProviders,
 } from "../routes/root/search-providers";
-import { openUrl } from "../../ui/external-link";
 import { useRouteListState } from "../routing/list-state";
 import { useCommandBarRootRuntime } from "../routes/root/runtime";
+import { createQuickLookTickerCandidates } from "../routes/ticker-search/results";
+import { useCommandSearchReport } from "../routes/root/search-report";
+import { useAppStateRef } from "../../../state/app/context";
+import { listingChoiceQuery } from "../../../tickers/search";
 import { parseRootShortcutIntent } from "../routes/root/shortcuts";
 import { useRootPluginInstallItem } from "../routes/root/plugin-install";
 import { useCommandBarThemePreview } from "../theme-preview";
+import { matchThemeOptions } from "../theme-picker";
 import { CommandBarPanel } from "../panel";
 import { useCommandBarNavigationState } from "../routing/navigation-state";
 import { useCommandBarSelectionRuntime } from "../selection-runtime";
@@ -28,6 +33,7 @@ import { useCommandBarRouteEffects } from "../routing/effects";
 import { useCommandBarEnvironment } from "./environment";
 import { useCommandBarActionRuntime } from "../action-runtime";
 import { requestKeybindingCapture } from "../../../app/keybindings";
+import { isDialogOpen } from "../../../ui/dialog-stack";
 
 interface CommandBarProps {
   dataProvider: DataProvider;
@@ -89,7 +95,9 @@ export function CommandBar({
     currentRoute,
     currentRouteRef,
     dismissCommandBar,
+    isAutomationQuery,
     lastMainBrowseRef,
+    openingQuery,
     markRootSelectionNavigated,
     popRoute,
     pushRoute,
@@ -112,6 +120,42 @@ export function CommandBar({
     restoreThemePreview,
   });
 
+  // Searches follow the Usage setting, both what the AI may keep and the
+  // report. Read from the live store: turning Usage off from the bar must
+  // count at once, not at the bar's next render (it may never render again).
+  const liveStateRef = useAppStateRef();
+  const searchLoggingAllowed = useCallback(() => usageTelemetryAllowed(liveStateRef.current.config), [liveStateRef]);
+  // Filled in below, once the assist runtime has run.
+  const searchIdForRef = useRef<(query: string) => string | undefined>(() => undefined);
+  const searchIdFor = useCallback((query: string) => searchIdForRef.current(query), []);
+  const {
+    choose: chooseSearchResult,
+    dismiss: dismissSearchReport,
+    finish: finishSearchReport,
+    runRootRow,
+    settle: settleSearchReport,
+  } = useCommandSearchReport({
+    currentRouteRef,
+    isAutomationQuery,
+    isEnabled: searchLoggingAllowed,
+    openingQuery,
+    rootQueryRef,
+    routeOpen: currentRoute !== null,
+    searchIdFor,
+  });
+  // Every close that follows something running goes through here, so the
+  // search report sends what ran rather than a dismissal. Esc, a click outside
+  // the bar and the bar's own key close without it.
+  const closeAfterRun = useCallback((options?: { revertThemePreview?: boolean }) => {
+    finishSearchReport();
+    closeAll(options);
+  }, [closeAll, finishSearchReport]);
+  // A click outside the bar, read before closing clears the route it was on.
+  const dismissOverlay = useCallback(() => {
+    dismissSearchReport();
+    closeAll();
+  }, [closeAll, dismissSearchReport]);
+
   const {
     adaptTickerSearchRouteResult,
     buildLayoutItems,
@@ -119,25 +163,19 @@ export function CommandBar({
     buildTickerSearchResultItems,
     buildWindowModeItems,
     collectionWorkflowActions,
-    confirmCurrentRoute,
     createPaneTemplateItem,
     createPluginCommandItem,
     executeCollectionCommand,
     getAvailablePaneShortcutTemplates,
     getAvailablePaneTemplates,
     getAvailablePluginCommands,
-    ensureRouteFieldFocus,
-    focusWorkflowField,
-    getWorkflowFieldStringValue,
-    getWorkflowInputRef,
     localTickerSearchResultItems,
-    moveWorkflowFocus,
+    mapTickerSearchCandidateToResultItem,
     nonShortcutPaneTemplateItems,
     openInlineConfirm,
     openModeRoute,
     openPaneTemplateWorkflow,
     openPluginCommandWorkflow,
-    openWorkflowFieldPicker,
     paneShortcutItems,
     persistLayoutChange,
     pluginCommandItems,
@@ -145,22 +183,15 @@ export function CommandBar({
     readTickerSearchCache,
     runDirectCommand,
     runSecurityDescriptionShortcut,
-    setWorkflowSelectFieldRef,
-    submitWorkflowRoute,
-    syncActiveWorkflowTextarea,
     tickerActionItems,
-    updateWorkflowValue,
-    workflowSelectFieldRefs,
-    workflowScrollRef,
     writeTickerSearchCache,
   } = useCommandBarActionRuntime({
     activeCollectionId,
     activeFinancials,
     activeTickerData,
     activeTickerSymbol,
-    closeAll,
+    closeAll: closeAfterRun,
     config: state.config,
-    currentRoute,
     dataProvider,
     dispatch,
     focusedPaneId: state.focusedPaneId,
@@ -171,18 +202,27 @@ export function CommandBar({
     quitApp,
     rootThemeBaseIdRef,
     setRootQuery,
-    setRouteStack,
     skipTickerSearchDebounceRef,
     state,
     stateRef,
     themePickerRef,
     tickerRepository,
     tickers: state.tickers,
-    updateTopRoute,
   });
 
   const getTickerSearchTickers = useCallback(() => stateRef.current.tickers, []);
   const hasPaneSettings = useCallback((paneId: string) => pluginRegistry.hasPaneSettings(paneId), [pluginRegistry]);
+  const buildRecentTickerItem = useCallback((symbol: string) => {
+    const ticker = state.tickers.get(symbol);
+    if (!ticker) return null;
+    const candidate = createQuickLookTickerCandidates([ticker])[0];
+    return candidate ? mapTickerSearchCandidateToResultItem(candidate) : null;
+  }, [mapTickerSearchCandidateToResultItem, state.tickers]);
+  const getRecentPaneTemplate = useCallback(
+    (id: string, arg?: string) => getAvailablePaneTemplates(arg ? { arg } : undefined, { includePromptableTickerTemplates: true })
+      .find((template) => template.id === id),
+    [getAvailablePaneTemplates],
+  );
 
   const rootShortcutIntent = useMemo(() => parseRootShortcutIntent({
     query: rootQuery,
@@ -191,13 +231,18 @@ export function CommandBar({
     paneTemplates: getAvailablePaneShortcutTemplates(rootQuery),
     activeTicker: activeTickerSymbol,
   }), [activeTickerSymbol, availableCommands, getAvailablePaneShortcutTemplates, getAvailablePluginCommands, rootQuery]);
+  const listingChoice = !currentRoute && rootShortcutIntent.kind === "none"
+    ? listingChoiceQuery(rootQuery)
+    : null;
 
   // Runs the typed text again once a plugin installed from the bar is in, the
-  // way a key bound to it would.
+  // way a key bound to it would. Not over a dialog opened since: the bar would
+  // sit over it without its keys, and close a form the user is filling in.
   const rerunQuery = useCallback((query: string) => {
+    if (isDialogOpen()) return;
     dispatch({ type: "SET_COMMAND_BAR", open: true, query, launch: { kind: "run-query", query } });
   }, [dispatch]);
-  const closeBar = useCallback(() => closeAll({ revertThemePreview: false }), [closeAll]);
+  const closeBar = useCallback(() => closeAfterRun({ revertThemePreview: false }), [closeAfterRun]);
   const pluginInstallItem = useRootPluginInstallItem({
     enabled: !currentRoute && rootShortcutIntent.kind === "none",
     query: rootQuery,
@@ -217,17 +262,25 @@ export function CommandBar({
   // Only the root list asks on its own, and only for text the prefix parser
   // could not claim — otherwise the user is mid-command, not mid-question.
   const assistAutoAsk = !currentRoute
+    && !listingChoice
     && planAccess.emailVerified
     && shouldAutoAskAssist({ query: rootQuery, hasShortcutIntent: rootShortcutIntent.kind !== "none" });
-  const { assistActive, assistState, askAssist, resetAssist } = useCommandBarAssist({
+  // The server keeps a question unless told not to, so the answer always
+  // goes out: false with the Usage setting off or for text remote control typed.
+  const logSearches = useCallback((query: string) => (
+    searchLoggingAllowed() && !automationActive() && !isAutomationQuery(query)
+  ), [isAutomationQuery, searchLoggingAllowed]);
+  const { assistActive, assistState, askAssist, resetAssist, searchIdFor: assistSearchIdFor } = useCommandBarAssist({
     autoAsk: assistAutoAsk,
     getInventory: buildAssistInventory,
+    logSearches,
     rootQuery,
   });
+  searchIdForRef.current = assistSearchIdFor;
   // Filled in below once the selection runtime exists, so an AI candidate runs
   // through the very same submit path as text the user typed.
   const runRootQueryRef = useRef<
-    ((query: string, options?: { fallbackPrefix?: string }) => void) | null
+    ((query: string, options?: { fallbackPrefix?: string }) => boolean) | null
   >(null);
   /**
    * Query whose answer the user is already waiting on, set by activating the
@@ -251,11 +304,21 @@ export function CommandBar({
     if (rootQueryRef.current.trim() !== pendingQuery) return;
     const candidate = assistState.candidates[0];
     if (!candidate) return;
-    runRootQueryRef.current?.(
-      candidate.input,
-      candidate.prefix ? { fallbackPrefix: candidate.prefix } : undefined,
-    );
-  }, [assistState, rootQueryRef]);
+    const run = () => {
+      runRootQueryRef.current?.(
+        candidate.input,
+        candidate.prefix ? { fallbackPrefix: candidate.prefix } : undefined,
+      );
+    };
+    // The claimed answer is the first AI row, which is what the user picked.
+    const listState = visibleListStateRef.current;
+    const rank = listState?.kind === "root"
+      ? listState.results.findIndex((item) => item.searchChoice?.kind === "assist")
+      : -1;
+    const row = rank >= 0 ? listState?.results[rank] : undefined;
+    if (row) runRootRow({ item: row, query: rootQueryRef.current, rank, isShortcut: () => false }, run);
+    else run();
+  }, [assistState, rootQueryRef, runRootRow, visibleListStateRef]);
   const startAssistSignUp = useCallback(() => {
     const signUpCommand = getAvailablePluginCommands().find((command) => command.id === "auth-signup");
     if (signUpCommand?.wizard?.length) {
@@ -296,9 +359,9 @@ export function CommandBar({
   // goes to Help > Shortcuts, which captures once the bar is gone.
   const bindKey = useCallback((query: string) => {
     requestKeybindingCapture({ kind: "command", query });
-    closeAll({ revertThemePreview: false });
+    closeAfterRun({ revertThemePreview: false });
     pluginRegistry.showPane("help");
-  }, [closeAll, pluginRegistry]);
+  }, [closeAfterRun, pluginRegistry]);
 
   const searchProviders = useMemo(
     () => getAvailableCommandBarSearchProviders(pluginRegistry, state.config.disabledPlugins),
@@ -309,14 +372,14 @@ export function CommandBar({
     activeCollectionId,
   }), [activeCollectionId, activeTickerSymbol]);
   const closeAfterProviderResult = useCallback(() => {
-    closeAll({ revertThemePreview: false });
-  }, [closeAll]);
+    closeAfterRun({ revertThemePreview: false });
+  }, [closeAfterRun]);
   const { providerResultItems, providerSearching } = useCommandBarSearchProviders({
     providers: searchProviders,
     query: rootQuery,
     // A resolved prefix means the user is running a command, so free-text
-    // providers neither ask the network nor add rows.
-    enabled: !currentRoute && rootShortcutIntent.kind === "none",
+    // providers neither ask the network nor add rows. A colon is the venue list.
+    enabled: !currentRoute && rootShortcutIntent.kind === "none" && !listingChoice,
     context: searchProviderContext,
     onExecuted: closeAfterProviderResult,
   });
@@ -344,6 +407,7 @@ export function CommandBar({
     bindKey,
     buildLayoutItems,
     buildPaneSettingItems,
+    buildRecentTickerItem,
     buildTickerSearchResultItems,
     buildWindowModeItems,
     createPaneTemplateItem,
@@ -352,6 +416,7 @@ export function CommandBar({
     dataProvider,
     executeCollectionCommand,
     getAvailablePaneShortcutTemplates,
+    getRecentPaneTemplate,
     getTickers: getTickerSearchTickers,
     hasPaneSettings,
     localTickerSearchResultItems,
@@ -381,6 +446,23 @@ export function CommandBar({
   });
   const themePickerActive = !currentRoute && activeMatch?.command.id === "theme";
   const themePickerFilter = themePickerActive ? activeMatch.arg : "";
+  // A theme picked from the root ("TH dracula", Enter) is the typed shortcut
+  // running, so the visit reports it as it closes.
+  const commitRootTheme = useCallback((themeId: string) => {
+    if (!currentRouteRef.current) {
+      const themes = matchThemeOptions(themePickerFilter);
+      const rank = themes.findIndex((theme) => theme.id === themeId);
+      chooseSearchResult(rootQueryRef.current, {
+        kind: "shortcut",
+        label: themes[rank]?.name ?? themeId,
+        input: rootQueryRef.current.trim(),
+        rank: Math.max(0, rank),
+        category: "Themes",
+        fromAssist: false,
+      });
+    }
+    commitTheme(themeId);
+  }, [chooseSearchResult, commitTheme, currentRouteRef, rootQueryRef, themePickerFilter]);
 
   const {
     acceptRootShortcutTab,
@@ -392,7 +474,7 @@ export function CommandBar({
     activeTickerSymbol,
     availableCommands,
     clearThemePreview,
-    closeAll,
+    closeAll: closeAfterRun,
     collectionWorkflowActions,
     createPaneTemplateItem,
     createPluginCommandItem,
@@ -412,37 +494,35 @@ export function CommandBar({
     rootQueryRef,
     rootThemeBaseIdRef,
     runDirectCommand,
+    runRootRow,
     runSecurityDescriptionShortcut,
     setRootQuery,
-    setRouteStack,
     stateConfigLayout: state.config.layout,
     stateRef,
     updateTopRoute,
-    updateWorkflowValue,
     visibleListStateRef,
   });
   runRootQueryRef.current = runRootQuery;
 
   // A key bound to command bar text opens the bar with a run-query launch:
   // the text is submitted exactly as if typed and entered, once per request,
-  // and text the parser cannot run stays in the input.
+  // and text the parser cannot run stays in the input. What a key runs is not
+  // a search, so the visit ends with no report.
   const processedRunQuerySequenceRef = useRef<number | null>(null);
   useEffect(() => {
     const launch = state.commandBarLaunchRequest;
     if (!launch || launch.kind !== "run-query" || !state.commandBarOpen) return;
     if (processedRunQuerySequenceRef.current === launch.sequence) return;
     processedRunQuerySequenceRef.current = launch.sequence;
-    runRootQuery(launch.query);
-  }, [runRootQuery, state.commandBarLaunchRequest, state.commandBarOpen]);
+    if (runRootQuery(launch.query)) settleSearchReport();
+  }, [runRootQuery, settleSearchReport, state.commandBarLaunchRequest, state.commandBarOpen]);
 
   const routeListState = useRouteListState({
     activeMatch,
     adaptTickerSearchRouteResult,
     buildLayoutItems,
-    buildPaneSettingItems,
     currentRoute,
     orderedRootResults,
-    pluginRegistry,
     rootCategoryPriorities: providerCategoryPriorities,
     rootHoveredIdx,
     rootModeKind: rootModeInfo.kind,
@@ -457,14 +537,11 @@ export function CommandBar({
     clearThemePreview,
     committedThemeId: state.config.theme,
     currentRoute,
-    dataProvider,
-    ensureRouteFieldFocus,
     lastMainBrowseRef,
     rootModeKind: rootModeInfo.kind,
     rootQuery,
     rootSelectedIdx,
     rootThemeBaseIdRef,
-    updateTopRoute,
   });
 
   const panelProps = useCommandBarPanelRuntime({
@@ -474,25 +551,19 @@ export function CommandBar({
     applyThemePreview,
     cellHeightPx,
     cellWidthPx,
-    closeAll,
-    commitTheme,
+    closeAll: closeAfterRun,
+    commitTheme: commitRootTheme,
     committedThemeId: state.config.theme,
-    confirmCurrentRoute,
     currentRoute,
     currentRouteRef,
     dismissCommandBar,
-    focusWorkflowField,
-    getWorkflowInputRef,
-    getWorkflowFieldStringValue,
+    dismissOverlay,
     markRootSelectionNavigated,
-    moveWorkflowFocus,
     nativeListScrollRef,
     nativePaneChrome,
     nativeWindowChrome,
     onNativeOccluderChange,
-    openWorkflowFieldPicker,
     persistConfig,
-    pluginRegistry,
     popRoute,
     resetAssist,
     rootModeKind: rootModeInfo.kind,
@@ -503,10 +574,7 @@ export function CommandBar({
     setRootHoveredIdx,
     setRootSelectedIdx,
     setRouteStack,
-    setWorkflowSelectFieldRef,
     stateRef,
-    submitWorkflowRoute,
-    syncActiveWorkflowTextarea,
     termHeight,
     termWidth,
     themePickerActive,
@@ -514,10 +582,7 @@ export function CommandBar({
     themePickerRef,
     titleBarOverlay,
     updateTopRoute,
-    updateWorkflowValue,
     visibleListStateRef,
-    workflowSelectFieldRefs,
-    workflowScrollRef,
   });
 
   return (

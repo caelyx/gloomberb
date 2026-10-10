@@ -1,5 +1,5 @@
 import type { TickerRecord } from "../types/ticker";
-import { canonicalExchange, US_LISTING_EXCHANGES } from "./exchanges";
+import { canonicalExchange, parsePublicTickerKey, US_LISTING_EXCHANGES } from "./exchanges";
 
 /** Canonical US equity venues: the listing exchanges plus other lit and OTC venues. */
 const US_EQUITY_EXCHANGES = new Set([
@@ -8,7 +8,7 @@ const US_EQUITY_EXCHANGES = new Set([
   "IEX",
   "OTC",
   "PINK",
-  // Yahoo's codes for Cboe BZX and the OTC Markets tiers.
+  // Listing codes for Cboe BZX and the OTC Markets tiers.
   "BTS",
   "PNK",
   "OQB",
@@ -33,7 +33,25 @@ function isEquityType(value?: string): boolean {
   return normalized.length === 0 || ["STK", "EQUITY", "ADR", "COMMONSTOCK", "DEPOSITARYRECEIPT"].includes(normalized);
 }
 
+const FUND_TYPES = new Set(["ETF", "ETP", "FUND", "MUTUALFUND", "CEF", "CLOSEDEND", "CLOSEDENDFUND"]);
+
+function isFundType(value?: string): boolean {
+  return FUND_TYPES.has(normalize(value).replace(/[\s_-]/g, ""));
+}
+
 export function isUsEquityTicker(ticker: TickerRecord | null | undefined): boolean {
+  return isUsListingOfType(ticker, isEquityType);
+}
+
+/** A US equity, or a US-listed fund, which files fund forms with the SEC. */
+export function isUsEquityOrFundTicker(ticker: TickerRecord | null | undefined): boolean {
+  return isUsListingOfType(ticker, (type) => isEquityType(type) || isFundType(type));
+}
+
+function isUsListingOfType(
+  ticker: TickerRecord | null | undefined,
+  acceptsType: (type?: string) => boolean,
+): boolean {
   if (!ticker) return false;
 
   const primaryContract = ticker.metadata.broker_contracts?.[0];
@@ -45,8 +63,9 @@ export function isUsEquityTicker(ticker: TickerRecord | null | undefined): boole
     ticker.metadata.exchange,
   ];
 
-  return isEquityType(type)
-    && currency === "USD"
+  // A listing saved without a known currency counts by its venue.
+  return acceptsType(type)
+    && (currency === "USD" || !currency)
     && exchangeCandidates.some((exchange) => isUsExchange(exchange));
 }
 
@@ -81,6 +100,28 @@ export function isKnownNonUsEquityTicker(ticker: TickerRecord | null | undefined
   if (!isEquityType(primaryContract?.secType ?? ticker.metadata.assetCategory)) return true;
   return [primaryContract?.primaryExchange, primaryContract?.exchange, ticker.metadata.exchange]
     .some((exchange) => normalize(exchange).length > 0);
+}
+
+/**
+ * The venue an SEC issuer lookup has to respect: a listing outside the US,
+ * whose bare symbol the SEC may know as another company (SAN is Banco
+ * Santander in New York, Sanofi in Paris). Null for a US venue, a routing
+ * destination or no venue at all, which look the symbol up as a US ticker.
+ */
+export function nonUsSecListingVenue(ticker: string, exchange?: string): string | null {
+  const venue = parsePublicTickerKey(ticker).exchange ?? canonicalExchange(exchange);
+  if (!venue || ROUTING_EXCHANGES.has(venue) || isUsExchange(venue)) return null;
+  return venue;
+}
+
+/**
+ * The key an issuer read is cached and deduplicated under: the ticker as given
+ * for a US listing or a symbol with no venue, SYMBOL:VENUE for a listing
+ * elsewhere, so SAN in Paris and SAN in New York never share an entry.
+ */
+export function secListingKey(ticker: string, exchange?: string): string {
+  const venue = nonUsSecListingVenue(ticker, exchange);
+  return venue ? `${parsePublicTickerKey(ticker).symbol}:${venue}` : normalize(ticker);
 }
 
 /**

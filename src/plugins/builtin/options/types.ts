@@ -1,6 +1,6 @@
 import type { DataTableColumn } from "../../../components";
 import type { OptionContract } from "../../../types/financials";
-import type { OptionSide, OptionValuation } from "../options-calculator/model";
+import type { OptionSide, OptionValuation } from "../shared/volatility";
 
 export type OptionFieldId =
   | "bid"
@@ -14,9 +14,10 @@ export type OptionFieldId =
   | "rho"
   | "iv"
   | "volume"
-  | "openInterest";
+  | "openInterest"
+  | "extrinsicPerYear";
 
-export type OptionColumnId = "strike" | `${OptionSide}${Capitalize<OptionFieldId>}`;
+type OptionColumnId = "strike" | `${OptionSide}${Capitalize<OptionFieldId>}`;
 
 export type OptionColumn = DataTableColumn & {
   id: OptionColumnId;
@@ -32,6 +33,9 @@ export interface OptionTableRow {
   impliedVolatility?: number;
   callGreeks?: OptionValuation;
   putGreeks?: OptionValuation;
+  /** Time value as a share of spot per year (see `carry.ts`); null when it cannot be read. */
+  callExtrinsicPerYear?: number | null;
+  putExtrinsicPerYear?: number | null;
   isPositionStrike: boolean;
 }
 

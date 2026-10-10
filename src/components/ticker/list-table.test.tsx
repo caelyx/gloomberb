@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { act, useEffect, useRef, useState, type ReactNode } from "react";
-import { emitKeypress, testRender } from "../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness } from "../../renderers/opentui/test-utils";
 import { AppContext, PaneInstanceProvider, createInitialState } from "../../state/app/context";
 import { createStaticAppStore } from "../../test-support/app-store";
 import { createDefaultConfig } from "../../types/config";
@@ -9,10 +9,10 @@ import type { TickerFinancials } from "../../types/financials";
 import type { TickerRecord } from "../../types/ticker";
 import type { ScrollBoxRenderable } from "../../ui";
 import { PaneFooterProvider, type CombinedPaneFooter } from "../layout/pane/footer";
-import { TickerListTableView, type TickerTableCell } from "./list-table-view";
+import { TickerListTableView, flashesOnQuoteTick, type TickerTableCell } from "./list-table-view";
 import { createTestTicker } from "../../test-support/ticker";
 
-let testSetup: Awaited<ReturnType<typeof testRender>> | undefined;
+const tui = createOpenTuiTestHarness();
 let setHarnessTickers: ((tickers: TickerRecord[]) => void) | null = null;
 let tableScrollRef: ScrollBoxRenderable | null = null;
 let resolveCellCallCount = 0;
@@ -132,13 +132,7 @@ function TickingTickerListTableHarness() {
   );
 }
 
-afterEach(async () => {
-  if (testSetup) {
-    await act(async () => {
-      testSetup!.renderer.destroy();
-    });
-    testSetup = undefined;
-  }
+afterEach(() => {
   resolveCellCallCount = 0;
   setHarnessTickers = null;
   setTickingFinancials = null;
@@ -147,39 +141,39 @@ afterEach(async () => {
 
 describe("TickerListTableView", () => {
   test("renders a bounded window for large ticker lists", async () => {
-    testSetup = await testRender(
+    await tui.render(
       <LargeTickerListTableHarness />,
       { width: 20, height: 6 },
     );
 
     await act(async () => {
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
 
-    const frame = testSetup.captureCharFrame();
+    const frame = tui.frame();
     expect(frame).toContain("T0");
     expect(frame).not.toContain("T999");
     expect(resolveCellCallCount).toBeLessThan(100);
 
     await act(async () => {
       for (let index = 0; index < 12; index++) {
-        await testSetup!.mockMouse.scroll(2, 2, "down");
+        await tui.setup().mockMouse.scroll(2, 2, "down");
       }
       await Promise.resolve();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
 
     const scrollTop = tableScrollRef?.scrollTop ?? 0;
     expect(scrollTop).toBeGreaterThan(0);
-    expect(testSetup.captureCharFrame()).toContain(`T${scrollTop}`);
+    expect(tui.frame()).toContain(`T${scrollTop}`);
   });
 
   test("a quote tick on one symbol redraws only that symbol's row", async () => {
-    testSetup = await testRender(<TickingTickerListTableHarness />, { width: 40, height: 24 });
+    await tui.render(<TickingTickerListTableHarness />, { width: 40, height: 24 });
     await act(async () => {
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
-    expect(testSetup.captureCharFrame()).toContain("T19");
+    expect(tui.frame()).toContain("T19");
 
     resolveCellCallCount = 0;
     await act(async () => {
@@ -187,7 +181,7 @@ describe("TickerListTableView", () => {
         ticker.metadata.ticker, tickingFinancials(ticker.metadata.ticker, 100 + index),
       ]));
       setTickingFinancials?.(next);
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
     // Every row got new records: all visible cells resolve again.
     expect(resolveCellCallCount).toBe(20 * tickingColumns.length);
@@ -195,20 +189,20 @@ describe("TickerListTableView", () => {
     resolveCellCallCount = 0;
     await act(async () => {
       setTickingFinancials?.((current: Map<string, TickerFinancials>) => new Map(current).set("T7", tickingFinancials("T7", 250)) as never);
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
     expect(resolveCellCallCount).toBe(tickingColumns.length);
   });
 
   test("preserves manual scroll when market data reorders rows around the same cursor", async () => {
-    testSetup = await testRender(
+    await tui.render(
       <ReorderingTickerListTableViewHarness />,
       { width: 20, height: 8 },
     );
 
     await act(async () => {
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
     });
 
     tableScrollRef!.scrollTop = 20;
@@ -217,8 +211,8 @@ describe("TickerListTableView", () => {
     await act(async () => {
       setHarnessTickers?.([...manyTickers.slice(1), manyTickers[0]!]);
       await Promise.resolve();
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
     });
 
     expect(tableScrollRef?.scrollTop).toBe(20);
@@ -253,16 +247,34 @@ describe("TickerListTableView", () => {
       );
     }
     const labels = () => footer!.menu.flatMap((item) => (item.type === "divider" ? [] : [item.label]));
-    testSetup = await testRender(<Harness />, { width: 20, height: 8 });
-    await act(async () => { await testSetup!.renderOnce(); });
+    await tui.render(<Harness />, { width: 20, height: 8 });
+    await act(async () => { await tui.setup().renderOnce(); });
     expect(labels()).toContain("Open T0 Ticker Research");
 
-    await emitKeypress(testSetup, { name: "j" });
-    await act(async () => { await testSetup!.renderOnce(); });
+    await tui.emitKeypress({ name: "j" });
+    await act(async () => { await tui.setup().renderOnce(); });
     expect(labels()).toContain("Open T1 Ticker Research");
     expect(labels()).not.toContain("Open T0 Ticker Research");
 
-    await act(async () => { setFocused(false); await testSetup!.renderOnce(); });
+    await act(async () => { setFocused(false); await tui.setup().renderOnce(); });
     expect(labels()).not.toContain("Open T1 Ticker Research");
+  });
+});
+
+describe("flashesOnQuoteTick", () => {
+  const quote = (overrides: Partial<TickerFinancials["quote"] & object>) => ({
+    symbol: "SPCX", currency: "USD", price: 165.39, change: -2.21, changePercent: -1.32, previousClose: 167.6,
+    marketState: "POST", postMarketPrice: 165.39, postMarketChange: 4.82, lastUpdated: Date.parse("2026-10-08T22:22:00Z"),
+    ...overrides,
+  }) as TickerFinancials["quote"];
+
+  test("after the regular close a tick leaves LAST, CHG and CHG% alone and flashes the columns that moved", () => {
+    const afterHours = quote({ regularClose: 160.57, regularCloseSessionDate: "2026-10-08" });
+    for (const id of ["price", "change", "change_pct"]) expect(flashesOnQuoteTick(id, afterHours)).toBe(false);
+    for (const id of ["ext_hours", "day_pnl", "mkt_value", "bid"]) expect(flashesOnQuoteTick(id, afterHours)).toBe(true);
+    // Before a close is known the print is the headline, so it flashes.
+    for (const open of [quote({ marketState: "REGULAR" }), quote({ marketState: "POST", postMarketChange: undefined })]) {
+      for (const id of ["price", "change", "change_pct"]) expect(flashesOnQuoteTick(id, open)).toBe(true);
+    }
   });
 });

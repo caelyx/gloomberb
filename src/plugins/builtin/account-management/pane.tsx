@@ -22,15 +22,17 @@ import {
   ScrollBox,
   Textarea,
   TextAttributes,
-  useRendererHost,
+  useUiCapabilities,
   type ScrollBoxRenderable,
   type TextareaRenderable,
 } from "../../../ui";
 import { useDialog, type AlertContext } from "../../../ui/dialog";
 import type { SelectControl } from "../../../components/ui/select-button";
+import { FRAMED_TEXTAREA_DESKTOP_STYLE } from "../../../components/ui/fields";
 import { apiClient, type AccountProfile, type CloudPricing } from "../../../api-client";
 import { chatController } from "../chat/controller";
 import { SignInWall } from "../cloud/auth-actions";
+import { loadUpgradeOffer } from "../cloud/upgrade-dialog";
 import { TeamsAccountTab } from "../cloud/team/acm-tab";
 import {
   CheckboxRow,
@@ -56,6 +58,7 @@ import {
   type AccountFieldKey,
 } from "./model";
 import { PasswordChangeDialog } from "./password-dialog";
+import { CalendarAccountTab } from "./calendar-tab";
 import { useAccountManagementFooter } from "./footer";
 import { useAccountManagementKeyboard } from "./keyboard";
 import {
@@ -73,7 +76,7 @@ import { setSyncedProfileAnalytics } from "../../../sync/profile-analytics";
 import { t, tf } from "../../../i18n";
 import { useAppLanguage } from "../../../i18n/react";
 import { subscribeRequestedAccountManagementTab, type AccountManagementTab } from "./navigation";
-import { openCloudUpgrade } from "../shared/cloud-upgrade";
+import { useCloudUpgradeAction } from "../shared/cloud-upgrade";
 import { resolvePlanAccess } from "../../../api-client/plan-access";
 import { usePluginPaneState } from "../../runtime";
 
@@ -81,6 +84,7 @@ type AccountBusy = "profile" | "password" | "alerts" | "billing" | "delete" | nu
 const ACCOUNT_TAB_DEFS: Array<{ label: string; value: AccountManagementTab }> = [
   { label: "Profile", value: "profile" },
   { label: "Emails", value: "emails" },
+  { label: "Calendar", value: "calendar" },
   { label: "Pro", value: "pro" },
   { label: "Teams", value: "teams" },
   { label: "Advanced", value: "advanced" },
@@ -105,6 +109,8 @@ const ACCOUNT_TAB_FIELD_ORDER: Record<AccountManagementTab, AccountFieldKey[]> =
     "positionAlertsEnabled",
     "emailAlertsOffAction",
   ],
+  // Its actions are footer hints; the tab owns its footer.
+  calendar: [],
   pro: ["upgradeAction"],
   // The Teams tab owns its own keyboard handling (a list, not form fields).
   teams: [],
@@ -191,7 +197,6 @@ function buildAccountSessionMarker(): string {
 export function AccountManagementPane({ focused, width, height }: PaneProps) {
   const language = useAppLanguage();
   const dialog = useDialog();
-  const renderer = useRendererHost();
   const config = usePaneAppConfig();
   const portfolios = config.portfolios;
   const baseCurrency = config.baseCurrency;
@@ -201,6 +206,8 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
   const [hasSession, setHasSession] = useState(() => apiClient.isSignedIn());
   const [profile, setProfile] = useState<AccountProfile | null>(null);
   const [pricing, setPricing] = useState<CloudPricing | null>(null);
+  // Null until the server says; only a confirmed trial is offered.
+  const [trialAvailable, setTrialAvailable] = useState<boolean | null>(null);
   const [draft, setDraft] = useState<AccountDraft>(() => profileToDraft(null));
   const [activeTab, setActiveTab] = usePluginPaneState<AccountManagementTab>("activeTab", "profile");
   const [activeField, setActiveField] = useState<AccountFieldKey>(
@@ -215,6 +222,7 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
     setActiveField(ACCOUNT_TAB_FIELD_ORDER[tab][0] ?? "username");
   }), []);
   const syncStatus = useCloudSyncStatus();
+  const { nativePaneChrome } = useUiCapabilities();
   const bioRef = useRef<TextareaRenderable | null>(null);
   const portfolioSelectRef = useRef<SelectControl | null>(null);
   const refreshedSyncRevisionRef = useRef<number | null>(null);
@@ -249,9 +257,9 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
         detail: profile?.email ?? undefined,
       },
       { id: "price", label: "Price", value: planPrice },
-      ...(planAccess.hasProAccess ? [] : [{ id: "trial", label: "Trial", value: trialOffer }]),
+      ...(!planAccess.hasProAccess && trialAvailable === true ? [{ id: "trial", label: "Trial", value: trialOffer }] : []),
     ];
-  }, [planAccess.hasProAccess, planPrice, planStatusLabel, profile?.email, trialOffer]);
+  }, [planAccess.hasProAccess, planPrice, planStatusLabel, profile?.email, trialAvailable, trialOffer]);
 
   const portfolioHoldingCounts = useMemo(() => countPortfolioHoldings(tickers), [tickers]);
   const portfolioChoices = useMemo(
@@ -463,18 +471,21 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
     void loadProfile();
   }, [loadProfile, sessionMarker]);
 
+  // Pricing is decoration (the table falls back to list prices), but whether
+  // the trial is still available belongs to the account, so both follow the session.
   useEffect(() => {
+    // Signed out, the pane is the sign-in wall.
+    if (!apiClient.isSignedIn()) return;
     let cancelled = false;
-    void apiClient.getCloudPricing()
-      .then((nextPricing) => {
-        if (!cancelled) setPricing(nextPricing);
-      })
-      // Pricing is decoration: the comparison table falls back to list prices.
-      .catch(() => {});
+    void loadUpgradeOffer().then((offer) => {
+      if (cancelled) return;
+      if (offer.pricing) setPricing(offer.pricing);
+      setTrialAvailable(offer.trialAvailable);
+    });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [sessionMarker]);
 
   useEffect(() => {
     if (!hasSession || !apiClient.isSignedIn()) return;
@@ -636,20 +647,27 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
     }
   }, []);
 
+  // Through the upgrade sheet like every other prompt, so the interval is
+  // chosen and "$0 today" is said only when it is true. The button waits only
+  // while checkout opens; a checkout that cannot be created falls back to the
+  // Cloud page.
+  const startUpgrade = useCloudUpgradeAction("acm");
   const openUpgrade = useCallback(() => {
     setActiveField("upgradeAction");
-    setBusy("billing");
-    setMessage({ tone: "info", text: t("Opening Pro upgrade...") });
-    void openCloudUpgrade(renderer)
-      .then(() => setMessage(null))
-      .catch((error) => {
-        setMessage({
-          tone: "error",
-          text: error instanceof Error ? error.message : t("Failed to open upgrade page."),
-        });
-      })
-      .finally(() => setBusy(null));
-  }, [renderer]);
+    if (busy) return;
+    let opening = false;
+    void startUpgrade({
+      onOpening: () => {
+        opening = true;
+        setBusy("billing");
+        setMessage({ tone: "info", text: t("Opening Pro upgrade...") });
+      },
+    }).finally(() => {
+      if (!opening) return;
+      setBusy(null);
+      setMessage(null);
+    });
+  }, [busy, startUpgrade]);
 
   const deleteAccount = useCallback(async () => {
     setActiveField("deleteAccountAction");
@@ -687,6 +705,8 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
 
   useAccountManagementFooter({
     busy,
+    // The Calendar tab saves nothing and shows its own status.
+    enabled: activeTab !== "calendar",
     hasSession,
     message,
     saveProfile,
@@ -699,7 +719,7 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
     draftRef,
     fieldOrder,
     // Behind the sign-in wall the fields are not there, and Enter is the wall's.
-    focused: focused && activeTab !== "teams" && (hasSession || apiClient.isSignedIn()),
+    focused: focused && activeTab !== "teams" && activeTab !== "calendar" && (hasSession || apiClient.isSignedIn()),
     openPasswordDialog,
     openPortfolioDialog: openPortfolioPicker,
     openUpgrade,
@@ -728,7 +748,7 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
   );
 
   if (!hasSession && !apiClient.isSignedIn()) {
-    return <SignInWall action="manage your Gloom Cloud account" />;
+    return <SignInWall placement="account-signin" action="manage your Gloom Cloud account" />;
   }
 
   return (
@@ -804,6 +824,7 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
                     backgroundColor={colors.panel}
                     flexGrow={1}
                     wrapText
+                    {...(nativePaneChrome ? { style: FRAMED_TEXTAREA_DESKTOP_STYLE } : {})}
                     onInput={(value: string) => setDraftValue("bio", value)}
                   />
                 </Box>
@@ -878,6 +899,10 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
                 <Button label={busy === "profile" ? t("Saving...") : t("Save")} variant="primary" onPress={() => { void saveProfile(); }} disabled={!!busy} />
               </Box>
             </>
+          ) : null}
+
+          {activeTab === "calendar" ? (
+            <CalendarAccountTab width={contentWidth} sessionMarker={sessionMarker} />
           ) : null}
 
           {activeTab === "pro" ? (

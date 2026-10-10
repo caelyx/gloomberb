@@ -240,12 +240,12 @@ export function DividendYieldPane({ focused, width, height, loadData = fetchDivi
   ), [refresh]);
 
   const emptyTitle = !symbol
-    ? "No ticker selected."
+    ? "Select a ticker."
     : loading
       ? "Loading dividends..."
       : error ?? (data?.historyAvailable ? "No cash distributions reported." : "Dividend history unavailable.");
 
-  if (authWall) return <SignInWall action="view dividend history" needsVerification={cloudSession.needsVerification} />;
+  if (authWall) return <SignInWall placement="dividend-yield-signin" action="view dividend history" needsVerification={cloudSession.needsVerification} />;
 
   return (
     <DataTableView<DividendRow, DividendColumn>

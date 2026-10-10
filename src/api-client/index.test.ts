@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { apiClient, setCloudApiFetchTransport } from "./index";
-import { publishableMarketplaceLayout } from "../layout-marketplace/payload";
+import { publishableMarketplaceLayout } from "../shares/portable-layout";
 import { createDefaultConfig } from "../types/config";
 import type { PaneDef } from "../types/plugin";
 import { GloomberbCloudProvider } from "../sources/gloomberb-cloud";
@@ -1143,6 +1143,75 @@ describe("apiClient command assist", () => {
     // A cut list would read as the whole set, so an oversized one is not sent.
     expect(curve?.arg).toEqual({ kind: "text", optional: true });
   });
+
+  test("passes the caller's log choice through, false included", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    apiClient.setSessionToken("session-token");
+    apiClient.restoreCachedUser(verifiedUser);
+    globalThis.fetch = mockFetch(async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return Response.json({ candidates: [], searchId: "search-1" });
+    });
+
+    await apiClient.assistCommand("gamestop options", []);
+    const logged = await apiClient.assistCommand("gamestop options", [], { log: true });
+    await apiClient.assistCommand("gamestop options", [], { log: false });
+
+    expect(logged.searchId).toBe("search-1");
+    // The server keeps a query unless told not to, so false must go out.
+    expect(bodies.map((body) => "log" in body ? body.log : "absent")).toEqual(["absent", true, false]);
+  });
+});
+
+describe("apiClient command search report", () => {
+  test("sends only with a session, fits the server caps, and never throws", async () => {
+    const sent: Array<{ path: string; body: Record<string, unknown> }> = [];
+    let fail = false;
+    globalThis.fetch = mockFetch(async (input, init) => {
+      if (fail) throw new Error("offline");
+      sent.push({ path: new URL(String(input)).pathname, body: JSON.parse(String(init?.body)) });
+      return new Response(null, { status: 204 });
+    });
+    const report = {
+      query: `  new\nchat   ${"pane ".repeat(60)}`,
+      outcome: "chosen" as const,
+      choice: {
+        kind: "a-kind-much-longer-than-the-server-takes",
+        label: "L".repeat(130),
+        input: "CHAT #general",
+        rank: 512,
+        category: "Ask AI",
+        fromAssist: true,
+      },
+      appVersion: "1.2.3",
+    };
+
+    apiClient.reportCommandSearch(report);
+    await Bun.sleep(0);
+    expect(sent).toEqual([]);
+
+    apiClient.setSessionToken("session-token");
+    apiClient.reportCommandSearch(report);
+    apiClient.reportCommandSearch({ ...report, query: "nvda", searchId: "search-1", outcome: "dismissed" });
+    await Bun.sleep(0);
+    expect(sent.map((request) => request.path)).toEqual(["/assist/searches", "/assist/searches"]);
+    const [chosen, dismissed] = sent.map((request) => request.body);
+    expect(chosen?.query).toBe(`new chat ${"pane ".repeat(60)}`.slice(0, 200));
+    expect(chosen?.choice).toEqual({
+      kind: "a-kind-much-longer-than-the-server-takes".slice(0, 24),
+      label: "L".repeat(120),
+      input: "CHAT #general",
+      rank: 200,
+      category: "Ask AI",
+      fromAssist: true,
+    });
+    // A dismissal names no row.
+    expect(dismissed).toEqual({ query: "nvda", searchId: "search-1", outcome: "dismissed", appVersion: "1.2.3" });
+
+    fail = true;
+    expect(() => apiClient.reportCommandSearch(report)).not.toThrow();
+    await Bun.sleep(0);
+  });
 });
 
 describe("apiClient cloud news", () => {
@@ -1180,6 +1249,23 @@ describe("apiClient cloud news", () => {
     expect(url.searchParams.get("since")).toBe("2026-04-01T00:00:00.000Z");
     expect(url.searchParams.get("cursor")).toBe("cursor-1");
     expect(result).toEqual({ items: [], nextCursor: null });
+  });
+});
+
+describe("apiClient IPO calendar", () => {
+  test("asks for the default window with no params and sends only the filters given", async () => {
+    const seen: URL[] = [];
+    globalThis.fetch = mockFetch(async (input: Request | string | URL) => {
+      seen.push(new URL(String(input)));
+      return Response.json({ asOf: "2026-09-29T00:00:00Z", deals: [], sources: [] });
+    });
+
+    expect(await apiClient.getCloudIpoCalendar()).toEqual({ asOf: "2026-09-29T00:00:00Z", deals: [], sources: [] });
+    expect(seen[0]!.pathname).toBe("/cloud/ipo/calendar");
+    expect(seen[0]!.search).toBe("");
+
+    await apiClient.getCloudIpoCalendar({ region: "apac", status: undefined, from: "2026-10-01" });
+    expect(seen[1]!.search).toBe("?region=apac&from=2026-10-01");
   });
 });
 

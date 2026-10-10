@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { OptionContract, OptionsChain } from "../../../types/financials";
-import { DEFAULT_OPTION_CALC_DRAFT, daysToExpiryFrom, valueOption } from "../options-calculator/model";
-import { optionDelta } from "../shared/volatility";
+import { DEFAULT_OPTION_CALC_DRAFT } from "../options-calculator/model";
+import { daysToExpiryFrom, optionDelta, valueOption } from "../shared/volatility";
 import {
   buildSurfaceExpiry, buildSurfaceGrid, cleanSurfaceQuotes, DEFAULT_SURFACE_SETTINGS,
   evaluateSurfaceSmile, surfaceSheetSnapshot, surfaceTreasuryRate, windowSurfaceGrid, type SurfaceSnapshot,
@@ -69,7 +69,7 @@ describe("surface cleaning and midpoint model", () => {
   });
 
   test("does not fit a smile whose near-the-money quotes are all missing", () => {
-    // Yahoo's post-close LEAPS: the wings keep quotes while every strike near
+    // Gloom's post-close LEAPS: the wings keep quotes while every strike near
     // the forward is zero-bid. A fit bridging the wings invented a 12% ATM.
     const input = chain(expiration, 0.3, Array.from({ length: 33 }, (_, index) => 60 + index * 2.5));
     const unquoted = (contract: OptionContract) => contract.strike > 80 && contract.strike < 120 ? { ...contract, bid: 0, ask: 0 } : contract;
@@ -238,6 +238,6 @@ test("the delta axis centres ATM on the delta-neutral straddle strike, between 4
   const row = buildSurfaceGrid(snapshot, { axis: "delta", coordinates: [-0.45, 0, 0.45] }).rows[0]!;
   const [put45, atm, call45] = row.cells.map((cell) => cell.strike!);
   expect(atm).toBeCloseTo(expiry.forward! * Math.exp(0.3 * 0.3 * expiry.years / 2), 1);
-  expect(put45).toBeLessThan(atm);
-  expect(call45).toBeGreaterThan(atm);
+  expect(put45).toBeLessThan(atm!);
+  expect(call45).toBeGreaterThan(atm!);
 });

@@ -1,5 +1,5 @@
-import { useCallback } from "react";
-import type { AppState } from "../../../state/app/context";
+import { useCallback, type Dispatch } from "react";
+import type { AppAction, AppState } from "../../../state/app/context";
 import type { TickerRecord } from "../../../types/ticker";
 import type {
   PaneTemplateCreateOptions,
@@ -20,18 +20,17 @@ import {
   getAvailablePaneShortcutTemplatesForQuery,
   getAvailablePaneTemplatesForState,
   getPaneTemplateDisplayLabel,
+  recentPaneTemplateArg,
 } from "./items";
-import type { CommandBarWorkflowRoute } from "../workflow/types";
+import type { FormModalRequest } from "../../form-modal";
 import {
   resolveTickerInput,
   resolveTickerListInput,
   type SharedWorkflowDeps,
 } from "../workflow/ops";
 import type { PluginRegistry } from "../../../plugins/registry";
-import {
-  buildPaneTemplateWorkflowRoute,
-  shouldOpenPaneTemplateConfig,
-} from "./workflow-route";
+import { PluginOffError, notifyPluginOff } from "../../../plugins/plugin-off";
+import { shouldOpenPaneTemplateConfig } from "./workflow-route";
 
 type CloseAllFn = (options?: { revertThemePreview?: boolean }) => void;
 type NotifyFn = (body: string, options?: { type?: "info" | "success" | "error" }) => void;
@@ -53,11 +52,12 @@ interface UseCommandBarPaneTemplateActionsOptions {
   buildWorkflowDeps: () => SharedWorkflowDeps;
   closeAll: CloseAllFn;
   config: AppState["config"];
+  dispatch: Dispatch<AppAction>;
   executeCollectionCommand: ExecuteCollectionCommandFn;
   focusedPaneId: string | null;
   notify: NotifyFn;
+  openForm: (request: FormModalRequest) => void;
   openModeRoute: OpenModeRouteFn;
-  openWorkflowRoute: (route: CommandBarWorkflowRoute) => void;
   pluginRegistry: PluginRegistry;
 }
 
@@ -69,11 +69,12 @@ export function useCommandBarPaneTemplateActions({
   buildWorkflowDeps,
   closeAll,
   config,
+  dispatch,
   executeCollectionCommand,
   focusedPaneId,
   notify,
+  openForm,
   openModeRoute,
-  openWorkflowRoute,
   pluginRegistry,
 }: UseCommandBarPaneTemplateActionsOptions) {
   const getPaneTemplateContext = useCallback(() => buildPaneTemplateContext({
@@ -83,29 +84,41 @@ export function useCommandBarPaneTemplateActions({
     focusedPaneId,
   }), [activeCollectionId, activeTickerSymbol, config, focusedPaneId]);
 
+  const recordPaneTemplate = useCallback((template: PaneTemplateDef, arg?: string) => {
+    const tickerArg = recentPaneTemplateArg(template, arg);
+    dispatch({
+      type: "RECORD_COMMAND",
+      id: `pane-template:${template.id}`,
+      label: getPaneTemplateDisplayLabel(template),
+      ...(tickerArg ? { arg: tickerArg } : {}),
+    });
+  }, [dispatch]);
+
   const openPaneTemplateWorkflow = useCallback((template: PaneTemplateDef, options?: { arg?: string }) => {
-    openWorkflowRoute(buildPaneTemplateWorkflowRoute({
-      activeTicker: activeTickerSymbol,
-      arg: options?.arg,
-      template,
-    }));
-  }, [activeTickerSymbol, openWorkflowRoute]);
+    recordPaneTemplate(template, options?.arg);
+    openForm({ kind: "pane-template", templateId: template.id, arg: options?.arg });
+  }, [openForm, recordPaneTemplate]);
 
   const openPaneTemplateDirect = useCallback(async (
     template: PaneTemplateDef,
     createOptions?: PaneTemplateCreateOptions,
   ) => {
+    recordPaneTemplate(template, createOptions?.arg);
     try {
-      await pluginRegistry.createPaneFromTemplateAsyncFn(template.id, createOptions);
+      await pluginRegistry.createPaneFromTemplateAsync(template.id, createOptions);
       closeAll({ revertThemePreview: false });
     } catch (error) {
+      if (error instanceof PluginOffError) {
+        notifyPluginOff(pluginRegistry, error, () => { void openPaneTemplateDirect(template, createOptions); });
+        return;
+      }
       const displayLabel = getPaneTemplateDisplayLabel(template);
       notify(
         error instanceof Error ? error.message : `Could not create ${displayLabel.toLowerCase()}.`,
         { type: "error" },
       );
     }
-  }, [closeAll, notify, pluginRegistry]);
+  }, [closeAll, notify, pluginRegistry, recordPaneTemplate]);
 
   const runPaneTemplateShortcut = useCallback(async (
     template: PaneTemplateDef,
@@ -157,6 +170,7 @@ export function useCommandBarPaneTemplateActions({
           trimmedList,
           activeCollectionId,
           buildWorkflowDeps(),
+          template.shortcut?.keepArgToken,
         );
         const createOptions = {
           arg: trimmedList,

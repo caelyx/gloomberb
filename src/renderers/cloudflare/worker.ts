@@ -1,5 +1,6 @@
-import { PROXY_ALLOWED_HOSTS } from "../../utils/plugin-proxy-hosts";
 import { handleHttpProxy, proxyPolicyFor } from "./http-proxy";
+import { createProxySessionGate } from "./proxy-session";
+import { HTTP_PROXY_PATH } from "../../utils/plugin-proxy-hosts";
 
 interface StaticAssetsBinding {
   fetch(request: Request): Promise<Response>;
@@ -17,7 +18,6 @@ export interface WorkerEnv {
 const SHARE_PATH = /^\/s\/[a-f0-9]{32}\/?$/;
 const LAYOUT_SHARE_PATH = /^\/l\/[a-f0-9]{32}\/?$/;
 const API_PATH = /^\/api(?:\/|$)/;
-const HTTP_PROXY_PATH = "/http-proxy";
 const APPLE_APP_SITE_ASSOCIATION_PATH = "/.well-known/apple-app-site-association";
 const ROBOTS_PATH = "/robots.txt";
 
@@ -55,6 +55,8 @@ const APPLE_APP_SITE_ASSOCIATION = {
 const API_ORIGIN = "https://api.gloom.sh";
 const API_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]);
 type ApiFetch = (request: Request) => Promise<Response>;
+/** Module scope, so every request this isolate serves shares one session cache. */
+const proxySessions = createProxySessionGate({ sessionUrl: `${API_ORIGIN}/auth/get-session` });
 
 export const SECURITY_HEADERS = {
   "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https:; connect-src 'self' https://api.github.com https://api.fiscaldata.treasury.gov https://plugins.gloom.sh; form-action 'self'; upgrade-insecure-requests",
@@ -129,7 +131,7 @@ export async function handleRequest(request: Request, env: WorkerEnv, fetchApi: 
   // Before the GET/HEAD gate below, since plugin requests arrive as POST.
   if (url.pathname === HTTP_PROXY_PATH) {
     const policy = proxyPolicyFor(env.PRIVATE_WEB_DEPLOYMENT);
-    return withSecurityHeaders(await handleHttpProxy(request, fetch, PROXY_ALLOWED_HOSTS, policy));
+    return withSecurityHeaders(await handleHttpProxy(request, { sessions: proxySessions, fetchApi, policy }));
   }
 
   if (request.method !== "GET" && request.method !== "HEAD") {

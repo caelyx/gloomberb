@@ -1,8 +1,11 @@
 import type { HeadlessBundleSection, HeadlessPaneDefinition } from "../../../types/plugin";
 import { loadRiskReportWithClient, loadRiskReportsWithClient, type RiskReportsResult } from "./data";
+import { SEC_FILINGS } from "../shared/report-freshness";
+import { resolveHeadlessIssuerListing } from "../shared/headless-market-data";
 
 export const riskFactorsHeadless: HeadlessPaneDefinition<"bundle"> = {
   shape: "bundle",
+  freshness: { ...SEC_FILINGS, basis: "10-K filings" },
   argument: { kind: "ticker", placeholder: "ticker", description: "Company symbol." },
   options: [
     { key: "year", type: "string", defaultValue: "latest", description: "Filing year (for example 2025), or latest discovered report." },
@@ -14,9 +17,11 @@ export const riskFactorsHeadless: HeadlessPaneDefinition<"bundle"> = {
     const selection = String(args.options.year ?? "latest").trim().toLowerCase();
     if (selection !== "latest" && !/^\d{4}$/.test(selection)) throw new Error("Risk report year must be a four-digit filing year or latest.");
     const force = args.options.refresh === true;
+    // A listing abroad names its venue and company, so it never reads a US namesake's reports.
+    const listing = await resolveHeadlessIssuerListing(context, ticker);
     // A specific immutable filing does not depend on the latest discovery list.
     let list: RiskReportsResult | null = null;
-    if (selection === "latest") list = await loadRiskReportsWithClient(context.apiClient, ticker, { force });
+    if (selection === "latest") list = await loadRiskReportsWithClient(context.apiClient, ticker, { force, listing });
     const year = list
       ? [...list.reports].sort((a, b) => b.reportYear - a.reportYear)[0]?.reportYear
       : Number(selection);
@@ -25,7 +30,7 @@ export const riskFactorsHeadless: HeadlessPaneDefinition<"bundle"> = {
         ? `No cached risk report available for ${ticker}; report discovery failed: ${list.refreshError}`
         : `No 10-K risk reports on file for ${ticker}.`);
     }
-    const report = await loadRiskReportWithClient(context.apiClient, ticker, year, { force });
+    const report = await loadRiskReportWithClient(context.apiClient, ticker, year, { force, listing });
     const sections: HeadlessBundleSection[] = [
       { title: "Filing", entries: [
         { label: "Ticker", value: report.ticker },

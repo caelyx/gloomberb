@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import type { PluginRegistry } from "../../../../plugins/registry";
+import { findAbsorbedPlugin } from "../../../../plugins/absorbed";
 import { isOfficialPluginRepo } from "../../../../plugins/auto-update";
 import { getCurrentPluginTarget, runsExternalPlugins } from "../../../../plugins/current-target";
-import { activateInstalledPlugin } from "../../../../plugins/builtin/plugin-marketplace/activation";
+import { activateInstall } from "../../../../plugins/builtin/plugin-marketplace/activation";
 import { loadRegistry, registryPluginUrl } from "../../../../plugins/builtin/plugin-marketplace/feed";
 import {
   installConsent,
@@ -36,9 +37,14 @@ export interface PluginInstallOffer {
 /**
  * Only plugins Gloom publishes. A typed word must never lead to installing
  * someone else's code, so the repository owner decides, not the feed's tier.
+ * A plugin that is built in now (absorbed.ts) is never offered, whatever the
+ * feed says: its code opens the built-in, and the installer refuses it.
  */
 function isOfferable(plugin: RegistryPlugin): boolean {
-  return plugin.tier === "official" && plugin.bundled !== true && isOfficialPluginRepo(plugin.repo);
+  return plugin.tier === "official"
+    && plugin.bundled !== true
+    && isOfficialPluginRepo(plugin.repo)
+    && !findAbsorbedPlugin({ id: plugin.id });
 }
 
 /** The feed is read defensively: an entry can come from any registry version. */
@@ -211,7 +217,7 @@ function buildPluginInstallItem(
       onConfirm: async () => {
         const result = await manager.install(repo, pin);
         if (!result.ok) throw new Error(`Could not install ${plugin.name}: ${result.error}`);
-        const activated = await activateInstalledPlugin(result.directory, host, manager);
+        const activated = await activateInstall(result, host, manager);
         if (!activated.ok) throw new Error(`${plugin.name} installed but did not load: ${activated.error}`);
         if (activated.restart) {
           context.notify(`Restart to finish installing ${plugin.name}.`, "info");
@@ -246,9 +252,9 @@ function buildPluginInstallItem(
 
 /**
  * The install row for the root query, or null. `enabled` is false whenever
- * something else already claimed the query or the bar shows another route,
- * such as the install confirmation, so coming back from one re-reads what is
- * installed.
+ * something else already claimed the query or the bar shows a route (a ticker
+ * search, a picker). The install confirm opens in the form modal with the bar
+ * closed, so the bar's next visit re-reads what is installed.
  */
 export function useRootPluginInstallItem({
   enabled,

@@ -19,6 +19,58 @@ export const MAX_TOOL_RESULT_BYTES = 262_144;
 /** Source form for valid tool names advertised to ASKG. */
 export const TOOL_NAME_PATTERN = "^[a-z0-9][a-z0-9_.]{0,47}$";
 
+/**
+ * The server tool that runs a script of tool calls in one step. The platform
+ * owns the name: a client that advertises a tool called this is refused.
+ */
+export const SCRIPT_TOOL_NAME = "run_script";
+
+/**
+ * Optional protocol features. A client offers them at session start, the
+ * server answers with the ones it will use, and the client repeats the
+ * accepted set on every turn of that session. A missing key, or a server that
+ * sends nothing, means the feature is off; unknown keys are ignored.
+ */
+export interface ASKGCapabilities {
+  /** 1: the turn may answer by running scripts of tool calls. */
+  scripts?: 1;
+  /**
+   * 1: answers can be rated. Only the session start carries it; a turn never
+   * repeats it, and a reopened conversation says it on its own response.
+   */
+  feedback?: 1;
+}
+
+/** What this build offers at session start. */
+export const ASKG_CLIENT_CAPABILITIES: ASKGCapabilities = { scripts: 1, feedback: 1 };
+
+/** A thumbs up or down on one answer. */
+export type ASKGFeedbackRating = "up" | "down";
+
+/** Why a thumbs down, from a fixed list: a rating never carries text. */
+export type ASKGFeedbackReason = "wrong" | "slow" | "missing_data" | "other";
+
+/** Body of `PUT /askg/turns/:turnId/feedback`. Rating again overwrites. */
+export interface ASKGFeedbackRequest {
+  rating: ASKGFeedbackRating;
+  /** Only with a thumbs down. */
+  reason?: ASKGFeedbackReason | null;
+  /**
+   * The person agreed to send this answer. The request carries the consent,
+   * not the text: the platform copies the question, the answer and the names
+   * of the tools that ran from its own transcript, and nothing else.
+   */
+  share?: boolean;
+}
+
+/** A rating as stored: the route's answer, and what a reopened answer carries. */
+export interface ASKGFeedback {
+  rating: ASKGFeedbackRating;
+  reason: ASKGFeedbackReason | null;
+  /** The answer was sent. Sending is one way: a later rating keeps it sent. */
+  shared: boolean;
+}
+
 /** JSON value accepted on the ASKG wire. */
 export type JsonValue =
   | string
@@ -32,7 +84,7 @@ export type JsonValue =
 export type WriteTier = RemoteWriteTier;
 
 /** Runtime that opened an ASKG session. */
-export type ASKGClientKind = "tui" | "desktop" | "web";
+type ASKGClientKind = "tui" | "desktop" | "web";
 
 /** Origin of an advertised client tool. */
 /**
@@ -47,7 +99,7 @@ export type ToolManifestSource = "headless" | "remote-op" | "server";
 export type ClientToolManifestSource = Exclude<ToolManifestSource, "server">;
 
 /** Headless result shapes supported by the tool timeline. */
-export type ToolManifestShape = HeadlessPaneShape;
+type ToolManifestShape = HeadlessPaneShape;
 
 /** Serializable headless argument declaration. */
 export type ToolManifestArgument = HeadlessPaneArgumentDef;
@@ -59,12 +111,12 @@ export type ToolManifestOption = Omit<HeadlessPaneOptionDef, "settingKey" | "plu
 export type ToolManifestColumn = Omit<HeadlessPaneColumn, "format">;
 
 /** JSON Schema accepted by a remote operation tool. */
-export type ToolInputSchema = RemoteJsonSchema;
+type ToolInputSchema = RemoteJsonSchema;
 
 /** Client or server tool metadata negotiated when a session starts. */
 export type ClientToolManifest = ToolManifest & { source: ClientToolManifestSource };
 
-export interface ToolManifest {
+interface ToolManifest {
   /** Lowercase stable identifier matching TOOL_NAME_PATTERN. */
   name: string;
   source: ToolManifestSource;
@@ -86,12 +138,25 @@ export interface ASKGClientDescriptor {
   version: string;
 }
 
-/** Terminal context supplied to the model at session start. */
+/**
+ * The user's portfolios, watchlists and broker accounts by id and display
+ * name, so Gloom passes real ids to tools instead of guessing them. Never
+ * positions, quantities or balances. Each list is optional and bounded.
+ */
+export interface ASKGUserData {
+  portfolios?: Array<{ id: string; name: string; kind: "manual" | "broker" }>;
+  watchlists?: Array<{ id: string; name: string; count?: number }>;
+  brokerAccounts?: Array<{ id: string; name: string; portfolioId?: string }>;
+}
+
+/** Terminal context supplied to the model at session start and with each turn. */
 export interface ASKGSessionContext {
   query?: string;
   symbol?: string;
   paneId?: string;
   layout?: JsonValue;
+  /** Optional: a server that does not know it ignores it. */
+  userData?: ASKGUserData;
 }
 
 /** Request used to negotiate tools and limits for an ASKG session. */
@@ -102,6 +167,7 @@ export interface ASKGSessionStartRequest {
   /** A client may only advertise tools it executes itself. */
   tools: ClientToolManifest[];
   manifestHash: string;
+  capabilities?: ASKGCapabilities;
 }
 
 /** Per-user and per-turn limits returned by the platform. */
@@ -115,7 +181,7 @@ export interface ASKGLimits {
 }
 
 /** Client tool rejected during session negotiation. */
-export interface ASKGRejectedTool {
+interface ASKGRejectedTool {
   name: string;
   reason: string;
 }
@@ -133,6 +199,8 @@ export interface ASKGSessionStartResponse {
   model: string;
   promptVersion: string;
   expiresAt: string;
+  /** Absent from a server that predates them or has them switched off. */
+  capabilities?: ASKGCapabilities;
 }
 
 /** Request body for one turn on an open session. */
@@ -150,15 +218,17 @@ export interface ASKGTurnRequest {
    * conversation cannot disagree about what was said.
    */
   history?: Array<{ role: "user" | "assistant"; text: string }>;
+  /** The features the session accepted, repeated because each turn decides alone. */
+  capabilities?: ASKGCapabilities;
 }
 
 /** Shared fields carried by every turn stream event. */
-export interface ASKGEventBase {
+interface ASKGEventBase {
   seq: number;
 }
 
 /** Announces the session and turn attached to this stream. */
-export interface ASKGSessionEvent extends ASKGEventBase {
+interface ASKGSessionEvent extends ASKGEventBase {
   type: "session";
   sessionId: string;
   turnId: string;
@@ -169,7 +239,7 @@ export interface ASKGSessionEvent extends ASKGEventBase {
 }
 
 /** Appends model text to the visible answer. */
-export interface ASKGTextDeltaEvent extends ASKGEventBase {
+interface ASKGTextDeltaEvent extends ASKGEventBase {
   type: "text-delta";
   turnId: string;
   delta: string;
@@ -190,7 +260,7 @@ export interface ASKGToolCallEvent extends ASKGEventBase {
 }
 
 /** Compact result information suitable for the tool timeline. */
-export interface ToolExecutionSummary {
+interface ToolExecutionSummary {
   rowCount?: number;
   elapsedMs: number;
   truncated: boolean;
@@ -208,7 +278,7 @@ export type ToolResultStatus =
   | "cancelled";
 
 /** Reports a completed server tool or an accepted client execution. */
-export interface ASKGToolExecutedEvent extends ASKGEventBase {
+interface ASKGToolExecutedEvent extends ASKGEventBase {
   type: "tool-executed";
   turnId: string;
   toolCallId: string;
@@ -219,7 +289,7 @@ export interface ASKGToolExecutedEvent extends ASKGEventBase {
 }
 
 /** Confirms that one client tool result was accepted by the turn loop. */
-export interface ASKGToolResultAckEvent extends ASKGEventBase {
+interface ASKGToolResultAckEvent extends ASKGEventBase {
   type: "tool-result-ack";
   turnId: string;
   toolCallId: string;
@@ -237,7 +307,7 @@ export type ASKGErrorCode =
   | "internal";
 
 /** Reports a recoverable or terminal session or turn failure. */
-export interface ASKGErrorEvent extends ASKGEventBase {
+interface ASKGErrorEvent extends ASKGEventBase {
   type: "error";
   turnId?: string;
   code: ASKGErrorCode;
@@ -247,7 +317,7 @@ export interface ASKGErrorEvent extends ASKGEventBase {
 }
 
 /** Token accounting emitted when the model provider supplies it. */
-export interface ASKGUsageEvent extends ASKGEventBase {
+interface ASKGUsageEvent extends ASKGEventBase {
   type: "usage";
   turnId: string;
   inputTokens?: number;
@@ -260,7 +330,7 @@ export interface ASKGUsageEvent extends ASKGEventBase {
 export type ASKGDoneReason = "complete" | "cancelled" | "error" | "timeout";
 
 /** Terminates a turn stream. */
-export interface ASKGDoneEvent extends ASKGEventBase {
+interface ASKGDoneEvent extends ASKGEventBase {
   type: "done";
   turnId: string;
   reason: ASKGDoneReason;

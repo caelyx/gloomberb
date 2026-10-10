@@ -10,8 +10,9 @@ import type {
 } from "../../../types/plugin";
 import { buildEventRows, eventSourceNotice, CORPORATE_ACTION_COVERAGE } from "./event-model";
 import { EVENT_COLUMNS, loadEventSources } from "./event-sources";
+import { REPORTED_DATA } from "../shared/report-freshness";
 
-export interface EventHeadlessData {
+interface EventHeadlessData {
   actions: CorporateActionsData | null;
   estimates: AnalystResearchData | null;
   financials: TickerFinancials | null;
@@ -45,6 +46,7 @@ export function createEventsHeadless(
 ): HeadlessPaneDefinition<"rows"> {
   return {
     shape: "rows",
+    freshness: { ...REPORTED_DATA, basis: "corporate actions", oldest: null },
     argument: {
       kind: "ticker",
       placeholder: "ticker",

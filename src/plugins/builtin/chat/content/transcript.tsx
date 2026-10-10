@@ -1,10 +1,10 @@
 import { Box, ScrollBox, Text, type ScrollBoxRenderable } from "../../../../ui";
 import type { Dispatch, SetStateAction } from "react";
 import type { InlineTickerCatalogEntry } from "../../../../state/hooks/inline-tickers";
-import { Button } from "../../../../components";
 import { colors } from "../../../../theme/colors";
 import { t } from "../../../../i18n";
-import type { ChatMessage, ChatUserSummary } from "../../../../api-client";
+import type { ChatAttachment, ChatMessage, ChatUserSummary } from "../../../../api-client";
+import type { ChatUserAnchor, ChatUserContextMenuEvent } from "../message/types";
 import { DesktopChatMessage } from "../message/desktop";
 import { UserProfilePopover } from "../message/profile-popover";
 import { TerminalChatMessage } from "../message/terminal";
@@ -28,6 +28,8 @@ interface ChatTranscriptProps {
   loadingOlderMessages: boolean;
   messagesError: string | null;
   onRetryMessages: () => void;
+  retryMessage: (index: number) => void;
+  onImageLoadError: (attachment: ChatAttachment) => void;
   messageAreaHeight: number;
   messageBodyWidth: number;
   messages: ChatMessage[];
@@ -35,13 +37,25 @@ interface ChatTranscriptProps {
   latestEditableMessageId: string | null;
   openTicker: (symbol: string) => void;
   profilePopoverUser: ChatUserSummary | null;
+  /** The name or @mention the open card belongs beside. */
+  profilePopoverAnchor: ChatUserAnchor;
   registerMessageElement: (messageId: string, node: unknown | null) => void;
   scheduleProfilePopoverClose: () => void;
   scrollRef: MutableRef<ScrollBoxRenderable | null>;
   selectedIdx: number;
   setHoveredIdx: Dispatch<SetStateAction<number | null>>;
-  showProfilePopover: (user: ChatUserSummary) => void;
+  showProfilePopover: (user: ChatUserSummary, anchor?: ChatUserAnchor) => void;
+  /** A click on a name: pins its card, or closes the one it pinned. */
+  toggleProfilePopover: (user: ChatUserSummary, anchor?: ChatUserAnchor) => void;
+  /** Closes the card at once, pinned or not (a click outside it on the desktop). */
+  dismissProfilePopover: () => void;
   onSetUpProfile: () => void;
+  /** Right-click on a name or @mention. */
+  onUserContextMenu: (user: ChatUserSummary, event: ChatUserContextMenuEvent, anchor?: ChatUserAnchor) => void;
+  /** The card's "Message" action for this user, or null where none is offered. */
+  profileMessageAction: { label: string; onPress: () => void } | null;
+  /** Why this user takes no DM from you, for a card that has no profile to show instead. */
+  profileMessageRefusal: string | null;
   stickyTranscript: boolean;
   user: { id: string; username: string; emailVerified: boolean } | null;
   userByUsername: Map<string, ChatUserSummary>;
@@ -62,6 +76,8 @@ export function ChatTranscript({
   loadingOlderMessages,
   messagesError,
   onRetryMessages,
+  retryMessage,
+  onImageLoadError,
   messageAreaHeight,
   messageBodyWidth,
   messages,
@@ -69,16 +85,22 @@ export function ChatTranscript({
   latestEditableMessageId,
   openTicker,
   profilePopoverUser,
+  profilePopoverAnchor,
   registerMessageElement,
   scheduleProfilePopoverClose,
   scrollRef,
   selectedIdx,
   setHoveredIdx,
   showProfilePopover,
+  toggleProfilePopover,
+  dismissProfilePopover,
   stickyTranscript,
   user,
   userByUsername,
   onSetUpProfile,
+  onUserContextMenu,
+  profileMessageAction,
+  profileMessageRefusal,
 }: ChatTranscriptProps) {
   return (
     <>
@@ -127,10 +149,14 @@ export function ChatTranscript({
               openTicker={openTicker}
               onUserHover={showProfilePopover}
               onUserHoverEnd={scheduleProfilePopoverClose}
+              onUserActivate={toggleProfilePopover}
+              onUserContextMenu={onUserContextMenu}
               beginReplyTo={beginReplyTo}
               beginEditMessage={beginEditMessage}
               jumpToMessage={jumpToMessage}
               latestEditableMessageId={latestEditableMessageId}
+              retryMessage={retryMessage}
+              onImageLoadError={onImageLoadError}
               registerMessageElement={registerMessageElement}
             />
           ) : (
@@ -149,10 +175,13 @@ export function ChatTranscript({
               openTicker={openTicker}
               onUserHover={showProfilePopover}
               onUserHoverEnd={scheduleProfilePopoverClose}
+              onUserActivate={toggleProfilePopover}
+              onUserContextMenu={onUserContextMenu}
               beginReplyTo={beginReplyTo}
               beginEditMessage={beginEditMessage}
               jumpToMessage={jumpToMessage}
               latestEditableMessageId={latestEditableMessageId}
+              retryMessage={retryMessage}
               setHoveredIdx={setHoveredIdx}
             />
           )
@@ -162,11 +191,15 @@ export function ChatTranscript({
       {profilePopoverUser && (
         <UserProfilePopover
           user={profilePopoverUser}
+          anchor={profilePopoverAnchor}
           width={chatWidth}
           onClose={scheduleProfilePopoverClose}
+          onDismiss={dismissProfilePopover}
           onKeepOpen={cancelProfilePopoverClose}
           isOwnProfile={profilePopoverUser.id === user?.id}
           onSetUpProfile={onSetUpProfile}
+          messageAction={profileMessageAction}
+          messageRefusal={profileMessageRefusal}
         />
       )}
     </>

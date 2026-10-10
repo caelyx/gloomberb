@@ -10,8 +10,6 @@ import {
   connectionHealth as sharedConnectionHealth,
   type ConnectionHealthRegistry,
 } from "../../core/connection-health";
-import type { PaneRuntimeState } from "../../core/state/app/state";
-import type { LayoutMarketplacePayload } from "../../layout-marketplace/payload";
 import { cloudSyncController } from "../../sync/controller";
 import type {
   RegisteredSyncContributor,
@@ -20,15 +18,10 @@ import type {
   SyncTransport,
 } from "../../sync/types";
 import type { BrokerAdapter } from "../../types/broker";
-import type { BrokerInstanceConfig, LayoutConfig } from "../../types/config";
 import { resolvePaneInstance } from "../../types/config";
 import type { ContextMenuContext, ContextMenuItem } from "../../types/context-menu";
 import type { DataProvider } from "../../types/data-provider";
-import type { TickerFinancials } from "../../types/financials";
 import type {
-  AppNotificationDelivery,
-  AppNotificationRequest,
-  BrokerInstanceUpdateOptions,
   CommandBarSearchProvider,
   CommandDef,
   CustomColumnDef,
@@ -37,13 +30,10 @@ import type {
   GloomSlots,
   KeyboardShortcut,
   PaneDef,
-  PaneTemplateCreateOptions,
   PaneTemplateDef,
-  PinTickerOptions,
   TickerAction,
   TickerResearchTabDef,
 } from "../../types/plugin";
-import type { TickerRecord } from "../../types/ticker";
 import { debugLog } from "../../utils/debug-log";
 import { EventBus, type HostEvents } from "../event-bus";
 import { isReservedBuiltinPluginId } from "../ownership";
@@ -53,12 +43,24 @@ import { withPluginRender, type PluginRuntimeAccess } from "../runtime";
 import { resolveRegistryContextMenuItems } from "./context-menu";
 import { RegistryContributions, type PluginItems } from "./contributions";
 import {
+  createDefaultHostActions,
+  HOST_ACTION_NAMES,
+  type DeprecatedHostActionSlots,
+  type PluginHostActions,
+} from "./host-actions";
+import {
   resolveRegistryPaneQuickSettings,
   resolveRegistryPaneSettings,
   type ResolvedRegistryPaneQuickSetting,
   type ResolvedRegistryPaneSettings,
 } from "./pane-settings";
-import { RegistryResumeStateListeners, createPluginPaneSettingsState, createPluginResumeState } from "./plugin-state";
+import {
+  RegistryResumeStateListeners,
+  bindPluginContextNamespaces,
+  createPluginPaneSettingsState,
+  createPluginResumeState,
+  type NamespacedPluginContext,
+} from "./plugin-state";
 import { createPluginSetupCommand, isPluginConfigured } from "./setup-command";
 import {
   bindSharedRegistry,
@@ -79,7 +81,13 @@ interface PluginRegistryOptions {
   ) => Promise<T>;
 }
 
-export type WindowEditMode = "move" | "resize";
+export type { WindowEditMode } from "./host-actions";
+
+/** A switched-off plugin, named for a "Turn on" offer. */
+export interface DisabledPluginOwner {
+  id: string;
+  name: string;
+}
 export {
   getSharedMarketData,
   getSharedRegistry,
@@ -87,7 +95,16 @@ export {
   setSharedRegistryForTests
 } from "./shared";
 
+/**
+ * Every host action is also a member of the registry (`registry.showPane(id)`)
+ * that calls whatever the app bound last, so one passed around keeps working
+ * after the app rebinds it.
+ */
+export interface PluginRegistry extends PluginHostActions, DeprecatedHostActionSlots {}
+
 export class PluginRegistry implements PluginRuntimeAccess {
+  private readonly defaultHostActions = createDefaultHostActions(() => this);
+  private readonly hostActions: PluginHostActions = { ...this.defaultHostActions };
   private slots = new RegistrySlots();
   private readonly contributions: RegistryContributions;
   private plugins = new Map<string, GloomPlugin>();
@@ -109,35 +126,6 @@ export class PluginRegistry implements PluginRuntimeAccess {
     options?: { signal?: AbortSignal },
   ) => Promise<T>;
 
-  getTickerFn: ((symbol: string) => TickerRecord | null) = () => null;
-  getDataFn: ((symbol: string) => TickerFinancials | null) = () => null;
-  getConfigFn: (() => import("../../types/config").AppConfig) = () => { throw new Error("getConfigFn not set"); };
-  createBrokerInstanceFn: ((brokerType: string, label: string, values: Record<string, unknown>) => Promise<BrokerInstanceConfig>) = async () => {
-    throw new Error("createBrokerInstanceFn not set");
-  };
-  connectBrokerInstanceFn: ((instanceId: string) => Promise<void>) = async () => {};
-  updateBrokerInstanceFn: ((instanceId: string, values: Record<string, unknown>, options?: BrokerInstanceUpdateOptions) => Promise<void>) = async () => {};
-  syncBrokerInstanceFn: ((instanceId: string) => Promise<void>) = async () => {};
-  removeBrokerInstanceFn: ((instanceId: string) => Promise<void>) = async () => {};
-
-  selectTickerFn: ((symbol: string, paneId?: string) => void) = () => {};
-  switchPanelFn: ((panel: "left" | "right") => void) = () => {};
-  switchTabFn: ((tabId: string, paneId?: string) => void) = () => {};
-  openCommandBarFn: ((query?: string) => void) = () => {};
-  openPluginCommandWorkflowFn: ((commandId: string) => void) = () => {};
-  openPaneSettingsFn: ((paneId?: string) => void) = () => {};
-  sharePaneFn: ((paneId?: string) => void) = () => {};
-  openWindowModeFn: ((paneId?: string, mode?: WindowEditMode) => void) = () => {};
-  /** The shell's fullscreen toggle for a pane; false when there is nothing to fill the window with. */
-  togglePaneFullscreenFn: ((paneId: string) => boolean) = () => false;
-  showPaneFn: ((paneId: string) => void) = () => {};
-  createPaneFromTemplateFn: ((templateId: string, options?: PaneTemplateCreateOptions) => void) = () => {};
-  createPaneFromTemplateAsyncFn: ((templateId: string, options?: PaneTemplateCreateOptions) => Promise<void>) = async () => {};
-  openPortablePaneShareAsyncFn: ((layout: LayoutMarketplacePayload) => Promise<void>) = async () => {};
-  hidePaneFn: ((paneId: string) => void) = () => {};
-  focusPaneFn: ((paneId: string, layout?: LayoutConfig) => void) = () => {};
-  pinTickerFn: ((symbol: string, options?: PinTickerOptions) => void) = () => {};
-  navigateTickerFn: ((symbol: string, options?: { sourcePaneId?: string | null }) => void) = () => {};
   getMarketData = () => this.marketData;
   getConnectionHealth = () => this.connectionHealth;
   getCapability = (capabilityId: string) => this.capabilities.get(capabilityId)?.capability ?? null;
@@ -154,75 +142,7 @@ export class PluginRegistry implements PluginRuntimeAccess {
       : this.capabilities.invoke<T>(capabilityId, operationId, payload, { renderer: true, signal: options.signal })
   );
   getBrokerAdapter = (brokerType: string) => this.contributions.brokersMap.get(brokerType) ?? null;
-  connectBrokerInstance = (instanceId: string) => this.connectBrokerInstanceFn(instanceId);
-  updateBrokerInstance = (instanceId: string, values: Record<string, unknown>, options?: BrokerInstanceUpdateOptions) => (
-    this.updateBrokerInstanceFn(instanceId, values, options)
-  );
-  syncBrokerInstance = (instanceId: string) => this.syncBrokerInstanceFn(instanceId);
-  removeBrokerInstance = (instanceId: string) => this.removeBrokerInstanceFn(instanceId);
-  pinTicker = (symbol: string, options?: PinTickerOptions) => {
-    this.pinTickerFn(symbol, options);
-  };
-  navigateTicker = (symbol: string, options?: { sourcePaneId?: string | null }) => {
-    this.navigateTickerFn(symbol, options);
-  };
-  selectTicker = (symbol: string, paneId?: string) => {
-    this.selectTickerFn(symbol, paneId);
-  };
-  switchPanel = (panel: "left" | "right") => {
-    this.switchPanelFn(panel);
-  };
-  switchTab = (tabId: string, paneId?: string) => {
-    this.switchTabFn(tabId, paneId);
-  };
-  openCommandBar = (query?: string) => {
-    this.openCommandBarFn(query);
-  };
-  openPaneSettings = (paneId?: string) => {
-    this.openPaneSettingsFn(paneId);
-  };
-  sharePane = (paneId?: string) => {
-    this.sharePaneFn(paneId);
-  };
-  openWindowMode = (paneId?: string, mode?: WindowEditMode) => {
-    this.openWindowModeFn(paneId, mode);
-  };
-  openPluginCommandWorkflow = (commandId: string) => {
-    this.openPluginCommandWorkflowFn(commandId);
-  };
-  showPane = (paneId: string) => {
-    this.showPaneFn(paneId);
-  };
-  createPaneFromTemplate = (templateId: string, options?: PaneTemplateCreateOptions) => {
-    this.createPaneFromTemplateFn(templateId, options);
-  };
-  hidePane = (paneId: string) => {
-    this.hidePaneFn(paneId);
-  };
-  focusPane = (paneId: string) => {
-    this.focusPaneFn(paneId);
-  };
-
-  getLayoutFn: (() => LayoutConfig) = () => ({ dockRoot: null, instances: [], floating: [], detached: [] });
-  updateLayoutFn: ((layout: LayoutConfig) => void) = () => {};
-  getTermSizeFn: (() => { width: number; height: number }) = () => ({ width: 120, height: 40 });
-
-  registerNewsCapabilityFn: ((capability: NewsCapability) => () => void) = () => () => {};
-  watchNewsQueryFn: ((
-    query: import("../../types/news-source").NewsQuery,
-    listener: (state: import("../../types/news-source").NewsQueryState) => void,
-  ) => () => void) = () => () => {};
-
-  notifyFn: ((notification: AppNotificationRequest) => AppNotificationDelivery | void) = () => {};
-  getPaneRuntimeStateFn: ((paneId: string) => PaneRuntimeState | null) = () => null;
-  updatePaneRuntimeStateFn: ((paneId: string, patch: Partial<PaneRuntimeState>) => void) = () => {};
-  applyPaneSettingValueFn: ((paneId: string, field: import("../../types/plugin").PaneSettingField, value: unknown) => Promise<void>) = async () => {};
-  getPluginConfigValueFn: (<T = unknown>(pluginId: string, key: string) => T | null) = <T = unknown>(pluginId: string, key: string): T | null => (
-    (this.getConfigFn().pluginConfig[pluginId]?.[key] as T | undefined) ?? null
-  );
-  setPluginConfigValueFn: ((pluginId: string, key: string, value: unknown) => Promise<void>) = async () => {};
-  setPluginConfigValuesFn: ((pluginId: string, values: Record<string, unknown>) => Promise<void>) = async () => {};
-  deletePluginConfigValueFn: ((pluginId: string, key: string) => Promise<void>) = async () => {};
+  listBrokerAdapters = () => [...this.contributions.brokersMap.values()];
 
   constructor(
     marketData: DataProvider,
@@ -230,6 +150,18 @@ export class PluginRegistry implements PluginRuntimeAccess {
     persistence: AppPersistencePort,
     options: PluginRegistryOptions = {},
   ) {
+    for (const name of HOST_ACTION_NAMES) {
+      Object.assign(this, {
+        [name]: (...args: unknown[]) => (this.hostActions[name] as (...args: unknown[]) => unknown)(...args),
+      });
+      // The old one-slot-per-action API: reading a slot returns the bound
+      // action, assigning one binds it.
+      Object.defineProperty(this, `${name}Fn`, {
+        configurable: true,
+        get: () => this.hostActions[name],
+        set: (action: PluginHostActions[typeof name]) => { this.bindHost({ [name]: action }); },
+      });
+    }
     this.marketData = marketData;
     this.connectionHealth = options.connectionHealth ?? sharedConnectionHealth;
     this.tickerRepository = tickerRepository;
@@ -246,13 +178,30 @@ export class PluginRegistry implements PluginRuntimeAccess {
 
     bindSharedRegistry(this, marketData);
     this.capabilities = new CapabilityRegistry({
-      isPluginEnabled: (pluginId) => !this.getConfigFn().disabledPlugins.includes(pluginId),
+      isPluginEnabled: (pluginId) => !this.getConfig().disabledPlugins.includes(pluginId),
+      pluginName: (pluginId) => this.plugins.get(pluginId)?.name,
       isCapabilityEnabled: (capability, pluginId) => {
-        const disabledSources = this.getConfigFn().disabledSources ?? [];
-        return !disabledSources.includes(capability.sourceId ?? capability.id) && !this.getConfigFn().disabledPlugins.includes(pluginId);
+        const disabledSources = this.getConfig().disabledSources ?? [];
+        return !disabledSources.includes(capability.sourceId ?? capability.id) && !this.getConfig().disabledPlugins.includes(pluginId);
       },
       connectionHealth: this.connectionHealth,
     });
+  }
+
+  /**
+   * Binds the given host actions and leaves the others as they are. The
+   * returned function puts the defaults back for any of them still bound, so
+   * a shell or window that unmounts does not undo what mounted after it.
+   */
+  bindHost(actions: Partial<PluginHostActions>): () => void {
+    const bound = Object.entries(actions).filter(([, action]) => action !== undefined);
+    Object.assign(this.hostActions, Object.fromEntries(bound));
+    return () => {
+      for (const [name, action] of bound) {
+        const key = name as keyof PluginHostActions;
+        if (this.hostActions[key] === action) Object.assign(this.hostActions, { [key]: this.defaultHostActions[key] });
+      }
+    };
   }
 
   get panes(): ReadonlyMap<string, PaneDef> { return this.contributions.panesMap; }
@@ -277,14 +226,14 @@ export class PluginRegistry implements PluginRuntimeAccess {
   }
 
   getEnabledSyncContributors(): RegisteredSyncContributor[] {
-    const disabledPlugins = new Set(this.getConfigFn().disabledPlugins ?? []);
+    const disabledPlugins = new Set(this.getConfig().disabledPlugins ?? []);
     return cloudSyncController
       .getRegisteredContributors()
       .filter((entry) => !disabledPlugins.has(entry.pluginId));
   }
 
   getActiveSyncTransport(): RegisteredSyncTransport | null {
-    const disabledPlugins = new Set(this.getConfigFn().disabledPlugins ?? []);
+    const disabledPlugins = new Set(this.getConfig().disabledPlugins ?? []);
     return cloudSyncController
       .getRegisteredTransports()
       .find((entry) => !disabledPlugins.has(entry.pluginId) && entry.transport.isAvailable()) ?? null;
@@ -293,7 +242,7 @@ export class PluginRegistry implements PluginRuntimeAccess {
   getContextMenuItems(context: ContextMenuContext): ContextMenuItem[] {
     return resolveRegistryContextMenuItems({
       context,
-      disabledPlugins: new Set(this.getConfigFn().disabledPlugins ?? []),
+      disabledPlugins: new Set(this.getConfig().disabledPlugins ?? []),
       providers: this.contributions.contextMenuProvidersMap.entries(),
       onProviderError: (entry, error) => {
         this.registryLog.error("Context menu provider failed", {
@@ -323,18 +272,16 @@ export class PluginRegistry implements PluginRuntimeAccess {
   }
 
   getEnabledTickerActions(): TickerAction[] {
-    const disabled = this.getConfigFn().disabledPlugins;
+    const disabled = this.getConfig().disabledPlugins;
     return [...this.contributions.tickerActionsMap].filter(([id]) => (
       !disabled.includes(this.contributions.tickerActionsMap.owners.get(id)!)
     )).map(([, action]) => action);
   }
 
-  notify = (notification: AppNotificationRequest): AppNotificationDelivery | void => this.notifyFn(notification);
-
   renderSlot<K extends keyof GloomSlots>(
     name: K,
     props: GloomSlots[K],
-    disabledPlugins: readonly string[] = this.getConfigFn().disabledPlugins,
+    disabledPlugins: readonly string[] = this.getConfig().disabledPlugins,
   ): ReactNode {
     return this.slots.render(name, props, disabledPlugins);
   }
@@ -343,7 +290,7 @@ export class PluginRegistry implements PluginRuntimeAccess {
     const ownedCapability: PluginCapability = {
       ...capability,
       isEnabled: () => {
-        const config = this.getConfigFn();
+        const config = this.getConfig();
         const disabledPlugin = config.disabledPlugins.includes(pluginId);
         const disabledSource = config.disabledSources?.includes(capability.sourceId ?? capability.id) ?? false;
         return !disabledPlugin && !disabledSource && (capability.isEnabled?.() ?? true);
@@ -364,7 +311,7 @@ export class PluginRegistry implements PluginRuntimeAccess {
     }
 
     if (ownedCapability.kind === "news") {
-      const dispose = this.registerNewsCapabilityFn(ownedCapability as NewsCapability);
+      const dispose = this.registerNewsCapability(ownedCapability as NewsCapability);
       items.capabilityDisposers.push(dispose);
     }
   }
@@ -400,42 +347,42 @@ export class PluginRegistry implements PluginRuntimeAccess {
   }
 
   getConfigState<T = unknown>(pluginId: string, key: string): T | null {
-    return this.getPluginConfigValueFn<T>(this.stateNamespace(pluginId), key);
+    return this.getPluginConfigValue<T>(this.stateNamespace(pluginId), key);
   }
 
   setConfigState(pluginId: string, key: string, value: unknown): Promise<void> {
-    return this.setPluginConfigValueFn(this.stateNamespace(pluginId), key, value);
+    return this.setPluginConfigValue(this.stateNamespace(pluginId), key, value);
   }
 
   setConfigStates(pluginId: string, values: Record<string, unknown>): Promise<void> {
-    return this.setPluginConfigValuesFn(this.stateNamespace(pluginId), values);
+    return this.setPluginConfigValues(this.stateNamespace(pluginId), values);
   }
 
   deleteConfigState(pluginId: string, key: string): Promise<void> {
-    return this.deletePluginConfigValueFn(this.stateNamespace(pluginId), key);
+    return this.deletePluginConfigValue(this.stateNamespace(pluginId), key);
   }
 
   getConfigStateKeys(pluginId: string): string[] {
-    return Object.keys(this.getConfigFn().pluginConfig[this.stateNamespace(pluginId)] ?? {}).sort();
+    return Object.keys(this.getConfig().pluginConfig[this.stateNamespace(pluginId)] ?? {}).sort();
   }
 
   /** False while a plugin with a `configSchema` is missing a required value. */
   isPluginConfigured(pluginId: string): boolean {
     const plugin = this.plugins.get(pluginId);
     if (!plugin) return true;
-    return isPluginConfigured(plugin, this.getConfigFn().pluginConfig[this.stateNamespace(pluginId)] ?? {});
+    return isPluginConfigured(plugin, this.getConfig().pluginConfig[this.stateNamespace(pluginId)] ?? {});
   }
 
   private resolvePaneTarget(paneId: string): string | undefined {
-    return resolvePaneInstance(this.getLayoutFn(), paneId)?.instanceId;
+    return resolvePaneInstance(this.getLayout(), paneId)?.instanceId;
   }
 
   resolvePaneSettings(paneId: string): ResolvedRegistryPaneSettings | null {
     return resolveRegistryPaneSettings({
-      config: this.getConfigFn(),
+      config: this.getConfig(),
       getConfigState: (pluginId, key) => this.getConfigState(pluginId, key),
-      getPaneRuntimeState: this.getPaneRuntimeStateFn,
-      layout: this.getLayoutFn(),
+      getPaneRuntimeState: this.getPaneRuntimeState,
+      layout: this.getLayout(),
       paneDefs: this.contributions.panesMap,
       paneOwners: this.contributions.panesMap.owners,
       resolvePaneTarget: (targetPaneId) => this.resolvePaneTarget(targetPaneId),
@@ -454,7 +401,7 @@ export class PluginRegistry implements PluginRuntimeAccess {
   async togglePaneQuickSetting(paneId: string, key: string): Promise<void> {
     const quickSetting = this.resolvePaneQuickSettings(paneId).find((setting) => setting.key === key);
     if (!quickSetting) return;
-    await this.applyPaneSettingValueFn(paneId, quickSetting.field, !quickSetting.value);
+    await this.applyPaneSettingValue(paneId, quickSetting.field, quickSetting.nextValue);
   }
 
   getCommandPluginId(commandId: string): string | undefined {
@@ -473,6 +420,33 @@ export class PluginRegistry implements PluginRuntimeAccess {
     return this.contributions.paneTemplatesMap.owners.get(templateId);
   }
 
+  /**
+   * The plugin that owns this pane type when it is switched off. A pane of a
+   * switched-off plugin stays hidden, so callers offer to turn it on instead
+   * of adding one.
+   */
+  getDisabledPaneOwner(
+    paneType: string,
+    disabledPlugins: readonly string[] = this.getConfig().disabledPlugins,
+  ): DisabledPluginOwner | null {
+    return this.disabledOwner(this.getPanePluginId(paneType), disabledPlugins);
+  }
+
+  /** The same for a template: its own plugin, or the one owning the pane it opens. */
+  getDisabledPaneTemplateOwner(
+    templateId: string,
+    disabledPlugins: readonly string[] = this.getConfig().disabledPlugins,
+  ): DisabledPluginOwner | null {
+    const paneType = this.paneTemplates.get(templateId)?.paneId;
+    return this.disabledOwner(this.getPaneTemplatePluginId(templateId), disabledPlugins)
+      ?? (paneType ? this.getDisabledPaneOwner(paneType, disabledPlugins) : null);
+  }
+
+  private disabledOwner(pluginId: string | undefined, disabledPlugins: readonly string[]): DisabledPluginOwner | null {
+    if (!pluginId || !disabledPlugins.includes(pluginId)) return null;
+    return { id: pluginId, name: this.plugins.get(pluginId)?.name ?? pluginId };
+  }
+
   getBrokerPluginId(brokerType: string): string | undefined {
     return this.contributions.brokersMap.owners.get(brokerType);
   }
@@ -489,16 +463,48 @@ export class PluginRegistry implements PluginRuntimeAccess {
   isPaneFloating(paneId: string): boolean {
     try {
       const target = this.resolvePaneTarget(paneId);
-      return !!target && this.getLayoutFn().floating.some((entry) => entry.instanceId === target);
+      return !!target && this.getLayout().floating.some((entry) => entry.instanceId === target);
     } catch {
       return false;
     }
   }
 
+  /**
+   * The state parts of a plugin's context. `namespaceKey` is the plugin's id,
+   * or the namespace a composed module keeps; both resolve the way a render
+   * context's id does.
+   */
+  private createNamespacedContext(namespaceKey: string): NamespacedPluginContext {
+    const stateId = this.stateNamespace(namespaceKey);
+    return {
+      persistence: createPluginPersistence(
+        this.persistence.pluginState,
+        this.persistence.resources,
+        `plugin:${stateId}`,
+        stateId,
+      ),
+      resume: createPluginResumeState({
+        pluginId: stateId,
+        getResumeState: (key, version) => this.getResumeState(namespaceKey, key, version),
+        setResumeState: (key, value, version) => this.setResumeState(namespaceKey, key, value, version),
+        deleteResumeState: (key) => this.deleteResumeState(namespaceKey, key),
+        getPaneRuntimeState: (paneId) => this.getPaneRuntimeState(paneId),
+        updatePaneRuntimeState: (paneId, patch) => this.updatePaneRuntimeState(paneId, patch),
+      }),
+      teamState: createPluginTeamState(stateId),
+      configState: {
+        get: (key) => this.getConfigState(namespaceKey, key),
+        set: (key, value) => this.setConfigState(namespaceKey, key, value),
+        delete: (key) => this.deleteConfigState(namespaceKey, key),
+        keys: () => this.getConfigStateKeys(namespaceKey),
+      },
+    };
+  }
+
   private createContext(pluginId: string): GloomPluginContext {
     const contributions = this.contributions;
     const items = contributions.getOrCreatePluginItems(pluginId);
-    return {
+    return bindPluginContextNamespaces({
       registerPane: (pane) => contributions.registerPane(pluginId, pane),
       registerPaneTemplate: (template) => contributions.registerPaneTemplate(pluginId, template, true),
       registerCommand: (command) => contributions.registerCommand(pluginId, command),
@@ -523,45 +529,25 @@ export class PluginRegistry implements PluginRuntimeAccess {
         return dispose;
       },
       watchNewsQuery: (query, listener) => {
-        const dispose = this.watchNewsQueryFn(query, listener);
+        const dispose = this.watchNewsQuery(query, listener);
         items.newsQueryWatchDisposers.push(dispose);
         return dispose;
       },
-      getData: (ticker) => this.getDataFn(ticker),
-      getTicker: (symbol) => this.getTickerFn(symbol),
-      getConfig: () => this.getConfigFn(),
+      getData: (ticker) => this.getData(ticker),
+      getTicker: (symbol) => this.getTicker(symbol),
+      getConfig: () => this.getConfig(),
       getPaneDef: (paneId) => contributions.panesMap.get(paneId),
       marketData: this.marketData,
       connectionHealth: this.connectionHealth,
       tickerRepository: this.tickerRepository,
-      persistence: createPluginPersistence(
-        this.persistence.pluginState,
-        this.persistence.resources,
-        `plugin:${this.stateNamespace(pluginId)}`,
-        this.stateNamespace(pluginId),
-      ),
+      ...this.createNamespacedContext(pluginId),
       log: debugLog.createLogger(pluginId),
-      resume: createPluginResumeState({
-        pluginId: this.stateNamespace(pluginId),
-        getResumeState: (key, version) => this.getResumeState(pluginId, key, version),
-        setResumeState: (key, value, version) => this.setResumeState(pluginId, key, value, version),
-        deleteResumeState: (key) => this.deleteResumeState(pluginId, key),
-        getPaneRuntimeState: (paneId) => this.getPaneRuntimeStateFn(paneId),
-        updatePaneRuntimeState: (paneId, patch) => this.updatePaneRuntimeStateFn(paneId, patch),
-      }),
-      teamState: createPluginTeamState(this.stateNamespace(pluginId)),
       paneSettings: createPluginPaneSettingsState({
-        getLayout: () => this.getLayoutFn(),
-        updateLayout: (layout) => this.updateLayoutFn(layout),
+        getLayout: () => this.getLayout(),
+        updateLayout: (layout) => this.updateLayout(layout),
         resolvePaneTarget: (paneId) => this.resolvePaneTarget(paneId),
       }),
-      configState: {
-        get: (key) => this.getConfigState(pluginId, key),
-        set: (key, value) => this.setConfigState(pluginId, key, value),
-        delete: (key) => this.deleteConfigState(pluginId, key),
-        keys: () => this.getConfigStateKeys(pluginId),
-      },
-      createBrokerInstance: (brokerType, label, values) => this.createBrokerInstanceFn(brokerType, label, values),
+      createBrokerInstance: (brokerType, label, values) => this.createBrokerInstance(brokerType, label, values),
       updateBrokerInstance: this.updateBrokerInstance,
       syncBrokerInstance: this.syncBrokerInstance,
       removeBrokerInstance: this.removeBrokerInstance,
@@ -572,7 +558,7 @@ export class PluginRegistry implements PluginRuntimeAccess {
       showPane: this.showPane,
       createPaneFromTemplate: this.createPaneFromTemplate,
       hidePane: this.hidePane,
-      focusPane: this.focusPane,
+      focusPane: (paneId) => this.focusPane(paneId),
       pinTicker: this.pinTicker,
       navigateTicker: this.navigateTicker,
       openPaneSettings: this.openPaneSettings,
@@ -584,8 +570,8 @@ export class PluginRegistry implements PluginRuntimeAccess {
       },
       // Every plugin event is also a host event; TypeScript cannot see that through the generic key.
       emit: (event, payload) => this.events.emit(event, payload as HostEvents[typeof event]),
-      notify: (notification) => this.notifyFn(notification),
-    };
+      notify: (notification) => this.notify(notification),
+    }, (stateId) => this.createNamespacedContext(stateId));
   }
 
   private registryLog = debugLog.createLogger("registry");
@@ -624,9 +610,9 @@ export class PluginRegistry implements PluginRuntimeAccess {
       this.slots.register(plugin, (renderer) => withPluginRender(this.stateNamespace(plugin.id), this, renderer));
 
       const setupCommand = createPluginSetupCommand(plugin, {
-        getValues: () => this.getConfigFn().pluginConfig[this.stateNamespace(plugin.id)] ?? {},
+        getValues: () => this.getConfig().pluginConfig[this.stateNamespace(plugin.id)] ?? {},
         setValues: (values) => this.setConfigStates(plugin.id, values),
-        notify: (body, type) => this.notifyFn({ body, type }),
+        notify: (body, type) => this.notify({ body, type }),
       });
       if (setupCommand) this.contributions.registerCommand(plugin.id, setupCommand);
 

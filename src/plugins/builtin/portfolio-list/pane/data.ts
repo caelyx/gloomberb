@@ -34,6 +34,9 @@ const QUOTE_SORT_COLUMN_IDS = new Set([
   "ext_hours",
   "mkt_value",
   "weight",
+  "drift",
+  "trade",
+  "trade_value",
   "day_pnl",
   "pnl",
   "pnl_pct",
@@ -73,6 +76,23 @@ export function needsVisibleQuoteWatchdogRefresh(
   if (needsVisibleQuoteWarmup(financials, now)) return true;
   const quoteTimestamp = resolveQuoteAgeTimestamp(financials?.quote, now);
   return quoteTimestamp == null || now - quoteTimestamp >= maxAgeMs;
+}
+
+/**
+ * How a row whose quote needs warming is refreshed now, or null while it waits.
+ * A quote sort warms with the snapshot, which carries the change baseline, but
+ * a quote can stay missing or stale for good (an index without a feed, a
+ * listing that has not traded this session). Such a row gets one snapshot per
+ * snapshot cooldown and quote refreshes in between, never its full financials
+ * every quote cooldown.
+ */
+export function selectQuoteWarmupRoute(
+  attempts: { quoteAt?: number; snapshotAt?: number },
+  withSnapshot: boolean,
+  now = Date.now(),
+): "snapshot" | "quote" | null {
+  if (withSnapshot && now - (attempts.snapshotAt ?? 0) >= VISIBLE_SNAPSHOT_REFRESH_COOLDOWN_MS) return "snapshot";
+  return now - (attempts.quoteAt ?? 0) >= VISIBLE_QUOTE_REFRESH_COOLDOWN_MS ? "quote" : null;
 }
 
 export function needsVisibleSnapshotWarmup(
@@ -136,9 +156,12 @@ export function buildTrackedCurrencies(
   financialsMap: Map<string, TickerFinancials>,
   accountState: ResolvedPortfolioAccountState | null,
   baseCurrency: string,
+  /** The currency of cash entered by hand. */
+  cashCurrency?: string,
 ): string[] {
   const currencies = new Set<string>([baseCurrency]);
   if (accountState?.account.currency) currencies.add(accountState.account.currency);
+  if (cashCurrency) currencies.add(cashCurrency);
 
   for (const ticker of tickers) {
     if (ticker.metadata.currency) {

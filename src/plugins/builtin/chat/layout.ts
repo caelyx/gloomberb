@@ -23,6 +23,8 @@ export function isGroupedWithPrevious(messages: ChatMessage[], index: number) {
   const prev = messages[index - 1]!;
   const curr = messages[index]!;
   if (prev.user.id !== curr.user.id) return false;
+  // The Discord tag sits on a header, so a linked person's Discord and app messages do not share one.
+  if ((prev.origin === "discord") !== (curr.origin === "discord")) return false;
   return new Date(curr.createdAt).getTime() - new Date(prev.createdAt).getTime() < MESSAGE_GROUP_THRESHOLD_MS;
 }
 
@@ -34,7 +36,7 @@ export function formatInlinePreview(text: string, width: number) {
   return truncateWithEllipsis(normalizeInlinePreview(text), width);
 }
 
-export type ChatBodyInlineToken = InlineContentToken;
+type ChatBodyInlineToken = InlineContentToken;
 
 export type ChatBodyLine = ChatBodyInlineToken[];
 
@@ -249,7 +251,7 @@ export function getMessageBodyTokenLines(
   return lines.length > 0 ? lines : [[]];
 }
 
-export function getMessageBodyLines(
+function getMessageBodyLines(
   message: ChatMessage,
   width: number,
   catalog?: Record<string, InlineTickerCatalogEntry>,
@@ -267,10 +269,15 @@ export function estimateMessageHeight(
 ) {
   const headerHeight = grouped ? 0 : 1;
   const contentLineWidth = Math.max(width - 4, 1);
-  const bodyLineCount = catalog
-    ? getMessageBodyTokenLines(message.content, contentLineWidth, catalog).length
-    : getMessageBodyLines(message, width, catalog).length;
-  return headerHeight + (message.replyTo ? 1 : 0) + bodyLineCount;
+  const imageCount = message.attachments?.length ?? 0;
+  // The terminal draws a row per image and one for a review note; an image-only message has no text row.
+  const bodyLineCount = message.content.length === 0 && imageCount > 0
+    ? 0
+    : catalog
+      ? getMessageBodyTokenLines(message.content, contentLineWidth, catalog).length
+      : getMessageBodyLines(message, width, catalog).length;
+  const reviewNoteHeight = message.attachmentReview ? 1 : 0;
+  return headerHeight + (message.replyTo ? 1 : 0) + bodyLineCount + imageCount + reviewNoteHeight;
 }
 
 export function estimateComposerHeight(text: string, width: number) {

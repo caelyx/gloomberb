@@ -8,12 +8,12 @@ import { measurePerfAsync } from "../../../utils/perf-marks";
 import {
   backendRequest,
   initElectrobunBackend,
-  onPluginsUpdated,
+  onBackendMessage,
   replaceElectrobunCapabilityManifests,
   setElectrobunRemoteRequestHandler,
 } from "./backend-rpc";
 import { installElectrobunCapabilityStreamClient } from "./capability-stream-client";
-import { installFocusScopeRelease } from "./host/focus-scope";
+import { installFocusScopeRelease } from "../../dom/host/focus-scope";
 import { installElectrobunBrokerRemoteClient } from "./broker-remote-client";
 import { installElectrobunConfigStoreHost } from "./config-host";
 import {
@@ -23,17 +23,17 @@ import {
 import { installElectrobunUpdateHost } from "./update-host";
 import { installScreenshotWatermark } from "./screenshot-watermark";
 import { installElectrobunWindowFullscreenTracking } from "./window-fullscreen";
-import { installDomMarketDataFrames } from "./data-frames";
-import { DomErrorBoundary, DomHostProviders } from "./dom-host-providers";
+import { installDomMarketDataFrames } from "../../dom/data-frames";
+import { DomErrorBoundary, DomHostProviders } from "../../dom/dom-host-providers";
 import { DesktopFatalScreen } from "./fatal-screen";
+import { resolveRendererWindowError } from "./renderer-window-error";
 import { createWebUiHost, webRendererHost } from "./ui-host";
-import { createApplicationMenuBridge } from "./application-menu-bridge";
-import { createDesktopDeepLinkBridge } from "./desktop-deeplink-bridge";
 import {
   initializeDesktopResearchActivity,
   observeDesktopDeepLinks,
 } from "../../../api-client/research-activity";
 import { createDesktopWindowBridge } from "./desktop/window/bridge";
+import type { DesktopApplicationMenuBridge } from "../../../types/desktop-menu";
 import { prepareDetachedSnapshot } from "./desktop/window/snapshot";
 import { createElectrobunAppServices } from "./app-services";
 import { getRendererPlugins } from "../../../plugins/catalog-ui";
@@ -44,8 +44,9 @@ import { remoteNotesFilesIO, setNotesFilesIO } from "../../../plugins/builtin/no
 import { NOTES_FILES_CAPABILITY_ID } from "../../../capabilities";
 import { loadOfficialPluginIds } from "../../../plugins/builtin/plugin-marketplace/feed";
 import { crashReportsEnabled, installCrashReporter, reportCrash } from "../../../telemetry/crash-reports";
-import { installWindowCrashListeners } from "../../../telemetry/crash-reports-dom";
+import { browserDoNotTrack, installWindowCrashListeners } from "../../../telemetry/crash-reports-dom";
 import { currentTelemetryConfig } from "../../../telemetry/live-config";
+import { attentionCountsEnabled, installAttentionCounter } from "../../../telemetry/attention-counts";
 import { installUsageCounter, usageCountsEnabled } from "../../../telemetry/usage-counts";
 import { installWindowUsageFlush } from "../../../telemetry/usage-counts-dom";
 
@@ -83,7 +84,12 @@ function renderFatalError(error: unknown, details?: string, title = "Gloomberb f
 }
 
 window.__gloomRenderFatalError = (error, details, source) => {
-  if (appMounted && source === "unhandledrejection") {
+  if (resolveRendererWindowError({
+    error,
+    details,
+    source,
+    appMounted,
+  }) === "ignore") {
     return;
   }
   renderFatalError(error, details, "Gloomberb crashed");
@@ -136,6 +142,7 @@ async function boot() {
     getInstallId: () => init.telemetry.installId,
     officialPluginIds: loadOfficialPluginIds,
   });
+  installAttentionCounter(() => !init.telemetry.optedOut && !browserDoNotTrack() && attentionCountsEnabled(currentTelemetryConfig(init.config)));
   installElectrobunCapabilityStreamClient();
   installFocusScopeRelease();
   installElectrobunWindowFullscreenTracking();
@@ -147,9 +154,13 @@ async function boot() {
   const config = desktopSnapshot?.config ?? init.config;
   applyLanguageFromConfig(config);
   const desktopWindowBridge = createDesktopWindowBridge(init.windowKind, init.paneId);
-  const desktopApplicationMenuBridge = createApplicationMenuBridge();
+  const desktopApplicationMenuBridge: DesktopApplicationMenuBridge = {
+    subscribe: (listener) => onBackendMessage("application-menu.select", ({ command }) => listener(command)),
+  };
   initializeDesktopResearchActivity();
-  const desktopDeepLinkBridge = observeDesktopDeepLinks(createDesktopDeepLinkBridge());
+  const desktopDeepLinkBridge = observeDesktopDeepLinks({
+    subscribe: (listener) => onBackendMessage("desktop.deepLink", listener),
+  });
   const webUiHost = createWebUiHost(init.desktopPlatform);
   // Compiled by the Bun process, which owns the filesystem. A failure here must
   // not stop the app from starting: the marketplace reports broken plugins, and
@@ -193,7 +204,7 @@ async function boot() {
   setPluginManager(pluginManager);
   // Official plugins the Bun process updated in the background, brought into
   // this session the way the Plugins pane does after an update.
-  onPluginsUpdated(({ directories }) => {
+  onBackendMessage("plugins.updated", ({ directories }) => {
     const marketplace = getMarketplaceHost();
     if (marketplace) void activateUpdatedPlugins(directories, marketplace, pluginManager);
   });

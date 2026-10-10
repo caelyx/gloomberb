@@ -1,7 +1,10 @@
+import { futuresGenericListing, futuresGenericPriceBasis } from "../../utils/futures-generic";
 import type { TimeRange } from "../../time-series/range";
+import { RANGE_HISTORY_RESOLUTION } from "../../time-series/resolution";
 import type {
   FinancialStatement,
   Fundamentals,
+  NextEarnings,
   OptionsChain,
   PricePoint,
   Quote,
@@ -34,10 +37,31 @@ function cloudInternalProviderId(providerMeta?: CloudProviderMeta): string | nul
   return upstream ? `${GLOOMBERB_CLOUD_PROVIDER_ID}:${upstream}` : null;
 }
 
+/**
+ * A previous close is a price from inside the trailing 52 weeks, so it cannot
+ * sit far below the 52-week low. The service has sent 0.000205 as the
+ * Shanghai Composite's close (52-week low 3,741), which drew a +1.86e9% move.
+ * Today's price plays no part, so a real gap of any size still shows; two
+ * orders of magnitude leave room for a 52-week low that lags a crash or a split.
+ */
+const IMPOSSIBLE_CLOSE_FACTOR = 100;
+
+function isImpossiblePreviousClose(
+  previousClose: number | null | undefined,
+  low52w: number | null | undefined,
+): boolean {
+  return typeof previousClose === "number" && Number.isFinite(previousClose) && previousClose > 0
+    && typeof low52w === "number" && Number.isFinite(low52w) && low52w > 0
+    && previousClose * IMPOSSIBLE_CLOSE_FACTOR < low52w;
+}
+
 export function mapQuote(
   quote: CloudQuotePayload,
   providerMeta?: CloudProviderMeta,
 ): Quote {
+  if (quote.priceBasis != null && !["nav", "per-unit", "percent-of-par", "points", "thirty-seconds"].includes(quote.priceBasis)) {
+    throw createProviderMiss("Unsupported quote price basis");
+  }
   const { currency, divisor } = resolveCurrencyUnit(quote.currency);
   const listingExchangeName = quote.listingExchangeName ?? quote.exchangeName;
   const listingExchangeFullName =
@@ -45,20 +69,34 @@ export function mapQuote(
     quote.fullExchangeName ??
     listingExchangeName;
   const internalProviderId = cloudInternalProviderId(providerMeta);
-  const change = typeof quote.change === "number" && Number.isFinite(quote.change)
+  const impossibleClose = isImpossiblePreviousClose(quote.previousClose, quote.low52w);
+  const change = !impossibleClose && typeof quote.change === "number" && Number.isFinite(quote.change)
     ? quote.change / divisor
     : Number.NaN;
-  const changePercent = typeof quote.changePercent === "number" && Number.isFinite(quote.changePercent)
+  const changePercent = !impossibleClose && typeof quote.changePercent === "number" && Number.isFinite(quote.changePercent)
     ? quote.changePercent
     : Number.NaN;
+  // A generic future (VX1, TY1) reads in points or 32nds, not dollars.
+  const generic = futuresGenericListing(quote.symbol, quote.listingExchangeName ?? quote.exchangeName);
+  const priceObservation = quote.priceBasis === "nav" ? "nav" : undefined;
+  const priceBasis = quote.priceBasis === "nav"
+    ? "per-unit"
+    : (generic ? futuresGenericPriceBasis(generic) : null) ?? quote.priceBasis;
   return withoutUndefinedFields(reconcileQuoteDayRange({
     ...quote,
+    priceBasis,
+    priceObservation,
     currency: currency || quote.currency,
     price: normalizePriceValueByDivisor(quote.price, divisor) ?? quote.price,
     change,
     changePercent,
-    previousClose: normalizePriceValueByDivisor(quote.previousClose, divisor),
+    previousClose: impossibleClose ? undefined : normalizePriceValueByDivisor(quote.previousClose, divisor),
     regularClose: normalizePriceValueByDivisor(quote.regularClose, divisor),
+    // JSON carries an unavailable move as null; the percent is unitless.
+    regularChange: normalizePriceValueByDivisor(quote.regularChange ?? undefined, divisor),
+    regularChangePercent: typeof quote.regularChangePercent === "number" && Number.isFinite(quote.regularChangePercent)
+      ? quote.regularChangePercent
+      : undefined,
     high52w: normalizePriceValueByDivisor(quote.high52w, divisor),
     low52w: normalizePriceValueByDivisor(quote.low52w, divisor),
     bid: normalizePriceValueByDivisor(quote.bid, divisor),
@@ -188,7 +226,7 @@ const CLOUD_PER_SHARE_BASES = ["forwardEps", "dividendRate"] as const;
  * and the dividend yield from; JSON encodes a withdrawn one as null, and only
  * a finite number is kept.
  */
-export function mapCloudFundamentals(fundamentals: Fundamentals | undefined): Fundamentals | undefined {
+function mapCloudFundamentals(fundamentals: Fundamentals | undefined): Fundamentals | undefined {
   const value = redactUnavailableFundamentals(fundamentals);
   if (!value) return value;
   let result = value;
@@ -199,6 +237,19 @@ export function mapCloudFundamentals(fundamentals: Fundamentals | undefined): Fu
     delete result[field];
   }
   return result;
+}
+
+const EARNINGS_TIMINGS: ReadonlySet<unknown> = new Set(["bmo", "dmh", "amc"]);
+const EARNINGS_TIMING_SOURCES: ReadonlySet<unknown> = new Set(["filing", "calendar", "history"]);
+
+/** The served next report; one without a calendar date is left out. */
+function mapCloudNextEarnings(value: NextEarnings | undefined): NextEarnings | undefined {
+  if (!value || typeof value.date !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value.date)) return undefined;
+  return {
+    date: value.date,
+    timing: EARNINGS_TIMINGS.has(value.timing) ? value.timing : null,
+    timingSource: EARNINGS_TIMING_SOURCES.has(value.timingSource) ? value.timingSource : null,
+  };
 }
 
 /**
@@ -223,6 +274,7 @@ export function mapCloudFinancials(
     quoteMetadata: financials.quoteMetadata,
     quoteContributions: financials.quoteContributions,
     profile: financials.profile,
+    ...(financials.nextEarnings ? { nextEarnings: mapCloudNextEarnings(financials.nextEarnings) } : {}),
     fundamentals: mapCloudFundamentals(financials.fundamentals),
     financialCurrency: financials.financialCurrency,
     statementHistory: financials.statementHistory,
@@ -265,7 +317,7 @@ export function mapBatchError<T>(
   fallbackMessage: string,
 ): Error {
   if (isEmptyCloudStatus(item.status)) {
-    return createProviderMiss(item.reasonCode ?? fallbackMessage);
+    return createProviderMiss(item.reasonCode ?? fallbackMessage, item.message);
   }
   return new Error(item.reasonCode ?? fallbackMessage);
 }
@@ -319,29 +371,24 @@ export function formatCloudDateTime(
   return `${year}-${month}-${day}`;
 }
 
+const HISTORY_OUTPUT_SIZE: Record<TimeRange, number> = {
+  "1D": 24 * 12,
+  "1W": 7 * 24,
+  "1M": 31,
+  "3M": 93,
+  "6M": 186,
+  "1Y": 366,
+  "5Y": 261,
+  "ALL": 600,
+};
+
+/** The bar size comes from the shared range table, which `gloomberb help history` also lists. */
 export function toHistoryRequest(range: TimeRange): {
   interval: string;
   outputsize: number;
   rangeKey: TimeRange;
 } {
-  switch (range) {
-    case "1D":
-      return { interval: "5min", outputsize: 24 * 12, rangeKey: range };
-    case "1W":
-      return { interval: "1h", outputsize: 7 * 24, rangeKey: range };
-    case "1M":
-      return { interval: "1day", outputsize: 31, rangeKey: range };
-    case "3M":
-      return { interval: "1day", outputsize: 93, rangeKey: range };
-    case "6M":
-      return { interval: "1day", outputsize: 186, rangeKey: range };
-    case "1Y":
-      return { interval: "1day", outputsize: 366, rangeKey: range };
-    case "5Y":
-      return { interval: "1week", outputsize: 261, rangeKey: range };
-    case "ALL":
-      return { interval: "1month", outputsize: 600, rangeKey: range };
-    default:
-      return { interval: "1day", outputsize: 366, rangeKey: range };
-  }
+  const resolution = RANGE_HISTORY_RESOLUTION[range];
+  if (!resolution) return { interval: "1day", outputsize: 366, rangeKey: range };
+  return { interval: toCloudInterval(resolution), outputsize: HISTORY_OUTPUT_SIZE[range], rangeKey: range };
 }

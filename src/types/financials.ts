@@ -38,9 +38,25 @@ export interface QuoteMetadata {
   fieldSources?: Partial<Record<"currency" | "instrumentType", QuoteMetadataSource>>;
 }
 
-export interface Quote {
+/**
+ * What a record's share counts count: depositary receipts or the ordinary
+ * shares behind them. Gloom Cloud states it only when it established it.
+ */
+export type ShareBasis = "depositary_receipt" | "ordinary";
+
+/** How a depositary receipt relates to the ordinary shares, as Gloom Cloud states it. */
+interface DepositaryReceiptFacts {
+  /** Whether the listing is a depositary receipt; absent when unknown. */
+  isDepositaryReceipt?: boolean;
+  /** Ordinary shares per receipt, on a receipt's own records. */
+  adrRatio?: number;
+}
+
+export interface Quote extends DepositaryReceiptFacts {
   /** Applies to this price observation; a stored position cannot supply it. */
   priceBasis?: PriceBasis;
+  /** Daily fund net asset value; independent of the units used to format its price. */
+  priceObservation?: "nav";
   symbol: string;
   /** Provider-reported security type, independent of the company profile. */
   instrumentType?: string;
@@ -56,6 +72,9 @@ export interface Quote {
   regularClose?: number;
   /** Exchange-local date of regularClose; separate from the daily previous-close reference. */
   regularCloseSessionDate?: string;
+  /** Move of that completed regular session from the one before it, in this quote's currency; set and cleared together with regularClose. */
+  regularChange?: number;
+  regularChangePercent?: number;
   /** Provider's exchange-local session date for the daily quote reference. */
   changeSessionDate?: string;
   high52w?: number;
@@ -104,8 +123,12 @@ export interface QuoteContribution extends Quote {
 
 export type QuoteContributionMap = Record<string, QuoteContribution>;
 
-export interface Fundamentals {
-  source?: "twelvedata" | "yahoo";
+export interface Fundamentals extends DepositaryReceiptFacts {
+  /** Every share count here is on this basis, the basis of the listing's price and market cap; absent when unproven. */
+  shareBasis?: ShareBasis;
+  /** On a receipt, the ordinary shares behind `sharesOutstanding`. */
+  underlyingOrdinaryShares?: number;
+  source?: "gloom";
   fetchedAt?: string;
   stale?: boolean;
   /** Currency of reported revenue, income, and cash flows; may differ from the listing. */
@@ -130,7 +153,7 @@ export interface Fundamentals {
   freeCashFlow?: number;
   dividendYield?: number;
   dividendYieldBasis?: "forward" | "trailing";
-  dividendYieldSource?: "twelvedata" | "yahoo";
+  dividendYieldSource?: "gloom";
   /**
    * Annual dividend per share behind `dividendYield`, in the listing's major
    * currency unit. Served only when its basis matches the yield, so the yield
@@ -147,6 +170,20 @@ export interface Fundamentals {
   return3Y?: number;
   lastQuarterGrowth?: number;
   sharesOutstanding?: number;
+  /** Free float: shares outstanding less insider and strategic holdings. */
+  floatShares?: number;
+  beta?: number;
+  /** Shares sold short at the source's latest settlement. */
+  sharesShort?: number;
+  /** Shares short over float from the same observation, as a fraction (0.0127 for 1.27%). */
+  shortPercentOfFloat?: number;
+  /** Days to cover: shares short over average daily volume. */
+  shortRatio?: number;
+  /** Fractions of shares outstanding. */
+  insiderPercentHeld?: number;
+  institutionPercentHeld?: number;
+  /** The latest ex-dividend date (YYYY-MM-DD) while the dividend is being paid. */
+  exDividendDate?: string;
 }
 
 type HolderOwnerType = "institution" | "fund" | "direct" | "insider";
@@ -161,6 +198,8 @@ export interface HolderRecord {
   percentHeld?: number;
   changeShares?: number;
   changePercent?: number;
+  /** Set when the position's filing ties it to the receipts or to the ordinary shares. */
+  shareBasis?: ShareBasis;
 }
 
 interface HolderSummary {
@@ -170,11 +209,18 @@ interface HolderSummary {
   institutionsCount?: number;
 }
 
-export interface HolderData {
+export interface HolderData extends DepositaryReceiptFacts {
   providerId?: string;
   symbol: string;
   name?: string;
+  /** The listing's price currency. */
   currency?: string;
+  /** The currency of `value`, which can differ from the listing's (USD on a London line priced from 13F filings). */
+  valueCurrency?: string;
+  /** Reported shares times the latest price, or times the price at the report date. */
+  valueBasis?: "latest_price" | "period_end_price";
+  /** Set when every row is on one basis. */
+  shareBasis?: ShareBasis;
   exchange?: string;
   asOf?: string;
   summary?: HolderSummary;
@@ -287,6 +333,22 @@ export interface CompanyProfile {
   description?: string;
   sector?: string;
   industry?: string;
+  employees?: number;
+  website?: string;
+  /** SEC Standard Industrial Classification, four digits (US filers). */
+  sic?: string;
+  sicDescription?: string;
+  /** Fiscal year end as MM-DD (US filers). */
+  fiscalYearEnd?: string;
+}
+
+/** A company's next report from the earnings calendar. */
+export interface NextEarnings {
+  date: string;
+  /** Before the open, during market hours, after the close. */
+  timing: "bmo" | "dmh" | "amc" | null;
+  /** "history" when the timing is predicted from the last two reports. */
+  timingSource: "filing" | "calendar" | "history" | null;
 }
 
 export type IncomeStatementField = "netIncome" | "netIncomeIncludingNoncontrollingInterests" | "netIncomeCommonStockholders";
@@ -340,7 +402,7 @@ export interface ReportedOperatingCohort {
 
 /** @deprecated No longer populated. */
 export interface ProviderOperatingObservation {
-  provider: "yahoo" | "twelvedata";
+  provider: "gloom";
   sourceField: string;
   period: "annual" | "quarterly";
   endDate: string;
@@ -395,6 +457,8 @@ export interface ReportedEarningsCohort {
 export interface EarningsResultProvenance { version: 1; reported: ReportedEarningsCohort }
 
 export interface FinancialStatement {
+  /** The basis of this row's share counts and per-share earnings; absent when unproven. */
+  shareBasis?: ShareBasis;
   /** @deprecated No longer populated. */
   earningsResult?: EarningsResultProvenance;
   /** EPS lines unavailable for this period, for example because they disagree with the row's own income and shares. */
@@ -664,6 +728,7 @@ export interface TickerFinancials {
   quoteContributions?: QuoteContributionMap;
   fundamentals?: Fundamentals;
   profile?: CompanyProfile;
+  nextEarnings?: NextEarnings;
   annualStatements: FinancialStatement[];
   quarterlyStatements: FinancialStatement[];
   priceHistory: PricePoint[];
@@ -684,7 +749,7 @@ export interface OptionContract {
   lastPrice: number;
   change: number;
   percentChange: number;
-  /** Missing activity is unknown; an explicitly reported zero remains zero. Yahoo reports an untraded volume as zero. */
+  /** Missing activity is unknown; an explicitly reported zero remains zero. */
   volume?: number;
   openInterest?: number;
   bid: number;
@@ -704,7 +769,7 @@ export interface OptionsChain {
   puts: OptionContract[];
   providerId?: string;
   dataSource?: "live" | "delayed";
-  feed?: "opra" | "yahoo";
+  feed?: "opra" | "gloom";
   delayMinutes?: number;
   realtimeEligible?: boolean;
   /** ISO timestamp for the upstream options snapshot. */

@@ -21,7 +21,7 @@ const COLUMNS = [
   { key: "date", header: "As of" },
 ];
 
-export interface CreditConditionsHeadlessDependencies {
+interface CreditConditionsHeadlessDependencies {
   load(args: HeadlessPaneLoadArgs, loader: CreditSeriesLoader): Promise<CreditConditionsLoadResult>;
 }
 
@@ -29,7 +29,7 @@ const defaultDependencies: CreditConditionsHeadlessDependencies = {
   load: (_args, loader) => loadCreditConditions(false, loader),
 };
 
-export function createCreditConditionsHeadless(
+function createCreditConditionsHeadless(
   dependencies: CreditConditionsHeadlessDependencies = defaultDependencies,
 ): HeadlessPaneDefinition<"rows"> {
   return {
@@ -38,6 +38,7 @@ export function createCreditConditionsHeadless(
     options: [],
     columns: COLUMNS,
     describe: "Credit Spreads",
+    freshness: { source: "FRED", status: "not-a-feed", basis: "daily index levels", cadence: "daily", observedKey: "date" },
     async load(args, ctx) {
       const result = await dependencies.load(
         args,

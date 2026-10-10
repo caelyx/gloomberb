@@ -1,10 +1,12 @@
-import { t } from "../../../../i18n";
+import type { ReactNode } from "react";
+import { ExternalLinkText, RangeTrack, usePaneLinkMenuEntry } from "../../../../components";
+import { t, tf } from "../../../../i18n";
 import { formatMarketPriceWithCurrency, liveQuoteFormatOptions, type MarketFormatOptions } from "../../../../market-data/market/format";
-import { colors, priceColor } from "../../../../theme/colors";
+import { colors, hoverBg, priceColor } from "../../../../theme/colors";
 import type { Quote } from "../../../../types/financials";
-import { Box, Text, useUiCapabilities } from "../../../../ui";
-import { displayWidth, formatNumber, padTo } from "../../../../utils/format";
-import type { PositionTableRow, StatField } from "./types";
+import { Box, Text } from "../../../../ui";
+import { displayWidth, formatNumber, padTo, truncateToDisplayWidth } from "../../../../utils/format";
+import type { OverviewFunctionLink, PositionTableRow, StatField } from "./types";
 import { portfolioPnlLabel } from "../../portfolio-list/position-metrics";
 
 const STAT_COLUMN_GAP = 2;
@@ -12,6 +14,8 @@ const STAT_LABEL_WIDTH = 12;
 const FUNDAMENTALS_MAX_COLUMN_WIDTH = 40;
 const BOOK_LABEL_WIDTH = 4;
 const RANGE_ENDPOINT_WIDTH = 11;
+/** Shortest track worth drawing; below it the label shortens. */
+const RANGE_MIN_TRACK_WIDTH = 6;
 const POSITION_COLUMN_GAP = 1;
 
 interface PositionColumn {
@@ -24,113 +28,78 @@ interface PositionColumn {
   minPaneWidth?: number;
 }
 
-function RangeTrack({
-  barWidth,
-  markerIndex,
-  position,
-  markerColor,
-}: {
-  barWidth: number;
-  markerIndex: number;
-  position: number;
-  markerColor: string;
-}) {
-  // The desktop webview must not draw rules out of box-drawing glyphs.
-  if (useUiCapabilities().nativePaneChrome === true) {
-    return (
-      <Box
-        marginLeft={1}
-        marginRight={1}
-        width={barWidth}
-        height={1}
-        style={{ position: "relative", justifyContent: "center" }}
-      >
-        <Box style={{
-          position: "absolute",
-          left: 0,
-          right: 0,
-          height: "2px",
-          borderRadius: "1px",
-          backgroundColor: colors.border,
-        }} />
-        <Box style={{
-          position: "absolute",
-          left: `${position * 100}%`,
-          width: "8px",
-          height: "8px",
-          marginLeft: "-4px",
-          borderRadius: "50%",
-          backgroundColor: markerColor,
-        }} />
-      </Box>
-    );
-  }
-
-  return (
-    <Box marginLeft={1} marginRight={1} width={barWidth} flexDirection="row">
-      <Text fg={colors.border}>{"\u2500".repeat(markerIndex)}</Text>
-      <Text fg={markerColor}>{"\u25cf"}</Text>
-      <Text fg={colors.border}>{"\u2500".repeat(Math.max(0, barWidth - markerIndex - 1))}</Text>
-    </Box>
-  );
+/** Cells a range row needs around its track: label, endpoints and the gaps between them. */
+export function rangeRowChrome(labelWidth: number, endpointWidth: number): number {
+  return labelWidth + 1 + endpointWidth * 2 + 2;
 }
 
+/** The longest endpoint among ranges drawn together, so stacked tracks start and end in one column. */
+export function rangeEndpointWidth(
+  values: readonly number[],
+  currency: string,
+  priceOptions: MarketFormatOptions,
+): number {
+  const widths = values.map((value) => displayWidth(formatMarketPriceWithCurrency(value, currency, priceOptions)));
+  return Math.min(RANGE_ENDPOINT_WIDTH, Math.max(1, ...widths));
+}
+
+/**
+ * Where the price sits in a range, on one row: the label, the low, a track
+ * with a neutral marker and the high. The marker is the position, so no
+ * percentage repeats it.
+ */
 export function CompactRangeBar({
   current,
   low,
   high,
   label,
+  shortLabel,
+  labelWidth,
+  endpointWidth,
   width,
   currency,
   priceOptions,
-  markerColor,
 }: {
   current: number;
   low: number;
   high: number;
+  /** Translated, like `shortLabel`; `labelWidth` is measured from them. */
   label: string;
+  /** Used when the full label would leave the track too short. */
+  shortLabel?: string;
+  /** Shared by ranges drawn together, so their values line up. */
+  labelWidth: number;
+  endpointWidth: number;
   width: number;
   currency: string;
   /** The quote's live price options, so the endpoints keep the price's decimals. */
   priceOptions: MarketFormatOptions;
-  markerColor: string;
 }) {
   const range = high - low;
   if (range <= 0) return null;
   const position = Math.max(0, Math.min(1, (current - low) / range));
-  const pctLabel = `${Math.round(position * 100)}%`;
-  const endpointWidth = Math.min(
-    RANGE_ENDPOINT_WIDTH,
-    Math.max(7, Math.floor((width - 8) / 3)),
-  );
+  const useShortLabel = shortLabel != null && width - rangeRowChrome(labelWidth, endpointWidth) < RANGE_MIN_TRACK_WIDTH;
+  const shownLabel = useShortLabel ? shortLabel : label;
+  const shownLabelWidth = useShortLabel ? displayWidth(shortLabel) : labelWidth;
   const endpointOptions = { ...priceOptions, maxWidth: endpointWidth };
   const lowText = formatMarketPriceWithCurrency(low, currency, endpointOptions);
   const highText = formatMarketPriceWithCurrency(high, currency, endpointOptions);
-  const barWidth = Math.max(5, width - endpointWidth * 2 - 2);
-  const markerIndex = Math.max(0, Math.min(barWidth - 1, Math.round(position * (barWidth - 1))));
-  const labelWidth = Math.max(0, width - displayWidth(pctLabel));
+  const barWidth = Math.max(1, width - rangeRowChrome(shownLabelWidth, endpointWidth));
 
   return (
-    <Box flexDirection="column" width={width} flexShrink={0}>
-      <Box flexDirection="row" height={1}>
-        <Box width={labelWidth} overflow="hidden">
-          <Text fg={colors.textDim}>{label}</Text>
-        </Box>
-        <Text fg={markerColor}>{pctLabel}</Text>
+    <Box flexDirection="row" height={1} width={width} flexShrink={0} overflow="hidden">
+      <Box width={shownLabelWidth + 1} flexShrink={0} overflow="hidden">
+        <Text fg={colors.textDim}>{shownLabel}</Text>
       </Box>
-      <Box flexDirection="row" height={1}>
-        <Box width={endpointWidth} overflow="hidden">
-          <Text fg={colors.textDim}>{lowText}</Text>
-        </Box>
-        <RangeTrack
-          barWidth={barWidth}
-          markerIndex={markerIndex}
-          position={position}
-          markerColor={markerColor}
-        />
-        <Box flexDirection="row" width={endpointWidth} justifyContent="flex-end" overflow="hidden">
-          <Text fg={colors.textDim}>{highText}</Text>
-        </Box>
+      {/* The low sits against the track and the high starts after it, so stacked tracks align. */}
+      <Box flexDirection="row" width={endpointWidth} flexShrink={0} justifyContent="flex-end" overflow="hidden">
+        <Text fg={colors.text}>{lowText}</Text>
+      </Box>
+      <Box marginLeft={1} marginRight={1} flexShrink={0}>
+        <RangeTrack width={barWidth} position={position} markerColor={colors.textBright} />
+      </Box>
+      <Box width={endpointWidth} flexShrink={0} overflow="hidden">
+        <Text fg={colors.text}>{highText}</Text>
       </Box>
     </Box>
   );
@@ -173,8 +142,9 @@ export function QuoteBook({ quote, assetCategory, width }: { quote: Quote; asset
 
   return (
     <Box flexDirection="column" width={width} flexShrink={0}>
-      <BookRow label={t("Bid")} value={bidText} width={width} valueColor={colors.borderFocused} />
-      <BookRow label={t("Ask")} value={askText} width={width} valueColor={colors.negative} />
+      {/* Neutral: a red ask would read as a loss. */}
+      <BookRow label={t("Bid")} value={bidText} width={width} valueColor={colors.textBright} />
+      <BookRow label={t("Ask")} value={askText} width={width} valueColor={colors.textBright} />
       <BookRow label={t("Spr")} value={spreadText} width={width} valueColor={colors.textDim} />
     </Box>
   );
@@ -185,13 +155,75 @@ export function QuoteBook({ quote, assetCategory, width }: { quote: Quote; asset
  * capped at FUNDAMENTALS_MAX_COLUMN_WIDTH so a wide pane gets more of them
  * instead of pushing each value half a pane away from its label.
  */
-export function fundamentalsGridColumns(width: number): number {
+function fundamentalsGridColumns(width: number): number {
   if (width < 58) return 1;
   return Math.max(2, Math.min(4, Math.ceil((width + STAT_COLUMN_GAP) / (FUNDAMENTALS_MAX_COLUMN_WIDTH + STAT_COLUMN_GAP))));
 }
 
-export function FundamentalsGrid({ fields, width }: { fields: StatField[]; width: number }) {
-  const columnCount = fundamentalsGridColumns(width);
+function gridLabelWidth(colWidth: number): number {
+  return Math.min(STAT_LABEL_WIDTH, Math.max(8, Math.floor(colWidth * 0.45)));
+}
+
+/**
+ * Columns for words rather than figures (an industry, a website): the most
+ * the grid allows at which every value reads whole. A title that may be cut
+ * (a SIC description) does not count.
+ */
+export function textGridColumns(fields: StatField[], width: number): number {
+  const widest = Math.max(0, ...fields.map((field) => displayWidth(field.value)));
+  for (let columns = fundamentalsGridColumns(width); columns > 1; columns -= 1) {
+    const colWidth = Math.floor((width - STAT_COLUMN_GAP * (columns - 1)) / columns);
+    if (colWidth - gridLabelWidth(colWidth) >= widest) return columns;
+  }
+  return 1;
+}
+
+/** A figure that opens its research function: the whole cell is the target. */
+function LinkedStatCell({
+  link,
+  width,
+  onOpen,
+  children,
+}: {
+  link: OverviewFunctionLink;
+  width: number;
+  onOpen: (link: OverviewFunctionLink) => void;
+  children: ReactNode;
+}) {
+  // The pane menu lists each function once, so the keyboard reaches what a click opens.
+  usePaneLinkMenuEntry(`function:${link.templateId}`, tf("Open {label}", { label: t(link.name) }), () => onOpen(link));
+  return (
+    <Box
+      width={width}
+      flexDirection="row"
+      hoverBackgroundColor={hoverBg()}
+      onMouseDown={(event?: { button?: number }) => {
+        if ((event?.button ?? 0) === 0) onOpen(link);
+      }}
+      cursor="pointer"
+      data-gloom-interactive="true"
+      data-gloom-label={tf("Open {label}", { label: t(link.name) })}
+      data-gloom-ui="key-value-row"
+    >
+      {children}
+    </Box>
+  );
+}
+
+export function FundamentalsGrid({
+  fields,
+  width,
+  columns,
+  onOpenLink,
+}: {
+  fields: StatField[];
+  width: number;
+  /** Fixed column count; by default as many as keep each value near its label. */
+  columns?: number;
+  /** Opens a figure's research function; without it figures are plain. */
+  onOpenLink?: (link: OverviewFunctionLink) => void;
+}) {
+  const columnCount = columns ?? fundamentalsGridColumns(width);
   const availableWidth = width - STAT_COLUMN_GAP * (columnCount - 1);
   const baseColWidth = Math.floor(availableWidth / columnCount);
   const extraWidth = availableWidth - baseColWidth * columnCount;
@@ -215,19 +247,34 @@ export function FundamentalsGrid({ fields, width }: { fields: StatField[]; width
                 </Box>
               );
             }
-            const labelWidth = Math.min(STAT_LABEL_WIDTH, Math.max(8, Math.floor(colWidth * 0.45)));
+            const labelWidth = gridLabelWidth(colWidth);
             const valueWidth = Math.max(1, colWidth - labelWidth);
+            // A long value (an industry, a SIC title) is cut from the end, never from the label side.
+            const value = truncateToDisplayWidth(field.value, valueWidth);
+            const detailRoom = valueWidth - displayWidth(value) - 1;
+            const details = typeof field.detail === "string" ? [field.detail] : field.detail ?? [];
+            // A cut "in 4..." misleads; a title cut to "Semicond..." still names it.
+            const detail = details.find((text) => displayWidth(text) <= detailRoom)
+              ?? (field.clipDetail && details[0] && detailRoom >= 4 ? truncateToDisplayWidth(details[0], detailRoom) : "");
+            const content = (
+              <>
+                <Box width={labelWidth} overflow="hidden">
+                  <Text fg={colors.textDim}>{t(field.label)}</Text>
+                </Box>
+                <Box flexDirection="row" width={valueWidth} justifyContent="flex-end" overflow="hidden">
+                  {field.url
+                    ? <ExternalLinkText url={field.url} label={value} color={field.valueColor ?? colors.text} />
+                    : <Text fg={field.valueColor ?? colors.text}>{value}</Text>}
+                  {detail ? <Text fg={colors.textDim}>{` ${detail}`}</Text> : null}
+                </Box>
+              </>
+            );
             return (
               <Box key={j} flexDirection="row">
                 {j > 0 && <Box width={STAT_COLUMN_GAP} />}
-                <Box width={colWidth} flexDirection="row" data-gloom-ui="key-value-row">
-                  <Box width={labelWidth} overflow="hidden">
-                    <Text fg={colors.textDim}>{t(field.label)}</Text>
-                  </Box>
-                  <Box flexDirection="row" width={valueWidth} justifyContent="flex-end" overflow="hidden">
-                    <Text fg={field.valueColor ?? colors.text}>{field.value}</Text>
-                  </Box>
-                </Box>
+                {field.link && onOpenLink
+                  ? <LinkedStatCell link={field.link} width={colWidth} onOpen={onOpenLink}>{content}</LinkedStatCell>
+                  : <Box width={colWidth} flexDirection="row" data-gloom-ui="key-value-row">{content}</Box>}
               </Box>
             );
           })}

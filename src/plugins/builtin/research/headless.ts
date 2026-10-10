@@ -11,6 +11,7 @@ import type {
 } from "../../../types/plugin";
 import { buildEventRows, eventSourceNotice, type EventRow } from "./event-model";
 import { EVENT_COLUMNS, loadEventSources } from "./event-sources";
+import { REPORTED_DATA } from "../shared/report-freshness";
 
 export interface EarningsEstimateSources {
   actions: CorporateActionsData | null;
@@ -48,7 +49,7 @@ function matchesKind(row: EventRow, kind: string): boolean {
   return row.status === "Earnings" && row.earningsState === "reported";
 }
 
-export function projectEarningsEstimatesHeadless(
+function projectEarningsEstimatesHeadless(
   sources: EarningsEstimateSources,
   args: HeadlessPaneLoadArgs,
 ): HeadlessRowsResult {
@@ -92,6 +93,7 @@ export function createEarningsEstimatesHeadless(
 ): HeadlessPaneDefinition<"rows"> {
   return {
     shape: "rows",
+    freshness: { ...REPORTED_DATA, basis: "estimates and reported earnings", oldest: null },
     argument: {
       kind: "ticker",
       placeholder: "ticker",

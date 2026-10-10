@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   askgReducer,
+  canRateTurn,
   canRetryASKGError,
   describeASKGError,
-  describeToolStatus,
   EMPTY_ASKG_CONVERSATION,
   requiresLocalConfirmation,
   rowSymbol,
@@ -134,6 +134,94 @@ describe("askgReducer", () => {
     });
   });
 
+  test("a script reports how it ended on its own row and leaves the rows of its calls alone", () => {
+    const called = apply(withTurn(), {
+      seq: 1,
+      type: "tool-call",
+      turnId: "turn-1",
+      toolCallId: "script-1-1",
+      name: "pane.set_setting",
+      args: { paneId: "chart:main", key: "range", value: "5Y" },
+      writeTier: "ui-write",
+      requiresConfirmation: false,
+      preview: null,
+      timeoutMs: 10_000,
+      expiresAt: new Date().toISOString(),
+    });
+    const ran = askgReducer(called, {
+      type: "tool-result",
+      payload: {
+        turnId: "turn-1",
+        toolCallId: "script-1-1",
+        status: "ok",
+        truncated: false,
+        elapsedMs: 8,
+        undoToken: "undo-1",
+      },
+    });
+    const state = apply(
+      ran,
+      { seq: 2, type: "tool-result-ack", turnId: "turn-1", toolCallId: "script-1-1" },
+      {
+        seq: 3,
+        type: "tool-executed",
+        turnId: "turn-1",
+        toolCallId: "script-1-1",
+        name: "pane.set_setting",
+        source: "remote-op",
+        status: "ok",
+        summary: { elapsedMs: 9, truncated: false },
+      },
+      {
+        seq: 4,
+        type: "tool-executed",
+        turnId: "turn-1",
+        toolCallId: "script-1-2",
+        name: "news.search",
+        source: "server",
+        status: "error",
+        summary: { elapsedMs: 40, truncated: false, note: "Search failed." },
+      },
+      // An echo that calls the client's own call a server one changes nothing.
+      {
+        seq: 5,
+        type: "tool-executed",
+        turnId: "turn-1",
+        toolCallId: "script-1-1",
+        name: "pane.set_setting",
+        source: "server",
+        status: "ok",
+        summary: { elapsedMs: 9, truncated: false, note: "echo" },
+      },
+      // The script itself is reported last, once its calls are done.
+      {
+        seq: 6,
+        type: "tool-executed",
+        turnId: "turn-1",
+        toolCallId: "script-1",
+        name: "run_script",
+        source: "server",
+        status: "partial",
+        summary: { rowCount: 2, elapsedMs: 1_200, truncated: false, note: "2 calls, 1 failed, 1.2 s" },
+      },
+    );
+
+    const [call, serverCall, script, ...rest] = state.turns[0]!.tools;
+    expect(rest).toEqual([]);
+    expect(call).toMatchObject({
+      toolCallId: "script-1-1",
+      name: "pane.set_setting",
+      origin: "client",
+      writeTier: "ui-write",
+      argumentSummary: "chart:main \u00b7 key=range \u00b7 value=5Y",
+      undoToken: "undo-1",
+      undo: { status: "available" },
+    });
+    expect(serverCall).toMatchObject({ name: "news.search", origin: "server", status: "error" });
+    expect(script).toMatchObject({ name: "run_script", origin: "server", status: "partial" });
+    expect(script?.note).toBe("2 calls, 1 failed, 1.2 s");
+  });
+
   test("an error event describes the turn instead of leaving it streaming", () => {
     const state = apply(withTurn(), {
       seq: 1,
@@ -202,25 +290,34 @@ describe("timeline row helpers", () => {
     expect(summarizeToolArguments({ resource: "app://panes" })).toBe("app://panes");
   });
 
-  test("reads the row count into the status once a tool returns", () => {
-    const base = {
-      toolCallId: "call-1",
-      name: "val",
-      argumentSummary: "",
-      writeTier: "read" as const,
-      origin: "client" as const,
-      requiresConfirmation: false,
-      expanded: false,
-    };
-    expect(describeToolStatus({ ...base, status: "running" })).toBe("running");
-    expect(describeToolStatus({ ...base, status: "ok", rowCount: 1 })).toBe("1 row");
-    expect(describeToolStatus({ ...base, status: "ok", rowCount: 12 })).toBe("12 rows");
-    expect(describeToolStatus({ ...base, status: "timeout" })).toBe("timed out");
-  });
-
   test("finds the symbol a result row is about", () => {
     expect(rowSymbol({ ticker: "aapl", note: "x" })).toBe("AAPL");
     expect(rowSymbol({ name: "Apple Inc" })).toBeNull();
+  });
+});
+
+describe("daily questions left", () => {
+  test("counts each turn the platform admits after the limits were read, and none once it refuses at the cap", () => {
+    const limits = {
+      requestsPerMinute: 20,
+      turnsPerDay: 300,
+      turnsRemainingToday: 12,
+      maxToolCallsPerTurn: 8,
+      turnWallClockMs: 60_000,
+      clientToolTimeoutMs: 10_000,
+    };
+    const session = (seq: number, turnId: string): ASKGSseEvent => ({
+      seq, type: "session", sessionId: "s1", turnId, model: "m", promptVersion: "v1",
+    });
+    let state = askgReducer(withTurn(), { type: "session-started", sessionId: "s1", model: "m", limits, acceptedTools: [], feedback: false });
+    state = apply(state, session(1, "remote-1"));
+    // A resumed stream replays its session frame; the turn is counted once.
+    state = apply(state, session(1, "remote-1"));
+    expect(state.limits?.turnsRemainingToday).toBe(11);
+
+    state = askgReducer(state, { type: "prompt", turnId: "turn-2", prompt: "and now?", at: 1 });
+    state = apply(state, { seq: 1, type: "error", turnId: "turn-2", code: "daily_turn_cap", message: "No questions left today.", retryable: false });
+    expect(state.limits?.turnsRemainingToday).toBe(0);
   });
 });
 
@@ -257,6 +354,13 @@ describe("failure handling", () => {
       message: "Connection lost",
       retryable: true,
     })).toBe("Connection lost.");
+    // The cap says when there will be more, in words, and never its code.
+    expect(describeASKGError({
+      code: "daily_turn_cap",
+      message: "The daily Ask Gloom turn limit is used up. daily_turn_cap",
+      retryable: false,
+      retryAfterMs: 79_188_000,
+    })).toBe("No questions left today. More in 22 h.");
   });
 
   test("a retried turn leaves no trace of the attempt it replaces", () => {
@@ -322,6 +426,51 @@ describe("stored conversations", () => {
     expect(turns[2]).toMatchObject({ prompt: "", answer: "Orphan." });
   });
 
+  test("a stored script reads as it did live, its calls in their own rows", () => {
+    const at = "2026-09-20T10:00:00.000Z";
+    const [turn] = turnsFromConversation({
+      id: "conv-3",
+      title: "Margins",
+      messageCount: 2,
+      lastMessageAt: at,
+      createdAt: at,
+      updatedAt: at,
+      messages: [
+        { seq: 1, role: "user", text: "compare margins", tools: [], turnId: "t1", createdAt: at },
+        {
+          seq: 2,
+          role: "assistant",
+          text: "Partly.",
+          tools: [
+            { toolCallId: "s-1", name: "fa", origin: "client", status: "ok", args: { symbol: "NVDA" }, rowCount: 8 },
+            { toolCallId: "s-2", name: "fa", origin: "client", status: "error", args: { symbol: "AMD" }, note: "No filings." },
+            {
+              toolCallId: "s",
+              name: "run_script",
+              origin: "server",
+              status: "timeout",
+              // Whatever the platform kept of the call, the code is not a summary.
+              args: { code: "const a = await tools.fa({ symbol: 'NVDA' });" },
+              rowCount: 2,
+              note: "Script timed out after 2 calls, 20.0 s",
+            },
+          ],
+          turnId: "t1",
+          createdAt: at,
+        },
+      ],
+    });
+
+    expect(turn?.tools.map((row) => [row.name, row.status, row.rowCount])).toEqual([
+      ["fa", "ok", 8],
+      ["fa", "error", undefined],
+      ["run_script", "timeout", 2],
+    ]);
+    // The arguments survive, so a reopened row names what it read.
+    expect(turn?.tools[1]?.args).toEqual({ symbol: "AMD" });
+    expect(turn?.tools[2]?.note).toBe("Script timed out after 2 calls, 20.0 s");
+  });
+
   test("opening a conversation replaces the turns and starting one clears them", () => {
     const at = "2026-09-20T10:00:00.000Z";
     const opened = askgReducer(withTurn(), {
@@ -345,5 +494,60 @@ describe("stored conversations", () => {
     const started = askgReducer(opened, { type: "conversation-started" });
     expect(started.conversationId).toBeNull();
     expect(started.turns).toEqual([]);
+  });
+
+  test("a reopened conversation shows the ratings it was given, on a server that takes them", () => {
+    const at = "2026-09-20T10:00:00.000Z";
+    const conversation = {
+      id: "conv-3",
+      title: null,
+      messageCount: 6,
+      lastMessageAt: at,
+      createdAt: at,
+      updatedAt: at,
+      messages: [
+        { seq: 1, role: "user" as const, text: "q1", tools: [], turnId: "t1", createdAt: at },
+        {
+          seq: 2,
+          role: "assistant" as const,
+          text: "a1",
+          tools: [],
+          turnId: "t1",
+          createdAt: at,
+          feedback: { rating: "down" as const, reason: "wrong" as const, shared: true },
+        },
+        { seq: 3, role: "user" as const, text: "q2", tools: [], turnId: "t2", createdAt: at },
+        { seq: 4, role: "assistant" as const, text: "a2", tools: [], turnId: "t2", createdAt: at, feedback: null },
+        { seq: 5, role: "user" as const, text: "q3", tools: [], turnId: "t3", createdAt: at },
+        // An unknown thumb from a newer server is no rating rather than a wrong one.
+        {
+          seq: 6,
+          role: "assistant" as const,
+          text: "a3",
+          tools: [],
+          turnId: "t3",
+          createdAt: at,
+          feedback: { rating: "meh", reason: null, shared: false } as never,
+        },
+      ],
+    };
+
+    const older = askgReducer(EMPTY_ASKG_CONVERSATION, { type: "conversation-opened", conversation });
+    expect(older.feedbackAvailable).toBe(false);
+    expect(older.turns.some((turn) => canRateTurn(older, turn))).toBe(false);
+
+    const opened = askgReducer(EMPTY_ASKG_CONVERSATION, {
+      type: "conversation-opened",
+      conversation: { ...conversation, capabilities: { feedback: 1 } },
+    });
+    expect(opened.feedbackAvailable).toBe(true);
+    expect(opened.turns.map((turn) => turn.feedback)).toEqual([
+      { rating: "down", reason: "wrong", shared: true, pending: null },
+      undefined,
+      undefined,
+    ]);
+    expect(opened.turns.every((turn) => canRateTurn(opened, turn))).toBe(true);
+    // Starting over keeps what the server said about ratings; only the turns go.
+    expect(askgReducer(opened, { type: "conversation-started" }).feedbackAvailable).toBe(true);
   });
 });

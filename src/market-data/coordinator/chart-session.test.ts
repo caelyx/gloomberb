@@ -12,7 +12,7 @@ const request: ChartRequest = { instrument: { symbol: "AAPL", exchange: "NASDAQ"
   granularity: "resolution", resolution: "15m" };
 const sourceKey = "provider:gloomberb-cloud";
 const proof = (patch: Partial<HistorySession> = {}): HistorySession => ({ version: 1, kind: "regular", calendar: "us-equity",
-  timeZone: "America/New_York", symbol: "AAPL", exchange: "NASDAQ", interval: "15min", source: "yahoo",
+  timeZone: "America/New_York", symbol: "AAPL", exchange: "NASDAQ", interval: "15min", source: "gloom",
   timestampConvention: "bar-open", barAlignment: "session-open", observedAt: Date.now(), ...patch });
 function result(time = "2026-09-21T19:45:00Z", patch: Partial<PriceHistoryResult> = {}): PriceHistoryResult {
   return { points: [{ date: new Date(time), close: 338.8900146484375, volume: 2218511 }],
@@ -32,7 +32,7 @@ test("coordinator retains actual source/session/cadence and does not renew cache
   const instance = coordinator(async () => { calls++; return result(); });
   const first = await instance.loadChart(request);
   expect(first.data?.[0]?.close).toBe(338.8900146484375);
-  expect(first.history).toMatchObject({ resolution: "15m", sourceKey, session: { observedAt: preopen, source: "yahoo" } });
+  expect(first.history).toMatchObject({ resolution: "15m", sourceKey, session: { observedAt: preopen, source: "gloom" } });
   expect(first.source).toBe(sourceKey);
   setSystemTime(preopen + 9 * 60_000);
   const cached = await instance.loadChart(request);
@@ -75,7 +75,7 @@ test("empty and failed refreshes preserve retained history's own source, acquisi
   let calls = 0;
   const instance = coordinator(async () => {
     if (++calls === 1) return result();
-    if (calls === 2) return result(undefined, { points: [], sourceKey: "provider:other", session: proof({ source: "twelvedata" }) });
+    if (calls === 2) return result(undefined, { points: [], sourceKey: "provider:other", session: proof({ barAlignment: "clock" }) });
     throw new Error("Controlled provider outage");
   });
   const first = await instance.loadChart(request);
@@ -118,10 +118,15 @@ test("pending failures cannot retain a loading seed after its next session becom
   expect(failed.history).toBeUndefined();
 });
 
-test("source contracts never cross instrument scope and unknown sources keep conservative freshness", async () => {
+test("source contracts never cross instrument scope and a sessionless source is read on the venue calendar", async () => {
   setSystemTime(preopen);
+  // No session record: bars reaching the last close answer the pre-market, without claiming a session.
   const unproven = coordinator(async () => result(undefined, { session: undefined, sourceKey: "provider:extended" }));
-  expect((await unproven.loadChart(request)).data).toBeNull();
+  const sessionless = await unproven.loadChart(request);
+  expect(sessionless.data).toHaveLength(1);
+  expect(sessionless.history?.session).toBeUndefined();
+  const earlyCopy = coordinator(async () => result("2026-09-21T15:00:00Z", { session: undefined, sourceKey: "provider:extended" }));
+  expect((await earlyCopy.loadChart(request)).data).toBeNull();
   const mismatch = coordinator(async () => result(undefined, { session: proof({ symbol: "MSFT" }) }));
   expect((await mismatch.loadChart(request)).data).toBeNull();
   let release: (value: PriceHistoryResult) => void = () => {};

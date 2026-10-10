@@ -25,13 +25,15 @@ gloomberb plugin enable my-plugin  # turn one on or off without removing it
 gloomberb plugin disable my-plugin
 ```
 
-Plugins are installed to `~/.gloomberb/plugins/`, or under `$GLOOMBERB_HOME/plugins/` when that variable relocates the folder.
+Plugins are installed to `~/.gloomberb/plugins/`, or under `$GLOOMBERB_HOME/plugins/` when that variable relocates the folder. A new Linux install without `~/.gloomberb` uses `~/.local/share/gloomberb/plugins/` (see [Where your data lives](docs/installation.md#where-your-data-lives)); `gloomberb plugins` prints the folder in use.
 
 A plugin listed at [gloom.sh/plugins](https://gloom.sh/plugins) is installed at
 the tag and commit the registry reviewed, not at whatever the default branch
 holds that day, and `update` moves it to the next reviewed one. A plugin
 installed from a repository the registry does not list follows the remote's
-default branch instead.
+default branch instead. A plugin that builds on another, such as IBKR Gateway
+on Interactive Brokers, brings that one along from the registry, from the
+Plugins pane and the CLI alike.
 
 Either way the Plugins pane says when an update is waiting. For a listed
 plugin that is the reviewed commit; for an unlisted one, including a private
@@ -161,6 +163,12 @@ in the pane as `errors (n)`, with the last message in the detail view and the
 `d` key opening the debug log filtered to that plugin. Log real failures there
 rather than swallowing them; it is how a user finds out that a plugin which
 loaded fine is failing at runtime.
+
+A pane that throws while it renders stays inside its own frame: its body
+becomes a short failure card with Reload pane and Close pane, the rest of the
+app keeps running, and the error counts toward the plugin's errors. Only
+render errors are caught this way; errors in event handlers, effects and async
+code are still yours to catch and log.
 
 ## Plugin structure
 
@@ -310,9 +318,8 @@ To be bundled, a plugin has to be web-capable in practice, not just in its
   `Referer` and `User-Agent` are dropped. `httpFetch` reaches the API directly
   in the terminal, hands it to the Bun process on the desktop, and routes it
   through the web app's worker proxy.
-- `hosts` lists every host the plugin reaches, including ones reached on its
-  behalf by a host client such as `YahooHttpClient` (which collects a cookie
-  from `fc.yahoo.com` before any screener call). The worker proxies exactly
+- `hosts` lists every host the plugin reaches, including any hosts reached by
+  shared HTTP clients. Built-in market data uses the Gloom API. The worker proxies exactly
   what the bundled plugins declare and refuses the rest, so a missing host
   works on the desktop and fails on the web.
 - no `node:*` imports on the path the browser entry pulls in.
@@ -380,6 +387,8 @@ A pane with `headless` automatically gets:
 - strict option validation for `fn`, including allowed enum values and numeric bounds
 
 The definition is the only structured report contract. Optional `discovery` metadata supplies semantic aliases, a stable capability ID, limitations, and screenshot readiness; the catalog derives argument cardinality and options directly. No central pane capability map or report switch is needed.
+
+A pane without `headless` still answers `fn` and `shot` as a rendered view, read from the drawn pane. Every `--key value` becomes the pane setting of that key. To document and check the settings that matter, list them in the `PaneDef`'s `reportOptions` (the option schema above, plus `placeholder` for the value's name in the catalog, an `example` such as `--currencies USD,ZAR,NGN`, `normalize(value)`, which returns the setting or throws an `Error` naming what is wrong, and `settingKey` when the flag is named differently from the setting it sets). `reportNotices(settings)` returns lines the report prints above its table, such as what the default view leaves out; `--json` carries them in `data.metadata.notices`. FXC's `--currencies` is the example.
 
 ### Definition contract
 
@@ -504,7 +513,7 @@ ctx.registerContextMenuProvider({
 });
 ```
 
-Available context kinds are `pane`, `ticker`, `link`, `editable-text`, `selected-text`, `layout`, and `app`. Return `null` or an empty array when your plugin has nothing useful for a context. Keep actions renderer-neutral: call plugin context methods such as `ctx.openCommandBar()`, `ctx.selectTicker()`, `ctx.pinTicker()`, `ctx.focusPane()`, and `ctx.notify()` instead of using renderer-specific APIs.
+Available context kinds are `pane`, `ticker`, `link`, `editable-text`, `selected-text`, `layout`, `chat-user` (a name or @mention in the chat, with its user id and username), and `app`. Return `null` or an empty array when your plugin has nothing useful for a context. Keep actions renderer-neutral: call plugin context methods such as `ctx.openCommandBar()`, `ctx.selectTicker()`, `ctx.pinTicker()`, `ctx.focusPane()`, and `ctx.notify()` instead of using renderer-specific APIs.
 
 ### Command-bar shortcut discovery
 
@@ -515,9 +524,9 @@ List the same codes in `gloom.json`, so someone who does not have the plugin can
 ```json
 {
   "contributes": {
-    "panes": ["fear-greed"],
+    "panes": ["polls"],
     "shortcuts": [
-      { "code": "FNG", "name": "Fear & Greed", "description": "CNN Fear & Greed index with its history and the seven indicators behind it." }
+      { "code": "POLL", "name": "Polls", "description": "Political polls by race, with trend charts and pollster breakdowns." }
     ]
   }
 }
@@ -843,12 +852,12 @@ there.
 ### Navigation
 
 ```typescript
-ctx.selectTicker("AAPL");              // Select ticker + focus right panel
+ctx.selectTicker("AAPL");              // Move the list cursor to a ticker
 ctx.selectTicker("AAPL", "my-pane:1"); // Select in a specific pane
-ctx.switchPanel("left");               // Switch active panel
+ctx.switchPanel("left");               // Focus the leftmost pane
 ctx.switchTab("chart");                // Switch Ticker Research tab by id
 ctx.switchTab("chart", "ticker-research:1"); // Switch tab in a specific pane
-ctx.openCommandBar();                  // Open the command bar
+ctx.openCommandBar();                  // Open the command bar (nothing while a dialog is open)
 ctx.openCommandBar("export");          // Open with a pre-filled query
 ctx.openPaneSettings();                // Open settings for the focused pane
 ctx.openPaneSettings("my-pane:1");     // Open settings for a specific pane
@@ -962,6 +971,8 @@ Available field types:
 - `multi-select`
 - `ordered-multi-select`
 
+Give a long `multi-select` or `ordered-multi-select` (dozens of options) `searchable: true`: its dialog gets a filter box that narrows rows by label and description, shows each option's `description` beside its label and, when ordered, each selection's position. Arrows move, Space picks and `[` / `]` reorder while the box has focus.
+
 Every pane also gets a built-in **Lock Pane** toggle, so a pane with no `settings` of its own still opens a settings dialog. A locked pane stays in the layout when the close shortcut (`CmdOrCtrl+W`, `CmdOrCtrl+Alt+W`, or double `Esc`) is pressed; explicit closes still work. It is also offered in the pane action menu next to Close Pane. It is stored on the pane instance under the reserved `pane.locked` key, never in pane settings, so `applyValue` never sees it and a published layout never carries it. Do not register a field with a `pane.`-prefixed key.
 
 Imperative pane settings access is available on the plugin context:
@@ -1041,6 +1052,8 @@ function LivePricesPane() {
 
 Quick settings currently support toggle fields with the `zap` icon. Unknown keys and non-toggle fields are ignored.
 
+A setting that only applies to some of what the pane shows can say where with `visible(context)`, which gets the same context as `settings`: the control is left out of the header and the pane menu where it returns false, and the field stays in the settings dialog.
+
 ### Events
 
 Subscribe to and emit app events:
@@ -1118,7 +1131,7 @@ ctx.registerPaneTemplate({
     argKind: "ticker",
   },
 
-  // Optional: wizard steps shown before creating the pane
+  // Optional: fields asked in a form before creating the pane
   wizard: [
     { key: "interval", label: "Interval", type: "select", options: [
       { label: "1D", value: "1d" },
@@ -1178,9 +1191,10 @@ Choose the existing control that owns the interaction you need:
 | A form's field labels and keyboard ring | `FieldLabel`, `TextField` (`active`, `labelWidth`), `useFieldRing` |
 | Clickable/expandable summaries | `ActionRow` |
 | Selectable lists | `ListView` |
-| Dialog content | `DialogFrame`, `ChoiceDialog`, `ConfirmDialog` (`confirmDialog` asks and resolves a boolean), `TextPromptDialog`, `PriceSelectorDialog` |
+| Dialog content | `DialogFrame`, `ChoiceDialog`, `ConfirmDialog` (`confirmDialog` asks and resolves a boolean; `status` and `busy` show work the confirm started), `TextPromptDialog`, `PriceSelectorDialog` |
 | Section and document headings | `Section`, `SectionHeading` (`wrap` for long headings) |
 | Labeled values and badges | `KeyValueRow`, `Badge` |
+| Inline bars | `RatioBar` (a value against a scale: a count against the largest row, a move against a full-scale move), `RangeTrack` (where a value sits between a low and a high) |
 | Paragraphs, bullets and separators | `Prose`, `BulletList`, `FigureList` (value-first figure lines), `READING_WIDTH`, `Divider` |
 | Loading, empty states, inline feedback | `Spinner`, `EmptyState`, `PaneStatusBody`, `Notice` |
 | External links | `ExternalLink`, `ExternalLinkText` |
@@ -1188,7 +1202,7 @@ Choose the existing control that owns the interaction you need:
 
 [The component exports](src/components/index.ts) are the complete public surface, including the entire basic UI kit. Built-in and external panes must use these components for basic UI. Shared components own appearance, theme updates, focus, keyboard/mouse behavior, disabled state, and automation semantics. A pane supplies its data and domain behavior.
 
-Use `Box` and `ScrollBox` to arrange content. Custom chart surfaces, order-book visualizations, rich inline ticker content, and specialized editors can use lower-level primitives. Do not recreate a button with a clickable `Box`, a section heading with styled `Text`, or a field with raw `Input`. Add a missing repeated pattern to the kit and migrate the callers together. Keep domain calculations and formatting with the pane.
+Use `Box` and `ScrollBox` to arrange content. A `ScrollBox` scrolls vertically unless it says `scrollY={false}`, and the focused pane's arrow keys, PageUp, PageDown, Home and End move it. Custom chart surfaces, order-book visualizations, rich inline ticker content, and specialized editors can use lower-level primitives. Do not recreate a button with a clickable `Box`, a section heading with styled `Text`, or a field with raw `Input`. Add a missing repeated pattern to the kit and migrate the callers together. Keep domain calculations and formatting with the pane.
 
 `Button` supports a compact layout and a separate `displayLabel` for short/icon actions; `label` remains the full accessible and automation name. Use `stopPropagation` for actions nested inside a row. `ActionRow` owns an expandable row's interaction and disclosure affordance. `SelectButton` opens the kit menu on the desktop and a choice dialog in the terminal; a `SelectControl` ref can open it without knowing the renderer.
 
@@ -1198,11 +1212,11 @@ Everything that narrows or reorders a list sits in one `QueryBar` above it: `sea
 
 A pane's summary figures (a VWAP, a spread, a percentile, a range) go in a `StatGrid` directly under the `QueryBar`: one band of label, value and muted detail cells that the desktop draws like the query bar, so the title-bar tab, the bar and the figures read as one surface. Use it at the top of a stack detail too. Do not stack `KeyValueRow`s or text lines above a table for this. `statGridRows(items, width)` gives the rows it takes for terminal height budgeting.
 
-Table header labels and `SectionHeading` titles are uppercased by the kit. Pass `onHeaderClick` only when the table sorts; without it the headers are not interactive.
+Table header labels are uppercased by the kit; `SectionHeading` titles use title case. Pass `onHeaderClick` only when the table sorts; without it the headers are not interactive.
 
 A pane that computes an answer from inputs (a calculator, a sizer) puts its mode switches in a `QueryBar` (inline filters) and its inputs in a `FieldGrid`: one aligned sheet of label, value and unit cells. The pane owns which field is active; while one is being edited the grid walks its cells with Tab and leaves on Esc. Icon-only actions use `IconButton` with a name from the shared icon set; never draw an SVG or glyph button yourself.
 
-Every menu, dropdown and pop-up list uses `MenuPopover` (or `Menu` inside a `Popover`): filter menus, select fields, multi-selects, suggestions and the pane menu share one look and keyboard model. There is no other floating surface; extend these rather than positioning an absolute box.
+Every menu, dropdown and pop-up list uses `MenuPopover` (or `Menu` inside a `Popover`): filter menus, select fields, multi-selects, suggestions and the pane menu share one look and keyboard model. There is no other floating surface; extend these rather than positioning an absolute box. A card that opens beside something on the page, such as a name under the pointer, passes that element's `Box` ref as the `Popover`'s `anchor` (below it, above it when there is no room, `boundary="pane"` to stay inside the pane) and keeps itself open with `onPointerEnter` and `onPointerLeave`.
 
 `PaneStatusBody` replaces the body only when the caller passes a loading, error, or empty state. Preserve existing data during refresh by passing `loading={loading && !data}` and `error={!data ? error : null}`. Use `Notice` for inline refresh errors. It supports centered states, custom loading labels, and retry `actions`:
 
@@ -1263,6 +1277,8 @@ const rows = useLiveTickerFinancialsMap(tickers, { visible: false });
 ```
 
 `usePaneTickerIdentity()` returns the pane's symbol, ticker and contract without its financials; `usePaneTicker()` also re-renders on every quote tick of the symbol, so a pane that only needs the symbol (news, filings, holders) uses the identity hook.
+
+A pane that shows one ticker through these hooks can set `tickerFollower: true` on its `PaneDef`. Its pane menu then offers **Link to** each visible watchlist, portfolio, scanner, or other single-ticker pane, and once linked it follows that pane's selection, with **Unlink from** pinning it on the ticker it shows. A function decides per instance, for a pane that is single-ticker only in some setups (a price chart of one security, not a comparison or a fundamental graph). A linked pane changes ticker while mounted, so key the view by symbol and keep saved choices that only make sense for one ticker (an expiry, a strike) per symbol. Never write the pane's own `cursorSymbol`: it would win over the link.
 
 `createPluginCache` keeps the last good payload in plugin persistence with a TTL, so the pane has something to show before its first fetch after a restart. Table panes get `compareSortValues`, `nextHeaderSort` (header clicks) and `cycleSortPreference` (the keyboard equivalent) from `gloomberb/utils` so mixed columns sort like the host's.
 
@@ -1485,7 +1501,7 @@ export default {
 Every pane has to work with no mouse, in the terminal and on the desktop. Most of it comes from the kit, as long as the pane uses it:
 
 - **Footer hints are key bindings.** `usePaneFooter("my-pane", () => ({ hints: [{ id: "add", key: "a", label: "dd", onPress: add }] }), [add])` both draws `[a]dd` and binds `a` while the pane is focused and no field owns the keyboard. A pane does not bind a hinted key a second time. If it must (the key does something slightly different in one mode), its handler calls `event.preventDefault()` when it acts, or the footer fires the hint again. Keys use the keybinding grammar: `a`, `!`, `/`, `Enter`, `Ctrl+S`.
-- **The pane menu lists everything.** `.`, `Shift+F10` or the Menu key (and the `...` button) open the focused pane's menu: every enabled footer hint with its key, then entries the pane's kit controls add, the zap quick settings as toggles, then Settings, Fullscreen, Float, Lock, Close and the window actions. Give a hint a `title` when its key is not the first letter of the action (`{ key: "x", label: "port all", title: "Export All" }`); otherwise the menu reads `[a]dd` as "Add".
+- **The pane menu lists everything.** `.`, `Shift+F10` or the Menu key (and the `...` button) open the focused pane's menu: every enabled footer hint with its key, then entries the pane's kit controls add, the zap quick settings as toggles, then Settings, Fullscreen, Move to New Layout (or Move Back), Float, Lock, Close and the window actions. Give a hint a `title` when its key is not the first letter of the action (`{ key: "x", label: "port all", title: "Export All" }`); otherwise the menu reads `[a]dd` as "Add".
 - **Actions without a key** go in the pane menu with `usePaneMenuItems(id, () => items, deps)`. The items follow `PaneFooterScope` like hints, so an inactive tab's items drop out.
 - **Kit controls register themselves.** A focused `DataTableView` whose headers sort (it has `onHeaderClick`) offers "Sort by…" and "Reverse Sort" (`isColumnSortable` leaves out a column its header click ignores; `onSortChange` makes Reverse Sort flip a header that also cycles through unsorted), and moves its cursor on `Home`/`End`/`PageUp`/`PageDown`. A `QueryBar` binds `/` to its search and lists every filter, the view and "Clear Filters". A focused `Tabs` strip lists New/Close/Move Tab for the handlers it has. The first kit `Button` in an `EmptyState` or `PaneStatusBody` `actions` answers `Enter` and shows it; every action there is in the pane menu.
 - An inline action that has to stay a body button (a Retry beside a failure) goes in `ButtonActionScope`, which gives its first kit `Button` Enter and lists every one in the pane menu. Links and ticker badges in a detail go in `PaneLinkMenu`, which lists each as "Open …" in the pane menu.
@@ -1523,7 +1539,7 @@ setup(ctx) {
 }
 ```
 
-Commands can also define a multi-step wizard flow:
+Commands can also ask for values first. The wizard's steps open as one form in a centered dialog, every field at once:
 
 ```typescript
 ctx.registerCommand({
@@ -1538,16 +1554,15 @@ ctx.registerCommand({
       { label: "Below", value: "below" },
     ]},
   ],
-  wizardLayout: "form",  // "steps" (default) or "form" (all fields at once)
   async execute(values) {
     // values.price, values.direction
   },
 });
 ```
 
-Wizard step types: `text`, `password`, `number`, `select`, `info`. Steps can use `dependsOn` to conditionally appear based on a previous step's value.
+Wizard step types: `text`, `password`, `number`, `select`, `textarea`, `info`. A step is required unless it sets `required: false`, and `info` steps show their `body` above the fields. Steps can use `dependsOn` to conditionally appear based on a previous step's value. A pane template's `wizard` opens the same form, from the command bar or from `ctx.createPaneFromTemplate`, and creates the pane when it is sent. A form asked for while another is open, for example from a command's `execute`, opens once that one closes. `wizardLayout` is ignored.
 
-Commands can require confirmation before executing:
+Commands can require confirmation before executing. The confirm opens as a centered dialog:
 
 ```typescript
 ctx.registerCommand({
@@ -1620,8 +1635,8 @@ The shortcut appears in Help > Shortcuts, where users can move it to another key
 setup(ctx) {
   ctx.registerTickerAction({
     id: "open-in-browser",
-    label: "Open in Yahoo Finance",
-    keywords: ["open", "yahoo", "browser"],
+    label: "Open company website",
+    keywords: ["open", "website", "browser"],
     // Optional: only show for certain tickers
     filter: (ticker) => ticker.metadata.exchange === "US",
     execute(ticker, financials) {

@@ -30,10 +30,12 @@ export const executivesModule: PluginModule = {
   panes: [
     {
       id: EXECUTIVES_PANE_ID,
+      reportFreshness: { source: "SEC EDGAR", status: "not-a-feed", basis: "proxy statements" },
       name: "Executives",
       icon: "X",
       component: ExecutivesPane,
       defaultPosition: "right",
+      tickerFollower: true,
       defaultMode: "floating",
       defaultFloatingSize: { width: 100, height: 30 },
     },

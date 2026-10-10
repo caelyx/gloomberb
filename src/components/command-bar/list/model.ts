@@ -24,6 +24,11 @@ export interface ResultItem {
   lines?: CommandBarResultLine[];
   /** Short tag drawn left of the label: a shortcut, an asset class, a document type. */
   badge?: string;
+  /**
+   * An instrument's name, drawn muted after the symbol. Listings that share a
+   * symbol (SAP on NYSE and XETRA, Saputo as SAP on TSX) differ only here.
+   */
+  name?: string;
   right?: string;
   /** Provider type retained for symbol/alias identity checks. */
   instrumentType?: string;
@@ -37,6 +42,11 @@ export interface ResultItem {
   /** Tints the trailing marker and the section heading with the AI accent. */
   accent?: boolean;
   /**
+   * How the command-search report names running this row, for rows its kind
+   * does not describe: an AI candidate with the text it runs, or Ask Gloom.
+   */
+  searchChoice?: { kind: "assist"; input: string } | { kind: "ask-gloom" };
+  /**
    * Set false for rows that answer nothing on their own — a placeholder, or an
    * offer the user never asked for. The list skips them when it picks the
    * selection for an untouched query, so plain Enter always runs a real match.
@@ -49,7 +59,7 @@ export interface ResultItem {
   action: () => void | Promise<void>;
 }
 
-type ListScreenKind = "root" | "mode" | "picker" | "pane-settings";
+type ListScreenKind = "root" | "mode" | "picker";
 
 export interface ListScreenState {
   kind: ListScreenKind;

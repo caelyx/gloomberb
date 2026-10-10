@@ -38,7 +38,7 @@ function run(year = "latest", refresh = false) {
       instance: { settings: {} },
       capability: { id: "risk-factors" },
     } as never,
-    { dataProvider: createTestDataProvider(), config: createDefaultConfig("/tmp/gloomberb-risk-headless-test") } as never,
+    { dataProvider: createTestDataProvider(), config: createDefaultConfig("/tmp/gloomberb-risk-headless-test"), store: { loadTicker: async () => null } } as never,
     "ACME",
   );
 }
@@ -102,7 +102,7 @@ test("an explicit missing filing fails without silently selecting a different ye
     : Response.json(list([2026])));
 
   await expect(run("2024")).rejects.toThrow("Requested 2024 report not found");
-  expect(requests).toEqual(["/public/risks/ACME/2024"]);
+  expect(requests).toEqual(["/cloud/risks/ACME/2024"]);
 });
 
 test("empty discovery does not fabricate the current annual report and invalid year input never requests one", async () => {

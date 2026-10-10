@@ -1,14 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { cloneLayout, createDefaultConfig, findPaneInstance, type LayoutConfig } from "../../../types/config";
 import { createInitialState, type AppState } from "../../../state/app/context";
-import type { PluginRegistry } from "../../../plugins/registry";
 import { PANE_LOCK_SETTING_KEY } from "../../../pane-settings";
 import { createTestDataProvider } from "../../../test-support/data-provider";
 import { applyPaneSettingFieldValue, createPaneTemplateOrThrow, resolveTickerInput, resolveTickerInputOrThrow, resolveTickerListInput } from "./ops";
 import type { TickerRecord } from "../../../types/ticker";
-import { bringToFront } from "../../../plugins/pane-manager/floating-actions";
+import { bringToFront } from "../../../layout/pane-manager/floating-actions";
 import { JsonTickerRepository } from "../../../data/json-ticker-repository";
 import { createTestTicker } from "../../../test-support/ticker";
+import { AppPersistence } from "../../../data/app-persistence";
+import { TickerRepository } from "../../../data/ticker-repository";
+import { PluginRegistry } from "../../../plugins/registry";
+import { PluginOffError } from "../../../plugins/plugin-off";
 
 type TemplateDeps = Parameters<typeof createPaneTemplateOrThrow>[2];
 
@@ -37,6 +40,7 @@ function templateDeps(
       paneTemplates: new Map([[template.id, template]]),
       panes: new Map([[pane.id, pane]]),
       getPaneTemplatePluginId: () => undefined,
+      getDisabledPaneTemplateOwner: () => null,
       events: { emit: () => {} },
       ...registry,
     }),
@@ -112,6 +116,38 @@ test("command ticker resolution persists the verified future without switching t
 });
 
 describe("createPaneTemplateOrThrow", () => {
+  // CHOKE belongs to one plugin and opens a chart, a pane of another: with
+  // that one off, the chart would be added and then hidden.
+  test("refuses a template whose pane belongs to a switched-off plugin, naming it", async () => {
+    const persistence = new AppPersistence(":memory:");
+    const registry = new PluginRegistry(createTestDataProvider(), new TickerRepository(persistence.tickers), persistence);
+    try {
+      const state = createInitialState({ ...createDefaultConfig(":memory:"), disabledPlugins: ["charts"] });
+      registry.bindHost({ getConfig: () => state.config });
+      await registry.register({
+        id: "maps", name: "Maps", version: "1.0.0",
+        paneTemplates: [{ id: "choke", paneId: "chart", label: "Chokepoints", description: "Chokepoints" }],
+      });
+      await registry.register({
+        id: "charts", name: "Charts", version: "1.0.0",
+        panes: [{ id: "chart", name: "Chart", component: () => null, defaultPosition: "right" }],
+      });
+      const built: string[] = [];
+      const opening = createPaneTemplateOrThrow("choke", undefined, {
+        ...workflowDeps(state, {}),
+        pluginRegistry: registry,
+        buildPaneInstance: (paneId) => { built.push(paneId); return null; },
+        placePaneInstance: () => {},
+      });
+      await expect(opening).rejects.toBeInstanceOf(PluginOffError);
+      await expect(opening).rejects.toMatchObject({ plugin: { id: "charts" }, message: "Turn on Charts to open Chokepoints." });
+      expect(built).toEqual([]);
+    } finally {
+      registry.destroy();
+      persistence.close();
+    }
+  });
+
   test("treats createInstance null as cancellation and does not create a pane", async () => {
     const config = createDefaultConfig("/tmp/gloomberb-workflow-ops-test");
     const state = createInitialState(config);
@@ -265,11 +301,11 @@ describe("createPaneTemplateOrThrow pane reuse", () => {
       template: { id: "template", paneId: "chat", label: "Chat", description: "Chat", createInstance: () => spec },
       pane: { id: "chat", name: "Chat", component: () => null },
       registry: {
-        focusPaneFn: (paneId: string, nextLayout?: LayoutConfig) => {
+        focusPane: (paneId: string, nextLayout?: LayoutConfig) => {
           focused.push(paneId);
           if (batchedFloating) layouts.push(bringToFront(nextLayout ?? state.config.layout, paneId));
         },
-        updateLayoutFn: (next: LayoutConfig) => {
+        updateLayout: (next: LayoutConfig) => {
           layouts.push(next);
           if (!batchedFloating) state.config.layout = next;
         },
@@ -355,6 +391,43 @@ describe("createPaneTemplateOrThrow pane reuse", () => {
 
     expect(result.focused).toEqual([]);
     expect(result.created).toBe(1);
+  });
+
+  // A ticker template's id names the ticker it opened on (`options:AAPL`). Once that pane is linked
+  // to a list, or unlinked on another ticker, typing `OMON AAPL` must neither unlink nor take it
+  // over, and typing it again must land on the same pinned pane even after it rewrote its settings.
+  test("opens one pinned pane beside a stable-id ticker pane that shows another ticker", async () => {
+    const spec = { instanceId: "chat:AAPL", title: "OMON AAPL", binding: { kind: "fixed", symbol: "AAPL" } };
+    const linked = {
+      instanceId: "chat:AAPL",
+      paneId: "chat",
+      title: "OMON",
+      binding: { kind: "follow", sourceInstanceId: "portfolio-list:main" },
+    };
+
+    const first = await runTemplate(spec, [linked]);
+    expect(first.focused).toEqual([]);
+    expect(first.layouts).toEqual([]);
+    expect(first.createdWith).toMatchObject({ instanceId: "chat:AAPL:pinned", binding: { kind: "fixed", symbol: "AAPL" } });
+
+    const pinned = { ...spec, instanceId: "chat:AAPL:pinned", paneId: "chat", settings: { expirationTargetKey: "AAPL|AAPL" } };
+    const again = await runTemplate(spec, [linked, pinned]);
+    expect(again.focused).toEqual(["chat:AAPL:pinned"]);
+    expect(again.created).toBe(0);
+
+    const unlinked = await runTemplate(spec, [{ ...linked, title: "OMON MSFT", binding: { kind: "fixed", symbol: "MSFT" } }]);
+    expect(unlinked.layouts).toEqual([]);
+    expect(unlinked.createdWith).toMatchObject({ instanceId: "chat:AAPL:pinned" });
+
+    // The pinned pane can be linked or moved on too; the next command takes the next id and keeps
+    // landing there, instead of opening an unkeyed pane on every repeat.
+    const pinnedLinked = { ...pinned, binding: linked.binding };
+    const third = await runTemplate(spec, [linked, pinnedLinked]);
+    expect(third.layouts).toEqual([]);
+    expect(third.createdWith).toMatchObject({ instanceId: "chat:AAPL:pinned-2" });
+    const fourth = await runTemplate(spec, [linked, pinnedLinked, { ...pinned, instanceId: "chat:AAPL:pinned-2" }]);
+    expect(fourth.focused).toEqual(["chat:AAPL:pinned-2"]);
+    expect(fourth.created).toBe(0);
   });
 
   test("reuses an unkeyed template only on an equivalent spec, ignoring settings key order", async () => {

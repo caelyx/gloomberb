@@ -12,6 +12,7 @@ import { assetDataProvider, newsProvider, type PluginCapability } from "../../ca
 import type {
   AssetDataProvider,
   CachedFinancialsTarget,
+  EarningsEvent,
   SecFilingDocument,
   SecFilingItem,
   MarketDataRequestContext,
@@ -37,12 +38,14 @@ import type { NewsArticle, NewsQuery } from "../../types/news-source";
 import { normalizeNewsFeed } from "../../news/news-model";
 import { resolveCurrencyUnit } from "../../utils/currency-units";
 import { canonicalExchange, canonicalTickerKey, parsePublicTickerKey } from "../../utils/exchanges";
-import { normalizePriceHistory } from "../../utils/price-history";
-import { createProviderMiss } from "../provider-errors";
+import { normalizePriceHistory, priceHistoryIntervalMs, reachesLatestSettledSession } from "../../utils/price-history";
+import { createProviderMiss, providerMissReason } from "../provider-errors";
+import { assertSecRegistrantMatches } from "../sec-registrant";
+import { nonUsSecListingVenue } from "../../utils/sec";
 import { publicListingTarget } from "../listing-target";
 import { canonicalHistoryInterval, HistoryRetentionError, parseHistoryRecoveryCandidate, parseHistoryRetention, type HistoryRetention } from "../history-retention";
 import { getRouterEntityKey } from "../provider-router/cache";
-import { tickerHasYahooSuffix } from "../yahoo-finance/symbols";
+import { hongKongListingCode, tickerHasListingSuffix } from "../listing-symbols";
 import { parseSecAcceptanceTime } from "../sec-edgar/acceptance-time";
 import { hasMalformedIntradayHistory } from "../../time-series/history-quality";
 import {
@@ -121,7 +124,7 @@ async function withCloudFallback<T>(load: () => Promise<T>, message: string): Pr
     return await load();
   } catch (error) {
     if (isCloudProviderMiss(error)) {
-      throw createProviderMiss(message);
+      throw createProviderMiss(message, providerMissReason(error));
     }
     throw error;
   }
@@ -131,6 +134,28 @@ function isStaleCloudResponse(response: CloudMarketResponse<unknown>): boolean {
   return response.stale === true || response.providerMeta?.stale === true;
 }
 
+/**
+ * History with the pre-market and after-hours bars when the chart asks for
+ * them. A backend that cannot serve them answers the regular session, and one
+ * that ignores the request answers it without saying it served them.
+ */
+async function loadCloudHistory(
+  interval: string,
+  load: (session?: "extended") => Promise<CloudMarketResponse<CloudPricePointPayload[]>>,
+  context: MarketDataRequestContext | undefined,
+): Promise<{ response: CloudMarketResponse<CloudPricePointPayload[]>; extendedHours: boolean }> {
+  if (context?.historySession !== "extended" || !/^\d+(min|h)$/i.test(interval)) return { response: await load(), extendedHours: false };
+  try {
+    const response = await load("extended");
+    if (response.status === "success" || response.status === "partial" || response.status === "empty") {
+      return { response, extendedHours: response.session === "extended" };
+    }
+  } catch {
+    // The regular session below.
+  }
+  return { response: await load(), extendedHours: false };
+}
+
 function mapCloudPriceHistory(
   response: CloudMarketResponse<CloudPricePointPayload[]>,
   ticker: string,
@@ -138,11 +163,17 @@ function mapCloudPriceHistory(
   interval: string,
   requestedStart: Date,
   requestedEnd?: Date,
+  extendedHours = false,
 ): PriceHistoryResult {
   const coverageStart = parseHistoryCoverageStart(response.coverage);
   if (response.status === "empty" && coverageStart
     && requestedStart.getTime() < Date.parse(coverageStart)) throw new HistoryCoverageError(coverageStart);
-  if (isStaleCloudResponse(response)) {
+  // The server marks a cached copy it could not refresh in time. Bars that
+  // reach the venue's latest settled session still answer, and the router's
+  // own current-window check applies to them as to any other copy. Older bars,
+  // or a stale answer without bars, are a miss.
+  const stale = isStaleCloudResponse(response);
+  if (stale && response.status !== "success" && response.status !== "partial") {
     throw createProviderMiss(`Cloud chart data is stale for ${ticker}`);
   }
   if (response.status === "unsupported" && response.reasonCode === "HISTORY_RETENTION" && requestedEnd) {
@@ -166,14 +197,11 @@ function mapCloudPriceHistory(
       `Cloud chart data is unavailable for ${ticker}`,
     ).map((point) => mapPricePoint(point, divisor, exchange)),
   );
-  const upstream = (
-    response.providerMeta?.provider
-    ?? response.providerMeta?.upstream
-    ?? ""
-  ).trim().toLowerCase();
+  if (stale && !reachesLatestSettledSession(points, Date.now(), { symbol: ticker, exchange, intervalMs: priceHistoryIntervalMs(interval) })) {
+    throw createProviderMiss(`Cloud chart data is stale for ${ticker}`);
+  }
   if (
     /^\d+(min|h)$/i.test(interval)
-    && upstream !== "yahoo"
     && hasMalformedIntradayHistory(points)
   ) {
     throw createProviderMiss(`Cloud chart data failed OHLC validation for ${ticker}`);
@@ -198,6 +226,7 @@ function mapCloudPriceHistory(
     resolution,
     ...(session && matchingSource && matchingIdentity ? { session } : {}),
     ...(coverageStart ? { coverageStart } : {}),
+    ...(extendedHours ? { extendedHours: true } : {}),
   };
 }
 
@@ -208,8 +237,8 @@ function cloudHistoryResolution(interval: string): ManualChartResolution | null 
 }
 
 function quoteTargetKey(symbol: string, exchange?: string): string {
-  const target = publicListingTarget(symbol, exchange);
-  const base = target.exchange && tickerHasYahooSuffix(target.symbol) ? target.symbol.slice(0, target.symbol.indexOf(".")) : target.symbol;
+  const target = cloudInstrumentTarget(symbol, exchange);
+  const base = target.exchange && tickerHasListingSuffix(target.symbol) ? target.symbol.slice(0, target.symbol.indexOf(".")) : target.symbol;
   return canonicalTickerKey(base, target.exchange);
 }
 
@@ -222,7 +251,14 @@ function cloudResponseTargetKey(key: string, requested: Set<string>): string | u
     ? symbol : undefined;
 }
 
-const cloudInstrumentTarget = publicListingTarget;
+/**
+ * The listing as Gloom Cloud knows it. A Hong Kong code goes out with its four
+ * digits: Cloud has no 700 or 5 on HKEX, only 0700 and 0005.
+ */
+function cloudInstrumentTarget(symbol: string, exchange?: string) {
+  const target = publicListingTarget(symbol, exchange);
+  return target.exchange ? { ...target, symbol: hongKongListingCode(target.symbol, target.exchange) } : target;
+}
 
 function cloudHistoryRecovery(
   context: MarketDataRequestContext | undefined,
@@ -280,7 +316,7 @@ function matchCloudBatchItems<T extends { symbol: string; exchange?: string }, I
 }
 
 function retainRequestedQuoteSymbol(quote: Quote, ticker: string): Quote {
-  return parsePublicTickerKey(ticker).exchange || tickerHasYahooSuffix(ticker) ? { ...quote, symbol: ticker } : quote;
+  return parsePublicTickerKey(ticker).exchange || tickerHasListingSuffix(ticker) ? { ...quote, symbol: ticker } : quote;
 }
 
 function retainRequestedFinancialsSymbol(financials: TickerFinancials, ticker: string): TickerFinancials {
@@ -289,19 +325,12 @@ function retainRequestedFinancialsSymbol(financials: TickerFinancials, ticker: s
     : financials;
 }
 
-async function requireVerifiedSession(): Promise<void> {
-  const user = await apiClient.ensureVerifiedSession();
-  if (!user) {
-    throw createProviderMiss("Gloom Cloud requires signup and email verification");
-  }
-}
-
 function unwrapRequiredCloudResponse<T>(response: CloudMarketResponse<T>, message: string): T {
   if ((response.status === "success" || response.status === "partial") && response.data != null) {
     return response.data;
   }
   if (isEmptyCloudStatus(response.status)) {
-    throw createProviderMiss(response.reasonCode ?? message);
+    throw createProviderMiss(response.reasonCode ?? message, response.message);
   }
   throw new Error(response.reasonCode ?? message);
 }
@@ -466,16 +495,33 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     );
   }
 
-  async getSecFilings(ticker: string, count = 15): Promise<SecFilingItem[]> {
-    await requireVerifiedSession();
-    return withCloudFallback(async () => {
-      const response = await apiClient.getCloudSecFilings({ ticker, limit: count, offset: 0 });
+  async getSecFilings(ticker: string, count = 15, exchange?: string, context?: MarketDataRequestContext): Promise<SecFilingItem[]> {
+    const venue = nonUsSecListingVenue(ticker, exchange);
+    const name = venue ? context?.listingName?.trim() || await this.listingName(ticker, venue) || undefined : undefined;
+    const filings = await withCloudFallback(async () => {
+      const response = await apiClient.getCloudSecFilings({ ticker, exchange, name, limit: count, offset: 0 });
       return response.filings.map(mapCloudSecFiling);
     }, `Cloud SEC filings are unavailable for ${ticker}`);
+    if (!venue || filings.length === 0) return filings;
+    const symbol = parsePublicTickerKey(ticker).symbol;
+    // Without the listing's company the filings cannot be told apart from another company's.
+    if (!name) throw createProviderMiss(`SEC filings for ${symbol} could not be matched to its ${venue} listing`);
+    assertSecRegistrantMatches(filings, { symbol, exchange: venue, name });
+    return filings;
+  }
+
+  /** The company a listing belongs to, from its own quote; null when the quote prices another venue. */
+  private async listingName(ticker: string, venue: string): Promise<string | null> {
+    try {
+      const quote = await this.getQuote(ticker, venue);
+      const quoteVenue = canonicalExchange(quote.listingExchangeName || quote.exchangeName);
+      return quoteVenue === venue ? quote.name?.trim() || null : null;
+    } catch {
+      return null;
+    }
   }
 
   async getSecFilingDocuments(filing: SecFilingItem): Promise<SecFilingDocument[]> {
-    await requireVerifiedSession();
     return withCloudFallback(async () => {
       const response = await apiClient.getCloudSecFilingDocuments({
         cik: filing.cik,
@@ -489,7 +535,6 @@ export class GloomberbCloudProvider implements AssetDataProvider {
   }
 
   async getSecFilingContent(filing: SecFilingItem): Promise<string | null> {
-    await requireVerifiedSession();
     return withCloudFallback(async () => {
       const response = await apiClient.getCloudSecFilingContent({
         cik: filing.cik,
@@ -505,7 +550,6 @@ export class GloomberbCloudProvider implements AssetDataProvider {
 
   async getHolders(ticker: string, exchange = "", _context?: MarketDataRequestContext): Promise<HolderData> {
     const target = cloudInstrumentTarget(ticker, exchange);
-    await requireVerifiedSession();
     return withCloudFallback(async () => {
       const response = await apiClient.getCloudHolders(target.symbol, target.exchange);
       return unwrapRequiredCloudResponse(response, `Cloud holders are unavailable for ${ticker}`) as CloudHoldersPayload;
@@ -514,7 +558,6 @@ export class GloomberbCloudProvider implements AssetDataProvider {
 
   async getAnalystResearch(ticker: string, exchange = "", _context?: MarketDataRequestContext): Promise<AnalystResearchData> {
     const target = cloudInstrumentTarget(ticker, exchange);
-    await requireVerifiedSession();
     return withCloudFallback(async () => {
       const response = await apiClient.getCloudAnalystResearch(target.symbol, target.exchange);
       return unwrapRequiredCloudResponse(response, `Cloud analyst research is unavailable for ${ticker}`) as CloudAnalystResearchPayload;
@@ -523,15 +566,31 @@ export class GloomberbCloudProvider implements AssetDataProvider {
 
   async getCorporateActions(ticker: string, exchange = "", _context?: MarketDataRequestContext): Promise<CorporateActionsData> {
     const target = cloudInstrumentTarget(ticker, exchange);
-    await requireVerifiedSession();
     return withCloudFallback(async () => {
       const response = await apiClient.getCloudCorporateActions(target.symbol, target.exchange);
       return unwrapRequiredCloudResponse(response, `Cloud corporate actions are unavailable for ${ticker}`) as CloudCorporateActionsPayload;
     }, `Cloud corporate actions are unavailable for ${ticker}`);
   }
 
-  async getArticleSummary(_url: string): Promise<string | null> {
-    throw createProviderMiss("Cloud article summaries are not available");
+  async getArticleSummary(url: string): Promise<string | null> {
+    return (await apiClient.getCloudArticleSummary(url)).summary;
+  }
+
+  async getEarningsCalendar(symbols: string[]): Promise<EarningsEvent[]> {
+    const unique = [...new Set(symbols.map((symbol) => symbol.trim().toUpperCase()).filter(Boolean))];
+    const events: EarningsEvent[] = [];
+    for (let index = 0; index < unique.length; index += 100) {
+      const response = await apiClient.getMarketEarningsCalendar(unique.slice(index, index + 100));
+      const payload = unwrapRequiredCloudResponse(response, "Cloud earnings calendar is unavailable");
+      for (const event of payload) {
+        const earningsDate = new Date(event.earningsDate);
+        if (!Number.isFinite(earningsDate.getTime())) continue;
+        const earningsCallDate = event.earningsCallDate ? new Date(event.earningsCallDate) : null;
+        events.push({ ...event, earningsDate,
+          earningsCallDate: earningsCallDate && Number.isFinite(earningsCallDate.getTime()) ? earningsCallDate : null });
+      }
+    }
+    return events.sort((left, right) => left.earningsDate.getTime() - right.earningsDate.getTime());
   }
 
   async getPriceHistory(ticker: string, exchange: string, range: TimeRange, _context?: MarketDataRequestContext): Promise<PricePoint[]> {
@@ -543,11 +602,11 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     const target = cloudInstrumentTarget(ticker, exchange);
     exchange = target.exchange ?? "";
     const request = toHistoryRequest(range);
-    const response = await withCloudFallback(
-      () => apiClient.getCloudHistory(target.symbol, exchange, request),
+    const { response, extendedHours } = await withCloudFallback(
+      () => loadCloudHistory(request.interval, (session) => apiClient.getCloudHistory(target.symbol, exchange, { ...request, ...(session ? { session } : {}) }), _context),
       `Cloud chart data is unavailable for ${ticker}`,
     );
-    return mapCloudPriceHistory(response, target.symbol, exchange, request.interval, subtractTimeRange(new Date(), range));
+    return mapCloudPriceHistory(response, target.symbol, exchange, request.interval, subtractTimeRange(new Date(), range), undefined, extendedHours);
   }
 
   async getPriceHistoryForResolution(
@@ -571,15 +630,16 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     const endDate = new Date();
     const startDate = subtractTimeRange(endDate, bufferRange);
     const includeTime = /^\d+(min|h)$/i.test(interval);
-    const response = await withCloudFallback(
-      () => apiClient.getCloudHistory(target.symbol, exchange, {
+    const { response, extendedHours } = await withCloudFallback(
+      () => loadCloudHistory(interval, (session) => apiClient.getCloudHistory(target.symbol, exchange, {
         interval,
         startDate: formatCloudDateTime(startDate, includeTime, exchange),
         endDate: formatCloudDateTime(endDate, includeTime, exchange),
-      }),
+        ...(session ? { session } : {}),
+      }), _context),
       `Cloud chart data is unavailable for ${ticker}`,
     );
-    return mapCloudPriceHistory(response, target.symbol, exchange, interval, startDate, endDate);
+    return mapCloudPriceHistory(response, target.symbol, exchange, interval, startDate, endDate, extendedHours);
   }
 
   async getDetailedPriceHistory(
@@ -602,16 +662,17 @@ export class GloomberbCloudProvider implements AssetDataProvider {
     const interval = toCloudInterval(barSize);
     const includeTime = /^\d+(min|h)$/i.test(interval);
     const historyRecovery = cloudHistoryRecovery(_context, ticker, target.symbol, exchange, interval, startDate, endDate);
-    const response = await withCloudFallback(
-      () => apiClient.getCloudHistory(target.symbol, exchange, {
+    const { response, extendedHours } = await withCloudFallback(
+      () => loadCloudHistory(interval, (session) => apiClient.getCloudHistory(target.symbol, exchange, {
         interval,
         startDate: formatCloudDateTime(startDate, includeTime, exchange),
         endDate: formatCloudDateTime(endDate, includeTime, exchange),
         ...(historyRecovery ? { historyRecovery } : {}),
-      }),
+        ...(session ? { session } : {}),
+      }), historyRecovery ? undefined : _context),
       `Cloud detailed chart history is unavailable for ${ticker}`,
     );
-    return mapCloudPriceHistory(response, target.symbol, exchange, interval, startDate, endDate);
+    return mapCloudPriceHistory(response, target.symbol, exchange, interval, startDate, endDate, extendedHours);
   }
 
   async getOptionsChain(ticker: string, exchange?: string, expirationDate?: number, _context?: MarketDataRequestContext): Promise<OptionsChain> {

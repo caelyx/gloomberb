@@ -8,6 +8,12 @@ export type DataTableColumn = Pick<
 > & {
   headerColor?: string;
   headerBackgroundColor?: string;
+  /**
+   * Artwork drawn before the header label on the desktop and the web, such as
+   * a flag. It is decoration: the terminal does not draw it, and exports,
+   * automation and screen readers read only `label`.
+   */
+  headerLeading?: ReactNode;
   flexGrow?: number;
 };
 
@@ -21,6 +27,13 @@ export interface DataTableCell {
    */
   value?: number | string | Date | null;
   content?: ReactNode;
+  /**
+   * Artwork drawn before `text` on the desktop and the web, such as a flag.
+   * It is decoration: the terminal does not draw it, and exports, automation
+   * and screen readers read only `text`. Unlike `content`, the text itself
+   * keeps its clipping, alignment and selection color.
+   */
+  leading?: ReactNode;
   color?: string;
   /**
    * Keeps `color` on the selected row of a table with
@@ -49,7 +62,7 @@ export interface DataTableSectionHeader {
 
 export type DataTableScrollAlign = "nearest" | "center";
 
-export interface DataTableRowState {
+interface DataTableRowState {
   selected: boolean;
 }
 
@@ -133,6 +146,12 @@ export interface DataTableProps<
   freezeFirstColumn?: boolean;
   /** Append export-only source records after the displayed table. */
   getExportMetadata?: () => readonly (readonly unknown[])[];
+  /**
+   * A rendered-view report (`gloomberb fn`) reads every row, not only those
+   * the viewport shows. For a bounded table a reader needs whole, such as an
+   * option chain's strike window; leave it off for long or paged lists.
+   */
+  reportEveryRow?: boolean;
   scrollToIndex?: number | null;
   scrollToIndexAlign?: DataTableScrollAlign;
   scrollToIndexVersion?: number;

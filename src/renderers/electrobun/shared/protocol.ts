@@ -3,6 +3,7 @@ import type { PaneRuntimeState } from "../../../core/state/app/state";
 import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState } from "../../../types/desktop-window";
 import type { DesktopApplicationMenuCommand } from "../../../types/desktop-menu";
 import type { AppConfig } from "../../../types/config";
+import type { CachedResourceRecord, ResourceCacheKey } from "../../../data/resource-store";
 import type { TickerRecord } from "../../../types/ticker";
 import type { ReleaseInfo, UpdateCheckResult, UpdateProgress } from "../../../updater";
 import type { CapabilityManifest } from "../../../capabilities";
@@ -18,6 +19,8 @@ export interface ElectrobunBackendInit {
   desktopSnapshot: DesktopSharedStateSnapshot | null;
   desktopThemePreview: DesktopThemePreviewState;
   pluginState: Record<string, Record<string, unknown>>;
+  /** Saved broker account snapshots, which the view's in-memory store starts from. */
+  savedResources?: CachedResourceRecord[];
   capabilityManifests: CapabilityManifest[];
   desktopPlatform: string;
   windowKind: "main" | "detached";
@@ -26,7 +29,7 @@ export interface ElectrobunBackendInit {
   telemetry: ElectrobunTelemetryInit;
 }
 
-export interface ElectrobunTelemetryInit {
+interface ElectrobunTelemetryInit {
   /** Random per-install id from `<dataDir>/install-id`; null when the file could not be written. */
   installId: string | null;
   os: string;
@@ -86,14 +89,14 @@ export type DesktopHttpStreamOpenResponse = Omit<HttpProxyResponseEnvelope, "bod
  * One slice of a streamed body. Exactly one terminal message ends a stream:
  * `done` when the body completed, `error` when reading it failed.
  */
-export interface DesktopHttpStreamChunkMessage {
+interface DesktopHttpStreamChunkMessage {
   streamId: string;
   chunk?: string;
   done?: boolean;
   error?: string;
 }
 
-export interface DesktopCapabilityInvokeRequest {
+interface DesktopCapabilityInvokeRequest {
   capabilityId: string;
   operationId: string;
   payload?: unknown;
@@ -147,7 +150,7 @@ export type DesktopPluginActivationResult =
   | { ok: true; pluginId: string; capabilityManifests: CapabilityManifest[] }
   | { ok: false; error: string };
 
-export interface DesktopBackendRequestMap {
+interface DesktopBackendRequestMap {
   init: {
     request: { kind?: "main" | "detached"; paneId?: string };
     response: ElectrobunBackendInit;
@@ -209,7 +212,10 @@ export interface DesktopBackendRequestMap {
   };
   "host.showContextMenu": { request: { menu: DesktopContextMenuItem[] }; response: boolean };
   "update.check": { request: { currentVersion: string }; response: UpdateCheckResult };
+  /** Downloads and stages the update. It ends in `ready` and never relaunches the app. */
   "update.start": { request: { release: ReleaseInfo; currentVersion?: string }; response: null };
+  /** Installs the staged update and relaunches. Sent only when the user presses Restart. */
+  "update.apply": { request: null; response: null };
   "ticker.loadAll": { request: null; response: TickerRecord[] };
   "ticker.load": { request: { symbol: string }; response: TickerRecord | null };
   "ticker.save": { request: { ticker: TickerRecord }; response: null };
@@ -223,6 +229,9 @@ export interface DesktopBackendRequestMap {
     response: null;
   };
   "session.delete": { request: { sessionId: string }; response: null };
+  /** Saves or drops a broker account snapshot in the cache database; nothing else is accepted. */
+  "resources.set": { request: { record: CachedResourceRecord }; response: null };
+  "resources.delete": { request: { key: ResourceCacheKey }; response: null };
 }
 
 export type DesktopBackendRequestMethod = keyof DesktopBackendRequestMap;
@@ -230,7 +239,7 @@ export type DesktopBackendRequestPayload<K extends DesktopBackendRequestMethod> 
   DesktopBackendRequestMap[K]["request"];
 export type DesktopBackendRequestResponse<K extends DesktopBackendRequestMethod> =
   DesktopBackendRequestMap[K]["response"];
-export type DesktopBackendRequestFor<K extends DesktopBackendRequestMethod> = {
+type DesktopBackendRequestFor<K extends DesktopBackendRequestMethod> = {
   [Method in K]: {
     method: Method;
     payload: DesktopBackendRequestPayload<Method>;
@@ -248,7 +257,10 @@ export type DesktopWorkspaceRequest = DesktopBackendRequestFor<Extract<DesktopBa
 export type DesktopPluginStateRequest = DesktopBackendRequestFor<Extract<DesktopBackendRequestMethod, `pluginState.${string}`>>;
 export type DesktopHostRequest = DesktopBackendRequestFor<Extract<DesktopBackendRequestMethod, `host.${string}`>>;
 export type DesktopCoreRequest = DesktopBackendRequestFor<
-  Extract<DesktopBackendRequestMethod, `update.${string}` | `ticker.${string}` | `config.${string}` | `session.${string}`>
+  Extract<
+    DesktopBackendRequestMethod,
+    `update.${string}` | `ticker.${string}` | `config.${string}` | `session.${string}` | `resources.${string}`
+  >
 >;
 
 interface BackendRequestPayload {
@@ -261,11 +273,11 @@ export interface ContextMenuSelectMessage {
   itemId: string;
 }
 
-export interface ApplicationMenuSelectMessage {
+interface ApplicationMenuSelectMessage {
   command: DesktopApplicationMenuCommand;
 }
 
-export interface DesktopStateMessage {
+interface DesktopStateMessage {
   snapshot: DesktopSharedStateSnapshot;
 }
 
@@ -277,23 +289,23 @@ export interface DesktopThemePreviewMessage {
   preview: DesktopThemePreviewState;
 }
 
-export interface UpdateProgressMessage {
+interface UpdateProgressMessage {
   progress: UpdateProgress;
 }
 
-export interface CapabilityEventMessage {
+interface CapabilityEventMessage {
   subscriptionId: string;
   event: unknown;
 }
 
-export type HttpStreamChunkMessage = DesktopHttpStreamChunkMessage;
+type HttpStreamChunkMessage = DesktopHttpStreamChunkMessage;
 
 export interface DesktopDeepLinkMessage {
   url: string;
 }
 
 /** Plugin folders the Bun process updated in the background, for the main window to bring into its session. */
-export interface PluginsUpdatedMessage {
+interface PluginsUpdatedMessage {
   directories: string[];
 }
 

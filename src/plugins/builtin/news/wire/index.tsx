@@ -16,20 +16,25 @@ import {
   loadNewsFeedSettings,
   saveNewsFeedSettings,
 } from "./feed-config";
-import { IndustryPane } from "./industry-pane";
+import { IndustryPane, TOPIC_NEWS_TITLE } from "./industry-pane";
+import { newsMuteSettingsDef } from "./mutes";
 import { createNewsPresetPane } from "./news/preset-pane";
-import { NEWS_QUERY_PRESETS } from "./news/query-presets";
+import { createNewsStoryPaneTemplate, NEWS_STORY_PANE_ID, NewsStoryPane } from "./news/pop-out";
+import { createLoadedStorySearchProvider } from "./news/command-bar-search";
+import { NEWS_INDUSTRY_CODES, NEWS_QUERY_PRESETS, parseNewsIndustryCode } from "./news/query-presets";
 import { createRssNewsCapability } from "./rss/source";
 import { rssCliCommand } from "./rss/cli";
 import { newsFeedHeadless } from "../headless";
+import type { PaneDef } from "../../../../types/plugin";
 
 const TopPane = createNewsPresetPane({
   paneKey: "top:curated",
   title: "Top News",
   query: NEWS_QUERY_PRESETS.top,
   // A story can merge several outlets, so one source name would misattribute it.
-  columns: ["time", "title", "tickers", "categories", "importance"],
-  defaultSort: { columnId: "importance", direction: "desc" },
+  // The rank orders the stories; the score behind it is not for reading.
+  columns: ["rank", "time", "title", "tickers", "categories"],
+  defaultSort: { columnId: "rank", direction: "desc" },
   emptyStateTitle: "No top stories yet",
   emptyStateHint: "Top stories appear when curated market sources publish them.",
 });
@@ -57,12 +62,45 @@ export const BreakingPane = createNewsPresetPane({
 
 let disposeBreakingNewsNotifications: (() => void) | null = null;
 
+// A rendered news pane is a list of published stories, dated by its newest.
+const NEWS_REPORT_FRESHNESS: PaneDef["reportFreshness"] = { status: "not-a-feed", basis: "published stories" };
+
 const newsWirePanes: PluginModule["panes"] = [
-    { id: "news-top", name: "Top News", icon: "T", component: TopPane, defaultPosition: "right", defaultMode: "floating", defaultFloatingSize: { width: 90, height: 30 } },
-    { id: "news-feed", name: "News Feed", icon: "N", component: FeedPane, defaultPosition: "right", defaultMode: "floating", defaultFloatingSize: { width: 100, height: 35 } },
-    { id: "news-industry", name: "Sector News", icon: "S", component: IndustryPane, defaultPosition: "right", defaultMode: "floating", defaultFloatingSize: { width: 100, height: 35 } },
+    { id: "news-top", reportFreshness: NEWS_REPORT_FRESHNESS, name: "Top News", icon: "T", component: TopPane, defaultPosition: "right", defaultMode: "floating", defaultFloatingSize: { width: 90, height: 30 } },
+    {
+      id: "news-feed",
+      name: "News Feed",
+      icon: "N",
+      component: FeedPane,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 100, height: 35 },
+      settings: (context) => newsMuteSettingsDef(context, "News Feed Settings"),
+    },
+    {
+      id: "news-industry",
+      reportFreshness: NEWS_REPORT_FRESHNESS,
+      name: TOPIC_NEWS_TITLE,
+      icon: "S",
+      component: IndustryPane,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 100, height: 35 },
+      settings: (context) => newsMuteSettingsDef(context, "Topic News Settings"),
+    },
+    {
+      id: NEWS_STORY_PANE_ID,
+      reportFreshness: NEWS_REPORT_FRESHNESS,
+      name: "Story",
+      icon: "A",
+      component: NewsStoryPane,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 80, height: 24 },
+    },
     {
       id: "news-breaking",
+      reportFreshness: NEWS_REPORT_FRESHNESS,
       name: "Breaking News",
       icon: "!",
       component: BreakingPane,
@@ -102,9 +140,33 @@ const newsWirePanes: PluginModule["panes"] = [
 
 const newsWirePaneTemplates: PluginModule["paneTemplates"] = [
   { id: "news-top-pane", paneId: "news-top", label: "Top News", description: "Curated top market stories ranked by importance", keywords: ["top", "news", "headlines", "stories"], shortcut: { prefix: "TOP" } },
-  { id: "news-feed-pane", paneId: "news-feed", label: "News Feed", description: "Chronological market news firehose", keywords: ["news", "feed", "firehose", "wire", "stream"], shortcut: { prefix: "N" }, headless: newsFeedHeadless },
-  { id: "news-industry-pane", paneId: "news-industry", label: "Sector News", description: "Market news filtered by sector", keywords: ["news", "industry", "sector", "ni", "filter"], shortcut: { prefix: "NI" } },
+  // FH is the same combined latest feed, Gloom Cloud with your RSS feeds, so it opens this pane.
+  { id: "news-feed-pane", paneId: "news-feed", label: "News Feed", description: "Chronological market news firehose", keywords: ["news", "feed", "firehose", "wire", "stream", "latest"], shortcut: { prefix: "N", aliases: ["FH"] }, headless: newsFeedHeadless },
+  {
+    id: "news-industry-pane",
+    paneId: "news-industry",
+    label: TOPIC_NEWS_TITLE,
+    description: "Market news by topic code (MNA, CB, ENERGY, REG, CRYPTO, EARN, IPO) or sector",
+    keywords: ["news", "industry", "sector", "topic", "ni", "mna", "central banks", "crypto", "ipo", "earnings", "regulation"],
+    shortcut: {
+      prefix: "NI",
+      argPlaceholder: "code",
+      argKind: "text",
+      argOptional: true,
+      openWithoutArg: true,
+      argOptions: () => NEWS_INDUSTRY_CODES
+        .filter((entry) => entry.code !== "ALL")
+        .map((entry) => ({ value: entry.code, label: entry.label })),
+    },
+    // An unknown code still opens, on a body that lists the codes.
+    createInstance: (_context, options) => {
+      const input = options?.arg?.trim();
+      const code = input ? parseNewsIndustryCode(input)?.code ?? input.toUpperCase() : "ALL";
+      return { title: code === "ALL" ? TOPIC_NEWS_TITLE : `NI ${code}`, params: { code } };
+    },
+  },
   { id: "news-breaking-pane", paneId: "news-breaking", label: "Breaking News", description: "Breaking and urgent market news", keywords: ["first", "breaking", "urgent", "alert", "flash"], shortcut: { prefix: "FIRST" } },
+  createNewsStoryPaneTemplate(),
 ];
 
 /**
@@ -117,6 +179,7 @@ export const browserNewsWireModule: PluginModule = {
   paneTemplates: newsWirePaneTemplates,
   setup(ctx) {
     ctx.registerCommand(breakingNewsSnoozeCommand(ctx));
+    ctx.registerCommandBarSearchProvider(createLoadedStorySearchProvider(ctx));
     disposeBreakingNewsNotifications = setupBreakingNewsNotifications(ctx);
   },
   dispose() {
@@ -173,6 +236,7 @@ export const newsWireModule: PluginModule = {
     });
 
     ctx.registerCommand(breakingNewsSnoozeCommand(ctx));
+    ctx.registerCommandBarSearchProvider(createLoadedStorySearchProvider(ctx));
     disposeBreakingNewsNotifications = setupBreakingNewsNotifications(ctx);
   },
   dispose() {

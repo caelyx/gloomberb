@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import type { HeadlessPaneContext, HeadlessPaneLoadArgs } from "../../../types/headless";
+import type { HeadlessPaneContext, HeadlessPaneEntry, HeadlessPaneLoadArgs, HeadlessSeriesResult } from "../../../types/headless";
 import { createTestDataProvider } from "../../../test-support/data-provider";
 import { correlationHeadless, relationshipHeadless } from "./headless";
 import { buildCorrelationMatrix, buildCorrelationSeries, buildStatusSummary, pairKey } from "./matrix/model";
@@ -23,6 +23,12 @@ function context(missing = "", disjoint = false): HeadlessPaneContext {
   } as HeadlessPaneContext;
 }
 
+/** The relationship report lists its figures as entries, not as a keyed record. */
+function statEntries(result: HeadlessSeriesResult): HeadlessPaneEntry[] {
+  if (!Array.isArray(result.stats)) throw new Error("Expected stat entries");
+  return result.stats;
+}
+
 test("correlation retains usable pairs and marks failed histories without discarding their peers", async () => {
   const result = await correlationHeadless.load(args(["ABC", "SPY", "MISSING"]), context("MISSING"));
   expect(result.rows[0]).toMatchObject({ left: "ABC", right: "SPY", sampleSize: 6 });
@@ -39,6 +45,22 @@ test("relationship supplies the default benchmark, ratio history, rolling correl
   expect(result.series[1]!.points.at(-1)?.value).toBeCloseTo(1);
   expect(result.metadata).toMatchObject({ right: "SPY", alignedPriceCount: 7, returnCount: 6, regression: { beta: 1, rSquared: 1, sampleSize: 6 } });
   expect(result.unavailableSymbols).toEqual([]);
+});
+
+test("relationship notes mixed session closes only, and keeps a small ratio's digits in its figure", async () => {
+  const ctx = {
+    ...context(),
+    resolveInstrument: async (key: string) => ({ symbol: key, exchange: key === "BTC-USD" ? "CCC" : "NASDAQ" }),
+    marketData: createTestDataProvider({
+      getPriceHistory: async (symbol) => [100, 110, 105, 115, 111, 118, 130].map((close, index) => ({
+        date: new Date(Date.UTC(2026, 0, index + 1)), close: close * (symbol === "BTC-USD" ? 150_000 : 1),
+      })),
+    }),
+  } as HeadlessPaneContext;
+  const mixed = await relationshipHeadless.load(args(["IBIT", "BTC-USD"]), ctx);
+  expect(mixed.metadata?.notices).toEqual(["IBIT closes 21:00 UTC; BTC-USD bar is 00:00 UTC (3 h offset). Daily pairs are matched by date."]);
+  expect(statEntries(mixed).find((stat) => stat.key === "latestRatio")?.formatted).toBe("0.000006667");
+  expect((await relationshipHeadless.load(args(["IBIT", "MSFT"]), ctx)).metadata?.notices).toBeUndefined();
 });
 
 test("one usable pair cannot make a matrix with disjoint histories look complete", async () => {
@@ -68,7 +90,7 @@ test("rolling correlation waits for the entire selected observation window", asy
   expect(result.series[0]!.points).toHaveLength(7);
   expect(result.series[1]!.points).toHaveLength(0);
   expect(result.metadata).toMatchObject({ latestCorrelation: null, returnCount: 6 });
-  expect(result.stats?.find((stat) => stat.key === "beta")?.value).toBeCloseTo(1);
+  expect(statEntries(result).find((stat) => stat.key === "beta")?.value).toBeCloseTo(1);
 });
 
 
@@ -100,7 +122,7 @@ test("inconsistent OHLC quarantines risk windows, retains original diagnostics a
   })]));
   const relationship = await relationshipHeadless.load(args(["ABC", "SPY"]), ctx);
   expect(relationship.series.every((series) => series.points.length === 0)).toBe(true);
-  expect(relationship.stats?.filter((stat) => stat.key !== "returnCount").every((stat) => stat.value === null)).toBe(true);
+  expect(statEntries(relationship).filter((stat) => stat.key !== "returnCount").every((stat) => stat.value === null)).toBe(true);
   expect(relationship.unavailableSymbols).toEqual(["SPY"]);
   expect(relationship.errors).toEqual([expect.stringContaining("Inconsistent OHLC")]);
   expect(relationship.metadata?.integrity).toMatchObject({ right: [{ sourcePoints: [expect.objectContaining({ close: corrupt.close })] }] });
@@ -108,7 +130,7 @@ test("inconsistent OHLC quarantines risk windows, retains original diagnostics a
   expect(history[3]!.open).toBe(764.0800);
   ctx.marketData = createTestDataProvider({ getPriceHistory: async () => cleanHistory });
   const recovered = await relationshipHeadless.load(args(["ABC", "SPY"]), ctx);
-  expect(recovered.stats?.find((stat) => stat.key === "rSquared")?.value).toBeCloseTo(1);
+  expect(statEntries(recovered).find((stat) => stat.key === "rSquared")?.value).toBeCloseTo(1);
   expect(recovered.errors).toEqual([]);
 });
 
@@ -140,7 +162,7 @@ test("a zero-variance latest rolling window never publishes an older correlation
   const result = await relationshipHeadless.load(args(["ABC", "SPY"]), ctx);
   expect(result.series[1]?.points.length).toBeGreaterThan(0);
   expect(result.series[1]?.points.at(-1)).toEqual({ date: "2026-09-11T00:00:00.000Z", value: null });
-  expect(result.stats?.find(stat => stat.key === "latestCorrelation")?.value).toBeNull();
+  expect(statEntries(result).find(stat => stat.key === "latestCorrelation")?.value).toBeNull();
   expect(result.metadata?.latestCorrelation).toBeNull();
   expect(result.errors).toEqual([expect.stringContaining("zero return variance in the latest 5 shared returns")]);
   expect(result.metadata?.regression).toMatchObject({ rSquared: 1, sampleSize: 10 });

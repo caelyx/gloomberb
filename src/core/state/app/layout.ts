@@ -1,4 +1,5 @@
-import { getDockLeafLayouts, getDockedPaneIds } from "../../../plugins/pane-manager";
+import { getDockLeafLayouts, getDockedPaneIds } from "../../../layout/pane-manager";
+import { pinFollowingPane } from "../../../layout/pane-follow";
 import {
   cloneLayout,
   findPaneInstance,
@@ -7,9 +8,13 @@ import {
   normalizePaneLayout,
   removePaneInstances,
   TICKER_RESEARCH_PANE_ID,
+  type AppConfig,
   type LayoutConfig,
+  type PaneBinding,
+  type PaneInstanceConfig,
+  type RecentCommand,
+  type SavedLayout,
 } from "../../../types/config";
-import type { AppConfig, PaneBinding, PaneInstanceConfig, SavedLayout } from "../../../types/config";
 import type { DesktopSharedStateSnapshot } from "../../../types/desktop-window";
 import type { BrokerAccount } from "../../../types/trading";
 import { isBrokerPortfolioId } from "../../../utils/broker-instances";
@@ -281,6 +286,36 @@ export function nextRecentTickers(current: string[], symbol: string | null): str
   return next;
 }
 
+/** Cap for the recently run pane templates. */
+export const RECENT_COMMANDS_LIMIT = 10;
+
+function sameRecentCommandEntry(left: RecentCommand, right: RecentCommand | undefined): boolean {
+  return !!right
+    && left.id === right.id
+    && left.label === right.label
+    && left.arg === right.arg;
+}
+
+/**
+ * Newest first. The same id with the same argument is promoted instead of
+ * duplicated, so two tickers opened in one pane both stay in the ring.
+ */
+export function nextRecentCommands(
+  current: readonly RecentCommand[],
+  entry: RecentCommand | null,
+): RecentCommand[] {
+  if (!entry?.id || !entry.label) return current as RecentCommand[];
+  const next = [entry, ...current.filter((existing) => (
+    existing.id !== entry.id || existing.arg !== entry.arg
+  ))].slice(0, RECENT_COMMANDS_LIMIT);
+  if (next.length === current.length && next.every((candidate, index) => (
+    sameRecentCommandEntry(candidate, current[index])
+  ))) {
+    return current as RecentCommand[];
+  }
+  return next;
+}
+
 const savedLayoutClones = new WeakMap<SavedLayout, SavedLayout>();
 const layoutClones = new WeakMap<LayoutConfig, LayoutConfig>();
 
@@ -309,18 +344,16 @@ function buildSavedLayoutSnapshot(
   layout: LayoutConfig,
   paneState: Record<string, PaneRuntimeState>,
   focusedPaneId: string | null,
-  activePanel: "left" | "right",
 ): SavedLayout {
   return {
     ...(entry ?? { name: "Default" }),
     layout: cloneLayoutOnce(layout),
     paneState: clonePaneStateMap(paneState),
     focusedPaneId,
-    activePanel,
   };
 }
 
-const SAVED_LAYOUT_MIRROR_KEYS = new Set<keyof SavedLayout>(["paneState", "focusedPaneId", "activePanel"]);
+const SAVED_LAYOUT_MIRROR_KEYS = new Set<keyof SavedLayout>(["paneState", "focusedPaneId"]);
 
 /**
  * True when two saved-layout lists differ only in what the active layout
@@ -350,7 +383,6 @@ export function syncConfigActiveLayoutState(
   config: AppConfig,
   paneState: Record<string, PaneRuntimeState>,
   focusedPaneId: string | null,
-  activePanel: "left" | "right",
 ): AppConfig {
   const activeLayoutIndex = config.activeLayoutIndex >= 0 && config.activeLayoutIndex < config.layouts.length
     ? config.activeLayoutIndex
@@ -358,10 +390,10 @@ export function syncConfigActiveLayoutState(
   const layouts = config.layouts.length > 0
     ? config.layouts.map((savedLayout, index) => (
       index === activeLayoutIndex
-        ? buildSavedLayoutSnapshot(savedLayout, config.layout, reconcilePaneState(config, paneState), focusedPaneId, activePanel)
+        ? buildSavedLayoutSnapshot(savedLayout, config.layout, reconcilePaneState(config, paneState), focusedPaneId)
         : cloneSavedLayout(savedLayout)
     ))
-    : [buildSavedLayoutSnapshot(undefined, config.layout, reconcilePaneState(config, paneState), focusedPaneId, activePanel)];
+    : [buildSavedLayoutSnapshot(undefined, config.layout, reconcilePaneState(config, paneState), focusedPaneId)];
   return {
     ...config,
     layouts,
@@ -515,7 +547,7 @@ export function focusPaneState(state: AppState, paneId: string): AppState {
   }
   return {
     ...state,
-    config: syncConfigActiveLayoutState(config, state.paneState, paneId, state.activePanel),
+    config: syncConfigActiveLayoutState(config, state.paneState, paneId),
     focusedPaneId: paneId,
     previousFocusedPaneId: state.focusedPaneId && state.focusedPaneId !== paneId
       ? state.focusedPaneId
@@ -530,12 +562,12 @@ export function withFocusedPane(
   options: {
     paneState?: Record<string, PaneRuntimeState>;
     focusedPaneId?: string | null;
-    activePanel?: "left" | "right";
   } = {},
 ): AppState {
   const normalizedLayout = normalizePaneLayout(config.layout, {
     // Keep a follower alive on its last symbol when its source pane is gone.
     resolveOrphanSymbol: (instanceId) => resolveTickerForPane(state, instanceId),
+    pinOrphan: pinFollowingPane,
   });
   const nextConfig = normalizedLayout === config.layout
     ? config
@@ -543,7 +575,6 @@ export function withFocusedPane(
       ...config,
       layout: normalizedLayout,
   };
-  const activePanel = options.activePanel ?? state.activePanel;
   const nextPaneState = reconcilePaneState(nextConfig, options.paneState ?? state.paneState);
   const requestedFocusedPaneId = Object.prototype.hasOwnProperty.call(options, "focusedPaneId")
     ? (options.focusedPaneId ?? null)
@@ -551,7 +582,7 @@ export function withFocusedPane(
   const focusedPaneId = resolveFocusedPaneId(nextConfig.layout, requestedFocusedPaneId);
   const focusedLayout = focusedPaneId ? bringFloatingToFront(nextConfig.layout, focusedPaneId) : nextConfig.layout;
   const focusedConfig = focusedLayout === nextConfig.layout ? nextConfig : { ...nextConfig, layout: focusedLayout };
-  const syncedConfig = syncConfigActiveLayoutState(focusedConfig, nextPaneState, focusedPaneId, activePanel);
+  const syncedConfig = syncConfigActiveLayoutState(focusedConfig, nextPaneState, focusedPaneId);
   return {
     ...state,
     config: syncedConfig,
@@ -561,21 +592,14 @@ export function withFocusedPane(
     previousFocusedPaneId: state.focusedPaneId && state.focusedPaneId !== focusedPaneId
       ? state.focusedPaneId
       : state.previousFocusedPaneId,
-    activePanel,
   };
 }
 
 export function hydrateDesktopSnapshot(state: AppState, snapshot: DesktopSharedStateSnapshot): AppState {
-  const baseState = withFocusedPane({
+  return withFocusedPane({
     ...state,
     paneState: snapshot.paneState,
     focusedPaneId: snapshot.focusedPaneId,
-    activePanel: snapshot.activePanel,
     statusBarVisible: snapshot.statusBarVisible,
   }, snapshot.config);
-  return {
-    ...baseState,
-    activePanel: snapshot.activePanel,
-    statusBarVisible: snapshot.statusBarVisible,
-  };
 }

@@ -1,6 +1,7 @@
 import { createElement, forwardRef, useCallback, useRef, type ComponentProps } from "react";
 import { useForwardedScrollBoxRef, useRegisterPaneScrollBox } from "../state/pane-scroll-registry";
 import { useUiHost, type UiHost } from "./host";
+import { scrollBoxScrollsVertically } from "./scroll-box-axis";
 import { useRemoteUiNode } from "../remote/semantic-tree";
 import { assignRef } from "../react/assign-ref";
 import {
@@ -48,6 +49,7 @@ export type {
   MediaSurfaceHandle,
   MediaSurfaceProps,
   InputRenderable,
+  LiveBoxFrame,
   NativeCursorState,
   NativeRendererHost,
   NativePostProcessFn,
@@ -128,8 +130,11 @@ export const ScrollBox = forwardRef<any, ComponentProps<UiHost["ScrollBox"]>>((p
   const { ScrollBox: HostScrollBox } = useUiHost();
   const localRef = useForwardedScrollBoxRef<any>(ref);
   const rawProps = props as Record<string, unknown>;
+  // The same rule the hosts scroll by: a ScrollBox that omits scrollY scrolls,
+  // so it is a scrollbox to the remote tree and to the pane scroll keys.
+  const scrollsVertically = scrollBoxScrollsVertically(props);
   const remoteNodeId = useRemoteUiNode(
-    props.scrollY === true
+    scrollsVertically
       ? {
         role: remotePropRole(rawProps, "scrollbox"),
         label: remotePropLabel(rawProps),
@@ -150,7 +155,7 @@ export const ScrollBox = forwardRef<any, ComponentProps<UiHost["ScrollBox"]>>((p
           ...remoteMetadataFromProps(rawProps),
           width: rawProps.width,
           height: rawProps.height,
-          scrollY: props.scrollY === true,
+          scrollY: true,
           scrollTop: localRef.current?.scrollTop,
           viewportHeight: localRef.current?.viewport?.height,
         },
@@ -158,7 +163,7 @@ export const ScrollBox = forwardRef<any, ComponentProps<UiHost["ScrollBox"]>>((p
       : null,
   );
   useRegisterPaneScrollBox(localRef, {
-    enabled: props.scrollY === true,
+    enabled: scrollsVertically,
     onScrollActivity: typeof props.onMouseScroll === "function"
       ? props.onMouseScroll as (event: { scroll: { direction: "up" | "down"; delta: number } }) => void
       : undefined,
@@ -200,13 +205,18 @@ export const Input = forwardRef<any, ComponentProps<UiHost["Input"]>>((props, re
 });
 Input.displayName = "Input";
 
-export const Textarea = forwardRef<any, ComponentProps<UiHost["Textarea"]>>((props, ref) => {
+export const Textarea = forwardRef<any, ComponentProps<UiHost["Textarea"]>>(({
+  "data-gloom-remote-hidden": remoteHidden,
+  ...props
+}: ComponentProps<UiHost["Textarea"]> & { "data-gloom-remote-hidden"?: boolean }, ref) => {
   const { Textarea: HostTextarea } = useUiHost();
   const rawProps = props as Record<string, unknown>;
   const onInput = rawProps.onInput as ((value: string) => unknown) | undefined;
   const onChange = rawProps.onChange as ((value: string) => unknown) | undefined;
   const onSubmit = rawProps.onSubmit as (() => unknown) | undefined;
-  const remoteNodeId = useRemoteUiNode({
+  // An owner that registers the control itself (a form field) hides this node,
+  // whose setValue could not reach an uncontrolled textarea's buffer.
+  const remoteNodeId = useRemoteUiNode(remoteHidden ? null : {
     role: remotePropRole(rawProps, "textarea"),
     label: remotePropLabel(rawProps),
     disabled: rawProps.disabled === true,

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, Text, useUiCapabilities } from "../../../ui";
+import { Text, useUiCapabilities } from "../../../ui";
 import {
   useAsyncResource,
   useAutoRefresh,
@@ -30,7 +30,7 @@ import { Blurred, LockedOverlay, UpgradeLabel } from "../shared/locked-rows";
 import { usePaneStatusFooter } from "../../../components/layout/pane/status-footer";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
-import { listingIdentity } from "../shared/ticker-request";
+import { listingIdentity, useIssuerListing } from "../shared/ticker-request";
 import { QuarterBars, type BarHover } from "./bars";
 import {
   cachedRevenueBreakdown,
@@ -79,20 +79,23 @@ function RevenueBreakdownView({ width, height, focused }: { width: number; heigh
   const session = useResearchCloudSession();
   const access = usePlanAccess();
   const pro = access.hasProAccess;
-  const openUpgrade = useCloudUpgradeAction();
+  const openUpgrade = useCloudUpgradeAction("seg");
   const identity = listingIdentity(boundSymbol, ticker?.metadata.exchange ?? "");
   const symbol = identity?.symbol ?? null;
+  const { name } = useIssuerListing(ticker);
+  const exchange = identity?.exchange ?? "";
+  const listing = useMemo(() => ({ exchange, name }), [exchange, name]);
   const [requestedView, setView] = usePaneSettingValue<RevenueBreakdownView>("view", "product");
   const [mode, setMode] = usePluginPaneState<RevenueMode>("revenue:mode", "trend");
   const [sort, setSort] = usePluginPaneState<RevenueSort>("revenue:sort", { column: "revenue", direction: "desc" });
   const view = REVENUE_VIEWS.includes(requestedView) ? requestedView : "product";
 
   const loader = useCallback(
-    (force: boolean) => loadRevenueBreakdown(symbol!, view, pro, force),
-    [symbol, view, pro, session.requestKey],
+    (force: boolean) => loadRevenueBreakdown(symbol!, view, pro, force, listing),
+    [symbol, listing, view, pro, session.requestKey],
   );
   const resource = useAsyncResource(symbol ? loader : null, {
-    initialData: () => (symbol ? cachedRevenueBreakdown(symbol, view, pro) : null),
+    initialData: () => (symbol ? cachedRevenueBreakdown(symbol, view, pro, listing) : null),
     clearOnError: (error) => error instanceof Error && error.message === NO_BREAKDOWN,
   });
   useAutoRefresh(resource.updatedAt, resource.load);

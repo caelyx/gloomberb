@@ -1,12 +1,13 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { act, useState } from "react";
 import type { ScrollBoxRenderable } from "@opentui/core";
-import { emitKeypress as emitTuiKeypress, testRender, type TestKeyEvent } from "../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness, type TestKeyEvent } from "../../renderers/opentui/test-utils";
 import {
   AppContext,
   PaneInstanceProvider,
   createInitialState,
 } from "../../state/app/context";
+import { PaneKeyboardScrollController } from "../../state/pane-scroll-registry";
 import { createStaticAppStore } from "../../test-support/app-store";
 import { createDefaultConfig } from "../../types/config";
 import { Box, Text } from "../../ui";
@@ -35,15 +36,7 @@ const columns: Column[] = [
   { id: "title", label: "Title", width: 20, align: "left" },
 ];
 
-let testSetup: Awaited<ReturnType<typeof testRender>> | undefined;
-
-afterEach(async () => {
-  if (!testSetup) return;
-  await act(async () => {
-    testSetup!.renderer.destroy();
-  });
-  testSetup = undefined;
-});
+const tui = createOpenTuiTestHarness();
 
 function Harness({ onCursor = () => {} }: { onCursor?: () => void }) {
   const [selectedIndex, setSelectedIndex] = useState(1);
@@ -134,6 +127,61 @@ function LargeSelectionHarness({
   );
 }
 
+/** A read-only table: no cursor, so the pane scroll keys are what move it. */
+function NoCursorHarness() {
+  const state = createInitialState(createDefaultConfig("/tmp/gloomberb-data-table-view-no-cursor-test"));
+  return (
+    <AppContext value={createStaticAppStore(state)}>
+      <PaneInstanceProvider paneId="data-table-view-no-cursor-test">
+        <PaneKeyboardScrollController paneId="data-table-view-no-cursor-test" focused />
+        <DataTableView<Row, Column>
+          focused
+          selection={{ kind: "none" }}
+          columns={columns}
+          items={largeRows}
+          sortColumnId={null}
+          sortDirection="asc"
+          getItemKey={(row) => row.id}
+          renderCell={(row): DataTableCell => ({ text: row.title })}
+          emptyStateTitle="No rows"
+        />
+      </PaneInstanceProvider>
+    </AppContext>
+  );
+}
+
+let rerenderParent: (() => void) | undefined;
+let parentRenderedCells = 0;
+const renderCountedCell = (row: Row): DataTableCell => {
+  parentRenderedCells += 1;
+  return { text: row.title };
+};
+
+/** Builds `selection` inline, as most panes do, with a stable `renderCell`. */
+function InlineSelectionHarness() {
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [, setRenderCount] = useState(0);
+  rerenderParent = () => setRenderCount((count) => count + 1);
+  const state = createInitialState(createDefaultConfig("/tmp/gloomberb-data-table-view-inline-test"));
+  return (
+    <AppContext value={createStaticAppStore(state)}>
+      <PaneInstanceProvider paneId="data-table-view-inline-test">
+        <DataTableView<Row, Column>
+          focused
+          selection={{ kind: "index", selectedIndex, onChange: (index) => setSelectedIndex(index) }}
+          columns={columns}
+          items={largeRows}
+          sortColumnId={null}
+          sortDirection="asc"
+          getItemKey={(row) => row.id}
+          renderCell={renderCountedCell}
+          emptyStateTitle="No rows"
+        />
+      </PaneInstanceProvider>
+    </AppContext>
+  );
+}
+
 let setDeferredRows: ((rows: Row[]) => void) | undefined;
 let setRequestedIndex: ((index: number) => void) | undefined;
 
@@ -181,57 +229,57 @@ async function renderSettled() {
   // numeric scroll offset updated while the captured frame is still old.
   for (let phase = 0; phase < 3; phase += 1) {
     await act(async () => {
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
     });
   }
 }
 
-const emitKeypress = (event: TestKeyEvent) => emitTuiKeypress(testSetup!, event);
+const emitKeypress = (event: TestKeyEvent) => tui.emitKeypress(event);
 
-const emitKeypressBatch = (events: TestKeyEvent[]) => emitTuiKeypress(testSetup!, events);
+const emitKeypressBatch = (events: TestKeyEvent[]) => tui.emitKeypress(events);
 
 describe("DataTableView", () => {
   test("owns row keyboard navigation and skips section headers", async () => {
-    testSetup = await testRender(<Harness />, { width: 60, height: 12 });
+    await tui.render(<Harness />, { width: 60, height: 12 });
 
     await renderSettled();
-    expect(testSetup.captureCharFrame()).toContain("cursor=First row selected=First row");
+    expect(tui.frame()).toContain("cursor=First row selected=First row");
 
     // The first step after a pause commits at once; the steps that follow
     // inside the commit window only move the cursor.
     await emitKeypress({ name: "down", sequence: "\u001B[B" });
     await renderSettled();
-    expect(testSetup.captureCharFrame()).toContain("cursor=Second row selected=Second row");
+    expect(tui.frame()).toContain("cursor=Second row selected=Second row");
 
     await emitKeypress({ name: "up", sequence: "\u001B[A", meta: true });
     await renderSettled();
-    expect(testSetup.captureCharFrame()).toContain("cursor=Second row selected=Second row");
+    expect(tui.frame()).toContain("cursor=Second row selected=Second row");
 
     await emitKeypress({ name: "up", sequence: "\u001B[A" });
     await renderSettled();
-    expect(testSetup.captureCharFrame()).toContain("cursor=First row selected=Second row");
+    expect(tui.frame()).toContain("cursor=First row selected=Second row");
 
     await emitKeypress({ name: "j", sequence: "j" });
     await emitKeypress({ name: "k", sequence: "k" });
     await renderSettled();
-    expect(testSetup.captureCharFrame()).toContain("cursor=First row selected=Second row");
+    expect(tui.frame()).toContain("cursor=First row selected=Second row");
 
     await emitKeypress({ name: "enter", sequence: "\r" });
     await renderSettled();
-    expect(testSetup.captureCharFrame()).toContain("activated=First row");
+    expect(tui.frame()).toContain("activated=First row");
 
     await emitKeypress({ name: "j", sequence: "j" });
     await renderSettled();
-    expect(testSetup.captureCharFrame()).toContain("cursor=Second row selected=First row activated=First row");
+    expect(tui.frame()).toContain("cursor=Second row selected=First row activated=First row");
 
     await emitKeypress({ name: "enter", sequence: "\r", defaultPrevented: true });
     await renderSettled();
-    expect(testSetup.captureCharFrame()).toContain("cursor=Second row selected=First row activated=First row");
+    expect(tui.frame()).toContain("cursor=Second row selected=First row activated=First row");
   });
 
   test("does no cursor or scroll work when navigation is already at an edge", async () => {
     let cursorChanges = 0;
-    testSetup = await testRender(
+    await tui.render(
       <Harness onCursor={() => { cursorChanges += 1; }} />,
       { width: 60, height: 12 },
     );
@@ -243,8 +291,29 @@ describe("DataTableView", () => {
     expect(cursorChanges).toBe(0);
   });
 
+  test("leaves the scroll keys to the pane when the table has no cursor", async () => {
+    // A key the table claims is stopped, as in the app, so the pane scroll keys skip it.
+    const pressTracked = (event: TestKeyEvent) => tui.emitKeypress(event, { trackPropagation: true });
+    await tui.render(<NoCursorHarness />, { width: 60, height: 12 });
+    await renderSettled();
+    expect(tui.frame()).toContain("Row 0");
+
+    await pressTracked({ name: "pagedown", sequence: "\u001B[6~" });
+    await renderSettled();
+    expect(tui.frame()).not.toContain("Row 0\n");
+    expect(tui.frame()).toContain("Row 10");
+
+    await pressTracked({ name: "end", sequence: "\u001B[F" });
+    await renderSettled();
+    expect(tui.frame()).toContain("Row 999");
+
+    await pressTracked({ name: "home", sequence: "\u001B[H" });
+    await renderSettled();
+    expect(tui.frame()).toContain("Row 0");
+  });
+
   test("keeps selection current across repeated keypresses before the next render", async () => {
-    testSetup = await testRender(<Harness />, { width: 60, height: 12 });
+    await tui.render(<Harness />, { width: 60, height: 12 });
 
     await renderSettled();
     await emitKeypressBatch([
@@ -254,11 +323,11 @@ describe("DataTableView", () => {
     ]);
     await renderSettled();
 
-    expect(testSetup.captureCharFrame()).toContain("selected=Third row activated=Third row");
+    expect(tui.frame()).toContain("selected=Third row activated=Third row");
   });
 
   test("keeps the immediate cursor visible while a controlled selection is deferred", async () => {
-    testSetup = await testRender(
+    await tui.render(
       <LargeSelectionHarness onIsSelected={() => {}} />,
       { width: 60, height: 12 },
     );
@@ -270,12 +339,12 @@ describe("DataTableView", () => {
     })));
     await renderSettled();
 
-    expect(testSetup.captureCharFrame()).toContain("Row 530");
+    expect(tui.frame()).toContain("Row 530");
   });
 
   test("renders only the visible rows and the rows changed by navigation", async () => {
     let renderedCells = 0;
-    testSetup = await testRender(
+    await tui.render(
       <LargeSelectionHarness
         onIsSelected={() => {
           renderedCells += 1;
@@ -293,20 +362,36 @@ describe("DataTableView", () => {
 
     expect(renderedCells - beforeNavigation).toBeLessThanOrEqual(4);
   });
+
+  test("keeps unchanged rows memoized when the parent re-renders with an inline selection", async () => {
+    await tui.render(<InlineSelectionHarness />, { width: 60, height: 12 });
+    await renderSettled();
+
+    parentRenderedCells = 0;
+    await act(async () => { rerenderParent?.(); });
+    await renderSettled();
+    expect(parentRenderedCells).toBe(0);
+
+    // A keypress commits the selection, which re-renders the parent with a new
+    // selection object; only the two rows whose selected state flipped repaint.
+    await emitKeypress({ name: "down", sequence: "\u001B[B" });
+    await renderSettled();
+    expect(parentRenderedCells).toBeLessThanOrEqual(4);
+  });
 });
 
 test("fulfills a center request after rows are laid out and then leaves manual scrolling alone", async () => {
   const scrollSources: Array<"programmatic" | "user" | undefined> = [];
-  testSetup = await testRender(
+  await tui.render(
     <DeferredScrollHarness onScroll={(source) => scrollSources.push(source)} />,
     { width: 60, height: 12 },
   );
   await renderSettled();
   await act(async () => { setDeferredRows!(largeRows); });
   await renderSettled();
-  const body = testSetup.renderer.root.findDescendantById("deferred-scroll-body") as ScrollBoxRenderable;
+  const body = tui.setup().renderer.root.findDescendantById("deferred-scroll-body") as ScrollBoxRenderable;
   expect(body.scrollTop).toBe(500 - Math.floor(body.viewport.height / 2));
-  expect(testSetup.captureCharFrame()).toContain("Row 500");
+  expect(tui.frame()).toContain("Row 500");
   expect(scrollSources.at(-1)).toBe("programmatic");
 
   await act(async () => { body.scrollTo(50); });
@@ -320,7 +405,7 @@ test("fulfills a center request after rows are laid out and then leaves manual s
   await renderSettled();
   expect(body.scrollTop).toBe(0);
   expect(scrollSources.at(-1)).toBe("programmatic");
-  expect(testSetup.captureCharFrame()).toContain("Loading rows");
+  expect(tui.frame()).toContain("Loading rows");
   await act(async () => { setDeferredRows!(largeRows); });
   await renderSettled();
   expect(body.scrollTop).toBe(500 - Math.floor(body.viewport.height / 2));
@@ -331,14 +416,14 @@ test("fulfills a center request after rows are laid out and then leaves manual s
 
 
 test("an external selection and scroll request cannot be reversed by the previous cursor", async () => {
-  testSetup = await testRender(
+  await tui.render(
     <DeferredScrollHarness initialRows={largeRows} initialIndex={0} controlSelection />,
     { width: 60, height: 12 },
   );
   await renderSettled();
   await act(async () => { setRequestedIndex!(500); });
   await renderSettled();
-  const body = testSetup.renderer.root.findDescendantById("deferred-scroll-body") as ScrollBoxRenderable;
+  const body = tui.setup().renderer.root.findDescendantById("deferred-scroll-body") as ScrollBoxRenderable;
   expect(body.scrollTop).toBe(500 - Math.floor(body.viewport.height / 2));
-  expect(testSetup.captureCharFrame()).toContain("Row 500");
+  expect(tui.frame()).toContain("Row 500");
 });

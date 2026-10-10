@@ -3,6 +3,7 @@ import type { TickerRecord } from "../../../../types/ticker";
 import { isManualPortfolio } from "../../../../plugins/builtin/portfolio-list/mutations";
 import type { Command } from "../../commands/registry";
 import type { ResultItem } from "../../list/model";
+import { canRestartToApply } from "../../../../updater";
 
 interface RootCommandItemBuilderOptions {
   activeCollectionId: string | null;
@@ -84,6 +85,9 @@ export function createRootCommandItemBuilder({
         return activeTickerSymbol ? `Remove ${activeTickerSymbol} from Portfolio` : command.label;
       case "set-portfolio-position":
         return activeTickerSymbol ? `Set Position for ${activeTickerSymbol}` : command.label;
+      // The row only shows its label, so a downloaded update is announced there.
+      case "check-for-updates":
+        return state.updateProgress?.phase === "ready" ? "Update ready, restart to apply" : command.label;
       default:
         return command.label;
     }
@@ -128,8 +132,9 @@ export function createRootCommandItemBuilder({
           return `Downloading v${state.updateAvailable?.version}: ${state.updateProgress.percent ?? 0}%`;
         }
         if (state.updateProgress?.phase === "replacing") return "Installing update";
+        if (state.updateProgress?.phase === "ready") return "Update ready, restart to apply";
         if (state.updateProgress?.phase === "done") {
-          return state.updateProgress.message ?? "Update installed - restart to apply";
+          return state.updateProgress.message ?? "Update ready, restart to apply";
         }
         if (state.updateProgress?.phase === "error") {
           return `Update failed: ${state.updateProgress.error}`;
@@ -146,6 +151,10 @@ export function createRootCommandItemBuilder({
         return state.config.telemetry?.crashReports === false ? "Currently off" : "Currently on";
       case "toggle-usage-counts":
         return state.config.telemetry?.usage === false ? "Currently off" : "Currently on";
+      case "toggle-attention-counts":
+        return state.config.telemetry?.attention === true
+          ? "Currently on: share ticker research counts"
+          : "Currently off: opt in to sharing ticker research counts";
       case "font-size-increase":
       case "font-size-decrease":
         return `Currently ${state.config.fontSize ?? 12}px`;
@@ -163,6 +172,8 @@ export function createRootCommandItemBuilder({
         return state.config.telemetry?.crashReports === false ? "off" : "on";
       case "toggle-usage-counts":
         return state.config.telemetry?.usage === false ? "off" : "on";
+      case "toggle-attention-counts":
+        return state.config.telemetry?.attention === true ? "on" : "off";
       default:
         return command.prefix || undefined;
     }
@@ -172,6 +183,8 @@ export function createRootCommandItemBuilder({
     switch (command.id) {
       case "set-portfolio-position":
         return "edit position update position modify position manual position portfolio position";
+      case "check-for-updates":
+        return state.updateProgress?.phase === "ready" ? "check for updates restart relaunch" : "";
       default:
         return "";
     }
@@ -190,7 +203,7 @@ export function createRootCommandItemBuilder({
       searchText: smartSearchText(command),
       disabled:
         command.id === "check-for-updates" &&
-        (state.updateCheckInProgress || !!state.updateProgress),
+        (state.updateCheckInProgress || (!!state.updateProgress && !canRestartToApply(state.updateProgress))),
       action: () => runDirectCommand(command, arg),
     };
   };

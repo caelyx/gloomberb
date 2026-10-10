@@ -6,7 +6,7 @@ Bug reports and pull requests are welcome. Please follow the [code of conduct](C
 
 ## Running locally
 
-Requires [Bun](https://bun.sh).
+Requires [Bun](https://bun.sh) 1.3.11, the version CI runs (`packageManager` in `package.json`). Install it with `curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.11"`, and recheck a test that fails only on another version against 1.3.11 before chasing it.
 
 ```bash
 git clone https://github.com/gloom-sh/gloomberb.git
@@ -16,7 +16,7 @@ bun dev               # terminal app, restarted on save
 bun run desktop:dev   # desktop app
 ```
 
-Both use your real `~/.gloomberb`. To develop against a throwaway profile, point `GLOOMBERB_HOME` somewhere else:
+Both use your real profile (`~/.gloomberb`, or the XDG folders on a Linux install that never had one). To develop against a throwaway profile, point `GLOOMBERB_HOME` somewhere else:
 
 ```bash
 GLOOMBERB_HOME=/tmp/gloomberb-dev bun dev
@@ -37,10 +37,16 @@ This fetches the latest upstream version.
 | Path | Contents |
 |---|---|
 | `src/plugins/builtin/` | The built-in plugins: Portfolio, Ticker Research, News and every other product area |
-| `src/plugins/` | The plugin host: catalog, loader, registry, pane manager, and the bundler for external plugins |
+| `src/plugins/` | The plugin host: catalog, loader, registry and the bundler for external plugins |
+| `src/layout/` | The pane layout engine: the dock tree, floating windows, where a launched pane opens and which pane a ticker opens in |
 | `src/components/`, `src/ui/` | The shared UI kit every pane is built from |
+| `src/sources/` | Data provider adapters (Gloom Cloud, SEC EDGAR) and the router that picks a provider for each request |
+| `src/market-data/` | What panes read market data through: the request coordinator, its React hooks, quote display and exchange session calendars |
+| `src/time-series/` | Chart specs and the series they draw: the field catalog, resolving a spec into data, transforms and studies |
+| `src/data/` | Persistence: SQLite, the resource store, the config store and the plugin cache |
 | `src/renderers/opentui/` | The terminal renderer |
-| `src/renderers/electrobun/` | The desktop app: `bun/` is the native process, `view/` the web view |
+| `src/renderers/dom/` | The DOM renderer the desktop view and the web app share: host primitives, controls, data table, dialogs, toasts and the page build |
+| `src/renderers/electrobun/` | The desktop app: `bun/` is the native process, `view/` the desktop-only parts of the web view, `shared/` the protocol and RPC codec both use |
 | `src/renderers/browser/`, `src/renderers/cloudflare/` | The web app and the Cloudflare Worker that serves it |
 | `src/renderers/share/` | Public share pages |
 | `src/cli/` | `gloomberb <command>`, including the `fn` and `shot` pane reports |
@@ -55,7 +61,8 @@ This fetches the latest upstream version.
 CI runs these on every pull request. Run them before you push:
 
 ```bash
-bun run typecheck   # six projects: terminal, desktop Bun process, desktop view, browser, Worker, scripts
+bun run typecheck   # terminal, desktop Bun process, desktop view, browser, Worker, scripts, built-in plugin tests
+bun run knip        # unused files, exports and dependencies
 bun test
 ```
 
@@ -70,8 +77,21 @@ Some changes need one more check:
 | Web app, share page or Worker code | `bun run web:audit` and `bun run cloudflare:dry-run` |
 | Build scripts or the terminal entry point | `bun run build` |
 | Tables, rendering, or market data stores | `bun run benchmark:tui:compare --base <main checkout>` and `bun run benchmark:tui:memory` (need tmux); the Performance workflow runs both on every PR |
+| Pane chrome, docking, the DOM renderer or the desktop view | `bun run check:pane-chrome` and `bun run benchmark:pane-drag:compare --base <main checkout>`; see [Pane chrome checks](#pane-chrome-checks) |
 
 Try UI changes in the app as well. [`.agents/skills/tui-testing/SKILL.md`](.agents/skills/tui-testing/SKILL.md) shows how to drive the terminal app from tmux; give it a throwaway `GLOOMBERB_HOME`.
+
+### Pane chrome checks
+
+Unit tests press a pane's header with synthetic events, which is how v0.16.1 shipped panes that only moved from the grip and the title. `scripts/pane-chrome` drives the real desktop shell in headless Chrome with real pointer input instead, over a fixed layout of stand-in panes (`fixture.tsx`) with no network, and checks where each pane ends up: drags by the grip, the title and the bare header bar for docked, tabbed, failed, floating and fullscreen panes, tab select and reorder, the resize corner, a dock divider, and a popped-out window's title bar and caption buttons (the native window bridge is a recorder).
+
+The Pane chrome workflow runs these pointer checks on pull requests that touch the paths listed under `pull_request` in `.github/workflows/pane-chrome.yml`, and on pushes to `main` that touch them; a failed step fails the pull request. The Performance workflow's Pane drag frame budget job compares a pane drag against the base branch for the same paths and for `performance.yml` itself: its Pane drag scope job reads the list (`scripts/pane-chrome/scope.ts`) and skips the budget in seconds for any other change.
+
+- `bun run check:pane-chrome` runs every step once; `--only <text>` picks steps by name, `--repeat <n>` runs them again, `--root <checkout>` checks another checkout's sources. A failed step saves a screenshot under `~/.cache/gloomberb-pane-chrome/failures`.
+- `bun run benchmark:pane-drag:compare --base <main checkout>` compares main-thread time per frame and React commits while dragging a docked and a floating pane, and reports animation frames and estimated missed 60 Hz frames (requestAnimationFrame timing, not frames a GPU presented).
+- The first run downloads the pinned Chrome for Testing headless shell (`browser.ts`); `CHROME_PATH` uses another Chrome instead.
+- To add a case, add a step to `checks.ts` that starts from a fixture scenario, moves the pointer with `drag` or `click`, and checks the result in the page (where a pane is, what is selected), not which handler ran. A new kind of pane or layout goes in `fixture.tsx`.
+- Not covered: GPU compositing (the runner has none) and the native macOS WebKit view; the desktop window move is checked up to the bridge message.
 
 ## Tests
 
@@ -90,8 +110,8 @@ Tests run on `bun test` and sit next to the code they cover as `*.test.ts` or `*
 
 - `src/test-support/` is the home for shared fixtures and fakes: a data provider with quote and financials factories, ticker records, news articles, resolved chart series and points, a stand-in broker, a doubled plugin runtime, plugin persistence, market sessions, a static app store (`createStaticAppStore`), pane providers and the `TestPaneFrame` footer shell, headless and CLI contexts, a Cloud API WebSocket fake and temporary databases. Put a new shared fixture there instead of declaring it inline in another test. A fixture only one feature's tests share can sit next to them in a `test-fixture.ts` (or `test-harness.tsx` for render helpers), which the published package leaves out.
 - For a pending result, use `Promise.withResolvers()` rather than a local `deferred()` helper.
-- `src/renderers/opentui/test-utils.tsx` renders into a test terminal: `testRender`, `emitKeypress`, `settleFrame`.
-- `src/renderers/electrobun/view/test-utils.tsx` renders the desktop view into happy-dom: `createDomTestHarness`.
+- `src/renderers/opentui/test-utils.tsx` renders into a test terminal. `createOpenTuiTestHarness` mounts one renderer per test and destroys it after every test, with `frame`, `emitKeypress`, `renderFrames`, `waitForFrameToContain` and `clickFrameText` on the current renderer; `testRender`, `emitKeypress` and `settleFrame` remain for lower-level use.
+- `src/renderers/dom/test-utils.tsx` renders the desktop and web view into happy-dom: `createDomTestHarness`.
 - A few features keep a harness beside their code, such as the command bar (`src/components/command-bar/surface/test-harness.tsx`) and chat.
 - Plugins in their own repositories get the same fakes and render harness from `gloomberb/test-support`.
 
@@ -99,7 +119,7 @@ Tests run on `bun test` and sit next to the code they cover as `*.test.ts` or `*
 
 ### Host imports
 
-Built-in code under `src/` imports the host by relative path (`../../../ui`, `../../../components`, `../../../public/react`, `../../../theme/colors`). The `gloomberb/*` specifiers are the external-plugin API: Bun on Linux resolves them as a package self-reference, so typecheck and tests pass, but the Windows desktop bundle cannot resolve them and the Windows verify workflow on `main` fails.
+Built-in code under `src/` imports the host by relative path (`../../../ui`, `../../../components`, `../../../public/react`, `../../../theme/colors`). The `gloomberb/*` specifiers are the external-plugin API: Bun on Linux resolves them as a package self-reference, so typecheck and tests pass, but the Windows desktop bundle cannot resolve them and the Windows verify workflow on `main` fails. `src/architecture/import-boundaries.test.ts` fails on a `gloomberb` or `gloomberb/*` import in built-in code.
 
 ### One component for every renderer
 
@@ -114,14 +134,14 @@ Basic UI must use the shared kit: actions, selectable and expandable rows, field
 [PLUGINS.md](PLUGINS.md) is the guide to building a plugin and its APIs. [docs/pane-conventions.md](docs/pane-conventions.md) covers how a pane is put together: where actions, status and warnings go, detail stacks, load-more lists, tabs, forms, reserved keys, and a checklist for a new pane. The rules that come up most in review:
 
 - The pane footer shows what changes (loading, error, live or delayed, stale, auth state) and the pane's action keys. No fixed labels, row counts or generic keyboard hints there, and no button rows in the body.
-- Never show the data provider in a pane (`provider:*`, Gloom Cloud, Yahoo, Alpaca and so on). Say what the data is instead: real-time, 15m delayed, settlement, as of a date.
+- Never show internal provider or source identifiers in a pane (`provider:*`, raw feed names). Say what the data is instead: real-time, 15m delayed, settlement, as of a date. Gloom Cloud is the public market-data service.
 - Say each thing once. When a pane title or detail header names the item, the body starts with metadata or content.
 - Methodology, model assumptions and usage explanations go in `docs/`, not in always-visible pane text or new info buttons. Units, source dates and active data failures stay in context.
 - Everything interactive works with the mouse and the keyboard.
 
 ### Built-in plugins
 
-Only independently owned, registered product areas implement `GloomPlugin`. Larger built-ins may compose internal `PluginModule` objects for panes, commands, capabilities and lifecycle code, but those modules have no identity, toggle, version or persistence namespace of their own, and smaller built-ins declare their contributions directly. `PluginModule` is an internal organization tool, not a second plugin API: external plugins export one `GloomPlugin`.
+Only independently owned, registered product areas implement `GloomPlugin`. Larger built-ins may compose internal `PluginModule` objects for panes, commands, capabilities and lifecycle code, but those modules have no identity, toggle or version of their own, and smaller built-ins declare their contributions directly. A module persists under its plugin's state namespace, unless it moved from another plugin: its entry then keeps the namespace it had (`{ module, stateId }`), so its users keep their pane state, settings and caches. `PluginModule` is an internal organization tool, not a second plugin API: external plugins export one `GloomPlugin`.
 
 ## Pull requests
 

@@ -2,9 +2,12 @@ import type { RevenueBreakdownView } from "../../../api-client/revenue-breakdown
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
 import { fetchRevenueBreakdown } from "./client";
 import { quarterLabel, reportedSpan } from "./model";
+import { SEC_FILINGS } from "../shared/report-freshness";
+import { resolveHeadlessIssuerListing } from "../shared/headless-market-data";
 
 export const revenueBreakdownHeadless: HeadlessPaneDefinition<"bundle"> = {
   shape: "bundle",
+  freshness: { ...SEC_FILINGS, basis: "10-Q and 10-K filings" },
   argument: {
     kind: "ticker",
     description: "SEC reporting issuer ticker.",
@@ -32,10 +35,12 @@ export const revenueBreakdownHeadless: HeadlessPaneDefinition<"bundle"> = {
   ],
   describe: (args) => `Revenue breakdown | ${args.symbols[0]}`,
   async load(args, ctx) {
+    const symbol = args.symbols[0]!;
     const data = reportedSpan(await fetchRevenueBreakdown(
-      args.symbols[0]!,
+      symbol,
       (args.options.view as RevenueBreakdownView | undefined) ?? "product",
       ctx.apiClient,
+      await resolveHeadlessIssuerListing(ctx, symbol),
     ));
     return {
       complete: data.access === "full",

@@ -6,9 +6,10 @@ import {
   getDockedPaneIds,
   isPaneInLayout,
   isPaneDocked,
-} from "../../plugins/pane-manager";
+} from "../../layout/pane-manager";
 import type { PluginRegistry } from "../../plugins/registry";
-import { findFixedTickerPaneForSymbol } from "../../plugins/ticker-navigation";
+import { PluginOffError, notifyPluginOff } from "../../plugins/plugin-off";
+import { findFixedTickerPaneForSymbol } from "../../layout/ticker-navigation";
 import type { AppAction, AppState } from "../../state/app/context";
 import { TICKER_RESEARCH_PANE_ID, normalizePaneId } from "../../types/config";
 import type {
@@ -23,13 +24,15 @@ import {
   type TickerOpenTarget,
 } from "../../tickers/open-target";
 import { AmbiguousTickerError, findExactTickerSearchMatch } from "../../tickers/search";
-import { parsePublicTickerKey } from "../../utils/exchanges";
-import { tickerHasYahooSuffix } from "../../sources/yahoo-finance/symbols";
+import { isDialogOpen } from "../../ui/dialog-stack";
+import { parsePublicTickerKey, publicTickerKey } from "../../utils/exchanges";
+import { attentionActionForPane, captureAttentionAction } from "../../telemetry/attention-counts";
+import { tickerHasListingSuffix } from "../../sources/listing-symbols";
 import { instrumentFromTicker } from "../../market-data/request-types";
 import { tickerInstrumentLabel } from "../../tickers/instrument-label";
 
 interface UseAppTickerOpenRuntimeOptions {
-  activatePane: (paneId: string, layout?: LayoutConfig) => void;
+  activatePane: (paneId: string) => void;
   buildPaneInstance: (paneType: string, options?: {
     title?: string;
     binding?: PaneBinding;
@@ -75,7 +78,8 @@ export function useAppTickerOpenRuntime({
       return target;
     } catch (err) {
       if (!canPresentFeedback()) return null;
-      if (err instanceof AmbiguousTickerError) {
+      // Ticker search offers the listings, unless a dialog would sit over the bar.
+      if (err instanceof AmbiguousTickerError && !isDialogOpen()) {
         dispatch({ type: "SET_COMMAND_BAR", open: true, query: rawSymbol,
           launch: { kind: "ticker-search", query: rawSymbol } });
       }
@@ -95,10 +99,23 @@ export function useAppTickerOpenRuntime({
     }
   }, [dispatch, pluginRegistry.events, stateRef]);
 
+  /**
+   * A ticker opens in a pane of its plugin, which is added hidden while that
+   * plugin is off, so the open is refused with an offer to turn it on.
+   */
+  const refuseWhileOwnerOff = useCallback((symbol: string, options: PinTickerOptions | undefined, reopen: () => void) => {
+    const paneType = normalizePaneId(options?.paneType ?? TICKER_RESEARCH_PANE_ID);
+    const owner = pluginRegistry.getDisabledPaneOwner(paneType, stateRef.current.config.disabledPlugins);
+    if (!owner) return false;
+    notifyPluginOff(pluginRegistry, new PluginOffError(owner, symbol), reopen);
+    return true;
+  }, [pluginRegistry, stateRef]);
+
   const placePinnedTickerTarget = useCallback((target: TickerOpenTarget, options?: PinTickerOptions) => {
     const paneType = normalizePaneId(options?.paneType ?? TICKER_RESEARCH_PANE_ID);
     const paneDef = pluginRegistry.panes.get(paneType);
     if (!paneDef) return;
+    if (refuseWhileOwnerOff(target.symbol, options, () => placePinnedTickerTarget(target, options))) return;
 
     publishTickerOpenTarget(target);
     const symbol = target.symbol;
@@ -114,7 +131,7 @@ export function useAppTickerOpenRuntime({
     if (!options?.forceNewPane && !existing && instrument === null && !target.ticker.metadata.broker_contracts?.length) {
       existing = findFixedTickerPaneForSymbol(currentLayout, paneType, symbol);
     }
-    if (!options?.forceNewPane && !existing && !instrument && (parsePublicTickerKey(symbol).exchange || tickerHasYahooSuffix(symbol))) {
+    if (!options?.forceNewPane && !existing && !instrument && (parsePublicTickerKey(symbol).exchange || tickerHasListingSuffix(symbol))) {
       existing = currentLayout.instances.find((instance) => {
         if (instance.paneId !== paneType || instance.binding?.kind !== "fixed" || instance.binding.instrument || !isPaneInLayout(currentLayout, instance.instanceId)) return false;
         const ticker = currentState.tickers.get(instance.binding.symbol);
@@ -152,7 +169,7 @@ export function useAppTickerOpenRuntime({
     });
     if (!instance) return;
 
-    const { width, height } = pluginRegistry.getTermSizeFn();
+    const { width, height } = pluginRegistry.getTermSize();
     const shouldFloat = options?.floating ?? true;
     const nextLayout = shouldFloat
       ? addPaneFloating(currentLayout, instance, width, height, paneDef)
@@ -170,7 +187,7 @@ export function useAppTickerOpenRuntime({
     if (paneType === TICKER_RESEARCH_PANE_ID && options?.tabId) {
       dispatch({ type: "UPDATE_PANE_STATE", paneId: instance.instanceId, patch: { activeTabId: options.tabId } });
     }
-    activatePane(instance.instanceId, nextLayout);
+    activatePane(instance.instanceId);
   }, [
     activatePane,
     buildPaneInstance,
@@ -179,17 +196,25 @@ export function useAppTickerOpenRuntime({
     persistLayout,
     pluginRegistry,
     publishTickerOpenTarget,
+    refuseWhileOwnerOff,
     stateRef,
   ]);
 
   const openPinnedTicker = useCallback(async (rawSymbol: string, options?: PinTickerOptions) => {
+    // Before resolving, so a refused open adds no ticker either.
+    if (refuseWhileOwnerOff(rawSymbol, options, () => { void openPinnedTicker(rawSymbol, options); })) return;
+    const recordAttention = captureAttentionAction();
     const selectedTicker = options?.instrument !== undefined && (options.instrument || options.listing) ? await tickerRepository.loadTicker(rawSymbol) : null;
     const target = selectedTicker
       ? { symbol: selectedTicker.metadata.ticker, ticker: selectedTicker, created: false, instrument: options?.instrument, listing: options?.listing }
       : await resolveOpenTickerTarget(rawSymbol, options?.instrument === null);
     if (!target) return;
     placePinnedTickerTarget(target, options);
-  }, [placePinnedTickerTarget, resolveOpenTickerTarget, tickerRepository]);
+    const action = attentionActionForPane(options?.paneType ?? TICKER_RESEARCH_PANE_ID);
+    if (action && pluginRegistry.panes.has(options?.paneType ?? TICKER_RESEARCH_PANE_ID)) {
+      recordAttention(publicTickerKey(target.symbol, target.listing?.exchange ?? target.ticker.metadata.exchange), action);
+    }
+  }, [placePinnedTickerTarget, pluginRegistry, refuseWhileOwnerOff, resolveOpenTickerTarget, tickerRepository]);
 
   return {
     openPinnedTicker,

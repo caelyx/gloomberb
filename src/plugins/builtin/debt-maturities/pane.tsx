@@ -1,5 +1,5 @@
 import { useCallback, useMemo, type ReactNode } from "react";
-import { listingIdentity } from "../shared/ticker-request";
+import { listingIdentity, useIssuerListing } from "../shared/ticker-request";
 import { Box, ScrollBox, Text, useUiCapabilities } from "../../../ui";
 import {
   useAsyncResource,
@@ -32,6 +32,7 @@ import type {
   DebtMetric,
 } from "../../../api-client/debt-maturities";
 import { isAccessDenied } from "../../../api-client/errors";
+import { formatCompactAxis } from "../../../components/chart-table";
 import { staticSeries } from "../../../components/chart/static/series";
 import type { PaneProps } from "../../../types/plugin";
 import { formatPercentileRank } from "../../../utils/format";
@@ -49,7 +50,6 @@ import {
   bucketShare,
   datedBucketScale,
   debtAmount,
-  debtAxisAmount,
   debtFilingUrl,
   debtMetricCaption,
   debtMetricValue,
@@ -275,13 +275,14 @@ function HistoryDetail({
 export function DebtMaturitiesPane({ width, height, focused }: PaneProps) {
   const { ticker } = usePaneTickerIdentity();
   const symbol = listingIdentity(ticker?.metadata.ticker)?.symbol ?? null;
+  const listing = useIssuerListing(ticker);
   const session = useResearchCloudSession();
   const loader = useCallback(
-    (force: boolean) => loadDebtMaturities(symbol!, force),
-    [symbol, session.requestKey],
+    (force: boolean) => loadDebtMaturities(symbol!, listing, force),
+    [symbol, listing, session.requestKey],
   );
   const resource = useAsyncResource(symbol ? loader : null, {
-    initialData: () => (symbol ? cachedDebtMaturities(symbol) : null),
+    initialData: () => (symbol ? cachedDebtMaturities(symbol, listing) : null),
     clearOnError: isAccessDenied,
   });
   const [initialTab] = usePaneSettingValue("tab", "maturities");
@@ -488,6 +489,7 @@ export function DebtMaturitiesPane({ width, height, focused }: PaneProps) {
   if (!data && isCloudSessionRequired(resource.error))
     return (
       <SignInWall
+        placement="debt-maturities-signin"
         action="view debt maturities"
         needsVerification={session.needsVerification}
       />
@@ -595,7 +597,7 @@ export function DebtMaturitiesPane({ width, height, focused }: PaneProps) {
                           showTimeAxis
                           xAxis={barAxis}
                           formatValue={(value) => debtAmount(value)}
-                          formatAxisValue={debtAxisAmount}
+                          formatAxisValue={formatCompactAxis}
                           legendAccessory={<Text fg={colors.textMuted}>{historyWindow}</Text>}
                           legendAccessoryWidth={historyWindow.length}
                           remoteKind="debt-filing-history"

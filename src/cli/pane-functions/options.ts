@@ -1,12 +1,15 @@
 import type { PaneTemplateCreateOptions, PaneTemplateDef } from "../../types/plugin";
 import { parseTickerListInput } from "../../tickers/list";
 import { normalizeTickerInput } from "../../tickers/search";
+import { resolveFinancialPeriodOption } from "../../plugins/builtin/ticker-detail/financials/model";
 import {
-  FINANCIAL_SUB_TABS,
-  resolveFinancialPeriodOption,
-} from "../../plugins/builtin/ticker-detail/financials/model";
+  FINANCIAL_SECTIONS,
+  RATIO_TAB_KEYS,
+  resolveFinancialSectionKey,
+} from "../../plugins/builtin/ticker-detail/financials/ratios";
 import type { PaneRuntimeState } from "../../core/state/app/state";
 import type { NormalizedPaneFunctionOptions } from "./capabilities";
+import type { ListingArg } from "../listing-arg";
 
 const DEFAULT_SHOT_WIDTH = 1280;
 const DEFAULT_SHOT_HEIGHT = 720;
@@ -30,6 +33,8 @@ export interface ParsedPaneFunctionArgs {
   /** Small label drawn in the pane title bar, e.g. a domain; null draws nothing. */
   watermark: string | null;
   requireBotSafe: boolean;
+  /** The listing a one-ticker function's argument named, once `applyListingArgument` has resolved it. */
+  listing?: ListingArg;
 }
 
 export interface ParsedPaneCatalogArgs {
@@ -62,7 +67,7 @@ export function parseArgumentsOption(value: string): Record<string, string> {
   return pairs;
 }
 
-export function parsePaneFunctionArgs(args: string[], globalOptions: { limit?: number } = {}): ParsedPaneFunctionArgs {
+export function parsePaneFunctionArgs(args: string[], globalOptions: { limit?: number; tail?: number } = {}): ParsedPaneFunctionArgs {
   const positionals: string[] = [];
   const options: Record<string, string | true> = {};
   let outputPath: string | null = null;
@@ -122,9 +127,11 @@ export function parsePaneFunctionArgs(args: string[], globalOptions: { limit?: n
 
   const target = positionals[0]?.trim() ?? "";
   const arg = positionals.slice(1).join(" ").trim();
-  // The outer CLI parser consumes --limit before fn/shot sees its arguments.
-  // Restore it for the pane's own schema and loader, including bounds checks.
+  // The outer CLI parser consumes --limit and --tail before fn/shot sees its arguments.
+  // Restore them for the pane's own schema and loader, including bounds checks,
+  // so a function without a tail option says so instead of ignoring it.
   if (globalOptions.limit != null) options.limit = String(globalOptions.limit);
+  if (globalOptions.tail != null) options.tail = String(globalOptions.tail);
   return { target, arg, options, outputPath, width, height, theme, scale, watermark, requireBotSafe };
 }
 
@@ -178,7 +185,7 @@ export function parsePaneCatalogArgs(args: string[]): ParsedPaneCatalogArgs {
 
 type PaneOptionValues = Record<string, string | number | boolean>;
 
-export function optionString(options: PaneOptionValues, key: string): string | undefined {
+function optionString(options: PaneOptionValues, key: string): string | undefined {
   const value = options[normalizeOptionKey(key)];
   return value === true || value === undefined ? undefined : String(value);
 }
@@ -248,10 +255,11 @@ function normalizeFinancialSubTabOption(value: string | undefined): string | und
   if (!normalized) return undefined;
   if (normalized === "cf" || normalized === "cashflows") return "cashflow";
   if (normalized === "bs" || normalized === "balancesheet") return "balance";
-  return FINANCIAL_SUB_TABS.find((tab) => (
+  const section = resolveFinancialSectionKey(value);
+  return FINANCIAL_SECTIONS.find((tab) => (
     tab.key.toLowerCase() === normalized
     || tab.name.toLowerCase().replace(/[\s_-]+/g, "") === normalized
-  ))?.key;
+  ))?.key ?? (RATIO_TAB_KEYS.has(section) ? section : undefined);
 }
 
 export function optionPaneState(options: PaneOptionValues | NormalizedPaneFunctionOptions): PaneRuntimeState {

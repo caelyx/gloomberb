@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { RemoteUiNodeSnapshot } from "../../remote/types";
 import {
+  assessPaneScreenshot,
   buildDesktopShotPayload,
   chartSeriesEvidenceWithinRange,
   chartEvidenceMismatchesFor,
@@ -14,19 +15,14 @@ import {
   shotSemanticRowCount,
   shotUnavailableSymbols,
   stripDesktopShotCredentials,
-  volSurfaceEvidenceMismatchesFor,
-  realizedVolEvidenceMismatchesFor,
-  volatilityEvidenceMismatchesFor,
-  scenarioEvidenceMismatchesFor,
-  calculatorEvidenceMismatchesFor,
-  calculatorVisibilityMismatchesFor,
   type PaneScreenshotExpectedChartEvidence,
   type PaneScreenshotExpectedSelection,
 } from "./screenshot";
+import { paneEvidenceMismatches } from "./screenshot-evidence";
 import { realizedVolSemanticEvidence } from "../../plugins/builtin/realized-vol/evidence";
 import { coneChartSeries, realizedChartSeries } from "../../plugins/builtin/realized-vol/chart-model";
 import { collectShotSymbols } from "./data";
-import type { DesktopPaneShotPayload } from "../desktop-pane-shot";
+import type { DesktopPaneShotPayload, DesktopPaneShotRenderResult } from "../desktop-pane-shot";
 import type { ResolvedPaneFunction } from "./resolver";
 import { buildCustomChartPreset } from "../../plugins/builtin/chart-composer/presets";
 import { CHART_COMPOSER_PANE_ID, createDefaultConfig } from "../../types/config";
@@ -40,7 +36,17 @@ import { optionsScenarioHeadless } from "../../plugins/builtin/options-scenario/
 import { calculatorSemanticEvidence } from "../../plugins/builtin/options-calculator/evidence";
 import { draftFromCalculatorInputs } from "../../plugins/builtin/options-calculator/inputs";
 import { optionsCalculatorHeadless } from "../../plugins/builtin/options-calculator/headless";
-import { valueOption, solveImpliedVolatility } from "../../plugins/builtin/options-calculator/model";
+import { valueOption, solveImpliedVolatility } from "../../plugins/builtin/shared/volatility";
+import { loadSeasonalityHistory } from "../../plugins/builtin/seasonality/client";
+import { createTestDataProvider, createTestFinancials, createTestQuote } from "../../test-support/data-provider";
+import type { FinancialStatement, PricePoint, TickerFinancials } from "../../types/financials";
+import { loadPeriodEndHistory } from "../../plugins/builtin/ticker-detail/financials/period-end-history";
+import {
+  RATIO_TABS,
+  formatRatioValue,
+  periodEndClose,
+  ratioTableForFinancials,
+} from "../../plugins/builtin/ticker-detail/financials/ratios";
 
 test("calculator screenshots freeze percent inputs without market requests, including an inactive cash schedule", async () => {
   const request = { pane: { id: "options-calculator" }, capability: { id: "options-calculator-pane", options: optionsCalculatorHeadless.options },
@@ -68,20 +74,21 @@ test("calculator screenshot evidence must match the requested inputs, not just a
     implied: solveImpliedVolatility(inputs, inputs.marketPrice), loading: false, surface: null });
   const evidence = project();
   const nodes = (metadata: unknown = evidence) => [{ id: "calculator-data", role: "chart-data", actions: [], metadata }] as RemoteUiNodeSnapshot[];
+  const visibleKeyValues = ["Model", "Implied IV", "Delta", "Gamma", "Theta", "Vega", "Rho"].map((label) => ({ label, text: `${label} 1` }));
+  const mismatches = (req: ResolvedPaneFunction, shot: DesktopPaneShotPayload, semanticUi: RemoteUiNodeSnapshot[], visible = visibleKeyValues) => (
+    paneEvidenceMismatches(req, shot, { semanticUi, visibleKeyValues: visible }));
   expect(shotDataEvidenceFor(request, source, nodes())).toEqual(evidence);
   expect(shotSemanticRowCount(request, source, nodes())).toBe(7);
   expect(shotUnavailableSymbols(request, source, nodes())).toEqual([]);
-  expect(calculatorEvidenceMismatchesFor(request, source, nodes())).toEqual([]);
-  expect(calculatorEvidenceMismatchesFor({ ...request, options: { ...options, model: "american", volSource: "surface" } }, source, nodes()))
+  expect(mismatches(request, source, nodes())).toEqual([]);
+  expect(mismatches({ ...request, options: { ...options, model: "american", volSource: "surface" } }, source, nodes()))
     .toEqual(["option calculator snapshot does not match requested inputs"]);
-  expect(calculatorEvidenceMismatchesFor(request, source, nodes(project({ ...draft, spot: 100 })))).toEqual(["rendered option calculator inputs do not match"]);
-  expect(calculatorEvidenceMismatchesFor(request, { ...source, config: {} as typeof source.config }, nodes())).toHaveLength(1);
+  expect(mismatches(request, source, nodes(project({ ...draft, spot: 100 })))).toEqual(["rendered option calculator inputs do not match"]);
+  expect(mismatches(request, { ...source, config: {} as typeof source.config }, nodes())).toHaveLength(1);
   expect(shotDataEvidenceFor(request, source, nodes({ ...evidence, complete: true, loading: true }))).toBeNull();
   expect(shotSemanticRowCount(request, source, [])).toBe(0);
   expect(shotUnavailableSymbols(request, source, [])).toEqual(["AAPL"]);
-  const visibleKeyValues = ["Model", "Implied IV", "Delta", "Gamma", "Theta", "Vega", "Rho"].map((label) => ({ label, text: `${label} 1` }));
-  expect(calculatorVisibilityMismatchesFor(request, { visibleKeyValues })).toEqual([]);
-  expect(calculatorVisibilityMismatchesFor(request, { visibleKeyValues: visibleKeyValues.slice(0, 5) }))
+  expect(mismatches(request, source, nodes(), visibleKeyValues.slice(0, 5)))
     .toEqual(["option calculator metrics are clipped or missing: Vega, Rho"]);
 });
 
@@ -122,10 +129,12 @@ test("option scenario screenshots require the active numeric model and consumed 
   expect(shotSemanticRowCount(request, source, nodes())).toBe(scenario.payoff.length * 2);
   expect(shotUnavailableSymbols(request, source, nodes())).toEqual([]);
   expect(shotDataEvidenceFor(request, source, nodes())).toEqual(evidence);
-  expect(scenarioEvidenceMismatchesFor(request, source, nodes())).toEqual([]);
-  expect(scenarioEvidenceMismatchesFor({ ...request, options: { tab: "grid" } }, source, nodes())).toHaveLength(1);
+  expect(paneEvidenceMismatches(request, source, { semanticUi: nodes() })).toEqual([]);
+  expect(paneEvidenceMismatches({ ...request, options: { tab: "grid" } }, source, { semanticUi: nodes() })).toHaveLength(1);
   const changed = buildScenario({ ...scenario.position, legs: scenario.position.legs.map((leg) => ({ ...leg, quantity: -1 })) });
-  expect(scenarioEvidenceMismatchesFor(request, source, nodes(scenarioSemanticEvidence({ scenario: changed, view: "payoff", loading: false })))).toHaveLength(1);
+  expect(paneEvidenceMismatches(request, source, {
+    semanticUi: nodes(scenarioSemanticEvidence({ scenario: changed, view: "payoff", loading: false })),
+  })).toHaveLength(1);
   expect(shotDataEvidenceFor(request, source, [])).toBeNull();
   expect(shotSemanticRowCount(request, source, [])).toBe(0);
   expect(shotUnavailableSymbols(request, source, nodes({ ...evidence, loading: true, complete: false }))).toEqual(["AAPL"]);
@@ -143,12 +152,12 @@ test("volatility history screenshot readiness requires dated plotted values and 
   expect(shotSemanticRowCount(request, source, nodes)).toBe(3);
   expect(shotUnavailableSymbols(request, source, nodes)).toEqual([]);
   expect(shotDataEvidenceFor(request, source, nodes)).toEqual(metadata);
-  expect(volatilityEvidenceMismatchesFor(request, source, nodes)).toEqual([]);
+  expect(paneEvidenceMismatches(request, source, { semanticUi: nodes })).toEqual([]);
   source.config.layout.instances[0]!.settings = { initialTab: "board" };
-  expect(volatilityEvidenceMismatchesFor(request, source, nodes)).toEqual(["rendered volatility index view does not match"]);
+  expect(paneEvidenceMismatches(request, source, { semanticUi: nodes })).toEqual(["rendered volatility index view does not match"]);
   expect(shotSemanticRowCount(request, source, [])).toBe(0);
   expect(shotDataEvidenceFor(request, source, [])).toBeNull();
-  expect(volatilityEvidenceMismatchesFor(request, source, [])).toHaveLength(1);
+  expect(paneEvidenceMismatches(request, source, { semanticUi: [] })).toHaveLength(1);
 });
 
 describe("realized volatility screenshot history", () => {
@@ -210,6 +219,181 @@ describe("realized volatility screenshot history", () => {
   });
 });
 
+describe("seasonality screenshot history", () => {
+  const request = {
+    pane: { id: "seasonality" }, capability: { id: "seasonality-pane", options: [] },
+    instance: { instanceId: "seas:test", paneId: "seasonality", binding: { kind: "fixed", symbol: "SPY" }, settings: {} },
+    createOptions: { symbol: "SPY" }, options: {},
+  } as unknown as ResolvedPaneFunction;
+  // Monday-stamped weeks: none of these closes is a month-end close.
+  const weekly = [{ date: new Date("2026-08-31"), close: 770 }, { date: new Date("2026-09-28"), close: 769 }];
+  const monthly = [{ date: new Date("2026-08-01"), close: 760 }, { date: new Date("2026-09-01"), close: 765 },
+    { date: new Date("2026-10-01"), close: 772 }];
+  const capture = (history: (resolution: string) => PricePoint[]) => buildDesktopShotPayload(request, {
+    config: createDefaultConfig("/tmp/seasonality-shot-test"), store: { loadTicker: async () => null },
+    dataProvider: createTestDataProvider({ getTickerFinancials: async () => createTestFinancials(),
+      getPriceHistoryForResolution: async (_symbol, _exchange, _range, resolution) => history(resolution) }),
+  } as unknown as MarketContext, "SPY", {}, 800, 600, null, 1, null);
+
+  test("captures the pane's monthly closes, tagged 1mo, instead of the weekly seed", async () => {
+    const requested: string[] = [];
+    const shot = await capture((resolution) => { requested.push(resolution); return resolution === "1mo" ? monthly : weekly; });
+    expect(requested).toEqual(["1mo"]);
+    expect(shot.financials[0]![1]).toMatchObject({ priceHistory: monthly, priceHistoryResolution: "1mo" });
+    // The page answers the pane's own request from the capture, never from live data.
+    const page = createSnapshotDataProvider(JSON.parse(JSON.stringify(shot)), createTestDataProvider());
+    const replayed = await loadSeasonalityHistory({ instrument: { symbol: "SPY" } }, page);
+    expect(replayed.history.map((point) => point.close)).toEqual([760, 765, 772]);
+  });
+
+  test("fails instead of drawing another cadence when monthly history is missing", async () => {
+    await expect(capture((resolution) => resolution === "1mo" ? [] : weekly)).rejects.toThrow(/^SPY: /);
+  });
+});
+
+test("correlation screenshots capture daily closes where the range preset is weekly", async () => {
+  const request = {
+    pane: { id: "correlation" }, capability: { id: "return-correlation", options: [] },
+    instance: { instanceId: "corr:test", paneId: "correlation", binding: { kind: "none" }, settings: { rangePreset: "5Y" } },
+    createOptions: { symbols: ["SPY", "QQQ"] }, options: { rangePreset: "5Y" },
+  } as unknown as ResolvedPaneFunction;
+  const daily = [{ date: new Date("2026-09-30"), close: 100 }, { date: new Date("2026-10-01"), close: 101 }];
+  const requested: unknown[][] = [];
+  const shot = await buildDesktopShotPayload(request, {
+    config: createDefaultConfig("/tmp/correlation-shot-test"), store: { loadTicker: async () => null },
+    dataProvider: createTestDataProvider({ getTickerFinancials: async () => createTestFinancials(),
+      getPriceHistory: async () => { throw new Error("A 5Y range capture is weekly"); },
+      getPriceHistoryForResolution: async (symbol, _exchange, range, resolution) => { requested.push([symbol, range, resolution]); return daily; } }),
+  } as unknown as MarketContext, "SPY,QQQ", {}, 800, 600, null, 1, null);
+  expect(requested).toEqual([["SPY", "5Y", "1d"], ["QQQ", "5Y", "1d"]]);
+  expect(shot.financials.map(([, data]) => [data.priceHistory, data.priceHistoryResolution])).toEqual([[daily, "1d"], [daily, "1d"]]);
+});
+
+describe("financial analysis ratio screenshots", () => {
+  // Every line any ratio tab reads, so a correct table has a number in each cell.
+  const fiscal = (date: string): FinancialStatement => ({
+    date, currency: "USD", totalRevenue: 400, costOfRevenue: 160, grossProfit: 240, operatingIncome: 120, pretaxIncome: 110, taxProvision: 22,
+    netIncome: 88, eps: 4.4, ordinarySharesNumber: 20, ebitda: 150, interestExpense: 5, operatingCashFlow: 130,
+    capitalExpenditure: -30, freeCashFlow: 100, totalAssets: 900, currentAssets: 300, currentLiabilities: 150, inventory: 40,
+    accountsReceivable: 60, accountsPayable: 30, totalDebt: 200, cashCashEquivalentsAndShortTermInvestments: 120, totalEquity: 500,
+  });
+  const statements = {
+    quote: createTestQuote({ symbol: "MSFT", currency: "USD" }),
+    annualStatements: ["2021-06-30", "2022-06-30", "2023-06-30", "2024-06-30", "2025-06-30", "2026-06-30"].map(fiscal),
+    quarterlyStatements: ["2025-03-31", "2025-06-30", "2025-09-30", "2025-12-31", "2026-03-31", "2026-06-30"].map(fiscal),
+  };
+  // The pane's columns: five years, or six quarters, back from June 2026.
+  const OLDEST = { annual: "2022-06-30", quarterly: "2025-03-31" } as const;
+  const DAY_MS = 86_400_000;
+  const RANGE_DAYS: Record<string, number> = { "6M": 183, "1Y": 366, "5Y": 1_827, ALL: 20_000 };
+  /** Weekday closes, or Monday-stamped weeks, over a range ending `end`. */
+  const bars = (range: string, resolution: string, end = Date.now()): PricePoint[] => {
+    const points: PricePoint[] = [];
+    for (let time = end - RANGE_DAYS[range]! * DAY_MS; time <= end; time += DAY_MS) {
+      const date = new Date(Math.floor(time / DAY_MS) * DAY_MS);
+      if (resolution === "1d" ? date.getUTCDay() % 6 !== 0 : date.getUTCDay() === 1) {
+        points.push({ date, close: 100 + (Math.floor(time / DAY_MS) % 97) });
+      }
+    }
+    return points;
+  };
+  const request = (statement: string, period: string) => ({
+    token: "FA", pane: { id: "financial-analysis" },
+    capability: { id: "financial-statements", options: [], screenshotReadiness: "ready" },
+    instance: { instanceId: "fa:test", paneId: "financial-analysis", binding: { kind: "fixed", symbol: "MSFT" }, settings: {} },
+    createOptions: { symbol: "MSFT" }, options: { statement, period },
+  }) as unknown as ResolvedPaneFunction;
+  const capture = (period: string, history: (range: string, resolution: string) => PricePoint[]) => buildDesktopShotPayload(
+    request("valuation", period), {
+      config: createDefaultConfig("/tmp/fa-shot-test"), store: { loadTicker: async () => null },
+      dataProvider: createTestDataProvider({ getTickerFinancials: async () => createTestFinancials(statements),
+        getPriceHistoryForResolution: async (_symbol, _exchange, range, resolution) => history(range, resolution) }),
+    } as unknown as MarketContext, "MSFT", {}, 800, 600, null, 1, null,
+  );
+
+  test.each(["annual", "quarterly"] as const)("valuation captures daily closes back to the oldest %s period end, tagged 1d", async (period) => {
+    const requested: string[] = [];
+    const shot = await capture(period, (range, resolution) => { requested.push(resolution); return bars(range, resolution); });
+    const [, captured] = shot.financials[0]!;
+    expect(requested).toEqual(["1d"]);
+    expect(captured.priceHistoryResolution).toBe("1d");
+    const oldestClose = periodEndClose(captured.priceHistory, OLDEST[period]);
+    expect(oldestClose).toBeNumber();
+    // The page answers the pane's own request from the capture, never from live data.
+    const page = createSnapshotDataProvider(JSON.parse(JSON.stringify(shot)), createTestDataProvider());
+    const replayed = await loadPeriodEndHistory(page, "MSFT", "", OLDEST[period]);
+    expect(periodEndClose(replayed, OLDEST[period])).toBe(oldestClose!);
+  });
+
+  test("valuation fails instead of drawing weekly bars when daily closes are missing, errored or stale", async () => {
+    await expect(capture("annual", (range, resolution) => resolution === "1d" ? [] : bars(range, resolution)))
+      .rejects.toThrow(/^MSFT: daily price history is unavailable/);
+    await expect(capture("annual", (range, resolution) => {
+      if (resolution === "1d") throw new Error("Source unavailable");
+      return bars(range, resolution);
+    })).rejects.toThrow(/^MSFT: Source unavailable/);
+    // A source that answers the daily request with weekly bars.
+    await expect(capture("annual", (range) => bars(range, "1wk"))).rejects.toThrow(/^MSFT: Daily closes are unavailable/);
+    // Closes that stop more than a week before the June 2026 period end.
+    await expect(capture("quarterly", (range, resolution) => bars(range, resolution, Date.parse("2026-06-01"))))
+      .rejects.toThrow(/^MSFT: daily price history is stale/);
+  });
+
+  /** The pane's collapsed table drawn from `history`, as the page renders it. */
+  const assess = (statement: string, financials: TickerFinancials, drawnHistory: PricePoint[] | null) => {
+    const tab = RATIO_TABS.find(({ key }) => key === statement)!;
+    const table = ratioTableForFinancials(financials, tab, "annual", drawnHistory);
+    const columns = table.periods.map(({ statement: { date } }, index) => ({ id: `statement:${date}:${index}`, label: date.slice(0, 4) }));
+    const rows = table.rows.flatMap((row, rowIndex) => row.kind === "ratio" ? [{
+      tableIndex: 0, rowIndex, key: row.id, selected: rowIndex === 0,
+      cells: [{ columnId: "metric", columnLabel: "Ratio", text: row.label }, ...columns.map((column, index) => ({
+        columnId: column.id, columnLabel: column.label, text: formatRatioValue(row.def.format, table.cells.get(row.id)![index]!.value),
+      }))],
+    }] : []);
+    const render: DesktopPaneShotRenderResult = {
+      visibleText: ["FA MSFT Statement Income Cash Flow Balance Sheet Ratios Ratio", tab.name, "USD · as of 2026-06-30 Annual Quarterly RATIO",
+        ...rows.flatMap(({ cells }) => cells.map(({ text }) => text))].join(" "),
+      rows, truncated: false, truncationReasons: [], loadingStateDetected: false, errorStateDetected: false, errorStateMarkers: [],
+      emptyStateDetected: false, emptyStateMarkers: [], visibleKeyValues: [],
+      semanticUi: [{ id: "query", role: "query-bar", actions: [], metadata: { selections: [
+        { id: "statement", value: "ratios", label: "Ratios" }, { id: "ratio", value: tab.key, label: tab.name },
+        { id: "view", value: "annual", label: "Annual" }] } }],
+    };
+    return assessPaneScreenshot(request(statement, "annual"), { financials: [["MSFT", financials]] } as unknown as DesktopPaneShotPayload,
+      render, "MSFT", "/tmp/fa-shot-test.png");
+  };
+  const daily = bars("5Y", "1d");
+  const captured = createTestFinancials({ ...statements, priceHistory: daily, priceHistoryResolution: "1d" });
+
+  test.each(RATIO_TABS.map(({ key }) => key))("%s: a correct shot is usable", (statement) => {
+    const shot = assess(statement, captured, statement === "valuation" ? daily : null);
+    expect(shot.render.missingExpectedText).toEqual([]);
+    expect(shot.unusableReason).toBeNull();
+    expect(shot.usable).toBe(true);
+    expect(shot.dataEvidence).toMatchObject({ kind: "financial-ratios", statement, latest: { date: "2026-06-30" } });
+  });
+
+  test.each(RATIO_TABS.map(({ key }) => key))("%s: a shot whose cells all read not reported is unusable", (statement) => {
+    const bare = createTestFinancials({ quote: statements.quote,
+      annualStatements: statements.annualStatements.map(({ date }) => ({ date, currency: "USD", totalRevenue: 400 })),
+      priceHistory: daily, priceHistoryResolution: "1d" });
+    const shot = assess(statement, bare, statement === "valuation" ? daily : null);
+    expect(shot.usable).toBe(false);
+    expect(shot.unusableReason).toMatch(/unreported/);
+  });
+
+  test("a valuation shot that reads no price is unusable, whether the capture or the page lost the closes", () => {
+    // The weekly seed, untagged: the page rejects it and every cell reads "no price".
+    const seeded = assess("valuation", createTestFinancials({ ...statements, priceHistory: bars("ALL", "1wk") }), null);
+    expect(seeded.usable).toBe(false);
+    expect(seeded.unusableReason).toMatch(/no period-end close/);
+    // A daily capture the page did not draw from.
+    const undrawn = assess("valuation", captured, null);
+    expect(undrawn.usable).toBe(false);
+    expect(undrawn.render.chartEvidenceMismatches[0]).toMatch(/^Valuation P\/E 2026 reads "no price"/);
+  });
+});
+
 describe("volatility surface screenshot evidence", () => {
   const request = { ...resolved("vol-surface-pane", { tab: "surface", axis: "spot", tenors: "listed", ivSource: "recomputed", priceSide: "mid" }),
     pane: { id: "vol-surface" }, capability: { id: "vol-surface-pane", screenshotReadiness: "live-dom" } } as ResolvedPaneFunction;
@@ -231,7 +415,7 @@ describe("volatility surface screenshot evidence", () => {
   test("verifies numeric surface cells and provenance despite a live-dom capability with no table rows", () => {
     expect(shotSemanticRowCount(request, source, nodes())).toBe(4);
     expect(shotUnavailableSymbols(request, source, nodes())).toEqual([]);
-    expect(volSurfaceEvidenceMismatchesFor(request, source, nodes())).toEqual([]);
+    expect(paneEvidenceMismatches(request, source, { semanticUi: nodes() })).toEqual([]);
     expect(shotDataEvidenceFor(request, source, nodes())).toMatchObject({
       kind: "volatility-surface", grid: metadata.grid, spotAsOf: "2026-09-22T14:00:00Z", plottedValueCount: 4,
     });
@@ -244,9 +428,9 @@ describe("volatility surface screenshot evidence", () => {
     const partial = nodes({ ...metadata, complete: false, failedExpiries: 1, failures: [{ expiration: 1_800_000_000, message: "offline" }] });
     expect(shotUnavailableSymbols(request, source, partial)).toEqual(["AAPL"]);
     expect(shotSemanticRowCount(request, source, partial)).toBe(4);
-    expect(volSurfaceEvidenceMismatchesFor({ ...request, options: { ...request.options, tab: "smile" } }, source, nodes())).toContain("rendered volatility view does not match");
-    expect(volSurfaceEvidenceMismatchesFor(request, source, nodes({ ...metadata, symbol: "TSLA" }))).toContain("rendered volatility symbol does not match");
-    expect(volSurfaceEvidenceMismatchesFor(request, source, nodes({ ...metadata, ivSource: "provider" }))).toContain("rendered volatility source does not match");
+    expect(paneEvidenceMismatches({ ...request, options: { ...request.options, tab: "smile" } }, source, { semanticUi: nodes() })).toContain("rendered volatility view does not match");
+    expect(paneEvidenceMismatches(request, source, { semanticUi: nodes({ ...metadata, symbol: "TSLA" }) })).toContain("rendered volatility symbol does not match");
+    expect(paneEvidenceMismatches(request, source, { semanticUi: nodes({ ...metadata, ivSource: "provider" }) })).toContain("rendered volatility source does not match");
     const empty = nodes({ ...metadata, plottedValueCount: 0, validQuadCount: 0,
       grid: { ...metadata.grid, values: [[null, null], [null, null]] } });
     expect(shotSemanticRowCount(request, source, empty)).toBe(0);
@@ -273,7 +457,7 @@ describe("realized volatility screenshot evidence", () => {
   test("certifies actual HVG values and one dated IV point without table rows", () => {
     expect(shotSemanticRowCount(request, source, nodes())).toBe(4);
     expect(shotUnavailableSymbols(request, source, nodes())).toEqual([]);
-    expect(realizedVolEvidenceMismatchesFor(request, source, nodes())).toEqual([]);
+    expect(paneEvidenceMismatches(request, source, { semanticUi: nodes() })).toEqual([]);
     expect(shotDataEvidenceFor(request, source, nodes())).toMatchObject({ series: [
       { id: "hv-10", points: [{ date: dates[0]!.toISOString(), value: null }, { date: dates[1]!.toISOString(), value: 20 }] },
       { id: "current-iv", points: [{ date: status.currentIv.date, value: 22 }] },
@@ -286,7 +470,7 @@ describe("realized volatility screenshot evidence", () => {
       mean: 0.25, median: 0.22, percentile: 40, sampleSize: 250 }], ["a", "b", "c", "d"]), { ...status, view: "cone" });
     const hvt = { ...request, options: { ...request.options, tab: "cone" } };
     expect(shotSemanticRowCount(hvt, source, nodes(cone))).toBe(4);
-    expect(realizedVolEvidenceMismatchesFor(hvt, source, nodes(cone))).toEqual([]);
+    expect(paneEvidenceMismatches(hvt, source, { semanticUi: nodes(cone) })).toEqual([]);
     expect(shotUnavailableSymbols(hvt, source, nodes(cone))).toEqual([]);
   });
 
@@ -295,7 +479,9 @@ describe("realized volatility screenshot evidence", () => {
     expect(shotDataEvidenceFor(request, source, nodes({ ...evidence, plottedValueCount: 200 }))).toBeNull();
     expect(shotDataEvidenceFor(request, source, nodes({ ...evidence, series: evidence.series.slice(-1), plottedValueCount: 2 }))).toBeNull();
     expect(shotDataEvidenceFor(request, source, nodes({ ...evidence, currentIv: { ...status.currentIv, value: 99 } }))).toBeNull();
-    expect(realizedVolEvidenceMismatchesFor(request, source, nodes({ ...evidence, symbol: "SPY", estimator: "parkinson", view: "cone" }))).not.toEqual([]);
+    expect(paneEvidenceMismatches(request, source, {
+      semanticUi: nodes({ ...evidence, symbol: "SPY", estimator: "parkinson", view: "cone" }),
+    })).not.toEqual([]);
     for (const state of [{ stale: true }, { loading: true }, { errors: ["History unavailable"] }]) {
       expect(shotUnavailableSymbols(request, source, nodes({ ...evidence, ...state, complete: false }))).toEqual(["AAPL"]);
       expect(shotDataEvidenceFor(request, source, nodes({ ...evidence, ...state }))).toBeNull();

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { act } from "react";
-import { testRender } from "../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import {
   MarketDataCoordinator,
   setSharedMarketDataCoordinator,
@@ -75,35 +75,35 @@ function Harness() {
   );
 }
 
-let testSetup: Awaited<ReturnType<typeof testRender>> | undefined;
+const tui = createOpenTuiTestHarness();
 
-afterEach(async () => {
-  if (testSetup) {
-    await act(async () => {
-      testSetup!.renderer.destroy();
-    });
-    testSetup = undefined;
-  }
+afterEach(() => {
   setSharedMarketDataCoordinator(null);
 });
 
 describe("FxMatrixPane", () => {
   test("renders a missing rate as unavailable instead of parity", async () => {
     installCoordinator();
-    testSetup = await testRender(<Harness />, { width: 100, height: 14 });
+    await tui.render(<Harness />, { width: 100, height: 14 });
     await act(async () => {
-      await testSetup!.renderOnce();
-      await testSetup!.renderOnce();
+      await tui.setup().renderOnce();
+      await tui.setup().renderOnce();
     });
 
-    const frame = testSetup.captureCharFrame();
+    const frame = tui.frame();
     // EUR/USD is a real cross built from the two USD legs.
     expect(frame).toContain("1.0800");
+    // The terminal draws no flags: codes only, in the columns it always had.
+    const [header, usdRow] = frame.split("\n");
+    expect(header!.trim().split(/\s+/)).toEqual(["USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD"]);
+    expect(header!.indexOf("USD")).toBe(13);
+    expect(usdRow!.indexOf("USD")).toBe(1);
 
     // Regression: a currency with no rate rendered 1.0000 against everything.
     const jpyRow = frame.split("\n").find((line) => line.trimStart().startsWith("JPY"));
     expect(jpyRow).toBeDefined();
-    expect(jpyRow).not.toContain("1.0000");
+    // Its own diagonal is the only 1.0000 in the row.
+    expect(jpyRow!.match(/1\.0000/g)).toHaveLength(1);
     expect(jpyRow).toContain("—");
   });
 });

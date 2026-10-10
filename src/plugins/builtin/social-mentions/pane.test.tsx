@@ -2,7 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { act } from "react";
 import { apiClient } from "../../../api-client";
 import type { SocialMentionsPayload } from "../../../api-client/social-mentions";
-import { testRender } from "../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { createInitialState } from "../../../state/app/context";
 import { TestPaneFrame, createTestPaneConfig, createTestTicker } from "../../../test-support/pane";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
@@ -28,29 +28,28 @@ function payload(): SocialMentionsPayload {
   };
 }
 
-let setup: Awaited<ReturnType<typeof testRender>> | undefined;
+const tui = createOpenTuiTestHarness();
 const spies: Array<{ mockRestore(): void }> = [];
-afterEach(async () => {
-  if (setup) await act(async () => { setup!.renderer.destroy(); });
-  setup = undefined;
+afterEach(() => {
   for (const spy of spies.splice(0)) spy.mockRestore();
 });
 
 async function settle() {
-  for (let i = 0; i < 8; i++) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await setup!.renderOnce(); });
+  for (let i = 0; i < 8; i++) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); await tui.setup().renderOnce(); });
 }
 
-async function render(width: number, height: number, open?: string): Promise<string> {
+async function render(width: number, height: number, open?: string, tickerKey = "SOUN"): Promise<string> {
   const state = createInitialState(createTestPaneConfig("/tmp/gloom-social-test", { instanceId: "buzz", paneId: "social-mentions" }));
   state.focusedPaneId = "buzz";
-  state.paneState.buzz = { cursorSymbol: "SOUN",
+  state.paneState.buzz = { cursorSymbol: tickerKey,
     pluginState: open ? { "social-mentions": { "social-mentions:open": `1y:SOUN:${open}` } } : {} };
-  state.tickers.set("SOUN", createTestTicker("SOUN", "SoundHound AI", { assetCategory: "STK" }));
-  await act(async () => { setup = await testRender(<TestPaneFrame state={state} paneId="buzz" pluginId="social-mentions" runtime={createTestPluginRuntime()} width={width} height={height}>
-    {(body) => <SocialMentionsPane paneId="buzz" paneType="social-mentions" focused {...body} />}
+  state.tickers.set(tickerKey, createTestTicker(tickerKey, tickerKey === "SOUN" ? "SoundHound AI" : "Planoptik AG",
+    { assetCategory: "STK", exchange: tickerKey === "SOUN" ? "NASDAQ" : "XETR", currency: tickerKey === "SOUN" ? "USD" : "EUR" }));
+  await act(async () => { await tui.render(<TestPaneFrame state={state} paneId="buzz" pluginId="social-mentions" runtime={createTestPluginRuntime()} width={width} height={height}>
+    {(body) => <SocialMentionsPane focused {...body} />}
   </TestPaneFrame>, { width, height }); });
   await settle();
-  return setup!.captureCharFrame();
+  return tui.frame();
 }
 
 test("the pane leads with the last closed day against its median, then the daily table", async () => {
@@ -66,6 +65,16 @@ test("the pane leads with the last closed day against its median, then the daily
   expect(frame).toContain("REDDIT");
   expect(frame).toContain("4.0x median · 09-26");
   expect(frame).toContain("3,600");
+});
+
+test("an alphanumeric overseas ticker requests its cashtag history", async () => {
+  const request = spyOn(apiClient, "getCloudSocialMentions").mockImplementation(async () => ({
+    ...payload(), symbol: "P4O", wikipedia: undefined, reddit: undefined, topPosts: [],
+  }));
+  spies.push(request);
+  const frame = await render(96, 30, undefined, "P4O:XETR");
+  expect(request).toHaveBeenCalledWith("P4O", "1y");
+  expect(frame).toContain("30D median");
 });
 
 test("opening a closed day loads its top posts", async () => {

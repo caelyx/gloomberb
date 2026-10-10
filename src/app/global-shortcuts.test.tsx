@@ -1,32 +1,14 @@
-import { createTestRenderer } from "@opentui/core/testing";
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { act } from "react";
 import type { PluginRegistry } from "../plugins/registry";
-import { TestDialogProvider, createOpenTuiTestRoot as createRoot, emitKeypress as emitTuiKeypress, type TestKeyEvent } from "../renderers/opentui/test-utils";
+import { TestDialogProvider, createOpenTuiTestHarness, type TestKeyEvent } from "../renderers/opentui/test-utils";
 import { createInitialState, type AppAction, type AppState } from "../state/app/context";
 import { cloneLayout, createDefaultConfig, type KeybindingsConfig } from "../types/config";
 import type { ReleaseInfo } from "../updater";
 import { useAppGlobalShortcuts } from "./global-shortcuts";
 import { resolveKeybindings } from "./keybindings";
 
-let testSetup: Awaited<ReturnType<typeof createTestRenderer>> | undefined;
-let root: ReturnType<typeof createRoot> | undefined;
-const actEnvironment = globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean };
-actEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
-
-afterEach(async () => {
-  if (root) {
-    await act(async () => {
-      root!.unmount();
-      await Promise.resolve();
-    });
-    root = undefined;
-  }
-  if (testSetup) {
-    testSetup.renderer.destroy();
-    testSetup = undefined;
-  }
-});
+const tui = createOpenTuiTestHarness({ width: 40, height: 8 });
 
 function createRegistry(
   shortcutExecute?: () => void,
@@ -53,6 +35,7 @@ function ShortcutHarness({
   focusedTickerSymbol = null,
   pluginRegistry,
   refreshTicker = () => {},
+  restartToApplyUpdate = () => {},
   startUpdate = () => {},
   state,
 }: {
@@ -60,6 +43,7 @@ function ShortcutHarness({
   focusedTickerSymbol?: string | null;
   pluginRegistry: PluginRegistry;
   refreshTicker?: (symbol: string, exchange?: string, tickerOverride?: any, priority?: number) => void;
+  restartToApplyUpdate?: () => void;
   startUpdate?: (release: ReleaseInfo) => void;
   state: AppState;
 }) {
@@ -70,6 +54,7 @@ function ShortcutHarness({
     keybindings: resolveKeybindings(state.config.keybindings),
     pluginRegistry,
     refreshTicker,
+    restartToApplyUpdate,
     startUpdate,
     state,
   });
@@ -89,39 +74,37 @@ async function renderHarness(
   options: {
     focusedTickerSymbol?: string | null;
     refreshTicker?: (symbol: string, exchange?: string, tickerOverride?: any, priority?: number) => void;
+    restartToApplyUpdate?: () => void;
     startUpdate?: (release: ReleaseInfo) => void;
   } = {},
 ) {
-  testSetup = await createTestRenderer({ width: 40, height: 8 });
-  root = createRoot(testSetup.renderer);
-  act(() => {
-    root!.render(
-      <TestDialogProvider>
-        <ShortcutHarness
-          dispatch={dispatch}
-          focusedTickerSymbol={options.focusedTickerSymbol}
-          pluginRegistry={registry}
-          refreshTicker={options.refreshTicker}
-          startUpdate={options.startUpdate}
-          state={state}
-        />
-      </TestDialogProvider>,
-    );
-  });
+  await tui.render(
+    <TestDialogProvider>
+      <ShortcutHarness
+        dispatch={dispatch}
+        focusedTickerSymbol={options.focusedTickerSymbol}
+        pluginRegistry={registry}
+        refreshTicker={options.refreshTicker}
+        restartToApplyUpdate={options.restartToApplyUpdate}
+        startUpdate={options.startUpdate}
+        state={state}
+      />
+    </TestDialogProvider>,
+  );
   await act(async () => {
-    await testSetup!.renderOnce();
+    await tui.setup().renderOnce();
   });
 }
 
 /** The OpenTUI input host derives `targetEditable` from the focused editor. */
 function focusEditor() {
-  Object.defineProperty(testSetup!.renderer, "currentFocusedEditor", {
+  Object.defineProperty(tui.setup().renderer, "currentFocusedEditor", {
     configurable: true,
     get: () => ({}),
   });
 }
 
-const emitKeypress = (event: TestKeyEvent) => emitTuiKeypress(testSetup!, event, { trackPropagation: true });
+const emitKeypress = (event: TestKeyEvent) => tui.emitKeypress(event, { trackPropagation: true });
 
 describe("useAppGlobalShortcuts", () => {
   // The open bar moves its selection on Ctrl+P, so that chord must reach it.
@@ -151,6 +134,24 @@ describe("useAppGlobalShortcuts", () => {
     const retry = await emitKeypress({ name: "u" });
     expect(started).toEqual(["9.9.9"]);
     expect(retry.defaultPrevented).toBe(true);
+  });
+
+  test("U restarts into a downloaded desktop update, and does nothing for a terminal one", async () => {
+    let restarts = 0;
+    const config = createDefaultConfig("/tmp/gloomberb-global-shortcuts-restart");
+    const desktopReady = { ...createInitialState(config), updateProgress: { phase: "ready" as const, canRestart: true } };
+    await renderHarness(desktopReady, createRegistry(), () => {}, { restartToApplyUpdate: () => { restarts += 1; } });
+
+    const restart = await emitKeypress({ name: "u" });
+    expect(restarts).toBe(1);
+    expect(restart.defaultPrevented).toBe(true);
+
+    // The terminal binary is swapped in already: nothing to press.
+    const terminalReady = { ...createInitialState(config), updateProgress: { phase: "ready" as const } };
+    await renderHarness(terminalReady, createRegistry(), () => {}, { restartToApplyUpdate: () => { restarts += 1; } });
+    const ignored = await emitKeypress({ name: "u" });
+    expect(restarts).toBe(1);
+    expect(ignored.defaultPrevented).toBe(false);
   });
 
   test("a rebound action answers to its new key and not the old one", async () => {

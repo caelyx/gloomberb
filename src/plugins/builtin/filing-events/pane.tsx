@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiClient } from "../../../api-client";
+import { ApiRequestError } from "../../../api-client/errors";
+import type { IssuerListingParams } from "../../../api-client/paths";
 import {
   BulletList,
   EmptyState,
@@ -23,7 +25,8 @@ import {
 } from "../../../ui";
 import { truncateToDisplayWidth } from "../../../utils/format";
 import { isPlainKey } from "../../../utils/keyboard";
-import { useBoundTicker, useTickerRequest } from "../shared/ticker-request";
+import { useProFeatureWall, type ProFeatureWallCopy, type ReadGuard } from "../shared/pro-feature-wall";
+import { useBoundTicker, useIssuerListing, useTickerRequest } from "../shared/ticker-request";
 import {
   buildFilingEventsFeed,
   resolveFeedScrollTop,
@@ -32,7 +35,12 @@ import {
 
 export const FILING_EVENTS_PANE_ID = "filing-events";
 
-const loadFilingEvents = (symbol: string) => apiClient.getFilingEvents(symbol, 100);
+const EK_WALL: ProFeatureWallCopy = {
+  placement: "ek-wall",
+  action: "read 8-K filings",
+  title: "8-K filings are part of Gloom Cloud Pro.",
+  message: "Every 8-K classified by item and read: agreements, executive changes, auditor changes, restructurings, and what each one said.",
+};
 
 /** One filing: when it was filed, what it was about, and what it said. */
 function FilingEntry({
@@ -94,19 +102,46 @@ function FilingEntry({
   );
 }
 
-export function FilingEventsPane({
-  focused,
-  width,
-}: {
+/**
+ * The latest 8-Ks of a listing. The service answers 404 when it can tie no
+ * filer to the ticker, as for a listing abroad whose company files none:
+ * that is no 8-Ks, not a failure.
+ */
+async function fetchFilingEvents(ticker: string, listing: IssuerListingParams) {
+  try {
+    return await apiClient.getFilingEvents(ticker, 100, listing);
+  } catch (error) {
+    if (error instanceof ApiRequestError && error.status === 404) return { ticker, events: [] };
+    throw error;
+  }
+}
+
+interface FilingEventsPaneProps {
   focused: boolean;
   width: number;
   height: number;
-}) {
-  const { symbol, exchange } = useBoundTicker();
+}
+
+export function FilingEventsPane(props: FilingEventsPaneProps) {
+  const { wall, guard } = useProFeatureWall(EK_WALL, props);
+  return wall ?? <FilingEventsReader {...props} guard={guard} />;
+}
+
+function FilingEventsReader({
+  focused,
+  width,
+  guard,
+}: FilingEventsPaneProps & { guard: ReadGuard }) {
+  const { symbol, exchange, ticker: boundTicker } = useBoundTicker();
   const ticker = symbol ? symbol.toUpperCase() : null;
+  const { name } = useIssuerListing(boundTicker);
   const nativePaneChrome = useUiCapabilities().nativePaneChrome === true;
   const rendererHost = useRendererHost();
 
+  const loadFilingEvents = useCallback(
+    (key: string, venue: string) => guard(fetchFilingEvents(key, { exchange: venue, name })),
+    [guard, name],
+  );
   const { data, loading, error, reload } = useTickerRequest(loadFilingEvents, ticker, exchange);
   const events = data?.events ?? [];
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -209,7 +244,7 @@ export function FilingEventsPane({
     return { info, hints };
   }, [loading, error, ticker, selected, openFiling]);
 
-  if (!ticker) return <EmptyState title="Pick a ticker to see its 8-K filings." />;
+  if (!ticker) return <EmptyState title="Select a ticker." />;
   if (loading && !data) {
     return <PaneStatusBody loading align="center" loadingLabel="Loading 8-Ks..." />;
   }

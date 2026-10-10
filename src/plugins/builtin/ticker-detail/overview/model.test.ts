@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import type { Fundamentals, Quote } from "../../../../types/financials";
+import type { Fundamentals, NextEarnings, Quote } from "../../../../types/financials";
 import type { TickerPosition, TickerRecord } from "../../../../types/ticker";
-import { buildOverviewStats, buildPositionRows } from "./model";
+import { buildOverviewStats, buildPositionRows, buildProfileFields } from "./model";
 import { createTestTicker } from "../../../../test-support/ticker";
 
-function overview(fundamentals: Fundamentals) {
+function overview(fundamentals: Fundamentals, financialCurrency?: string) {
   return Object.fromEntries(buildOverviewStats({
-    quote: undefined, fundamentals, quoteCurrency: "HKD", baseCurrency: "USD", toBase: (value) => value,
+    quote: undefined, fundamentals, financialCurrency, quoteCurrency: "HKD", baseCurrency: "USD", toBase: (value) => value,
   }).map(({ label, value }) => [label, value]));
 }
 
@@ -25,8 +25,35 @@ test("summary money keeps unknown units explicit without borrowing listing curre
     EPS: "CN¥4.22", Revenue: "1.22T CNY", "Net Income": "85.7B CNY", FCF: "-96.6B CNY",
   });
   expect(overview({ financialCurrency: " ", eps: 0, revenue: 0, netIncome: NaN, freeCashFlow: Infinity }))
-    .toEqual({ EPS: "0.00 (ccy?)", Revenue: "0 (ccy?)", "Net Income": "—", FCF: "—" });
+    .toEqual({ "P/E (TTM)": "N/M", EPS: "0.00 (ccy?)", Revenue: "0 (ccy?)", "Net Income": "—", FCF: "—" });
   expect(overview({})).toEqual({});
+});
+
+test("summary money falls back to the statements' reporting currency, and a zero enterprise value is left out", () => {
+  const figures = { eps: 31.43, revenue: 202.08e9, netIncome: 46.98e9, freeCashFlow: 36.96e9, enterpriseValue: 0 };
+  // The quote's HKD never stands in: the statements' currency is the only fallback.
+  expect(overview(figures, "ZAR")).toEqual({ EPS: "ZAR\u00a031.43", Revenue: "202.08B ZAR", "Net Income": "46.98B ZAR", FCF: "36.96B ZAR" });
+  expect(overview({ ...figures, financialCurrency: "USD" }, "ZAR")).toMatchObject({ Revenue: "202.08B USD" });
+  expect(overview(figures, " ")).toMatchObject({ EPS: "31.43 (ccy?)", Revenue: "202.08B (ccy?)" });
+  expect(overview({ ...figures, enterpriseValue: 5e9 }, "ZAR")).toMatchObject({ EV: "5B HKD" });
+});
+
+test("holdings and short interest read as fractions; blank, zero and past figures are left out", () => {
+  const figures = (fundamentals: Fundamentals, nextEarnings?: NextEarnings) => Object.fromEntries(buildOverviewStats({
+    quote: undefined, fundamentals, quoteCurrency: "USD", baseCurrency: "USD", toBase: (value) => value,
+    nextEarnings, today: "2026-09-30",
+  }).map(({ label, value, detail }) => [label, detail ? `${value} ${[detail].flat()[0]}` : value]));
+  expect(figures({
+    floatShares: 23.13e9, beta: 2.217, shortPercentOfFloat: 0.012719, shortRatio: 2.29,
+    institutionPercentHeld: 0.71417, insiderPercentHeld: 0.04007, exDividendDate: "2026-09-10",
+  }, { date: "2026-11-18", timing: "amc", timingSource: "history" })).toEqual({
+    Float: "23.13B", Beta: "2.22", "Short Float": "1.27% 2.3d to cover",
+    "Inst Own": "71.42%", "Insider Own": "4.01%", "Ex-Dividend": "Sep 10", Earnings: "Nov 18 AMC in 49d",
+  });
+  expect(figures({ floatShares: 0, beta: Number.NaN, exDividendDate: "" },
+    { date: "2026-09-29", timing: null, timingSource: null })).toEqual({});
+  expect(buildProfileFields({ profile: { employees: 0, website: "javascript:alert(1)", fiscalYearEnd: "13-31", sic: "" } }))
+    .toEqual([]);
 });
 
 test("declaring minor currency units preserves the reported amount and case-sensitive unit", () => {

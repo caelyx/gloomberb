@@ -65,6 +65,7 @@ import {
   parseScreenDefinition,
   resultFields,
   SHORT_LABELS,
+  SIGN_COLORED,
   screenLabel,
   screenRowId,
 } from "./model";
@@ -633,6 +634,7 @@ function EquityScreenView({
   const bodyHeight = Math.max(5, height - 1 - tabRows);
   const saveContent = !access.emailVerified ? (
     <SignInWall
+      placement="eqs-save-signin"
       action="save and open your screens"
       needsVerification={session.needsVerification}
     />
@@ -786,6 +788,7 @@ function EquityScreenView({
     ) : mode === "saved" ? (
       !access.emailVerified ? (
         <SignInWall
+          placement="eqs-signin"
           action="save and open your screens"
           needsVerification={session.needsVerification}
         />
@@ -904,7 +907,7 @@ function EquityScreenView({
               : null;
             if (field) {
               const observation = row.metrics[field];
-              const change = field === "changePercent" && observation.value != null
+              const change = SIGN_COLORED.has(field) && observation.value != null
                 // A move that prints 0.0 stays neutral.
                 ? priceColor(Math.abs(observation.value) < 0.05 ? 0 : observation.value, colors)
                 : undefined;

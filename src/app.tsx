@@ -19,6 +19,7 @@ import { DetachedPaneShell } from "./components/layout/detached-pane-shell";
 import { TransientLayoutProvider } from "./components/layout/transient-layout";
 import { CommandBar } from "./components/command-bar/surface";
 import { OnboardingWizard } from "./components/onboarding/onboarding-wizard";
+import { CompanyPickerHost } from "./plugins/builtin/cloud/company-picker";
 import { SignInGate } from "./components/sign-in-gate";
 import { useDialog } from "./ui/dialog";
 import { PluginRegistry } from "./plugins/registry";
@@ -31,7 +32,7 @@ import type { CliLaunchRequest, GloomPlugin } from "./types/plugin";
 import type { DataProvider } from "./types/data-provider";
 import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindowBridge } from "./types/desktop-window";
 import type { DesktopApplicationMenuBridge } from "./types/desktop-menu";
-import type { LayoutBounds } from "./plugins/pane-manager";
+import type { LayoutBounds } from "./layout/pane-manager";
 import type { AppSessionSnapshot } from "./core/state/session-persistence";
 import type { MarketDataCoordinator } from "./market-data/coordinator";
 import { createAppNotifier } from "./notifications/app-notifier";
@@ -39,6 +40,7 @@ import { useBrokerImportRuntime } from "./app/runtime/broker-import";
 import { useDesktopDeepLinkRuntime } from "./app/runtime/desktop-deeplink";
 import { useDesktopApplicationMenuRuntime } from "./app/runtime/desktop-menu";
 import { useAppGlobalShortcuts } from "./app/global-shortcuts";
+import { AppDialogBridge } from "./app/dialog-bridge";
 import { KeybindingsProvider, useResolvedKeybindings } from "./app/keybindings";
 import { useAppPaneRuntime } from "./app/pane-runtime";
 import { bindPluginRegistryRuntimeAccess } from "./app/runtime/plugin-bindings";
@@ -181,6 +183,10 @@ function AppInner({
   const toast = useToastHost();
   const isDetachedWindow = desktopWindowBridge?.kind === "detached";
   const detachedPaneId = isDetachedWindow ? desktopWindowBridge.paneId ?? null : null;
+  const focusDetachedPane = useMemo(() => {
+    const focus = desktopWindowBridge?.kind === "main" ? desktopWindowBridge.focusDetachedPane : undefined;
+    return focus ? (paneId: string) => { void focus(paneId).catch(() => {}); } : undefined;
+  }, [desktopWindowBridge]);
   const [desktopDockPreview, setDesktopDockPreview] = useState<DesktopDockPreviewState | null>(null);
   const [commandBarNativeOccluder, setCommandBarNativeOccluder] = useState<LayoutBounds | null>(null);
   appActiveRef.current = appActive;
@@ -262,7 +268,7 @@ function AppInner({
     tickerRepository,
   });
 
-  const { runUpdateCheck, startUpdate } = useAppUpdateRuntime({
+  const { restartToApplyUpdate, runUpdateCheck, runUpdateCommand, startUpdate } = useAppUpdateRuntime({
     enabled: updatesEnabled,
     dispatch,
     isDetachedWindow,
@@ -354,6 +360,7 @@ function AppInner({
     dialog,
     dispatch,
     externalPlugins,
+    focusDetachedPane,
     isDetachedWindow,
     notify,
     persistConfig,
@@ -364,7 +371,7 @@ function AppInner({
   });
 
   // Wire up app-level notifications.
-  pluginRegistry.notifyFn = appNotifier.notify;
+  pluginRegistry.bindHost({ notify: appNotifier.notify });
 
   // Persist layout changes (switching, saving, deleting, renaming layouts).
   // The saved layouts also mirror live pane state and focus, so they change on
@@ -402,6 +409,7 @@ function AppInner({
     keybindings,
     pluginRegistry,
     refreshTicker,
+    restartToApplyUpdate,
     startUpdate,
     state,
   });
@@ -409,6 +417,7 @@ function AppInner({
   if (desktopWindowBridge?.kind === "detached" && desktopWindowBridge.paneId) {
     return (
       <KeybindingsProvider value={keybindings}>
+        <AppDialogBridge />
         <ContextMenuProvider pluginRegistry={pluginRegistry}>
           <RemoteControlHost
             adapter={remoteControlAdapter}
@@ -432,6 +441,7 @@ function AppInner({
 
   return (
     <KeybindingsProvider value={keybindings}>
+    <AppDialogBridge />
     <ContextMenuProvider pluginRegistry={pluginRegistry}>
       <RemoteControlHost
         adapter={remoteControlAdapter}
@@ -441,25 +451,31 @@ function AppInner({
         desktopWindowBridge={desktopWindowBridge}
       >
         <ThemedAppRoot>
-          <Header onOpenHelp={() => {
-            recordFunctionOpen({ shortcut: "HELP", externalPluginId: null });
-            pluginRegistry.showPane("help");
-          }} />
+          <Header
+            onOpenHelp={() => {
+              recordFunctionOpen({ shortcut: "HELP", externalPluginId: null });
+              pluginRegistry.showPane("help");
+            }}
+            onRestartForUpdate={updatesEnabled && !isDetachedWindow ? restartToApplyUpdate : undefined}
+          />
           <TransientLayoutProvider>
             <Shell
               pluginRegistry={pluginRegistry}
+              dataProvider={dataProvider}
+              tickerRepository={tickerRepository}
               desktopWindowBridge={desktopWindowBridge}
               desktopDockPreview={desktopDockPreview}
               commandBarNativeOccluder={commandBarNativeOccluder}
             />
             <StatusBar
               onOpenChangelog={(version) => {
-                void pluginRegistry.createPaneFromTemplateAsyncFn("changelog-pane", {
+                void pluginRegistry.createPaneFromTemplateAsync("changelog-pane", {
                   values: { version },
                 }).catch(() => {});
               }}
             />
           </TransientLayoutProvider>
+          {!onboardingActive ? <CompanyPickerHost pluginRegistry={pluginRegistry} /> : null}
           {onboardingActive && onOnboardingComplete ? (
             <OnboardingWizard
               pluginRegistry={pluginRegistry}
@@ -474,7 +490,7 @@ function AppInner({
               tickerRepository={tickerRepository}
               pluginRegistry={pluginRegistry}
               quitApp={() => rendererHost.requestExit()}
-              onCheckForUpdates={updatesEnabled ? () => runUpdateCheck(true) : undefined}
+              onCheckForUpdates={updatesEnabled ? runUpdateCommand : undefined}
               onNativeOccluderChange={setCommandBarNativeOccluder}
             />
           )}

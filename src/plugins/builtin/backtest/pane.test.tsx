@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { act } from "react";
 import { getSharedMarketDataCoordinator, MarketDataCoordinator, setSharedMarketDataCoordinator } from "../../../market-data/coordinator";
 import type { QueryEntry } from "../../../market-data/result-types";
-import { testRender } from "../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { createInitialState } from "../../../state/app/context";
 import { createTestDataProvider } from "../../../test-support/data-provider";
 import { createTestPaneConfig, createTestTicker, TestPaneProvider } from "../../../test-support/pane";
@@ -12,7 +12,7 @@ import { BacktestPane } from "./pane";
 
 const PANE_ID = "backtest:layout-test";
 const SYMBOL = "BTTEST";
-let setup: Awaited<ReturnType<typeof testRender>> | undefined;
+const tui = createOpenTuiTestHarness();
 let previousCoordinator: ReturnType<typeof getSharedMarketDataCoordinator>;
 
 /** Three years of sessions that trend up with a dip, so both rules fire. */
@@ -36,13 +36,7 @@ function installCoordinator() {
   setSharedMarketDataCoordinator(coordinator);
 }
 
-afterEach(async () => {
-  if (setup) {
-    await act(async () => {
-      setup!.renderer.destroy();
-    });
-    setup = undefined;
-  }
+afterEach(() => {
   setSharedMarketDataCoordinator(previousCoordinator ?? null);
 });
 
@@ -53,7 +47,7 @@ async function renderPane(width: number, height: number) {
   });
   const state = createInitialState(config);
   state.tickers.set(SYMBOL, createTestTicker(SYMBOL, SYMBOL, { exchange: "NASDAQ", currency: "USD", assetCategory: "STK" }));
-  setup = await testRender(
+  await tui.render(
     <TestPaneProvider state={state} paneId={PANE_ID} pluginId="backtest" runtime={createTestPluginRuntime()}>
       <BacktestPane paneId={PANE_ID} paneType="backtest" focused width={width} height={height} />
     </TestPaneProvider>,
@@ -62,10 +56,10 @@ async function renderPane(width: number, height: number) {
   for (let frame = 0; frame < 8; frame += 1) {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
-      await setup!.renderOnce();
+      await tui.setup().renderOnce();
     });
   }
-  return setup.captureCharFrame();
+  return tui.frame();
 }
 
 /** The row holding the metrics table header. */
@@ -80,7 +74,7 @@ test("a default-size pane body (118 cells in the terminal) puts the metrics besi
   const { row, line } = metricsHeaderRow(frame);
   expect(row).toBeGreaterThanOrEqual(0);
   // Side by side: the chart legend and the table header share a row, the table right of the chart.
-  expect(line.indexOf("● Buy & hold")).toBeGreaterThanOrEqual(0);
+  expect(line.indexOf("• Buy & hold")).toBeGreaterThanOrEqual(0);
   expect(line.indexOf("METRIC")).toBeGreaterThan(118 - 50 - 1);
   // Every metric row fits beside the chart.
   expect(frame).toContain("Average hold (sessions)");
@@ -97,8 +91,8 @@ test("a short stacked pane sizes the chart with the kit: the legend names the li
   const frame = await renderPane(60, 16);
   const lines = frame.split("\n");
   const { row } = metricsHeaderRow(frame);
-  expect(lines.slice(0, row).join("\n")).toContain("● Buy & hold");
-  expect(lines.slice(0, row).join("\n")).toContain("● Strategy");
+  expect(lines.slice(0, row).join("\n")).toContain("• Buy & hold");
+  expect(lines.slice(0, row).join("\n")).toContain("+ Strategy");
   // The table keeps its header and four metrics under the chart.
   for (const label of ["Total return", "CAGR", "Volatility (ann.)", "Sharpe (0% cash)"]) {
     expect(lines.slice(row).join("\n")).toContain(label);
