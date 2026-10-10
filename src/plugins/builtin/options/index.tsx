@@ -4,7 +4,7 @@ import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
 import type { OptionsViewProps } from "./types";
 import { OptionsView } from "./view";
 import { isKnownMutualFund } from "../../../tickers/instrument-kind";
-import { expiryIsoDate, OPTION_EXPIRATION_FORMAT, parseOptionExpiration, readOptionExpiration } from "../../../utils/option-expiry";
+import { expirationOptionSeconds, expiryIsoDate, OPTION_EXPIRATION_FORMAT, OPTION_EXPIRATION_PLACEHOLDER, readOptionExpiration } from "../../../utils/option-expiry";
 
 /** The registered chain shows IV rank; isolated view renders stay offline. */
 function OptionsPane(props: OptionsViewProps) {
@@ -56,7 +56,7 @@ function optionsSettings(settings: Record<string, unknown>): PaneSettingsDef {
       {
         key: "optionColumnIds",
         label: "Columns",
-        description: "Choose and order the fields mirrored around the strike.",
+        description: "Choose and order the fields mirrored around the strike. Cost % of spot shows on the put side only.",
         type: "ordered-multi-select",
         options: OPTION_FIELD_DEFS.map((field) => ({
           value: field.id,
@@ -84,14 +84,10 @@ function optionsSettings(settings: Record<string, unknown>): PaneSettingsDef {
 const EXPIRATION_REPORT_OPTION: PaneReportOptionDef = {
   key: "expiration",
   type: "string",
-  placeholder: "YYYY-MM-DD|unix",
+  placeholder: OPTION_EXPIRATION_PLACEHOLDER,
   description: `The expiry to show, as ${OPTION_EXPIRATION_FORMAT}. Without it, the nearest one.`,
   example: "--expiration 2028-01-21",
-  normalize: (value) => {
-    const expiration = parseOptionExpiration(value);
-    if (expiration == null) throw new Error(`Invalid --expiration "${value}". Use ${OPTION_EXPIRATION_FORMAT}.`);
-    return expiryIsoDate(expiration);
-  },
+  normalize: (value) => expiryIsoDate(expirationOptionSeconds(value)),
 };
 
 export const optionsModule: PluginModule = {
@@ -122,7 +118,8 @@ export const optionsModule: PluginModule = {
         settingKey: "optionColumnIds",
         type: "string",
         placeholder: "fields",
-        description: `Fields mirrored around the strike, in order, as the Columns setting picks them: ${OPTION_FIELD_DEFS.map((field) => field.id).join(", ")}`,
+        description: `Fields mirrored around the strike, in order, as the Columns setting picks them: ${OPTION_FIELD_DEFS.map((field) => field.id).join(", ")}. `
+          + "costOfSpot (the put's midpoint as a percent of spot) shows on the put side only",
         example: "--columns bid,ask,spread,delta,openInterest,extrinsicPerYear",
         normalize: normalizeOptionColumnsOption,
       }],

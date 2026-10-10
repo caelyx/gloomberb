@@ -8,8 +8,10 @@ import { formatMarketPrice, formatSignedMarketPrice, liveQuoteFormatOptions } fr
 import { formatExpDate, resolveOptionsTarget } from "../../../utils/options";
 import { expiryIsoDate, findListedExpiry, formatDaysToExpiry, daysToExpiry, missingExpiryText, readOptionExpiration } from "../../../utils/option-expiry";
 import { canonicalTickerKey } from "../../../utils/exchanges";
+import { isOptionsUnavailableError, listedOptionsAlternative, optionsUnavailableTitle } from "../../../market-data/options-alternatives";
 import { useChartQueries, useOptionsQuery, useResolvedEntryValue, useTickerFinancials } from "../../../market-data/hooks";
 import {
+  Button,
   DataTableView,
   EmptyState,
   usePaneFooter,
@@ -69,7 +71,7 @@ import type { IvStats } from "../iv-history/client";
 import { useIvRank } from "../iv-history/rank";
 import { useOptionsSessionOpen, useThrottledValue } from "../shared/volatility/live-session";
 import { useRemoteUiNode } from "../../../remote/semantic-tree";
-import { optionCarry } from "./carry";
+import { optionCarry, optionCostOfSpot } from "./carry";
 import {
   ALL_STRIKES,
   STRIKE_WINDOW_PRESETS,
@@ -510,6 +512,7 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
       putGreeks: volatilities ? calculateOptionGreeks(put, "put", spot, dividendYield, volatilities) : undefined,
       callExtrinsicPerYear: call && volatilities ? optionCarry(call, "call", spot, volatilities.valuationTime)?.extrinsicPerYear ?? null : null,
       putExtrinsicPerYear: put && volatilities ? optionCarry(put, "put", spot, volatilities.valuationTime)?.extrinsicPerYear ?? null : null,
+      putCostOfSpot: put ? optionCostOfSpot(put, spot) : null,
       isPositionStrike: !!parsed && strike === parsed.strike,
     };
   }), [callsByStrike, dividendYield, parsed, putsByStrike, spot, strikes, volatilities]);
@@ -761,6 +764,20 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
     return <EmptyState title="Select a ticker." />;
   }
   if (loading && !chain) return <Spinner label="Loading options chain..." />;
+  if (error && !chain && isOptionsUnavailableError(error)) {
+    // A future or commodity with no chain of its own: the listed fund whose options stand in, and OSA on it.
+    const alternative = listedOptionsAlternative(effectiveTicker);
+    return (
+      <EmptyState
+        title={optionsUnavailableTitle(effectiveTicker)}
+        hint={alternative ? `Nearest listed alternative: ${alternative.symbol} (${alternative.name}).` : "OSA builds strategy payoffs on a listed underlying."}
+        actions={alternative ? <>
+          <Button label={`${alternative.symbol} options`} onPress={() => createPaneFromTemplate("options-pane", { symbol: alternative.symbol })} />
+          <Button label={`OSA ${alternative.symbol}`} onPress={() => createPaneFromTemplate("options-scenario-pane", { symbol: alternative.symbol })} />
+        </> : undefined}
+      />
+    );
+  }
   if (error && !chain) return <EmptyState title="Options chain unavailable." message={error} />;
   if (!chain || expirationDates.length === 0) {
     return <EmptyState title={`No options available for ${effectiveTicker}.`} />;

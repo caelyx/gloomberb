@@ -7,11 +7,19 @@ import type {
   CorporateActionsData,
   HolderData,
   OptionsChain,
+  Quote,
   TickerFinancials,
 } from "../../types/financials";
 import { currencyMinorDigits, formatMarketPrice, formatMarketPriceWithCurrency, quoteFormatOptions } from "../../market-data/market/format";
-import { getActiveQuoteDisplay, marketStateLabel } from "../../market-data/market/status";
-import { formatCompact, formatDistributionAmount, formatPercent } from "../../utils/format";
+import {
+  EXTENDED_SESSION_LABELS,
+  getExtendedSessionDisplay,
+  getQuoteSessionFields,
+  getRegularSessionDisplay,
+  marketStateLabel,
+  type ExtendedSession,
+} from "../../market-data/market/status";
+import { formatCompact, formatDistributionAmount, formatPercent, formatPercentRaw } from "../../utils/format";
 import { withCliServices, withMarketData } from "../context";
 import { isoDate, parsePositiveInt, rejectExtraArgs, requireOneArg, takeFlag, takeOption } from "./command-utils";
 import type { BuiltinCliCommandDef } from "../command-options";
@@ -22,7 +30,7 @@ import {
   formatFractionPercentCell,
   formatPriceRange,
 } from "../helpers";
-import { cliStyles, renderStats } from "../../utils/cli-output";
+import { cliStyles, colorBySign, renderStats } from "../../utils/cli-output";
 import { formatPerShareNumber } from "../../utils/reported-money";
 import {
   analystTargetCurrency,
@@ -33,6 +41,8 @@ import {
   targetUpside,
 } from "../../plugins/builtin/research/analyst-model";
 import { getPublishedUsEquityCalendarYears, getPublishedUsEquitySession } from "../../market-data/published-us-sessions";
+import { isQuoteStaleForCurrentSession } from "../../market-data/quotes/freshness";
+import { isOptionsUnavailableError, listedOptionsAlternative, optionsUnavailableTitle } from "../../market-data/options-alternatives";
 import { fundamentalsReportTables, renderFundamentalsReport } from "./ticker";
 import {
   chainHasExpiry,
@@ -70,14 +80,17 @@ import { CRYPTO_BOARD_HINT, quoteNotes } from "./crypto-hints";
 import { formatUtcTime } from "../../utils/utc-time";
 import { isFiniteNumber } from "../../utils/guards";
 import { exportedFundamentals } from "../../utils/price-earnings";
-import { fundamentalsFreshness, quotesFreshness, rowsFreshness } from "../freshness";
+import { fundamentalsFreshness, fxPairFreshness, quotesFreshness, rowsFreshness } from "../freshness";
 import {
   barHistoryFreshness,
   barResolutionFromDates,
+  cloudNewsFreshness,
+  cloudRealtimeAccess,
   REPORTED_DATA,
   SEC_FILINGS,
 } from "../../plugins/builtin/shared/report-freshness";
 import {
+  bareListingNote,
   EXCHANGE_OPTION,
   isNoProviderError,
   listingHeading,
@@ -87,12 +100,16 @@ import {
   loadForListing,
   loadListingQuote,
   notTradedMessage,
-  otherListingsMessage,
+  quoteBareListing,
   requireCliListing,
   type CliListing,
+  type ListingDataRequest,
   type ListingIdentity,
 } from "../listing-arg";
+import { indexRootAlsoLine, indexRootFor, indexRootTryLine, isYieldIndexSymbol } from "../index-roots";
+import { formatBasisPoints, toBasisPoints } from "../../utils/basis-points";
 import { providerMissReason } from "../../sources/provider-errors";
+import { isNotATickerMessage } from "../not-a-ticker";
 import { secRegistrantMismatchMessage, SecRegistrantMismatchError, areDifferentCompanies } from "../../sources/sec-registrant";
 import { isCryptoPairSymbol } from "../../utils/crypto-pair";
 import { isUsListingExchange } from "../../utils/exchanges";
@@ -157,38 +174,94 @@ function listingMetadata(identity: ListingIdentity) {
   return { symbol: identity.symbol, exchange: identity.exchange || null, name: identity.name };
 }
 
+// Fitted to a narrow width, the columns marked optional go first (higher dropPriority first), then Name is cut short.
+// What a user types or reads the price by stays whole.
 const QUOTE_LEAD_COLUMNS = [
-  { key: "symbol", header: "Symbol" },
+  { key: "symbol", header: "Symbol", shrink: false },
   { key: "name", header: "Name" },
   {
     key: "price",
     header: "Last",
     align: "right" as const,
-    format: (value: unknown, row: ReturnType<typeof quoteRows>[number]) => (
-      row.error && !value ? cliStyles.danger("unavailable") : String(value ?? "")
+    format: (value: unknown, row: QuoteRow) => (
+      row.error && !value
+        // A typo is not an outage: say what is wrong with the symbol itself.
+        ? isNotATickerMessage(row.error) ? cliStyles.warning("not a ticker") : cliStyles.danger("unavailable")
+        : yieldLevelCell(value, row)
     ),
   },
-  { key: "changePercent", header: "Chg%", align: "right" as const, format: formatChangePercentCell },
-  { key: "session", header: "Session" },
+  {
+    key: "changePercent",
+    header: "Chg%",
+    align: "right" as const,
+    format: (value: unknown, row: QuoteRow) => row.yieldIndex ? yieldChangeCell(row) : formatChangePercentCell(value),
+  },
+  // Text drops a column no row fills, so a table without an extended print stays as narrow as before.
+  extendedColumn("PRE"),
+  extendedColumn("POST"),
+  { key: "session", header: "Session", shrink: false },
 ];
+
+type QuoteRow = ReturnType<typeof quoteRows>[number];
+
+/** A Cboe yield index level is a yield: `5.24%`, not a price. */
+function yieldLevelCell(value: unknown, row: QuoteRow): string {
+  const text = String(value ?? "");
+  return row.yieldIndex && text ? `${text}%` : text;
+}
+
+/** A yield index moves in basis points: `+1.3bp`, from the real previous close, not a percent of a percent. */
+function yieldChangeCell(row: QuoteRow): string {
+  return row.changeBasisPoints == null ? "" : colorBySign(formatBasisPoints(row.changeBasisPoints / 100, 1), row.changeBasisPoints);
+}
+
+/** The pre-market or after-hours print and its move from the regular close, in its own column. */
+function extendedColumn(session: ExtendedSession) {
+  return {
+    key: session === "PRE" ? "preMarket" : "afterHours",
+    header: EXTENDED_SESSION_LABELS[session],
+    align: "right" as const,
+    value: (row: QuoteRow) => row.extendedSession === session && row.extendedPrice
+      ? [row.extendedPrice, row.extendedChangePercent == null ? "" : formatPercentRaw(row.extendedChangePercent)].join(" ").trim()
+      : "",
+    format: (value: unknown, row: QuoteRow) => (
+      value ? [row.extendedPrice, formatChangePercentCell(row.extendedChangePercent)].join(" ").trim() : ""
+    ),
+  };
+}
+
+/** A percent to two decimals, as the table prints it. */
+function roundedPercent(value: number | undefined): number | null {
+  return value == null ? null : Number(value.toFixed(2));
+}
 
 function quoteColumns() {
   return [
     ...QUOTE_LEAD_COLUMNS,
-    { key: "currency", header: "Cur" },
-    // Whether the price is real-time or delayed: a feed state, not where it came from.
-    { key: "source", header: "Feed", format: (value: unknown) => value === "live" || value === "delayed" ? value : "" },
-    { key: "updatedAt", header: "Updated" },
+    { key: "currency", header: "Cur", shrink: false, optional: true, dropPriority: 1 },
+    // Whether the price is real-time, delayed or stale: a feed state, not where it came from. A stale
+    // row says so here, so the closing line's "N of M stale" always points at rows the table marks.
+    {
+      key: "feed",
+      header: "Feed",
+      shrink: false,
+      optional: true,
+      dropPriority: 2,
+      format: (value: unknown) => value === "stale" ? cliStyles.warning(value) : String(value ?? ""),
+    },
+    // In a narrow terminal the closing line's as-of stands in for each row's.
+    { key: "updatedAt", header: "Updated", shrink: false, optional: true, dropPriority: 3 },
   ];
 }
 
 function compareColumns() {
   return [
     ...QUOTE_LEAD_COLUMNS,
-    { key: "previousClose", header: "Prev Close", align: "right" as const },
-    { key: "dayRange", header: "Day Range", align: "right" as const },
-    { key: "volume", header: "Volume", align: "right" as const, format: formatCountCell },
-    { key: "currency", header: "Cur" },
+    { key: "previousClose", header: "Prev Close", align: "right" as const, format: yieldLevelCell },
+    // A narrow terminal drops these before it cuts the names short.
+    { key: "dayRange", header: "Day Range", align: "right" as const, optional: true, dropPriority: 1 },
+    { key: "volume", header: "Volume", align: "right" as const, format: formatCountCell, optional: true, dropPriority: 2 },
+    { key: "currency", header: "Cur", shrink: false, optional: true, dropPriority: 3 },
   ];
 }
 
@@ -197,11 +270,21 @@ function errorMessage(error: unknown): string | null {
   return error instanceof Error ? error.message : String(error);
 }
 
-function quoteRows(results: QuoteCliRecord[]) {
+/** What the Feed cell says: stale wins over the feed's own live or delayed, as the closing line counts it. */
+function quoteFeedState(quote: QuoteCliRecord["quote"], now: number): "stale" | "live" | "delayed" | "" {
+  if (!quote) return "";
+  if (isQuoteStaleForCurrentSession(quote, now)) return "stale";
+  return quote.dataSource === "live" || quote.dataSource === "delayed" ? quote.dataSource : "";
+}
+
+function quoteRows(results: QuoteCliRecord[], now = Date.now()) {
   return results.map((result) => {
     const quote = result.quote;
-    // Same price and move as the quote monitor: the live session's print against the daily reference.
-    const display = getActiveQuoteDisplay(quote);
+    // Last and Chg% are the regular session, as `ticker` and the quote monitor read it; a
+    // pre-market or after-hours print is its own column, measured from that session's close.
+    const display = getRegularSessionDisplay(quote);
+    const extended = getExtendedSessionDisplay(quote);
+    const yieldIndex = isYieldIndexSymbol(result.target.symbol);
     // An index level is in points, not in the currency its members trade in.
     const indexPoints = quote?.instrumentType?.trim().toUpperCase() === "INDEX";
     // Pad to two decimals so a column lines up, but never past the currency's minor unit (JPY has none).
@@ -223,9 +306,17 @@ function quoteRows(results: QuoteCliRecord[]) {
       priceBasis: quote?.priceBasis ?? null,
       instrumentType: quote?.instrumentType ?? null,
       change: display?.change ?? null,
-      changePercent: display?.changePercent == null ? null : Number(display.changePercent.toFixed(2)),
+      changePercent: roundedPercent(display?.changePercent),
+      // A Cboe yield index is read as a yield in percent and moves in basis points.
+      yieldIndex,
+      changeBasisPoints: yieldIndex && display?.change != null ? toBasisPoints(display.change, 1) : null,
+      extendedSession: extended?.session ?? null,
+      extendedPrice: price(extended?.price),
+      rawExtendedPrice: extended?.price ?? null,
+      extendedChange: extended?.change ?? null,
+      extendedChangePercent: roundedPercent(extended?.changePercent),
       session: quote?.marketState ? marketStateLabel(quote.marketState) : "",
-      // The close the shown move is measured from; a pre-market move starts at the last close.
+      // The close the shown move is measured from: the one before the session Last is.
       previousClose: price(display?.change != null ? display.price - display.change : quote?.previousClose),
       dayRange: quote?.low != null && quote.high != null
         ? indexPoints ? `${price(quote.low)}-${price(quote.high)}` : formatPriceRange(quote.low, quote.high, quote.currency, options, "-")
@@ -234,6 +325,7 @@ function quoteRows(results: QuoteCliRecord[]) {
       currency: quote?.currency ?? "",
       providerId: quote?.providerId ?? "",
       source: quote?.dataSource ?? quote?.providerId ?? "",
+      feed: quoteFeedState(quote, now),
       updatedAt: quote?.lastUpdated ? new Date(quote.lastUpdated).toISOString() : "",
       error: result.error ?? "",
     };
@@ -410,37 +502,103 @@ async function runQuote(rawArgs: string[], ctx: Parameters<CliCommandDef["execut
     const targets: QuoteSubscriptionTarget[] = listings.map((listing) => ({ symbol: listing.request.symbol, exchange: listing.request.exchange }));
     const results = await market.dataProvider.getQuotesBatch(targets, { forceRefresh: ctx.cliOptions.refresh });
     const listingOf = (result: QuoteBatchResult, index: number) => listings[targets.indexOf(result.target)] ?? listings[index]!;
-    // A listing with no quote on an exchange its symbol is not listed on says so, and a bare
-    // symbol no source quotes names its other listings; venues are only looked up for those.
     const request = { command: commandName, noun: "quote" };
-    const unquoted = await Promise.all(results.map(async (result, index) => {
-      if (result.quote) return null;
-      const listing = listingOf(result, index);
-      const notTraded = await notTradedMessage(listing, market);
-      if (notTraded) return { message: notTraded, details: undefined, oneLine: notTraded };
-      const other = isNoProviderError(result.error) ? await otherListingsMessage(listing, market, request) : null;
-      return other && { ...other, oneLine: `${other.message} Other listings: ${other.others.join(", ")}.` };
-    }));
-    if (listings.length === 1 && unquoted[0]) ctx.fail(unquoted[0].message, unquoted[0].details);
-    const notTraded = unquoted.map((entry) => entry?.oneLine ?? null);
+    const answers = await Promise.all(results.map((result, index) => answerQuote(result, listingOf(result, index), market, request, ctx.cliOptions.refresh)));
+    const failed = answers[0]?.failure;
+    if (listings.length === 1 && failed) ctx.fail(failed.message, failed.details);
     // Each row names its listing by key (SAN:EPA) and company, so the table needs no line above it.
-    const data = results.map((result, index) => ({
+    const data = answers.map(({ result, listing, failure }) => ({
       target: result.target,
-      listing: listingMetadata(listingIdentity(listingOf(result, index), result.quote)),
+      listing: listingMetadata(listingIdentity(listing, result.quote)),
+      // The figures the table shows, beside the quote as the source sent it.
+      ...getQuoteSessionFields(result.quote),
       quote: result.quote,
-      error: notTraded[index] ?? errorMessage(result.error),
+      error: failure?.oneLine ?? errorMessage(result.error),
+      ...yieldIndexFields(result),
     }));
-    // Text mode shows only "unavailable" in the cell; the JSON rows already carry each reason.
-    const notes = ctx.cliOptions.format === "text" ? quoteNotes(data, { exchange }) : [];
+    const notes = [
+      // Which listing a bare symbol was read as, and the index a bare root is not, are in no row.
+      ...answers.flatMap((answer) => answer.notes),
+      // Text mode shows only "unavailable" in the cell; the JSON rows already carry each reason.
+      ...ctx.cliOptions.format === "text" ? quoteNotes(data, { exchange }) : [],
+    ];
+    const columns = commandName === "compare" ? compareColumns() : quoteColumns();
+    // Only yield indices: their change is in bp, so the text header drops the percent sign (CSV keeps the percent it holds).
+    const yieldsOnly = data.length > 0 && data.every((row) => isYieldIndexSymbol(row.target.symbol));
     ctx.printResult({
       data,
       warnings: notes.length > 0 ? notes : undefined,
       freshness: quotesFreshness(data.map((row) => row.quote)),
     }, {
       rows: quoteRows,
-      columns: commandName === "compare" ? compareColumns() : quoteColumns(),
+      columns,
+      ...(yieldsOnly ? { textColumns: columns.map((column) => column.key === "changePercent" ? { ...column, header: "Chg" } : column) } : {}),
     });
   });
+}
+
+/**
+ * What a Cboe yield index adds to its JSON row: the level is a yield in percent
+ * and its change since the previous close is in basis points (the quote's own
+ * `change` is the same move in percentage points).
+ */
+function yieldIndexFields(result: QuoteBatchResult): { unit?: "percent"; changeBasisPoints?: number } {
+  if (!isYieldIndexSymbol(result.target.symbol)) return {};
+  const change = getRegularSessionDisplay(result.quote)?.change;
+  return { unit: "percent", ...(change == null ? {} : { changeBasisPoints: toBasisPoints(change, 1) }) };
+}
+
+interface QuoteAnswer {
+  result: QuoteBatchResult;
+  /** The listing the row is: the one asked for, or the venue a bare symbol was quoted on. */
+  listing: CliListing;
+  /** Why there is no quote, when there is more to say than the source's own error. */
+  failure?: { message: string; details?: string; oneLine: string };
+  notes: string[];
+}
+
+/**
+ * One symbol's row of `quote` and `compare`. A listing on an exchange its symbol
+ * is not listed on says so. A bare symbol the data service read on its home
+ * listing abroad names that venue (SXR8 -> XETRA). One no source quotes is
+ * quoted on its listings (`quoteBareListing`), else names them, or asks for an
+ * exchange when several companies list it (2222); a bare index root (VIX) also
+ * names its index (^VIX). Venues are only looked up for a
+ * symbol with no quote, so a request that succeeds costs no search.
+ */
+async function answerQuote(
+  result: QuoteBatchResult,
+  listing: CliListing,
+  market: MarketContext,
+  request: ListingDataRequest,
+  refresh: boolean,
+): Promise<QuoteAnswer> {
+  const root = listing.exchange ? null : indexRootFor(listing.symbol);
+  // A bare root that quoted something else, such as MOVE (Corvex), points at the index too.
+  const also = (quote: Quote) => root && quote.instrumentType?.trim().toUpperCase() !== "INDEX"
+    ? [indexRootAlsoLine(root, request.command)] : [];
+  if (result.quote) return { result, listing, notes: [bareListingNote(listing, result.quote) ?? [], also(result.quote)].flat() };
+  const notTraded = await notTradedMessage(listing, market);
+  if (notTraded) return { result, listing, failure: { message: notTraded, oneLine: notTraded }, notes: [] };
+  if (!isNoProviderError(result.error)) return { result, listing, notes: [] };
+  const other = await quoteBareListing(listing, market, request, { refresh });
+  if (other?.kind === "quoted") {
+    return {
+      result: { target: other.listing.request, quote: other.quote },
+      listing: other.listing,
+      notes: [other.note, ...also(other.quote)],
+    };
+  }
+  const indexLine = root ? indexRootTryLine(root, request.command) : null;
+  if (!other && !indexLine) return { result, listing, notes: [] };
+  const message = other?.message ?? `${listing.symbol} has no ${request.noun}.`;
+  const details = [other?.details, indexLine].filter(Boolean).join("\n");
+  const oneLine = [
+    message,
+    other ? `${other.heading}: ${other.listings.join(", ")}.` : "",
+    indexLine ?? "",
+  ].filter(Boolean).join(" ");
+  return { result, listing, failure: { message, details, oneLine }, notes: [] };
 }
 
 /** A crypto pair that will not load points at the crypto board. Structured formats keep the error as thrown. */
@@ -646,9 +804,7 @@ async function runNews(rawArgs: string[], ctx: Parameters<CliCommandDef["execute
     ctx.printResult({
       data: articles,
       metadata: { ticker: listing?.key ?? null, ...(identity ? listingMetadata(identity) : {}), feed: feed ?? null },
-      freshness: rowsFreshness(newsRows(articles), {
-        status: "not-a-feed", basis: "published stories", observedKey: "publishedAt", oldest: null,
-      }),
+      freshness: rowsFreshness(newsRows(articles), cloudNewsFreshness(await cloudRealtimeAccess())),
     }, {
       ...(identity ? { heading: listingHeading(identity) } : {}),
       rows: newsRows,
@@ -1004,7 +1160,15 @@ async function runOptions(rawArgs: string[], ctx: Parameters<CliCommandDef["exec
           cacheMode: refresh ? "refresh" : "default",
         }),
       };
-    }, undefined, { command: "options", noun: "options chain" });
+    }, undefined, { command: "options", noun: "options chain" }).catch((error: unknown) => {
+      if (!isOptionsUnavailableError(error)) throw error;
+      // A future or commodity with no chain of its own: name the listed fund whose options stand in.
+      const alternative = listedOptionsAlternative(listing.key);
+      return ctx.fail(optionsUnavailableTitle(listing.key), alternative
+        ? `Nearest listed alternative: ${alternative.symbol} (${alternative.name}), gloomberb options ${alternative.symbol}.`
+          + ` Strategy payoffs: gloomberb fn OSA ${alternative.symbol}`
+        : "Strategy payoffs on a listed underlying: gloomberb fn OSA <ticker>");
+    });
     const inputs = await inputsPromise;
     if (expirationDate != null && !chainHasExpiry(loaded, expirationDate)) {
       // An unlisted date comes back as an empty chain; its own list of expiries, else the default chain's, says what to pick.
@@ -1100,12 +1264,16 @@ async function runFx(rawArgs: string[], ctx: Parameters<CliCommandDef["execute"]
     const asOf = observed.length > 0 ? new Date(Math.min(...observed)).toISOString() : null;
     const stale = legs.some((leg) => leg != null && (leg.staleAt <= Date.now() || leg.refreshError != null));
     const row = { currency, baseCurrency, rate, asOf, stale, pair, inverse: 1 / rate };
-    ctx.printResult({ data: [row] }, {
-      text: () => {
-        const time = asOf ? `As of ${formatUtcTime(asOf)}` : "";
-        const when = stale ? cliStyles.warning(time ? `${time}, stale` : "Stale") : time && cliStyles.muted(time);
-        return [describeFxRate(request, rate), when].filter(Boolean).join("\n");
-      },
+    // The closing line dates the rate, and says when it is stale, as `fn FXC` does.
+    const freshness = fxPairFreshness(new Map(codes.flatMap((code, index) => {
+      const leg = legs[index];
+      return leg ? [[code, {
+        rate: leg.value,
+        timing: { asOf: leg.asOf, staleAt: leg.staleAt, error: leg.refreshError, delayMinutes: leg.delayMinutes },
+      }] as const] : [];
+    })));
+    ctx.printResult({ data: [row], freshness }, {
+      text: () => describeFxRate(request, rate),
       columns: [
         { key: "currency", header: "Currency" },
         { key: "baseCurrency", header: "Base" },

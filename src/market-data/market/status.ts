@@ -24,6 +24,9 @@ export interface ActiveQuoteDisplay {
 
 export type ExtendedSession = "PRE" | "POST";
 
+/** What reports call each extended session's line or column. */
+export const EXTENDED_SESSION_LABELS: Record<ExtendedSession, string> = { PRE: "Pre-Market", POST: "After Hours" };
+
 export interface ExtendedSessionDisplay extends ActiveQuoteDisplay {
   session: ExtendedSession;
 }
@@ -278,9 +281,46 @@ export function getExtendedSessionDisplay(quote: Quote | null | undefined): Exte
   return { session: "POST", price, change, changePercent: (change / close) * 100 };
 }
 
+/**
+ * A quote's headline and extended print as flat figures, for a report row or
+ * an export: price, change and changePercent are the regular session's
+ * (getRegularSessionDisplay), the extended fields the pre-market or
+ * after-hours print measured from its close (getExtendedSessionDisplay), all
+ * null when there is none.
+ */
+export function getQuoteSessionFields(quote: Quote | null | undefined) {
+  const headline = getRegularSessionDisplay(quote);
+  const extended = getExtendedSessionDisplay(quote);
+  return {
+    price: headline?.price ?? null,
+    change: headline?.change ?? null,
+    changePercent: headline?.changePercent ?? null,
+    extendedSession: extended?.session ?? null,
+    extendedPrice: extended?.price ?? null,
+    extendedChange: extended?.change ?? null,
+    extendedChangePercent: extended?.changePercent ?? null,
+  };
+}
+
 /** The extended display only while its session is open: the pre-market or the after-hours session. */
 function getOpenExtendedSessionDisplay(quote: Quote | null | undefined): ExtendedSessionDisplay | null {
   return quote?.marketState === "PRE" || quote?.marketState === "POST" ? getExtendedSessionDisplay(quote) : null;
+}
+
+/**
+ * The regular session alone, for a board that never shows extended trading:
+ * the live quote while the session trades, then the completed session's close
+ * and its move (getCompletedRegularSessionDisplay). Null outside the session
+ * when the quote cannot say which close that is, rather than an extended
+ * print or a flat move standing in for one. A quote that does not say its
+ * session is read as the regular one, as getRegularSessionDisplay does.
+ */
+export function getRegularSessionMoveDisplay(quote: Quote | null | undefined): ActiveQuoteDisplay | null {
+  if (!quote) return null;
+  if (quote.marketState == null || quote.marketState === "REGULAR") {
+    return { price: quote.price, change: quote.change, changePercent: quote.changePercent };
+  }
+  return getCompletedRegularSessionDisplay(quote);
 }
 
 /**
