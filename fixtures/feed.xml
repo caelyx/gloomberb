@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
+ <title>ABC News (Australia)</title>
+ <published>2008-06-09T23:46:02+00:00</published>
+ <entry>
+  <id>yt:video:YVOEzEhbATA</id>
+  <yt:videoId>YVOEzEhbATA</yt:videoId>
+  <title>Olympic emblems leaked &amp; &quot;revealed&quot; early | ABC NEWS</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=YVOEzEhbATA"/>
+  <published>2026-10-03T10:45:00+00:00</published>
+  <media:group>
+   <media:title>Olympic emblems leaked | ABC NEWS</media:title>
+   <media:thumbnail url="https://i2.ytimg.com/vi/YVOEzEhbATA/hqdefault.jpg" width="480" height="360"/>
+   <media:description>The emblem for the Brisbane 2032 Olympics has been revealed.</media:description>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:FPA18sVa9es</id>
+  <yt:videoId>FPA18sVa9es</yt:videoId>
+  <title>Queensland runner tackles safety concerns | ABC NEWS</title>
+  <link rel="alternate" href="https://www.youtube.com/shorts/FPA18sVa9es"/>
+  <published>2026-10-03T09:00:00+00:00</published>
+  <media:group>
+   <media:description></media:description>
+  </media:group>
+ </entry>
+ <entry>
+  <id>yt:video:bad</id>
+  <yt:videoId>not-an-id</yt:videoId>
+  <title>Malformed entry</title>
+  <published>2026-10-03T08:00:00+00:00</published>
+ </entry>
+</feed>
