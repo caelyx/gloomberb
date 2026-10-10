@@ -1,22 +1,32 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { Box, Text, TextAttributes, useUiCapabilities } from "gloomberb/ui";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from "react";
+import { Box, Text, TextAttributes, useUiCapabilities, type ScrollBoxRenderable } from "gloomberb/ui";
 import {
-  buildMetricTreemapNavigationTiles,
+  DetailScrollBody,
+  EmptyState,
   findMetricTreemapNeighbor,
   loadingText,
+  Notice,
+  PageStackView,
   PaneStatusBody,
+  Prose,
+  READING_WIDTH,
+  Spinner,
+  StatGrid,
   useExternalLinkFooter,
   usePaneMenuItems,
   type MetricTreemapDirection,
   type MetricTreemapItem,
+  type PaneHint,
+  type StatItem,
 } from "gloomberb/components";
 import {
-  useAutoRefresh, usePaneSettingValue, usePaneVisible, usePluginPaneState,
+  useAutoRefresh, usePaneSettingValue, usePaneVisible, usePluginConfigState, usePluginPaneState,
   useShortcut, useUpdatedAgo,
 } from "gloomberb/react";
 import { colors } from "gloomberb/theme";
-import { displayWidth, isPlainKey, padTo } from "gloomberb/utils";
+import { displayWidth, formatRelativeAge, isPlainKey, padTo } from "gloomberb/utils";
 import type { PaneProps } from "gloomberb/types/plugin";
+import { loadArticle, type Article } from "./article";
 import { cachedFeed, loadFeed } from "./cache";
 import { gloomNewsAvailable, watchGloomNews } from "./gloom-news";
 import {
@@ -29,6 +39,9 @@ import {
   tileTextColor, topStories,
   type TilePalette,
 } from "./model";
+import { buildGroupedTiles } from "./layout";
+import { isGoogleNewsArticleUrl, resolveArticleUrl } from "./resolve";
+import { DEFAULT_GEMINI_MODEL, summarizeArticle } from "./summary";
 
 const GLOOM_NEWS_LIMIT = 150;
 /** News does not move fast enough to justify more, and Google answers a
@@ -44,6 +57,8 @@ const DEFAULT_SECTION_SETTING: string[] = [...DEFAULT_SECTIONS];
 const EMPTY_TITLE = "No stories.";
 
 type Tile = { item: MetricTreemapItem<Headline>; x: number; y: number; width: number; height: number };
+/** Module-level so the tile memo does not see a new grouping every render. */
+const groupOfItem = (item: MetricTreemapItem<Headline>) => item.data.section;
 type PreventableMouseEvent = { preventDefault(): void };
 type PointerMoveEvent = { x?: number; y?: number; pixelX?: number; pixelY?: number };
 
@@ -140,6 +155,13 @@ function pct(value: number, total: number): string {
   return `${total > 0 ? (value / total) * 100 : 0}%`;
 }
 
+/** The 1px inset and the 1px border the desktop tile draws on each edge, top
+ * and bottom together: pixels of tile height that can never hold text. */
+const TILE_EDGE_PX = 4;
+/** The source line's height. Set on the element as well as budgeted here —
+ * `Text` otherwise takes the host's cell height and overruns its share. */
+const SOURCE_LINE_PX = 13;
+
 const DesktopTile = memo(function DesktopTile({ tile, chartWidth, chartHeight, cellHeightPx, selected, background, palette, now, onSelect, onActivate }: {
   tile: Tile;
   chartWidth: number;
@@ -156,14 +178,17 @@ const DesktopTile = memo(function DesktopTile({ tile, chartWidth, chartHeight, c
   const tiny = tile.width < 5 || tile.height < 2;
   const headline = tile.item.data;
   // The browser ellipsizes, so the DOM tile gets the whole headline and a line
-  // clamp rather than the terminal's hand-wrapped lines. The clamp counts CSS
-  // lines, not terminal rows: measuring in rows ran about one line long, and
-  // `overflow: hidden` then cut the last one mid-glyph instead of ellipsising.
+  // clamp rather than the terminal's hand-wrapped lines. A clamp can only count
+  // lines the text was allowed to break into, and `Text` is `white-space: pre`
+  // until it is asked to wrap, so the headline below opts in with `wrapText`.
+  // The clamp counts CSS lines, not terminal rows: measuring in rows ran about
+  // one line long, and `overflow: hidden` then cut the last one mid-glyph
+  // instead of ellipsising.
   const fontSize = tiny ? 11 : 13;
   const lineHeightPx = fontSize * 1.2;
   const showsSource = tile.height >= 3.5;
   const boxPx = tile.height * cellHeightPx;
-  const spentPx = (tiny ? 6 : 12) + (showsSource ? 13 + 2 : 0);
+  const spentPx = TILE_EDGE_PX + (tiny ? 6 : 12) + (showsSource ? SOURCE_LINE_PX + 2 : 0);
   const maxLines = Math.max(1, Math.floor((boxPx - spentPx) / lineHeightPx));
 
   const style: CSSProperties = {
@@ -195,6 +220,8 @@ const DesktopTile = memo(function DesktopTile({ tile, chartWidth, chartHeight, c
       onDoubleClick={() => onActivate(tile.item.id)}
     >
       <Text
+        wrapText
+        width="100%"
         fg={textColor}
         attributes={selected ? TextAttributes.BOLD : TextAttributes.NONE}
         style={{
@@ -207,7 +234,10 @@ const DesktopTile = memo(function DesktopTile({ tile, chartWidth, chartHeight, c
       {showsSource && (
         <Text
           fg={textColor}
-          style={{ opacity: 0.75, fontSize: 11, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+          style={{
+            opacity: 0.75, fontSize: 11, lineHeight: `${SOURCE_LINE_PX}px`,
+            whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+          }}
         >
           {headline.source}
         </Text>
@@ -277,6 +307,83 @@ function Legend({ groups, hues, active, width, onToggle }: {
       )}
     </Box>
   );
+}
+
+// ----------------------------------------------------------------- reader
+
+type Load<T> =
+  | { status: "loading"; label: string }
+  | { status: "ready"; value: T }
+  | { status: "error"; message: string };
+
+/** What the reader is waiting on first: Google, for a Google News link, or the publisher. */
+function firstLoadingLabel(url: string): string {
+  return isGoogleNewsArticleUrl(url) ? "Finding the article..." : "Reading the article...";
+}
+
+function StoryReader({ headline, width, article, summary, scrollRef }: {
+  headline: Headline;
+  width: number;
+  article: Load<Article> | undefined;
+  summary: Load<string> | undefined;
+  scrollRef: RefObject<ScrollBoxRenderable | null>;
+}) {
+  // The stack bar already names the story, so the reader opens on its figures.
+  const stats: StatItem[] = [
+    { id: "source", label: "Source", value: headline.source || "—" },
+    { id: "section", label: "Section", value: sectionLabel(headline.section) },
+    { id: "age", label: "Published", value: formatRelativeAge(headline.publishedAt) },
+    { id: "outlets", label: "Outlets", value: String(headline.relatedCount + 1) },
+  ];
+  // Long lines are hard to track back across a wide pane, so text stops at
+  // the host's reading width.
+  const textWidth = Math.max(1, Math.min(width - 2, READING_WIDTH));
+
+  return (
+    <Box flexDirection="column" flexGrow={1} flexShrink={1} width={width}>
+      <StatGrid items={stats} width={width} />
+      <DetailScrollBody ref={scrollRef} resetScrollKey={headline.id}>
+        <Box flexDirection="column" gap={1}>
+          {summary ? <SummaryBlock summary={summary} width={textWidth} /> : null}
+          {summary?.status === "ready" ? <Text fg={colors.textDim}>ARTICLE</Text> : null}
+          <ArticleBody article={article ?? { status: "loading", label: firstLoadingLabel(headline.url) }} width={textWidth} />
+        </Box>
+      </DetailScrollBody>
+    </Box>
+  );
+}
+
+function ArticleBody({ article, width }: { article: Load<Article>; width: number }) {
+  if (article.status === "loading") return <Spinner label={article.label} />;
+  if (article.status === "error") {
+    return <EmptyState title={article.message} hint="Press o to open it in the browser." />;
+  }
+  return <Paragraphs paragraphs={article.value.paragraphs} width={width} />;
+}
+
+function SummaryBlock({ summary, width }: { summary: Load<string>; width: number }) {
+  if (summary.status === "loading") return <Spinner label={summary.label} />;
+  if (summary.status === "error") return <Notice>{summary.message}</Notice>;
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Text fg={colors.textDim}>SUMMARY</Text>
+      <Paragraphs paragraphs={summary.value.split(/\n\s*\n/)} width={width} />
+    </Box>
+  );
+}
+
+function Paragraphs({ paragraphs, width }: { paragraphs: string[]; width: number }) {
+  return (
+    <Box flexDirection="column" gap={1}>
+      {paragraphs.map((paragraph, index) => <Prose key={index} text={paragraph} width={width} />)}
+    </Box>
+  );
+}
+
+/** One line of the reader, clamped to its ends as the host's own detail scroll is. */
+function scrollReader(scrollBox: ScrollBoxRenderable, delta: number): void {
+  const max = Math.max(0, scrollBox.scrollHeight - (scrollBox.viewport?.height ?? 0));
+  scrollBox.scrollTop = Math.min(max, Math.max(0, scrollBox.scrollTop + delta));
 }
 
 // ------------------------------------------------------------------- pane
@@ -422,11 +529,13 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
   const chartWidth = Math.max(1, width - 2);
   const cellAspect = Math.max(0.5, Math.min(4, cellHeightPx / Math.max(1, cellWidthPx)));
 
-  const tiles = useMemo(
-    () => buildMetricTreemapNavigationTiles(
-      items, chartWidth, chartHeight, cellAspect, nativePaneChrome ? "float" : "integer",
-    ) as Tile[],
-    [cellAspect, chartHeight, chartWidth, items, nativePaneChrome],
+  // One block per section, as Newsola draws it, with the stories a treemap
+  // inside each block — placed in legend order where the shapes allow.
+  const tiles = useMemo<Tile[]>(
+    () => buildGroupedTiles(
+      items, groupOfItem, groups, chartWidth, chartHeight, cellAspect, nativePaneChrome ? "float" : "integer",
+    ),
+    [cellAspect, chartHeight, chartWidth, groups, items, nativePaneChrome],
   );
 
   // Selection follows what is drawn, not what was budgeted. The layout drops
@@ -452,23 +561,97 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
     [hues, now],
   );
 
-  // useExternalLinkFooter owns the open; the ref mirrors it onto Enter and
-  // double-click, which it does not bind itself.
+  // useExternalLinkFooter owns opening in the browser; the ref lets the menu
+  // reach it.
   const openRef = useRef<(() => void) | null>(null);
+
+  // The story being read, held by value: a refresh can drop it from the board,
+  // and the reader must not close or change story under the reader's eyes.
+  const [reading, setReading] = useState<Headline | null>(null);
+  const [geminiApiKey] = usePluginConfigState<string>("geminiApiKey", "");
+  const [geminiModel] = usePluginConfigState<string>("geminiModel", DEFAULT_GEMINI_MODEL);
+
+  // Keyed by headline id and kept for the life of the pane, so going back to a
+  // story already read, or summarised, costs nothing.
+  const [articles, setArticles] = useState<ReadonlyMap<string, Load<Article>>>(new Map());
+  const [summaries, setSummaries] = useState<ReadonlyMap<string, Load<string>>>(new Map());
+  const articlesRef = useRef(articles);
+  articlesRef.current = articles;
+  const readerScrollRef = useRef<ScrollBoxRenderable | null>(null);
+
+  const readingId = reading?.id ?? null;
+  const readingUrl = reading?.url;
+
+  // Runs each time a story is opened. A finished article is reused; a failed
+  // one is tried again. Closing the story cancels the request and drops its
+  // "loading" entry at once, so a reopen never waits on a cancelled request.
+  useEffect(() => {
+    if (readingId === null || !readingUrl) return;
+    if (articlesRef.current.get(readingId)?.status === "ready") return;
+
+    const controller = new AbortController();
+    const settle = (next: Load<Article>) => {
+      if (!controller.signal.aborted) setArticles((current) => new Map(current).set(readingId, next));
+    };
+
+    settle({ status: "loading", label: firstLoadingLabel(readingUrl) });
+    (async () => {
+      const url = await resolveArticleUrl(readingUrl);
+      settle({ status: "loading", label: "Reading the article..." });
+      settle({ status: "ready", value: await loadArticle(url, controller.signal) });
+    })().catch((error: unknown) => settle({
+      status: "error",
+      message: error instanceof Error ? error.message : "Could not load the article.",
+    }));
+
+    return () => {
+      controller.abort();
+      setArticles((current) => {
+        if (current.get(readingId)?.status !== "loading") return current;
+        const next = new Map(current);
+        next.delete(readingId);
+        return next;
+      });
+    };
+  }, [readingId, readingUrl]);
+
+  const article = reading ? articles.get(reading.id) : undefined;
+  const summary = reading ? summaries.get(reading.id) : undefined;
+
+  const summarize = useCallback(() => {
+    if (!reading || article?.status !== "ready") return;
+    if (summary?.status === "loading" || summary?.status === "ready") return;
+    const id = reading.id;
+    const settle = (next: Load<string>) => setSummaries((current) => new Map(current).set(id, next));
+
+    if (!geminiApiKey.trim()) {
+      settle({ status: "error", message: "Add a Gemini API key with Set up News Heatmap in the command bar to summarise articles." });
+      return;
+    }
+    settle({ status: "loading", label: "Summarising..." });
+    summarizeArticle(geminiApiKey, geminiModel.trim() || DEFAULT_GEMINI_MODEL, reading.title, article.value.paragraphs)
+      .then((value) => settle({ status: "ready", value }))
+      .catch((error: unknown) => settle({
+        status: "error",
+        message: error instanceof Error ? error.message : "Could not summarise the article.",
+      }));
+  }, [article, geminiApiKey, geminiModel, reading, summary]);
 
   const selectTile = useCallback((id: string) => setSelectedId(id), []);
   const activateTile = useCallback((id: string) => {
     setSelectedId(id);
-    openRef.current?.();
-  }, []);
+    const headline = tiles.find((tile) => tile.item.id === id)?.item.data;
+    if (headline) setReading(headline);
+  }, [tiles]);
 
   const selectNeighbor = useCallback((direction: MetricTreemapDirection) => {
     const target = findMetricTreemapNeighbor(tiles, selectedId, direction);
     if (target) setSelectedId(target.item.id);
   }, [selectedId, tiles]);
 
-  // Walks the drawn tiles, in weight order, so j/k never lands on a story that
-  // has no tile and appears to do nothing.
+  // Walks the drawn tiles in reading order — section by section, heaviest
+  // first within each — so j/k never lands on a story that has no tile and
+  // appears to do nothing.
   const step = useCallback((delta: 1 | -1) => {
     const index = tiles.findIndex((tile) => tile.item.id === selectedId);
     const next = tiles[Math.min(Math.max((index < 0 ? 0 : index) + delta, 0), tiles.length - 1)];
@@ -503,6 +686,17 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
     if (!focused || event.targetEditable) return;
     const take = () => { event.preventDefault(); event.stopPropagation(); };
 
+    // The reader is a different page: the board's keys would act on tiles that
+    // are not on screen, and Esc and o belong to the stack and the footer.
+    if (reading) {
+      if (isPlainKey(event, "s")) { take(); summarize(); return; }
+      const delta = isPlainKey(event, "j", "down") ? 1 : isPlainKey(event, "k", "up") ? -1 : 0;
+      const scrollBox = readerScrollRef.current;
+      // Claimed at either end too, so the pane scroll keys never page it on.
+      if (delta && scrollBox) { take(); scrollReader(scrollBox, delta); }
+      return;
+    }
+
     // Only claimed when it has something to do; the gloom feed is pushed by
     // the host, so `r` there belongs to the app.
     if (isPlainKey(event, "r") && source === "google") { take(); refresh(); return; }
@@ -520,7 +714,7 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
     if (isPlainKey(event, "down")) { take(); selectNeighbor("down"); return; }
     if (isPlainKey(event, "j")) { take(); step(1); return; }
     if (isPlainKey(event, "k")) { take(); step(-1); return; }
-    if (isPlainKey(event, "enter", "return") && selected) { take(); openRef.current?.(); }
+    if (isPlainKey(event, "enter", "return") && selected) { take(); setReading(selected); }
   });
 
   useEffect(() => {
@@ -544,9 +738,13 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
   // the two cycling controls have footer hints; without this the arrows, j/k,
   // the digits and `[` exist only in the README.
   usePaneMenuItems(`${NEWSMAP_PANE_ID}:menu`, () => [
-    { id: "open", label: "Open story", accelerator: "Enter", enabled: !!selected, onSelect: () => openRef.current?.() },
+    { id: "read", label: "Read story", accelerator: "Enter", enabled: !!selected && !reading, onSelect: () => setReading(selected) },
+    { id: "open", label: "Open in browser", accelerator: "o", enabled: !!(reading ?? selected), onSelect: () => openRef.current?.() },
+    ...(reading
+      ? [{ id: "summary", label: "Summarise", accelerator: "s", enabled: article?.status === "ready" && summary?.status !== "ready", onSelect: summarize }]
+      : []),
     { id: "move", label: "Move between tiles", accelerator: "Arrows", enabled: false },
-    { id: "step", label: "Next / previous by weight", accelerator: "j / k", enabled: false },
+    { id: "step", label: "Next / previous story", accelerator: "j / k", enabled: false },
     ...(source === "google"
       ? [
         { id: "refresh", label: "Refresh", accelerator: "r", onSelect: refresh },
@@ -579,13 +777,27 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
       }]
       : []),
     { id: "show-all", label: "Show every section", accelerator: "0", enabled: hiddenGroups.size > 0, onSelect: () => setHidden(EMPTY_HIDDEN) },
-  ], [density, editionId, groups, hiddenGroups, refresh, selected, setDensity, setHidden, shiftEdition, source, toggleGroup, toggleSource]);
+  ], [article, density, editionId, groups, hiddenGroups, reading, refresh, selected, setDensity, setHidden, shiftEdition, source, summarize, summary, toggleGroup, toggleSource]);
+
+  const hints = useMemo<PaneHint[]>(() => {
+    if (reading) {
+      return article?.status === "ready" && summary?.status !== "ready"
+        ? [{ id: "summary", key: "s", label: "ummary", onPress: summarize }]
+        : [];
+    }
+    return [
+      ...(source === "google"
+        ? [{ id: "edition", key: "]", label: " edition", onPress: () => shiftEdition(1) }]
+        : []),
+      { id: "source", key: "g", label: " source", onPress: toggleSource },
+    ];
+  }, [article, reading, shiftEdition, source, summarize, summary, toggleSource]);
 
   openRef.current = useExternalLinkFooter({
     registrationId: NEWSMAP_PANE_ID,
     focused,
-    url: selected?.url ?? null,
-    source: selected?.source ?? null,
+    url: (reading ?? selected)?.url ?? null,
+    source: (reading ?? selected)?.source ?? null,
     label: "story",
     info: [
       { id: "feed", parts: [{ text: sourceLabel, tone: "muted" as const }] },
@@ -593,12 +805,7 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
       ...(loading ? [{ id: "loading", parts: [{ text: "loading", tone: "muted" as const }] }] : []),
       ...(error && hasBoard ? [{ id: "error", parts: [{ text: error, tone: "warning" as const }] }] : []),
     ],
-    hints: [
-      ...(source === "google"
-        ? [{ id: "edition", key: "]", label: " edition", onPress: () => shiftEdition(1) }]
-        : []),
-      { id: "source", key: "g", label: " source", onPress: toggleSource },
-    ],
+    hints,
   });
 
   const body = nativePaneChrome ? (
@@ -631,7 +838,7 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
             palette={PALETTE}
             now={now}
             onSelect={() => setSelectedId(tile.item.id)}
-            onActivate={() => { setSelectedId(tile.item.id); openRef.current?.(); }}
+            onActivate={() => activateTile(tile.item.id)}
             pointerMoved={pointerMoved}
           />
         ))}
@@ -639,7 +846,7 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
     </Box>
   );
 
-  return (
+  const map = (
     <Box flexDirection="column" width={width} height={height}>
       {legendHeight > 0 && (
         <Legend
@@ -660,5 +867,18 @@ export function NewsmapPane({ focused, width, height }: PaneProps) {
         {body}
       </PaneStatusBody>
     </Box>
+  );
+
+  return (
+    <PageStackView
+      focused={focused}
+      detailOpen={!!reading}
+      onBack={() => setReading(null)}
+      rootContent={map}
+      detailContent={reading
+        ? <StoryReader headline={reading} width={width} article={article} summary={summary} scrollRef={readerScrollRef} />
+        : null}
+      detailTitle={reading?.title}
+    />
   );
 }

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Why SQLite Uses Bytecode | Example Engineering Blog</title>
+  <meta property="og:title" content="Why SQLite Uses Bytecode">
+  <style>body { font-family: sans-serif; } .cookie { position: fixed; }</style>
+  <script>window.analytics = { track: function () {} };</script>
+</head>
+<body>
+  <div class="cookie-banner" id="cookie-consent">
+    <p>We use cookies to improve your experience. Accept all cookies?</p>
+    <button>Accept</button><button>Reject</button>
+  </div>
+  <header class="site-header">
+    <nav class="main-nav">
+      <ul>
+        <li><a href="/">Home</a></li>
+        <li><a href="/archive">Archive</a></li>
+        <li><a href="/about">About the team</a></li>
+        <li><a href="/subscribe">Subscribe to the newsletter</a></li>
+      </ul>
+    </nav>
+  </header>
+  <main>
+    <article class="post">
+      <h1>Why SQLite Uses Bytecode</h1>
+      <p class="byline">By Jane Doe &middot; 12 min read</p>
+      <p>SQLite compiles every SQL statement into a program for a small virtual machine. The program is a list of instructions, each doing one simple thing, and the virtual machine runs them one after another until the statement is done.</p>
+      <p>Most other databases compile SQL into a tree of objects instead. Each node in the tree knows how to produce rows, and the root pulls rows from its children. That design is flexible, but it is much harder to see what the database is actually going to do.</p>
+      <h2>Reading the plan</h2>
+      <p>Because the bytecode is a flat list, you can print it with EXPLAIN and read it from top to bottom. Every loop, every comparison, and every jump is visible, and the output is the same on every machine that runs the same version of SQLite.</p>
+      <blockquote><p>A flat program is easier to reason about than a tree of cooperating objects.</p></blockquote>
+      <ul>
+        <li>The program can be paused after any instruction &amp; resumed later.</li>
+        <li>Progress callbacks are cheap, because the loop already counts steps.</li>
+      </ul>
+      <p>None of this makes SQLite faster than a tree-walking engine on its own. What it buys is predictability: the same statement produces the same program, and the program is small enough to read.</p>
+    </article>
+    <aside class="related">
+      <h3>Related posts</h3>
+      <ul>
+        <li><a href="/p/1">Ten things we learned about B-trees</a></li>
+        <li><a href="/p/2">Our favourite database papers</a></li>
+      </ul>
+    </aside>
+  </main>
+  <footer class="site-footer">
+    <p>Copyright 2026 Example Engineering. All rights reserved.</p>
+    <p><a href="/privacy">Privacy policy</a> &middot; <a href="/terms">Terms</a></p>
+  </footer>
+</body>
+</html>

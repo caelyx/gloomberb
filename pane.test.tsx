@@ -6,6 +6,7 @@ import {
   type PluginRuntimeAccess,
 } from "gloomberb/test-support";
 import { setPluginContext } from "./gloom-news";
+import * as realCache from "./cache";
 
 /**
  * The pane is driven through the host's own news feed rather than Google News:
@@ -27,7 +28,9 @@ function article(topic: string, index: number, title: string) {
   return {
     id: `${topic}-${index}`,
     title,
-    url: `https://example.test/${topic}/${index}`,
+    // The reader refuses local addresses before fetching, so opening one of
+    // these stays offline and lands on the same error every time.
+    url: `http://localhost/${topic}/${index}`,
     source: "Reuters",
     publishedAt: new Date(now - index * HOUR),
     topic,
@@ -41,7 +44,8 @@ function article(topic: string, index: number, title: string) {
  */
 const loadFeed = mock(async () => ({ headlines: [], failedSections: [], fetchedAt: Date.now(), stale: false }));
 const cachedFeed = mock(() => null);
-mock.module("./cache", () => ({ loadFeed, cachedFeed }));
+const loadArticleUrl = mock(async (url: string) => url);
+mock.module("./cache", () => ({ ...realCache, loadFeed, cachedFeed, loadArticleUrl }));
 
 const { NewsmapPane } = await import("./pane");
 
@@ -157,4 +161,38 @@ test("does not refetch in a loop under the default settings", async () => {
   const rendered = await mountPane(80, 20, {});
   for (let attempt = 0; attempt < 8; attempt += 1) await settleFrame(rendered, 15);
   expect(loadFeed.mock.calls.length).toBeLessThanOrEqual(2);
+}, 30_000);
+
+test("Enter reads the story in place, and Esc goes back to the board", async () => {
+  const rendered = await mountPane();
+  await waitForFrame(rendered, (painted) => painted.includes("Central bank"));
+
+  await press(rendered, "return");
+  const reader = await waitForFrame(rendered, (painted) => painted.includes("not fetched"));
+  // The stack bar names the story; the stat band carries what the tile did.
+  expect(reader).toContain("Back");
+  expect(reader).toContain("Central bank lifts rates");
+  expect(reader).toContain("Published");
+  expect(reader).toContain("Outlets");
+  expect(reader).toContain("Links to a local network address are not fetched.");
+  // The board's own keys are not live under the reader.
+  expect(reader).not.toContain("1 Business");
+
+  await press(rendered, "escape");
+  const board = await waitForFrame(rendered, (painted) => painted.includes("1 Business"));
+  expect(board).toContain("1 Business");
+  expect(board).not.toContain("not fetched");
+}, 30_000);
+
+test("board keys do nothing while the reader is open", async () => {
+  const rendered = await mountPane();
+  await waitForFrame(rendered, (painted) => painted.includes("Central bank"));
+
+  await press(rendered, "return");
+  await waitForFrame(rendered, (painted) => painted.includes("not fetched"));
+  // `1` would hide Business on the board; under the reader it must not.
+  await press(rendered, "1");
+  await press(rendered, "escape");
+  const board = await waitForFrame(rendered, (painted) => painted.includes("1 Business"));
+  expect(board).toContain("Central bank");
 }, 30_000);
