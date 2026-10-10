@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import type { Headline } from "./types";
+import * as realCache from "./cache";
 
 const HOUR = 3_600_000;
 const now = Date.now();
@@ -20,7 +21,7 @@ const loadFeed = mock(async (sections: readonly string[]) => {
   requested = sections;
   return { headlines: FEED, failedSections: [], fetchedAt: now, stale: false };
 });
-mock.module("./cache", () => ({ loadFeed, cachedFeed: () => null }));
+mock.module("./cache", () => ({ ...realCache, loadFeed, cachedFeed: () => null }));
 // The real `./config` is used rather than a stub: it reads through a plugin
 // context, so a fake context exercises the actual resolution instead of
 // asserting against a second copy of it. (A partial stub here also leaks into

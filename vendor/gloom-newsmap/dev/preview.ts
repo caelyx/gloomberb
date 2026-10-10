@@ -8,11 +8,12 @@
  *   bun dev/preview.ts demo 118 30     — offline fixture, no network
  *   bun dev/preview.ts demo-jp 118 30  — the CJK wrapping case
  */
-import { buildMetricTreemapNavigationTiles, type MetricTreemapItem } from "gloomberb/components";
+import type { MetricTreemapItem } from "gloomberb/components";
 import { displayWidth } from "gloomberb/utils";
 import { parseGoogleNewsFeed, feedUrl } from "../parse";
 import { assignHues, DEFAULT_SECTIONS, editionById, sectionLabel, type Density, type Headline } from "../types";
 import { fixtureHeadlines } from "./fixture";
+import { buildGroupedTiles } from "../layout";
 import { dedupeHeadlines, freshness, storyWeight, tileBudget, tileColor, tileLines, tileTextColor, topStories, type TilePalette } from "../model";
 
 const PALETTE: TilePalette = {
@@ -59,7 +60,9 @@ const items: Array<MetricTreemapItem<Headline>> = board.map((headline) => ({
   id: headline.id, label: headline.title, weight: storyWeight(headline), data: headline,
 }));
 
-const tiles = buildMetricTreemapNavigationTiles(items, width, height, 2.2, "integer");
+// The pane's legend order: the configured sections, in order, that have stories.
+const groups = DEFAULT_SECTIONS.filter((section) => stories.some((headline) => headline.section === section));
+const tiles = buildGroupedTiles(items, (item) => item.data.section, groups, width, height, 2.2, "integer");
 
 // A character grid, composited the way the terminal composites absolute boxes.
 const grid: Array<Array<{ ch: string; fg: string; bg: string }>> = Array.from(
@@ -102,17 +105,15 @@ for (const tile of tiles) {
 
 // Mirrors the pane's own legend — numbered toggles and the age key — rather
 // than inventing a different one, so this really is what the pane draws.
-const drawn: string[] = [];
-for (const headline of board) if (!drawn.includes(headline.section)) drawn.push(headline.section);
 
 console.log(
   `\n  ${editionId.startsWith("demo") ? "Fixture" : editionById(editionId).label} · ${headlines.length} fetched · ${stories.length} unique · ${board.length} budgeted (${density}) · ${tiles.length} tiles drawn · ${width}x${height}\n`,
 );
 const ageKey = [1, 0.55, 0.15]
-  .map((level) => `${fgAnsi(tileColor(hues.get(drawn[0]!)!, level, PALETTE))}█\x1b[0m`)
+  .map((level) => `${fgAnsi(tileColor(hues.get(groups[0]!)!, level, PALETTE))}█\x1b[0m`)
   .join("");
 console.log(
-  "  " + drawn.map((section, index) =>
+  "  " + groups.map((section, index) =>
     `${fgAnsi(hues.get(section)!)}■\x1b[0m ${index + 1} ${sectionLabel(section)}`).join("  ")
   + `   new ${ageKey} old\n`,
 );

@@ -44,12 +44,32 @@ const feedCache = createPluginCache<Headline[]>({
   policy: { staleMs: STALE_MS, expireMs: EXPIRE_MS },
 });
 
+/**
+ * Google News link → publisher URL. Resolving one costs two requests to Google,
+ * one of them a half-megabyte page, and the answer never changes, so it is
+ * kept as long as anything here is.
+ */
+const ARTICLE_URL_MS = 30 * 24 * 60 * 60 * 1000;
+
+const articleUrlCache = createPluginCache<string>({
+  kind: "newsmap-article-url",
+  source: "google-news",
+  schemaVersion: 1,
+  policy: { staleMs: ARTICLE_URL_MS, expireMs: ARTICLE_URL_MS },
+});
+
 export function attachNewsmapCache(persistence: PluginPersistence): void {
   feedCache.attach(persistence);
+  articleUrlCache.attach(persistence);
 }
 
 export function resetNewsmapCache(): void {
   feedCache.reset();
+  articleUrlCache.reset();
+}
+
+export async function loadArticleUrl(googleUrl: string, resolve: () => Promise<string>): Promise<string> {
+  return (await articleUrlCache.load(googleUrl, resolve)).data;
 }
 
 export function sectionKey(section: string, editionId: string): string {

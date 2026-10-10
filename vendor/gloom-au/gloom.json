@@ -1,0 +1,112 @@
+{
+  "id": "au-markets",
+  "name": "Australian Markets",
+  "tagline": "ASX, RBA, ABS, ASIC and AEMO data for Australian investors, from free public sources",
+  "description": "Brings Gloomberb's coverage of Australian markets closer to its US coverage, from free public sources. ASX announcements: the market feed and full company histories with PDF extracts, director-interest and substantial-holder filters. Franking credits, ASX options in the built-in options views, and ASIC short positions. RBA rates and the AUD, the RBA path priced by ASX cash rate futures, and ABS indicators and release dates, charted in their panes and in custom charts. An ASX market board with sector rotation, and an ASX heatmap grouped by sector. Australian news, including ASIC media releases, and AusTender government contracts. NEM electricity: prices on a map of Australia, the generation mix by fuel, battery discharge against price and FCAS prices, with prices, demand and the mix in custom charts; an optional OpenElectricity key adds rooftop solar and battery charging. ASX search for companies, ETFs and funds. Panes open with their last data from a local cache.",
+  "categories": [
+    "markets",
+    "research",
+    "macro",
+    "news"
+  ],
+  "targets": [
+    "cli",
+    "tui",
+    "desktop",
+    "web"
+  ],
+  "hosts": [
+    "www.asx.com.au",
+    "asx.api.markitdigital.com",
+    "download.asic.gov.au",
+    "www.asic.gov.au",
+    "www.rba.gov.au",
+    "data.api.abs.gov.au",
+    "www.abs.gov.au",
+    "www.abc.net.au",
+    "api.tenders.gov.au",
+    "cdn.cboe.com",
+    "cdn-api.markitdigital.com",
+    "visualisations.aemo.com.au",
+    "takeovers.gov.au",
+    "www.tga.gov.au",
+    "scanner.tradingview.com",
+    "api.openelectricity.org.au"
+  ],
+  "contributes": {
+    "panes": [
+      "au-announcements",
+      "asx-short-positions",
+      "au-rba",
+      "au-rbap",
+      "au-abs",
+      "asx-market",
+      "au-contracts",
+      "au-nem",
+      "au-heatmap"
+    ],
+    "shortcuts": [
+      {
+        "code": "ASXA",
+        "name": "ASX Announcements",
+        "description": "Company announcements lodged with ASX: the market feed, or one company's with an ASX ticker."
+      },
+      {
+        "code": "ASX",
+        "name": "ASX Announcements",
+        "description": "Alias of ASXA (gloom-asx's shortcut): ASX announcements, the market feed or one company's."
+      },
+      {
+        "code": "ASXS",
+        "name": "ASX Short Positions",
+        "description": "ASIC's daily report of short positions in ASX products, most shorted first, or one company's history with an ASX ticker."
+      },
+      {
+        "code": "FRANK",
+        "name": "ASX Franking",
+        "description": "Franking credits, grossed-up dividend and gross yield for an ASX company, on Ticker Research's Franking tab."
+      },
+      {
+        "code": "RBA",
+        "name": "RBA Rates",
+        "description": "RBA cash rate, bank bill rates, government bond yields, the Australian dollar and board decision dates."
+      },
+      {
+        "code": "RBAP",
+        "name": "RBA Rate Path",
+        "description": "The RBA cash rate path priced by ASX 30-day interbank cash rate futures: implied rate and move odds at each board meeting."
+      },
+      {
+        "code": "WIRA",
+        "name": "RBA Rate Path",
+        "description": "Alias of RBAP: the RBA path priced by ASX cash rate futures, WIRP's Australian counterpart."
+      },
+      {
+        "code": "ABS",
+        "name": "ABS Indicators",
+        "description": "Australian CPI, labour force, wages and GDP from the ABS, and upcoming ABS releases."
+      },
+      {
+        "code": "ASXM",
+        "name": "ASX Market",
+        "description": "ASX 200, All Ords and A-VIX, the 11 GICS sectors with returns and rotation against the ASX 200, and the day's biggest movers."
+      },
+      {
+        "code": "HMA",
+        "name": "ASX Heatmap",
+        "description": "The ASX 50, ASX 200 or the 11 GICS sector indices, sized by market cap, coloured by the day's move and grouped by sector."
+      },
+      {
+        "code": "AUTN",
+        "name": "AusTender Contracts",
+        "description": "Australian Government contracts published on AusTender, largest first, with ASX-listed suppliers marked."
+      },
+      {
+        "code": "NEM",
+        "name": "NEM Electricity",
+        "description": "Wholesale electricity spot prices and demand across the National Electricity Market, the generation mix by fuel, battery discharge against price, FCAS prices and AEMO market notices."
+      }
+    ]
+  },
+  "minGloom": "0.16.0"
+}

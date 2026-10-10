@@ -37,11 +37,14 @@
     // Loaded by package name through WEB_BUNDLED_PLUGIN_PACKAGES in src/plugins/web-bundled.ts.
     "gloom-polls",
     "gloom-prediction-markets",
-    // Downstream: same, for the Hacker News plugin.
-    "gloom-hackernews",
-    // Downstream: a runtime dependency of the vendored gloom-asx plugin (vendor/
-    // is outside knip's project), installed here because vendored plugins'
-    // own dependencies are not; see scripts/web-plugins.ts.
+    // Downstream: runtime dependencies of the vendored plugins (vendor/ is
+    // outside knip's project), installed here because vendored plugins' own
+    // dependencies are not; see scripts/web-plugins.ts. unpdf: gloom-au;
+    // @mozilla/readability and linkedom: gloom-newsmap and gloom-hackernews;
+    // papaparse: gloom-acgb.
+    "@mozilla/readability",
+    "linkedom",
+    "papaparse",
     "unpdf"
   ]
 }

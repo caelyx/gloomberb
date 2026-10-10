@@ -15,7 +15,7 @@ import {
   type LayoutConfig,
 } from "../../types/config";
 import { researchEntryFromSearch } from "./research-entry";
-import { PRIVATE_DEFAULT_LAYOUT } from "./private-default-config";
+import { PRIVATE_DEFAULT_LAYOUTS, PRIVATE_DEFAULT_THEME } from "./private-default-config";
 import { BROWSER_STORAGE_KEYS, SafeJsonStorage, type StorageLike } from "../../data/json-storage";
 
 export const BROWSER_DATA_DIR = "browser://local";
@@ -93,12 +93,17 @@ function createBrowserDefaultConfig(dataDir: string, search = ""): AppConfig {
     focusedPaneId: BROWSER_RESEARCH_PANE_ID,
   };
   config.layout = config.layouts[0].layout;
-  // Downstream: the private deployment opens on its own workspace (see
+  // Downstream: the private deployment opens on its own layouts instead (see
   // private-default-config.ts). A research deep link still opens on research.
-  if (PRIVATE_DEFAULT_LAYOUT) {
-    config.layouts.splice(researchEntryFromSearch(search) ? 1 : 0, 0, structuredClone(PRIVATE_DEFAULT_LAYOUT));
-    config.layout = config.layouts[0].layout;
+  if (PRIVATE_DEFAULT_LAYOUTS) {
+    const research = researchEntryFromSearch(search) ? config.layouts.slice(0, 1) : [];
+    const [first, ...rest] = [...research, ...structuredClone(PRIVATE_DEFAULT_LAYOUTS)];
+    if (first) {
+      config.layouts = [first, ...rest];
+      config.layout = first.layout;
+    }
   }
+  if (PRIVATE_DEFAULT_THEME) config.theme = PRIVATE_DEFAULT_THEME;
   return browserReady(config);
 }
 

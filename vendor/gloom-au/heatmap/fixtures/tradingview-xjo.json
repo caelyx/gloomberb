@@ -1,0 +1,3415 @@
+{
+ "totalCount": 199,
+ "data": [
+  {
+   "s": "ASX:CSL",
+   "d": [
+    "CSL",
+    "CSL Limited",
+    85534576230,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SLX",
+   "d": [
+    "SLX",
+    "Silex Systems Limited",
+    1168065962,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:GPT",
+   "d": [
+    "GPT",
+    "GPT Group",
+    8543475243.999999,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MIN",
+   "d": [
+    "MIN",
+    "Mineral Resources Limited",
+    9836757088,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DRR",
+   "d": [
+    "DRR",
+    "Deterra Royalties Ltd",
+    2148344447,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:REA",
+   "d": [
+    "REA",
+    "REA Group Ltd",
+    20168114435,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MFG",
+   "d": [
+    "MFG",
+    "Magellan Financial Group Ltd",
+    2387748530,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:VCX",
+   "d": [
+    "VCX",
+    "Vicinity Centres",
+    10905486142,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BGA",
+   "d": [
+    "BGA",
+    "Bega Cheese Limited",
+    1870106153,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:COL",
+   "d": [
+    "COL",
+    "Coles Group Ltd.",
+    30577188599,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:KAR",
+   "d": [
+    "KAR",
+    "Karoon Energy Ltd",
+    1056908430,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SUL",
+   "d": [
+    "SUL",
+    "Super Retail Group Limited",
+    2867996603,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WOW",
+   "d": [
+    "WOW",
+    "Woolworths Group Ltd",
+    46299963795,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ALL",
+   "d": [
+    "ALL",
+    "Aristocrat Leisure Limited",
+    34770153599,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:RMD",
+   "d": [
+    "RMD",
+    "ResMed Inc. CHESS Depositary Interests on a ratio of 10 CDIs per ord.sh",
+    46058356613.19897,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:RWC",
+   "d": [
+    "RWC",
+    "Reliance Worldwide Corp. Ltd.",
+    3526197404,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WAF",
+   "d": [
+    "WAF",
+    "West African Resources Ltd",
+    3950090863,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:LOV",
+   "d": [
+    "LOV",
+    "Lovisa Holdings Ltd.",
+    2690945341,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ANZ",
+   "d": [
+    "ANZ",
+    "ANZ Group Holdings Limited",
+    112044222840,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BOQ",
+   "d": [
+    "BOQ",
+    "Bank of Queensland Limited",
+    4215614838.0000005,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PDI",
+   "d": [
+    "PDI",
+    "PDI Gold Limited",
+    5019114649,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WGX",
+   "d": [
+    "WGX",
+    "Westgold Resources Ltd",
+    4904876055,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PMV",
+   "d": [
+    "PMV",
+    "Premier Investments Limited",
+    1911642034,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WES",
+   "d": [
+    "WES",
+    "Wesfarmers Limited",
+    85974963806,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SFR",
+   "d": [
+    "SFR",
+    "Sandfire Resources Ltd",
+    10107818660,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SRG",
+   "d": [
+    "SRG",
+    "SRG Global Limited",
+    2520801661,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BWP",
+   "d": [
+    "BWP",
+    "BWP Group",
+    2772626886,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NXG",
+   "d": [
+    "NXG",
+    "NexGen Energy Ltd. Shs Chess Depository Interests repr 1 shs",
+    8592836424.727777,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:IAG",
+   "d": [
+    "IAG",
+    "Insurance Australia Group Ltd",
+    18128871521,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:QAN",
+   "d": [
+    "QAN",
+    "Qantas Airways Limited",
+    13405092729,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:GDG",
+   "d": [
+    "GDG",
+    "Generation Development Group Limited",
+    1099455023,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NEC",
+   "d": [
+    "NEC",
+    "Nine Entertainment Co. Holdings Limited",
+    1077226261,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CSC",
+   "d": [
+    "CSC",
+    "Capstone Copper Corp. Shs Chess Depository Interests Repr 1 Sh",
+    10710251724.3215,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NEM",
+   "d": [
+    "NEM",
+    "Newmont Corporation Registered Chess Depositary Interests Repr 1 Sh",
+    174446514892.51117,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:S32",
+   "d": [
+    "S32",
+    "South32 Ltd.",
+    21955733209,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CIA",
+   "d": [
+    "CIA",
+    "Champion Iron Ltd.",
+    1685741272,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:VUL",
+   "d": [
+    "VUL",
+    "Vulcan Energy Resources Ltd.",
+    813723274,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TLS",
+   "d": [
+    "TLS",
+    "Telstra Group Limited",
+    53483544891,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DTL",
+   "d": [
+    "DTL",
+    "Data#3 Limited.",
+    1959964567,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CNI",
+   "d": [
+    "CNI",
+    "Centuria Capital Group",
+    1194108477,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:EMR",
+   "d": [
+    "EMR",
+    "Emerald Resources NL",
+    4509487114,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ANN",
+   "d": [
+    "ANN",
+    "Ansell Limited",
+    6195324943,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ILU",
+   "d": [
+    "ILU",
+    "Iluka Resources Limited",
+    2467529171,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:OBM",
+   "d": [
+    "OBM",
+    "Ora Banda Mining Ltd.",
+    2806877064,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CGF",
+   "d": [
+    "CGF",
+    "Challenger Limited",
+    6680591406,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:HDN",
+   "d": [
+    "HDN",
+    "HomeCo Daily Needs REIT",
+    2196835996,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ORA",
+   "d": [
+    "ORA",
+    "Orora Limited",
+    1658746131,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MPL",
+   "d": [
+    "MPL",
+    "Medibank Private Ltd.",
+    12420554944,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CBA",
+   "d": [
+    "CBA",
+    "Commonwealth Bank of Australia",
+    250284794481,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:RRL",
+   "d": [
+    "RRL",
+    "Regis Resources Limited",
+    5447439663,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:REH",
+   "d": [
+    "REH",
+    "Reece Limited",
+    10222828209,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MP1",
+   "d": [
+    "MP1",
+    "Megaport Ltd.",
+    4804502838,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PLS",
+   "d": [
+    "PLS",
+    "PLS Group Limited",
+    11774706045,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:HUB",
+   "d": [
+    "HUB",
+    "HUB24 Limited",
+    5169375245,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:RGN",
+   "d": [
+    "RGN",
+    "Region Group",
+    2505229359,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:A2M",
+   "d": [
+    "A2M",
+    "a2 Milk Company Limited",
+    4824939785.943693,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MGR",
+   "d": [
+    "MGR",
+    "Mirvac Group",
+    6945583548,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MSB",
+   "d": [
+    "MSB",
+    "Mesoblast Limited",
+    2687003691,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:RHC",
+   "d": [
+    "RHC",
+    "Ramsay Health Care Limited",
+    12515680086,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NXT",
+   "d": [
+    "NXT",
+    "Nextdc Limited",
+    8052043405,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:APE",
+   "d": [
+    "APE",
+    "Eagers Automotive Limited",
+    5064116028,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ARF",
+   "d": [
+    "ARF",
+    "Arena REIT",
+    829632206,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ALX",
+   "d": [
+    "ALX",
+    "Atlas Arteria",
+    5465135660,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TWE",
+   "d": [
+    "TWE",
+    "Treasury Wine Estates Limited",
+    4360171701,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:COH",
+   "d": [
+    "COH",
+    "Cochlear Limited",
+    8524094752.000001,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:KCN",
+   "d": [
+    "KCN",
+    "Kingsgate Consolidated Limited",
+    1292083608,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MTS",
+   "d": [
+    "MTS",
+    "Metcash Limited",
+    3145216719,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ELD",
+   "d": [
+    "ELD",
+    "Elders Limited",
+    1363474508,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:AIA",
+   "d": [
+    "AIA",
+    "Auckland International Airport Limited",
+    11579853673.547405,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:XYZ",
+   "d": [
+    "XYZ",
+    "Block, Inc. Shs Chess Depository Interests Repr 1 Sh",
+    64223335511.02321,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TUA",
+   "d": [
+    "TUA",
+    "Tuas Ltd.",
+    918563574,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TLX",
+   "d": [
+    "TLX",
+    "Telix Pharmaceuticals Limited",
+    5305745894,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NIC",
+   "d": [
+    "NIC",
+    "Nickel Industries Limited",
+    3278161686,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TAH",
+   "d": [
+    "TAH",
+    "Tabcorp Holdings Limited",
+    2019080282,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PDN",
+   "d": [
+    "PDN",
+    "Paladin Energy Ltd",
+    4089161597,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BSL",
+   "d": [
+    "BSL",
+    "Bluescope Steel Limited",
+    13158339974,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PNR",
+   "d": [
+    "PNR",
+    "Pantoro Gold Limited",
+    1149694818,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ABB",
+   "d": [
+    "ABB",
+    "Aussie Broadband Ltd.",
+    1280734128,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:EVN",
+   "d": [
+    "EVN",
+    "Evolution Mining Limited",
+    26742692129,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MI6",
+   "d": [
+    "MI6",
+    "Minerals 260 Limited",
+    2103933713.9999998,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:GMD",
+   "d": [
+    "GMD",
+    "Genesis Minerals Limited",
+    8295447362.000001,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:XRO",
+   "d": [
+    "XRO",
+    "Xero Limited",
+    9437094284,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:JDO",
+   "d": [
+    "JDO",
+    "Judo Capital Holdings Limited",
+    1004506484,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PXA",
+   "d": [
+    "PXA",
+    "PEXA Group Limited",
+    1143585320,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:GNC",
+   "d": [
+    "GNC",
+    "Graincorp Limited Class A",
+    1475127220,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CHC",
+   "d": [
+    "CHC",
+    "Charter Hall Group",
+    8632198761,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ASB",
+   "d": [
+    "ASB",
+    "Austal Limited",
+    1811938550,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PNI",
+   "d": [
+    "PNI",
+    "Pinnacle Investment Management Group Limited",
+    3014468579,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:FFM",
+   "d": [
+    "FFM",
+    "FireFly Metals Ltd",
+    1418090012,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:AMP",
+   "d": [
+    "AMP",
+    "AMP Limited",
+    6072254339,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CNU",
+   "d": [
+    "CNU",
+    "Chorus Limited",
+    2931613587.792674,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SGM",
+   "d": [
+    "SGM",
+    "Sims Ltd.",
+    4568729708,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BPT",
+   "d": [
+    "BPT",
+    "Beach Energy Limited",
+    1879646256,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WDS",
+   "d": [
+    "WDS",
+    "Woodside Energy Group Ltd",
+    58661624683,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ELV",
+   "d": [
+    "ELV",
+    "Elevra Lithium Limited",
+    1009834167,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CAR",
+   "d": [
+    "CAR",
+    "CAR Group Limited",
+    8339546875,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SDF",
+   "d": [
+    "SDF",
+    "Steadfast Group Limited",
+    6382608300,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:FBU",
+   "d": [
+    "FBU",
+    "Fletcher Building Limited",
+    3074104774.5771623,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DOW",
+   "d": [
+    "DOW",
+    "Downer EDI Limited",
+    4378566209,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:EOS",
+   "d": [
+    "EOS",
+    "Electro Optic Systems Holdings Limited",
+    2487498336,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ORI",
+   "d": [
+    "ORI",
+    "Orica Limited",
+    10610488492,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:HLI",
+   "d": [
+    "HLI",
+    "Helia Group Limited",
+    1345886041,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:STO",
+   "d": [
+    "STO",
+    "Santos Limited",
+    27185872721,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:AAI",
+   "d": [
+    "AAI",
+    "Alcoa Corporation shs Chess Depository Interests Repr 1 Sh",
+    16025916765.08381,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DYL",
+   "d": [
+    "DYL",
+    "Deep Yellow Limited",
+    1100897047,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TLC",
+   "d": [
+    "TLC",
+    "Lottery Corporation Limited",
+    10839508063,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SHL",
+   "d": [
+    "SHL",
+    "Sonic Healthcare Limited",
+    9197679871,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:FPH",
+   "d": [
+    "FPH",
+    "Fisher & Paykel Healthcare Corporation Limited",
+    22110183009.168617,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:FMG",
+   "d": [
+    "FMG",
+    "Fortescue Ltd",
+    50006197205,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:JHX",
+   "d": [
+    "JHX",
+    "James Hardie Industries PLC Chess Units of Foreign Securities",
+    21121187353.998528,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:RSG",
+   "d": [
+    "RSG",
+    "Resolute Mining Limited",
+    2415281743,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ARB",
+   "d": [
+    "ARB",
+    "ARB Corporation Limited",
+    1480783479,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:FLT",
+   "d": [
+    "FLT",
+    "Flight Centre Travel Group Limited",
+    2074770728.9999998,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NWH",
+   "d": [
+    "NWH",
+    "NRW Holdings Limited",
+    3705094270,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CDA",
+   "d": [
+    "CDA",
+    "Codan Limited",
+    12304911811,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BRG",
+   "d": [
+    "BRG",
+    "Breville Group Limited",
+    4317823725,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ALD",
+   "d": [
+    "ALD",
+    "Ampol Limited",
+    10368523688,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:QBE",
+   "d": [
+    "QBE",
+    "QBE Insurance Group Limited",
+    34138461220.999996,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:LNW",
+   "d": [
+    "LNW",
+    "Light & Wonder, Inc. Shs Chess Depository Interests Repr 1 Sh",
+    8226540591.000001,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:IPX",
+   "d": [
+    "IPX",
+    "Iperionx Ltd.",
+    836774709,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NST",
+   "d": [
+    "NST",
+    "Northern Star Resources Ltd",
+    33818440247,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:AZJ",
+   "d": [
+    "AZJ",
+    "Aurizon Holdings Ltd.",
+    6159412893,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NWL",
+   "d": [
+    "NWL",
+    "Netwealth Group Ltd.",
+    4097820683,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SGH",
+   "d": [
+    "SGH",
+    "SGH Limited",
+    14983375377,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:HVN",
+   "d": [
+    "HVN",
+    "Harvey Norman Holdings Ltd",
+    5245687799,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:360",
+   "d": [
+    "360",
+    "Life360, Inc. Shs Chess Depository Interests Repr 3 Sh",
+    4740855624.21495,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PRN",
+   "d": [
+    "PRN",
+    "Perenti Limited",
+    2062501284.9999998,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TCL",
+   "d": [
+    "TCL",
+    "Transurban Group Ltd.",
+    40598382260,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DXS",
+   "d": [
+    "DXS",
+    "Dexus",
+    5957628053,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CLW",
+   "d": [
+    "CLW",
+    "Charter Hall Long WALE REIT",
+    2333210938,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SOL",
+   "d": [
+    "SOL",
+    "Washington H. Soul Pattinson and Company Limited",
+    17364734907,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DBI",
+   "d": [
+    "DBI",
+    "Dalrymple Bay Infrastructure Ltd.",
+    2612663927,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:EDV",
+   "d": [
+    "EDV",
+    "Endeavour Group Ltd",
+    5333008114,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BHP",
+   "d": [
+    "BHP",
+    "BHP Group Ltd",
+    306330553938,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:IFT",
+   "d": [
+    "IFT",
+    "Infratil Limited",
+    11311760227.981403,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NAB",
+   "d": [
+    "NAB",
+    "National Australia Bank Limited",
+    117795086843,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SEK",
+   "d": [
+    "SEK",
+    "Seek Limited",
+    4230496064,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:GGP",
+   "d": [
+    "GGP",
+    "Greatland Resources Limited",
+    6813286915.57224,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:VAU",
+   "d": [
+    "VAU",
+    "Vault Minerals Limited",
+    6083247716,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BXB",
+   "d": [
+    "BXB",
+    "Brambles Limited",
+    25144871796,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:IGO",
+   "d": [
+    "IGO",
+    "IGO Limited",
+    4799840284,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ORG",
+   "d": [
+    "ORG",
+    "Origin Energy Limited",
+    18591876204,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DNL",
+   "d": [
+    "DNL",
+    "Dyno Nobel Limited",
+    6987882036,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SGP",
+   "d": [
+    "SGP",
+    "Stockland",
+    10076726074,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:AUB",
+   "d": [
+    "AUB",
+    "AUB Group Limited",
+    3425394297,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:APA",
+   "d": [
+    "APA",
+    "APA Group",
+    14114505262,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MND",
+   "d": [
+    "MND",
+    "Monadelphous Group Limited",
+    3112160119,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:MQG",
+   "d": [
+    "MQG",
+    "Macquarie Group, Ltd.",
+    90473124956,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:IRE",
+   "d": [
+    "IRE",
+    "IRESS Limited",
+    987056832,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:IMD",
+   "d": [
+    "IMD",
+    "Imdex Ltd",
+    1680513770,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SUN",
+   "d": [
+    "SUN",
+    "Suncorp Group Limited",
+    19610950745,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:VEA",
+   "d": [
+    "VEA",
+    "Viva Energy Group Ltd.",
+    5182668298,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CQR",
+   "d": [
+    "CQR",
+    "Charter Hall Retail REIT",
+    2022679069,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:GQG",
+   "d": [
+    "GQG",
+    "GQG Partners, Inc. Shs Chess Depository Interests Repr 1 Sh",
+    3327751224,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CIP",
+   "d": [
+    "CIP",
+    "Centuria Industrial REIT",
+    1729554919,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:AGL",
+   "d": [
+    "AGL",
+    "AGL Energy Limited",
+    5429070130,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WTC",
+   "d": [
+    "WTC",
+    "Wisetech Global Ltd.",
+    10450214401,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PRU",
+   "d": [
+    "PRU",
+    "Perseus Mining Limited",
+    8520184137,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TNE",
+   "d": [
+    "TNE",
+    "Technology One Limited",
+    9563754463,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NEU",
+   "d": [
+    "NEU",
+    "Neuren Pharmaceuticals Limited",
+    2553227863,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BGL",
+   "d": [
+    "BGL",
+    "Bellevue Gold Limited",
+    2341146452,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NHF",
+   "d": [
+    "NHF",
+    "NIB Holdings Ltd",
+    3112795397,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PME",
+   "d": [
+    "PME",
+    "Pro Medicus, Ltd.",
+    16829065969,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WBC",
+   "d": [
+    "WBC",
+    "Westpac Banking Corporation",
+    115800369226,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NHC",
+   "d": [
+    "NHC",
+    "New Hope Corporation Limited",
+    4826382193,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WHC",
+   "d": [
+    "WHC",
+    "Whitehaven Coal Limited",
+    5999209152,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:LLC",
+   "d": [
+    "LLC",
+    "Lendlease Group",
+    1864287422,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WOR",
+   "d": [
+    "WOR",
+    "Worley Limited",
+    4613379324,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ALK",
+   "d": [
+    "ALK",
+    "Alkane Resources Ltd",
+    2534309993,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:RMS",
+   "d": [
+    "RMS",
+    "Ramelius Resources Limited",
+    7247115307,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:4DX",
+   "d": [
+    "4DX",
+    "4DMedical Ltd.",
+    2622937121,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:BEN",
+   "d": [
+    "BEN",
+    "Bendigo & Adelaide Bank Ltd.",
+    5832765676,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:YAL",
+   "d": [
+    "YAL",
+    "Yancoal Australia Ltd.",
+    7394460128,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:GMG",
+   "d": [
+    "GMG",
+    "Goodman Group",
+    54635926156,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NWS",
+   "d": [
+    "NWS",
+    "News Corporation Shs B Chess Depository Interests repr 1 Sh",
+    23077158095.953106,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CWY",
+   "d": [
+    "CWY",
+    "Cleanaway Waste Management Ltd.",
+    5784081421,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DRO",
+   "d": [
+    "DRO",
+    "DroneShield Limited",
+    1586957543,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:EVT",
+   "d": [
+    "EVT",
+    "EVT Limited",
+    2272720959,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:VNT",
+   "d": [
+    "VNT",
+    "Ventia Services Group Limited",
+    4958907164,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:WPR",
+   "d": [
+    "WPR",
+    "Waypoint REIT Ltd.",
+    1391046731,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CPU",
+   "d": [
+    "CPU",
+    "Computershare Limited",
+    23071860466,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:LYC",
+   "d": [
+    "LYC",
+    "Lynas Rare Earths Limited",
+    12722192748,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CMM",
+   "d": [
+    "CMM",
+    "Capricorn Metals Ltd",
+    6628577560,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:NCK",
+   "d": [
+    "NCK",
+    "Nick Scali Limited",
+    1178612927,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SIG",
+   "d": [
+    "SIG",
+    "Sigma Healthcare Ltd",
+    29512689604,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ALQ",
+   "d": [
+    "ALQ",
+    "ALS Ltd.",
+    10506131628,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ZIP",
+   "d": [
+    "ZIP",
+    "Zip Co Ltd.",
+    2485613903,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:INA",
+   "d": [
+    "INA",
+    "Ingenia Communities Group",
+    1907489549,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:JBH",
+   "d": [
+    "JBH",
+    "JB Hi-Fi Limited",
+    7663218564,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:PPT",
+   "d": [
+    "PPT",
+    "Perpetual Limited",
+    1936731450,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:DMP",
+   "d": [
+    "DMP",
+    "Domino's Pizza Enterprises Limited",
+    1892094815,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:TPG",
+   "d": [
+    "TPG",
+    "TPG Telecom Limited",
+    7479141974,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:ASX",
+   "d": [
+    "ASX",
+    "ASX Limited",
+    11456572470,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:CYL",
+   "d": [
+    "CYL",
+    "Catalyst Metals Limited",
+    1529280464,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:RIO",
+   "d": [
+    "RIO",
+    "Rio Tinto Limited",
+    226969908050,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SCG",
+   "d": [
+    "SCG",
+    "Scentre Group",
+    17811191371,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "S&P/ASX 50",
+      "proname": "ASX:XFL"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:SLC",
+   "d": [
+    "SLC",
+    "Superloop Ltd.",
+    1298299253,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:LTR",
+   "d": [
+    "LTR",
+    "Liontown Limited",
+    2521665025,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     },
+     {
+      "name": "STOXX Global 1800",
+      "proname": "STOXX:SXW1E"
+     }
+    ]
+   ]
+  },
+  {
+   "s": "ASX:AMC",
+   "d": [
+    "AMC",
+    "Amcor PLC Shs Chess Depository Interests",
+    27909090289.18759,
+    [
+     {
+      "name": "S&P/ASX 200",
+      "proname": "ASX:XJO"
+     }
+    ]
+   ]
+  }
+ ]
+}

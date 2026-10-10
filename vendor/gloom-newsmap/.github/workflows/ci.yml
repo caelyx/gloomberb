@@ -10,8 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Pinned, so a host change breaks the build deliberately rather than on
-      # somebody else's merge.
-      GLOOMBERB_REVISION: main
+      # somebody else's merge. v0.15.5; DetailScrollBody needs 0.15.3 or later.
+      GLOOMBERB_REVISION: 3a6550d09207a505f7d48e815965c30ac9658f11
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2

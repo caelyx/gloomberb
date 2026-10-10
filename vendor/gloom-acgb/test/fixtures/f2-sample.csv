@@ -1,0 +1,52 @@
+﻿F2 CAPITAL MARKET YIELDS – GOVERNMENT BONDS
+Title,Australian Government 2 year bond,Australian Government 3 year bond,Australian Government 5 year bond,Australian Government 10 year bond,Australian Government Indexed Bond
+Description,"Yields on Australian government bonds, interpolated, 2 years maturity","Yields on Australian government bonds, interpolated, 3 years maturity","Yields on Australian government bonds, interpolated, 5 years maturity","Yields on Australian government bonds, interpolated, 10 years maturity","Yields on Australian government indexed bonds, interpolated, 10 years maturity"
+Frequency,Daily,Daily,Daily,Daily,Daily
+Type,Original,Original,Original,Original,Original
+Units,Per cent per annum,Per cent per annum,Per cent per annum,Per cent per annum,Per cent per annum
+
+
+Source,RBA,RBA,RBA,RBA,RBA
+Publication date,25-Sep-2026,25-Sep-2026,25-Sep-2026,25-Sep-2026,25-Sep-2026
+Series ID,FCMYGBAG2D,FCMYGBAG3D,FCMYGBAG5D,FCMYGBAG10D,FCMYGBAGID
+20-May-2013,,,,3.229
+30-Jul-2026,4.559,4.545,4.618,5.011,2.672
+31-Jul-2026,4.509,4.491,4.559,4.943,2.620
+03-Aug-2026,4.517,4.504,4.576,4.964,2.633
+04-Aug-2026,4.542,4.526,4.598,4.988,2.662
+05-Aug-2026,4.488,4.468,4.535,4.924,2.626
+06-Aug-2026,4.504,4.483,4.550,4.939,2.663
+07-Aug-2026,4.551,4.535,4.604,4.999,2.708
+10-Aug-2026,4.556,4.540,4.605,4.984,2.689
+11-Aug-2026,4.581,4.564,4.634,5.024,2.706
+12-Aug-2026,4.568,4.549,4.620,5.013,2.710
+13-Aug-2026,4.529,4.505,4.579,4.980,2.674
+14-Aug-2026,4.543,4.520,4.593,4.995,2.692
+17-Aug-2026,4.564,4.545,4.623,5.031,2.720
+18-Aug-2026,4.608,4.589,4.670,5.087,2.769
+19-Aug-2026,4.584,4.565,4.642,5.047,2.726
+20-Aug-2026,4.545,4.526,4.600,4.997,2.666
+21-Aug-2026,4.583,4.565,4.642,5.048,2.698
+24-Aug-2026,4.549,4.531,4.607,5.008,2.680
+25-Aug-2026,4.567,4.550,4.622,5.013,2.676
+26-Aug-2026,4.618,4.598,4.656,5.023,2.674
+27-Aug-2026,4.684,4.664,4.723,5.083,2.731
+28-Aug-2026,4.673,4.653,4.716,5.088,2.749
+31-Aug-2026,4.677,4.659,4.718,5.084,2.756
+01-Sep-2026,4.734,4.718,4.784,5.169,2.826
+02-Sep-2026,4.831,4.819,4.871,5.220,2.863
+03-Sep-2026,4.771,4.756,4.810,5.170,2.809
+04-Sep-2026,4.761,4.745,4.803,5.165,2.793
+07-Sep-2026,4.795,4.779,4.834,5.191,2.816
+08-Sep-2026,4.796,4.780,4.831,5.182,2.809
+09-Sep-2026,4.835,4.821,4.866,5.202,2.820
+10-Sep-2026,4.863,4.849,4.899,5.242,2.850
+11-Sep-2026,5.006,5.002,5.046,5.362,2.932
+14-Sep-2026,4.965,4.958,5.007,5.332,2.947
+15-Sep-2026,5.055,5.049,5.098,5.411,3.008
+16-Sep-2026,5.000,4.990,5.041,5.348,2.952
+17-Sep-2026,4.971,4.963,5.009,5.299,2.930
+18-Sep-2026,4.947,4.933,4.972,5.260,2.884
+21-Sep-2026,4.981,4.970,5.004,5.277,2.876
+22-Sep-2026,5.003,4.989,5.022,5.293,2.884
+23-Sep-2026,4.947,4.934,4.965,5.245,2.862

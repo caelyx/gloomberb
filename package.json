@@ -98,14 +98,16 @@
     "finance"
   ],
   "devDependencies": {
+    "@mozilla/readability": "0.6.0",
     "@types/bun": "^1.3.14",
     "@types/react-dom": "^19.2.3",
     "@types/three": "0.165.0",
     "electrobun": "^1.18.1",
-    "gloom-hackernews": "github:gloom-sh/gloom-hackernews#6447013f526daedf73699334958672645024dc8c",
     "gloom-polls": "github:gloom-sh/gloom-polls",
     "gloom-prediction-markets": "github:gloom-sh/gloom-prediction-markets",
     "happy-dom": "^20.11.1",
+    "linkedom": "0.18.13",
+    "papaparse": "5.7.0",
     "png-to-ico": "^2.1.8",
     "rcedit": "^4.0.1",
     "typescript": "^5.9.2",
