@@ -2,15 +2,19 @@ import type { ElectrobunConfig } from "electrobun/bun";
 import pkg from "./package.json";
 import { DESKTOP_APP_IDENTIFIER, DESKTOP_APP_NAME } from "./src/renderers/electrobun/shared/app-name";
 
-const RELEASE_BASE_URL = "https://github.com/gloom-sh/gloomberb/releases/latest/download";
+// GLOOMBERB_DESKTOP_LOCAL=1 builds an unsigned app with no update feed or DMG,
+// for a Mac without Gloom's Apple signing secrets. With the feed left on, the app
+// would offer upstream's next release and replace this build with it.
+const LOCAL_BUILD = process.env.GLOOMBERB_DESKTOP_LOCAL === "1";
+const RELEASE_BASE_URL = LOCAL_BUILD ? "" : "https://github.com/gloom-sh/gloomberb/releases/latest/download";
 /** Patches from the previous release ship for macOS only: no release carries a Linux app, and Windows takes the whole archive. */
-const GENERATE_RELEASE_PATCH = process.platform === "darwin";
+const GENERATE_RELEASE_PATCH = !LOCAL_BUILD && process.platform === "darwin";
 /**
  * A macOS build for a check rather than for users, which has nothing to sign
  * with: neither signed nor notarized. A release signs, and its checks fail on
  * a disk image that is not.
  */
-const MAC_UNSIGNED = process.env.GLOOM_DESKTOP_UNSIGNED === "1";
+const MAC_UNSIGNED = LOCAL_BUILD || process.env.GLOOM_DESKTOP_UNSIGNED === "1";
 /**
  * Windows on x64 draws the app with the Chromium it ships. Windows on Arm
  * draws it with the system's WebView2 (window/create.ts), so an Arm build
@@ -71,7 +75,7 @@ const config: ElectrobunConfig = {
     ],
     mac: {
       codesign: !MAC_UNSIGNED,
-      createDmg: true,
+      createDmg: !LOCAL_BUILD,
       notarize: !MAC_UNSIGNED,
       icons: "icon.iconset",
       defaultRenderer: "native",
