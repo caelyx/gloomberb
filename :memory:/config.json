@@ -1,0 +1,80 @@
+{
+  "dataDir": ":memory:",
+  "configVersion": 25,
+  "baseCurrency": "USD",
+  "refreshIntervalMinutes": 30,
+  "portfolios": [
+    {
+      "id": "main",
+      "name": "Main Portfolio",
+      "currency": "USD"
+    }
+  ],
+  "watchlists": [
+    {
+      "id": "watchlist",
+      "name": "Watchlist"
+    }
+  ],
+  "layout": {
+    "dockRoot": {
+      "kind": "pane",
+      "instanceId": "members"
+    },
+    "instances": [
+      {
+        "instanceId": "members",
+        "paneId": "members",
+        "title": "S&P 500, IVV holdings",
+        "binding": {
+          "kind": "fixed",
+          "symbol": "IVV"
+        }
+      }
+    ],
+    "floating": [],
+    "detached": []
+  },
+  "layouts": [
+    {
+      "name": "Default",
+      "layout": {
+        "dockRoot": {
+          "kind": "pane",
+          "instanceId": "members"
+        },
+        "instances": [
+          {
+            "instanceId": "members",
+            "paneId": "members",
+            "title": "S&P 500, IVV holdings",
+            "binding": {
+              "kind": "fixed",
+              "symbol": "IVV"
+            }
+          }
+        ],
+        "floating": [],
+        "detached": []
+      },
+      "paneState": {
+        "members": {}
+      },
+      "focusedPaneId": "members"
+    }
+  ],
+  "activeLayoutIndex": 0,
+  "brokerInstances": [],
+  "disabledPlugins": [],
+  "seededPlugins": [],
+  "disabledSources": [],
+  "pluginConfig": {},
+  "theme": "white",
+  "chartPreferences": {
+    "renderer": "auto"
+  },
+  "valueFlashingEnabled": true,
+  "fontSize": 12,
+  "recentTickers": [],
+  "recentCommands": []
+}
