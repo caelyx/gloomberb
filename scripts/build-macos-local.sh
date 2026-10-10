@@ -44,8 +44,9 @@ codesign --verify --deep --strict "$app"
 "$app/Contents/Resources/gloomberb" help >/dev/null
 
 if $install; then
-  if pgrep -xq Gloomberb; then
-    echo "Quit Gloomberb, then run this again with --install." >&2
+  # Covers the desktop app and the gloomberb terminal command it bundles.
+  if pgrep -qf "/Applications/Gloomberb.app/Contents/"; then
+    echo "Quit Gloomberb (and any gloomberb terminal sessions), then run this again with --install." >&2
     exit 1
   fi
   rm -rf /Applications/Gloomberb.app
