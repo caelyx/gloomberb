@@ -1,6 +1,6 @@
 import type { MarketState } from "../../types/financials";
 import { canonicalExchange, EXCHANGE_TIME_ZONES, isUsListingExchange } from "../../utils/exchanges";
-import { hasPublishedApacCalendar, isPublishedApacClosure } from "../published-apac-sessions";
+import { hasPublishedApacCalendar, isPublishedApacClosure, isPublishedApacEarlyClose } from "../published-apac-sessions";
 import { hasPublishedCnCalendar, isPublishedCnClosure } from "../published-cn-sessions";
 import { hasPublishedJpxCalendar, isPublishedJpxClosure } from "../published-jpx-sessions";
 import { hasPublishedNseCalendar, isPublishedNseClosure } from "../published-nse-sessions";
@@ -95,6 +95,11 @@ const REGULAR_CLOSE_MINUTES: Record<string, number> = {
 // Pesach are not weekly and are not listed.
 const WEEKDAY_CLOSE_MINUTES: Record<string, Partial<Record<number, number>>> = {
   TASE: { 5: 13 * 60 + 50 },
+};
+// Close on a venue's published early-close days, on the rounded-up basis
+// above: ASX's 14:10 closing auction, as 16:10 is to 16:15.
+const EARLY_CLOSE_MINUTES: Record<string, number> = {
+  ASX: 14 * 60 + 15,
 };
 // Venues that pause at midday, as local minutes [start, end), with a zone for
 // those the session tables above do not cover. Jakarta pauses longer on Fridays.
@@ -234,6 +239,8 @@ function localWeekday(date: string): number | null {
 
 /** The local close of the venue's regular session on `date`, in minutes of the day. */
 function regularCloseMinutes(exchange: string, date: string): number | undefined {
+  const early = EARLY_CLOSE_MINUTES[exchange];
+  if (early !== undefined && isPublishedApacEarlyClose(exchange, date)) return early;
   const weekday = localWeekday(date);
   return (weekday == null ? undefined : WEEKDAY_CLOSE_MINUTES[exchange]?.[weekday]) ?? REGULAR_CLOSE_MINUTES[exchange];
 }

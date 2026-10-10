@@ -25,3 +25,12 @@ test("Taiwan's sessions reach back past the Lunar New Year closure, and its unpu
   }
   expect(hasPublishedSessionCalendar("KOSDAQ", "2027-02-23")).toBe(true);
 });
+
+test("ASX's Christmas Eve session closes after the 14:10 auction, on Sydney daylight time", () => {
+  // Thursday 24 December 2026 is AEDT (UTC+11): the close is 14:15 local.
+  const close = latestRegularSessionClose("ASX", Date.parse("2026-12-24T03:20:00Z"));
+  expect(close?.date).toBe("2026-12-24");
+  expect(close?.close).toBe(Date.parse("2026-12-24T03:15:00Z"));
+  expect(latestRegularSessionClose("XASX", Date.parse("2026-12-24T03:00:00Z"))?.date).toBe("2026-12-23");
+  expect(latestRegularSessionClose("ASX", Date.parse("2026-12-23T06:00:00Z"))?.close).toBe(Date.parse("2026-12-23T05:15:00Z"));
+});
