@@ -3,6 +3,7 @@ import { historyStatistics } from "../../../components/chart/curve/model";
 import type { CloudPricePointPayload } from "../../../api-client/types";
 import { getSectorCollection } from "../sectors/sector-data";
 import { rotationQuadrant, rotationSeries, type RotationQuadrantName } from "../alerts/metric-model";
+import { indexHomeExchange, publicListingVenue } from "../../../sources/listing-target";
 import {
   canonicalExchange,
   normalizeSymbol,
@@ -80,9 +81,14 @@ export function rotationInstruments(value: string): RotationInstrument[] {
     const parsed = parsePublicTickerKey(value);
     if (!/^[A-Z0-9.^=-]{1,20}$/.test(parsed.symbol))
       throw new Error(`Invalid rotation symbol: ${value}`);
+    // The venue picks the weekly-close calendar, so a suffix (BHP.AX) or a
+    // known index (^AXJO) names it as an exchange key would.
+    const listing = publicListingVenue(value);
+    if (!listing)
+      throw new Error(`${parsed.symbol} does not trade on ${parsed.exchange}.`);
     return {
-      symbol: parsed.symbol,
-      exchange: canonicalExchange(parsed.exchange ?? ""),
+      symbol: listing.symbol,
+      exchange: listing.exchange || (indexHomeExchange(listing.symbol) ?? ""),
       label: parsed.symbol,
     };
   });

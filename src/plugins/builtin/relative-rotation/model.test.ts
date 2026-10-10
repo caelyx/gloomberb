@@ -121,6 +121,15 @@ test("Cloud boundary rejects intraday masquerading as daily data and invalid cus
   ).toThrow("at most");
 });
 
+test("a listing suffix or a known index names the venue whose calendar dates weekly closes", () => {
+  // Without a venue, an ASX benchmark had no calendar: "outside published coverage".
+  expect(rotationInstruments("^AXJO")[0]).toMatchObject({ symbol: "^AXJO", exchange: "ASX" });
+  expect(rotationInstruments("STW.AX")[0]).toMatchObject({ symbol: "STW", exchange: "ASX", label: "STW.AX" });
+  expect(rotationInstruments("BHP.AX BHP:ASX")).toHaveLength(1);
+  expect(rotationInstruments("^GSPC")[0]?.exchange).toBe("");
+  expect(() => rotationInstruments("BHP.AX:NYSE")).toThrow("BHP.AX does not trade on NYSE.");
+});
+
 test("Cloud currency and listing provenance cannot be overridden by a valid quote", async () => {
   const reference = history("SPY", Array(90).fill(1)),
     asset = history("XLK", Array(90).fill(2));

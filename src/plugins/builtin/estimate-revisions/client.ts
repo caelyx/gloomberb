@@ -12,12 +12,7 @@ import { canonicalExchange, normalizeSymbol, parsePublicTickerKey } from "../../
 import { AmbiguousContractError, AmbiguousTickerError } from "../../../tickers/search";
 import { bareListingExchange } from "../../../tickers/listing-venues";
 import type { DataProvider } from "../../../types/data-provider";
-import {
-  hongKongListingCode,
-  listingSuffixConflictsWithExchange,
-  listingSuffixExchange,
-} from "../../../sources/listing-symbols";
-import { publicListingTarget } from "../../../sources/listing-target";
+import { publicListingVenue } from "../../../sources/listing-target";
 
 export const estimateRevisionsCache =
   createPluginCache<EstimateRevisionsPayload>({
@@ -226,28 +221,6 @@ export function validateEstimates(
     return invalid();
   return data;
 }
-interface EstimateListing {
-  symbol: string;
-  exchange: string;
-}
-
-/**
- * The bare symbol and venue the estimates route takes for a ticker key. A
- * recognised listing suffix names the venue and outranks the saved one
- * (`BHP.AX` is BHP on ASX), and a Hong Kong code goes out with four digits
- * (`700.HK` is 0700 on HKEX). Null when the key names an exchange its suffix
- * rules out (`BHP.AX:NYSE`).
- */
-export function estimateListing(ticker: string, savedExchange: string): EstimateListing | null {
-  const qualified = parsePublicTickerKey(ticker);
-  if (qualified.exchange && listingSuffixConflictsWithExchange(qualified.symbol, qualified.exchange)) return null;
-  const target = publicListingTarget(ticker, savedExchange);
-  const exchange = canonicalExchange(target.exchange);
-  const symbol = exchange && listingSuffixExchange(target.symbol) === exchange
-    ? target.symbol.slice(0, target.symbol.indexOf("."))
-    : target.symbol;
-  return { symbol: exchange ? hongKongListingCode(symbol, exchange) : symbol, exchange };
-}
 
 function notListedOn(ticker: string): Error {
   const { symbol, exchange } = parsePublicTickerKey(ticker);
@@ -283,7 +256,7 @@ export async function fetchEstimates(
   /** Resolves a symbol typed with no exchange; a listing named by the caller never asks it. */
   marketData?: DataProvider,
 ) {
-  const listing = estimateListing(ticker, savedExchange);
+  const listing = publicListingVenue(ticker, savedExchange);
   if (!listing) throw notListedOn(ticker);
   const { symbol } = listing;
   const venue = canonicalExchange(listing.exchange) || (await bareSymbolVenue(symbol, marketData));
@@ -302,7 +275,7 @@ export async function fetchEstimates(
 const key = (symbol: string, exchange: string) =>
   `${canonicalExchange(exchange)}:${normalizeSymbol(symbol)}`;
 export function cachedEstimates(ticker: string, savedExchange: string) {
-  const listing = estimateListing(ticker, savedExchange);
+  const listing = publicListingVenue(ticker, savedExchange);
   if (!listing) return null;
   const { symbol, exchange } = listing;
   return cachedCloudResource(estimateRevisionsCache, key(symbol, exchange), (payload) =>
@@ -310,7 +283,7 @@ export function cachedEstimates(ticker: string, savedExchange: string) {
   );
 }
 export function loadEstimates(ticker: string, savedExchange: string, force = false, marketData?: DataProvider) {
-  const listing = estimateListing(ticker, savedExchange);
+  const listing = publicListingVenue(ticker, savedExchange);
   if (!listing) return Promise.reject(notListedOn(ticker));
   const { symbol, exchange } = listing;
   return loadCloudResource(
