@@ -1,0 +1,182 @@
+{
+ "data": {
+  "datesAvailable": {
+   "quarterly": [],
+   "monthly": [
+    "2026-10-15",
+    "2026-11-19",
+    "2026-12-17",
+    "2027-01-21",
+    "2027-02-18",
+    "2027-03-18",
+    "2027-06-17",
+    "2027-09-16",
+    "2027-12-16",
+    "2028-03-16",
+    "2028-06-15",
+    "2028-09-21",
+    "2028-12-21",
+    "2029-06-21"
+   ],
+   "weekly": [
+    "2026-10-08",
+    "2026-10-22"
+   ]
+  },
+  "datesIncluded": {
+   "quarterly": [],
+   "monthly": [
+    "2026-10-15"
+   ],
+   "weekly": []
+  },
+  "expiryGroups": {
+   "items": [
+    {
+     "date": "2026-10-15",
+     "exerciseGroups": [
+      {
+       "priceExercise": 92,
+       "call": {
+        "chainType": "Call",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 10,
+        "priceAsk": 56.46,
+        "priceBid": 55.36,
+        "priceExercise": 92,
+        "priceLast": 0,
+        "style": "American",
+        "symbol": "CBA7R9",
+        "volume": 10
+       },
+       "put": {
+        "chainType": "Put",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 0,
+        "priceAsk": 0.12,
+        "priceBid": 0,
+        "priceExercise": 92,
+        "priceLast": 0,
+        "style": "American",
+        "symbol": "CBA7W9",
+        "volume": 0
+       }
+      },
+      {
+       "priceExercise": 92.01,
+       "call": {
+        "chainType": "Call",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 300,
+        "priceAsk": 56.45,
+        "priceBid": 55.35,
+        "priceExercise": 92.01,
+        "priceLast": 0,
+        "style": "European",
+        "symbol": "CBA7Y9",
+        "volume": 300
+       },
+       "put": {
+        "chainType": "Put",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 320,
+        "priceAsk": 0.12,
+        "priceBid": 0,
+        "priceExercise": 92.01,
+        "priceLast": 0,
+        "style": "European",
+        "symbol": "CBA827",
+        "volume": 20
+       }
+      },
+      {
+       "priceExercise": 148,
+       "call": {
+        "chainType": "Call",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 46,
+        "priceAsk": 1.93,
+        "priceBid": 1.48,
+        "priceExercise": 148,
+        "priceLast": 0,
+        "style": "American",
+        "symbol": "CBA0A9",
+        "volume": 5
+       },
+       "put": {
+        "chainType": "Put",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 414,
+        "priceAsk": 1.69,
+        "priceBid": 1.24,
+        "priceExercise": 148,
+        "priceLast": 1.47,
+        "style": "American",
+        "symbol": "CBA049",
+        "volume": 200
+       }
+      },
+      {
+       "priceExercise": 150,
+       "call": {
+        "chainType": "Call",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 125,
+        "priceAsk": 0.99,
+        "priceBid": 0.64,
+        "priceExercise": 150,
+        "priceLast": 0.8,
+        "style": "American",
+        "symbol": "CBA039",
+        "volume": 239
+       },
+       "put": {
+        "chainType": "Put",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 1165,
+        "priceAsk": 2.91,
+        "priceBid": 2.31,
+        "priceExercise": 150,
+        "priceLast": 2.6,
+        "style": "American",
+        "symbol": "CBA0E9",
+        "volume": 411
+       }
+      },
+      {
+       "priceExercise": 162,
+       "call": {
+        "chainType": "Call",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 109,
+        "priceAsk": 0.12,
+        "priceBid": 0,
+        "priceExercise": 162,
+        "priceLast": 0.13,
+        "style": "American",
+        "symbol": "CBAAZ7",
+        "volume": 30
+       },
+       "put": {
+        "chainType": "Put",
+        "dateExpiry": "2026-10-15",
+        "openInterest": 157,
+        "priceAsk": 13.365,
+        "priceBid": 12.265,
+        "priceExercise": 162,
+        "priceLast": 4.3500000000000005,
+        "style": "American",
+        "symbol": "CBAA18",
+        "volume": 1
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "underlyingAsset": {
+   "priceLast": 148.12,
+   "symbol": "CBA"
+  }
+ }
+}
