@@ -1,0 +1,16 @@
+{
+  "id": "acgb-curve",
+  "name": "Australian Government Bonds Curve",
+  "tagline": "Australian Government bond yield curve",
+  "description": "Australian Government bond yields by maturity from the Reserve Bank of Australia, with week and month look-backs and the US Treasury curve beside it.",
+  "categories": ["macro"],
+  "targets": ["cli", "tui", "desktop", "web"],
+  "hosts": ["www.rba.gov.au", "home.treasury.gov"],
+  "contributes": {
+    "panes": ["acgb-curve"],
+    "shortcuts": [
+      { "code": "ACGB", "name": "Australian Government Bonds Curve", "description": "Australian Government bond yield curve, optionally against the US Treasury curve." }
+    ]
+  },
+  "minGloom": "0.15.4"
+}
