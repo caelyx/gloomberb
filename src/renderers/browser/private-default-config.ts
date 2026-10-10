@@ -8,8 +8,8 @@ import type { SavedLayout } from "../../types/config";
  * `PRIVATE_DEFAULT_LAYOUT` to null to go back to upstream's research workspace.
  *
  * Every pane here reads public data, so the first visit works signed out of
- * Gloom. Hacker News (`HN`) and ASX announcements (`ASX`) are left to the
- * command bar: ASX follows a ticker, which a first visit does not have yet.
+ * Gloom. Hacker News (`HN`) and the Australian Markets panes (`ASXA`, `ASXM`,
+ * `RBA`, ...) are left to the command bar.
  * The upstream research workspace stays available as the second layout.
  *
  * To change it, edit the panes below. `paneId` is the pane a plugin registers

@@ -27,8 +27,8 @@ export interface CompiledWebPlugin {
   plugin: GloomPlugin;
   /**
    * Hosts the worker must proxy for this plugin: what the module declares plus
-   * what its `gloom.json` manifest declares. Some plugins (Hacker News at the
-   * pinned commit) list hosts only in the manifest.
+   * what its `gloom.json` manifest declares. Some plugins list hosts only in
+   * the manifest.
    */
   hosts: string[];
   /** Emitted module, relative to the directory it was compiled into. */

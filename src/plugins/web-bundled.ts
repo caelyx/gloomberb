@@ -15,10 +15,11 @@
 export const WEB_BUNDLED_PLUGIN_PACKAGES = [
   "gloom-polls",
   "gloom-prediction-markets",
-  // Private deployment additions (downstream). Pinned by commit in package.json.
-  "gloom-hackernews",
+  // Private deployment additions (downstream), vendored under vendor/ by
+  // scripts/vendor-plugin.sh rather than installed.
+  "gloom-au",
   "gloom-newsmap",
-  "gloom-asx",
+  "gloom-hackernews",
 ] as const;
 
 /**

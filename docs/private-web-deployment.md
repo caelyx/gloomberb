@@ -43,7 +43,7 @@ anonymous state without closing the workspace.
 
 | # | Change | Files |
 |---|---|---|
-| 1 | Three more web-bundled plugins: Hacker News pinned by commit, Newsmap and ASX vendored | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated), `vendor/`, `scripts/vendor-plugin.sh`, `bunfig.toml` |
+| 1 | Three more web-bundled plugins, vendored: Australian Markets (gloom-au), Newsmap and Hacker News | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated), `vendor/`, `scripts/vendor-plugin.sh`, `bunfig.toml` |
 | 1a | The web build also reads each plugin's `gloom.json` (hosts; id and `web` target must agree), and compiles `vendor/<name>` when present | `scripts/web-plugins.ts`, `scripts/build-web.ts`, `scripts/generate-web-proxy-hosts.ts` |
 | 2 | Gloom session restore reports unexpected errors instead of swallowing them (it was already non-blocking) | `src/renderers/browser/cloud-transport.ts`, `src/renderers/browser/main.tsx` |
 | 3 | Plugin proxy policy switch and credential stripping; Access credentials stripped from `/api/*` | `src/renderers/cloudflare/http-proxy.ts`, `src/renderers/cloudflare/worker.ts` |
@@ -96,9 +96,21 @@ envelope.
 |---|---|---|---|---|
 | gloom-polls | `github:gloom-sh/gloom-polls` | `90a780e` (bun.lock) | polls | api.votehub.com |
 | gloom-prediction-markets | `github:gloom-sh/gloom-prediction-markets` | `1d8036f` (bun.lock) | prediction-markets | gamma-api / clob / data-api.polymarket.com, api.elections.kalshi.com |
-| **gloom-hackernews** | `github:gloom-sh/gloom-hackernews` | `6447013f526daedf73699334958672645024dc8c` | hackernews | hacker-news.firebaseio.com (declared in its gloom.json only) |
-| **gloom-newsmap** | `vendor/gloom-newsmap` (from private `caelyx/gloom-newsmap`) | `f27e6950f6bfb1070ea25a0d4f8ce2ffda34aa2f` | newsmap | news.google.com |
-| **gloom-asx** | `vendor/gloom-asx` (from private `caelyx/gloom-asx`) | `bd13e937028224dba64cb0424549b5eb5415f953` | asx-announcements | asx.api.markitdigital.com, cdn-api.markitdigital.com |
+| **gloom-au** | `vendor/gloom-au` (from private `caelyx/gloom-au`) | `be062e4ed44a2b2c3139de9a499dca90d5cdff6a` | au-markets | www.asx.com.au, asx.api.markitdigital.com, cdn-api.markitdigital.com, download.asic.gov.au, www.asic.gov.au, www.rba.gov.au, data.api.abs.gov.au, www.abs.gov.au, www.abc.net.au, api.tenders.gov.au, cdn.cboe.com, visualisations.aemo.com.au, takeovers.gov.au, www.tga.gov.au, scanner.tradingview.com, api.openelectricity.org.au |
+| **gloom-newsmap** | `vendor/gloom-newsmap` (from private `caelyx/gloom-newsmap`) | `de8117446f185dbf3d73ed9bb51c3f410befebc5` | newsmap | news.google.com, generativelanguage.googleapis.com |
+| **gloom-hackernews** | `vendor/gloom-hackernews` (from public `caelyx/gloom-hackernews`, a fork of `gloom-sh/gloom-hackernews`) | `aeb2ceae33dfd6662676c485f9d705ff38400ef9` | hackernews | hacker-news.firebaseio.com, generativelanguage.googleapis.com |
+
+gloom-au replaces the earlier gloom-asx plugin: it carries ASX announcements
+(`ASXA`, with `ASX` as an alias). `caelyx/gloom-abcnews` is not bundled: it
+declares only the `cli`, `tui` and `desktop` targets, and the build refuses a
+plugin without `web`.
+
+Newsmap and Hacker News read linked articles in place. On the web those
+requests go through `/http-proxy`, which only reaches the hosts above, so an
+article on any other site shows the plugin's fetch error there; the allowlist
+is deliberately not widened to arbitrary hosts. Gemini summaries
+(generativelanguage.googleapis.com) need the viewer's own API key in the
+plugin's settings.
 
 Fear & Greed, IPO Calendar and Market Halts are built-in plugins upstream, not
 bundled packages. The other hosts in the generated allowlist come from
@@ -119,24 +131,28 @@ bundle, cannot be evaluated, exports no valid plugin, does not declare `web` in
 its module or in `gloom.json`, has a `gloom.json` whose id differs from the
 module's, or declares a host that is not a bare domain.
 
-### Vendored private plugins
+### Vendored plugins
 
-`gloom-newsmap` and `gloom-asx` live in private repositories, which Bun cannot
+`gloom-au` and `gloom-newsmap` live in private repositories, which Bun cannot
 install from in CI (it downloads `github:` dependencies without credentials).
+`gloom-hackernews` is public but vendored the same way, so all three of this
+fork's plugins update with one script.
 Their code is copied into this repository under `vendor/` instead, with
 `git subtree --squash`, by `scripts/vendor-plugin.sh`. The plugin repositories
 stay private; only the files copied here are public.
 
-- The script leaves out `CLAUDE.md`, `AGENTS.md`, `.claude` and `docs/research`
+- The script leaves out `CLAUDE.md`, `AGENTS.md`, `.claude`, `docs/research`,
+  and gloom-au's working notes `STATUS.md` and `docs/australian-data-parity.md`
   (the list is `EXCLUDED_PATHS` at the top of the script). The plugins' own
   history never enters this repository: the import is a squashed, filtered
   snapshot.
 - They are not package dependencies. `scripts/web-plugins.ts` compiles
   `vendor/<name>` directly when it exists, because installing a folder
-  dependency makes Bun install its devDependencies too (for gloom-asx, that
-  includes the published `gloomberb` package). A vendored plugin's runtime
-  dependencies are devDependencies of this repository instead: `unpdf` (for
-  gloom-asx). A missing one fails the web build.
+  dependency makes Bun install its devDependencies too. A vendored plugin's
+  runtime dependencies are devDependencies of this repository instead, pinned
+  to the versions the plugin's own `bun.lock` resolves: `unpdf` (gloom-au),
+  `@mozilla/readability` and `linkedom` (gloom-newsmap, gloom-hackernews). A
+  missing one fails the web build.
 - `bunfig.toml` keeps `vendor/**` out of `bun test`; the plugins' tests run in
   their own repositories. The typecheck projects list their files explicitly and
   do not include `vendor/`.
@@ -146,18 +162,18 @@ stay private; only the files copied here are public.
 To update one (needs read access to the private repository, and a clean tree):
 
 ```sh
-scripts/vendor-plugin.sh gloom-asx https://github.com/caelyx/gloom-asx.git <commit-or-branch>
+scripts/vendor-plugin.sh gloom-au https://github.com/caelyx/gloom-au.git <commit-or-branch>
 scripts/vendor-plugin.sh gloom-newsmap https://github.com/caelyx/gloom-newsmap.git <commit-or-branch>
+scripts/vendor-plugin.sh gloom-hackernews https://github.com/caelyx/gloom-hackernews.git <commit-or-branch>
 ```
 
 Each run adds a merge commit whose message records the source commit
 (`vendor-plugin-source: <sha>`). Then: if the plugin's `package.json`
 `dependencies` changed, mirror them in this repository's devDependencies and
 `bun install`; `bun run web:proxy-hosts` if its hosts changed; and the checks
-below. Note that gloom-asx's test fixtures include two ASX responses that are
-byte-identical to files in its excluded `docs/research/samples/`.
+below.
 
-### ASX PDF extracts on the web
+### ASX PDF extracts on the web (gloom-au)
 
 The proxy envelope carries response bodies as text (`response.text()`), which
 corrupts binary PDFs. Real ASX PDFs are binary (compressed streams), so on the
@@ -176,8 +192,8 @@ only when the browser has no saved config (`gloomberb.web.config.v1` in
 `localStorage`); a saved config is always loaded as is and never rewritten. A
 research deep link (`/?ticker=…`) still opens on upstream's Research layout, with
 Markets next. Set `PRIVATE_DEFAULT_LAYOUT = null` to go back to upstream's
-first-visit workspace. Hacker News (`HN`) and ASX (`ASX <ticker>`, or the ASX tab
-of an `.AX` ticker) open from the command bar.
+first-visit workspace. Hacker News (`HN`), the Australian Markets panes (`ASXA`
+or `ASX`, `ASXM`, `RBA`, `NEM` and the rest) open from the command bar.
 
 ## Build and test locally
 
@@ -270,7 +286,12 @@ The fork's `main` mirrors upstream `gloom-sh/gloomberb` `main` and carries no
 downstream changes; everything in this document lives on the long-lived
 `feature/private-deployment` branch. To sync: bring `main` up to upstream (a
 fast-forward, or GitHub's "Sync fork"), then merge `main` into
-`feature/private-deployment`. Never commit downstream changes to `main`.
+`feature/private-deployment`. Never commit downstream changes to `main`, with
+one exception: `.github/workflows/deploy-private.yml` is also on `main`, because
+GitHub only offers Run workflow for a `workflow_dispatch` workflow on the
+default branch. Keep the two copies identical (edit it here, then copy it to
+`main`) so merging `main` into this branch never conflicts; the copy on the
+branch you pick is the one that runs.
 
 Files most likely to conflict on a merge from upstream, in order of risk:
 
@@ -287,7 +308,7 @@ Files most likely to conflict on a merge from upstream, in order of risk:
 6. `scripts/web-plugins.ts`, `build-web.ts`, `generate-web-proxy-hosts.ts` - the
    `hosts` field on compiled plugins and the `vendor/` lookup.
 7. `src/plugins/web-bundled.ts` - three list entries.
-8. `knip.jsonc` - two `ignoreDependencies` entries.
+8. `knip.jsonc` - the downstream `ignoreDependencies` entries.
 
 `vendor/`, `scripts/vendor-plugin.sh` and `bunfig.toml` are downstream-only and
 do not conflict.
