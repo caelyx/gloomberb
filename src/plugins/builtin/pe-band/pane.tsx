@@ -34,7 +34,7 @@ function tableColumns(conversion: PeBandModel["conversion"]): DataTableColumn[] 
     { id: "period", label: "Period", width: 13, align: "left" },
     { id: "known", label: "Known", width: 11, align: "left" },
     { id: "eps", label: conversion ? `EPS ${conversion.currency}` : "EPS", width: 9, align: "right" },
-    ...(conversion ? [{ id: "fx", label: fxPairQuote(conversion.currency, conversion.latest.rate).pair, width: 9, align: "right" as const }] : []),
+    ...(conversion ? [{ id: "fx", label: fxPairQuote(conversion.latest.from, conversion.latest.to, conversion.latest.rate).pair, width: 9, align: "right" as const }] : []),
     { id: "yoy", label: "YoY", width: 8, align: "right" },
     { id: "price", label: "Price", width: 10, align: "right" },
     { id: "pe", label: "P/E", width: 7, align: "right" },
@@ -54,7 +54,7 @@ function renderCell(row: PeBandRow, column: DataTableColumn, colors: ReturnType<
     case "yoy": return { text: pct(row.yoy), value: row.yoy == null ? null : row.yoy * 100,
       color: row.yoy == null || Math.abs(row.yoy) < 0.0005 ? undefined : row.yoy > 0 ? colors.positive : colors.negative };
     case "fx": {
-      const quote = row.fx && row.currency ? fxPairQuote(row.currency, row.fx.rate).value : null;
+      const quote = row.fx ? fxPairQuote(row.fx.from, row.fx.to, row.fx.rate).value : null;
       return { text: quote == null ? "--" : quote.toPrecision(5), value: quote };
     }
     case "price": return { text: row.price == null ? "--" : formatPerShare(row.price), value: row.price };
@@ -107,7 +107,7 @@ export function PeBandPane({ width, height, focused }: PaneProps) {
     : null, [inputs.data, lookbackYears, symbol]);
   const rows = model?.rows ?? [];
   const conversion = model?.conversion ?? null;
-  const columns = useMemo(() => tableColumns(conversion), [conversion?.currency, conversion?.latest.rate]);
+  const columns = useMemo(() => tableColumns(conversion), [conversion?.currency, conversion?.latest.to, conversion?.latest.rate]);
   const series = useMemo(() => model && !model.error ? chartSeries(model, colors) : [], [model, colors]);
   const currency = model?.currency ?? undefined;
   const firstWeek = model?.weeks[0]?.date;
@@ -140,7 +140,7 @@ export function PeBandPane({ width, height, focused }: PaneProps) {
     const { current, range } = model;
     const step = current.step;
     // Converted EPS says what it was converted from, and at which close.
-    const pair = conversion ? fxPairQuote(conversion.currency, conversion.latest.rate) : null;
+    const pair = conversion ? fxPairQuote(conversion.latest.from, conversion.latest.to, conversion.latest.rate) : null;
     const converted = step?.eps != null && conversion && pair && step.currency === conversion.currency
       ? `, from ${conversion.currency} ${formatPerShare(step.eps)} at ${pair.pair} ${pair.value.toPrecision(5)}` : "";
     return [
