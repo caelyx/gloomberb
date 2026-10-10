@@ -1,0 +1,34 @@
+{
+  "id": "hackernews",
+  "name": "Hacker News",
+  "icon": "icon.svg",
+  "tagline": "Hacker News front page, with article text and optional Gemini summaries",
+  "description": "Browse Hacker News without leaving Gloomberb. Top, New, Best, Show, and Ask feeds with scores and comment counts. Opening a story shows a reader-view extract of the linked article, fetched from the article's own site, and s summarises it with Gemini when an API key is set.",
+  "categories": [
+    "news",
+    "example"
+  ],
+  "targets": [
+    "cli",
+    "tui",
+    "desktop",
+    "web"
+  ],
+  "hosts": [
+    "hacker-news.firebaseio.com",
+    "generativelanguage.googleapis.com"
+  ],
+  "contributes": {
+    "panes": [
+      "hackernews"
+    ],
+    "shortcuts": [
+      {
+        "code": "HN",
+        "name": "Hacker News",
+        "description": "Top, New, Best, Show and Ask stories with scores and comments."
+      }
+    ]
+  },
+  "minGloom": "0.15.3"
+}
