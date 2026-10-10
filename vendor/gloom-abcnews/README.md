@@ -5,9 +5,9 @@ The ABC NEWS Australia live channel and its latest video stories, in a
 command bar to open it.
 
 - **Live** plays the 24/7 ABC NEWS stream.
-- **Stories** lists the channel's latest 45 uploads, newest first, and `/`
-  searches their titles and summaries. Enter plays
-  the story in the pane; `o` opens it on YouTube. An open story is kept
+- **Stories** lists the channel's latest 45 uploads (15 on the web), newest
+  first, and `/` searches their titles and summaries. Enter plays the story
+  in the pane; `o` opens it on YouTube. An open story is kept
   across restarts, but only starts playing again when you press `p`.
 
 | Key | Action |
@@ -58,7 +58,9 @@ rather than the viewer's. So on the web:
 - Stories are the channel feed alone, fetched through the web app's proxy:
   the latest fifteen uploads, Shorts included, rather than forty-five.
 - `r` reloads the player. An upload whose owner has switched off embedding
-  shows YouTube's own error in the player; `o` opens it on YouTube.
+  cannot play there; `o` opens it on YouTube. On a host whose player reads
+  YouTube's own reports (the private web build's does), the pane says so,
+  and its status and `p` follow what the player is actually doing.
 
 The browser entry (`index.browser.ts`) carries this web capability. The
 desktop's webview also loads that entry but never runs plugin capability

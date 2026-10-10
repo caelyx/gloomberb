@@ -102,7 +102,7 @@ envelope.
 | gloom-prediction-markets | `github:gloom-sh/gloom-prediction-markets` | `1d8036f` (bun.lock) | prediction-markets | gamma-api / clob / data-api.polymarket.com, api.elections.kalshi.com |
 | **gloom-au** | `vendor/gloom-au` (from private `caelyx/gloom-au`) | `be062e4ed44a2b2c3139de9a499dca90d5cdff6a` | au-markets | www.asx.com.au, asx.api.markitdigital.com, cdn-api.markitdigital.com, download.asic.gov.au, www.asic.gov.au, www.rba.gov.au, data.api.abs.gov.au, www.abs.gov.au, www.abc.net.au, api.tenders.gov.au, cdn.cboe.com, visualisations.aemo.com.au, takeovers.gov.au, www.tga.gov.au, scanner.tradingview.com, api.openelectricity.org.au |
 | **gloom-acgb** | `vendor/gloom-acgb` (from private `caelyx/gloom-acgb`) | `cbf5ab600715b02852d3af8a5ffd0cb461f7f03c` | acgb-curve | www.rba.gov.au, home.treasury.gov |
-| **gloom-abcnews** | `vendor/gloom-abcnews` (from private `caelyx/gloom-abcnews`) | `4b3003f1335b85a2fca5dcd303a89446fa794fda` | abc-news | youtube.com, www.youtube.com, googlevideo.com, ytimg.com |
+| **gloom-abcnews** | `vendor/gloom-abcnews` (from private `caelyx/gloom-abcnews`) | `710428e43d61dbb101bb7d1511b939d8fc411b83` | abc-news | youtube.com, www.youtube.com, googlevideo.com, ytimg.com |
 | **gloom-newsmap** | `vendor/gloom-newsmap` (from private `caelyx/gloom-newsmap`) | `de8117446f185dbf3d73ed9bb51c3f410befebc5` | newsmap | news.google.com, generativelanguage.googleapis.com |
 | **gloom-hackernews** | `vendor/gloom-hackernews` (from public `caelyx/gloom-hackernews`, a fork of `gloom-sh/gloom-hackernews`) | `aeb2ceae33dfd6662676c485f9d705ff38400ef9` | hackernews | hacker-news.firebaseio.com, generativelanguage.googleapis.com |
 
