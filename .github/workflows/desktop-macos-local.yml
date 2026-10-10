@@ -1,7 +1,8 @@
 name: Build macOS desktop (unsigned)
 
-# Downstream: builds Gloomberb.app for Apple Silicon from the selected branch,
-# for installing this fork's changes in place of the upstream release.
+# Downstream: runs scripts/build-macos-local.sh to build Gloomberb.app for
+# Apple Silicon from the selected branch, for installing this fork's changes in
+# place of the upstream release.
 # Manual only (Actions > Build macOS desktop (unsigned) > Run workflow).
 #
 # The app is ad-hoc signed, not signed with a Developer ID or notarised, and
@@ -24,29 +25,17 @@ jobs:
 
       - uses: ./.github/actions/setup-bun
 
-      - name: Build desktop app
-        env:
-          GLOOMBERB_DESKTOP_LOCAL: "1"
-        run: bun run desktop:release
+      - name: Build Gloomberb.app
+        run: |
+          brew install zstd
+          scripts/build-macos-local.sh
 
       - name: Package Gloomberb.app
         run: |
           set -euo pipefail
-          brew install zstd
-          out="$RUNNER_TEMP/app"
-          mkdir -p "$out"
-          zstd -d -o "$out/Gloomberb.app.tar" artifacts/stable-macos-arm64-Gloomberb.app.tar.zst
-          tar -xf "$out/Gloomberb.app.tar" -C "$out"
-          app="$out/Gloomberb.app"
-          test -x "$app/Contents/Resources/gloomberb"
-          test -f "$app/Contents/Resources/gloomberb-tui/tui-entry.js"
-          test -f "$app/Contents/Resources/gloomberb-tui/node_modules/@opentui/core-darwin-arm64/libopentui.dylib"
-          # Apple Silicon refuses to run unsigned code; an ad-hoc signature is enough.
-          codesign --force --deep --sign - "$app"
-          codesign --verify --deep --strict --verbose=2 "$app"
-          "$app/Contents/Resources/gloomberb" help
           version="$(node -p 'require("./package.json").version')"
-          ditto -c -k --keepParent "$app" "$out/Gloomberb-$version-${GITHUB_SHA::7}-macos-arm64.zip"
+          mkdir -p "$RUNNER_TEMP/app"
+          ditto -c -k --keepParent artifacts/local/Gloomberb.app "$RUNNER_TEMP/app/Gloomberb-$version-${GITHUB_SHA::7}-macos-arm64.zip"
 
       - uses: actions/upload-artifact@v4
         with:
