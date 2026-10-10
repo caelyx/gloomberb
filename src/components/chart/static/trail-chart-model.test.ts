@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { buildTrailChart, trailAxisTicks } from "./trail-chart-model";
+import { buildTrailChart, TRAIL_AGE_FADE, trailAxisTicks } from "./trail-chart-model";
 
 test("scatter trails preserve backtracking and vertical edges without changing symmetric domains", () => {
   const chart = buildTrailChart(
@@ -27,6 +27,20 @@ test("scatter trails preserve backtracking and vertical edges without changing s
   ).toBe(1);
   expect((chart.min + chart.max) / 2).toBe(100);
   expect(chart.series.at(-1)!.points[0]!.value).toBe(99);
+  // Without a background, nothing fades.
+  expect(new Set(edges.map((edge) => edge.color))).toEqual(new Set(["#ff0000"]));
+});
+
+test("trail edges fade from the newest toward the oldest", () => {
+  const points = [101, 102, 103, 104].map((x, i) => ({ x, y: 100 + i, date: `2026-01-0${i + 1}` }));
+  const chart = buildTrailChart([{ id: "t", label: "T", color: "#ff0000", points }], 100, "#888888", "#000000");
+  const reds = chart.series
+    .filter((series) => series.id.includes(":edge:"))
+    .map((series) => parseInt(series.color.slice(1, 3), 16));
+  expect(reds).toEqual([...reds].sort((a, b) => a - b));
+  expect(reds.at(-1)).toBe(255);
+  expect(reds[0]).toBe(Math.round(255 * (1 - TRAIL_AGE_FADE)));
+  expect(chart.series.at(-1)!.color).toBe("#ff0000");
 });
 
 test("strength axis labels sit on round values inside the domain", () => {

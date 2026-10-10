@@ -207,7 +207,8 @@ export function layoutTrailAxis({ width, ticks, name, readout }: {
  * Relative rotation trails over a 100/100 crosshair: strength across,
  * momentum up. Each trail head carries its symbol, so the chart reads without
  * colour; the selected trail keeps its colour and the cursor, which reads its
- * strength under the plot and its momentum beside it.
+ * strength under the plot and its momentum beside it. Each trail is one solid
+ * line that fades toward its oldest week.
  */
 export function ScatterTrailSurface({
   trails,
@@ -247,6 +248,7 @@ export function ScatterTrailSurface({
       })),
       center,
       colors.textDim,
+      colors.bg,
     );
     // In cells the origin lines would draw as dots, like a trail. There they
     // become four anchor points on the crosshair, which keep 100 in the middle
@@ -362,6 +364,8 @@ export function ScatterTrailSurface({
           height={plotHeight}
           axisWidth={0}
           showLegend={false}
+          // The edges are one trail: a dash pattern apiece would read as meaning something.
+          lineCues={false}
           showTimeAxis={false}
           xAxis={STRENGTH_AXIS}
           formatAxisValue={axisValue}

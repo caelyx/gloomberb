@@ -1,4 +1,5 @@
 import type { ResolvedSeries } from "../../../time-series/types";
+import { blendHex } from "../../../theme/color-utils";
 import { scalarPoint, staticSeries } from "./series";
 
 export interface ScatterTrail {
@@ -8,10 +9,18 @@ export interface ScatterTrail {
   points: Array<{ x: number; y: number; date: string }>;
 }
 const SCALE = 1_000_000;
+/** How far a trail's oldest edge fades toward the background; its newest keeps full colour. */
+export const TRAIL_AGE_FADE = 0.65;
+/**
+ * Each trail is drawn edge by edge (a time-series chart sorts x), so with a
+ * background colour the edges fade from the newest toward the oldest and the
+ * trail reads as one line with a direction.
+ */
 export function buildTrailChart(
   trails: readonly ScatterTrail[],
   center: number,
   axisColor: string,
+  fadeTo?: string,
 ) {
   const valid = trails.map((trail) => ({
     ...trail,
@@ -50,13 +59,20 @@ export function buildTrailChart(
       // A vertical edge needs distinct integer timestamps to survive date deduplication.
       if (dates[0]!.getTime() === dates[1]!.getTime())
         dates[1] = new Date(dates[0]!.getTime() + 1);
+      const age =
+        trail.points.length > 2
+          ? (trail.points.length - 1 - index) / (trail.points.length - 2)
+          : 0;
       series.push(
         staticSeries(
           ends.map((point, i) => scalarPoint(dates[i]!, point.y)),
           {
             id: `${trail.id}:edge:${index}`,
             label: trail.label,
-            color: trail.color,
+            color:
+              fadeTo && age > 0
+                ? blendHex(trail.color, fadeTo, TRAIL_AGE_FADE * age)
+                : trail.color,
             calendarSpaced: true,
           },
         ),
