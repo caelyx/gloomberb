@@ -10,7 +10,7 @@ import { abortable, abortError, settleWithin } from "../../../utils/async-deadli
 import { errorMessage } from "../../../utils/errors";
 import { isUsListingExchange } from "../../../utils/exchanges";
 import { fetchEarningsHistory } from "../earnings/client";
-import { epsFxCurrencies } from "./model";
+import { epsFxNeeds } from "./model";
 import { reportDatesFrom, type ReportDate } from "./report-dates";
 
 export interface PeBandInputs {
@@ -23,7 +23,7 @@ export interface PeBandInputs {
   historyError: string | null;
   /** Report dates for US listings; empty for the rest and when the earnings history is unavailable. */
   reports: ReportDate[];
-  /** Daily FX closes for each currency a dollar-priced listing reports its EPS in. */
+  /** Daily dollar closes of the EPS and price currencies, when EPS is reported in another currency than the price. */
   fx: Map<string, FxCloses>;
   /** Why a currency's FX closes are missing; its EPS then stays unconverted. */
   fxError: string | null;
@@ -47,22 +47,21 @@ type ReportClient = Pick<typeof apiClient, "getCloudEarningsHistory" | "getCloud
 
 /**
  * Completed daily closes of each currency's dollar pair, from just before the
- * oldest statement in that currency. Never rejects but on cancel: a missing
- * or stale history is said in `error`, and that currency's EPS stays unconverted.
+ * oldest statement they convert. Never rejects but on cancel: a missing or
+ * stale history is said in `error`, and the EPS it converts stays unconverted.
  */
 async function loadFxCloses(financials: TickerFinancials, client: ReportClient, signal: AbortSignal | undefined, now: Date):
   Promise<{ fx: Map<string, FxCloses>; error: string | null }> {
   const fx = new Map<string, FxCloses>();
   const errors: string[] = [];
-  const rows = [...financials.annualStatements, ...financials.quarterlyStatements];
-  await Promise.all(epsFxCurrencies(financials).map(async (currency) => {
+  const needs = epsFxNeeds(financials);
+  if (!needs) return { fx, error: null };
+  const startDate = new Date(Date.parse(needs.oldest) - FX_LEAD_DAYS * 86_400_000).toISOString().slice(0, 10);
+  await Promise.all(needs.currencies.map(async (currency) => {
     const leg = fxLegForCurrency(currency)!;
-    const oldest = rows.filter((row) => row.currency?.trim().toUpperCase() === currency && Number.isFinite(Date.parse(row.date)))
-      .reduce((min, row) => Math.min(min, Date.parse(row.date)), now.getTime());
     try {
       const response = await client.getCloudHistory(leg.instrument.symbol, leg.instrument.exchange ?? "", {
-        interval: "1day", startDate: new Date(oldest - FX_LEAD_DAYS * 86_400_000).toISOString().slice(0, 10),
-        endDate: now.toISOString().slice(0, 10), outputsize: FX_MAX_ROWS,
+        interval: "1day", startDate, endDate: now.toISOString().slice(0, 10), outputsize: FX_MAX_ROWS,
       }, signal ? { signal } : undefined);
       fx.set(currency, dailyFxCloses(response, leg, now, FX_MAX_ROWS));
     } catch (error) {

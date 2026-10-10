@@ -59,6 +59,14 @@ describe("P/E band inputs", () => {
     const stale = await loadPeBandInputs({ instrument: { symbol: "TSM", exchange: "NYSE" } }, adr, coordinator, answer(closes, true));
     expect(stale.fx.size).toBe(0);
     expect(stale.fxError).toBe("daily TWD FX closes are stale");
+
+    // Dollar EPS against an Australian-dollar price needs the price currency's pair, from before the oldest dollar statement.
+    asked.length = 0;
+    const asx = createTestDataProvider({ getTickerFinancials: async () => createTestFinancials({ quote: createTestQuote({ currency: "AUD" }),
+      annualStatements: statements(["2022-12-31", "2023-12-31"]).map((row) => ({ ...row, currency: "USD" })) }) });
+    const crossed = await loadPeBandInputs({ instrument: { symbol: "BHP.AX", exchange: "ASX" } }, asx, coordinator, answer(closes));
+    expect(asked).toEqual([["AUDUSD=X", "2022-12-17"]]);
+    expect(crossed.fx.get("AUD")?.closes.get(day(1))).toBe(32);
   });
 
   test("leave listings elsewhere alone, and carry on without reports when the history fails or is empty", async () => {
