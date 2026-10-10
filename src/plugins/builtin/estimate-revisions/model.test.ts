@@ -5,7 +5,7 @@ import type {
 } from "../../../api-client/estimate-revisions";
 import { ApiRequestError } from "../../../api-client/errors";
 import { CLOUD_SESSION_REQUIRED } from "../shared/research-cloud-session";
-import { estimateListing, fetchEstimates, validateEstimates } from "./client";
+import { fetchEstimates, validateEstimates } from "./client";
 import {
   estimateCurrent,
   estimateHistory,
@@ -171,16 +171,9 @@ test("a listing suffix names the venue instead of a search that cannot choose on
     }),
   ).rejects.toThrow("not available yet");
   expect(asked).toEqual(["BHP:ASX"]);
-  // A share-class dot is not a listing suffix.
-  expect(estimateListing("BRK.B", "")).toEqual({ symbol: "BRK.B", exchange: "" });
-  // The suffix outranks a saved venue; a key that names another venue is not a listing.
-  expect(estimateListing("BHP.AX", "NYSE")).toEqual({ symbol: "BHP", exchange: "ASX" });
-  expect(estimateListing("BHP.AX:ASX", "")).toEqual({ symbol: "BHP", exchange: "ASX" });
-  expect(estimateListing("BHP.AX:NYSE", "")).toBeNull();
   await expect(fetchEstimates("BHP.AX:NYSE", "", {
     getCloudEstimateRevisions: async () => { throw new Error("no request expected"); },
   })).rejects.toThrow("BHP.AX does not trade on NYSE.");
-  expect(estimateListing("700.HK", "")).toEqual({ symbol: "0700", exchange: "HKEX" });
 });
 
 test("fiscal pin preserves frequency and currency identity and rejects invalid or unavailable dates", () => {

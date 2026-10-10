@@ -706,6 +706,8 @@ CLI rates and IV are percentages; `--market-price` is a per-unit premium and use
 `RRG` or `GRR` opens US sector ETFs versus SPY. `RRG AAPL:NASDAQ,MSFT:NASDAQ`
 uses an explicit universe. Pane settings choose the benchmark, a linked watchlist
 or portfolio, custom symbols and a 2-12-week trail (six by default). The
+benchmark needs a venue for its calendar: an exchange key (`SPY:NYSEARCA`,
+`STW:ASX`), a listing suffix (`STW.AX`) or a known index such as `^AXJO`. The
 maximum is 24 instruments; a larger collection asks for a smaller scope.
 
 Select a coloured table row to locate its trail; open it for dated strength and
