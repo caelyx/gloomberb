@@ -5,6 +5,7 @@ import { EDITION_CONFIG_KEY, PROVIDER_SCOPE_CONFIG_KEY, setConfigContext } from 
 import { createNewsmapHeadless } from "./headless";
 import { setPluginContext } from "./gloom-news";
 import { NewsmapPane } from "./pane";
+import { DEFAULT_GEMINI_MODEL } from "./summary";
 import {
   DEFAULT_DENSITY, DEFAULT_EDITION_ID, DEFAULT_PROVIDER_SCOPE, DEFAULT_SECTIONS, DENSITIES,
   EDITIONS, NEWSMAP_PANE_ID, NEWSMAP_PLUGIN_ID, PROVIDER_SCOPES, SECTIONS,
@@ -16,11 +17,15 @@ export const newsmapPlugin: GloomPlugin = {
   version: "0.1.0",
   description: "World news as a treemap — bigger is more important, brighter is newer",
   toggleable: true,
+  // On the web the map loads but the reader cannot: the hosted app only reaches
+  // hosts listed in `hosts`, and article sites cannot be listed.
   targets: ["cli", "tui", "desktop", "web"],
 
   // Google News sends no CORS headers, so the web build proxies the feed; the
   // terminal and desktop go direct. Either way the domain has to be declared.
-  hosts: ["news.google.com"],
+  // Article pages come from whatever site a story links to, which no list of
+  // hosts can name; these are the fixed ones.
+  hosts: ["news.google.com", "generativelanguage.googleapis.com"],
 
   capabilities: [googleNewsCapability],
 
@@ -42,6 +47,23 @@ export const newsmapPlugin: GloomPlugin = {
     required: false,
     defaultValue: DEFAULT_PROVIDER_SCOPE,
     options: PROVIDER_SCOPES.map((scope) => ({ value: scope.id, label: scope.label })),
+  },
+  // Optional, so the plugin never reports "needs setup": without a key the
+  // reader still shows article text, and `s` explains where the key goes.
+  {
+    key: "geminiApiKey",
+    label: "Gemini API key",
+    type: "password",
+    required: false,
+    placeholder: "From aistudio.google.com/apikey",
+    description: "Enables s to summarise an article. Free-tier requests may be used by Google to improve its models.",
+  }, {
+    key: "geminiModel",
+    label: "Gemini model",
+    type: "text",
+    required: false,
+    defaultValue: DEFAULT_GEMINI_MODEL,
+    description: "Any model id that supports generateContent.",
   }],
 
   panes: [{
