@@ -1,0 +1,52 @@
+{
+ "data": {
+  "items": [
+   {
+    "announcementTypes": [
+     "Non-Renounceable Issue"
+    ],
+    "date": "2026-10-08T08:48:51.000Z",
+    "documentKey": "2924-03146238-6A1348365",
+    "fileSize": "205KB",
+    "headline": "Bonus Option Offer to Shareholders",
+    "isPriceSensitive": true,
+    "symbol": "SLZ"
+   },
+   {
+    "announcementTypes": [
+     "Non-Renounceable Issue",
+     "Disclosure Document"
+    ],
+    "date": "2026-10-08T08:42:06.000Z",
+    "documentKey": "2924-03146236-6A1348363",
+    "fileSize": "382KB",
+    "headline": "Non-Renounceable Issue - Bonus Options Prospectus",
+    "isPriceSensitive": true,
+    "symbol": "SLZ"
+   },
+   {
+    "announcementTypes": [
+     "Notice of Meeting - Other"
+    ],
+    "date": "2026-10-08T08:37:16.000Z",
+    "documentKey": "2924-03146234-6A1348362",
+    "fileSize": "239KB",
+    "headline": "ASIC Grants Extension of Time to Hold 2026 AGM",
+    "isPriceSensitive": true,
+    "symbol": "HMX"
+   },
+   {
+    "announcementTypes": [
+     "Scheme of Arrangement"
+    ],
+    "date": "2026-10-08T08:36:16.000Z",
+    "documentKey": "2924-03146233-6A1348361",
+    "fileSize": "11304KB",
+    "headline": "Dispatch of Scheme Booklet & Amended Scheme Booklet",
+    "isPriceSensitive": true,
+    "symbol": "HMX"
+   }
+  ],
+  "count": 10000
+ }
+}

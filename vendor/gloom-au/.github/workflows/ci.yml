@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The Gloomberb revision the plugin is checked against. Bump it after
+  # checking the plugin against a newer Gloomberb.
+  GLOOMBERB_REVISION: 787cf06a19147d6102ed368bc0eb97a68b5465bd
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: gloom-au
+
+      - uses: actions/checkout@v4
+        with:
+          repository: gloom-sh/gloomberb
+          ref: ${{ env.GLOOMBERB_REVISION }}
+          path: gloomberb
+
+      - name: Read Gloomberb's pinned Bun version
+        id: bun-version
+        run: |
+          package_manager="$(node -p 'require("./gloomberb/package.json").packageManager')"
+          echo "version=${package_manager#bun@}" >> "$GITHUB_OUTPUT"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ steps.bun-version.outputs.version }}
+
+      - name: Install Gloomberb
+        working-directory: gloomberb
+        run: bun install --frozen-lockfile
+
+      # One copy of gloomberb and react: the plugin's peers point into the checkout.
+      - name: Install the plugin and link Gloomberb
+        working-directory: gloom-au
+        run: |
+          bun install --frozen-lockfile
+          rm -rf node_modules/gloomberb node_modules/react
+          ln -s "$GITHUB_WORKSPACE/gloomberb" node_modules/gloomberb
+          ln -s "$GITHUB_WORKSPACE/gloomberb/node_modules/react" node_modules/react
+
+      - name: Typecheck
+        working-directory: gloom-au
+        run: bun run typecheck
+
+      - name: Test
+        working-directory: gloom-au
+        run: bun test

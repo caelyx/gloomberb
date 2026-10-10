@@ -1,0 +1,71 @@
+[
+  {
+    "id": 61502,
+    "name": "26-237MR Full Federal Court dismisses appeal by former auditor Reginald Lance Williams",
+    "publishedDate": "2026-10-09T16:00:00Z",
+    "dateCreated": "2026-10-09T16:00:00Z",
+    "createDate": "2026-10-09T04:57:59Z",
+    "updateDate": "2026-10-09T05:02:45Z",
+    "url": "/about-asic/news-centre/find-a-media-release/2026-releases/26-237mr-full-federal-court-dismisses-appeal-by-former-auditor-reginald-lance-williams",
+    "documentNumber": "26-237MR",
+    "metaAudience": [],
+    "metaDateModified": "0001-01-01T00:00:00",
+    "metaDescription": "The Full Court of the Federal Court has dismissed an appeal by former registered company auditor Reginald Lance Williams, upholding an earlier judgment and leaving in place a disciplinary decision cancelling his registration as a company auditor.",
+    "metaSubject": [
+      "auditors",
+      "bannings and alerts"
+    ],
+    "metaType": "media release",
+    "metaFunction": [
+      "enforcement"
+    ],
+    "robotsNofollowNoindex": false
+  },
+  {
+    "id": 61501,
+    "name": "26-236MR Hollard fined $2 million for serious insurance claim delay",
+    "publishedDate": "2026-10-09T13:30:00Z",
+    "dateCreated": "2026-10-09T13:30:00Z",
+    "createDate": "2026-10-09T02:16:30Z",
+    "updateDate": "2026-10-09T05:32:33Z",
+    "url": "/about-asic/news-centre/find-a-media-release/2026-releases/26-236mr-hollard-fined-2-million-for-serious-insurance-claim-delay",
+    "documentNumber": "26-236MR",
+    "metaAudience": [
+      "Insurance provider",
+      "Media"
+    ],
+    "metaDateModified": "0001-01-01T00:00:00",
+    "metaDescription": "Hollard Insurance Partners Limited (Hollard) has been ordered by the Federal Court to pay a $2 million penalty after Hollard admitted that its serious claim-handling failures left a Victorian family living in appalling conditions, with their home ultimately deemed a total loss.",
+    "metaSubject": [
+      "financial services"
+    ],
+    "metaType": "media release",
+    "metaFunction": [
+      "enforcement"
+    ],
+    "robotsNofollowNoindex": false,
+    "nrBanner": "https://download.asic.gov.au/asic-nextgen/img/newsroom/default/financial_services1_default.jpg"
+  },
+  {
+    "id": 61333,
+    "name": "26-220MR ART amends ASIC’s permanent ban made against Noel Northcott",
+    "publishedDate": "2026-09-18T16:45:00Z",
+    "dateCreated": "2026-09-18T16:45:00Z",
+    "createDate": "2026-09-18T06:38:23Z",
+    "updateDate": "2026-09-18T06:45:24Z",
+    "url": "/about-asic/news-centre/find-a-media-release/2026-releases/26-220mr-art-amends-asic-s-permanent-ban-made-against-noel-northcott",
+    "documentNumber": "26-220MR",
+    "metaAudience": [],
+    "metaDateModified": "0001-01-01T00:00:00",
+    "metaDescription": "The Administrative Review Tribunal (ART) has varied ASIC’s decision to permanently ban Noel Northcott from providing financial services and carrying on a financial services business",
+    "metaSubject": [
+      "bannings and alerts",
+      "financial services"
+    ],
+    "metaType": "media release",
+    "metaFunction": [
+      "enforcement"
+    ],
+    "robotsNofollowNoindex": false
+  }
+]

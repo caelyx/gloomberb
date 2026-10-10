@@ -1,0 +1,97 @@
+{
+ "vanguard australian": {
+  "data": {
+   "items": [
+    {
+     "displayName": "VANGUARD AUSTRALIAN CORP FIXED INTEREST INDEX ETF",
+     "issueType": "ETF",
+     "marketCap": 698370977,
+     "priceChangeOneWeekPercent": -0.01984914648669712,
+     "priceLast": 50.370000000000005,
+     "securityType": 7,
+     "symbol": "VACF",
+     "xid": "349088418",
+     "xidEntity": 349124076
+    },
+    {
+     "displayName": "VANGUARD AUSTRALIAN FIXED INTEREST INDEX ETF",
+     "issueType": "ETF",
+     "marketCap": 3880039300,
+     "priceChangeOneWeekPercent": 0.17941242431037965,
+     "priceLast": 44.67,
+     "securityType": 7,
+     "symbol": "VAF",
+     "xid": "51149743",
+     "xidEntity": 224332482
+    },
+    {
+     "displayName": "VANGUARD AUSTRALIAN FLOATING RATE BOND INDEX ETF",
+     "issueType": "ETF",
+     "marketCap": 22567500,
+     "priceChangeOneWeekPercent": 0.07982438635002824,
+     "priceLast": 50.15,
+     "securityType": 7,
+     "symbol": "VFLT",
+     "xid": "1093123880",
+     "xidEntity": 1093111315
+    },
+    {
+     "displayName": "VANGUARD AUSTRALIAN GOVERNMENT BOND INDEX ETF",
+     "issueType": "ETF",
+     "marketCap": 1389708482,
+     "priceChangeOneWeekPercent": 0.04434589800442577,
+     "priceLast": 45.12,
+     "securityType": 7,
+     "symbol": "VGB",
+     "xid": "44968058",
+     "xidEntity": 342726880
+    },
+    {
+     "displayName": "VANGUARD AUSTRALIAN PROPERTY SECURITIES INDEX ETF",
+     "issueType": "ETF",
+     "marketCap": 2719806175,
+     "priceChangeOneWeekPercent": 3.5727440147329608,
+     "priceLast": 84.36,
+     "securityType": 7,
+     "symbol": "VAP",
+     "xid": "26831511",
+     "xidEntity": 204250706
+    }
+   ]
+  }
+ },
+ "VAS": {
+  "data": {
+   "items": [
+    {
+     "displayName": "VANGUARD AUSTRALIAN SHARES INDEX ETF",
+     "issueType": "ETF",
+     "marketCap": 25972604821,
+     "priceChangeOneWeekPercent": 0.3720238095238148,
+     "priceLast": 107.92,
+     "securityType": 7,
+     "symbol": "VAS",
+     "xid": "18461765",
+     "xidEntity": 204235013
+    }
+   ]
+  }
+ },
+ "VHY": {
+  "data": {
+   "items": [
+    {
+     "displayName": "VANGUARD AUSTRALIAN SHARES HIGH YIELD ETF",
+     "issueType": "ETF",
+     "marketCap": 7982374954,
+     "priceChangeOneWeekPercent": 0.43646944713869956,
+     "priceLast": 82.84,
+     "securityType": 7,
+     "symbol": "VHY",
+     "xid": "34497036",
+     "xidEntity": 204169817
+    }
+   ]
+  }
+ }
+}
