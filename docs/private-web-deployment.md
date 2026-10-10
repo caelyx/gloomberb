@@ -200,8 +200,8 @@ private config; its output must list `env.PRIVATE_WEB_DEPLOYMENT ("true")`.
 The deployment is the Worker `main` at `https://main.privategloom.workers.dev`
 (`<worker name>.<account's workers.dev subdomain>`), deployed by the manual
 **Deploy private web** workflow (`.github/workflows/deploy-private.yml`). It
-runs only from `main` and only when started by hand (Actions > Deploy private
-web > Run workflow). It uses two repository secrets, `CF_ACCT` (account ID) and
+runs only from `feature/private-deployment` and only when started by hand
+(Actions > Deploy private web > Run workflow, choosing that branch). It uses two repository secrets, `CF_ACCT` (account ID) and
 `CF_TKN` (API token, "Edit Cloudflare Workers" permissions). They are named
 differently from the `CLOUDFLARE_*` secrets upstream's Verify workflow deploys
 term.gloom.sh with, so that job never picks them up. No secrets are stored in
@@ -266,11 +266,19 @@ the origin.
 
 ## Keeping up with upstream
 
+The fork's `main` mirrors upstream `gloom-sh/gloomberb` `main` and carries no
+downstream changes; everything in this document lives on the long-lived
+`feature/private-deployment` branch. To sync: bring `main` up to upstream (a
+fast-forward, or GitHub's "Sync fork"), then merge `main` into
+`feature/private-deployment`. Never commit downstream changes to `main`.
+
 Files most likely to conflict on a merge from upstream, in order of risk:
 
 1. `bun.lock` / `package.json` - regenerate with `bun install`, never hand-merge.
-2. `src/renderers/cloudflare/http-proxy.ts` - the policy switch, redirect loop
-   and header stripping sit inside `handleHttpProxy`.
+   `src/utils/plugin-proxy-hosts.json` likewise: `bun run web:proxy-hosts`.
+2. `src/renderers/cloudflare/http-proxy.ts` - the `policy` option around the
+   session gate in `handleHttpProxy`, and the header stripping in
+   `upstreamHeaders`.
 3. `src/renderers/cloudflare/worker.ts` - `WorkerEnv`, the `/http-proxy` call and
    `proxyApi`.
 4. `src/renderers/browser/config-host.ts` - one `if` in `createBrowserDefaultConfig`.
@@ -279,6 +287,7 @@ Files most likely to conflict on a merge from upstream, in order of risk:
 6. `scripts/web-plugins.ts`, `build-web.ts`, `generate-web-proxy-hosts.ts` - the
    `hosts` field on compiled plugins and the `vendor/` lookup.
 7. `src/plugins/web-bundled.ts` - three list entries.
+8. `knip.jsonc` - two `ignoreDependencies` entries.
 
 `vendor/`, `scripts/vendor-plugin.sh` and `bunfig.toml` are downstream-only and
 do not conflict.

@@ -1,7 +1,8 @@
 name: Deploy private web
 
 # Downstream: deploys wrangler.private.jsonc to https://main.privategloom.workers.dev.
-# Manual only (Actions > Deploy private web > Run workflow), from main only.
+# Manual only (Actions > Deploy private web > Run workflow), and only from the
+# long-lived feature/private-deployment branch; main mirrors upstream.
 #
 # Fails closed on Cloudflare Access: it refuses to deploy unless the hostname
 # already redirects to an Access login, and if the site answers without Access
@@ -25,7 +26,7 @@ env:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/feature/private-deployment'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

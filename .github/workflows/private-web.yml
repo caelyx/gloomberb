@@ -8,10 +8,10 @@ name: Private web
 on:
   push:
     branches:
-      - main
+      - feature/private-deployment
   pull_request:
     branches:
-      - main
+      - feature/private-deployment
   workflow_dispatch:
 
 permissions:
