@@ -1,6 +1,8 @@
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
+import { parsePublicTickerKey } from "../../../utils/exchanges";
+import { isKnownNonUsListingSymbol } from "../../../utils/sec";
 import { fetchShortVolume } from "./client";
-import { volumePercent, volumePointStatus, volumeQuantity } from "./model";
+import { NON_US_LISTING_MESSAGE, volumePercent, volumePointStatus, volumeQuantity } from "./model";
 
 export const shortVolumeHeadless: HeadlessPaneDefinition<"bundle"> = {
   shape: "bundle", argument: { kind: "ticker", description: "US equity ticker.", placeholder: "ticker" },
@@ -13,7 +15,13 @@ export const shortVolumeHeadless: HeadlessPaneDefinition<"bundle"> = {
   ],
   describe: (args) => `Daily short volume | ${args.symbols[0]}`,
   async load(args, ctx) {
-    const symbol = String(args.options["finra-symbol"] || args.symbols[0]);
+    const override = args.options["finra-symbol"];
+    const ticker = args.symbols[0] ?? "";
+    if (!override && isKnownNonUsListingSymbol(ticker)) {
+      return { complete: false, sections: [], unavailableSymbols: [ticker], errors: [NON_US_LISTING_MESSAGE] };
+    }
+    // The override is the exact, case-sensitive FINRA identity; a ticker drops its exchange key as the pane does.
+    const symbol = override ? String(override) : parsePublicTickerKey(ticker).symbol;
     const data = await fetchShortVolume(symbol, args.options.scope === "otc" ? "otc" : "nms", ctx.apiClient);
     return { complete: data.status === "available", errors: data.warnings,
       sections: [{ title: "Daily off-exchange volume", columns: [

@@ -51,3 +51,5 @@ export function volumeHistoryPoints(data: ShortVolumePayload) {
     return [...gap, { date: new Date(point.date), observedAt: new Date(point.date), value: point.ratioPercent }];
   });
 }
+
+export const NON_US_LISTING_MESSAGE = "Daily short volume is available for US equities.";

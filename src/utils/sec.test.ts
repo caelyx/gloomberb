@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { TickerRecord } from "../types/ticker";
-import { isKnownNonUsEquityTicker, mayBeUsEquityOrFundTicker, mayBeUsEquityTicker } from "./sec";
+import { isKnownNonUsEquityTicker, isKnownNonUsListingSymbol, mayBeUsEquityOrFundTicker, mayBeUsEquityTicker } from "./sec";
 import { createTestTicker } from "../test-support/ticker";
 
 const makeTicker = (overrides: Partial<TickerRecord["metadata"]>) => createTestTicker("AAPL", "Apple Inc.", overrides);
@@ -50,4 +50,18 @@ describe("SEC pane eligibility", () => {
     expect(mayBeUsEquityOrFundTicker(ticker)).toBe(equityOrFund);
     expect(isKnownNonUsEquityTicker(ticker)).toBe(!equity);
   });
+});
+
+test("a venue key or listing suffix places a symbol outside the US", () => {
+  expect(isKnownNonUsListingSymbol("BHP.AX")).toBe(true);
+  expect(isKnownNonUsListingSymbol("BHP:ASX")).toBe(true);
+  expect(isKnownNonUsListingSymbol("VOD.L")).toBe(true);
+  expect(isKnownNonUsListingSymbol("WALMEX.MX")).toBe(true);
+  // US exchange and OTC listings, a share-class dot, a bare symbol and an unknown venue are not known to be foreign.
+  expect(isKnownNonUsListingSymbol("BHP:NYSE")).toBe(false);
+  expect(isKnownNonUsListingSymbol("X:OTC")).toBe(false);
+  expect(isKnownNonUsListingSymbol("X:PINK")).toBe(false);
+  expect(isKnownNonUsListingSymbol("BRK.B")).toBe(false);
+  expect(isKnownNonUsListingSymbol("BHP")).toBe(false);
+  expect(isKnownNonUsListingSymbol("BHP:FOO")).toBe(false);
 });
