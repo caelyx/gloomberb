@@ -804,7 +804,9 @@ edges even when strength reverses direction.
 
 The latest eligible benchmark daily observation in each completed Friday-ending
 week defines the required date for peers. The current week is excluded. The final session must match the benchmark venue's published closure calendar
-(NYSE/Nasdaq, ASX, JPX, NSE/BSE, SSE/SZSE, KRX/KOSDAQ, TWSE/TPEX, HKEX, SGX); a Thursday is accepted only for a verified Friday closure. Unknown venues and years
+(NYSE/Nasdaq, ASX, JPX, NSE/BSE, SSE/SZSE, KRX/KOSDAQ, TWSE/TPEX, HKEX, SGX); a Thursday is accepted only for a verified Friday closure. The venue comes from the
+benchmark's exchange key (`STW:ASX`), its listing suffix (`STW.AX`), or for `^AXJO`, `^AORD`, `^N225`,
+`^HSI`, `^KS11`, `^NSEI` and `^BSESN`, the index's home market. Unknown venues and years
 are unavailable, and a missing expected weekly close is flagged. Earlier history
 outside the published calendar does not enter the model. Missing or contradictory closes break continuity; no forward-fill,
 zero price or cross-currency comparison is allowed. Seventeen consecutive matched
