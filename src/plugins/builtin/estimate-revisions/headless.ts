@@ -39,7 +39,7 @@ export const estimateRevisionsHeadless: HeadlessPaneDefinition<"bundle"> = {
     const symbol = args.symbols[0]!,
       instrument = await ctx.resolveInstrument?.(symbol);
     const data = await fetchEstimates(
-      instrument?.symbol ?? symbol,
+      symbol,
       instrument?.exchange ?? "",
       ctx.apiClient,
     );
