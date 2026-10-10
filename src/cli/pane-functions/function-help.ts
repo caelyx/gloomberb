@@ -38,12 +38,13 @@ export interface FunctionHelp {
   data: FunctionFreshness | null;
   /** The Bloomberg mnemonics it stands in for; empty when Bloomberg has none. */
   bloomberg: readonly string[];
-  /** The docs entry when it is filed under another mnemonic (BTST under BT). */
+  /** The docs entry when it is filed under another mnemonic (BTST under BT), or the full URL of a page of its own. */
   docs?: string;
 }
 
-/** The docs page's anchor for a mnemonic, as the page builds heading ids. */
+/** The docs page's anchor for a mnemonic, as the page builds heading ids, or a full docs URL as is. */
 export function functionDocsUrl(code: string): string {
+  if (code.startsWith("https://")) return code;
   const anchor = code.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   return anchor ? `${FUNCTION_DOCS_URL}#${anchor}` : FUNCTION_DOCS_URL;
 }
@@ -266,7 +267,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["OVDV"],
   },
   HIVG: {
-    summary: "Daily 30- and 90-day at-the-money implied vol since February 2024 against realized vol, with each measure's 52-week rank and percentile.",
+    summary: "Daily 30-day, 90-day and one-year at-the-money implied vol since February 2024 against realized vol, with each measure's 52-week rank and percentile.",
     usage: ["HIVG AAPL"],
     keys: [key("s", "urface")],
     data: IV_DAILY,
@@ -323,7 +324,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   VCA: {
-    summary: "IV rank, term slope, skew and IV against realized vol for up to 60 US tickers, flagged rich or cheap against each name's own year. Alone it screens index and sector ETFs.",
+    summary: "IV rank, one-year IV and its percentile, term slope, skew and IV against realized vol for up to 60 US tickers, flagged rich or cheap against each name's own year. Alone it screens index and sector ETFs.",
     usage: ["VCA", "VCA NVDA, AAPL, TSLA"],
     keys: [OPEN],
     data: IV_DAILY,
@@ -1127,6 +1128,14 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     keys: [],
     data: null,
     bloomberg: [],
+  },
+  MCP: {
+    summary: "Connects Claude Code, Codex, Cursor or any MCP client to Gloom's research tools: the command to copy, or a key to create.",
+    usage: ["MCP"],
+    keys: [key("c", "opy"), key("←/→", " client"), key("k", "ey")],
+    data: null,
+    bloomberg: [],
+    docs: "https://gloom.sh/docs/mcp",
   },
   BR: {
     summary: "Broker profiles, account sync and connection status. Every broker is a plugin you install first.",

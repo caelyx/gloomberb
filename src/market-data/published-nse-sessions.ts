@@ -18,3 +18,8 @@ export function isPublishedNseClosure(date: string): boolean {
 export function hasPublishedNseCalendar(year: number): boolean {
   return NSE_CLOSURES[year] !== undefined;
 }
+
+/** The years whose closures are published. */
+export function publishedYearsNse(): readonly number[] {
+  return Object.keys(NSE_CLOSURES).map(Number);
+}

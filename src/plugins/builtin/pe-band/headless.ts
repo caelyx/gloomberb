@@ -14,7 +14,7 @@ export const peBandHeadless: HeadlessPaneDefinition<"bundle"> = {
   freshness: { ...DAILY_CLOSES, basis: "daily closes and reported EPS" },
   describe: (args) => `PEB ${args.symbols[0] ?? ""}`,
   discovery: { screenshotReadiness: "live-dom", limitations: [
-    "Weekly closes. EPS reported in another currency than a dollar price is converted at daily FX closes; other currency pairs are not computed.",
+    "Weekly closes. EPS reported in another currency than the price is converted at daily FX closes, through the dollar when neither is USD.",
   ] },
   options: [
     { key: "lookbackYears", type: "integer", minimum: 0, maximum: 30, defaultValue: 10, description: "Years of history; 0 for all on record" },
@@ -28,12 +28,12 @@ export const peBandHeadless: HeadlessPaneDefinition<"bundle"> = {
       fx: inputs.fx, fxError: inputs.fxError });
     const current = model.current;
     const conversion = model.conversion;
-    const pairQuote = (rate: number) => {
-      const quote = fxPairQuote(conversion!.currency, rate);
+    const pairQuote = (close: { from: string; to: string; rate: number }) => {
+      const quote = fxPairQuote(close.from, close.to, close.rate);
       return `${quote.pair} ${quote.value.toPrecision(5)}`;
     };
     const reported = current?.step?.eps != null && conversion && current.step.currency === conversion.currency
-      ? `, from ${conversion.currency} ${amount(current.step.eps)} at ${pairQuote(conversion.latest.rate)} (${conversion.latest.date} close)` : "";
+      ? `, from ${conversion.currency} ${amount(current.step.eps)} at ${pairQuote(conversion.latest)} (${conversion.latest.date} close)` : "";
     return {
       sections: [
         { title: "P/E band", columns: [{ key: "label", header: "" }, { key: "value", header: "Value" }], rows: [
@@ -53,14 +53,15 @@ export const peBandHeadless: HeadlessPaneDefinition<"bundle"> = {
           { key: "yoy", header: "YoY", format: percent }, { key: "price", header: "Price", format: amount }, { key: "pe", header: "P/E", format: multiple }],
         rows: model.rows.map((row) => ({ periodEnd: row.periodEnd, basis: row.basis === "annual" ? "FY" : "TTM",
           knownAt: row.dated ? row.knownAt.toISOString().slice(0, 10) : "period end", eps: row.eps,
-          ...(conversion ? { currency: row.currency, fx: row.fx ? `${pairQuote(row.fx.rate)} (${row.fx.date})` : row.currency === model.currency ? "" : "--" } : {}),
+          ...(conversion ? { currency: row.currency, fx: row.fx ? `${pairQuote(row.fx)} (${row.fx.date})` : row.currency === model.currency ? "" : "--" } : {}),
           yoy: row.yoy, price: row.price, pe: row.pe })) },
       ],
       complete: !inputs.stale && !inputs.error && !inputs.historyError && !model.error,
       unavailableSymbols: current?.pe != null ? [] : [instrument.symbol],
       errors: [inputs.error, inputs.historyError, model.error, model.notice].filter((value): value is string => !!value),
       metadata: { currency: model.currency, lookbackYears,
-        epsConversion: conversion ? { from: conversion.currency, to: model.currency, usdPerUnit: conversion.latest.rate, latestClose: conversion.latest.date,
+        epsConversion: conversion ? { from: conversion.currency, to: conversion.latest.to, rate: conversion.latest.rate,
+          ...(conversion.latest.to === "USD" ? { usdPerUnit: conversion.latest.rate } : {}), latestClose: conversion.latest.date,
           basis: "daily FX close on or before each date: a week's bar date for the band, the publication date for each table row, the latest completed close for the current P/E" } : null,
         sampleStart: model.sample?.start.toISOString().slice(0, 10) ?? null, sampleWeeks: model.sample?.weeks ?? 0, multiples: model.multiples, undatedEpsPeriods: model.undated, unavailableTtmSums: model.unavailable,
         stale: inputs.stale, fetchedAt: inputs.fetchedAt, methodology: "docs/research-data.md#pe-band" },

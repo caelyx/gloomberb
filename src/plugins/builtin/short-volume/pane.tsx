@@ -13,8 +13,9 @@ import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { SignInWall } from "../cloud/auth-actions";
 import { isCloudSessionRequired, useResearchCloudSession } from "../shared/research-cloud-session";
 import { cachedShortVolume, loadShortVolume } from "./client";
-import { exactQuantity, sortedVolumeHistory, VOLUME_COLUMNS, volumeChange, volumeHistoryPoints, volumePercent, volumePointStatus, volumeQuantity, type VolumeColumn, type VolumeSort } from "./model";
+import { exactQuantity, NON_US_LISTING_MESSAGE, sortedVolumeHistory, VOLUME_COLUMNS, volumeChange, volumeHistoryPoints, volumePercent, volumePointStatus, volumeQuantity, type VolumeColumn, type VolumeSort } from "./model";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
+import { isKnownNonUsListing, isKnownNonUsListingSymbol } from "../../../utils/sec";
 
 const DETAIL_LABEL_WIDTH = 26;
 const rowDate = (row: ShortVolumeObservation) => row.ratioPercent == null ? null : new Date(row.date);
@@ -42,7 +43,9 @@ export function ShortVolumePane({ width, height, focused }: Pick<PaneProps, "wid
   const [sourceSymbol] = usePaneSettingValue("finraSymbol", "");
   const [scopeValue] = usePaneSettingValue("shortVolumeScope", "nms");
   const scope = scopeValue === "otc" ? "otc" : "nms";
-  const symbol = sourceSymbol.trim() || listingIdentity(ticker?.metadata.ticker)?.symbol || null;
+  // Without an override, a known non-US listing has nothing FINRA reports; do not ask for it under its US-style symbol.
+  const nonUsListing = !sourceSymbol.trim() && (isKnownNonUsListing(ticker) || isKnownNonUsListingSymbol(ticker?.metadata.ticker ?? ""));
+  const symbol = nonUsListing ? null : sourceSymbol.trim() || listingIdentity(ticker?.metadata.ticker)?.symbol || null;
   const session = useResearchCloudSession();
   const loader = useCallback((force: boolean) => loadShortVolume(symbol!, scope, force), [symbol, scope, session.requestKey]);
   const resource = useAsyncResource(symbol ? loader : null, {
@@ -87,6 +90,7 @@ export function ShortVolumePane({ width, height, focused }: Pick<PaneProps, "wid
     stale: !!data && resource.data?.stale,
   });
   if (!data && isCloudSessionRequired(resource.error)) return <SignInWall placement="short-volume-signin" action="view daily short volume" needsVerification={session.needsVerification} />;
+  if (nonUsListing) return <EmptyState title="US equities only" message={NON_US_LISTING_MESSAGE} />;
   if (!symbol) return <EmptyState title="No ticker selected." message="Select a ticker to view daily short volume." />;
   return <Box flexDirection="column" width={width} height={height}>
     <PaneStatusBody loading={resource.loading && !data} error={!data ? resource.error : null} subject="daily short volume"

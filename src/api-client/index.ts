@@ -425,6 +425,8 @@ class GloomApiClient {
   async recordExperimentExposure(payload: {
     eventId: string; surface: "web" | "desktop" | "tui" | "cli"; anonymousId?: string;
     attribution?: Record<string, string>; experiment: string; variant?: string;
+    /** Where the experiment showed, by a content-free id like an upgrade placement. */
+    placement?: string;
   }, signal?: AbortSignal): Promise<import("./web-experiments").ExperimentAnswer> {
     return this.request("/activity/research", {
       method: "POST",
@@ -441,6 +443,7 @@ class GloomApiClient {
   getCalendarFeed = this.auth.getCalendarFeed.bind(this.auth);
   ensureCalendarFeed = this.auth.ensureCalendarFeed.bind(this.auth);
   rotateCalendarFeed = this.auth.rotateCalendarFeed.bind(this.auth);
+  createMcpKey = this.auth.createMcpKey.bind(this.auth);
 
   async getSyncSnapshot(): Promise<CloudSyncSnapshotResponse> {
     return this.request<CloudSyncSnapshotResponse>("/sync/snapshot", { method: "GET" });
@@ -671,6 +674,10 @@ class GloomApiClient {
   subscribeTeamUpdates = this.teams.subscribeTeamUpdates.bind(this.teams);
   subscribeTeamNotifications = this.teams.subscribeTeamNotifications.bind(this.teams);
   subscribeCloudEvent = this.teams.subscribeCloudEvent.bind(this.teams);
+  /** The Cloud socket's own lifecycle and frames, for protocols layered on it (the terminal relay). */
+  subscribeSocketConnection = this.socket.subscribeConnection.bind(this.socket);
+  sendSocketFrame = this.socket.sendFrame.bind(this.socket);
+  socketServerOffers = this.socket.serverOffers.bind(this.socket);
   listCloudNotes = this.notes.listNotes.bind(this.notes);
   getCloudNote = this.notes.getNote.bind(this.notes);
   putCloudNote = this.notes.putNote.bind(this.notes);

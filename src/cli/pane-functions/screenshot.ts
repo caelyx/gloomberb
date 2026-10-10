@@ -86,6 +86,7 @@ import {
   clipPriceHistoryToRange,
   createFallbackTicker,
   fetchTickerFinancials,
+  loadBrokerMarkedHolding,
   isFinancialAnalysisFunction,
   readsDailyReturns,
   withShotDailyReturns,
@@ -528,7 +529,7 @@ export async function buildDesktopShotPayload(
     shotInstance = { ...shotInstance, settings: { ...shotInstance.settings, ...prepared.settings } };
     for (const [symbol, data] of prepared.financials ?? []) {
       financials.push([symbol, data]);
-      tickers.push(createFallbackTicker(symbol, data, context));
+      tickers.push(await createFallbackTicker(symbol, data, context));
     }
   } else if (resolved.pane.id === "analytics") {
     const loaded = await loadResolvedHeadlessPaneModel(resolved, context, rawArg);
@@ -554,13 +555,23 @@ export async function buildDesktopShotPayload(
       if (!target.instrument) financials.push([label, data]);
       const { symbol } = parsePublicTickerKey(key);
       const ticker = await context.store.loadTicker(key) ?? await context.store.loadTicker(symbol);
-      tickers.push(ticker ?? createFallbackTicker(key, data, context));
+      tickers.push(ticker ?? await createFallbackTicker(key, data, context));
     }
     intradayHistories.push(...chartModel.snapshot.intradayHistories.map((history) => ({
       ...history, start: history.start?.toISOString() ?? null, end: history.end?.toISOString() ?? null,
     })));
   } else for (const symbol of await collectShotSymbolsWithCollections(resolved, context, rawArg)) {
-    const entry = await fetchTickerFinancials(context, symbol);
+    let entry: Awaited<ReturnType<typeof fetchTickerFinancials>>;
+    try {
+      entry = await fetchTickerFinancials(context, symbol);
+    } catch (error) {
+      // The pane values a holding no quote covers, such as an option contract,
+      // at the broker's mark. It has no financials to capture.
+      const holding = COLLECTION_PANE_IDS.has(resolved.pane.id) ? await loadBrokerMarkedHolding(context, symbol) : null;
+      if (!holding) throw error;
+      tickers.push(holding);
+      continue;
+    }
     const requestedRange = shotPriceHistoryRange(resolved);
     let data = entry.financials;
     const exchange = entry.instrument.exchange
@@ -603,7 +614,7 @@ export async function buildDesktopShotPayload(
       // letting the pane fetch them.
       data = await withShotPriceHistory(context, symbol, entry.tickerFile, data);
     }
-    tickers.push(entry.tickerFile ?? createFallbackTicker(symbol, data, context));
+    tickers.push(entry.tickerFile ?? await createFallbackTicker(symbol, data, context));
     financials.push([symbol, data]);
     if (resolved.pane.id === "time-sales") {
       tapeSnapshots.push([entry.instrument.symbol, exchange, await fetchTape(entry.instrument.symbol, exchange)]);

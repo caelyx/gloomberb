@@ -77,9 +77,10 @@ describe("P/E band", () => {
     expect(projectPeBand(taiwan, weeks, { symbol: "X", lookbackYears: 10 }).error).toBe("EPS is reported in TWD and the price is in USD.");
     expect(projectPeBand(taiwan, weeks, { symbol: "X", lookbackYears: 10, fx: new Map(), fxError: "daily TWD FX closes are stale" }).error)
       .toBe("EPS is reported in TWD and the price is in USD; daily TWD FX closes are stale.");
-    // A pound price has no dollar leg to cross through, so Taiwan dollars stay unconverted however many closes there are.
-    expect(projectPeBand({ ...taiwan, quote: { price: 140, currency: "GBP" } as Quote }, weeks, { symbol: "X", lookbackYears: 10, fx: new Map() }).error)
-      .toBe("EPS is reported in TWD and the price is in GBP.");
+    // A pound price crosses through the dollar, so it needs the pound's closes as well as the Taiwan dollar's.
+    const twdOnly = new Map([["TWD", { currency: "TWD", closes: new Map([["2026-01-30", 1 / 30]]), first: "2026-01-30", asOf: "2026-01-30" }]]);
+    expect(projectPeBand({ ...taiwan, quote: { price: 140, currency: "GBP" } as Quote }, weeks,
+      { symbol: "X", lookbackYears: 10, now: Date.parse("2026-02-01"), fx: twdOnly }).error).toBe("EPS is reported in TWD and the price is in GBP.");
   });
 
   test("dollar prices convert foreign EPS at the FX close of each week, of each publication and of today", () => {
@@ -99,7 +100,7 @@ describe("P/E band", () => {
     expect(model.weeks.map((week) => week.eps)).toEqual([0.4, 0.4, 0.5]);
     expect(model.weeks.map((week) => week.pe)).toEqual([20, 20, 16]);
     expect(model.current).toMatchObject({ price: 10, eps: 0.5, pe: 20 });
-    expect(model.conversion).toEqual({ currency: "TWD", latest: { date: "2026-01-30", rate: 1 / 20 } });
+    expect(model.conversion).toEqual({ currency: "TWD", latest: { date: "2026-01-30", rate: 1 / 20, from: "TWD", to: "USD" } });
     // The table row keeps the reported figure and converts it at the close of the day it became known.
     expect(model.rows[0]).toMatchObject({ periodEnd: "2025-12-31", eps: 10, fx: { date: "2025-12-31", rate: 1 / 25 } });
     // A week before the first FX close has no dollar EPS, so no P/E, rather than one at a later rate.
@@ -172,5 +173,39 @@ describe("P/E band", () => {
     const covered = trailingEpsSteps(financials(quarters), [{ date: "2024-08-01", fiscalPeriod: "2024-06", reportedAt: null }]);
     expect(covered.map((step) => [step.periodEnd, step.dated, step.knownAt.toISOString().slice(0, 10)]))
       .toEqual([["2024-09-30", true, "2024-11-01"], ["2024-12-31", true, "2025-02-06"]]);
+  });
+
+  test("a price in another currency than the dollar converts dollar EPS at its own pair, and pence take the pound rate times 100", () => {
+    // USD 10 of trailing EPS. The Australian dollar is worth 0.625 dollars, then 0.5 from 2026-01-12.
+    const quarters = ["2025-03-31", "2025-06-30", "2025-09-30", "2025-12-31"].map((date) => quarter(date, 2.5, date));
+    const closes = (rate: (date: string) => number) => {
+      const map = new Map<string, number>();
+      for (let time = Date.parse("2025-12-29"); time <= Date.parse("2026-01-30"); time += 86_400_000) {
+        const date = new Date(time).toISOString().slice(0, 10);
+        if (![0, 6].includes(new Date(time).getUTCDay())) map.set(date, rate(date));
+      }
+      return { closes: map, first: "2025-12-29", asOf: "2026-01-30" };
+    };
+    const aud = { currency: "AUD", ...closes((date) => (date < "2026-01-12" ? 0.625 : 0.5)) };
+    const weeks = ["2026-01-04", "2026-01-11", "2026-01-18"].map((date) => ({ date: new Date(date), close: 240 }));
+    const options = { symbol: "BHP.AX", lookbackYears: 10, now: Date.parse("2026-02-01"), fx: new Map([["AUD", aud]]) };
+    const model = projectPeBand(financials(quarters, [], { price: 240, currency: "AUD" }), weeks, options);
+    // 10 / 0.625 = AUD 16 of EPS, then 10 / 0.5 = AUD 20.
+    expect(model.weeks.map((week) => week.eps)).toEqual([16, 16, 20]);
+    expect(model.current).toMatchObject({ eps: 20, pe: 12 });
+    expect(model.conversion).toEqual({ currency: "USD", latest: { date: "2026-01-30", rate: 2, from: "USD", to: "AUD" } });
+    expect(model.rows[0]).toMatchObject({ eps: 10, fx: { date: "2025-12-31", rate: 1.6 } });
+
+    // A pence price: USD 10 at 1.25 dollars to the pound is GBP 8, 800 pence.
+    const gbp = { currency: "GBP", ...closes(() => 1.25) };
+    const pence = projectPeBand(financials(quarters, [], { price: 4000, currency: "GBp" }), weeks.map((week) => ({ ...week, close: 4000 })),
+      { ...options, fx: new Map([["GBP", gbp]]) });
+    expect(pence.current).toMatchObject({ eps: 800, pe: 5 });
+    // Neither side the dollar: euro EPS against the pound, crossed through each one's dollar close.
+    const euro = financials(quarters.map((row) => ({ ...row, currency: "EUR" })), [], { price: 4000, currency: "GBp" });
+    const cross = projectPeBand(euro, weeks, { ...options, fx: new Map([["GBP", gbp], ["EUR", { currency: "EUR", ...closes(() => 1.1) }]]) });
+    expect(cross.conversion?.latest).toMatchObject({ from: "EUR", to: "GBP" });
+    expect(cross.conversion?.latest.rate).toBeCloseTo(0.88, 12);
+    expect(cross.current?.eps).toBeCloseTo(880, 9);
   });
 });

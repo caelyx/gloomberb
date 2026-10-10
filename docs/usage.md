@@ -14,6 +14,7 @@
 - [Cash, target weights and rebalancing](#cash-target-weights-and-rebalancing)
 - [Broker position sync](#broker-position-sync)
 - [Gloom Cloud sign-in](#gloom-cloud-sign-in)
+- [Connect an AI assistant (MCP)](#connect-an-ai-assistant-mcp)
 - [Debt maturities](#debt-maturities)
 - [Theses](#theses)
 - [Interface language](#localized-interface)
@@ -104,6 +105,8 @@ Use `HELP` inside Gloomberb for the live shortcut list. The common command-bar p
 ### Searching by asset class
 
 Text that no command claims searches symbols and names, and every result carries its class: `EQ` equity (receipts, preferred shares and partnership units included), `ETF` exchange-traded fund, `FUND` any other fund (mutual, closed-end or money-market), `CUR` currency pair, `CRYP` coin, `FUT` future, `IDX` index, `OPT` option, and `DERIV` for other derivatives. End a search with one of those codes, other than `DERIV`, to keep only that class, the way a market sector key follows a ticker: `ES FUT` finds the E-mini S&P 500 future rather than Eversource, `EURUSD CUR` the currency pair, `BTC CRYP` the coin, `SPY ETF` the fund, `S&P 500 IDX` the index. `CUR` keeps coins as well (`BTC CUR`), and `FUND` keeps exchange-traded funds as well, so a fund's full name (`Technology Select Sector SPDR Fund`) still finds it. For `FUT`, `CUR`, `CRYP` and `IDX` a bare symbol is also looked up in its market spelling (`ES=F`, `EURUSD=X`, `BTC-USD`, `^GSPC`), which symbol search does not return for the bare letters. `AAPL OPT` lists option contracts when a connected broker returns them. A code on its own, or first, is not a filter: `EQ` searches that symbol, and `FUT`, `CRYP` and `ETF SPY` open their panes. The filter works the same in ticker search (`` ` ``) and after `DES`.
+
+A symbol that trades in several places lists its exchanges after a colon: `NET:` shows each one, your saved listing first and the rest in search order. Letters after the colon narrow the list (`NET:L` keeps exchanges whose name or code starts with L), and `NET:XLON` names one listing.
 
 ### Company Research
 
@@ -349,11 +352,12 @@ FUT's 1W, 1M and YTD columns are returns on the contract the row names (LEZ26 fo
 | `CONN` | Connection health |
 | `POLL` | Political polls from VoteHub ([Polls plugin](https://github.com/gloom-sh/gloom-polls)) |
 | `UPGRADE` | Account upgrade |
+| `MCP` | Connect Claude Code, Codex, Cursor or another MCP client to Gloom |
 | `CR` | Cycle chart renderer |
 | `LANG <locale>` | Change interface language (`auto`, `en`, `es`, `zh-CN`, `zh-TW`, `ja`, or `ko`) |
 | `PL <plugin>` | Manage plugins |
 
-In `PF`, `a` adds a ticker to the open manual portfolio or watchlist and `d` removes the selected one after a confirm. Removing it from a portfolio deletes its position there; its notes, alerts and other lists stay. Broker portfolios have no `d`, since the next sync would put the ticker back, and neither do team lists, which everyone on the team shares; `RW` and `RP` still edit a team list.
+In `PF`, `a` adds a ticker to the open manual portfolio or watchlist and `d` removes the selected one after a confirm. Removing it from a portfolio deletes its position there; its notes, alerts and other lists stay. Broker portfolios have no `d`, since the next sync would put the ticker back, and neither do team lists, which everyone on the team shares; `RW` and `RP` still edit a team list. In the add row, a symbol with a colon (`NET:`) opens that symbol's exchanges, and the one you pick joins the open portfolio or watchlist.
 
 `gloomberb fn PF <portfolio-or-watchlist> --json` returns a portfolio's positions, broker or manual, valued as `gloomberb portfolio show` values them: quantity, average cost, last price, market value and unrealized P&L in the portfolio's currency, and weight of the total with cash (see [Cash, target weights and rebalancing](#cash-target-weights-and-rebalancing)), largest first, then the cash line. With target weights set, each row adds its target, drift and the trade that reaches it. `--limit` caps the rows (50 by default, at most 200); the totals always cover every position. Name the portfolio or watchlist by its ID or its name; without one it reads your first portfolio. A watchlist returns its tickers with their quotes.
 
@@ -476,6 +480,8 @@ In short DVD panes, the summary scrolls separately so cash history stays visible
 
 `gloomberb config set telemetry.crashReports false` turns off automatic crash reports, and `gloomberb config set telemetry.usage false` turns off anonymous usage counts and the command bar search log; see [Crash reports and usage counts](../README.md#crash-reports-and-usage-counts) for what each contains.
 
+On the third day you open the terminal app, after a minute on screen, the status bar asks once to star Gloomberb on GitHub. The notification key (`Alt+Enter`) opens the repository in your browser, the dismiss key (`Alt+Backspace`) or the × hides the line, and it goes away by itself after five minutes. Whichever happens, it never comes back. It never shows in the desktop or web app, in CI, or when the app's input or output is not a terminal. `gloomberb config set starPrompt.enabled false` turns it off before it ever shows.
+
 ### CSV and NDJSON from reports
 
 `gloomberb fn <function> --csv` writes the report's table as flat rows a spreadsheet can open: the header is the columns the text report shows (`Index,Name,Last,Change,Change %`), and every cell is a plain value, never a JSON blob. Numbers carry no thousands separators, compact scales or units: `1.20B` is `1200000000`, `+3.45%` is `3.45`, and the unit moves into the header (`Yield (%)`, `Market cap ($)`). A table of metrics, one per row, names each row's unit in its label instead (`Total return (%)`), and a column that mixes units (a rate in % beside a spread in bp) is followed by a `<column> unit` column. Times are ISO 8601 with their zone; a date stays a date. A value the text draws from a fraction exports as drawn, so a 6.15% yield is `6.15`; series values keep their own unit's scale (`Value (%)`, `Value (bp)`).
@@ -576,9 +582,23 @@ An independent current bond quote must declare its own price basis. A percent-of
 
 Sign in with email and password, or pick `Log In with QR Code` from the command bar and scan the code with the Gloomberb mobile companion app to sign the terminal in without typing. The onboarding wizard offers the same QR option as the recommended path, with email and password as the alternative.
 
+## Connect an AI assistant (MCP)
+
+`MCP` opens a short setup for the [Gloom MCP server](https://gloom.sh/docs/mcp); typing mcp, claude, codex or cursor in the command bar finds it too, and so does `ACM` > Advanced > Assistants (MCP). Pick the client and copy its one command or config with `c` or Copy.
+
+Claude Code, Cursor and most recent clients sign in through your browser on first use, so they need no key. Codex, and clients without a browser, use a key: `k` creates one through your Gloom Cloud account (Pro) and fills it into every snippet. The key is shown once and saved nowhere, so copy it before you close the dialog. Keys made here get Read access; to choose another level or revoke a key, use Cloud settings, Agents on gloom.sh.
+
+## Remote control from an assistant
+
+An assistant connected to the Gloom Cloud MCP with Terminal control (Cloud settings, Agents) can drive this app while it is open and signed in: read what is on screen, open and arrange panes, navigate tickers, switch layouts, everything the local remote API offers. It needs no setup in the app.
+
+The first time an assistant asks, a prompt names it: `s` allows it for this session, `a` always, `n` or Esc denies. Plugin actions, button presses, commands and anything that reaches an outside service (an order, a transfer, a message) then ask on every call, with what the call will do and its key arguments; `y` allows that one call, and one left unanswered for 60 seconds is denied. Deleting a layout asks too, since it cannot be undone. While an assistant works, its name shows in the status bar; a click opens Account Management on the Agents tab, where `r` revokes it so its next call asks again. The `MCP` dialog says how many assistants are allowed, and `m` opens the same tab. Revoking its key or disconnecting it in Cloud settings does the same. Credentials in the configuration never leave the app.
+
 ## Chat
 
 `CHAT [channel]` opens a channel. When the pane is too narrow or short for the channel list beside it, the list and the open channel take turns: Back, Esc, Backspace, Left or the mouse back button return to the list, and Enter, Right or a click opens a channel. Pointing at a name or an @mention shows that person's card: their public profile if they made it public, otherwise their name and @username. On the desktop and the web the card opens just below the name, so the pointer can move straight onto it; in the terminal it sits in the chat's top-right corner. It stays open while the pointer is on it. Someone else's card has Message (Open DM when you already share one); a card with only a name says why instead when they take no DM from you. A click on the name keeps the card open until Esc, a click outside it or a second click; `p` shows the card of the selected message's author.
+
+Your channels and DMs are in the command bar too. Type part of a channel's name (`gen` for #general) or of a person's username or name to find the conversation: channels are tagged `CHAT`, team channels `TEAM`, DMs `DM` and group chats `GROUP`, and a conversation with unread messages shows how many. Picking one shows it in the Chat pane that is open, or opens one, with the message field ready to type in. The empty command bar lists a few conversations, unread ones first and then your latest DMs; `chat` or `messages` alone lists them all and `DM` your DMs and group chats, each ending with New DM, which opens the Chat pane's New DM dialog. `CHAT gen` opens the conversation listed first for `gen` when no channel is called that. The rows come from what the chat already holds, so signed out there are none.
 
 Public channels are mirrored to the Gloom Discord, and messages written there appear with a dim `Discord` tag after the author's name. Someone on Discord who has not linked a Gloom account has no card and cannot be messaged. Type `/discord` in the message field to connect your Discord account (it opens gloom.sh in your browser, which signs you in and then asks Discord to approve), and `/discord mirror off` to stop your own messages going to Discord (`/discord mirror on` turns it back on, `/discord unlink` disconnects the account). A message written on Discord can only be edited there.
 
@@ -617,6 +637,24 @@ Gloomberb includes English, Spanish, Simplified Chinese, Traditional Chinese, Ja
 - **One-run override:** `GLOOMBERB_LANG=ja gloomberb` (or another supported locale) takes highest priority in environments that expose process locale variables.
 
 ## Market and macro plugins
+
+Ticker Research, Market Overview and Macro are split into smaller plugins you can switch separately in `PL`, with the same panes, shortcuts, settings and saved state:
+
+- Ticker Research, the research pane and its core: DES, FA, QQ, HP, RETURN, the G charts, CAT, ANR, DIAG, EVT, RV, EE, EM, GUID, KPIS, GUIDE, SEG, DVD, RDCF, PEB, EXEC and TAS.
+- Options & Volatility: OMON, OPX, GEX, OVME, OSA, OVDV, HVG, HVT, HIVG and VCA.
+- Ownership & Insiders: HDS, 13F, INS, SI, SIW, SIV and the Congress tab.
+- Filings & Events: SEC, ETF, RISK, EK, CATL, LITI, MA and DIST.
+- Credit & Bonds: CDS, CDX, SOVR, CRD, AUCT, YAS, CRDOC, COVN and DDIS.
+- Earnings: ERN, EVTS, CALLS and RIPL.
+- Supply Chain & Alt Data: SPLC, EXPO, AWARDS, HIRE, APPS, JOBS, BUZZ, ATTN and the Gloom Trending pane, GPU and POWER.
+- Quant: CORR, GR, BT, SEAS and MDAY.
+- Rates & Macro: ECO, ECST, CPI, GC, WIRP, BTMM, CBR, VIX, VOLS and VAL.
+- Global Markets: WEI, MAP, CHOKE, BI, THEM, FXC and RRG.
+- Screeners & Movers: EQS, MOST, HILO and FLOW.
+- Futures & Commodities: FUT, CTM, COT, DOE and NGS.
+- Crypto & Perps: CRYP and PERP.
+
+A tab in the research pane belongs to the plugin of its function, so switching off Ownership & Insiders removes the Holders, 13F, Insider, Short Interest and Congress tabs. If Ticker Research, Market Overview or Macro was switched off, all of its successors start off; Credit & Bonds and Earnings hold functions from both Ticker Research and Macro, and Supply Chain & Alt Data and Quant from both Ticker Research and Market Overview, so either one switched off turns them off. `gloomberb plugin disable ticker-research` (or `macro`, `market-overview`) switches all of its successors together. An older Gloomberb signed in to the same account shows the old plugin off only while all of its successors are off.
 
 Polls lives in its own repository rather than inside the app. It reads one third-party site directly, so the plugin can ship a fix the day that site changes instead of waiting for an app release.
 

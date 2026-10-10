@@ -1,6 +1,6 @@
 import type { MarketState } from "../../types/financials";
 import { canonicalExchange, EXCHANGE_TIME_ZONES, isUsListingExchange } from "../../utils/exchanges";
-import { hasPublishedApacCalendar, isPublishedApacClosure } from "../published-apac-sessions";
+import { hasPublishedApacCalendar, isPublishedApacClosure, isPublishedApacEarlyClose } from "../published-apac-sessions";
 import { hasPublishedCnCalendar, isPublishedCnClosure } from "../published-cn-sessions";
 import { hasPublishedJpxCalendar, isPublishedJpxClosure } from "../published-jpx-sessions";
 import { hasPublishedNseCalendar, isPublishedNseClosure } from "../published-nse-sessions";
@@ -95,6 +95,11 @@ const REGULAR_CLOSE_MINUTES: Record<string, number> = {
 // Pesach are not weekly and are not listed.
 const WEEKDAY_CLOSE_MINUTES: Record<string, Partial<Record<number, number>>> = {
   TASE: { 5: 13 * 60 + 50 },
+};
+// Close on a venue's published early-close days, on the rounded-up basis
+// above: ASX's 14:10 closing auction, as 16:10 is to 16:15.
+const EARLY_CLOSE_MINUTES: Record<string, number> = {
+  ASX: 14 * 60 + 15,
 };
 // Venues that pause at midday, as local minutes [start, end), with a zone for
 // those the session tables above do not cover. Jakarta pauses longer on Fridays.
@@ -234,6 +239,8 @@ function localWeekday(date: string): number | null {
 
 /** The local close of the venue's regular session on `date`, in minutes of the day. */
 function regularCloseMinutes(exchange: string, date: string): number | undefined {
+  const early = EARLY_CLOSE_MINUTES[exchange];
+  if (early !== undefined && isPublishedApacEarlyClose(exchange, date)) return early;
   const weekday = localWeekday(date);
   return (weekday == null ? undefined : WEEKDAY_CLOSE_MINUTES[exchange]?.[weekday]) ?? REGULAR_CLOSE_MINUTES[exchange];
 }
@@ -469,20 +476,35 @@ export function isUsRegularCloseQuoteInPostSession(
 }
 
 /**
- * Whether a US print belongs to the after-hours session in progress: today's,
- * from the regular close. An earlier day's after-hours print is not.
+ * Whether a US print belongs to the extended-hours session the source labels,
+ * or to the regular session it extends. POST, after today's regular close (a
+ * published early close included) and before 20:00: a print from today's
+ * regular session or its after-hours. PRE, before today's open: a print from
+ * the previous regular session or since, so its after-hours or this morning's
+ * pre-market. An earlier print is not, and neither is any print on a day
+ * without a session.
  */
-export function isUsPostSessionPrint(
+export function isUsExtendedHoursSessionPrint(
   timestampMs: number,
   exchange: string | undefined,
+  marketState: MarketState | undefined,
   now = Date.now(),
 ): boolean {
   const canonical = canonicalExchange(exchange);
-  if (!isUsListingExchange(canonical)) return false;
+  if ((marketState !== "PRE" && marketState !== "POST") || !isUsListingExchange(canonical)) return false;
   if (!Number.isFinite(timestampMs) || !Number.isFinite(now) || timestampMs > now + quoteFutureToleranceMs()) return false;
-  if (!Number.isFinite(new Date(now).getTime()) || usSessionState(now) !== "POST") return false;
-  const currentDate = exchangeLocalDate(canonical, now);
-  return !!currentDate && exchangeLocalDate(canonical, timestampMs) === currentDate && usSessionState(timestampMs) === "POST";
+  if (!Number.isFinite(new Date(now).getTime())) return false;
+  const today = exchangeLocalDate(canonical, now);
+  const close = latestRegularSessionClose(canonical, now);
+  if (!today || !close || !isLocalTradingDay(canonical, today)) return false;
+  const session = usSessionState(now);
+  const closedToday = close.date === today;
+  if (marketState === "POST" ? !closedToday || (session !== "REGULAR" && session !== "POST") : closedToday || session !== "PRE") {
+    return false;
+  }
+  // The open of the session that closed last: today's after the close, the previous one before the open.
+  const open = latestRegularSessionOpen(canonical, close.close);
+  return open != null && timestampMs >= open;
 }
 
 export function isTimestampStaleForExchangeSession(

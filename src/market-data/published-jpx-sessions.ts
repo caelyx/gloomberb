@@ -20,3 +20,8 @@ export function isPublishedJpxClosure(date: string): boolean {
 export function hasPublishedJpxCalendar(year: number): boolean {
   return JPX_CLOSURES[year] !== undefined;
 }
+
+/** The years whose closures are published. */
+export function publishedYearsJpx(): readonly number[] {
+  return Object.keys(JPX_CLOSURES).map(Number);
+}

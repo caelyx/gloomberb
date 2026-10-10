@@ -23,3 +23,8 @@ export function isPublishedCnClosure(date: string): boolean {
 export function hasPublishedCnCalendar(year: number): boolean {
   return CN_CLOSURES[year] !== undefined;
 }
+
+/** The years whose closures are published. */
+export function publishedYearsCn(): readonly number[] {
+  return Object.keys(CN_CLOSURES).map(Number);
+}

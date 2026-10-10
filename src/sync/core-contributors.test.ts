@@ -11,7 +11,6 @@ import {
   coreConfigSyncContributor,
 } from "./core-contributors";
 import { setSyncedProfileAnalytics } from "./profile-analytics";
-import { setBuiltinPluginGroupsForTests } from "../plugins/ownership";
 import { createTestTicker } from "../test-support/ticker";
 import { createTestFinancials } from "../test-support/data-provider";
 
@@ -97,7 +96,7 @@ describe("core sync contributors", () => {
     const layouts = config.layouts.map((savedLayout) => savedLayout);
 
     const merged = __syncContributorInternalsForTests.mergeConfigPayload(config, {
-      disabledPlugins: ["analytics", "kelly-sizer", "changelog", "macro-tv"],
+      disabledPlugins: ["analytics", "kelly-sizer", "changelog"],
       pluginConfig: {
         analytics: { metric: "beta", shared: "legacy" },
         portfolio: { shared: "canonical" },
@@ -108,7 +107,7 @@ describe("core sync contributors", () => {
       activeLayoutIndex: config.activeLayoutIndex,
     });
 
-    expect(merged?.disabledPlugins).toEqual(["portfolio", "macro"]);
+    expect(merged?.disabledPlugins).toEqual(["portfolio"]);
     expect(merged?.pluginConfig).toEqual({
       portfolio: { metric: "beta", shared: "canonical" },
       application: { section: "shortcuts" },
@@ -195,25 +194,72 @@ describe("core sync contributors", () => {
     }
   });
 
-  test("a retired plugin id round-trips through sync with older apps as its group", async () => {
-    setBuiltinPluginGroupsForTests({ macro: ["rates-macro", "credit", "earnings"] });
-    try {
-      const config = createDefaultConfig("/tmp/gloomberb-sync-group-test");
-      // An older app pushes Macro off, under the module id it once had or its own.
-      for (const pushed of [["macro"], ["macro-tv"]]) {
-        const merged = __syncContributorInternalsForTests.mergeConfigPayload(config, { disabledPlugins: pushed });
-        expect(merged?.disabledPlugins).toEqual(["rates-macro", "credit", "earnings"]);
-        // All of it off goes back out as the one id the older app knows.
-        const payload = await coreConfigSyncContributor.collect({ state: createInitialState(merged!) }) as any;
-        expect(payload.disabledPlugins).toEqual(["macro"]);
-      }
+  test("Macro round-trips through sync with apps from before it was split", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-sync-group-test");
+    const pull = (disabledPlugins: string[]) => (
+      __syncContributorInternalsForTests.mergeConfigPayload(config, { disabledPlugins })?.disabledPlugins
+    );
+    const push = async (disabledPlugins: string[]) => (
+      (await coreConfigSyncContributor.collect({ state: createInitialState({ ...config, disabledPlugins }) }) as any).disabledPlugins
+    );
+    const all = ["rates-macro", "credit", "earnings"];
 
-      config.disabledPlugins = ["credit"];
-      const partial = await coreConfigSyncContributor.collect({ state: createInitialState(config) }) as any;
-      expect(partial.disabledPlugins).toEqual(["credit"]);
-    } finally {
-      setBuiltinPluginGroupsForTests(null);
-    }
+    // An older app turns Macro off, under its own id or the one TV had inside it.
+    expect(pull(["macro"])).toEqual(all);
+    expect(pull(["macro-tv"])).toEqual(all);
+    // A module that was once a plugin of its own stays with the successor holding it.
+    expect(pull(["earnings-calendar"])).toEqual(["earnings"]);
+    // Turning Macro off there over one successor already off here.
+    expect(pull(["credit", "macro"])).toEqual(["credit", "rates-macro", "earnings"]);
+
+    // All three off goes out as the one id the older app knows; fewer go out as themselves.
+    expect(await push(all)).toEqual(["macro"]);
+    expect(await push(["credit"])).toEqual(["credit"]);
+    expect(await push(["credit", "earnings"])).toEqual(["credit", "earnings"]);
+    // So turning Macro back on there drops `macro`, and all three come back.
+    expect(pull((await push(all)).filter((pluginId: string) => pluginId !== "macro"))).toEqual([]);
+  });
+
+  test("Ticker Research round-trips through sync with apps from before it was split", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-sync-ticker-research-test");
+    const pull = (disabledPlugins: string[]) => (
+      __syncContributorInternalsForTests.mergeConfigPayload(config, { disabledPlugins })?.disabledPlugins
+    );
+    const push = async (disabledPlugins: string[]) => (
+      (await coreConfigSyncContributor.collect({ state: createInitialState({ ...config, disabledPlugins }) }) as any).disabledPlugins
+    );
+    const all = ["ticker-core", "options-volatility", "ownership", "filings", "alt-data", "quant", "credit", "earnings"];
+    const allButCredit = all.filter((pluginId) => pluginId !== "credit");
+
+    // An older app turns Ticker Research off, or one of the modules it once had as plugins.
+    expect(pull(["ticker-research"])).toEqual(all);
+    expect(pull(["options", "holders", "sec"])).toEqual(["options-volatility", "ownership", "filings"]);
+    expect(pull(["macro", "ticker-research"])).toEqual(["rates-macro", "credit", "earnings", ...all.slice(0, 6)]);
+    expect(await push(all)).toEqual(["ticker-research"]);
+    expect(await push(["ownership"])).toEqual(["ownership"]);
+    // Credit & Bonds turned back on: the older app sees Ticker Research on, the rest stay off here.
+    expect(await push(allButCredit)).toEqual(allButCredit);
+    expect(pull(await push(allButCredit))).toEqual(allButCredit);
+    // And turning Ticker Research back on there brings all eight back.
+    expect(pull((await push([...all, "news"])).filter((pluginId: string) => pluginId !== "ticker-research"))).toEqual(["news"]);
+  });
+
+  test("Market Overview round-trips through sync with apps from before it was split", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-sync-market-overview-test");
+    const pull = (disabledPlugins: string[]) => (
+      __syncContributorInternalsForTests.mergeConfigPayload(config, { disabledPlugins })?.disabledPlugins
+    );
+    const push = async (disabledPlugins: string[]) => (
+      (await coreConfigSyncContributor.collect({ state: createInitialState({ ...config, disabledPlugins }) }) as any).disabledPlugins
+    );
+    const all = ["global-markets", "screeners", "futures-commodities", "crypto", "alt-data", "quant"];
+
+    expect(pull(["market-overview"])).toEqual(all);
+    expect(pull(["world-indices", "market-movers"])).toEqual(["global-markets", "screeners"]);
+    expect(pull(["quant", "market-overview"])).toEqual(["quant", ...all.slice(0, 5)]);
+    expect(await push(all)).toEqual(["market-overview"]);
+    expect(await push(["global-markets"])).toEqual(["global-markets"]);
+    expect(pull((await push([...all, "news"])).filter((pluginId: string) => pluginId !== "market-overview"))).toEqual(["news"]);
   });
 
   test("preserves local broker identity when applying sanitized portfolios", () => {
