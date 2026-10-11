@@ -22,6 +22,7 @@ export const WEB_BUNDLED_PLUGIN_PACKAGES = [
   "gloom-abcnews",
   "gloom-newsmap",
   "gloom-hackernews",
+  "gloom-quantum",
 ] as const;
 
 /**
