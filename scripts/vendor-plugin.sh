@@ -23,10 +23,29 @@ EXCLUDED_PATHS=(CLAUDE.md AGENTS.md .claude docs/research STATUS.md docs/austral
 # already-vendored plugin contains changes that rebuild; re-add the plugin then.
 FILTER_LABEL="CLAUDE.md AGENTS.md .claude docs/research"
 
+# Plugins copied by allowlist: only the files the web build compiles (the
+# entry, its sources, the manifests), never tests, tools, data sources or
+# documentation. Plugins not listed here keep the exclusion-only filter above;
+# adding one changes its filtered commits, so re-add it (delete vendor/<name>
+# first) rather than update it.
+INCLUDED_PATHS=()
+# Files whose dataset changelog summaries are blanked: curation notes the
+# plugin carries but never shows.
+BLANK_CHANGELOG_SUMMARIES=()
+PLUGIN_FILTER_LABEL=""
+
 name="${1:?usage: $0 <name> <git-url> <commit-or-ref>}"
 url="${2:?usage: $0 <name> <git-url> <commit-or-ref>}"
 ref="${3:?usage: $0 <name> <git-url> <commit-or-ref>}"
 prefix="vendor/${name}"
+
+case "$name" in
+  gloom-quantum)
+    INCLUDED_PATHS=(package.json gloom.json tsconfig.json index.tsx src)
+    BLANK_CHANGELOG_SUMMARIES=(src/data/generated.ts)
+    PLUGIN_FILTER_LABEL="; only ${INCLUDED_PATHS[*]}, no tests, changelog summaries blanked"
+    ;;
+esac
 root="$(git rev-parse --show-toplevel)"
 
 if [ -n "$(git -C "$root" status --porcelain)" ]; then
@@ -47,11 +66,32 @@ filtered_commit() {
   local source="$1" tree date
   GIT_INDEX_FILE="$work/index" git -C "$work/src" read-tree "$source"
   GIT_INDEX_FILE="$work/index" git -C "$work/src" rm --cached -r --quiet --ignore-unmatch -- "${EXCLUDED_PATHS[@]}"
+  if [ "${#INCLUDED_PATHS[@]}" -gt 0 ]; then
+    GIT_INDEX_FILE="$work/index" git -C "$work/src" ls-files -z | while IFS= read -r -d '' path; do
+      keep=false
+      for included in "${INCLUDED_PATHS[@]}"; do
+        case "$path" in "$included" | "$included"/*) keep=true ;; esac
+      done
+      case "$path" in *.test.ts | *.test.tsx | */__test__/* | */__fixtures__/*) keep=false ;; esac
+      "$keep" || printf '%s\0' "$path"
+    done | GIT_INDEX_FILE="$work/index" xargs -0 -r git -C "$work/src" rm --cached --quiet --
+  fi
+  local file blob
+  for file in "${BLANK_CHANGELOG_SUMMARIES[@]}"; do
+    blob="$(git -C "$work/src" show "${source}:${file}" \
+      | sed -E 's/^( *"summary": )".*"(,?)$/\1""\2/' \
+      | git -C "$work/src" hash-object -w --stdin)"
+    if git -C "$work/src" cat-file blob "$blob" | grep -qE '"summary": *"[^"]'; then
+      echo "${file} still has a changelog summary after blanking; check its format." >&2
+      exit 1
+    fi
+    GIT_INDEX_FILE="$work/index" git -C "$work/src" update-index --cacheinfo "100644,${blob},${file}"
+  done
   tree="$(GIT_INDEX_FILE="$work/index" git -C "$work/src" write-tree)"
   date="$(git -C "$work/src" show -s --format=%cI "$source")"
   GIT_AUTHOR_NAME=vendor-plugin GIT_AUTHOR_EMAIL=vendor-plugin@invalid GIT_AUTHOR_DATE="$date" \
   GIT_COMMITTER_NAME=vendor-plugin GIT_COMMITTER_EMAIL=vendor-plugin@invalid GIT_COMMITTER_DATE="$date" \
-    git -C "$work/src" commit-tree "$tree" -m "${name} ${source} without ${FILTER_LABEL}"
+    git -C "$work/src" commit-tree "$tree" -m "${name} ${source} without ${FILTER_LABEL}${PLUGIN_FILTER_LABEL}"
 }
 
 filtered="$(filtered_commit "$source_commit")"
@@ -71,7 +111,7 @@ fi
 
 message="Vendor ${name} at ${source_commit}
 
-From ${url}, without: ${EXCLUDED_PATHS[*]}.
+From ${url}, without: ${EXCLUDED_PATHS[*]}${PLUGIN_FILTER_LABEL}.
 
 vendor-plugin-source: ${source_commit}"
 
