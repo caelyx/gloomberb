@@ -1,0 +1,22 @@
+{
+  "dark": {
+    "modality": {
+      "superconducting": "#4da3ff",
+      "trapped_ion": "#3ecf8e",
+      "neutral_atom": "#ff9f1c",
+      "spin_semiconductor": "#ff6fd8"
+    },
+    "rsa2048": "#ff3b3b",
+    "ecc256": "#f5f53d"
+  },
+  "light": {
+    "modality": {
+      "superconducting": "#0868d0",
+      "trapped_ion": "#00936a",
+      "neutral_atom": "#e07b00",
+      "spin_semiconductor": "#c2129e"
+    },
+    "rsa2048": "#d7191c",
+    "ecc256": "#4b2e83"
+  }
+}

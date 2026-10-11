@@ -43,7 +43,7 @@ anonymous state without closing the workspace.
 
 | # | Change | Files |
 |---|---|---|
-| 1 | Five more web-bundled plugins, vendored: Australian Markets (gloom-au), ACGB curve (gloom-acgb), ABC News (gloom-abcnews), Newsmap and Hacker News | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated), `vendor/`, `scripts/vendor-plugin.sh`, `bunfig.toml` |
+| 1 | Six more web-bundled plugins, vendored: Australian Markets (gloom-au), ACGB curve (gloom-acgb), ABC News (gloom-abcnews), Newsmap, Hacker News and Quantum Computing (gloom-quantum) | `package.json`, `bun.lock`, `src/plugins/web-bundled.ts`, `src/utils/plugin-proxy-hosts.json` (generated), `vendor/`, `scripts/vendor-plugin.sh`, `bunfig.toml` |
 | 1a | The web build also reads each plugin's `gloom.json` (hosts; id and `web` target must agree), and compiles `vendor/<name>` when present | `scripts/web-plugins.ts`, `scripts/build-web.ts`, `scripts/generate-web-proxy-hosts.ts` |
 | 2 | Gloom session restore reports unexpected errors instead of swallowing them (it was already non-blocking) | `src/renderers/browser/cloud-transport.ts`, `src/renderers/browser/main.tsx` |
 | 3 | Plugin proxy policy switch and credential stripping; Access credentials stripped from `/api/*` | `src/renderers/cloudflare/http-proxy.ts`, `src/renderers/cloudflare/worker.ts` |
@@ -105,6 +105,7 @@ envelope.
 | **gloom-abcnews** | `vendor/gloom-abcnews` (from private `caelyx/gloom-abcnews`) | `710428e43d61dbb101bb7d1511b939d8fc411b83` | abc-news | youtube.com, www.youtube.com, googlevideo.com, ytimg.com |
 | **gloom-newsmap** | `vendor/gloom-newsmap` (from private `caelyx/gloom-newsmap`) | `de8117446f185dbf3d73ed9bb51c3f410befebc5` | newsmap | news.google.com, generativelanguage.googleapis.com |
 | **gloom-hackernews** | `vendor/gloom-hackernews` (from public `caelyx/gloom-hackernews`, a fork of `gloom-sh/gloom-hackernews`) | `aeb2ceae33dfd6662676c485f9d705ff38400ef9` | hackernews | hacker-news.firebaseio.com, generativelanguage.googleapis.com |
+| **gloom-quantum** | `vendor/gloom-quantum` (from private `caelyx/gloom-quantumcomputing`) | `3e5d9616fa129d94936fd8fd82b06bf52724b7d3` | quantum | none (its curated dataset is compiled in) |
 
 gloom-au replaces the earlier gloom-asx plugin: it carries ASX announcements
 (`ASXA`, with `ASX` as an alias).
@@ -161,7 +162,7 @@ module's, or declares a host that is not a bare domain.
 
 ### Vendored plugins
 
-`gloom-au`, `gloom-acgb`, `gloom-abcnews` and `gloom-newsmap` live in private repositories,
+`gloom-au`, `gloom-acgb`, `gloom-abcnews`, `gloom-newsmap` and `gloom-quantum` live in private repositories,
 which Bun cannot install from in CI (it downloads `github:` dependencies without
 credentials). Their code is copied into this repository under `vendor/`
 instead, with `git subtree --squash`, by `scripts/vendor-plugin.sh`. The plugin
@@ -174,6 +175,12 @@ fork adds updates with the same script.
   (the list is `EXCLUDED_PATHS` at the top of the script). The plugins' own
   history never enters this repository: the import is a squashed, filtered
   snapshot.
+- gloom-quantum is copied by allowlist instead (`INCLUDED_PATHS` in the
+  script): only `package.json`, `gloom.json`, `tsconfig.json`, `index.tsx` and
+  `src/`, without tests or fixtures. Its dataset sources, curation evidence,
+  tools, workflows and documentation stay in its repository, and the
+  curation-note summaries in its compiled dataset changelog are blanked (the
+  plugin counts changelog entries but does not show them).
 - They are not package dependencies. `scripts/web-plugins.ts` compiles
   `vendor/<name>` directly when it exists, because installing a folder
   dependency makes Bun install its devDependencies too. A vendored plugin's
@@ -197,6 +204,7 @@ scripts/vendor-plugin.sh gloom-acgb https://github.com/caelyx/gloom-acgb.git <co
 scripts/vendor-plugin.sh gloom-abcnews https://github.com/caelyx/gloom-abcnews.git <commit-or-branch>
 scripts/vendor-plugin.sh gloom-newsmap https://github.com/caelyx/gloom-newsmap.git <commit-or-branch>
 scripts/vendor-plugin.sh gloom-hackernews https://github.com/caelyx/gloom-hackernews.git <commit-or-branch>
+scripts/vendor-plugin.sh gloom-quantum https://github.com/caelyx/gloom-quantumcomputing.git <commit-or-branch>
 ```
 
 Each run adds a merge commit whose message records the source commit

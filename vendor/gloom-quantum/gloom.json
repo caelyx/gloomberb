@@ -1,0 +1,19 @@
+{
+  "id": "quantum",
+  "name": "Quantum Computing",
+  "tagline": "Curated quantum-computing hardware progress",
+  "description": "Tracks quantum-computing hardware results from primary sources for security briefings: a qubits-versus-error landscape with cryptanalytic resource estimates, current records with dataset-version changes, all results in a lookback window, and the gap between today's devices and published estimates, compared like for like.",
+  "categories": ["data"],
+  "targets": ["desktop", "web", "tui", "cli"],
+  "hosts": [],
+  "contributes": {
+    "panes": ["quantum-landscape", "quantum-records", "quantum-devices", "quantum-estimates"],
+    "shortcuts": [
+      { "code": "QC", "name": "Quantum Landscape", "description": "Physical qubits against error rate, with resource-estimate curves for a cryptographically relevant quantum computer (CRQC)." },
+      { "code": "QCR", "name": "Quantum Records", "description": "Current best result on each quantum hardware metric." },
+      { "code": "QCD", "name": "Quantum Devices", "description": "Quantum hardware results in a lookback window, by modality." },
+      { "code": "QCE", "name": "Quantum Estimates", "description": "Resource estimates for a cryptographically relevant quantum computer (CRQC), and the gap to today's devices." }
+    ]
+  },
+  "minGloom": "0.16.3"
+}
