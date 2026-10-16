@@ -1,5 +1,6 @@
-import type { FinancialStatement } from "../../../../types/financials";
+import type { EarningsField, FinancialStatement } from "../../../../types/financials";
 import { completeAvailability, statementFieldAvailability } from "../../../../utils/financial-statements";
+import { hasStatementGap } from "../../../../utils/statement-gaps";
 
 export type FinancialPeriod = "annual" | "quarterly";
 
@@ -90,6 +91,8 @@ const FLOW_KEYS = new Set<string>([
   "changesInCash",
   "effectOfExchangeRateChanges",
 ]);
+
+const EARNINGS_KEYS = ["basicEps", "eps"] as const satisfies readonly EarningsField[];
 
 const BALANCE_KEYS = new Set<string>([
   "totalAssets",
@@ -195,7 +198,17 @@ function aggregateQuarterlyStatements(
     const availableAt = completeAvailability(sources.map((source) => statementFieldAvailability(source, key)));
     if (availableAt) availability[key] = availableAt;
   };
+  // A quarter that declares an EPS line unavailable, or whose EPS share basis
+  // is unresolved, leaves the year's EPS unknown even when it still carries a
+  // number: the sum is withheld and the aggregate says why, as a quarter would.
+  const unresolvedEps = statements.find((statement) => statement.epsBasis?.status === "unresolved");
+  const gapped = EARNINGS_KEYS.filter((key) => statements.some((statement) => hasStatementGap(statement, key)));
+  if (gapped.length > 0) aggregate.unavailableEarnings = [...gapped];
+  if (unresolvedEps) aggregate.epsBasis = unresolvedEps.epsBasis;
+  const withheld = new Set<string>(gapped);
+  if (unresolvedEps) withheld.add("eps");
   for (const key of FLOW_KEYS) {
+    if (withheld.has(key)) continue;
     const values = statements
       .map((statement) => (statement as unknown as Record<string, unknown>)[key])
       .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
@@ -232,6 +245,17 @@ function aggregateQuarterlyStatements(
   const availableAt = completeAvailability(includedFields.map((key) => availability[key]));
   if (availableAt) aggregate.availableAt = availableAt;
   return aggregate;
+}
+
+/**
+ * The four quarters to the one dated `end`, summed: what a quarterly column
+ * reads a flow over a year from. Null when fewer than four consecutive
+ * quarters end there.
+ */
+export function trailingFourQuarters(quarterlyStatements: readonly FinancialStatement[], end: string) {
+  const sorted = [...quarterlyStatements].sort((a, b) => a.date.localeCompare(b.date));
+  const index = sorted.findIndex((statement) => statement.date === end);
+  return index < 3 ? null : aggregateQuarterlyStatements(sorted.slice(index - 3, index + 1), "TTM");
 }
 
 export function computeTTM(quarterlyStatements: FinancialStatement[]) {

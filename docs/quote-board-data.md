@@ -11,16 +11,28 @@ supply a valid quote, the board retains its previous value and reports stale
 status in the existing footer. An initial failure leaves the value unavailable.
 Source stale flags and invalid observation times remain ineligible.
 
+The futures board (`FUT`) opens on the quotes already cached, however old, and
+refreshes only the rows it lists: `FUT gold` asks for gold alone, and a row is
+asked for when a search or an opened section first lists it. The listed rows go
+out in up to four batches at once, and a batch with no answer after five
+seconds is given up, so one slow contract cannot hold the rest; its rows keep
+the cached quote, marked stale. The 1W, 1M and YTD returns load history only
+for the listed rows. The footer, the empty state and the source line of
+`fn FUT` and `shot FUT` count the listed rows alone, so `fn FUT gold` is dated
+by gold's quote.
+
 A finite futures price can be zero or negative. The router requires explicit
 source instrument type `FUT`, `FUTURE` or `FUTURES` to accept that price domain;
 a ticker suffix alone is insufficient. Equity, fund and option quotes retain
 their existing positive-price validation. See [CME Clearing Advisory 20-160](https://www.cmegroup.com/notices/clearing/2020/04/Chadv20-160.html)
 for CME's support of zero and negative energy futures prices.
 
-The futures board uses provider continuous/front-month aliases. These do not
-establish an explicit expiry curve, contract quantity, physical-unit conversion,
-or roll-adjusted investment return. Quote validation does not add those
-capabilities.
+The futures board uses Gloom Cloud's continuous aliases, which quote each root's
+most active month and name the nearer month while it still trades (see the
+`Front month` glossary entry). Each row's unit comes from the contract terms
+`quote` shows. The aliases do not establish an explicit expiry curve, contract
+quantity, physical-unit conversion, or roll-adjusted investment return. Quote
+validation does not add those capabilities.
 
 Contract prices in Overview, quote reports and quote-monitor text retain up to
 eight decimal places; contract changes use the same price precision instead of

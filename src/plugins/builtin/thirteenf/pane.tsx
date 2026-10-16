@@ -46,12 +46,14 @@ import {
   buildTimelineColumns,
   buildTimelineRows,
   inferBrowserTabFromQuery,
+  quartersBehindLatest,
   selectedIndexById,
   sortBrowserRows,
   sortFilingPositionRows,
   sortHoldingRows,
   sortTimelineRows,
 } from "./model";
+import { isOptionType, isStaleFiling, quartersOldText } from "./report-notes";
 import {
   renderBrowserCell,
   renderFilingPositionCell,
@@ -111,13 +113,21 @@ function ThirteenFBrowserPane({ focused, width, height, onDetailChange }: PanePr
   // A new query starts from an empty list; a refresh keeps the rows it has.
   const browser = usePagedRows(showTickerHoldings ? null : loadPage, { getId: rowId });
   const { loading, loadingMore, rows } = browser;
+  const [reportPaint, setReportPaint] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    void Promise.all(browser.pages.map((page) => page.reportsLoaded ?? Promise.resolve())).then(() => {
+      if (alive) setReportPaint((value) => value + 1);
+    }, () => {});
+    return () => { alive = false; };
+  }, [browser.pages]);
   const error = browser.error?.message ?? null;
   // A refresh clears the pages' warnings until it answers.
   const pagesSettled = !loading && !browser.error;
   const warning = useMemo(() => {
     const notes = [...(pagesSettled ? browser.pages.map((page) => page.warning) : []), browser.moreError?.message];
     return [...new Set(notes.filter(Boolean))].join(" ") || null;
-  }, [browser.moreError, browser.pages, pagesSettled]);
+  }, [browser.moreError, browser.pages, pagesSettled, reportPaint]);
   const [detailSeed, setDetailSeed] = useState<FundSeed | null>(() => (
     initialCik ? { cik: String(initialCik), name: normalizedQuery || String(initialCik) } : null
   ));
@@ -155,7 +165,7 @@ function ThirteenFBrowserPane({ focused, width, height, onDetailChange }: PanePr
   }, { allowEditable: true });
 
   const browserSort = useMemo(() => browserSortFor(sortPreference, browserMode), [sortPreference, browserMode]);
-  const sortedRows = useMemo(() => sortBrowserRows(rows, browserSort), [rows, browserSort]);
+  const sortedRows = useMemo(() => sortBrowserRows(rows, browserSort), [rows, browserSort, reportPaint]);
   const columns = useMemo(() => {
     if (browserMode !== "performance") return buildBrowserColumns(false);
     const history = rows[0]?.priorReturns ?? [];
@@ -479,14 +489,21 @@ export function FundDetailView({
     }
   });
 
+  const quartersBehind = quartersBehindLatest(data?.latestForm?.periodOfReport);
+  const staleFiling = isStaleFiling(quartersBehind);
   const holdingStats: StatItem[] = [
     { id: "reported", label: "Reported", value: data?.latestForm?.periodOfReport ?? "--",
-      detail: `filed ${data?.latestForm?.filedAsOfDate || "--"}${data?.latestForm && amendmentKind(data.latestForm) === "restatement" ? ", restated" : ""}` },
+      detail: `filed ${data?.latestForm?.filedAsOfDate || "--"}${data?.latestForm && amendmentKind(data.latestForm) === "restatement" ? ", restated" : ""}${staleFiling ? `, ${quartersOldText(quartersBehind)}` : ""}`,
+      ...(staleFiling ? { tone: "warning" as const } : {}) },
     data && hasComparable13FQuarter(data)
       ? { id: "compared", label: "Compared with", value: data.previousForm!.periodOfReport }
       : { id: "compared", label: "Compared with", value: "No prior quarter", tone: "muted" },
     ...(data?.latestReport && data.latestReport.filings.length > 1
       ? [{ id: "combined", label: "Combined", value: `${data.latestReport.filings.length} filings` }]
+      : []),
+    // The value basis of option rows, like a unit: only for a fund that holds them.
+    ...(holdingRows.some((row) => isOptionType(row.putCall))
+      ? [{ id: "options", label: "CALL/PUT", value: "underlying value", tone: "muted" as const }]
       : []),
   ];
 

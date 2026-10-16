@@ -16,7 +16,7 @@ import { attachEarningsCalendarPersistence, resetEarningsCalendarPersistence } f
 import { attachEarningsCloudCaches, resetEarningsCloudCaches } from "./client";
 import { EarningsBoard } from "./board";
 import { EarningsHistoryView } from "./history";
-import { earningsBoardHeadless, earningsCalendarHeadless } from "./headless";
+import { EARNINGS_CALENDAR, earningsBoardHeadless, earningsCalendarHeadless } from "./headless";
 import { scopedSymbolsFromSettings } from "./model";
 
 /** `ERN <ticker>`: that company's reports, with the footer's ways into its other panes. */
@@ -99,10 +99,23 @@ export const earningsModule: PluginModule = {
       name: "Earnings Calendar",
       icon: "$",
       component: EarningsPane,
+      // ERN and EVTS open this pane: EVTS sets `board`, a scoped ERN sets the tickers.
+      identitySettings: ["board", "symbols", "symbolsText"],
+      personalData: ({ settings, tickers }) => {
+        const symbols = settings.board === true ? [] : scopedSymbolsFromSettings(settings);
+        // Single-ticker report history is public. The board marks owned names.
+        if (symbols.length === 1) return null;
+        return [...tickers.values()].some(({ metadata }) => (
+          metadata.portfolios.length > 0
+          && (symbols.length === 0 || symbols.includes(metadata.ticker.trim().toUpperCase()))
+        )) ? "holdings" : null;
+      },
       defaultPosition: "right",
       defaultMode: "floating",
       defaultFloatingSize: { width: 110, height: 28 },
       tableExport: true,
+      // Dated as `fn EVTS` and `fn ERN` date it, by the calendar, not by the quotes behind the board's MOVE column.
+      reportFreshness: EARNINGS_CALENDAR,
       settings: earningsSettings,
     },
   ],

@@ -8,6 +8,7 @@ import {
   Badge, buildSectionedRows, DataTableView, EmptyState, isSectionedItemRow, PageStackView, renderSectionedRowHeader, PaneStatusBody, QueryBar, StatGrid, statGridRows, usePaneNoticeFooter,
   usePaneStatusFooter, usePaneTabs, type DataTableCell, type DataTableColumn, type PaneHint, type SectionedRow, type StatItem,
 } from "../../../components";
+import { ClippedText } from "../../../components/ui/display";
 import { RatioBar } from "../../../components/ui/ratio-bar";
 import { getTableWidth } from "../../../components/ui/table-layout";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
@@ -16,9 +17,10 @@ import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
 import { Box, Text, TextAttributes, useRendererHost, useUiCapabilities } from "../../../ui";
-import { displayWidth, truncateToDisplayWidth } from "../../../utils/format";
+import { displayWidth } from "../../../utils/format";
 import { SignInWall } from "../cloud/auth-actions";
 import { CLOUD_PLAN_KEY, useCloudUpgradeAction } from "../shared/cloud-upgrade";
+import { useOpenDescription } from "../shared/open-description";
 import { Blurred, LockedOverlay, UpgradeLabel } from "../shared/locked-rows";
 import { isCloudSessionRequired, useResearchCloudSession } from "../shared/research-cloud-session";
 import { cachedSupplyChain, loadSupplyChain, SUPPLY_UNAVAILABLE, validateSupplyChain } from "./client";
@@ -26,8 +28,8 @@ import { useSupplyEvidence } from "./evidence";
 import { SupplyFlow } from "./flow";
 import { SupplyGraphPane } from "./graph-pane";
 import {
-  cellText, counterpartyKind, counterpartyKindLabel, counterpartyLabel, counterpartyName, disclosedValue, nativeValue, percentage, ROLE_COLORS, roleLabel,
-  shareParts, sortRows, supplyRoleCounts, type SupplySort,
+  cellText, counterpartyKind, counterpartyKindLabel, counterpartyLabel, counterpartyName, disclosedValue, lockedDisclosures, nativeValue, percentage, ROLE_COLORS, roleLabel,
+  shareParts, sortRows, supplyPreviewNote, supplyRoleCounts, type SupplySort,
 } from "./model";
 import { RowEvidence } from "./row-evidence";
 import { evidenceDate, evidenceLabel, isUnconfirmed, matchesSupplyOptions, supplyOptions, TIER_OPTIONS } from "./trust";
@@ -143,6 +145,7 @@ function SupplyView({ symbol, width, height, focused }: Pick<PaneProps, "width" 
   const host = useRendererHost();
   const desktop = !!useUiCapabilities().nativePaneChrome;
   const { createPaneFromTemplate } = usePluginAppActions();
+  const openDescription = useOpenDescription();
   const session = useResearchCloudSession();
   const access = usePlanAccess();
   const accessKey = `${session.requestKey}:${access.hasProAccess ? "full" : "preview"}`;
@@ -178,7 +181,7 @@ function SupplyView({ symbol, width, height, focused }: Pick<PaneProps, "width" 
     : selectionRows.find((row) => row.id === selectedId) ?? (tab === "flow" ? allRows.find((row) => row.id === flowIds[0]) : rows[0]) ?? null;
   const openRow = allRows.find((row) => row.id === openId) ?? (openingEvidence && openId === null ? rows[0] : null) ?? null;
   useSupplyEvidence(graphTab ? null : data, tab, view, tab === "flow" ? flowIds : rows.map((row) => row.id), openRow?.id ?? null, options.tiers);
-  const locked = data?.truncated ? Math.max(0, Object.values(data.counts[view]).reduce((a, b) => a + b, 0) - data[view].length) : 0;
+  const locked = data?.truncated ? lockedDisclosures(data, [view]) : 0;
   const items = useMemo<SectionedRow<Item>[]>(() => buildSectionedRows<Item>([
     { label: "Relationships", items: rows.filter((row) => !isUnconfirmed(row)).map((row) => ({ kind: "edge", row })) },
     { label: "Unconfirmed", items: rows.filter(isUnconfirmed).map((row) => ({ kind: "edge", row })) },
@@ -200,7 +203,7 @@ function SupplyView({ symbol, width, height, focused }: Pick<PaneProps, "width" 
     ...(current ? [{ id: "source", key: "o", label: "pen source", onPress: () => void host.openExternal(current.filingUrl) }] : []),
     ...(!openRow && selected ? [{ id: "evidence", key: "e", label: "vidence", onPress: evidence }] : []),
     ...(selected?.counterparty.ticker ? [
-      { id: "description", key: "d", label: "es", onPress: () => navigate(selected, "new-ticker-detail-pane") },
+      { id: "description", key: "d", label: "es", onPress: () => openDescription(selected.counterparty.ticker!, selected.counterparty.exchange ?? undefined) },
       { id: "financials", key: "f", label: "a", onPress: () => navigate(selected, "financial-analysis-pane") },
       { id: "chart", key: "g", label: "raph", onPress: () => createPaneFromTemplate("chart-composer-pane", { arg: publicTickerKey(selected.counterparty.ticker!, selected.counterparty.exchange ?? undefined) }) },
       ...(getSharedRegistry()?.paneTemplates.has("buildout-pane") ? [{ id: "buildout", key: "t", label: "bo", onPress: () => createPaneFromTemplate("buildout-pane") }] : []),
@@ -239,13 +242,15 @@ function SupplyView({ symbol, width, height, focused }: Pick<PaneProps, "width" 
       case "name": {
         const company = counterpartyKind(row) === "company";
         // The kind label never gives way to a long cohort name; a column too narrow for the name says it in one word.
+        // The desktop always says it in one word: the Role column beside it names the role, and the name takes the room.
         const full = counterpartyKindLabel(row);
-        const kind = full && displayWidth(counterpartyLabel(row)) + displayWidth(full) + 4 <= column.width ? full : counterpartyKindLabel(row, true);
+        const kind = !desktop && full && displayWidth(counterpartyLabel(row)) + displayWidth(full) + 4 <= column.width ? full : counterpartyKindLabel(row, true);
         const ticker = !columns.some((entry) => entry.id === "ticker") ? row.counterparty.ticker : null;
         const room = Math.max(8, column.width - (kind ? displayWidth(kind) + 4 : 0) - (ticker ? displayWidth(ticker) + 1 : 0));
-        return { text: cellText(row, "name"), content: <Box flexDirection="row" height={1} gap={ticker ? 1 : 2} overflow="hidden">
-          <Text fg={ink ?? (company ? colors.textBright : colors.textDim)}>{truncateToDisplayWidth(counterpartyLabel(row), room)}</Text>
-          {ticker ? <Text fg={ink ?? colors.textDim}>{ticker}</Text> : null}
+        // On the desktop the name gives way at the column's edge by CSS and the ticker and kind keep their room.
+        return { text: cellText(row, "name"), content: <Box flexDirection="row" height={1} gap={ticker ? 1 : 2} overflow="hidden" {...(desktop ? { flexShrink: 1, minWidth: 0 } : {})}>
+          <ClippedText fg={ink ?? (company ? colors.textBright : colors.textDim)} text={counterpartyLabel(row)} width={room} />
+          {ticker ? <Text fg={ink ?? colors.textDim} style={desktop ? { flex: "0 0 auto" } : undefined}>{ticker}</Text> : null}
           {kind ? desktop ? <Badge label={kind} /> : <Text fg={ink ?? colors.textMuted}>{kind}</Text> : null}
         </Box> };
       }
@@ -301,8 +306,8 @@ function SupplyView({ symbol, width, height, focused }: Pick<PaneProps, "width" 
           items={items} focused={focused && !openRow} rootWidth={width} rootHeight={bodyHeight} rootBefore={header}
           selection={{ kind: "id", selectedId: selected?.id ?? null, getId: (entry) => entry.key, onChange: (id) => setSelected(id) }} getItemKey={(entry) => entry.key}
           isNavigable={isSectionedItemRow}
-          // The placeholders stand for every locked disclosure; the header counts those, as the figures do.
-          renderSectionHeader={(entry) => entry.kind === "section" && entry.label === "Pro" ? { text: `Pro (${locked})` } : renderSectionedRowHeader(entry)}
+          // The placeholders stand for every locked disclosure; the header says what free shows and counts those, as the figures do.
+          renderSectionHeader={(entry) => entry.kind === "section" && entry.label === "Pro" ? { text: supplyPreviewNote(data, locked) } : renderSectionedRowHeader(entry)}
           onActivate={(entry) => { if (isSectionedItemRow(entry)) entry.item.kind === "edge" ? navigate(entry.item.row) : openUpgrade(); }}
           renderCell={renderCell} sortColumnId={sort.column} sortDirection={sort.direction}
           onHeaderClick={(column) => setSort((old) => ({ column, direction: old.column === column && old.direction === "desc" ? "asc" : "desc" }))}

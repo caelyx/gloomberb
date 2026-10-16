@@ -27,7 +27,13 @@ import type {
 import { resolveDataTableScrollTop } from "../visible-range";
 import { useFocusOwningPane, useVisibleRangeEmitter } from "../hooks";
 import { useStableColumns } from "../stable-columns";
-import { resolveDataTableVisibleWindow } from "./model";
+import {
+  cutColumnText,
+  resolveDataTableColumnClips,
+  resolveDataTableVisibleWindow,
+  reuseDataTableColumnClips,
+  type DataTableColumnClip,
+} from "./model";
 
 interface DataTableRowPointerTarget<T> {
   item: T;
@@ -72,11 +78,15 @@ function OpenTuiDataTableRowInner<
   renderCell,
   renderSectionHeader,
   rowContextMenuSurface,
+  sectionWidth,
   selected,
   selectedTextOverridesCellColor,
+  columnClips,
 }: {
   /** Only compared by the row memo; see `getRowVersion`. */
   rowVersion?: unknown;
+  /** Columns of the row in view, which a section header's action keeps to. */
+  sectionWidth: number;
   colors: ReturnType<typeof useThemeColors>;
   columnGap: number;
   columnStarts: number[];
@@ -102,12 +112,15 @@ function OpenTuiDataTableRowInner<
   rowContextMenuSurface: boolean;
   selected: boolean;
   selectedTextOverridesCellColor: boolean;
+  /** How the viewport cuts each column, null when every column shows whole (resolveDataTableColumnClips). */
+  columnClips: readonly (DataTableColumnClip | null)[] | null;
 }) {
   const sectionHeader = renderSectionHeader?.(item, index) ?? null;
 
   if (sectionHeader) {
     // A header the cursor can land on (a collapsible group) shows it like a row.
     const headerColor = sectionHeader.color ?? (selected ? colors.selectedText : colors.textBright);
+    const action = sectionHeader.action;
     return (
       <Box
         flexDirection="row"
@@ -125,12 +138,37 @@ function OpenTuiDataTableRowInner<
         {sectionHeader.expanded !== undefined && (
           <Text fg={headerColor}>{sectionHeader.expanded ? "\u25be " : "\u25b8 "}</Text>
         )}
-        <Text
-          attributes={sectionHeader.attributes ?? TextAttributes.BOLD}
-          fg={headerColor}
-        >
-          {sectionHeader.text}
-        </Text>
+        {action ? (
+          // Kept to the columns in view, so a table wider than its pane does not push the action out of sight.
+          <Box flexDirection="row" height={1} flexShrink={1} minWidth={0} width={Math.max(1, sectionWidth - horizontalPadding * 2)}>
+            <Text attributes={sectionHeader.attributes ?? TextAttributes.BOLD} fg={headerColor} wrapMode="none" truncate flexShrink={1} minWidth={0}>
+              {sectionHeader.text}
+            </Text>
+            <Box flexGrow={1} minWidth={1} />
+            <Box
+              flexShrink={0}
+              height={1}
+              cursor="pointer"
+              hoverBackgroundColor={selected ? undefined : hoverBg(colors)}
+              onMouseDown={(event: any) => {
+                // The action, not the header's own press (a group's collapse).
+                event.stopPropagation?.();
+                event.preventDefault?.();
+                focusPane();
+                action.onPress();
+              }}
+            >
+              <Text fg={selected ? colors.selectedText : colors.text}>{action.label}</Text>
+            </Box>
+          </Box>
+        ) : (
+          <Text
+            attributes={sectionHeader.attributes ?? TextAttributes.BOLD}
+            fg={headerColor}
+          >
+            {sectionHeader.text}
+          </Text>
+        )}
       </Box>
     );
   }
@@ -162,12 +200,20 @@ function OpenTuiDataTableRowInner<
       }}
     >
       {displayColumns.map((column, columnIndex) => {
-        const cell = renderCell(item, column, index, rowState);
         const frozen = columnIndex === 0 && frozenColumnOffset !== undefined;
+        const clip = columnClips?.[columnIndex] ?? null;
+        const cell = renderCell(item, column, index, rowState);
         const columnStart = columnStarts[columnIndex] ?? 0;
         const leadGap = tableColumnLeadGap(displayColumns, columnIndex, columnGap);
-        const inset = !frozen && frozenColumnOffset !== undefined
+        const inset = clip ? clip.inset : !frozen && frozenColumnOffset !== undefined
           ? Math.min(column.width, Math.max(0, frozenColumnOffset + (displayColumns[0]?.width ?? 0) + columnGap - columnStart)) : 0;
+        const shownWidth = clip ? clip.width : column.width - inset;
+        // Cut text is fitted to what shows; a number the edge cuts stays blank in its own place,
+        // and its cell keeps its background and its press.
+        const shownText = clip
+          ? cutColumnText(cell.text, column.align, column.width, clip, (text, width) => fitTableCellText(text, width, column.align))
+          : shownWidth > 0 ? fitTableCellText(cell.text, shownWidth, column.align) : "";
+        const contentCut = clip !== null && column.align === "right" && shownText.trim() === "";
         return (
           <Box
             key={column.id}
@@ -193,10 +239,10 @@ function OpenTuiDataTableRowInner<
               handleRowMouseDown(itemKey, { item, index }, event);
             }}
           >
-            {cell.content !== undefined ? (frozenColumnOffset === undefined ? cell.content : (
+            {cell.content !== undefined && !contentCut ? (frozenColumnOffset === undefined && !clip ? cell.content : (
               <>
                 {frozen && <Text position="absolute" left={0} top={0}>{" ".repeat(column.width + columnGap + horizontalPadding)}</Text>}
-                <Box marginLeft={frozen ? horizontalPadding : inset} width={Math.max(0, column.width - inset)} overflow="hidden">
+                <Box marginLeft={frozen ? horizontalPadding : inset} width={Math.max(0, shownWidth)} overflow="hidden">
                   {cell.content}
                 </Box>
               </>
@@ -207,7 +253,7 @@ function OpenTuiDataTableRowInner<
                   ? colors.selectedText
                   : cell.color ?? colors.text}
               >
-                {`${frozen ? " ".repeat(horizontalPadding) : ""}${" ".repeat(inset)}${inset < column.width ? fitTableCellText(cell.text, column.width - inset, column.align) : ""}${frozen ? " ".repeat(columnGap) : ""}`}
+                {`${frozen ? " ".repeat(horizontalPadding) : ""}${" ".repeat(inset)}${shownText}${frozen ? " ".repeat(columnGap) : ""}`}
               </Text>
             )}
           </Box>
@@ -269,10 +315,13 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
   const appViewport = useViewport();
   const nativeRenderer = useNativeRenderer();
   const [scrollVersion, setScrollVersion] = useState(0);
-  const [frozenColumnOffset, setFrozenColumnOffset] = useState(0);
+  // How far the columns are scrolled sideways: a frozen first column moves with
+  // it, and a column the viewport cuts is drawn to what shows (resolveDataTableColumnClips).
+  const [scrollLeft, setScrollLeft] = useState(0);
+  const frozenColumnOffset = scrollLeft;
   useEffect(() => {
-    if (freezeFirstColumn) setFrozenColumnOffset(scrollRef.current?.scrollLeft ?? 0);
-  }, [freezeFirstColumn, scrollRef]);
+    setScrollLeft(scrollRef.current?.scrollLeft ?? 0);
+  }, [scrollRef]);
   const lastAppliedScrollRequestRef = useRef<string | null>(null);
   const controlledScrollTopRef = useRef<number | null>(null);
   const scrollTop = virtualize ? (scrollRef.current?.scrollTop ?? 0) : 0;
@@ -320,6 +369,7 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
   const horizontalScrollbarVisible = showHorizontalScrollbar
     && hasMeaningfulTableHorizontalOverflow(tableWidth, measuredViewportWidth, columnGap);
   const contentWidth = fillAvailableWidth ? measuredContentWidth : tableWidth;
+  const sectionWidth = measuredViewportWidth > 0 ? Math.min(contentWidth, measuredViewportWidth) : contentWidth;
   const displayColumns = useMemo(
     () => expandTableColumns(columns, contentWidth, columnGap, horizontalPadding),
     [columnGap, columns, contentWidth, horizontalPadding],
@@ -327,6 +377,22 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
   const columnStarts = useMemo(
     () => tableColumnStarts(displayColumns, columnGap),
     [columnGap, displayColumns],
+  );
+  // A scroll step that cuts the columns as the last one did keeps the same
+  // array, so the memoized rows skip the render.
+  const columnClipsRef = useRef<readonly (DataTableColumnClip | null)[] | null>(null);
+  const columnClips = useMemo(
+    () => columnClipsRef.current = reuseDataTableColumnClips(columnClipsRef.current, resolveDataTableColumnClips({
+      columnGap,
+      columnStarts,
+      frozenFirstColumn: freezeFirstColumn,
+      horizontalPadding,
+      scrollLeft,
+      // A table that cannot scroll sideways fits its own columns; one it cut could never be scrolled to.
+      viewportWidth: showHorizontalScrollbar ? measuredViewportWidth : 0,
+      widths: displayColumns.map((column) => column.width),
+    })),
+    [columnGap, columnStarts, displayColumns, freezeFirstColumn, horizontalPadding, measuredViewportWidth, scrollLeft, showHorizontalScrollbar],
   );
   const reportVisibleRange = useVisibleRangeEmitter({
     itemCount: items.length,
@@ -369,8 +435,8 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
   }, [emitVisibleRange, nativeRenderer, onBodyScrollActivity, scrollRef, virtualize]);
   const syncHorizontalScroll = useCallback(() => {
     syncHeaderScroll();
-    if (freezeFirstColumn) setFrozenColumnOffset(scrollRef.current?.scrollLeft ?? 0);
-  }, [freezeFirstColumn, scrollRef, syncHeaderScroll]);
+    setScrollLeft(scrollRef.current?.scrollLeft ?? 0);
+  }, [scrollRef, syncHeaderScroll]);
   useScrollBoxScrollActivity({
     scrollRef,
     onVerticalScroll: handleBodyScrollActivity,
@@ -381,9 +447,9 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
     const body = scrollRef.current;
     if (!header || !body || body.scrollLeft === header.scrollLeft) return;
     body.scrollLeft = header.scrollLeft;
-    if (freezeFirstColumn) setFrozenColumnOffset(body.scrollLeft ?? 0);
+    setScrollLeft(body.scrollLeft ?? 0);
     nativeRenderer.requestRender();
-  }, [freezeFirstColumn, headerScrollRef, nativeRenderer, scrollRef]);
+  }, [headerScrollRef, nativeRenderer, scrollRef]);
   useScrollBoxScrollActivity({
     scrollRef: headerScrollRef,
     onHorizontalScroll: syncBodyScroll,
@@ -460,6 +526,7 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
       }
       if (!horizontalScrollbarVisible) {
         body.scrollLeft = 0;
+        setScrollLeft(0);
       }
     }
   }, [columns.length, headerScrollRef, horizontalScrollbarVisible, items.length, measuredViewportHeight, scrollRef]);
@@ -535,8 +602,10 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
           {displayColumns.map((column, columnIndex) => {
             const frozen = freezeFirstColumn && columnIndex === 0;
             const columnStart = columnStarts[columnIndex] ?? 0;
-            const inset = freezeFirstColumn && !frozen
+            const clip = columnClips?.[columnIndex] ?? null;
+            const inset = clip ? clip.inset : freezeFirstColumn && !frozen
               ? Math.min(column.width, Math.max(0, frozenColumnOffset + (displayColumns[0]?.width ?? 0) + columnGap - columnStart)) : 0;
+            const shownWidth = clip ? clip.width : column.width - inset;
             const isSorted = sortColumnId === column.id;
             const marker = sortDirection === "asc" ? "▲" : "▼";
             // An unlabeled column shows the bare marker, not a stray space before it.
@@ -546,12 +615,13 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
             // over its numbers.
             const hasNextLabel = columnIndex < displayColumns.length - 1
               && tableColumnLeadGap(displayColumns, columnIndex + 1, columnGap) === 0;
-            const labelText = " ".repeat(inset) + (inset < column.width ? fitTableHeaderText(
-              column.label + indicator,
-              column.width - inset,
-              column.align,
-              hasNextLabel,
-            ) : "");
+            const label = column.label + indicator;
+            const labelText = " ".repeat(inset) + (clip
+              // Cut on the right, the label's last cell is the edge.
+              ? cutColumnText(label, column.align, column.width, clip, (text, width, cutRight) => (
+                fitTableHeaderText(text, width, column.align, hasNextLabel && !cutRight)
+              ))
+              : shownWidth > 0 ? fitTableHeaderText(label, shownWidth, column.align, hasNextLabel) : "");
             return (
               <Box
                 key={column.id}
@@ -634,8 +704,10 @@ export function OpenTuiDataTable<T, C extends DataTableColumn = DataTableColumn>
                     renderSectionHeader={renderSectionHeader}
                     rowContextMenuSurface={rowContextMenuSurface}
                     rowVersion={getRowVersion?.(item, index)}
+                    sectionWidth={sectionWidth}
                     selected={isSelected(item, index)}
                     selectedTextOverridesCellColor={selectedTextOverridesCellColor}
+                    columnClips={columnClips}
                   />
                 );
               }),

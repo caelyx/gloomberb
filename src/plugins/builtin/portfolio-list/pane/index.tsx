@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   confirmDialog,
   usePaneFooter,
+  usePaneMenuItems,
   usePaneNoticeFooter,
   usePaneTabs,
   type DataTableKeyEvent,
@@ -12,7 +13,7 @@ import {
 import { useTickerSourceActivate } from "../../../../react/ticker-source";
 import { useFxRatesMap, useTickerFinancialsMap } from "../../../../market-data/hooks";
 import { buildPortfolioFinancialsMap } from "../../../../market-data/portfolio-financials";
-import { useAppVisible } from "../../../../state/app/activity";
+import { useAppActive, useAppVisible, usePaneVisible } from "../../../../state/app/activity";
 import { tf } from "../../../../i18n";
 import { useDialog } from "../../../../ui/dialog";
 import {
@@ -35,6 +36,7 @@ import type { PaneProps } from "../../../../types/plugin";
 import type { InstrumentRef } from "../../../../market-data/request-types";
 import {
   calculatePortfolioSummaryTotals,
+  getSortValue,
   resolveCollectionSortPreference,
   resolvePortfolioTotalsCurrency,
   type ColumnContext,
@@ -60,13 +62,14 @@ import {
   type PortfolioViewMode,
 } from "../settings";
 import { useQuoteFlashMap } from "../../../../components/quote-flash";
+import { sinceLastSeenAfterMs, useSinceLastSeen } from "../since-last-seen";
 import { PortfolioTickerTable } from "../table";
 import { PortfolioGrid } from "../grid";
 import { useThrottledCursorSymbol } from "../use-throttled-cursor-symbol";
 import { useCursorNeighborPrefetch } from "../use-cursor-neighbor-prefetch";
 import { getSharedRegistry } from "../../../registry";
 import { usePluginAppActions } from "../../../runtime";
-import { isManualPortfolio } from "../mutations";
+import { isManualPortfolio } from "../../../../portfolio/mutations";
 import {
   cursorAfterRemoval,
   removableCollection,
@@ -83,12 +86,16 @@ import {
 } from "./data";
 import { usePortfolioPaneStreaming } from "./streaming";
 import { usePortfolioSupplementalData } from "./supplemental";
+import { PERPETUAL_COLUMN_IDS } from "../cell-version";
+import { useListPerpetuals } from "../../perps/list-perpetuals";
+import { openPerpLabel, useOpenPerpMarket } from "../../perps/open-market";
 import { useLiveStreamingSetting } from "../../../../state/hooks/live-streaming";
 import { useThrottledTickerOrder } from "../use-throttled-ticker-order";
 import { useThrottledMemo } from "../use-throttled-memo";
+import { perpetualDisplaySymbol, perpetualListing, perpetualVenueName } from "../../../../tickers/perpetual-listing";
 import { useColumnClock } from "../use-column-clock";
-import { liveMarketCapitalization } from "../live-valuation";
-import { hasUnknownOptionMultiplier } from "../position-metrics";
+import { liveMarketCapitalization } from "../../../../market-data/quotes/live-valuation";
+import { hasUnknownOptionMultiplier } from "../../../../portfolio/position-metrics";
 import {
   allocationTotal,
   buildPortfolioAllocation,
@@ -126,6 +133,8 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
 
   const [streamWindow, setStreamWindow] = useState({ start: 0, end: 24 });
   const [quickAddFocused, setQuickAddFocused] = useState(false);
+  // Bumped by the empty table's "+ ticker" button to open the add row.
+  const [quickAddRequest, setQuickAddRequest] = useState(0);
 
   const {
     cursorSymbol,
@@ -155,6 +164,7 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       : null
   ), [activeCollectionId, config.portfolios, isPortfolioTab]);
   const viewMode: PortfolioViewMode = isPortfolioTab ? paneSettings.viewMode : "table";
+  const valuationBasis = paneSettings.valueAtClose ? "regular-close" as const : "latest-print" as const;
 
   const tickers = useMemo(
     () => getCollectionTickersFromConfig(config, tickersBySymbol, activeCollectionId),
@@ -180,6 +190,10 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     [currentPortfolio, isPortfolioTab, paneSettings.columnIds],
   );
   const supplementalData = usePortfolioSupplementalData(tickers, columns, appActive);
+  // One lookup for the whole list, only while a perpetual column is on screen.
+  const showsPerpetuals = viewMode === "table" && columns.some((column) => PERPETUAL_COLUMN_IDS.has(column.id));
+  const perpetuals = useListPerpetuals(tickers, showsPerpetuals);
+  const openPerpMarket = useOpenPerpMarket();
   const visibleWarmupRequirements = useMemo(
     () => resolveVisibleWarmupRequirements(columns),
     [columns],
@@ -223,9 +237,10 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       exchangeRates,
       isPortfolioTab,
       activeCollectionId,
+      valuationBasis,
     ).allocationHoldings : undefined,
     [financialsMap],
-    [activeCollectionId, exchangeRates, isPortfolioTab, needsWeightTotal, tickers, totalsCurrency],
+    [activeCollectionId, exchangeRates, isPortfolioTab, needsWeightTotal, tickers, totalsCurrency, valuationBasis],
     WEIGHT_TOTAL_THROTTLE_MS,
   );
   // Priced holdings plus cash, as `portfolio show` totals them.
@@ -241,9 +256,10 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       exchangeRates,
       isPortfolioTab,
       activeCollectionId,
+      valuationBasis,
     ),
     [financialsMap],
-    [activeCollectionId, exchangeRates, isPortfolioTab, tickers, totalsCurrency],
+    [activeCollectionId, exchangeRates, isPortfolioTab, tickers, totalsCurrency, valuationBasis],
     FOOTER_TOTALS_THROTTLE_MS,
   );
 
@@ -252,20 +268,25 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     activeTab: isPortfolioTab ? activeCollectionId : undefined,
     baseCurrency: totalsCurrency,
     exchangeRates,
+    valuationBasis,
     portfolioTotalMarketValue,
     portfolioTargets,
     supplementalVersion: supplementalData.version,
     analystResearch: supplementalData.analystResearch,
     corporateActions: supplementalData.corporateActions,
     earningsEvents: supplementalData.earningsEvents,
+    perpetuals: perpetuals.markets,
+    perpetualsVersion: perpetuals.version,
   }), [
     activeCollectionId,
     exchangeRates,
     isPortfolioTab,
+    perpetuals,
     portfolioTargets,
     portfolioTotalMarketValue,
     supplementalData,
     totalsCurrency,
+    valuationBasis,
   ]);
   const columnContext: ColumnContext = useMemo(() => ({ ...baseColumnContext, now }), [baseColumnContext, now]);
   // The order only follows the per-second clock when sorting by quote age;
@@ -296,6 +317,32 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     }),
     [orderedSymbols, tickerBySymbol],
   );
+
+  // What LAST shows for each row, snapshotted when the table goes out of sight.
+  const priceColumn = viewMode === "table" ? columns.find((column) => column.id === "price") : undefined;
+  const lastSeenInputsRef = useRef({ tickers, financialsMap, columnContext });
+  lastSeenInputsRef.current = { tickers, financialsMap, columnContext };
+  const readLastPrices = useCallback(() => {
+    const prices = new Map<string, number>();
+    const inputs = lastSeenInputsRef.current;
+    if (!priceColumn) return prices;
+    for (const ticker of inputs.tickers) {
+      const price = getSortValue(priceColumn, ticker, inputs.financialsMap.get(ticker.metadata.ticker), inputs.columnContext);
+      if (typeof price === "number") prices.set(ticker.metadata.ticker, price);
+    }
+    return prices;
+  }, [priceColumn]);
+  const appFocused = useAppActive();
+  const paneVisible = usePaneVisible();
+  // Away is out of sight, not out of focus: a PF beside the focused pane is still watched.
+  const { recap: sinceLastSeen, dismiss: dismissSinceLastSeen } = useSinceLastSeen({
+    paneKey: paneInstance?.instanceId,
+    present: appFocused && paneVisible,
+    afterMs: priceColumn ? sinceLastSeenAfterMs(paneSettings.sinceLastSeen) : null,
+    readPrices: readLastPrices,
+    pricesVersion: financialsMap,
+    resetKey: `${activeCollectionId}|${viewMode}`,
+  });
 
   const selectedIdx = sortedTickers.findIndex((ticker) => ticker.metadata.ticker === cursorSymbol);
   const safeSelectedIdx = selectedIdx >= 0 ? selectedIdx : 0;
@@ -340,7 +387,8 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     baseCurrency: config.baseCurrency,
     manualCash,
     brokerPortfolio,
-  }), [brokerPortfolio, config.baseCurrency, convertAccountValue, isPortfolioTab, manualCash, portfolioSummaryTotals, summaryAccountState, totalsCurrency]);
+    valuationBasis,
+  }), [brokerPortfolio, config.baseCurrency, convertAccountValue, isPortfolioTab, manualCash, portfolioSummaryTotals, summaryAccountState, totalsCurrency, valuationBasis]);
   // The header row sits in the pane's one-cell side padding, like the table.
   const summaryWidth = Math.max(0, width - 2);
   const summaryLayout = useMemo(() => layoutPortfolioSummaryHeader(summarySegments, summaryWidth, {
@@ -401,10 +449,13 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     setViewMode((current) => current === "table" ? "grid" : "table");
   }, [isPortfolioTab, setViewMode]);
 
+  // A perpetual opens PERP on its market's history, as its PERP% and FUND 8H cells do; any other row its research.
   const handleRowActivate = useCallback((ticker: TickerRecord) => {
     flushCursorSymbol(ticker.metadata.ticker);
-    openTickerFloating(ticker.metadata.ticker);
-  }, [flushCursorSymbol, openTickerFloating]);
+    const perpetual = perpetualListing(ticker.metadata.ticker, ticker.metadata.exchange);
+    if (perpetual) openPerpMarket(perpetual.marketId);
+    else openTickerFloating(ticker.metadata.ticker);
+  }, [flushCursorSymbol, openPerpMarket, openTickerFloating]);
   const handleTickerAdded = useCallback((symbol: string) => {
     setCursorSymbol(symbol, { immediate: true });
   }, [setCursorSymbol]);
@@ -418,6 +469,8 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
   // bind their own keys in both views; the table only adds Shift+Enter.
   const handleTableKeyDown = useCallback((event: DataTableKeyEvent) => {
     if (!focused) return;
+    // The next key clears the moves since last seen, as a click in the table does.
+    dismissSinceLastSeen();
 
     const key = event.name;
     const isEnter = key === "enter" || key === "return";
@@ -431,7 +484,7 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     }
 
     return false;
-  }, [focused, openTickerInNewPane, safeSelectedIdx, sortedTickers]);
+  }, [dismissSinceLastSeen, focused, openTickerInNewPane, safeSelectedIdx, sortedTickers]);
 
   useEffect(() => {
     if (activeCollectionId !== currentCollectionId) {
@@ -553,10 +606,24 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     }
   }, [appStateRef, dialog, dispatch, notify, removalCollection, selectedTicker, setCursorSymbol]);
 
+  // The cursor row's perpetual, for the keyboard: the pane menu opens what clicking its cell opens. A row that is a
+  // perpetual market opens its own, as Enter does.
+  const cursorPerpetual = showsPerpetuals && cursorSymbol ? perpetuals.markets.get(cursorSymbol) ?? null : null;
+  const cursorMarket = useMemo(() => selectedTicker ? perpetualListing(selectedTicker.metadata.ticker, selectedTicker.metadata.exchange) : null,
+    [selectedTicker]);
+  usePaneMenuItems("portfolio-list-perpetual", () => cursorPerpetual
+    ? [{ id: "open-perpetual", label: openPerpLabel(cursorPerpetual), onSelect: () => openPerpMarket(cursorPerpetual.marketId) }]
+    : cursorMarket
+      ? [{ id: "open-perpetual", label: tf("Open {label}", { label: `PERP ${perpetualDisplaySymbol(cursorMarket)} · ${perpetualVenueName(cursorMarket.exchange)}` }),
+        onSelect: () => openPerpMarket(cursorMarket.marketId) }]
+      : null, [cursorMarket, cursorPerpetual, openPerpMarket]);
+
   usePaneFooter("portfolio-list", () => ({
-    info: fxStatusText && !fxWarning
-      ? [...summaryFooterInfo, { id: "fx", parts: [{ text: `FX ${fxStatusText}`, tone: "muted" as const }] }]
-      : summaryFooterInfo,
+    info: [
+      ...summaryFooterInfo,
+      ...(fxStatusText && !fxWarning ? [{ id: "fx", parts: [{ text: `FX ${fxStatusText}`, tone: "muted" as const }] }] : []),
+      ...(showsPerpetuals && perpetuals.stale ? [{ id: "perpetuals", parts: [{ text: "perpetuals stale", tone: "warning" as const }] }] : []),
+    ],
     hints: [
       ...(removalCollection
         ? [{
@@ -592,11 +659,13 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     fxStatusText,
     fxWarning,
     isPortfolioTab,
+    perpetuals.stale,
     removalCollection,
     removeSelectedTicker,
     selectedTicker,
     setCashDrawerExpanded,
     showCashDrawer,
+    showsPerpetuals,
     summaryFooterInfo,
     toggleViewMode,
     viewMode,
@@ -612,6 +681,7 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     return null;
   }, [activeCollectionId, config, currentPortfolio]);
   const showQuickAdd = !!(activeCollectionId && activeCollectionEntry && quickAddCollectionKind);
+  const requestQuickAdd = useCallback(() => setQuickAddRequest((count) => count + 1), []);
   const quickAddHeight = showQuickAdd ? 1 : 0;
   const selectedFinancials = cursorSymbol ? financialsMap.get(cursorSymbol) : undefined;
   const selectedCap = liveMarketCapitalization(selectedFinancials?.quote, selectedFinancials?.fundamentals);
@@ -636,6 +706,7 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       width={width}
       onAdded={handleTickerAdded}
       onFocusChange={setQuickAddFocused}
+      focusRequest={quickAddRequest}
     />
   ) : null;
 
@@ -669,11 +740,15 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
           financialsMap={financialsMap}
           columnContext={columnContext}
           flashSymbols={flashSymbols}
+          sinceLastSeen={sinceLastSeen}
           onRootKeyDown={handleTableKeyDown}
+          onTableMouseDown={dismissSinceLastSeen}
           onVisibleRangeChange={handleVisibleRangeChange}
           visibleRangeBuffer={3}
           resetScrollKey={activeCollectionId}
           onRowActivate={handleRowActivate}
+          onAddTicker={showQuickAdd ? requestQuickAdd : undefined}
+          onOpenPerpetual={showsPerpetuals ? openPerpMarket : undefined}
           rootHeight={contentHeight}
         />
       ) : (

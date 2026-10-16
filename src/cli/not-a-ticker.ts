@@ -1,16 +1,24 @@
 import { notATickerSymbol } from "../sources/provider-errors";
+import { splitSymbolArgs } from "./symbol-args";
 
 // "Not a ticker: APPLE." as the router words it; the symbol ends at the sentence's own period.
-const NOT_A_TICKER_SENTENCE = /Not a ticker: ((?:(?!\.\s)[^\n`\x1b])+?)\.(?=\s|\x1b|$)(?! Try `gloomberb search)/g;
+// One that already names what to try (a search, a FRED series, the pair search offered) is left alone.
+const NOT_A_TICKER_SENTENCE = /Not a ticker: ((?:(?!\.\s)[^\n`\x1b])+?)\.(?=\s|\x1b|$)(?! Try `gloomberb (?:search|fred) | Did you mean )/g;
 
-/** The symbol as the user typed it on the command line (`Apple`), not as the router saw it (`APPLE`). */
+/**
+ * The symbol as the user typed it on the command line (`Apple`), not as the router saw it (`APPLE`).
+ * A symbol list splits as the commands split it; a command that takes one name (`Apple Inc`) is
+ * matched as the whole argument first, so the hint searches for the name.
+ */
 function typedSymbol(symbol: string, args: readonly string[]): string {
   const wanted = symbol.toUpperCase();
   for (const arg of args) {
-    for (const part of arg.split(",")) {
-      const typed = part.trim().replace(/^\$/, "");
-      if (typed.toUpperCase() === wanted) return typed;
-    }
+    const whole = arg.trim().replace(/^\$/, "");
+    if (/\s/.test(whole) && whole.toUpperCase() === wanted) return whole;
+  }
+  for (const part of splitSymbolArgs(args)) {
+    const typed = part.replace(/^\$/, "");
+    if (typed.toUpperCase() === wanted) return typed;
   }
   return symbol;
 }
@@ -21,14 +29,33 @@ function searchHint(typed: string): string {
   return `Try \`gloomberb search ${/\s/.test(query) ? JSON.stringify(query) : query}\`.`;
 }
 
+/** Whether an id is a FRED series the catalog charts (DFEDTARU), which `gloomberb fred` prints. */
+export type FredSeriesCheck = (seriesId: string) => boolean;
+
 /**
  * Adds the search hint after each "Not a ticker: APPLE." in text meant for a person. The router
- * only knows the symbol upper-cased, so the hint reads the user's own spelling from `args`.
+ * only knows the symbol upper-cased, so the hint reads the user's own spelling from `args`. A FRED
+ * series id (DFEDTARU) is no ticker search finds, so its hint is the `fred` command instead.
  */
-export function withSearchHints(text: string, args: readonly string[]): string {
+export function withSearchHints(text: string, args: readonly string[], isFredSeries: FredSeriesCheck = () => false): string {
   return text.includes("Not a ticker: ")
-    ? text.replace(NOT_A_TICKER_SENTENCE, (sentence, symbol: string) => `${sentence} ${searchHint(typedSymbol(symbol, args))}`)
+    ? text.replace(NOT_A_TICKER_SENTENCE, (sentence, symbol: string) => {
+      const typed = typedSymbol(symbol, args);
+      const id = typed.toUpperCase();
+      return `${sentence} ${/^[A-Z0-9]+$/.test(id) && isFredSeries(id) ? `Try \`gloomberb fred ${id}\`.` : searchHint(typed)}`;
+    })
     : text;
+}
+
+/**
+ * "Not a ticker: USD_NGN. Did you mean USDNGN=X (US Dollar/Nigerian Naira)?",
+ * the listing search suggests, which takes the place of the search hint.
+ */
+export function withListingSuggestion(message: string, suggestion: string): string {
+  const symbol = notATickerSymbol(message);
+  if (!symbol || message.includes(" Did you mean ")) return message;
+  const sentence = `Not a ticker: ${symbol}.`;
+  return message.replace(sentence, `${sentence} Did you mean ${suggestion}?`);
 }
 
 /** Whether an error message says the symbol is not a ticker. */

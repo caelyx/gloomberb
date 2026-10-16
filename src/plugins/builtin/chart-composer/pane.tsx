@@ -1,4 +1,5 @@
 import { FINANCIAL_VINTAGE_NOTICE, SEC_EPS_BASIS_NOTICE } from "../../../utils/financial-statements";
+import { usePaneSharePreparation } from "../../../shares/prepare";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Box, useUiCapabilities } from "../../../ui";
 import {
@@ -17,6 +18,8 @@ import {
   type MultiSelectRowAction,
 } from "../../../components/ui";
 import { CompositeChart } from "../../../components/chart/composite";
+import { useChartViewReset, useChartViewResetListener } from "../../../components/chart/core/view-reset";
+import { formatCompositeDatasetDate } from "../../../components/chart/composite/format";
 import type { CompositeChartLevels, CompositeLevelEdit } from "../../../components/chart/composite/levels";
 import type { PaneProps, TickerResearchTabProps } from "../../../types/plugin";
 import type { ChartResolution, TimeRange } from "../../../components/chart/core/types";
@@ -43,8 +46,9 @@ import {
   type AppState,
 } from "../../../state/app/context";
 import { colors } from "../../../theme/colors";
-import { isUsListingExchange, parsePublicTickerKey, publicTickerKey, resolveExchangeTimeZone } from "../../../utils/exchanges";
+import { isUsListingExchange, parsePublicTickerKey, publicTickerKey } from "../../../utils/exchanges";
 import { isMarketFieldId } from "../../../time-series/field-catalog";
+import { isDatasetChart } from "../../../time-series/spec";
 import { CHART_COMPOSER_PANE_ID } from "../../../types/config";
 import { useRemoteUiNode } from "../../../remote/semantic-tree";
 import { SeriesEditorDialog } from "./editor";
@@ -104,6 +108,7 @@ import {
 } from "./settings";
 import { resolveChartComposerShortcut } from "./shortcuts";
 import { describeChartResolution, formatChartDateWindow, formatChartResolution } from "./viewport-labels";
+import { intradaySessionTimeZone } from "./session-history";
 import { ChartSeriesQuickAdd } from "./quick-add";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
 import { usePluginAppActions, usePluginConfigState } from "../../runtime";
@@ -116,13 +121,14 @@ import { getActiveQuoteDisplay } from "../../../market-data/market/status";
 import { resolveEntryData } from "../../../market-data/selectors";
 import { editPriceLevels, parsePriceLevels, PRICE_LEVELS_KEY, priceLevelTickerKey } from "./price-levels";
 import { canonicalExchange } from "../../../utils/exchanges";
-import { isPlainKey } from "../../../utils/keyboard";
 import { resolveInstrumentForPane } from "../../../core/state/app/instrument";
 import { CHART_FOLLOW_SERIES_SETTING_KEY, rebindFollowChartSpec, resolveFollowSeriesIds } from "./follow-binding";
 import type { InstrumentRef } from "../../../market-data/request-types";
 
 const RANGE_OPTIONS = RANGES.map((range, index) => ({ label: range, value: range, hint: String(index + 1) }));
 const AUTO_VIEWPORT_DEBOUNCE_MS = 350;
+/** A load for a moving view that has not answered in this long no longer holds the next one back. */
+const LOAD_AHEAD_TIMEOUT_MS = 4_000;
 /**
  * Drawings persist into pane settings on a short debounce after the pointer
  * settles. A share reads those settings, so it waits at least that long for a
@@ -142,6 +148,22 @@ interface RuntimeChartViewportState {
   key: string;
   adaptiveViewport: RuntimeChartViewport | null;
   requestViewport: RuntimeChartViewport;
+}
+
+/** The oldest and newest market bars loaded, and whether every listing has said it keeps nothing older. */
+function loadedMarketHistory(series: readonly ResolvedSeries[]): { start: number; end: number; complete: boolean } | null {
+  let start = Number.POSITIVE_INFINITY;
+  let end = Number.NEGATIVE_INFINITY;
+  let complete = true;
+  for (const entry of series) {
+    if (entry.observationKind !== "market" || entry.points.length === 0) continue;
+    const first = entry.points[0]!.date.getTime();
+    const last = entry.points.at(-1)!.date.getTime();
+    if (Number.isFinite(first)) start = Math.min(start, first);
+    if (Number.isFinite(last)) end = Math.max(end, last);
+    if (!entry.historyStart) complete = false;
+  }
+  return Number.isFinite(start) && Number.isFinite(end) ? { start, end, complete } : null;
 }
 
 function runtimeViewportFromSetting(
@@ -258,7 +280,7 @@ function ChartComposerSurface({
 }: ChartComposerSurfaceProps) {
   const dialog = useDialog();
   const dispatch = useAppDispatch();
-  const { publicSharing, cellWidthPx = 8 } = useUiCapabilities();
+  const { cellWidthPx = 8 } = useUiCapabilities();
   const desktopWeb = useUiCapabilities().nativePaneChrome === true;
   const paneId = usePaneInstanceId();
   const liveStreaming = useLiveStreamingSetting();
@@ -351,9 +373,15 @@ function ChartComposerSurface({
     spec.viewport.range,
     spec.viewport.resolution,
   ]);
+  // Auto names the bars it is on, which change as the view moves: a pan back
+  // past where a source keeps 30-minute bars charts days instead.
+  const autoBars = spec.viewport.resolution === "auto" ? resolution.resolution ?? null : null;
   const resolutionOptions = useMemo(
-    () => availableResolutions.map((value) => ({ label: formatChartResolution(value), value })),
-    [availableResolutions],
+    () => availableResolutions.map((value) => ({
+      label: value === "auto" && autoBars ? `Auto (${formatChartResolution(autoBars)})` : formatChartResolution(value),
+      value,
+    })),
+    [autoBars, availableResolutions],
   );
   const selectedStudies = getSelectedBuiltinStudies(spec);
   const selectedPairStudies = getSelectedPairStudies(spec);
@@ -396,7 +424,7 @@ function ChartComposerSurface({
     ),
     [resolution.bufferedSeries, resolution.legendSeries, resolution.series, spec],
   );
-  const { sharePane, notify } = usePluginAppActions();
+  const { notify } = usePluginAppActions();
   const { runtime } = usePluginRenderContext();
   const [levelStore, setLevelStore] = usePluginConfigState<unknown>(PRICE_LEVELS_KEY, null);
   const alertsJson = useAppSelector((state) => state.config.pluginConfig[PRICE_ALERTS_STORE.pluginId]?.[PRICE_ALERTS_STORE.key]);
@@ -472,10 +500,6 @@ function ChartComposerSurface({
       ...(alertsOn ? { action: { label: "alert", title: "Alert at Level", run: (level) => { void alertAtLevel(level.value); } } } : {}),
     };
   }, [alertAtLevel, alertsJson, alertsOn, editLevels, levelStore, listing]);
-  const shareTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => () => {
-    if (shareTimerRef.current !== null) clearTimeout(shareTimerRef.current);
-  }, []);
   const [interactionCaptured, setInteractionCapturedState] = useState(false);
   // Typing in quick-add must not freeze the plot: it only takes the keyboard.
   const [modalCaptured, setModalCaptured] = useState(false);
@@ -631,7 +655,19 @@ function ChartComposerSurface({
   const activatePane = useCallback(() => {
     if (!focused) dispatch({ type: "FOCUS_PANE", paneId });
   }, [dispatch, focused, paneId]);
+  useEffect(() => () => {
+    if (runtimeViewportTimerRef.current !== null) {
+      clearTimeout(runtimeViewportTimerRef.current);
+      runtimeViewportTimerRef.current = null;
+    }
+  }, []);
+  // The view this pane last saved, so its own write coming back through the
+  // settings is not mistaken for another device's view: that would cancel the
+  // load a pan still in progress has scheduled and put its window back.
+  const savedInteractionViewportRef = useRef<string | null>(null);
   useEffect(() => {
+    if (persistedInteractionViewport && requestViewportOwnerRef.current === authoredViewportKey
+      && JSON.stringify(persistedInteractionViewport) === savedInteractionViewportRef.current) return;
     if (runtimeViewportTimerRef.current !== null) {
       clearTimeout(runtimeViewportTimerRef.current);
       runtimeViewportTimerRef.current = null;
@@ -645,30 +681,41 @@ function ChartComposerSurface({
     requestViewportOwnerRef.current = authoredViewportKey;
     setRuntimeViewportState((current) => current?.key === authoredViewportKey ? current : restored);
     if (persistedInteractionViewport && !restored) setStoredInteractionViewport(null);
-    return () => {
-      if (runtimeViewportTimerRef.current !== null) {
-        clearTimeout(runtimeViewportTimerRef.current);
-        runtimeViewportTimerRef.current = null;
-      }
-    };
   }, [authoredViewportKey, persistedInteractionViewport, setStoredInteractionViewport]);
-  const commitRuntimeViewport = useCallback(() => {
+  // The bars loaded so far, and whether the source has said nothing older exists.
+  const loadedHistory = useMemo(() => loadedMarketHistory(plottedSeries), [plottedSeries]);
+  const loadedHistoryRef = useRef(loadedHistory);
+  loadedHistoryRef.current = loadedHistory;
+  // The newest bar seen at all: bars loaded for a moved view (finer ones, after
+  // a zoom) can end before it, and a pan forward then has more to ask for.
+  const newestBarRef = useRef(Number.NEGATIVE_INFINITY);
+  if (loadedHistory) newestBarRef.current = Math.max(newestBarRef.current, loadedHistory.end);
+  // A window asked for and not answered yet: the result's view ends where the request does once it lands.
+  const loadingWindowRef = useRef<{ end: number; at: number } | null>(null);
+  const resultViewportEnd = resolution.viewport?.end.getTime() ?? null;
+  if (loadingWindowRef.current && resultViewportEnd !== null
+    && Math.abs(resultViewportEnd - loadingWindowRef.current.end) < 1_000) loadingWindowRef.current = null;
+  const commitRuntimeViewport = useCallback((save = true) => {
     const requestViewport = requestViewportRef.current;
     if (!requestViewport) return;
     const adaptiveViewport = spec.viewport.resolution === "auto"
       ? adaptiveViewportRef.current
       : null;
+    loadingWindowRef.current = { end: requestViewport.end.getTime(), at: Date.now() };
     setRuntimeViewportState({
       key: authoredViewportKey,
       adaptiveViewport,
       requestViewport,
     });
-    setStoredInteractionViewport({
+    if (!save) return;
+    const saved = {
       authoredViewportKey,
       start: requestViewport.start.toISOString(),
       end: requestViewport.end.toISOString(),
       adaptive: adaptiveViewport !== null,
-    } satisfies ChartInteractionViewport);
+    } satisfies ChartInteractionViewport;
+    savedInteractionViewportRef.current = JSON.stringify(parseChartInteractionViewport(saved));
+    setStoredInteractionViewport(saved);
   }, [authoredViewportKey, setStoredInteractionViewport, spec.viewport.resolution]);
   const handleChartViewportChange = useCallback((
     next: { start: Date; end: Date } | null,
@@ -681,6 +728,7 @@ function ChartComposerSurface({
     if (!next) {
       adaptiveViewportRef.current = null;
       requestViewportRef.current = null;
+      loadingWindowRef.current = null;
       setRuntimeViewportState(null);
       setStoredInteractionViewport(null);
       return;
@@ -694,24 +742,37 @@ function ChartComposerSurface({
     // A pan can leave the window a provider serves at the current resolution
     // just as a zoom can, so both re-pick.
     if (spec.viewport.resolution === "auto") adaptiveViewportRef.current = viewport;
+    // Bars are asked for while the view is still moving, once it comes within
+    // half a screen of the oldest loaded one (or of the newest, when newer
+    // ones exist), so a long pan keeps going instead of running into the end
+    // of what is loaded and waiting for the pointer to rest.
+    const loaded = loadedHistoryRef.current;
+    const loading = loadingWindowRef.current;
+    const reach = (end - start) / 2;
+    const nearOldest = !!loaded && !loaded.complete && start - loaded.start < reach;
+    const nearNewest = !!loaded && loaded.end < newestBarRef.current - reach / 10 && loaded.end - end < reach;
+    if ((nearOldest || nearNewest) && (!loading || Date.now() - loading.at > LOAD_AHEAD_TIMEOUT_MS)) {
+      commitRuntimeViewport(false);
+    }
     runtimeViewportTimerRef.current = globalThis.setTimeout(() => {
       runtimeViewportTimerRef.current = null;
       commitRuntimeViewport();
     }, AUTO_VIEWPORT_DEBOUNCE_MS);
-  }, [authoredViewportKey, commitRuntimeViewport, spec.viewport.resolution]);
-  const shareChart = useCallback(() => {
-    // The share reads pane settings, so the gesture in flight lands there first.
+  }, [authoredViewportKey, commitRuntimeViewport, setStoredInteractionViewport, spec.viewport.resolution]);
+  // The view the pane keeps (the window a pan asked for, the one saved with the
+  // pane and restored when it reopens) is the pane's to clear with the chart's
+  // own, whether or not the chart holds a moved view of its own.
+  useChartViewResetListener(() => {
+    if (activeRuntimeViewport || requestViewportRef.current) handleChartViewportChange(null, "reset");
+  });
+  usePaneSharePreparation(paneId, async () => {
     if (runtimeViewportTimerRef.current !== null) {
       clearTimeout(runtimeViewportTimerRef.current);
       runtimeViewportTimerRef.current = null;
       commitRuntimeViewport();
     }
-    if (shareTimerRef.current !== null) return;
-    shareTimerRef.current = globalThis.setTimeout(() => {
-      shareTimerRef.current = null;
-      sharePane(paneId);
-    }, SHARE_SETTLE_DELAY_MS);
-  }, [commitRuntimeViewport, paneId, sharePane]);
+    await new Promise((resolve) => setTimeout(resolve, SHARE_SETTLE_DELAY_MS));
+  });
 
   useRemoteUiNode({
     role: "chart-data",
@@ -739,12 +800,20 @@ function ChartComposerSurface({
     }
   }, [dialog, setInteractionCaptured, setSpec, spec]);
 
+  const resetChartView = useChartViewReset();
+  /** The range the bar shows as selected; a fixed window or a period count leaves a range to pick. */
+  const rangeReselects = !spec.viewport.dateWindow && spec.viewport.maxPoints === undefined;
   const setRange = useCallback((range: TimeRange) => {
+    // The range already showing: a view moved off it goes back to it, as `0` does.
+    if (rangeReselects && range === spec.viewport.range) {
+      resetChartView();
+      return;
+    }
     setSpec({
       ...spec,
       viewport: { ...spec.viewport, range, dateWindow: undefined, maxPoints: undefined },
     });
-  }, [setSpec, spec]);
+  }, [rangeReselects, resetChartView, setSpec, spec]);
   const setResolution = useCallback((next: ChartResolution) => {
     setSpec({ ...spec, viewport: { ...spec.viewport, resolution: next } });
   }, [setSpec, spec]);
@@ -800,12 +869,6 @@ function ChartComposerSurface({
   );
   useShortcut((event) => {
     if (interactionCaptureRef.current || dialogOpen) return;
-    if (publicSharing && isPlainKey(event, "y")) {
-      event.preventDefault();
-      event.stopPropagation();
-      shareChart();
-      return;
-    }
     const shortcut = resolveChartComposerShortcut(event, RANGES.length);
     if (!shortcut) return;
     event.preventDefault();
@@ -834,12 +897,10 @@ function ChartComposerSurface({
     ? "Comparison unavailable: need two shared dates and a nonzero baseline."
     : null;
   const statusError = resolution.errors[0];
-  const spreadUnitError = spec.studies.some((study) => study.kind === "spread"
-    && statusError?.startsWith(`${study.id}: spread cannot subtract `)
-    && statusError.endsWith("; inputs require matching known units, currencies and scales."));
-  const statusErrorNotice = spreadUnitError
-    ? "Spread unavailable: incompatible or unknown units."
-    : statusError;
+  // A spread or formula error names its legs and their units; the study's id adds nothing to it.
+  const formulaStudy = spec.studies.find((study) => (study.kind === "spread" || study.kind === "formula")
+    && statusError?.startsWith(`${study.id}: `));
+  const statusErrorNotice = formulaStudy ? statusError?.slice(`${formulaStudy.id}: `.length) : statusError;
   // Failed series use their authored id in errors and their display label in warnings.
   const errorSeries = spec.series.find((entry) => statusError?.startsWith(`${entry.label ?? entry.id}: `));
   const errorMessage = errorSeries ? statusError?.slice(`${errorSeries.label ?? errorSeries.id}: `.length) : undefined;
@@ -871,11 +932,10 @@ function ChartComposerSurface({
   });
 
   // Footer registrations compare presentation, so their callbacks must read current actions.
-  const currentActionsRef = useRef({ openSeriesEditor, openResolutionPicker, shareChart });
-  currentActionsRef.current = { openSeriesEditor, openResolutionPicker, shareChart };
+  const currentActionsRef = useRef({ openSeriesEditor, openResolutionPicker });
+  currentActionsRef.current = { openSeriesEditor, openResolutionPicker };
   const footerSeries = useCallback(() => { void currentActionsRef.current.openSeriesEditor(); }, []);
   const footerResolution = useCallback(() => { void currentActionsRef.current.openResolutionPicker(); }, []);
-  const footerShare = useCallback(() => { currentActionsRef.current.shareChart(); }, []);
   const openIndicators = useCallback((event?: PaneFooterPressEvent) => {
     indicatorsDialogRef.current?.open(footerAnchorPoint(event));
   }, []);
@@ -889,21 +949,36 @@ function ChartComposerSurface({
   }, [anchoredVwapOn]);
   const anchorable = anchoredVwapOn && !pickingAnchor;
   const footerAnchor = useCallback(() => setPickingAnchor(true), []);
+  // A dataset (CHOKE's transits) panned or zoomed back from its newest
+  // observation says how far its data goes, as its legend dates a value.
+  const newestBeyondView = useMemo(() => {
+    const end = viewport?.end.getTime();
+    if (!activeRuntimeViewport || !isDatasetChart(spec) || end === undefined || !Number.isFinite(end)) return null;
+    let newest = Number.NEGATIVE_INFINITY;
+    for (const entry of plottedSeries) {
+      for (const point of entry.points) {
+        const time = point.date.getTime();
+        if (point.value != null && Number.isFinite(time) && time > newest) newest = time;
+      }
+    }
+    return newest > end ? formatCompositeDatasetDate(new Date(newest), end) : null;
+  }, [activeRuntimeViewport, plottedSeries, spec, viewport]);
   usePaneFooter(footerId, () => ({
     info: resolution.loading
       ? [{ id: "loading", parts: [{ text: "loading", tone: "muted" as const }] }]
       : pickingAnchor
         ? [{ id: "anchor", parts: [{ text: "pick a bar to anchor VWAP", tone: "muted" as const }] }]
-        : [],
+        : newestBeyondView
+          ? [{ id: "newest", asOf: true, parts: [{ text: `newest ${newestBeyondView}`, tone: "muted" as const }] }]
+          : [],
     hints: [
       { id: "series", key: "s", label: "eries", onPress: footerSeries },
       { id: "indicators", key: "i", label: "ndicators", onPress: openIndicators, disabled: indicatorsDisabled },
       { id: "formulas", key: "f", label: "ormulas", onPress: openFormulas, disabled: formulasDisabled },
       { id: "resolution", key: "t", label: "imeframe", onPress: footerResolution },
       ...(anchorable ? [{ id: "vwap-anchor", key: "v", label: "wap anchor", title: "Anchor VWAP", onPress: footerAnchor }] : []),
-      ...(publicSharing ? [{ id: "share", key: "y", label: " share", onPress: footerShare }] : []),
     ],
-  }), [resolution.loading, pickingAnchor, footerSeries, openIndicators, indicatorsDisabled, openFormulas, formulasDisabled, footerResolution, anchorable, footerAnchor, publicSharing, footerShare]);
+  }), [resolution.loading, pickingAnchor, newestBeyondView, footerSeries, openIndicators, indicatorsDisabled, openFormulas, formulasDisabled, footerResolution, anchorable, footerAnchor]);
 
   // A fixed window (a GIP session) highlights no range, so the bar names it.
   const dateWindowLabel = useMemo(() => {
@@ -911,7 +986,7 @@ function ChartComposerSurface({
     if (!window) return undefined;
     const exchange = spec.series.find((entry) => entry.source.kind === "security")?.source;
     const timeZone = exchange?.kind === "security"
-      ? resolveExchangeTimeZone(exchange.instrument.exchange) ?? "UTC"
+      ? intradaySessionTimeZone(exchange.instrument.symbol, exchange.instrument.exchange)
       : "UTC";
     return formatChartDateWindow(window, timeZone);
   }, [spec.series, spec.viewport.dateWindow]);
@@ -977,7 +1052,7 @@ function ChartComposerSurface({
       <QueryBar
         width={width}
         filters={[
-          { id: "range", label: "Range", inline: true,
+          { id: "range", label: "Range", inline: true, chartRange: rangeReselects,
             value: spec.viewport.dateWindow ? "" : spec.viewport.range,
             options: RANGE_OPTIONS,
             onChange: (value: string) => setRange(value as TimeRange) },

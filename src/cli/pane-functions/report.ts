@@ -2,7 +2,7 @@ import type { MarketContext } from "../types";
 import type { NormalizedPaneFunctionOptions } from "./capabilities";
 import type { ResolvedPaneFunction } from "./resolver";
 import { buildHeadlessFunctionReport } from "./headless";
-import { appendDomReportFooter, buildDomFunctionReport, domReportNote } from "./dom";
+import { appendDomReportFooter, buildDomFunctionReport, domReportNote, domReportView } from "./dom";
 import type { ReportFreshness } from "./freshness";
 import type { CliReportTables } from "../report-tables";
 
@@ -22,8 +22,18 @@ interface PaneFunctionReportData {
   empty: boolean;
   complete: boolean;
   unavailableSymbols: string[];
-  /** Source, as-of in UTC and live/delayed/stale/not-a-feed status; the last line of the text report. */
-  freshness: ReportFreshness;
+  /** Report errors: a source that did not answer, a symbol that is not one. */
+  errors?: string[];
+  /** What the report could not do as asked and did instead; `fn` prints them on stderr and in JSON's `warnings`. */
+  warnings?: string[];
+  /**
+   * Source, as-of in UTC and live/delayed/stale/not-a-feed status; the last
+   * line of the text report. Absent when a wall covered the pane (`locked`),
+   * since nothing was read.
+   */
+  freshness?: ReportFreshness;
+  /** The wall that covered the whole pane, so the report read nothing. */
+  locked?: "sign-in" | "pro";
   [key: string]: unknown;
 }
 
@@ -41,6 +51,12 @@ export function resolvePaneFunctionReportSource(
   return resolved.capability.reportReadiness === "live-dom" ? "dom" : null;
 }
 
+/** `gloomberb shot CAT santander`, the argument quoted when it has spaces. */
+function shotCommand(token: string, rawArg: string): string {
+  const arg = rawArg.trim();
+  return ["gloomberb shot", token, arg && /\s/.test(arg) ? JSON.stringify(arg) : arg].filter(Boolean).join(" ");
+}
+
 export async function buildFunctionReport(
   resolved: ResolvedPaneFunction,
   context: MarketContext,
@@ -53,6 +69,11 @@ export async function buildFunctionReport(
     if (resolved.pane.id === "help") {
       throw new Error("HELP is an in-app pane, so it has no report. For the commands run `gloomberb help`; for the functions run `gloomberb catalog`.");
     }
+    // A pane `shot` can draw is still one command away.
+    const screenshot = resolved.capability.screenshotReadiness;
+    if (screenshot != null && screenshot !== "unsupported") {
+      throw new Error(`${resolved.token} is an interactive pane with no data report; run \`${shotCommand(resolved.token, rawArg)}\` to see it.`);
+    }
     throw new Error(`${resolved.token} is an interactive pane and does not expose a data report.`);
   }
 
@@ -61,16 +82,16 @@ export async function buildFunctionReport(
     : await buildDomFunctionReport(resolved, context, rawArg);
   const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
   report.data = { ...report.data, source, elapsedMs };
+  // A report about one symbol names it on every exported row; a chart's series name their own.
+  if (!report.tables.identity && report.data.symbols.length === 1) {
+    report.tables = { ...report.tables, identity: { symbolOrSeries: report.data.symbols[0]! } };
+  }
   if (source === "dom") {
-    report.text = appendDomReportFooter(
-      report.text,
-      elapsedMs,
-      report.data.truncated === true,
-      report.data.freshness,
-    );
+    const view = domReportView(report.data);
+    report.text = appendDomReportFooter(report.text, elapsedMs, view, report.data.freshness);
     report.tables = {
       ...report.tables,
-      footer: [...report.tables.footer, `note: ${domReportNote(elapsedMs, report.data.truncated === true)}`],
+      footer: [...report.tables.footer, `note: ${domReportNote(elapsedMs, view)}`],
     };
   }
   return report;

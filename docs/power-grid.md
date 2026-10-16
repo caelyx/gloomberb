@@ -1,8 +1,8 @@
 # Power and grid capacity
 
-`POWER` opens power interconnection and large-load research. `POWER NEE` narrows it to a listed developer or utility resolved by the entity directory. Exchange-qualified tickers retain their venue. POWER is a **Pro dataset**; free accounts receive up to three records per section with a locked remainder and limited history.
+`POWER` opens power interconnection and large-load research. `POWER NEE` narrows it to a listed developer or utility resolved by the entity directory. Exchange-qualified tickers retain their venue. When the open tab has no record mapped to the ticker, it says which tabs do and how many records each holds, with a button to open each. POWER is a **Pro dataset**; free accounts receive up to three records per section with a locked remainder and limited history.
 
-The Queue table explores public interconnection registers by country, grid region, fuel, status, project, developer and utility. Columns include reported MW, proposed in-service date, location and mapped tickers. Click a column heading to sort the full matching dataset. The figures follow the selected record’s register and region; overlapping registers are not summed into a national total. Additional records append as you scroll. A missing capacity is `--`; zero remains zero. Regional summaries and portions of connection applications can be separate records, so a record count is not necessarily a count of unique physical projects.
+The Queue table explores public interconnection registers by country, grid region, fuel, status, project, developer and utility. Columns include reported MW, proposed in-service date, location and mapped tickers; a record no listed company is mapped to reads `unmapped`. Click a column heading to sort the full matching dataset. The figures follow the selected record’s register and region; overlapping registers are not summed into a national total. Additional records append as you scroll. A missing capacity is `--`; zero remains zero. Regional summaries and portions of connection applications can be separate records, so a record count is not necessarily a count of unique physical projects.
 
 The tabs cover:
 
@@ -21,6 +21,12 @@ Open a row with Enter or a click for dates, units, exact source cells, the prima
 `O` opens the selected source. For a mapped company, `D`, `F`, `G` and `S` open DES, FA, a chart and SPLC. `C` opens GPU rental prices. `T` opens TBO where installed, passing the selected ticker. TBO has independent coverage; its data does not feed POWER. Actions are also in the pane menu.
 
 Columns that would only repeat a default on every row, such as a project-level record scope or zero records with missing capacity, are left out until a row differs. The Queue figures carry the selected region's active, completed and withdrawn MW as one bar.
+
+## European prices and gas storage (EPWR)
+
+`EPWR` opens the Prices tab, free. Its query bar switches between the power board (day-ahead prices and the EUA auction price) and gas storage. `EPWR GAS` opens gas storage on the EU, `EPWR GAS DE` on one country.
+
+Gas storage comes from GIE AGSI+, published each evening. Each area is dated by its gas day; `est` marks a day the platform still flags as estimated, as the current day always is. The EU row is the platform's own aggregate, not a sum. The five-year range reads the same calendar day in the five years before the gas day's year: February 29 reads the 28th in years without one, and a range holding fewer years says how many. A missing day is a gap, never zero. Chart `CAP:gas-storage:eu` (% full), `CAP:gas-storage-twh:eu` (TWh) or `CAP:gas-injection:eu` (net injection, GWh/day).
 
 ## History and comparability
 

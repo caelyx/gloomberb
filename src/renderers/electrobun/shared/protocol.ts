@@ -2,12 +2,12 @@ import type { AppSessionSnapshot } from "../../../core/state/session-persistence
 import type { PaneRuntimeState } from "../../../core/state/app/state";
 import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState } from "../../../types/desktop-window";
 import type { DesktopApplicationMenuCommand } from "../../../types/desktop-menu";
-import type { AppConfig } from "../../../types/config";
+import type { AppConfig, UpdateChannel } from "../../../types/config";
 import type { CachedResourceRecord, ResourceCacheKey } from "../../../data/resource-store";
 import type { TickerRecord } from "../../../types/ticker";
 import type { ReleaseInfo, UpdateCheckResult, UpdateProgress } from "../../../updater";
 import type { CapabilityManifest } from "../../../capabilities";
-import type { PluginOperationResult, PluginPin } from "../../../plugins/builtin/plugin-marketplace/store";
+import type { PluginOperationResult, PluginPin } from "../../../plugins/marketplace/store";
 import type { RemoteControlRequest, RemoteControlResponse } from "../../../remote/types";
 import type { HttpProxyRequestEnvelope, HttpProxyResponseEnvelope } from "../../../utils/http-proxy-response";
 
@@ -85,7 +85,7 @@ export interface DesktopHttpStreamOpenRequest extends HttpProxyRequestEnvelope {
 }
 
 /** The response head. Its body follows as `http.stream.chunk` messages. */
-export type DesktopHttpStreamOpenResponse = Omit<HttpProxyResponseEnvelope, "body">;
+export type DesktopHttpStreamOpenResponse = Omit<HttpProxyResponseEnvelope, "body" | "bodyBase64">;
 
 /**
  * One slice of a streamed body. Exactly one terminal message ends a stream:
@@ -94,6 +94,8 @@ export type DesktopHttpStreamOpenResponse = Omit<HttpProxyResponseEnvelope, "bod
 interface DesktopHttpStreamChunkMessage {
   streamId: string;
   chunk?: string;
+  /** A slice of a body whose content type is not text, which `chunk` would mangle. */
+  chunkBase64?: string;
   done?: boolean;
   error?: string;
 }
@@ -213,9 +215,12 @@ interface DesktopBackendRequestMap {
     response: null;
   };
   "host.showContextMenu": { request: { menu: DesktopContextMenuItem[] }; response: boolean };
-  "update.check": { request: { currentVersion: string }; response: UpdateCheckResult };
+  /** The unread count for the Dock icon badge: `""` (none), `"1"` to `"99"` or `"99+"`. Only the main window's is applied. */
+  "host.setAppBadge": { request: { label: string }; response: null };
+  /** `channel` absent (an older view) means stable. */
+  "update.check": { request: { currentVersion: string; channel?: UpdateChannel }; response: UpdateCheckResult };
   /** Downloads and stages the update. It ends in `ready` and never relaunches the app. */
-  "update.start": { request: { release: ReleaseInfo; currentVersion?: string }; response: null };
+  "update.start": { request: { release: ReleaseInfo }; response: null };
   /** Installs the staged update and relaunches. Sent only when the user presses Restart. */
   "update.apply": { request: null; response: null };
   "ticker.loadAll": { request: null; response: TickerRecord[] };

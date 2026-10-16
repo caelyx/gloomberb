@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { Box, Text } from "../../ui";
+import { Box, Text, useUiHost } from "../../ui";
 import { type PromptContext, useDialogKeyboard } from "../../ui/dialog";
 import { useThemeColors } from "../../theme/theme-context";
 import { t } from "../../i18n";
-import { DialogFrame } from "./frame";
+import { DialogFrame, fitDialogWidth } from "./frame";
 import { ListView, listCursorMove, type ListViewItem } from "./list-view";
 import { clampIndex } from "../../utils/math";
 
@@ -13,6 +13,8 @@ export interface ChoiceDialogChoice {
   description?: string;
   detail?: string;
   disabled?: boolean;
+  /** Tints the label, e.g. a status in its tone. */
+  color?: string;
 }
 
 export interface ChoiceDialogProps extends PromptContext<string> {
@@ -53,6 +55,7 @@ export function ChoiceDialog({
   bgColor,
 }: ChoiceDialogProps) {
   const colors = useThemeColors();
+  const desktop = useUiHost().kind === "desktop-web";
   const [index, setIndex] = useState(() =>
     clampIndex(getInitialChoiceIndex(choices, selectedChoiceId), choices.length, -1)
   );
@@ -64,6 +67,7 @@ export function ChoiceDialog({
     description: getChoiceDescription(choice),
     detail: choice.detail,
     disabled: choice.disabled,
+    color: choice.color,
   })), [choices]);
   const width = useMemo(() => choiceDialogWidth(title, choices), [choices, title]);
 
@@ -90,7 +94,8 @@ export function ChoiceDialog({
 
   return (
     <DialogFrame title={title} footer={footer} showTitleDivider={false}>
-      <Box flexDirection="column" width={width}>
+      {/* Never wider than the dialog: the terminal's box is 60 columns, a phone narrower than the cells asked for. */}
+      <Box flexDirection="column" {...(desktop ? { style: { width: fitDialogWidth(width) } } : { width, maxWidth: "100%" })}>
         <ListView
           items={items}
           selectedIndex={selectedIndex}
@@ -105,7 +110,7 @@ export function ChoiceDialog({
           onActivate={(_, nextIndex) => activateChoice(choices[nextIndex])}
         />
         <Box height={1} />
-        <Text fg={colors.textDim} wrapText width={width}>{getChoiceDescription(selectedChoice)}</Text>
+        <Text fg={colors.textDim} wrapText>{getChoiceDescription(selectedChoice)}</Text>
       </Box>
     </DialogFrame>
   );

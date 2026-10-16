@@ -1,10 +1,35 @@
 import { describe, expect, test } from "bun:test";
-import { cleanFloat32Price, historyFlagNote, historyNotes, historyPriceDecimals, historyRows, historyUnit } from "./history-rows";
+import {
+  cleanFloat32Price, formingPeriodBar, historyFlagNote, historyGapNote, historyJumpNote, historyNotes, historyPriceDecimals, historyRows, historyUnbrokenFrom,
+  historyUnit,
+} from "./history-rows";
 import { pricePointValues } from "../utils/price-history-integrity";
+import type { ManualChartResolution } from "../time-series/resolution";
+import { rowsFreshness } from "./freshness";
+import { formatFreshnessLine } from "./pane-functions/freshness";
+import { barHistoryFreshness } from "../plugins/builtin/shared/report-freshness";
 
 const daily = (bars: number[][]) => historyRows(bars.map(([open, high, low, close], index) => ({
   date: new Date(Date.UTC(2026, 0, index + 1)), open, high, low, close: close!,
 })), "1d");
+
+/** USDILS=X monthly as the source served it: 34 old-shekel bars, 148 months without one, then new shekels. */
+const usdIlsMonthly = () => [
+  ...Array.from({ length: 34 }, (_, month) => ({ date: new Date(Date.UTC(1977, 9 + month, 1)), close: Number((0.0015 + month * 0.0034 / 33).toFixed(4)) })),
+  ...[2.763, 2.762, 2.795].map((close, month) => ({ date: new Date(Date.UTC(1992, 11 + month, 1)), close })),
+];
+
+/** Bars at `step` from `first` to `last`, skipping those `skip` says, with a close that swings between 80 and 120. */
+const series = (first: string, last: string, step: number, skip: (date: Date) => boolean = () => false) => {
+  const points: Array<{ date: Date; close: number }> = [];
+  for (let time = Date.parse(first); time <= Date.parse(last); time += step) {
+    if (!skip(new Date(time))) points.push({ date: new Date(time), close: 100 + 20 * Math.sin(time / 4e8) });
+  }
+  return points;
+};
+const DAY = 86_400_000;
+const weekend = (date: Date) => date.getUTCDay() === 0 || date.getUTCDay() === 6;
+const between = (date: Date, from: string, to: string) => date.toISOString().slice(0, 10) >= from && date.toISOString().slice(0, 10) <= to;
 
 describe("history rows", () => {
   test("float32 noise from either source becomes the intended decimal while real precision stays", () => {
@@ -65,9 +90,76 @@ describe("history rows", () => {
     expect(historyNotes("6M", weekly[0]!.interval, weekly[0]!.date, now)).toContain("Asked 6M, got weekly bars from 2026-01-05");
   });
 
+  test("a coin's day without a bar is named; a market's weekends and the days before a listing are not", () => {
+    const days = (first: string, last: string, skip: string[] = []) => {
+      const dates: Date[] = [];
+      for (let time = Date.parse(first); time <= Date.parse(last); time += 86_400_000) {
+        if (!skip.includes(new Date(time).toISOString().slice(0, 10))) dates.push(new Date(time));
+      }
+      return historyRows(dates.map((date) => ({ date, close: 1 })), "1d");
+    };
+    const btc = { listing: "BTC-USD", exchange: "CCC", instrumentType: "CRYPTOCURRENCY" };
+    // The coin's daily bars went from 9 Oct to 11 Oct; a coin listed mid-range starts late without a gap.
+    expect(historyGapNote(days("2026-09-11", "2026-10-11", ["2026-10-10"]), btc)).toBe("No bar for 2026-10-10");
+    expect(historyGapNote(days("2026-10-02", "2026-10-11"), { listing: "NEW-USD" })).toBeNull();
+    // A coin named by its listing type alone counts too; several gaps fold into one line.
+    expect(historyGapNote(
+      days("2026-08-01", "2026-10-11", ["2026-08-03", "2026-08-20", "2026-09-30", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-10"]),
+      { listing: "BTC-EUR", instrumentType: "CRYPTOCURRENCY" },
+    )).toBe("No bars for 2 earlier days, 2026-09-30, 2026-10-04 to 2026-10-06 and 2026-10-10");
+    // A stock's weekend, and a coin's weekly bars, are no gap.
+    const weekdays = days("2026-09-28", "2026-10-09", ["2026-10-03", "2026-10-04"]);
+    expect(historyGapNote(weekdays, { listing: "AAPL", exchange: "NASDAQ", instrumentType: "EQUITY" })).toBeNull();
+    const weekly = historyRows([0, 7, 21].map((day) => ({ date: new Date(Date.UTC(2026, 8, 7 + day)), close: 1 })), "1wk");
+    expect(historyGapNote(weekly, btc)).toBeNull();
+  });
+
+  test("a gap or a 100x jump flags the bar after it and keeps its prices, which the blanked-bar count leaves out", () => {
+    const rows = historyRows(usdIlsMonthly(), "1mo", "ILS", "ILS per USD");
+    expect(rows.filter((row) => row.flag).map((row) => [row.date, row.flag, row.close])).toEqual([["1992-12-01", "gap,jump", 2.763]]);
+    expect(historyFlagNote(rows)).toBeNull();
+    const blanked = historyRows([{ date: new Date("1977-09-01"), open: 0.0015, high: 0.0014, low: 0.0014, close: 0.0015 }, ...usdIlsMonthly()], "1mo");
+    expect(historyFlagNote(blanked)).toBe("1 of 38 bars has high below open or close in the source data; their prices are left blank");
+    // A daily series breaks where its weekly bars would: Athens shut for five weeks in 2015, and a fall is a jump too.
+    const athens = historyRows([
+      ...series("2015-06-22", "2015-06-26", DAY), ...series("2015-08-03", "2015-08-05", DAY), { date: new Date("2015-08-06"), close: 0.5 },
+    ], "1d");
+    expect(athens.filter((row) => row.flag).map((row) => [row.date, row.flag])).toEqual([["2015-08-03", "gap"], ["2015-08-06", "jump"]]);
+    expect(historyGapNote(athens, { listing: "ETE.AT" })).toBe("No bars for 2015-06-27 to 2015-08-02 (5 weeks)");
+    expect(historyJumpNote(athens)).toMatch(/^Close falls \d+x from [\d.]+ on 2015-08-05 to 0.5 on 2015-08-06$/);
+    expect(historyUnbrokenFrom(athens)).toBe("2015-08-06");
+  });
+
+  test("closures, thin trading and round-the-clock coins are no break", () => {
+    const cases: Array<[string, ReturnType<typeof series>, ManualChartResolution, { listing: string; exchange?: string; instrumentType?: string }]> = [
+      // AAPL's year: weekends and a four-day Easter.
+      ["daily", series("2025-10-13", "2026-10-12", DAY, (date) => weekend(date) || between(date, "2026-04-03", "2026-04-06")), "1d", { listing: "AAPL" }],
+      // Lunar New Year shuts Shanghai for nine days; a thin listing goes two weeks without a trade.
+      ["closures", series("2026-01-05", "2026-04-30", DAY, (date) => weekend(date) || between(date, "2026-02-14", "2026-02-23")
+        || between(date, "2026-03-09", "2026-03-20")), "1d", { listing: "600519.SS" }],
+      ["weekly", series("2021-10-04", "2026-10-05", 7 * DAY, (date) => between(date, "2025-09-29", "2025-10-06")), "1wk", { listing: "600519.SS" }],
+      ["monthly", series("1990-01-01", "2026-10-01", 30.44 * DAY, (date) => between(date, "2001-09-01", "2001-10-31")), "1mo", { listing: "GC=F" }],
+      // 5-minute bars of a Friday and Monday session, hourly bars across a week's nights.
+      ["5-minute", series("2026-10-09T13:30:00Z", "2026-10-12T19:55:00Z", 5 * 60_000, (date) => weekend(date)
+        || date.getUTCHours() < 13 || date.getUTCHours() >= 20), "5m", { listing: "AAPL" }],
+      ["hourly", series("2026-10-05T13:00:00Z", "2026-10-09T19:00:00Z", 3_600_000, (date) => date.getUTCHours() < 13 || date.getUTCHours() > 19), "1h", { listing: "AAPL" }],
+      // A coin trades every day; a thin one misses hours.
+      ["crypto", series("2025-10-13", "2026-10-12", DAY), "1d", { listing: "BTC-USD", exchange: "CCC" }],
+      ["crypto hourly", series("2026-10-05T00:00:00Z", "2026-10-12T00:00:00Z", 3_600_000, (date) => date.getUTCHours() % 5 === 0), "1h",
+        { listing: "PEPE-USD", exchange: "CCC" }],
+    ];
+    for (const [name, points, interval, market] of cases) {
+      const rows = historyRows(points, interval);
+      expect([name, rows.filter((row) => row.flag).length, historyGapNote(rows, market), historyJumpNote(rows), historyUnbrokenFrom(rows)])
+        .toEqual([name, 0, null, null, null]);
+    }
+  });
+
   test("prices are in the quote's currency, an FX pair's counter currency, or index points, and never a guessed one", () => {
     expect(historyUnit("ZAR=X", null)).toEqual({ kind: "pair", currency: "ZAR", unit: "ZAR per USD" });
-    expect(historyUnit("EURUSD=X", { currency: "USD" })).toEqual({ kind: "pair", currency: "USD", unit: "USD per EUR" });
+    for (const listing of ["EURUSD=X", "EUR/USD", "EURUSD:CCY"]) {
+      expect(historyUnit(listing, { currency: "USD" })).toEqual({ kind: "pair", currency: "USD", unit: "USD per EUR" });
+    }
     expect(historyUnit("LUMI.TA", { currency: "ILA" }).unit).toBe("ILA (agorot, 1/100 ILS)");
     expect(historyUnit("^GSPC", { currency: "USD", instrumentType: "INDEX" })).toEqual({ kind: "points", currency: null, unit: "index points" });
     expect(historyUnit("LUMI.TA", null)).toEqual({ kind: "unknown", currency: null, unit: null });
@@ -85,5 +177,63 @@ describe("history rows", () => {
     expect(historyPriceDecimals(daily(shib.map((bar) => bar.map(Math.fround))))).toBe(8);
     // A known kind applies the app's price rules: an equity shows cents even with sub-penny prints.
     expect(historyPriceDecimals(daily([[334.5795, 335.48, 333.1697, 334.225], [334.26, 334.1216, 332.8706, 333.8972]]), "STK")).toBe(2);
+  });
+});
+
+describe("a weekly or monthly bar whose period runs on", () => {
+  const bars = (dates: string[], resolution: ManualChartResolution) => historyRows(dates.map((date) => ({ date: new Date(`${date}T00:00:00Z`), close: 100 })), resolution);
+  // The status line `history` ends with, from the bars it prints.
+  const footer = (rows: ReturnType<typeof bars>, venue: string, now: number) => {
+    const forming = formingPeriodBar(rows, venue, now);
+    const shown = forming?.rows ?? rows;
+    return {
+      partial: shown.map((row) => row.partial === true),
+      line: formatFreshnessLine(rowsFreshness(shown, {
+        ...barHistoryFreshness(rows[0]!.interval), observedKey: "date", oldest: null, cadenceExchange: venue,
+        ...(forming ? { periodToDate: forming.periodToDate } : {}),
+      }, undefined, now)!),
+    };
+  };
+  // Fri 16 Oct 2026 08:14 UTC: New York has not opened; Thursday's session is the latest close.
+  const friday = Date.parse("2026-10-16T08:14:00Z");
+  const monthly = bars(["2026-09-01", "2026-10-01"], "1mo");
+  const weekly = bars(["2026-10-05", "2026-10-12"], "1wk");
+
+  test("is marked partial and dated by the last session it covers, not the start of its period", () => {
+    expect(footer(monthly, "NASDAQ", friday)).toEqual({
+      partial: [false, true], line: "Source: Gloom Cloud · month to date, through Thu 15 Oct 2026 · not a live feed (monthly bars)",
+    });
+    expect(footer(weekly, "NASDAQ", friday)).toEqual({
+      partial: [false, true], line: "Source: Gloom Cloud · week to date, through Thu 15 Oct 2026 · not a live feed (weekly bars)",
+    });
+    // While a session trades, the bar runs through today; a coin's always does.
+    expect(footer(monthly, "NASDAQ", Date.parse("2026-10-16T15:00:00Z")).line).toContain("month to date, through Fri 16 Oct 2026");
+    expect(footer(weekly, "CCC", friday).line).toContain("week to date, through Fri 16 Oct 2026");
+    // A venue whose sessions are unknown is read by the calendar, with no day to name.
+    expect(footer(monthly, "", friday).line).toContain("· Oct 2026 to date ·");
+  });
+
+  test("is complete once the last session of its period has closed, though the month runs on", () => {
+    // Sat 31 Oct: October's last session closed on Friday the 30th.
+    const saturday = Date.parse("2026-10-31T12:00:00Z");
+    expect(footer(monthly, "NASDAQ", saturday)).toEqual({
+      partial: [false, false], line: "Source: Gloom Cloud · Thu 1 Oct 2026 · not a live feed (monthly bars)",
+    });
+    // September's bar on 16 Oct, and last week's on Monday before the open, are complete.
+    expect(formingPeriodBar(bars(["2026-08-01", "2026-09-01"], "1mo"), "NASDAQ", friday)).toBeNull();
+    expect(formingPeriodBar(bars(["2026-10-05"], "1wk"), "NASDAQ", Date.parse("2026-10-12T08:00:00Z"))).toBeNull();
+    // Daily bars are left as their source marks them.
+    expect(formingPeriodBar(bars(["2026-10-15", "2026-10-16"], "1d"), "NASDAQ", Date.parse("2026-10-16T15:00:00Z"))).toBeNull();
+  });
+
+  test("a week that starts on a holiday ends with that calendar week, however its bar is dated", () => {
+    // Labor Day week: Monday 7 Sep closed, Friday the 11th its last session. On Saturday the 12th it is complete,
+    // dated by its Monday or by its first session, Tuesday the 8th; on Friday morning it still forms.
+    const saturday = Date.parse("2026-09-12T12:00:00Z");
+    for (const date of ["2026-09-07", "2026-09-08"]) {
+      expect(formingPeriodBar(bars(["2026-08-31", date], "1wk"), "NASDAQ", saturday), date).toBeNull();
+      expect(formingPeriodBar(bars(["2026-08-31", date], "1wk"), "NASDAQ", Date.parse("2026-09-11T12:00:00Z"))?.periodToDate, date)
+        .toEqual({ period: "week", through: "2026-09-10" });
+    }
   });
 });

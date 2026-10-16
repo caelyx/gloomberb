@@ -14,7 +14,7 @@ import { Header } from "./components/layout/header";
 import { StatusBar } from "./components/layout/status-bar";
 import { useAppChromeShown } from "./components/layout/presentation";
 import { useLinkedLayoutSync } from "./layout-marketplace/linked-sync";
-import { useTeamCollectionsSync } from "./plugins/builtin/cloud/team/collections-sync";
+import { useTeamCollectionsSync } from "./team/collections-sync";
 import { Shell } from "./components/layout/shell";
 import { DetachedPaneShell } from "./components/layout/detached-pane-shell";
 import { TransientLayoutProvider } from "./components/layout/transient-layout";
@@ -38,6 +38,7 @@ import type { LayoutBounds } from "./layout/pane-manager";
 import type { AppSessionSnapshot } from "./core/state/session-persistence";
 import type { MarketDataCoordinator } from "./market-data/coordinator";
 import { createAppNotifier } from "./notifications/app-notifier";
+import { attachNotificationLog } from "./notifications/notification-log";
 import { useBrokerImportRuntime } from "./app/runtime/broker-import";
 import { useDesktopDeepLinkRuntime } from "./app/runtime/desktop-deeplink";
 import { useDesktopApplicationMenuRuntime } from "./app/runtime/desktop-menu";
@@ -49,6 +50,7 @@ import { bindPluginRegistryRuntimeAccess } from "./app/runtime/plugin-bindings";
 import { useAppStartupRuntime } from "./app/runtime/startup";
 import { useTickerRefreshRuntime } from "./app/runtime/ticker-refresh";
 import { useAppUpdateRuntime } from "./app/runtime/update";
+import { resolveUpdateChannel } from "./updater/channel";
 import { createCoreSyncContributors } from "./sync/core-contributors";
 import { useCloudSyncRuntime } from "./sync/react";
 import { RemoteControlHost, type RemoteControlAdapter } from "./remote/app-host";
@@ -277,6 +279,7 @@ function AppInner({
     pluginRegistry,
     stateRef,
     updateAvailable: state.updateAvailable,
+    updateChannel: resolveUpdateChannel(state.config),
     updateCheckInProgress: state.updateCheckInProgress,
     updateProgress: state.updateProgress,
   });
@@ -374,6 +377,11 @@ function AppInner({
 
   // Wire up app-level notifications.
   pluginRegistry.bindHost({ notify: appNotifier.notify });
+  // Missed alerts live in this device's state store. A detached window keeps
+  // its own in memory rather than overwrite the main window's.
+  useEffect(() => (
+    isDetachedWindow ? undefined : attachNotificationLog(pluginRegistry.persistence.pluginState)
+  ), [isDetachedWindow, pluginRegistry]);
 
   // Persist layout changes (switching, saving, deleting, renaming layouts).
   // The saved layouts also mirror live pane state and focus, so they change on

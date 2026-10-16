@@ -1,9 +1,12 @@
+import { ApiRequestError } from "../../../api-client/errors";
 import type {
   HeadlessBundleResult,
   HeadlessPaneDefinition,
 } from "../../../types/plugin";
+import { explainRefusal } from "../shared/cloud-denied";
 import { formatCompact, formatNumber } from "../../../utils/format";
 import { fetchJobs, fetchJobsMovers, type JobsCloudClient, type JobsCompanyState } from "./client";
+import { jobsLockNote } from "./lock-note";
 import {
   buildMoverRows,
   buildPostingRows,
@@ -13,8 +16,7 @@ import {
   functionLabel,
 } from "./model";
 
-function companyBundle(symbol: string, state: JobsCompanyState, roleLimit: number): HeadlessBundleResult {
-  if (state.kind === "denied") throw new Error(state.message);
+function companyBundle(symbol: string, state: Exclude<JobsCompanyState, { kind: "denied" }>, roleLimit: number): HeadlessBundleResult {
   if (state.kind === "pending") {
     return {
       sections: [{ title: "Hiring", entries: [{ label: "Status", value: "pending", formatted: state.message }] }],
@@ -169,15 +171,22 @@ export const jobsHeadless: HeadlessPaneDefinition<"bundle"> = {
       maximum: 200,
     },
   ],
+  // No aliases: the template's keywords stay the catalog's search terms.
+  discovery: {
+    dataRequirements: ["Gloom Cloud Pro account"],
+    limitations: ["Pro only; HIRE <ticker> previews a company's hiring for free."],
+  },
   describe: (args) => (args.symbols[0] ? `Hiring | ${args.symbols[0]}` : "Hiring | coverage"),
   async load(args, ctx): Promise<HeadlessBundleResult> {
     const limit = Number(args.options.roles);
     const symbol = args.symbols[0];
     if (symbol) {
       const state = await fetchJobs(symbol, { force: true, client: ctx.apiClient as JobsCloudClient });
+      if (state.kind === "denied") throw explainRefusal(new ApiRequestError(state.message, state.status), jobsLockNote, { symbol });
       return companyBundle(symbol, state, limit);
     }
-    const payload = await fetchJobsMovers(ctx.apiClient as JobsCloudClient);
+    const payload = await fetchJobsMovers(ctx.apiClient as JobsCloudClient)
+      .catch((error: unknown) => { throw explainRefusal(error, jobsLockNote, { symbol: null }); });
     const rows = buildMoverRows(payload.movers).slice(0, Math.max(limit, 15)).map((row) => ({
       ticker: row.ticker,
       company: row.company,

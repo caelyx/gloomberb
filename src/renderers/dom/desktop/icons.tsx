@@ -12,6 +12,13 @@ const ICONS: Record<IconName, ReactNode> = {
       <circle cx="10" cy="6" r="1.1" fill="currentColor" />
     </>
   ),
+  // A question mark, drawn like the other bare glyphs (the pane's `...`).
+  help: (
+    <>
+      <path d="M4.2 4.3a1.85 1.85 0 1 1 2.65 1.65c-.55.28-.85.62-.85 1.22v.33" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx="6" cy="9.55" r=".82" fill="currentColor" />
+    </>
+  ),
   close: <path d="M3 3L9 9M9 3L3 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />,
   zap: <path d="M7.1 1.2 2.7 6.5h3.1l-.7 4.3 4.4-5.5H6.4l.7-4.1Z" fill="currentColor" />,
   sqrt: <path d="M1.5 6.6h1.6l1.8 3.6L7.6 2h3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />,
@@ -101,6 +108,40 @@ const ICONS: Record<IconName, ReactNode> = {
       <rect x="3" y="10" width="4" height="10" rx="1" stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
       <path d="M7 10l3.5-6.5a1.8 1.8 0 0 1 3.3 1.2L13 9.5h5.6a2 2 0 0 1 2 2.4l-1.4 6.5a2 2 0 0 1-2 1.6H7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
     </g>
+  ),
+  // Ask Gloom: a four-point spark, outlined like the header's other glyphs.
+  ask: (
+    <path
+      d="M6 1.6C6.35 4.1 7.9 5.65 10.4 6 7.9 6.35 6.35 7.9 6 10.4 5.65 7.9 4.1 6.35 1.6 6 4.1 5.65 5.65 4.1 6 1.6Z"
+      stroke="currentColor"
+      strokeWidth="1.2"
+      strokeLinejoin="round"
+    />
+  ),
+  // A robot's head: an antenna, two eyes and a mouth.
+  bot: (
+    <>
+      <path d="M6 1.9v1.3" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+      <circle cx="6" cy="1.45" r=".8" fill="currentColor" />
+      <rect x="1.9" y="3.6" width="8.2" height="6.6" rx="1.7" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="4.5" cy="6.3" r=".95" fill="currentColor" />
+      <circle cx="7.5" cy="6.3" r=".95" fill="currentColor" />
+      <path d="M4.7 8.35h2.6" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+    </>
+  ),
+  // The Gloom mark: a solid core in a ring.
+  team: (
+    <>
+      <circle cx="6" cy="6" r="4.45" stroke="currentColor" strokeWidth="1.2" />
+      <circle cx="6" cy="6" r="2.25" fill="currentColor" />
+    </>
+  ),
+  // A cut gem: the table on top, the point below.
+  pro: (
+    <>
+      <path d="M3.6 2.4h4.8l2.3 2.9L6 10.4 1.3 5.3l2.3-2.9Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+      <path d="M1.5 5.3h9M4.8 2.5 4.3 5.3 6 10.1l1.7-4.8-.5-2.8" stroke="currentColor" strokeWidth=".9" strokeLinejoin="round" />
+    </>
   ),
   restore: (
     <>

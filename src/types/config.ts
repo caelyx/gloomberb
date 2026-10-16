@@ -2,7 +2,7 @@ import type { Portfolio, Watchlist } from "./ticker";
 import type { BrokerContractRef, TickerListingRef } from "./instrument";
 import type { LanguagePreference } from "../i18n/languages";
 
-export const CURRENT_CONFIG_VERSION = 25;
+export const CURRENT_CONFIG_VERSION = 28;
 
 type ChartRendererPreference = "auto" | "kitty" | "braille";
 
@@ -230,6 +230,18 @@ export interface TelemetryConfig {
 }
 
 /**
+ * Which builds the app updates to. `stable` is the tagged releases; `nightly`
+ * adds the daily prerelease built from main.
+ */
+export type UpdateChannel = "stable" | "nightly";
+
+/** How this machine updates the app. Absent means the stable channel. */
+export interface UpdatesConfig {
+  /** Only `nightly` is saved; stable is the default. `GLOOMBERB_UPDATE_CHANNEL` overrides it. */
+  channel?: UpdateChannel;
+}
+
+/**
  * The one-time line in the terminal's status bar asking to star Gloomberb on
  * GitHub. Absent means on and not shown yet. Kept on this machine only.
  */
@@ -297,6 +309,8 @@ export interface AppConfig {
   keybindings?: KeybindingsConfig;
   telemetry?: TelemetryConfig;
   starPrompt?: StarPromptConfig;
+  /** The update channel. Kept on this machine only. */
+  updates?: UpdatesConfig;
   /**
    * The IANA zone (`Asia/Tokyo`) the CLI and function reports show a local
    * time in, beside every UTC time. Absent prints UTC alone. Trading-day dates
@@ -344,6 +358,14 @@ const TICKER_PANE_IDS = new Set([
   "ibkr-trading",
 ]);
 
+/**
+ * Ticker panes that also have a view without a ticker, which an unbound
+ * instance shows: INS alone ranks the market's insider buying. Normalizing a
+ * layout leaves such an instance unbound instead of removing it or linking it
+ * to a list.
+ */
+const TICKERLESS_VIEW_PANE_IDS = new Set(["insider"]);
+
 export const DEFAULT_COLUMNS: ColumnConfig[] = [
   { id: "ticker", label: "TICKER", width: 8, align: "left" },
   { id: "price", label: "LAST", width: 10, align: "right", format: "currency" },
@@ -354,8 +376,10 @@ export const DEFAULT_COLUMNS: ColumnConfig[] = [
   { id: "latency", label: "AGE", width: 6, align: "right" },
 ];
 
+// A portfolio dates each row by the price its value uses (AS OF), where a
+// watchlist shows the quote's age (AGE).
 export const DEFAULT_PORTFOLIO_COLUMN_IDS = [
-  ...DEFAULT_COLUMNS.map((column) => column.id),
+  ...DEFAULT_COLUMNS.map((column) => column.id === "latency" ? "as_of" : column.id),
   "sparkline",
   "shares",
   "avg_cost",
@@ -795,7 +819,7 @@ export function normalizePaneLayout(
   let nextLayout = layout;
   if (fallbackAvailable) {
     const nextInstances: PaneInstanceConfig[] = layout.instances.map((instance) => {
-      if (!isTickerPaneInstance(instance)) return instance;
+      if (!isTickerPaneInstance(instance) || TICKERLESS_VIEW_PANE_IDS.has(instance.paneId)) return instance;
       if (instance.binding?.kind === "fixed" || instance.binding?.kind === "follow") return instance;
       return {
         ...instance,
@@ -831,6 +855,7 @@ export function normalizePaneLayout(
       if (
         isTickerPaneInstance(instance)
         && instance.paneId !== TICKER_RESEARCH_PANE_ID
+        && !TICKERLESS_VIEW_PANE_IDS.has(instance.paneId)
         && instance.binding?.kind !== "follow"
         && instance.binding?.kind !== "fixed"
       ) {

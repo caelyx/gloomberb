@@ -21,8 +21,9 @@ import {
 } from "./help";
 import { parsePaneFunctionArgs, SHOT_SIZE_LIMITS } from "./pane-functions/options";
 import { checkCliCommandOptions } from "./command-options";
+import { CLI_EXIT_CODES } from "./exit-codes";
 import { asUsageError, fail, inferCliErrorOptions, printCliError } from "./errors";
-import { setCliColorEnabledOverride, setCliWidthOverride } from "../utils/cli-output";
+import { cliStyles, setCliColorEnabledOverride, setCliWidthOverride } from "../utils/cli-output";
 import { setDisplayTimeZone } from "../utils/utc-time";
 import { search, searchCandidatesForCli, buildSearchReport } from "./commands/search";
 import { ticker } from "./commands/ticker";
@@ -36,7 +37,9 @@ import { createSystemCliCommands } from "./commands/system";
 import { brokerCliCommand, ibkrCliCommand } from "./commands/broker";
 import { listPlugins, updatePlugins } from "./commands/plugins";
 import { installListedPlugin, removePlugin } from "../plugins/installer";
-import { runPaneCatalog, runPaneFunction, runPaneScreenshot } from "./pane-functions";
+import { catalogCommandHits, functionCodeCommand, nearFunctionCodeCommand, runPaneCatalog, runPaneFunction, runPaneScreenshot } from "./pane-functions";
+import { catalogPointer, tickerPointer, type CatalogCommandHit } from "./unknown-command";
+import { catalogFredSeriesIds } from "./series-search";
 
 const { width: SHOT_WIDTH, height: SHOT_HEIGHT } = SHOT_SIZE_LIMITS;
 
@@ -58,11 +61,11 @@ function createCoreCliCommands(
         usage: ["help [command]", "<command> --help"],
         examples: ["help", "help quote", "quote --help"],
       },
-      execute: (args, ctx) => {
+      execute: async (args, ctx) => {
         const topic = args[0];
         if (topic) {
           const command = lookupCommand(topic);
-          if (!command) failUnknownCommand(topic, allCommands());
+          if (!command) failUnknownCommand(topic, allCommands(), await unknownCommandPointers(ctx, topic, [], allCommands()));
           printCommandHelp(command, ctx);
           return;
         }
@@ -96,6 +99,7 @@ function createCoreCliCommands(
         await search(query, {
           initMarketData: ctx.initMarketData,
           fail: ctx.fail,
+          plugins: ctx.plugins,
           ...(ctx.cliOptions.format === "text" ? {} : { printResult: ctx.printResult }),
         });
       },
@@ -129,13 +133,13 @@ function createCoreCliCommands(
         group: CLI_COMMAND_GROUPS.functions,
         usage: ["catalog [query] [--all] [--bot-safe]", "catalog glossary [term]", "catalog explain <term>"],
         options: [
-          { flags: "--all", description: "List every match instead of the first 25" },
+          { flags: "--all", description: "List every match, not just the best ones" },
           { flags: "--bot-safe, --botsafe", description: "Only functions with a verified unattended report" },
         ],
         sections: [{
           title: "Glossary",
           lines: [
-            "catalog glossary lists the rates and auction terms the functions show, such as bid-to-cover or SOFR; with a term, or as catalog explain <term>, it prints what that term means. A search names the terms it matches too.",
+            "catalog glossary lists the rates, auction, energy, perpetual-futures, portfolio and fund terms the functions show, such as bid-to-cover, SOFR, TTF, funding rate, drift or NAV; with a term, or as catalog explain <term>, it prints what that term means. A search names the terms it matches too.",
           ],
         }],
         examples: ["catalog", "catalog options", "catalog HP", "catalog glossary stop-out"],
@@ -191,6 +195,7 @@ function createCoreCliCommands(
           { flags: "--scale <n>", description: "Text scale from 0.5 to 4 (default 1)" },
           { flags: "--watermark <label>", description: "Label drawn in the pane title bar" },
           { flags: "--no-status", description: "Leave out the dated status line (as-of, delay, market hours) drawn in the pane footer" },
+          { flags: "--strict", description: `Exit ${CLI_EXIT_CODES.unusableShot} when the pane is empty, shows an error, is still loading or is access-gated; the PNG and the Reason line are still written` },
           { flags: "--<option> <value>", description: "A function setting; gloomberb catalog <function> lists them" },
           EXCHANGE_OPTION,
         ],
@@ -200,6 +205,7 @@ function createCoreCliCommands(
           "shot DDIS MSFT --tab history",
           "shot HP NVDA --width 1600 --theme green",
           "shot QQ AAPL,MSFT --no-status",
+          "shot OVDV SPY --tab term --strict --output term.png",
         ],
       },
       execute: async (args, ctx) => {
@@ -235,6 +241,7 @@ function createCoreCliCommands(
         if (!ref) {
           fail("Usage: gloomberb install <user/repo>");
         }
+        console.error(cliStyles.warning("Runs with your full permissions. Read the source first."));
         await installListedPlugin(ref);
       },
     },
@@ -244,6 +251,12 @@ function createCoreCliCommands(
       help: {
         group: CLI_COMMAND_GROUPS.plugins,
         usage: ["update [name]"],
+        sections: [{
+          title: "Updating Gloomberb itself",
+          lines: [
+            "The app updates itself from stable releases. config set updates.channel nightly adds the nightly build of main; see gloomberb help config.",
+          ],
+        }],
         examples: ["update", "update gloom-tv"],
       },
       execute: async (args) => {
@@ -300,17 +313,60 @@ function printCommandHelp(command: CliCommandDef, ctx: CliCommandContext): void 
   ctx.printResult({ data: { ...describeCliCommand(command), sections: command.help?.sections ?? [] } });
 }
 
-function failUnknownCommand(token: string, commands: CliCommandDef[]): never {
-  const suggestion = suggestCliCommand(
+function nearCommand(token: string, commands: CliCommandDef[]): string | null {
+  return suggestCliCommand(
     normalizeCliCommandToken(token),
     commands.flatMap((command) => [command.name, ...(command.aliases ?? [])]),
   );
-  fail(
-    `Unknown command "${token}".`,
-    suggestion
-      ? `Did you mean ${suggestion}? Run gloomberb help to see every command.`
-      : "Run gloomberb help to see every command.",
-  );
+}
+
+interface UnknownCommandPointers {
+  /** The word is a function's code: the command that runs it. */
+  fn: { code: string; command: string } | null;
+  /** The word is a slip from one function's code (RCDF for RDCF), read only when it is no code, no command is close to it and the catalog finds nothing for it. */
+  nearFn: { code: string; label: string; command: string } | null;
+  /** Functions the catalog finds for the word, read only when it is no code and no command is close to it. */
+  hits: CatalogCommandHit[];
+  /** What the reader typed after the word, which a pointer runs the function with. */
+  args: readonly string[];
+}
+
+/** What an unknown command word may point at: a function's code first, then what the catalog finds for it. */
+async function unknownCommandPointers(
+  ctx: CliCommandContext,
+  token: string,
+  args: readonly string[],
+  commands: CliCommandDef[],
+): Promise<UnknownCommandPointers> {
+  const fn = await functionCodeCommand(ctx, token, args);
+  const command = fn || nearCommand(token, commands);
+  const hits = command ? [] : await catalogCommandHits(ctx, token);
+  // What the catalog finds for a word (`comps`) outranks the code it happens to be a slip from.
+  const nearFn = command || hits.length > 0 ? null : await nearFunctionCodeCommand(ctx, token, args);
+  return { fn, nearFn, hits, args };
+}
+
+/**
+ * A function's code is pointed at `fn`; a typo of a command at the command;
+ * a typo of a function's code (`RCDF`) at that function; a word the catalog
+ * knows (`comps`, `peers`) at the functions it finds. A word written as a
+ * ticker (`PLTR`) is also pointed at `quote` and `search`.
+ */
+function failUnknownCommand(token: string, commands: CliCommandDef[], pointers: UnknownCommandPointers): never {
+  if (pointers.fn) fail(`${pointers.fn.code} is a function: ${pointers.fn.command}`);
+  const ticker = tickerPointer(token);
+  const suggestion = nearCommand(token, commands);
+  if (!suggestion && pointers.nearFn) {
+    fail(
+      `Unknown command "${token}". Did you mean the function ${pointers.nearFn.code} (${pointers.nearFn.label})?`,
+      [`Run: ${pointers.nearFn.command}`, ticker].filter(Boolean).join("\n"),
+    );
+  }
+  const catalog = suggestion ? null : catalogPointer(token, pointers.hits, pointers.args);
+  const help = suggestion
+    ? `Did you mean ${suggestion}? Run gloomberb help to see every command.`
+    : catalog ? `${catalog}\nRun gloomberb help to see every command.` : "Run gloomberb help to see every command.";
+  fail(`Unknown command "${token}".`, ticker ? `${ticker}\n${help}` : help);
 }
 
 const CLI_DESCRIPTION = "Market research and portfolio tracker for the terminal";
@@ -381,7 +437,8 @@ export async function dispatchCli(args: string[], options: DispatchCliOptions = 
     );
     return normalizeCliDispatchResult(result);
   } catch (error) {
-    printCliError(error, parsed.options, { command: resolved.command.name, args: commandArgs });
+    printCliError(error, parsed.options, { command: resolved.command.name, args: commandArgs,
+      isFredSeries: (id) => catalogFredSeriesIds(registry.plugins).has(id) });
     process.exitCode = 1;
     return { kind: "handled" };
   }
@@ -390,14 +447,22 @@ export async function dispatchCli(args: string[], options: DispatchCliOptions = 
 /** Explains why dispatch found no command in `args`, suggesting the closest one. */
 export async function failUnknownCliCommand(args: string[], options: DispatchCliOptions = {}): Promise<never> {
   let token = args[0] ?? "";
+  let parsed: ReturnType<typeof parseCliGlobalArgs> | null = null;
   try {
     // Global flags may come first, so name the token dispatch actually looked up.
-    token = parseCliGlobalArgs(args).args[0] ?? token;
+    parsed = parseCliGlobalArgs(args);
+    token = parsed.args[0] ?? token;
   } catch {
     // dispatchCli already reported flags that do not parse.
   }
   const registry = await createRegistry(options);
-  return failUnknownCommand(token, listedCommands(registry).map((entry) => entry.command));
+  const commands = listedCommands(registry).map((entry) => entry.command);
+  // A function's code typed as a command is pointed at `fn`, and a word the catalog knows at its
+  // functions, with the arguments the reader gave.
+  const pointers = token && parsed
+    ? await unknownCommandPointers(createCliCommandContext("core", registry, parsed.options, parsed.args.slice(1)), token, parsed.args.slice(1), commands)
+    : { fn: null, nearFn: null, hits: [], args: [] };
+  return failUnknownCommand(token, commands, pointers);
 }
 
 export async function runCli(args: string[], options: DispatchCliOptions = {}): Promise<boolean> {

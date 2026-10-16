@@ -2,6 +2,7 @@ import type { Portfolio, PortfolioCash } from "../../../types/ticker";
 import type { BrokerAccount } from "../../../types/trading";
 import { currencyMinorDigits, getCurrencySymbol, resolveAssetDisplayKind } from "../../../market-data/market/format";
 import { formatNumber } from "../../../utils/format";
+import { parseTypedNumber } from "../../../utils/decimal-comma";
 
 /**
  * Weights, targets and the trades that would rebalance a portfolio. `PF`, its
@@ -175,11 +176,15 @@ export function resolvePortfolioCash(
   return portfolio?.cash ? { ...portfolio.cash, source: "manual" } : null;
 }
 
-/** `12.5`, `12.5%`: a target weight in percent from 0 to 100. */
+/**
+ * `12.5`, `12.5%`, `12,5`: a target weight in percent from 0 to 100, read as
+ * other amounts are. A weight is never in the thousands, so `12,500` and
+ * `1.234` take their decimal reading.
+ */
 export function parseTargetWeight(raw: string | undefined): number {
-  const text = raw?.trim().replace(/%$/, "").trim() ?? "";
-  const value = Number(text);
-  if (!text || !Number.isFinite(value)) throw new Error(`Target weight must be a percent, such as 12.5 or 12.5%.`);
+  const read = parseTypedNumber(raw?.trim().replace(/%$/, "") ?? "");
+  const value = read.kind === "number" ? read.value : read.kind === "ambiguous" ? read.decimal : Number.NaN;
+  if (!Number.isFinite(value)) throw new Error(`Target weight must be a percent, such as 12.5, 12,5 or 12.5%.`);
   if (value < 0 || value > 100) throw new Error("Target weight must be between 0% and 100%.");
   return value;
 }
@@ -211,9 +216,10 @@ export function formatAllocationDrift(value: number | null | undefined): string 
 }
 
 /**
- * Units to trade, signed. A holding kept in whole units trades in whole units,
- * rounded to the nearest; fractional holdings and coins keep four decimals
- * (eight for coins).
+ * Units to trade, signed, at display precision: a holding kept in whole units
+ * trades in whole units, rounded to the nearest; a fractional holding to at
+ * most two decimals and a coin to at most four, trailing zeros dropped. JSON,
+ * CSV and the pane's cell value keep the full-precision figure.
  */
 export function formatTradeUnits(
   value: number | null | undefined,
@@ -222,7 +228,7 @@ export function formatTradeUnits(
   if (!finite(value)) return "—";
   const kind = resolveAssetDisplayKind({ assetCategory });
   const whole = kind !== "crypto" && kind !== "cash" && Number.isInteger(units);
-  const decimals = whole ? 0 : kind === "crypto" ? 8 : 4;
+  const decimals = whole ? 0 : kind === "crypto" ? 4 : 2;
   const rounded = Number(value.toFixed(decimals));
   if (rounded === 0) return "0";
   const body = new Intl.NumberFormat("en-US", { maximumFractionDigits: decimals }).format(Math.abs(rounded));

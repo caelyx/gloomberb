@@ -11,10 +11,10 @@ import { useAppDispatch, useAppSelector } from "../state/app/context";
 import { useDialog, useDialogState, type PromptContext } from "../ui/dialog";
 import { useRendererHost, useUiCapabilities } from "../ui";
 import { apiClient, type TeamSummary } from "../api-client";
-import { requestAuthDialog } from "../plugins/builtin/cloud/auth-dialog";
-import { teamStore } from "../plugins/builtin/cloud/team/store";
+import { requestAuthDialog } from "../account/auth-dialog";
+import { teamStore } from "../team/store";
 import { usePlanAccess } from "../api-client/plan-access";
-import { getMarketplaceHost } from "../plugins/builtin/plugin-marketplace/store";
+import { getMarketplaceHost } from "../plugins/marketplace/store";
 import { rememberLayoutRequirements } from "../components/layout/missing-pane";
 import type { PluginRegistry } from "../plugins/registry";
 import type { LayoutConfig } from "../types/config";
@@ -216,7 +216,7 @@ export function LayoutMarketplaceGallery({
       return;
     }
     const cloud = entry.kind === "team" ? teamEntryFor(entry) : null;
-    const origin = cloud ? originFromEntry(cloud) : null;
+    const origin = cloud ? originFromEntry(cloud, pluginRegistry.panes) : null;
     if (cloud) rememberLayoutRequirements(cloud.id, cloud.requires);
     const installed = materializeMarketplaceLayout(entry);
     close();
@@ -296,7 +296,7 @@ export function LayoutMarketplaceGallery({
         dispatch({ type: "SET_LAYOUT_ORIGIN", index: entry.index, origin: null });
         return;
       }
-      const nextOrigin = originFromEntry(cloud);
+      const nextOrigin = originFromEntry(cloud, pluginRegistry.panes);
       if (!nextOrigin) return;
       rememberLayoutRequirements(cloud.id, cloud.requires);
       const installed = materializeMarketplaceLayout(cloud);
@@ -374,7 +374,7 @@ export function LayoutMarketplaceGallery({
             return;
           }
         }
-        const nextOrigin = originFromEntry(published);
+        const nextOrigin = originFromEntry(published, pluginRegistry.panes);
         if (nextOrigin) dispatch({ type: "SET_LAYOUT_ORIGIN", index: entry.index, origin: nextOrigin });
         teamLayouts.upsert(published);
         pluginRegistry.notify({ body: `Published "${published.name}" r${published.revision} to ${entry.team?.name ?? "the team"}`, type: "success" });
@@ -391,7 +391,7 @@ export function LayoutMarketplaceGallery({
       });
       if (!name) return;
       const published = await apiClient.publishTeamLayout(team.id, name, payload, { requires });
-      const nextOrigin = originFromEntry(published);
+      const nextOrigin = originFromEntry(published, pluginRegistry.panes);
       if (nextOrigin) dispatch({ type: "SET_LAYOUT_ORIGIN", index: entry.index, origin: nextOrigin });
       if (name !== entry.name) dispatch({ type: "RENAME_LAYOUT", index: entry.index, name });
       teamLayouts.upsert(published);

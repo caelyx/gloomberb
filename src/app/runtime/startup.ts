@@ -6,7 +6,7 @@ import type { MarketDataCoordinator } from "../../market-data/coordinator";
 import { instrumentFromTicker, type InstrumentRef } from "../../market-data/request-types";
 import { useSavedLayoutWarmup } from "./layout-warmup";
 import { chatController } from "../../plugins/builtin/chat/controller";
-import { PLUGIN_MARKETPLACE_PANE_ID } from "../../plugins/builtin/plugin-marketplace/ids";
+import { PLUGIN_MARKETPLACE_PANE_ID } from "../../plugins/marketplace/ids";
 import type { LoadedExternalPlugin } from "../../plugins/loader";
 import type { PluginRegistry } from "../../plugins/registry";
 import type {
@@ -106,6 +106,10 @@ export function useAppStartupRuntime({
     chatController.setAppActive(appActive);
     appLog.info("app activity propagated", { active: appActive });
   }, [appActive]);
+
+  useEffect(() => {
+    chatController.setRaisesBackgroundAlerts(!isDetachedWindow);
+  }, [isDetachedWindow]);
 
   // Runs for the life of the app: a freeze is only reportable if something
   // was watching the clock while it happened.

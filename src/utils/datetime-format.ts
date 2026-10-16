@@ -39,6 +39,12 @@ export function formatRelativeAge(timestamp: number | undefined, now = Date.now(
   return elapsed ? `${elapsed.count}${elapsed.unit} ago` : "just now";
 }
 
+// Reuse the locale formatter when a feed contains older items. Constructing
+// one for every row dominates opening a long transcript, even without edits.
+const olderRelativeDateFormatter = new Intl.DateTimeFormat("en-US", {
+  month: "numeric", day: "numeric", year: "2-digit",
+});
+
 /**
  * Relative time that turns into a date ("1/5/26") after a week, for feeds read
  * by recency: "just now", "5m ago", "3h ago", "2d ago". `short` drops the
@@ -50,7 +56,7 @@ export function formatTimeAgo(date: Date | string, { short = false }: { short?: 
   const elapsed = elapsedUnits(Date.now() - ts);
   if (!elapsed) return short ? "<1m" : "just now";
   if (elapsed.unit === "d" && elapsed.count >= 7) {
-    return new Date(ts).toLocaleDateString("en-US", { month: "numeric", day: "numeric", year: "2-digit" });
+    return olderRelativeDateFormatter.format(ts);
   }
   return `${elapsed.count}${elapsed.unit}${short ? "" : " ago"}`;
 }
@@ -99,25 +105,46 @@ const weekdayClockFormatter = new Intl.DateTimeFormat("en-US", {
   hourCycle: "h23",
 });
 
+const utcClockFormatter = new Intl.DateTimeFormat("en-US", {
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+  timeZone: "UTC",
+});
+const utcWeekdayClockFormatter = new Intl.DateTimeFormat("en-US", {
+  weekday: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+  timeZone: "UTC",
+});
+
 function localMidnight(date: Date): number {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+}
+
+function utcMidnight(date: Date): number {
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
 }
 
 /**
  * When a feed item was published, in local time, as a newswire prints it:
  * the time today ("14:32"), the weekday and time over the six days before
  * ("Mon 09:10"), and the date for anything older ("Sep 18", or "Sep 18, 25"
- * in another year). A weekday never names a day a week or more back.
+ * in another year). A weekday never names a day a week or more back. With
+ * `utc`, the same in UTC, for a column whose header names the zone.
  */
-export function formatFeedTime(value: DisplayDateValue, now = Date.now(), fallback = "-"): string {
+export function formatFeedTime(value: DisplayDateValue, now = Date.now(), fallback = "-", { utc = false }: { utc?: boolean } = {}): string {
   const date = parseDisplayDate(value);
   if (!date) return fallback;
   const today = new Date(now);
+  const midnight = utc ? utcMidnight : localMidnight;
   // Rounded, since a day with a DST change is 23 or 25 hours long.
-  const daysAgo = Math.round((localMidnight(today) - localMidnight(date)) / 86_400_000);
-  if (daysAgo === 0) return clockFormatter.format(date);
-  if (daysAgo > 0 && daysAgo < 7) return weekdayClockFormatter.format(date).replace(",", "");
-  return formatShortDate(date, { year: date.getFullYear() === today.getFullYear() ? false : "2-digit" });
+  const daysAgo = Math.round((midnight(today) - midnight(date)) / 86_400_000);
+  if (daysAgo === 0) return (utc ? utcClockFormatter : clockFormatter).format(date);
+  if (daysAgo > 0 && daysAgo < 7) return (utc ? utcWeekdayClockFormatter : weekdayClockFormatter).format(date).replace(",", "");
+  const sameYear = utc ? date.getUTCFullYear() === today.getUTCFullYear() : date.getFullYear() === today.getFullYear();
+  return formatShortDate(date, { year: sameYear ? false : "2-digit", utc });
 }
 
 export function formatDetailDate(value: DisplayDateValue, fallback = "-"): string {

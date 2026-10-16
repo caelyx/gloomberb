@@ -107,12 +107,12 @@ test("the risk chart names the metric it plots and follows the selected row", as
   const frame = await renderPane(78, 28);
   let lines = frame();
   const basket = rowValue(lines, "60D basket return");
-  const benchmark = rowValue(lines, "60D benchmark return");
+  const benchmark = rowValue(lines, "60D benchmark return (SPY)");
   expect(basket).not.toBe("");
   // The return rows chart the basket against SPY over their window, ending on the rows' values.
   const legend = lines.findIndex((line) => line.includes("• 60D basket return"));
   expect(lines[legend]).toContain(`• 60D basket return ${basket}`);
-  expect(lines[legend]).toContain(`+ 60D benchmark return ${benchmark}`);
+  expect(lines[legend]).toContain(`+ 60D benchmark return (SPY) ${benchmark}`);
   expect(lines.findIndex((line) => line.includes("METRIC"))).toBeGreaterThan(legend + 6);
 
   // Another row plots its own history, named by the row.
@@ -157,7 +157,7 @@ test("a broker account the basket only partly covers states its coverage and lis
   const frame = await renderPane(130, 30, {}, { portfolio: BROKER_PORTFOLIO, tickers: brokerFixtureTickers() });
   let lines = frame();
   expect(rowValue(lines, "60D basket return")).not.toBe("");
-  expect(lines.at(-1)).toContain("covers 78% of market value \u00b7 9 holdings left out");
+  expect(lines.at(-1)).toContain("excludes EUR2, TWD1 +7 more, 22% of value");
   expect(lines.join("\n")).not.toContain("history unavailable");
 
   // The holdings view marks each holding left out where it sits by value, with its reason.
@@ -168,7 +168,7 @@ test("a broker account the basket only partly covers states its coverage and lis
   const twd = lines.find((line) => line.trimStart().startsWith("TWD1"));
   expect(twd).toContain("left out");
   expect(twd).toContain("Foreign holdings: daily FX closes unavailable");
-  expect(lines.at(-1)).toContain("covers 78% of market value");
+  expect(lines.at(-1)).toContain("excludes EUR2, TWD1 +7 more, 22% of value");
 });
 
 test("below the coverage minimum the risk view says why instead of a table of dashes", async () => {

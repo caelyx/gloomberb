@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { Box, Text, TextAttributes, useCommandBarShortcut, type TextareaRenderable } from "../../../../ui";
 import { getMessageComposerBlockHeight, MessageComposer } from "../../../../components/ui";
 import { colors } from "../../../../theme/colors";
@@ -7,11 +8,16 @@ import type { ChatMessage } from "../../../../api-client";
 import { InlineAuthActions } from "../../cloud/auth-actions";
 import { Button, ListView } from "../../../../components/ui";
 import { COMPOSER_ACTION_WIDTH } from "../layout";
+import { isManagedBot } from "../ghost-user";
+import { ChatBotIcon } from "../message/person-icons";
 import type { ChatMentionSuggestion } from "./mentions";
 import type { ChatDraftAttachment } from "../controller/attachments";
 import { DesktopChatAttachButton, DesktopChatAttachmentStrip } from "../attachments/desktop";
 import { TerminalChatAttachmentRows } from "../attachments/terminal";
 import type { TransferFile } from "../attachments/transfer";
+import { DesktopComposerPaneChips, TerminalComposerPaneChips } from "../message/pane-chip";
+import type { ComposerShareLink } from "../pane-links/composer";
+import type { ChatMessagePaneLink } from "../pane-links/model";
 
 const DESKTOP_CHAT_INPUT_TOP_MARGIN_PX = 6;
 
@@ -20,6 +26,8 @@ interface MutableRef<T> {
 }
 
 interface ChatComposerAreaProps {
+  /** The first-chat handle prompt, drawn above everything else once you can send. */
+  handlePrompt?: ReactNode;
   canSend: boolean;
   cancelEditMessage: () => void;
   clearReplyTarget: () => void;
@@ -52,6 +60,11 @@ interface ChatComposerAreaProps {
   onAttachFiles: (files: TransferFile[]) => void;
   onRemoveAttachment: (localId: string) => void;
   onRetryAttachment: (localId: string) => void;
+  /** Share links pasted into the field, waiting as the chips the message will show. */
+  draftLinks: readonly ComposerShareLink[];
+  onOpenDraftLink: (link: ChatMessagePaneLink) => void;
+  /** Takes out the chip at this place in `draftLinks`. */
+  onRemoveDraftLink: (index: number) => void;
   /** Filled by the desktop attach button, so the pane menu can open its picker. */
   attachPickerRef: { current: (() => void) | null };
 }
@@ -85,6 +98,7 @@ function ChatMentionSuggestions({
 }
 
 export function ChatComposerArea({
+  handlePrompt,
   canSend,
   cancelEditMessage,
   clearReplyTarget,
@@ -115,6 +129,9 @@ export function ChatComposerArea({
   onAttachFiles,
   onRemoveAttachment,
   onRetryAttachment,
+  draftLinks,
+  onOpenDraftLink,
+  onRemoveDraftLink,
   attachPickerRef,
 }: ChatComposerAreaProps) {
   const commandBarShortcut = useCommandBarShortcut();
@@ -159,6 +176,8 @@ export function ChatComposerArea({
         />
       )}
 
+      {handlePrompt}
+
       {editingMessage && (
         <Box height={1} width={contentWidth} flexDirection="row">
           <Text fg={colors.textMuted}>{` ${t("editing")} `}</Text>
@@ -176,7 +195,9 @@ export function ChatComposerArea({
         <Box height={1} width={contentWidth} flexDirection="row">
           <Text fg={colors.textMuted}>{` ${t("replying to")} `}</Text>
           <Text fg={colors.positive} attributes={TextAttributes.BOLD}>{`@${replyTo.user.username}`}</Text>
-          <Text fg={colors.textDim}>{replyPreview ? `: ${replyPreview}` : ""}</Text>
+          {isManagedBot(replyTo.user) && <ChatBotIcon />}
+          {/* The bot's icon stands where the colon would. */}
+          <Text fg={colors.textDim}>{replyPreview ? `${isManagedBot(replyTo.user) ? " " : ": "}${replyPreview}` : ""}</Text>
           <Box flexGrow={1} />
           <Button stopPropagation
             label={t("Cancel")}
@@ -206,6 +227,12 @@ export function ChatComposerArea({
           onRemove={onRemoveAttachment}
           onRetry={onRetryAttachment}
         />
+      ))}
+
+      {draftLinks.length > 0 && (nativePaneChrome ? (
+        <DesktopComposerPaneChips links={draftLinks} onOpen={onOpenDraftLink} onRemove={onRemoveDraftLink} />
+      ) : (
+        <TerminalComposerPaneChips links={draftLinks} width={contentWidth} onOpen={onOpenDraftLink} onRemove={onRemoveDraftLink} />
       ))}
 
       <MessageComposer
@@ -251,6 +278,8 @@ export function getChatComposerAreaHeight({
   replyTo,
   mentionSuggestionCount,
   draftAttachmentCount = 0,
+  draftLinkCount = 0,
+  promptRows = 0,
 }: {
   canSend: boolean;
   composerHeight: number;
@@ -260,10 +289,15 @@ export function getChatComposerAreaHeight({
   mentionSuggestionCount?: number;
   /** The terminal draws a row per waiting image; the desktop strip sizes itself. */
   draftAttachmentCount?: number;
+  /** The same for waiting share links, which an edit shows too. */
+  draftLinkCount?: number;
+  /** Terminal rows the handle prompt above the composer takes. */
+  promptRows?: number;
 }) {
   if (!canSend) return 2;
-  return getMessageComposerBlockHeight({ height: composerHeight, nativePaneChrome })
+  return promptRows + getMessageComposerBlockHeight({ height: composerHeight, nativePaneChrome })
     + (editingMessage || replyTo ? 1 : 0)
     + Math.max(0, mentionSuggestionCount ?? 0)
-    + (!nativePaneChrome && !editingMessage ? draftAttachmentCount : 0);
+    + (!nativePaneChrome && !editingMessage ? draftAttachmentCount : 0)
+    + (!nativePaneChrome ? draftLinkCount : 0);
 }

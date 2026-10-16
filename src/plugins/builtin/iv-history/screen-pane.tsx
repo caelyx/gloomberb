@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { DataTableView, PaneStatusBody, QueryBar, usePaneFooter, usePaneNoticeFooter, type DataTableColumn, type DataTableKeyEvent } from "../../../components";
+import { DataTableView, PaneStatusBody, Prose, QueryBar, usePaneFooter, usePaneNoticeFooter, type DataTableColumn, type DataTableKeyEvent } from "../../../components";
 import { useAsyncResource } from "../../../react/async-resource";
 import { usePaneCollection, usePaneSettingValue, usePluginAppActions, useTickers } from "../../../public/react";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
-import { Box, Text } from "../../../ui";
+import { Box, Text, useUiCapabilities } from "../../../ui";
 import { wrapTextLines } from "../../../utils/text-wrap";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { compareSortValues, nextHeaderSort, type SortDirection } from "../../../utils/sort-values";
-import { loadIvScreen, loadRealizedVolatilities } from "./client";
-import { formatPoints, formatRank, formatVol, readingLabel, sharedDates, shortDate, VCA_DEFINITIONS, verdictLabel } from "./format";
-import { projectRichCheap, type RichCheapRow, richCheapDates, type VcaPreset } from "./model";
+import { loadIvScreen, loadScreenVolatilities } from "./client";
+import { formatPoints, formatRank, formatSpot, formatVol, readingLabel, sharedDates, shortDate, VCA_DEFINITIONS, verdictLabel } from "./format";
+import { projectRichCheap, type RichCheapRow, richCheapDates, screenPaneNotices, type VcaPreset } from "./model";
 import { vcaUniverse } from "./universe";
+import { MovedTickerState } from "../../../components/layout/pane/ticker-fate-gate";
+import type { MovedTickerChange } from "../../../tickers/ticker-changes";
 
 type SortId = keyof RichCheapRow;
 const HV_WINDOW = 20;
@@ -21,6 +23,7 @@ const COLUMNS: DataTableColumn[] = [
   { id: "symbol", label: "Symbol", width: 8, align: "left" },
   { id: "iv30", label: "IV30", width: 7, align: "right" },
   { id: "date", label: "As of", width: 11, align: "right" },
+  { id: "spot", label: "Spot", width: 9, align: "right" },
   { id: "rankDate", label: "Rank as of", width: 11, align: "right" },
   { id: "rank", label: "IVR", width: 5, align: "right" },
   { id: "percentile", label: "IVP", width: 5, align: "right" },
@@ -34,8 +37,9 @@ const COLUMNS: DataTableColumn[] = [
   { id: "ivHv", label: "IV/HV", width: 6, align: "right" },
 ];
 
-export function IvScreenPane({ width, height, focused }: PaneProps) {
+export function IvScreenPane({ paneId, width, height, focused }: PaneProps) {
   const colors = useThemeColors();
+  const { nativePaneChrome } = useUiCapabilities();
   const [scope, setScope] = usePaneSettingValue("scope", "etfs");
   const [symbolsText, setSymbolsText] = usePaneSettingValue("symbols", "");
   const [symbolsActive, setSymbolsActive] = useState(false);
@@ -46,14 +50,27 @@ export function IvScreenPane({ width, height, focused }: PaneProps) {
   const key = universe.instruments.map((instrument) => instrument.symbol).join(",");
   const controller = useRef<AbortController | null>(null);
   const [hv, setHv] = useState<Map<string, number | null>>(new Map());
+  // Symbols whose company moved: their rows have no HV and the footer says where each company went.
+  const [moved, setMoved] = useState<Array<{ symbol: string; change: MovedTickerChange }>>([]);
   const loader = useCallback(async () => {
     controller.current?.abort();
     const current = new AbortController();
     controller.current = current;
     const payload = await loadIvScreen(universe.instruments.map((instrument) => instrument.symbol), { signal: current.signal });
     setHv(new Map());
-    void loadRealizedVolatilities(universe.instruments, HV_WINDOW, { signal: current.signal,
-      onValue: (symbol, value) => { if (!current.signal.aborted) setHv((previous) => new Map(previous).set(symbol, value)); } });
+    setMoved([]);
+    void loadScreenVolatilities(universe.instruments, Promise.resolve(payload.rows), HV_WINDOW, { signal: current.signal,
+      onValue: (symbol, value) => { if (!current.signal.aborted) setHv((previous) => new Map(previous).set(symbol, value)); },
+      onFates: (fates) => {
+        const changes = [...fates].flatMap(([symbol, fate]) => fate.moved ? [{ symbol, change: fate.moved }] : []);
+        if (changes.length === 0) return;
+        setMoved(changes);
+        setHv((previous) => {
+          const next = new Map(previous);
+          for (const change of changes) next.set(change.symbol, null);
+          return next;
+        });
+      } });
     return payload;
   }, [key]);
   const resource = useAsyncResource(universe.instruments.length ? loader : null);
@@ -78,11 +95,10 @@ export function IvScreenPane({ width, height, focused }: PaneProps) {
     }
   }), [rows, dates]);
   const [selected, setSelected] = useState<string | null>(null);
-  const queued = rows.filter((row) => row.status === "queued").length;
-  const uncovered = rows.filter((row) => row.status !== "queued" && row.iv30 == null).length;
-  const notices = [universe.error, resource.error,
-    ...(queued ? [`${queued} symbol${queued === 1 ? "" : "s"} queued for implied volatility history; they fill in after backfill.`] : []),
-    ...(uncovered ? [`${uncovered} symbol${uncovered === 1 ? " has" : "s have"} no stored implied volatility yet.`] : [])]
+  const coverageNotices = useMemo(() => screenPaneNotices(rows), [rows]);
+  // One symbol to screen whose company moved has nothing to show but where it went, as a ticker's panes say.
+  const movedOnly = universe.instruments.length === 1 && moved[0]?.symbol === universe.instruments[0]!.symbol ? moved[0]!.change : null;
+  const notices = [universe.error, resource.error, ...(movedOnly ? [] : [...moved.map((entry) => entry.change.note), ...coverageNotices])]
     .filter((value): value is string => !!value);
   usePaneNoticeFooter({ registrationId: "iv-screen-notices", notices, focused });
   const openHistory = (row: RichCheapRow) => createPaneFromTemplate("iv-history-pane", { symbol: row.symbol });
@@ -102,8 +118,9 @@ export function IvScreenPane({ width, height, focused }: PaneProps) {
     switch (id) {
       case "symbol": return { text: row.symbol, color: colors.textBright };
       case "iv30": return { text: formatVol(row.iv30), color: colors.warning };
-      case "date": return { text: row.date ? readingLabel(row.date, row.method, true) : row.status === "queued" ? "queued" : "--",
-        color: colors.textDim };
+      case "spot": return { text: formatSpot(row.spot), color: colors.textDim };
+      case "date": return { text: row.date ? readingLabel(row.date, row.method, true)
+        : row.status === "queued" || row.status === "backfilling" ? row.status : "--", color: colors.textDim };
       case "rankDate": return { text: row.rankDate ? `${shortDate(row.rankDate)} close` : "--", color: colors.textDim };
       case "rank": return { text: formatRank(row.rank) };
       case "percentile": return { text: formatRank(row.percentile) };
@@ -129,7 +146,7 @@ export function IvScreenPane({ width, height, focused }: PaneProps) {
         width: SYMBOLS_FIELD_WIDTH, debounceMs: SYMBOLS_DEBOUNCE_MS, focused, active: symbolsActive, onActiveChange: setSymbolsActive,
         onChange: setSymbolsText }] : []),
     ]} />
-    <PaneStatusBody subject="volatility rich/cheap" loading={resource.loading && !resource.data} error={universe.error && !universe.instruments.length ? universe.error : !resource.data ? resource.error : null}>
+    {movedOnly ? <MovedTickerState change={movedOnly} paneId={paneId} /> : <PaneStatusBody subject="volatility rich/cheap" loading={resource.loading && !resource.data} error={universe.error && !universe.instruments.length ? universe.error : !resource.data ? resource.error : null}>
       <DataTableView<RichCheapRow> focused={focused && !symbolsActive} columns={columns} items={rows} rootWidth={width}
         rootHeight={Math.max(2, height - 1 - definitions.length)}
         getItemKey={(row) => row.symbol} sortColumnId={sort.columnId} sortDirection={sort.direction} emptyStateTitle="No symbols to screen."
@@ -139,10 +156,17 @@ export function IvScreenPane({ width, height, focused }: PaneProps) {
         getExportMetadata={() => [["universe", universe.label], ["as of", fullDatesText || undefined],
           ["IV", "30-day ATM, annualized"], ["IV1Y", "one-year ATM, annualized"], ["rank window", "prior 52 weeks of trade-close readings"], ["HV", `${HV_WINDOW}-session close-to-close`]]}
         renderCell={(row, column) => cell(row, column.id)} />
-      <Box flexDirection="column" paddingX={1} height={definitions.length} flexShrink={0}>
-        {definitions.map((line, index) => <Text key={index} fg={colors.textDim}>{line}</Text>)}
-      </Box>
-    </PaneStatusBody>
+      {nativePaneChrome ? (
+        // The desktop and the web wrap each definition at the pane's width, under a table that fills the rest.
+        <Box flexDirection="column" paddingX={1} flexShrink={0}>
+          {VCA_DEFINITIONS.map((line) => <Prose key={line} text={line} width={Math.max(1, width - 2)} color={colors.textDim} figures={false} />)}
+        </Box>
+      ) : (
+        <Box flexDirection="column" paddingX={1} height={definitions.length} flexShrink={0}>
+          {definitions.map((line, index) => <Text key={index} fg={colors.textDim}>{line}</Text>)}
+        </Box>
+      )}
+    </PaneStatusBody>}
   </Box>;
 }
 

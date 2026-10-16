@@ -9,6 +9,7 @@ import type { PluginRegistry } from "../../../plugins/registry";
 import type { LayoutConfig } from "../../../types/config";
 import { isPaneLocked, setPaneLocked } from "../../../pane-settings";
 import { contextMenuDivider, type ContextMenuItem } from "../../../types/context-menu";
+import { pluginContextMenuSlot } from "../../../ui/context-menu";
 import { paneHintTitle, type CombinedPaneFooter } from "../pane/footer/model";
 import {
   formatPlatformShortcutLabel,
@@ -23,6 +24,9 @@ const MENU_MIN_WIDTH = 18;
 const MENU_MAX_WIDTH = 44;
 
 export const MENU_Z_INDEX = 10_000;
+
+/** The pane menu entry that opens Report a Bug, in the main window's and a popped-out window's menu. */
+export const REPORT_BUG_MENU_LABEL = "Report a Bug";
 
 /** One row of the kit pane menu; a divider row is skipped by the keyboard. */
 export interface PaneMenuEntry {
@@ -102,6 +106,12 @@ export function menuForPane(
   fullscreen?: { active: boolean; toggle: () => void },
   paneItems: ContextMenuItem[] = [],
   layoutMove: PaneMenuLayoutMove = {},
+  /** The pane's entry in DOCS, the same as the `?` in its header. */
+  openDocs?: () => void,
+  /** A new Ask Gloom conversation with this pane attached, the same as the button beside the `?`. */
+  askGloom?: () => void,
+  /** Report a Bug: the pane's picture and a line to #bugs; absent where it cannot be posted or pictured. */
+  reportBug?: () => void,
 ): ContextMenuItem[] {
   const baseActions: ContextMenuItem[] = [...paneItems];
   if (baseActions.length > 0) baseActions.push(contextMenuDivider("pane:own-actions-divider"));
@@ -122,13 +132,22 @@ export function menuForPane(
       onSelect: () => openPaneSettings(pane.instance.instanceId),
     });
   }
+  if (openDocs) {
+    baseActions.push({ id: "pane-docs", label: "Docs", onSelect: openDocs });
+  }
+  if (askGloom) {
+    baseActions.push({ id: "ask-gloom", label: "Ask Gloom", accelerator: accelerators.ask, onSelect: askGloom });
+  }
   if (sharePane) {
     baseActions.push({
       id: "share-pane",
-      label: "Share Pane",
+      label: "Share",
       accelerator: accelerators.share,
       onSelect: sharePane,
     });
+  }
+  if (reportBug) {
+    baseActions.push({ id: "report-bug", label: REPORT_BUG_MENU_LABEL, onSelect: reportBug });
   }
   if (copyPaneScreenshot) {
     baseActions.push({
@@ -146,6 +165,8 @@ export function menuForPane(
       onSelect: () => exportPaneCsv(pane.instance.instanceId),
     });
   }
+  // Plugin actions sit with sharing and exporting.
+  baseActions.push(pluginContextMenuSlot("pane"));
 
   if (fullscreen) {
     baseActions.push({

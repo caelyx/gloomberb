@@ -83,13 +83,13 @@ export function setDisplayTimeZone(zone: string | null | undefined): void {
 /**
  * ` (Sun 11 Oct 01:56 Asia/Tokyo)`: an instant on the reader's clock, to follow
  * its UTC time, with the weekday and date because the two can fall on
- * different days. Empty when no zone is set.
+ * different days; to the second with `seconds`. Empty when no zone is set.
  */
-export function localTimeSuffix(time: number): string {
+export function localTimeSuffix(time: number, seconds = false): string {
   if (!displayZone || !Number.isFinite(time)) return "";
   const local = zonedDateTimeParts(time, displayZone);
   const weekday = WEEKDAYS[new Date(Date.UTC(local.year, local.month - 1, local.day)).getUTCDay()];
-  const clock = `${String(local.hour).padStart(2, "0")}:${String(local.minute).padStart(2, "0")}`;
+  const clock = [local.hour, local.minute, ...(seconds ? [local.second] : [])].map((part) => String(part).padStart(2, "0")).join(":");
   return ` (${weekday} ${local.day} ${MONTHS[local.month - 1]} ${clock} ${displayZone})`;
 }
 
@@ -104,6 +104,29 @@ export function formatUtcTime(value: ReportTime | Date | number | string): strin
   const iso = new Date(parsed.time).toISOString();
   if (parsed.dateOnly) return iso.slice(0, 10);
   return `${iso.slice(0, 16).replace("T", " ")} UTC${localTimeSuffix(parsed.time)}`;
+}
+
+/**
+ * `2026-10-09 00:08:00 UTC`: `formatUtcTime` to the second, for a column whose
+ * times are to the second, so a time that fell on a whole minute reads like
+ * the rest. Text that is not a time comes back as it is.
+ */
+export function formatUtcSeconds(value: unknown): string {
+  const parsed = parseReportTime(value);
+  if (!parsed || parsed.dateOnly) return typeof value === "string" ? value : "";
+  return `${new Date(parsed.time).toISOString().slice(0, 19).replace("T", " ")} UTC${localTimeSuffix(parsed.time, true)}`;
+}
+
+/**
+ * `Fri 9 Oct 23:59` in UTC, or `Fri 9 Oct` for a date, for a table cell whose
+ * header names the zone: a time without its zone, so each row stays short. The
+ * year follows only when it is not the year of `now`.
+ */
+export function formatUtcDayTime(value: ReportTime, now = Date.now()): string {
+  const date = new Date(value.time);
+  const year = date.getUTCFullYear() === new Date(now).getUTCFullYear() ? "" : ` ${date.getUTCFullYear()}`;
+  const day = `${WEEKDAYS[date.getUTCDay()]} ${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}${year}`;
+  return value.dateOnly ? day : `${day} ${date.toISOString().slice(11, 16)}`;
 }
 
 /** The newest of some report times, as given, so a loader can declare its as-of from the rows it means. */

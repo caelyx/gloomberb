@@ -9,6 +9,7 @@ import type {
   TickerFinancials,
 } from "../types/financials";
 import type { SyncSettings, SyncSnapshot } from "../sync/types";
+import type { ChatPaneLink } from "./chat-pane-link";
 
 /**
  * What stands behind a chat account. `discord` is a person on the Gloom
@@ -19,6 +20,9 @@ export type ChatAccountType = "human" | "managed_llm" | "discord";
 
 /** Where a message was written. A message without one came from the app. */
 export type ChatMessageOrigin = "app" | "discord";
+
+/** A badge an account earns in chat: `team` for Gloom staff, `pro` with Pro access. */
+export type ChatUserBadge = "team" | "pro";
 
 export interface ChatUserSummary {
   id: string;
@@ -32,6 +36,15 @@ export interface ChatUserSummary {
   profilePublic?: boolean;
   acceptUnknownDms?: boolean;
   portfolioAnalytics?: PublicPortfolioAnalytics | null;
+  /** Badges the account earns. A server that predates them, or a person with none, leaves this out. */
+  badges?: ChatUserBadge[];
+  /**
+   * The person's current offset from UTC in minutes, as their app last
+   * reported it: left out while they keep their local time hidden.
+   */
+  utcOffsetMinutes?: number;
+  /** The desks (equities, options, ...) the person chose to show; left out unless they did. */
+  desks?: string[];
 }
 
 /**
@@ -47,6 +60,33 @@ export interface ChatAttachment {
   height: number;
   size: number;
   url: string;
+}
+
+/** Someone who reacted, as a reaction lists the first few. */
+export interface ChatReactionUser {
+  id: string;
+  username: string | null;
+  displayName: string;
+  accountType?: ChatAccountType | null;
+}
+
+/**
+ * One emoji on a message: how many reacted, whether you did, and the first
+ * few who did, oldest first. `emoji` is the character, or `:name:` for a
+ * custom Discord server emoji.
+ */
+export interface ChatReaction {
+  emoji: string;
+  count: number;
+  me: boolean;
+  users?: ChatReactionUser[];
+}
+
+/** A message's reactions as they stand after a change, from the `chat.reactions` frame or a reaction request. */
+export interface ChatReactionsUpdate {
+  channelId: string;
+  messageId: string;
+  reactions: ChatReaction[];
 }
 
 export interface ChatMessage {
@@ -67,11 +107,19 @@ export interface ChatMessage {
   /** Images in display order. A server that predates them leaves this out. */
   attachments?: ChatAttachment[];
   /**
+   * Emoji reactions in the order they first appeared. Message lists from a
+   * server that knows reactions always carry it; a live copy of a message
+   * (an edit) leaves it out, and the reactions held stay.
+   */
+  reactions?: ChatReaction[];
+  /**
    * Only on the author's copy of a public message whose images are still being
    * checked ("pending") or could not be checked ("failed"). Nobody else has the
    * message yet.
    */
   attachmentReview?: "pending" | "failed";
+  /** What the message opens in the terminal (a Gloom Wire story or calendar). Only the server sets it. */
+  paneLink?: ChatPaneLink;
   clientStatus?: "sending" | "failed";
   clientError?: string | null;
   /** The idempotency key a local send went out with, so a retry repeats it. */
@@ -95,6 +143,21 @@ export interface ChatChannel {
   teamId?: string;
   dmUser?: ChatUserSummary | null;
   members?: ChatUserSummary[];
+  /**
+   * When the newest message you can see in a direct or group conversation was
+   * sent; null when it has none. Absent from channels of other kinds and from
+   * servers that do not report it.
+   */
+  lastMessageAt?: string | null;
+}
+
+/** Minimal identities scoped by the server to this channel and existing DMs. */
+export interface ChatMentionCandidate {
+  id: string;
+  username: string;
+  displayName: string | null;
+  channelActivityAt: string | null;
+  conversationActivityAt: string | null;
 }
 
 export interface ChatChannelState {
@@ -175,6 +238,12 @@ export interface AccountProfile {
   acceptUnknownDms: boolean;
   chatEmailNotificationsEnabled: boolean;
   portfolioAnalytics?: PublicPortfolioAnalytics | null;
+  /** Chat shows your local time on your card. A server that predates the setting leaves it out. */
+  showLocalTime?: boolean;
+  /** The desks chat shows beside your name; empty shows none. */
+  chatDesks?: string[];
+  /** Your answer to "What do you trade?" at the first run: private, it pre-fills `chatDesks`. */
+  onboardingDesks?: string[];
   syncEnabled: boolean;
   weeklyRoundupEnabled: boolean;
   positionAlertsEnabled: boolean;
@@ -318,6 +387,9 @@ export type AccountProfileUpdate = Partial<{
   syncEnabled: boolean;
   weeklyRoundupEnabled: boolean;
   positionAlertsEnabled: boolean;
+  showLocalTime: boolean;
+  /** Null or empty shows no desks. */
+  chatDesks: string[] | null;
 }>;
 
 export interface CloudSyncSnapshotResponse {
@@ -402,6 +474,12 @@ export interface CloudPricePointPayload {
   low?: number;
   close: number;
   volume?: number;
+  /** A daily bar still forming when served: a coin's UTC day, or the trade date a future is trading. */
+  partial?: boolean;
+  /** A coin's daily bar whose prices were rebuilt from hourly bars; a day the source left empty has no volume. */
+  filled?: boolean;
+  /** A future's closed session whose settlement is not confirmed yet: it closes on the last trade. */
+  unsettled?: boolean;
 }
 
 type CloudEconImpact = "high" | "medium" | "low";
@@ -432,6 +510,13 @@ export interface CloudMacroReleaseDaysPayload {
 export interface CloudFredObservationPayload {
   date: string;
   value: number | null;
+  /**
+   * Who published a value FRED does not list yet, such as a Treasury yield
+   * Gloom Cloud read from the Treasury first. Absent on FRED's own values.
+   */
+  publisher?: string;
+  /** When that publisher's value was first read, ISO in UTC. */
+  publishedAt?: string;
 }
 
 export interface CloudFredSeriesInfoPayload {
@@ -536,6 +621,22 @@ export interface CloudCdsHistoryResponse {
   currency: string | null;
   asOf: string | null;
   points: CloudCdsHistoryPointPayload[];
+}
+
+/** An issuer's latest 5Y level: the last point of its history over the last month. */
+export interface CloudCdsLevelPayload {
+  /** The reference entity as the history response names it. */
+  issuer: string;
+  spreadBp: number;
+  date: string;
+}
+
+export interface CloudCdsLevelsResponse {
+  source: string;
+  tenor: string;
+  asOf: string | null;
+  /** Every issuer traded in the last month whose 5Y line has a level in it. */
+  levels: CloudCdsLevelPayload[];
 }
 
 interface CloudShortInterestPointPayload {
@@ -1098,7 +1199,7 @@ export interface CloudSearchResponse {
   tookMs: number;
 }
 
-export interface CloudSearchDocumentChunk {
+interface CloudSearchDocumentChunk {
   id: string;
   chunkIndex: number;
   body: string;
@@ -1361,7 +1462,9 @@ export interface CloudHistoryCoverage {
   /** First bar date (YYYY-MM-DD) the source serves, such as a fund's inception. */
   firstAllowedBarDate?: string;
   inceptionDate?: string;
-  sourceUrl: string;
+  /** Why nothing earlier is served, such as "old-shekel quotes before 1992 are not served". */
+  note?: string;
+  sourceUrl?: string;
   firstBarDate: string | null;
   lastBarDate: string | null;
   barCount: number;
@@ -1383,6 +1486,8 @@ export interface CloudMarketResponse<T> {
   historySession?: unknown;
   /** "extended" when the history includes the pre-market and after-hours bars asked for. */
   session?: unknown;
+  /** "1day" when daily bars answer an intraday range: the listing has no intraday bars. */
+  servedResolution?: unknown;
   /** Untrusted until the history adapter validates its boundary dates. */
   coverage?: CloudHistoryCoverage;
   providerMeta?: {
@@ -1427,13 +1532,36 @@ export interface CloudMarketBatchPayload<T> {
 
 export type CloudMarketScreenerCategory = "gainers" | "losers" | "most-active";
 
-export interface CloudMarketScreenerItem {
+/**
+ * What Gloom Cloud selects and ranks Gainers and Losers by: `regular` the last
+ * completed regular session's move, the Chg% a row shows; `extended` the
+ * latest print, after-hours or pre-market included. While the regular session
+ * trades the two are one list. A server that predates the choice ignores it
+ * and ranks by the latest print.
+ */
+export type CloudMoverSession = "regular" | "extended";
+
+/**
+ * A movers row's quote sessions, under the quote's field names and meaning:
+ * the session it was read in, the day its change is dated to, the last
+ * completed regular session's close and move, and an open pre-market or
+ * after-hours print with its move from that close. Older servers send none.
+ */
+export type CloudMoverSessionFields = Partial<Pick<Quote,
+  | "marketState" | "changeSessionDate"
+  | "regularClose" | "regularCloseSessionDate" | "regularChange" | "regularChangePercent"
+  | "preMarketPrice" | "preMarketChange" | "preMarketChangePercent"
+  | "postMarketPrice" | "postMarketChange" | "postMarketChangePercent">>;
+
+/** price, change and changePercent are the live print the server ranks the list by; the session fields say how it reads. */
+export interface CloudMarketScreenerItem extends CloudMoverSessionFields {
   rank: number;
   symbol: string;
   name: string;
   price: number;
   change: number;
   changePercent: number;
+  previousClose?: number;
   volume: number;
   /** Available average volume for this listing, independent of public ranking membership. */
   avgVolume?: number;

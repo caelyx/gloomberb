@@ -14,8 +14,17 @@ import {
 import { serializeCsv } from "../utils/csv";
 import { formatUtcTime, isEpochMilliseconds, isZonedIsoDateTime } from "../utils/utc-time";
 import { formatFreshnessLine, type ReportFreshness } from "./pane-functions/freshness";
-import { withSearchHints } from "./not-a-ticker";
-import { renderReportCsv, renderReportNdjson, type CliReportTables } from "./report-tables";
+import { withSearchHints, type FredSeriesCheck } from "./not-a-ticker";
+import { renderReportCsv, renderReportNdjson, withCsvFooter, type CliReportTables } from "./report-tables";
+import {
+  EXPORT_IDENTITY_COLUMNS,
+  exportIdentityCells,
+  exportIdentityFields,
+  exportSource,
+  exportSourceLines,
+  type ExportIdentity,
+  type ExportSource,
+} from "./export-source";
 import { windowRows, type RowWindow, type RowWindowOptions } from "./row-window";
 
 export interface CliResult<T = unknown> {
@@ -25,10 +34,18 @@ export interface CliResult<T = unknown> {
   /**
    * Source, as-of and status of market data, as every `fn` report states them
    * (docs/usage.md#how-current-a-report-is): the last line of the text output
-   * and `metadata.freshness` in JSON. CSV and NDJSON stay rows only, unless
-   * the command passes `tables`, whose footer carries it.
+   * and `metadata.freshness` in JSON. Exports cite it too (`exportSource`):
+   * CSV ends with it as `#` lines, or `tables` footer does, and JSON carries
+   * it as `source`. NDJSON stays rows only. CSV and NDJSON rows end with the
+   * fixed columns of `EXPORT_IDENTITY_COLUMNS`, its source and as-of among them.
    */
   freshness?: ReportFreshness;
+  /**
+   * What exports cite (CSV's closing `#` lines, JSON's `source`) when the text
+   * does not end with `freshness`: an `fn` report states its own, and
+   * `fear-greed` prints its row alone.
+   */
+  exportFreshness?: ReportFreshness;
 }
 
 export interface CliErrorObject {
@@ -36,6 +53,8 @@ export interface CliErrorObject {
   message: string;
   details?: unknown;
   retryable?: boolean;
+  /** What the failure says beside its message, such as the `tickerChange` of a symbol whose company moved. */
+  [field: string]: unknown;
 }
 
 export interface CliResultColumn<Row = Record<string, unknown>> extends CliTableColumn {
@@ -64,6 +83,8 @@ export interface CliResultRenderOptions<T = unknown, Row = Record<string, unknow
   heading?: string;
   /** Text-mode line printed under the rows, such as where a listing stops. Not printed with no rows: say it in `empty`. */
   footnote?: string;
+  /** Text-mode block printed under the rows and footnote, for figures about a row that are not columns. */
+  details?: (data: T) => string;
   /**
    * The row key holding each row's date, which makes the rows a dated series:
    * `--tail` keeps the newest rows whichever way the series runs, and a
@@ -78,10 +99,21 @@ export interface CliResultRenderOptions<T = unknown, Row = Record<string, unknow
    * text view shows them, CSV with its `# section:` and closing `#` lines.
    */
   tables?: CliReportTables;
+  /**
+   * What the rows are of, for the fixed columns (`EXPORT_IDENTITY_COLUMNS`)
+   * CSV and NDJSON end every row with when the result cites a source: one
+   * identity for every row, or each row's own. Without it a row's own
+   * `symbol` and `currency` fields say it, as far as they go.
+   */
+  exportIdentity?: ExportIdentity | ((row: Row) => ExportIdentity);
+  /** What CSV says after the source lines as `# note:` lines: what the rows do not show, such as where a series begins. */
+  exportNotes?: readonly string[];
 }
 
-interface CliResultJsonEnvelope<T> extends Omit<CliResult<T>, "freshness"> {
+interface CliResultJsonEnvelope<T> extends Omit<CliResult<T>, "freshness" | "exportFreshness"> {
   ok: true;
+  /** Where the data comes from, as CSV's closing `#` lines say it. */
+  source?: ExportSource;
   columns?: Array<Pick<CliResultColumn, "key" | "header" | "align" | "width">>;
 }
 
@@ -255,16 +287,32 @@ function serializeColumns<Row>(columns?: CliResultColumn<Row>[]) {
 function renderCsv<Row extends Record<string, unknown>>(
   rows: Row[],
   columns?: CliResultColumn<Row>[],
+  identity?: (row: Row) => string[],
 ): string {
   const resolvedColumns = columns && columns.length > 0
     ? columns
     : inferColumns(rows as Record<string, unknown>[]) as CliResultColumn<Row>[];
   return serializeCsv([
-    resolvedColumns.map((column) => column.header),
-    ...rows.map((row) => resolvedColumns.map((column) => (
-      column.value ? column.value(row) : row[column.key]
-    ))),
+    [...resolvedColumns.map((column) => column.header), ...identity ? EXPORT_IDENTITY_COLUMNS : []],
+    ...rows.map((row) => [
+      ...resolvedColumns.map((column) => (column.value ? column.value(row) : row[column.key])),
+      ...identity?.(row) ?? [],
+    ]),
   ]);
+}
+
+function stringField(row: Record<string, unknown>, key: string): string | null {
+  const value = row?.[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+/** What a row is of: as the command says, else its own `symbol` and `currency` fields. */
+function rowIdentity<Row extends Record<string, unknown>>(
+  row: Row,
+  declared: CliResultRenderOptions<unknown, Row>["exportIdentity"],
+): ExportIdentity {
+  if (typeof declared === "function") return declared(row);
+  return declared ?? { symbolOrSeries: stringField(row, "symbol"), currencyOrUnit: stringField(row, "currency") };
 }
 
 function textColumns<Row extends Record<string, unknown>>(
@@ -304,9 +352,12 @@ function renderTextTable<Row extends Record<string, unknown>>(
       align: column.align,
       width: column.width,
       maxWidth: column.maxWidth,
+      minWidth: column.minWidth,
       optional: column.optional,
       dropPriority: column.dropPriority,
       shrink: column.shrink,
+      stackPriority: column.stackPriority,
+      stackRows: column.stackRows,
     })),
     cells.map((row) => shown.map(({ index }) => row[index]!)),
   );
@@ -347,7 +398,8 @@ export function serializeCliResult<T, Row extends Record<string, unknown> = Reco
   options: CliGlobalOptions,
   renderOptions: CliResultRenderOptions<T, Row> = {},
 ): string {
-  const { freshness, ...rest } = result;
+  const { freshness, exportFreshness, ...rest } = result;
+  const cited = freshness ?? exportFreshness;
   if (options.format === "json") {
     const columns = serializeColumns(renderOptions.columns);
     const window = Array.isArray(result.data) ? windowed(result.data as unknown[], options, renderOptions) : null;
@@ -357,11 +409,12 @@ export function serializeCliResult<T, Row extends Record<string, unknown> = Reco
       ...rest,
       ...(freshness || cut ? { metadata: { ...rest.metadata, ...(freshness ? { freshness } : {}), ...(cut ? { rows: cut } : {}) } } : {}),
       data: window ? window.rows as T : result.data,
+      ...(cited ? { source: exportSource(cited) } : {}),
       ...(columns?.length ? { columns } : {}),
     };
     return JSON.stringify(envelope, null, 2);
   }
-  const body = serializeCliRows(rest, options, renderOptions);
+  const body = serializeCliRows(rest, options, renderOptions, cited);
   if (options.format !== "text" || !freshness) return body;
   return body ? `${body}\n\n${cliFreshnessFooter(freshness)}` : cliFreshnessFooter(freshness);
 }
@@ -370,16 +423,27 @@ function serializeCliRows<T, Row extends Record<string, unknown>>(
   result: CliResult<T>,
   options: CliGlobalOptions,
   renderOptions: CliResultRenderOptions<T, Row>,
+  cited?: ReportFreshness,
 ): string {
-  if (renderOptions.tables && options.format === "csv") return renderReportCsv(renderOptions.tables);
-  if (renderOptions.tables && options.format === "ndjson") return renderReportNdjson(renderOptions.tables);
+  if (renderOptions.tables && (options.format === "csv" || options.format === "ndjson")) {
+    // A report's tables name what they are of, else the command's one identity for every row does.
+    const declared = renderOptions.exportIdentity;
+    const tables = renderOptions.tables.identity || !declared || typeof declared === "function"
+      ? renderOptions.tables
+      : { ...renderOptions.tables, identity: declared };
+    return options.format === "csv" ? renderReportCsv(tables, cited) : renderReportNdjson(tables, cited);
+  }
   const window = windowed(asRows(result.data, renderOptions.rows), options, renderOptions);
   const rows = window.rows;
   if (options.format === "ndjson") {
-    return rows.map((row) => JSON.stringify(row)).join("\n");
+    return rows.map((row) => JSON.stringify(cited && isPlainObject(row)
+      ? { ...row, ...exportIdentityFields(cited, rowIdentity(row as Row, renderOptions.exportIdentity)) }
+      : row)).join("\n");
   }
   if (options.format === "csv") {
-    return renderCsv(rows as Row[], renderOptions.columns);
+    if (!cited) return renderCsv(rows as Row[], renderOptions.columns);
+    const csv = renderCsv(rows as Row[], renderOptions.columns, (row) => exportIdentityCells(cited, rowIdentity(row, renderOptions.exportIdentity)));
+    return withCsvFooter(csv, [...exportSourceLines(cited), ...(renderOptions.exportNotes ?? []).map((note) => `note: ${note}`)]);
   }
   if (renderOptions.text) {
     return renderOptions.text(result.data);
@@ -391,7 +455,8 @@ function serializeCliRows<T, Row extends Record<string, unknown>>(
   }
   const table = renderTextRows(rows as Row[], result.data, renderOptions);
   const notes = [window.note, renderOptions.footnote].filter((note): note is string => !!note);
-  const body = [table, ...notes.map((note) => cliStyles.muted(note))].join("\n");
+  const details = renderOptions.details?.(result.data) ?? "";
+  const body = [table, ...notes.map((note) => cliStyles.muted(note)), ...details ? ["", details] : []].join("\n");
   return withHeading(summary ? `${summary}\n\n${body}` : body);
 }
 
@@ -412,19 +477,33 @@ function renderTextRows<T, Row extends Record<string, unknown>>(
     : renderTextTable(rows as Row[], columns);
 }
 
+/** Settles once the result `printCliResult` last wrote has left the process: a pipe can hold it back. */
+let stdoutWritten: Promise<void> = Promise.resolve();
+
+/**
+ * For a command that must exit before its event loop empties: exiting while
+ * a pipe still holds part of the output would cut it off.
+ */
+export function cliOutputWritten(): Promise<void> {
+  return stdoutWritten;
+}
+
 export function printCliResult<T, Row extends Record<string, unknown> = Record<string, unknown>>(
   result: CliResult<T>,
   options: CliGlobalOptions,
   renderOptions: CliResultRenderOptions<T, Row> = {},
   args: readonly string[] = [],
+  isFredSeries?: FredSeriesCheck,
 ): void {
   if (options.quiet && options.format === "text") return;
   // JSON keeps the router's own words; everything else is for a person, so a "Not a ticker" gets its hint.
-  const hinted = (text: string) => options.format === "json" ? text : withSearchHints(text, args);
+  const hinted = (text: string) => options.format === "json" ? text : withSearchHints(text, args, isFredSeries);
   const output = hinted(serializeCliResult(result, options, renderOptions));
   // Bun's console writer can truncate a large pipe write after stdout has been
   // initialized. The stream queues the remaining bytes until the reader drains.
-  if (output) process.stdout.write(`${output}\n`);
+  if (output && !process.stdout.write(`${output}\n`)) {
+    stdoutWritten = new Promise((resolve) => process.stdout.once("drain", () => resolve()));
+  }
   // JSON carries warnings in its envelope. Text, CSV and NDJSON are only the
   // rows, so a warning goes to stderr, out of a file the rows are piped into.
   if (options.format !== "json" && !options.quiet) {

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { Box, Text, TextAttributes, useUiCapabilities } from "../../../../ui";
 import type { PricePoint, Quote, TickerFinancials } from "../../../../types/financials";
 import type { TickerRecord } from "../../../../types/ticker";
@@ -14,13 +14,15 @@ import {
   getCompletedRegularSessionDisplay,
   getExtendedSessionDisplay,
   getRegularSessionDisplay,
+  EXTENDED_SESSION_MARKS,
+  extendedSessionLineLabel,
   type ExtendedSessionDisplay,
 } from "../../../../market-data/market/status";
 import { t } from "../../../../i18n";
 import { isQuoteStaleForCurrentSession } from "../../../../market-data/quotes/freshness";
 import { formatQuoteNavAsOf } from "../../../../market-data/quotes/time";
 import { useQuoteFlashDirection } from "../../../../components/quote-flash";
-import { appendLiveQuotePoint } from "../../../../time-series/chart-data";
+import { followLiveSparklinePrice } from "../../../../components/price-sparkline/model";
 import {
   PriceAreaSparklineBackground,
   PriceSparkline,
@@ -39,20 +41,20 @@ const DESKTOP_DETAIL_CHAR_PX = 12 * 0.6;
 
 /**
  * The extended print's line, "After-Hours $336.08 -0.17%": the full label
- * where the room allows, else "AH" or "PM" as the heat map marks them, and
- * at the narrowest the mark and the move without the price.
+ * where the room allows, else "AH", "PM" or "ON" as the heat map marks them,
+ * and at the narrowest the mark and the move without the price.
  */
 function extendedLineParts(
   extended: ExtendedSessionDisplay,
   priceText: string,
   fits: (text: string) => boolean,
 ): { label: string; figures: string } | null {
-  const pre = extended.session === "PRE";
+  const mark = EXTENDED_SESSION_MARKS[extended.session];
   const percent = formatPercentRaw(extended.changePercent);
   const candidates = [
-    { label: t(pre ? "Pre-Market" : "After-Hours"), figures: `${priceText} ${percent}` },
-    { label: pre ? "PM" : "AH", figures: `${priceText} ${percent}` },
-    { label: pre ? "PM" : "AH", figures: percent },
+    { label: extendedSessionLineLabel(extended, t), figures: `${priceText} ${percent}` },
+    { label: mark, figures: `${priceText} ${percent}` },
+    { label: mark, figures: percent },
   ];
   return candidates.find(({ label, figures }) => fits(`${label} ${figures}`)) ?? null;
 }
@@ -143,8 +145,13 @@ export function QuoteMonitorCard({
     : cachedFinancials?.priceHistory;
   const assetCategory = quote?.instrumentType ?? ticker?.metadata.assetCategory;
   // Completed bars end at the prior close; the live price closes the line and the stated range.
-  const priceHistory = useMemo(() => barHistory && appendLiveQuotePoint(barHistory, quote, { assetCategory }),
-    [assetCategory, barHistory, quote]);
+  const sparklineRef = useRef<PricePoint[] | undefined>(undefined);
+  const priceHistory = useMemo(() => {
+    if (!barHistory) return undefined;
+    const next = followLiveSparklinePrice(barHistory, quote, { assetCategory, period: chartPeriod, previous: sparklineRef.current });
+    sparklineRef.current = next;
+    return next;
+  }, [assetCategory, barHistory, chartPeriod, quote]);
   const flashFinancials = useMemo<TickerFinancials | null>(
     () => quote ? { quote, annualStatements: [], quarterlyStatements: [], priceHistory: [] } : null,
     [quote],

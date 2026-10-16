@@ -11,6 +11,11 @@ body {
   line-height: var(--cell-h);
   color: var(--gloom-text, #f2f2f2);
   cursor: default;
+  /* The app is chrome, not a document: no text is selectable until it says so
+     (see "Selectable text" below). WebKit, the macOS app's WKWebView and
+     Safari, only knows the prefixed property and ignores the plain one, so every
+     user-select in this file and in the host is written with both. */
+  -webkit-user-select: none;
   user-select: none;
   color-scheme: dark;
   -webkit-font-smoothing: antialiased;
@@ -19,13 +24,32 @@ body {
 * { box-sizing: border-box; }
 #root > * { height: 100%; min-height: 100%; }
 input, textarea, button { font: inherit; }
-input, textarea { cursor: text; user-select: text; }
+/* Inherited "none" would also stop WebKit from typing into a field. */
+input, textarea, [contenteditable]:not([contenteditable="false"]) {
+  -webkit-user-select: text;
+  user-select: text;
+}
+input, textarea { cursor: text; }
+/* Selectable text: what a person may want to copy by hand. A host Text takes
+   the selectable prop; a block of text (a reader, markdown, a chat message, a
+   log) carries this attribute on its container, and everything inside it that
+   does not say otherwise can be selected. */
+[data-gloom-selectable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+}
 button, [data-gloom-interactive="true"] { cursor: pointer; }
 /* `plain` buttons drop the border, so hover is the only thing left that says
    the row or chip is clickable. A translucent wash reads the same on the
    sidebar, a pane body and the status bar. */
 [data-gloom-role="desktop-button"][data-gloom-variant="plain"]:not(:disabled):hover {
   background-color: color-mix(in srgb, var(--gloom-text-bright) 8%, transparent);
+}
+/* A raised button sinks while it is held: its light flips and its shadow goes
+   (control-styles.ts, buttonRelief). */
+[data-gloom-raised="true"]:not(:disabled):active {
+  background-image: var(--gloom-pressed-image) !important;
+  box-shadow: var(--gloom-pressed-shadow) !important;
 }
 [data-gloom-hover-bg="true"]:hover {
   background-color: var(--gloom-box-hover-bg) !important;
@@ -56,6 +80,12 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 }
 [data-titlebar-overlay="true"] * {
   cursor: inherit;
+}
+/* A row of text grows with the text size and the title bar does not: at the
+   largest sizes the top bar's buttons and prompt would stand out of it. */
+[data-gloom-role="app-header"][data-titlebar-overlay="true"] button,
+[data-gloom-role="app-header"][data-titlebar-overlay="true"] [role="button"] {
+  max-height: __TITLEBAR_OVERLAY_HEIGHT_PX__px;
 }
 [data-titlebar-overlay="true"] button,
 [data-titlebar-overlay="true"] input,
@@ -171,6 +201,7 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
    stream: a touch or pen press on them never starts a pan or zoom. */
 [data-gloom-role="pane-header"][data-drag-surface="pane"],
 [data-gloom-role="resize-handle"],
+[data-gloom-role="resize-edge"],
 [data-gloom-role="dock-divider"] {
   touch-action: none;
 }
@@ -178,22 +209,41 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-[data-gloom-role="chat-message"]:hover [data-gloom-role="chat-message-row"][data-selected="false"] {
-  background-color: var(--chat-hover-bg);
+/* A list row out of view keeps its width until a live resize ends (resize-rows.ts).
+   Not inherited: setting it on a row does not restyle everything inside the row. */
+@property --gloom-resize-held-width {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
 }
+[data-gloom-resize-held] {
+  width: var(--gloom-resize-held-width) !important;
+}
+/* A row's hover band is painted from the chat's own state (data-hovered), not
+   :hover, so it can be dropped when the list scrolls or fills under a pointer
+   that did not move. Its actions show with it. */
 [data-gloom-role="chat-message-reply-action"] {
   opacity: 0;
   pointer-events: none;
 }
-[data-gloom-role="chat-message"]:hover [data-gloom-role="chat-message-reply-action"],
-[data-gloom-role="chat-message"][data-selected="true"] [data-gloom-role="chat-message-reply-action"] {
+[data-gloom-role="chat-message"][data-hovered="true"] [data-gloom-role="chat-message-reply-action"],
+[data-gloom-role="chat-message"][data-selected="true"] [data-gloom-role="chat-message-reply-action"],
+[data-gloom-role="chat-message-reply-action"][data-picker-open="true"] {
   opacity: 1;
   pointer-events: auto;
 }
-/* Message text can be selected and copied, like any chat. */
-[data-gloom-role="chat-message-body"] {
-  -webkit-user-select: text;
-  user-select: text;
+/* The message a notification pointed at: marked, then fading out. */
+[data-gloom-role="chat-message"][data-highlighted="true"] [data-gloom-role="chat-message-row"] {
+  animation: gloom-chat-highlight 2s ease-out forwards;
+}
+@keyframes gloom-chat-highlight {
+  from { background-color: var(--chat-highlight-bg); }
+  to { background-color: transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-gloom-role="chat-message"][data-highlighted="true"] [data-gloom-role="chat-message-row"] {
+    animation: none;
+  }
 }
 [data-gloom-role="chat-message-image"]:focus-visible {
   outline: 2px solid var(--gloom-border-focused, currentColor);
@@ -219,10 +269,8 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
   max-width: calc(100vw - 48px);
 }
 [data-gloom-role="status-bar"] {
-  flex: 0 0 var(--cell-h);
+  flex: none;
   height: var(--cell-h);
-  min-height: var(--cell-h);
-  max-height: var(--cell-h);
   align-items: center;
   border-top: 1px solid color-mix(in srgb, var(--gloom-border) 72%, transparent);
   font-size: 11.5px;
@@ -236,10 +284,44 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 [data-gloom-role="pane-content"] {
   overflow: hidden;
 }
-[data-gloom-role="pane-content"] > * {
+/* A pane shown as a view inside another pane (Fixed Income's sections) gets
+   its space the way a pane gets the pane's: the host's bars are taller than
+   the rows the view was given, so its root never runs past the host's box. */
+[data-gloom-role="pane-content"] > *,
+[data-gloom-role="nested-pane-content"] > * {
   min-width: 0;
   min-height: 0;
   max-height: 100%;
+}
+/* A chart or heat map takes the space its box gives it rather than the whole
+   cells it was given (host/surface-fit.ts): a fill at rest, and, while a
+   resize is under way, the boxes up to the pane that are exactly the space
+   their parent gives them follow the frame the same way. */
+[data-gloom-fill-x="stretch"], [data-gloom-follow-x="stretch"] {
+  width: auto !important;
+  align-self: stretch !important;
+}
+[data-gloom-fill-x="grow"], [data-gloom-follow-x="grow"] {
+  flex: 1 1 0px !important;
+  width: auto !important;
+  min-width: 0 !important;
+}
+[data-gloom-fill-y="stretch"], [data-gloom-follow-y="stretch"] {
+  height: auto !important;
+  align-self: stretch !important;
+}
+[data-gloom-fill-y="grow"], [data-gloom-follow-y="grow"] {
+  flex: 1 1 0px !important;
+  height: auto !important;
+  min-height: 0 !important;
+}
+/* A chart whose time axis reaches a floating pane's resize grip keeps its
+   last label clear of it. */
+[data-gloom-grip-clear] [data-gloom-role="chart-time-axis"] [data-gloom-edge="end"] {
+  right: calc(2 * var(--cell-w)) !important;
+}
+[data-gloom-grip-clear] [data-gloom-role="chart-time-axis"] [data-gloom-edge="end-segment"] {
+  padding-right: calc(2 * var(--cell-w)) !important;
 }
 /* The same chrome row as the pane header, query bar and table header. */
 [data-gloom-role="pane-footer"] {
@@ -268,6 +350,23 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 }
 [data-gloom-role="resize-handle"] {
   cursor: nwse-resize;
+}
+/* The invisible strips around a floating pane that resize it from any edge or corner. */
+[data-gloom-role="resize-edge"][data-edge="left"],
+[data-gloom-role="resize-edge"][data-edge="right"] {
+  cursor: ew-resize;
+}
+[data-gloom-role="resize-edge"][data-edge="top"],
+[data-gloom-role="resize-edge"][data-edge="bottom"] {
+  cursor: ns-resize;
+}
+[data-gloom-role="resize-edge"][data-edge="top-left"],
+[data-gloom-role="resize-edge"][data-edge="bottom-right"] {
+  cursor: nwse-resize;
+}
+[data-gloom-role="resize-edge"][data-edge="top-right"],
+[data-gloom-role="resize-edge"][data-edge="bottom-left"] {
+  cursor: nesw-resize;
 }
 [data-gloom-role="window-mode-status"] {
   border: 1px solid color-mix(in srgb, var(--gloom-border-focused) 76%, transparent);
@@ -493,6 +592,7 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
   margin: 0;
   white-space: pre-wrap;
   color: var(--gloom-negative, #ff5f5f);
+  -webkit-user-select: text;
   user-select: text;
 }
 .gloom-toast-viewport {
@@ -799,6 +899,14 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 }
 .gloom-qb-meta + .gloom-qb-view { margin-left: 0; }
 
+.gloom-qb-leading {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  padding: 0 4px 0 8px;
+}
+
 
 /* Detail header of a list/detail stack: the same band as the query bar, so
    Back and the item title read as the pane's toolbar. Grows when a long title
@@ -1019,6 +1127,22 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   box-shadow: inset -1px 0 0 var(--sg-hairline);
 }
 [data-gloom-role="stat-grid-cell"][data-wide="true"] { grid-column: 1 / -1; box-shadow: none; }
+/* Column grid text whose track can be narrower than it, and the grid itself: clipped
+   without a scroll container where the engine has `overflow: clip`. A text box sets its
+   own overflow inline, hence !important. The margin keeps the antialiased edge of a glyph
+   that ends at the box from being cut. */
+[data-gloom-clip] {
+  overflow: clip !important;
+  overflow-clip-margin: 2px;
+}
+@supports not (overflow: clip) {
+  [data-gloom-clip] {
+    overflow: hidden !important;
+  }
+}
+[data-gloom-clip="text"] {
+  text-overflow: ellipsis !important;
+}
 [data-gloom-role="stat-grid-label"] {
   flex: 0 0 var(--stat-label-w, 10ch);
   width: var(--stat-label-w, 10ch);
@@ -1118,6 +1242,29 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 
 /* ===== Data table: sortable headers ===== */
 
+/* A section header's action (the preset a group is set to) is quiet text at
+   the right end of the header; the pointer brings out that it is a control. */
+[data-gloom-role="data-table-section-action"] {
+  margin-left: auto;
+  flex: none;
+  height: var(--cell-h);
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-weight: 400;
+  white-space: nowrap;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+[data-gloom-role="data-table-section-action"] svg { color: var(--gloom-text-muted); }
+[data-gloom-role="data-table-section-action"]:hover {
+  color: var(--gloom-text-bright) !important;
+  background-color: color-mix(in srgb, var(--gloom-text-bright) 8%, transparent);
+}
+
 /* A header that sorts brightens under the pointer; plain headers (no
    onHeaderClick) are not interactive and stay put. Tinted headers keep
    their colour. */
@@ -1130,4 +1277,37 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 :where(button, a[href], summary, [role="button"], [role="radio"], [role="option"], input[type="checkbox"]):focus-visible {
   outline: 2px solid var(--gloom-border-focused);
   outline-offset: 1px;
+}
+
+/* Keycaps on buttons and in dialog hints are for a keyboard; a touch screen
+   has none to press them with. A note beside them (a deadline) stays. */
+@media (hover: none) and (pointer: coarse) {
+  .gloom-keycap, .gloom-key-hint { display: none !important; }
+}
+
+/* Reading columns (src/components/reader) set their type from their own
+   width, not from a count of cells: body text at 1.1667em of the app's size
+   (14px), or 1.1em (13.2px) under 480px. The rest of the reader's scale is in
+   em of it (reader-text.tsx). */
+[data-gloom-ui="article-reader"],
+[data-gloom-ui="detail-reader"] {
+  container-type: inline-size;
+}
+@container (max-width: 480px) {
+  [data-gloom-ui="reader-column"] {
+    --reader-em: 1.1;
+  }
+}
+/* A detail's facts: label and value pairs, two pairs to a row when the
+   reader is wide enough for them. */
+[data-gloom-ui="detail-facts"] {
+  grid-template-columns: max-content minmax(0, 1fr);
+}
+@container (min-width: 720px) {
+  [data-gloom-ui="detail-facts"] {
+    grid-template-columns: max-content minmax(0, 1fr) max-content minmax(0, 1fr);
+  }
+  [data-gloom-ui="detail-facts"] > :nth-child(4n + 3) {
+    padding-left: 1.2em;
+  }
 }

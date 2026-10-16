@@ -21,6 +21,7 @@ import type { DataProvider } from "../../types/data-provider";
 import type { PinTickerOptions } from "../../types/plugin";
 import {
   resolveTickerOpenTarget,
+  tickerOpenFailureMessage,
   type TickerOpenTarget,
 } from "../../tickers/open-target";
 import { AmbiguousTickerError, findExactTickerSearchMatch } from "../../tickers/search";
@@ -73,7 +74,7 @@ export function useAppTickerOpenRuntime({
         tickerRepository,
       });
       if (!target && canPresentFeedback()) {
-        pluginRegistry.notify({ body: `Could not open ${rawSymbol}.`, type: "error" });
+        pluginRegistry.notify({ body: tickerOpenFailureMessage(rawSymbol), type: "error" });
       }
       return target;
     } catch (err) {
@@ -111,11 +112,11 @@ export function useAppTickerOpenRuntime({
     return true;
   }, [pluginRegistry, stateRef]);
 
-  const placePinnedTickerTarget = useCallback((target: TickerOpenTarget, options?: PinTickerOptions) => {
+  const placePinnedTickerTarget = useCallback((target: TickerOpenTarget, options?: PinTickerOptions, typed?: string) => {
     const paneType = normalizePaneId(options?.paneType ?? TICKER_RESEARCH_PANE_ID);
     const paneDef = pluginRegistry.panes.get(paneType);
     if (!paneDef) return;
-    if (refuseWhileOwnerOff(target.symbol, options, () => placePinnedTickerTarget(target, options))) return;
+    if (refuseWhileOwnerOff(target.symbol, options, () => placePinnedTickerTarget(target, options, typed))) return;
 
     publishTickerOpenTarget(target);
     const symbol = target.symbol;
@@ -128,8 +129,18 @@ export function useAppTickerOpenRuntime({
     let existing = options?.forceNewPane
       ? null
       : findFixedTickerPaneForSymbol(currentLayout, paneType, symbol, instrument);
-    if (!options?.forceNewPane && !existing && instrument === null && !target.ticker.metadata.broker_contracts?.length) {
-      existing = findFixedTickerPaneForSymbol(currentLayout, paneType, symbol);
+    // A pane bound to the key as typed (the web terminal's first pane for ?ticker=7203:TSE) is the one the
+    // resolved listing (7203:JPX) settles.
+    const typedKey = typed?.trim().toUpperCase();
+    if (!options?.forceNewPane && !existing && typedKey && typedKey !== symbol) {
+      existing = findFixedTickerPaneForSymbol(currentLayout, paneType, typedKey, instrument);
+    }
+    // Without a broker route, the public listing and an unnamed route are the same security: a link that names
+    // neither still finds the DES the command bar opened on the public listing, and leaves its binding as it is.
+    let keepBinding = false;
+    if (!options?.forceNewPane && !existing && !instrument && !target.ticker.metadata.broker_contracts?.length) {
+      existing = findFixedTickerPaneForSymbol(currentLayout, paneType, symbol, instrument === null ? undefined : null);
+      keepBinding = !!existing && instrument === undefined;
     }
     if (!options?.forceNewPane && !existing && !instrument && (parsePublicTickerKey(symbol).exchange || tickerHasListingSuffix(symbol))) {
       existing = currentLayout.instances.find((instance) => {
@@ -145,7 +156,7 @@ export function useAppTickerOpenRuntime({
       // verified same listing, retaining its pane identity and its followers.
       const previousSymbol = existing.binding?.kind === "fixed" ? existing.binding.symbol : null;
       let nextLayout = currentLayout;
-      if (previousSymbol && (previousSymbol !== symbol || JSON.stringify(existing.binding) !== JSON.stringify(binding))) {
+      if (previousSymbol && (previousSymbol !== symbol || (!keepBinding && JSON.stringify(existing.binding) !== JSON.stringify(binding)))) {
         const existingId = existing.instanceId;
         nextLayout = { ...currentLayout, instances: currentLayout.instances.map((instance) => (
           instance.instanceId === existingId ? {
@@ -209,7 +220,7 @@ export function useAppTickerOpenRuntime({
       ? { symbol: selectedTicker.metadata.ticker, ticker: selectedTicker, created: false, instrument: options?.instrument, listing: options?.listing }
       : await resolveOpenTickerTarget(rawSymbol, options?.instrument === null);
     if (!target) return;
-    placePinnedTickerTarget(target, options);
+    placePinnedTickerTarget(target, options, rawSymbol);
     const action = attentionActionForPane(options?.paneType ?? TICKER_RESEARCH_PANE_ID);
     if (action && pluginRegistry.panes.has(options?.paneType ?? TICKER_RESEARCH_PANE_ID)) {
       recordAttention(publicTickerKey(target.symbol, target.listing?.exchange ?? target.ticker.metadata.exchange), action);

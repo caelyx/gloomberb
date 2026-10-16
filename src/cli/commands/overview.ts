@@ -7,10 +7,18 @@ import {
   fetchScreenerResult,
   fetchTrending,
   MARKET_SUMMARY_SYMBOLS,
-  rankScreenerQuotes,
   type ScreenerCategory,
 } from "../../plugins/builtin/market-movers/screener";
-import { formatMoverPrice, moverReferencePrice } from "../../plugins/builtin/market-movers/model";
+import {
+  formatMoverPrice,
+  MOVER_RANK_BASES,
+  MOVER_RANKING_LABELS,
+  moverReferencePrice,
+  moverRegularSession,
+  rankMoverQuotes,
+  type MoverRankBasis,
+} from "../../plugins/builtin/market-movers/model";
+import { MOVER_CANDIDATES } from "../../plugins/builtin/market-movers/client";
 import { EXTENDED_SESSION_LABELS, getQuoteSessionFields, type ExtendedSession } from "../../market-data/market/status";
 import {
   COUNTRY_CYCLE,
@@ -27,7 +35,7 @@ import { buildCorrelationSeries } from "../../plugins/builtin/correlation/matrix
 import { alignDailyCloses, correlateDailyCloses } from "../../plugins/builtin/correlation/compute";
 import { mixedSessionCloseNote } from "../../market-data/market/session-close-note";
 import { CORRELATION_RETURN_BASIS, loadCorrelationHistory } from "../../plugins/builtin/correlation/history";
-import { EXCHANGE_OPTION, listingIdentity, loadForListing, loadListingQuote, requireCliListing, type CliListing } from "../listing-arg";
+import { EXCHANGE_OPTION, listingIdentity, listingReadNotes, loadForListing, loadListingQuote, requireCliListing, type CliListing } from "../listing-arg";
 import { CLI_COMMAND_GROUPS } from "../help";
 import { formatChangePercentCell, formatCompactCell } from "../helpers";
 import { WORLD_INDICES } from "../../plugins/builtin/world-indices/indices";
@@ -38,12 +46,21 @@ import { quotesFreshness, rowsFreshness } from "../freshness";
 import { periodicityOf } from "../pane-functions/freshness";
 import { formatBasisPoints, toBasisPoints } from "../../utils/basis-points";
 import {
+  basisPointsCell,
   DEFAULT_FRED_START,
+  filterFredSeries,
+  fredEmptyAdvice,
   fredEmptyMessage,
+  fredExportValue,
   fredHistoryNotes,
+  fredInterval,
+  fredObservationsFromStart,
+  fredProvenance,
+  fredPublicationTime,
+  fredUnit,
+  fredValueHeader,
   isSpreadSeries,
   laggingSeriesNote,
-  spreadBasisPointsCell,
 } from "./fred-series";
 
 // Batch quotes often omit names for indices and ETFs; these baskets are fixed, so name them here.
@@ -102,7 +119,16 @@ const MOVER_LISTS: Record<string, ScreenerCategory | "trending"> = {
   "most-active": "most_actives",
   trending: "trending",
 };
-const MOVERS_USAGE = "movers [gainers|losers|active|trending]";
+const MOVERS_USAGE = "movers [gainers|losers|active|trending] [--session regular|extended]";
+/** The most rows the movers list serves in one request. */
+const MOVER_REQUEST_CAP = 100;
+
+function moverRankBasis(value: string | undefined, ctx: Parameters<CliCommandDef["execute"]>[1]): MoverRankBasis {
+  if (value == null) return "regular";
+  const basis = MOVER_RANK_BASES.find((candidate) => candidate === value.trim().toLowerCase());
+  if (!basis) ctx.fail(`Unknown --session "${value}".`, "Use regular or extended.");
+  return basis;
+}
 
 function screenerCategory(args: readonly string[], ctx: Parameters<CliCommandDef["execute"]>[1]): ScreenerCategory | "trending" {
   rejectExtraArgs(args, 1, { usage: MOVERS_USAGE, takes: "one list" }, ctx);
@@ -145,9 +171,16 @@ function quoteRows(results: Awaited<ReturnType<NonNullable<import("../../types/d
   });
 }
 
-async function runMoverCommand(args: string[], ctx: Parameters<CliCommandDef["execute"]>[1]) {
+async function runMoverCommand(rawArgs: string[], ctx: Parameters<CliCommandDef["execute"]>[1]) {
+  const args = [...rawArgs];
+  const sessionOption = takeOption(args, "--session");
+  const basis = moverRankBasis(sessionOption, ctx);
   const category = screenerCategory(args, ctx);
   const limit = ctx.cliOptions.limit ?? 25;
+  if (sessionOption != null && (category === "trending" || category === "most_actives")) {
+    ctx.fail("--session ranks Gainers and Losers.", category === "trending"
+      ? "Trending keeps its source's order." : "Most active ranks by volume.");
+  }
   if (category === "trending") {
     await withCliServices(ctx, async (services) => {
       const trending = await fetchTrending(limit, undefined, { forceRefresh: ctx.cliOptions.refresh });
@@ -162,14 +195,39 @@ async function runMoverCommand(args: string[], ctx: Parameters<CliCommandDef["ex
     return;
   }
 
-  const screener = await fetchScreenerResult(category, limit, undefined, { forceRefresh: ctx.cliOptions.refresh });
-  const rows = rankScreenerQuotes(category, screener.data);
+  // After the close a price list keeps only the rows moving its way on the basis
+  // asked for, so it reads more candidates than it shows.
+  const count = category === "most_actives" ? limit : Math.min(MOVER_REQUEST_CAP, Math.max(limit, MOVER_CANDIDATES));
+  const screener = await fetchScreenerResult(category, count, undefined, { forceRefresh: ctx.cliOptions.refresh, session: basis });
+  // Last and Chg% are the regular session, as `ticker` reads it, and a
+  // pre-market or after-hours print is its own column. The list is ranked by
+  // the regular session's move (its close's after the close), or with
+  // --session extended by the extended print's move from that close.
+  const { quotes, rankedBy } = rankMoverQuotes(category, screener.data.map(moverRegularSession), basis);
+  const rows = quotes.slice(0, limit).map((quote) => {
+    const { extended, ...row } = quote;
+    return {
+      ...row,
+      extendedSession: extended?.session ?? null,
+      extendedPrice: extended?.price ?? null,
+      extendedChange: extended?.change ?? null,
+      extendedChangePercent: extended?.changePercent ?? null,
+    };
+  });
+  const fellBack = basis === "extended" && rankedBy === "regular";
   // A screener snapshot, as the MOST report reads it: delayed, each row dated by its own last price.
-  ctx.printResult({ data: rows, freshness: rowsFreshness(rows, { status: "delayed" }, { stale: screener.stale === true }) }, {
+  ctx.printResult({
+    data: rows,
+    metadata: { category, rankedBy },
+    ...(fellBack ? { warnings: ["No pre-market or after-hours prints now, so the list is ranked by the regular-session move."] } : {}),
+    freshness: rowsFreshness(rows, { status: "delayed" }, { stale: screener.stale === true }),
+  }, {
+    heading: `Ranked by ${MOVER_RANKING_LABELS[rankedBy]}`,
     columns: [
       ...MOVER_COLUMNS.slice(0, 4),
+      ...EXTENDED_COLUMNS,
       { key: "volume", header: "Volume", align: "right", value: (row) => formatCompact(Number(row.volume)) },
-      { key: "marketCap", header: "Mkt Cap", align: "right", value: (row) => row.marketCap == null ? "" : formatCompact(Number(row.marketCap)) },
+      { ...MARKET_CAP_CELL, value: (row) => row.marketCap == null ? "" : formatCompact(Number(row.marketCap)) },
     ],
   });
 }
@@ -329,18 +387,16 @@ async function runFredList(filter: string, ctx: Parameters<CliCommandDef["execut
     if (error instanceof ApiRequestError && error.status === 404) ctx.fail("The list of supported FRED series is not available yet.");
     throw error;
   }
-  const terms = filter.toLowerCase().split(/\s+/).filter(Boolean);
-  const rows = catalog.series
-    .map((series) => ({ id: series.id, title: series.title?.trim() ?? "", group: series.group?.trim() ?? "" }))
-    .filter((series) => {
-      const text = `${series.id} ${series.title} ${series.group}`.toLowerCase();
-      return terms.every((term) => text.includes(term));
-    });
+  const rows = filterFredSeries(
+    catalog.series.map((series) => ({ id: series.id, title: series.title?.trim() ?? "", group: series.group?.trim() ?? "" })),
+    filter,
+  );
   ctx.printResult({ data: rows, metadata: { filter: filter || null, total: catalog.series.length } }, {
     columns: [
       { key: "id", header: "ID", shrink: false },
-      { key: "title", header: "Title" },
-      { key: "group", header: "Group" },
+      // A title too narrow to tell series apart goes on a line under its ID.
+      { key: "title", header: "Title", minWidth: 30, stackPriority: 1 },
+      { key: "group", header: "Group", shrink: false },
     ],
     empty: filter ? `No supported FRED series match "${filter}". Run gloomberb fred --list to see them all.` : "No FRED series are listed.",
   });
@@ -363,7 +419,17 @@ async function runFred(rawArgs: string[], ctx: Parameters<CliCommandDef["execute
     if (isUnsupportedSeries(error)) ctx.fail(`Unsupported FRED series ${seriesId}. List supported series with: gloomberb fred --list`);
     throw error;
   });
-  const rows = data.observations;
+  // Every observation exports as `value`, a spread in basis points; its unit goes in the `currency_or_unit` column.
+  const unit = fredUnit(seriesId, data.info);
+  const interval = fredInterval(data.info?.frequency);
+  // A value FRED does not list yet carries its publisher and when it published, in every export.
+  const exportRow = (observation: { date: string; value: number | null; publisher?: string; publishedAt?: string }) => ({
+    date: observation.date,
+    value: fredExportValue(seriesId, observation.value),
+    ...(observation.publisher?.trim() ? { publisher: observation.publisher.trim(), ...(observation.publishedAt ? { publishedAt: observation.publishedAt } : {}) } : {}),
+  });
+  // A --start before the series begins comes back padded with blank days: the rows start at its first observation.
+  const rows = fredObservationsFromStart(data.observations, data.info?.observationStart).map(exportRow);
   // The default start hides older history and a start before the series begins is moved up silently: say where it really starts.
   const notes = [
     ...fredHistoryNotes({ startDate, startGiven: start != null, seriesStart: data.info?.observationStart }),
@@ -372,29 +438,41 @@ async function runFred(rawArgs: string[], ctx: Parameters<CliCommandDef["execute
   // Nothing on or after the start: name where the series ends, so an empty answer is not a dead end.
   const latest = rows.length > 0 ? null : await apiClient.getCloudFredSeries(seriesId, { limit: 1, sortOrder: "desc" })
     .then((payload) => payload.observations[0] ?? null).catch(() => null);
+  // CSV and NDJSON are rows alone: an empty one would read as a series with no data, so it fails and says where the series ends.
+  if (rows.length === 0 && (ctx.cliOptions.format === "csv" || ctx.cliOptions.format === "ndjson")) {
+    ctx.fail(`No ${seriesId} observations on or after ${startDate}.`, fredEmptyAdvice(seriesId, latest));
+  }
   const periodicity = periodicityOf(data.info?.frequency);
+  const newestDate = rows.reduce<string | null>((newest, row) => (!newest || row.date > newest ? row.date : newest), null);
+  // A newest value FRED does not list yet names its publisher, Treasury for a yield; FRED's own stay "FRED".
+  const ahead = fredProvenance(data.observations.filter((observation) => observation.date === newestDate));
+  // FRED names the series' publisher when Gloom Cloud passes it on, and when it last updated the series.
+  const publisher = ahead?.publisher ?? data.info?.source?.trim();
+  const publishedAt = ahead ? ahead.publishedAt : fredPublicationTime(data.info, newestDate);
   ctx.printResult({
     data: rows,
     metadata: {
-      info: data.info, seriesId, startDate, sortOrder,
+      info: data.info, seriesId, startDate, sortOrder, unit, interval,
       ...(notes.length ? { notes } : {}),
-      ...(latest ? { latestObservation: latest } : {}),
+      ...(latest ? { latestObservation: exportRow(latest) } : {}),
     },
     freshness: rowsFreshness(rows, {
-      source: "FRED", status: "not-a-feed", basis: "published statistics", observedKey: "date", oldest: null,
+      source: ahead?.source ?? "FRED", status: "not-a-feed", basis: "published statistics", observedKey: "date", oldest: null,
       // A monthly or quarterly observation is dated the first of its period, not a day it was seen.
       ...(periodicity ? { periodicity } : {}),
+      ...(publisher ? { publisher } : {}),
+      ...(publishedAt ? { publishedAt } : {}),
     }),
   }, {
     dateKey: "date",
-    empty: fredEmptyMessage(startDate, latest),
-    ...(notes.length ? { footnote: notes.join("\n") } : {}),
+    empty: fredEmptyMessage(startDate, latest == null ? null : exportRow(latest)),
+    ...(notes.length ? { footnote: notes.join("\n"), exportNotes: notes } : {}),
+    exportIdentity: { symbolOrSeries: seriesId, currencyOrUnit: unit, interval },
     textColumns: [
       { key: "date", header: "Date" },
       isSpreadSeries(seriesId)
-        // A spread is read in basis points; JSON and CSV keep FRED's percentage points.
-        ? { key: "value", header: "Value (bp)", align: "right", format: spreadBasisPointsCell }
-        : { key: "value", header: data.info?.units ? `Value (${data.info.units})` : "Value", align: "right" },
+        ? { key: "value", header: "Value (bp)", align: "right", format: basisPointsCell }
+        : { key: "value", header: fredValueHeader(data.info), align: "right" },
     ],
   });
 }
@@ -412,19 +490,32 @@ async function runYieldCurve(rawArgs: string[], ctx: Parameters<CliCommandDef["e
     return {
       seriesId,
       date: latest?.date ?? "",
+      // Yields in percent, which the exports' `currency_or_unit` column says (`pct`), as `fred` does.
       value: latest?.value ?? null,
       title: data.info?.title ?? "",
       // The move since the previous observation FRED has, not calendar yesterday: a Monday reads against Friday.
       previousDate: previous?.date ?? null,
       previousValue: previous?.value ?? null,
       changeBasisPoints: latest?.value != null && previous?.value != null ? toBasisPoints(latest.value - previous.value, 1) : null,
+      latest,
+      publishedAt: latest?.publisher ? null : fredPublicationTime(data.info, latest?.date),
     };
   }));
+  // Tenors whose latest yield FRED does not list yet name the Treasury and when it published them.
+  const ahead = fredProvenance(results.flatMap((row) => row.latest ? [row.latest] : []));
+  // The curve shown was published with its last tenor: the newest of their FRED updates, when each has one.
+  const published = results.map((row) => row.publishedAt);
+  const publishedAt = ahead ? ahead.publishedAt : published.every((time) => time != null) ? published.sort().at(-1) : null;
   ctx.printResult({
-    data: results,
+    data: results.map(({ publishedAt: _publishedAt, latest: _latest, ...row }) => row),
     metadata: { startDate },
-    freshness: rowsFreshness(results, { source: "FRED", status: "not-a-feed", basis: "daily Treasury yields", observedKey: "date" }),
+    freshness: rowsFreshness(results, {
+      source: ahead?.source ?? "FRED", status: "not-a-feed", basis: "daily Treasury yields", observedKey: "date",
+      ...(ahead?.publisher ? { publisher: ahead.publisher } : {}),
+      ...(publishedAt ? { publishedAt } : {}),
+    }),
   }, {
+    exportIdentity: (row) => ({ symbolOrSeries: String(row.seriesId), currencyOrUnit: "pct", interval: "daily" }),
     textColumns: [
       { key: "tenor", header: "Tenor", value: (row) => YIELD_TENORS[String(row.seriesId)] ?? row.seriesId },
       { key: "value", header: "Yield %", align: "right", format: (value) => typeof value === "number" ? value.toFixed(2) : "-" },
@@ -432,7 +523,7 @@ async function runYieldCurve(rawArgs: string[], ctx: Parameters<CliCommandDef["e
         key: "changeBasisPoints",
         header: "1D bp",
         align: "right",
-        format: (value) => typeof value === "number" ? formatBasisPoints(value / 100) : "-",
+        format: (value) => typeof value === "number" ? formatBasisPoints(value / 100, 1) : "-",
       },
       { key: "date", header: "Date" },
       { key: "seriesId", header: "Series" },
@@ -479,9 +570,10 @@ async function runCorrelation(rawArgs: string[], ctx: Parameters<CliCommandDef["
       asOf: newestReportTime(lastBars),
       oldest: oldestReportTime(lastBars),
     });
+    const warnings = [...listingReadNotes(leftListing!), ...listingReadNotes(rightListing!), ...sessionNote ? [sessionNote] : []];
     ctx.printResult({
       data: [{ left, right, samples: sampleSize, correlation }],
-      ...(sessionNote ? { warnings: [sessionNote] } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
       metadata: { range: "1Y", basis: CORRELATION_RETURN_BASIS },
       freshness,
     }, {
@@ -502,7 +594,11 @@ export const overviewCliCommands: CliCommandDef[] = [
     help: {
       group: CLI_COMMAND_GROUPS.markets,
       usage: [MOVERS_USAGE],
-      examples: ["movers", "movers losers --limit 10", "movers trending"],
+      options: [{
+        flags: "--session <basis>",
+        description: "Rank gainers and losers by the regular-session move (regular, the default) or by the pre-market or after-hours move from the close (extended)",
+      }],
+      examples: ["movers", "movers losers --limit 10", "movers gainers --session extended", "movers trending"],
     },
     execute: runMoverCommand,
   },

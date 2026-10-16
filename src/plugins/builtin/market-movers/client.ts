@@ -5,19 +5,39 @@ import type {
   CloudSessionMoversSide,
 } from "../../../api-client/market-movers";
 import type { DataProvider } from "../../../types/data-provider";
-import { CATEGORY_MAP, screenerQuoteFromQuote, type ScreenerTabId } from "./model";
+import {
+  CATEGORY_MAP,
+  moverRegularSession,
+  rankMoverQuotes,
+  screenerQuoteFromQuote,
+  type MoverQuote,
+  type MoverRankBasis,
+  type MoverRanking,
+  type ScreenerTabId,
+} from "./model";
 import {
   fetchPreferredMarketMovers,
   fetchTrending,
   type MarketMoversResult,
   type PreferredMoversOptions,
-  type ScreenerQuote,
   type TrendingSymbol,
 } from "./screener";
 
 export interface MarketMoverTabResult extends MarketMoversResult {
   tab: ScreenerTabId;
+  /** In the list's order; Last and Chg% the regular session, as `ticker` reads them. */
+  quotes: MoverQuote[];
+  /** What the list is ranked by; absent for trending, which keeps its source's order. */
+  rankedBy?: MoverRanking;
 }
+
+/** Rows a list shows. */
+const LIST_ROWS = 25;
+/**
+ * Rows a Gainers or Losers list asks for. After the close it keeps only the
+ * rows whose regular session moved its way, so it reads more than it shows.
+ */
+export const MOVER_CANDIDATES = 50;
 
 export interface MarketMoverTabDependencies {
   fetchPreferred(
@@ -36,9 +56,9 @@ const defaultDependencies: MarketMoverTabDependencies = {
 async function hydrateTrending(
   trending: readonly TrendingSymbol[],
   provider: DataProvider | null,
-): Promise<ScreenerQuote[]> {
+): Promise<MoverQuote[]> {
   const symbols = trending.slice(0, 25).map(({ symbol }) => symbol);
-  const bySymbol = new Map<string, ScreenerQuote>();
+  const bySymbol = new Map<string, MoverQuote>();
   if (!provider) return [];
   if (provider.getQuotesBatch) {
     const results = await provider.getQuotesBatch(
@@ -66,11 +86,12 @@ async function hydrateTrending(
 export async function loadMarketMoverTab(
   tab: ScreenerTabId,
   provider: DataProvider | null,
-  options?: Pick<PreferredMoversOptions, "forceRefresh" | "metadataWaitMs">,
+  options?: Pick<PreferredMoversOptions, "forceRefresh" | "metadataWaitMs"> & { basis?: MoverRankBasis },
   dependencies: MarketMoverTabDependencies = defaultDependencies,
 ): Promise<MarketMoverTabResult> {
+  const { basis, ...fetchOptions } = options ?? {};
   if (tab === "trending") {
-    const trending = await dependencies.fetchTrending(25, options);
+    const trending = await dependencies.fetchTrending(LIST_ROWS, fetchOptions);
     return {
       tab,
       quotes: await hydrateTrending(trending, provider),
@@ -78,8 +99,15 @@ export async function loadMarketMoverTab(
       stale: false,
     };
   }
-  const result = await dependencies.fetchPreferred(CATEGORY_MAP[tab], 25, options);
-  return { ...result, tab };
+  const category = CATEGORY_MAP[tab];
+  // The server picks the candidates on the basis the list ranks by, so after the close they are the session's movers.
+  const result = await dependencies.fetchPreferred(category, category === "most_actives" ? LIST_ROWS : MOVER_CANDIDATES, {
+    ...fetchOptions,
+    session: basis ?? "regular",
+  });
+  // Each row read as `ticker` reads it, then ranked by the move its Chg% shows.
+  const { quotes, rankedBy } = rankMoverQuotes(category, result.quotes.map(moverRegularSession), basis);
+  return { ...result, quotes: quotes.slice(0, LIST_ROWS), rankedBy, tab };
 }
 
 /** The server refused the list for the account's plan. */

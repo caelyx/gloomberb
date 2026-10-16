@@ -9,6 +9,7 @@ import { PaneKeyboardScrollController } from "../../../state/pane-scroll-registr
 import type { PaneDef } from "../../../types/plugin";
 import { Box } from "../../../ui";
 import { PaneErrorBoundary } from "./error-boundary";
+import { PaneTickerFateGate } from "./ticker-fate-gate";
 
 // Under GLOOMBERB_PERF_TRACE every pane commit is reported by pane, which is
 // how a store update that fans out to the whole layout gets attributed. The
@@ -42,13 +43,6 @@ interface PaneContentProps {
   onClose?: (paneId: string) => void;
   /** Takes the pane out of its layout; the failure card offers it. Keep it stable: the content is memoized. */
   closePane?: (paneId: string) => void;
-  /**
-   * Desktop: lays the content out at `width` by `height` instead of filling
-   * the pane, while a resize sizes the pane's frame ahead of it. The content,
-   * and whatever measures it, then lays out again only when it renders at a
-   * new size.
-   */
-  pinned?: boolean;
 }
 
 export const PaneContent = memo(function PaneContent({
@@ -62,7 +56,6 @@ export const PaneContent = memo(function PaneContent({
   inView = true,
   onClose,
   closePane,
-  pinned = false,
 }: PaneContentProps) {
   // The pane reads text and colors while it renders, so either redraws it.
   const language = useAppLanguage();
@@ -73,19 +66,23 @@ export const PaneContent = memo(function PaneContent({
   const closeFailedPane = useCallback(() => {
     closePane?.(paneId);
   }, [closePane, paneId]);
-  // Built again only when what the pane is given changes: pinning or
-  // unpinning the content box does not render the pane.
+  // Built again only when what the pane is given changes. The box below
+  // always fills the pane, so a frame a resize sizes ahead of the pane's
+  // props stretches whatever lays out by CSS in it at once (a table's
+  // columns), and the rest renders at the new size when the props catch up.
   const body = useMemo(() => (
     <PaneErrorBoundary paneType={paneType} title={title} onClose={closePane ? closeFailedPane : undefined}>
       <PaneRenderTrace paneId={paneId} paneType={paneType}>
-        <Component
-          paneId={paneId}
-          paneType={paneType}
-          focused={focused}
-          width={width}
-          height={height}
-          close={onClose ? close : undefined}
-        />
+        <PaneTickerFateGate paneId={paneId}>
+          <Component
+            paneId={paneId}
+            paneType={paneType}
+            focused={focused}
+            width={width}
+            height={height}
+            close={onClose ? close : undefined}
+          />
+        </PaneTickerFateGate>
       </PaneRenderTrace>
     </PaneErrorBoundary>
   ), [Component, close, closeFailedPane, closePane, focused, height, language, onClose, paneId, paneType, theme, title, width]);
@@ -97,9 +94,9 @@ export const PaneContent = memo(function PaneContent({
           <PaneKeyboardScrollController paneId={paneId} focused={focused} />
           <Box
             flexDirection="column"
-            {...(pinned
-              ? { width, height, flexGrow: 0, flexShrink: 0 }
-              : { flexGrow: 1, flexShrink: 1, flexBasis: 0 })}
+            flexGrow={1}
+            flexShrink={1}
+            flexBasis={0}
             minWidth={0}
             minHeight={0}
             overflow="hidden"

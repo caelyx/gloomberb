@@ -1,14 +1,22 @@
 {
   "hosts": [
+    "api.crypto.com",
     "api.elections.kalshi.com",
     "api.fda.gov",
+    "api.fiscaldata.treasury.gov",
+    "api.gemini.com",
+    "api.limitless.exchange",
     "api.votehub.com",
     "clinicaltrials.gov",
     "clob.polymarket.com",
     "data-api.polymarket.com",
+    "data.pascal.trade",
     "efts.sec.gov",
     "gamma-api.polymarket.com",
+    "gateway.polymarket.us",
+    "markets.newyorkfed.org",
     "nasdaqtrader.com",
-    "production.dataviz.cnn.io"
+    "production.dataviz.cnn.io",
+    "services-dynarep.ddwa.finra.org"
   ]
 }

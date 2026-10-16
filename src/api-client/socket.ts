@@ -1,8 +1,10 @@
 import type { TapeFeedEvent } from "./tape";
 import type {
   AuthUser,
+  ChatChannelState,
   ChatMessage,
   ChatNotification,
+  ChatReactionsUpdate,
   CloudQuotePayload,
   QuoteStreamTarget,
   ScannerFeedEvent,
@@ -10,8 +12,10 @@ import type {
   TeamNotification,
 } from "./types";
 import {
+  normalizeChatChannelStateFrame,
   normalizeChatMessage,
   normalizeChatNotification,
+  normalizeChatReactions,
   normalizeTeamNotification,
 } from "./normalizers";
 import { debugLog } from "../utils/debug-log";
@@ -40,7 +44,9 @@ const cloudApiLog = debugLog.createLogger("cloud-api");
 
 type ChannelListener = (message: ChatMessage) => void;
 type ChatNotificationListener = (notification: ChatNotification) => void;
+type ChatChannelStateListener = (state: ChatChannelState) => void;
 type ChatPresenceListener = (onlineCount: number) => void;
+type ChatReactionsListener = (update: ChatReactionsUpdate) => void;
 type TeamNotificationListener = (notification: TeamNotification) => void;
 type CloudEventListener = (data: unknown) => void;
 type QuoteListener = (
@@ -103,9 +109,13 @@ export class CloudApiSocket {
   private reconnectDelayMs = 1000;
 
   private readonly channelListeners = new Map<string, Set<ChannelListener>>();
+  private readonly chatMentionCandidatesListeners = new Set<() => void>();
   private readonly chatNotificationListeners =
     new Set<ChatNotificationListener>();
+  private readonly chatChannelStateListeners =
+    new Set<ChatChannelStateListener>();
   private readonly chatPresenceListeners = new Set<ChatPresenceListener>();
+  private readonly chatReactionsListeners = new Set<ChatReactionsListener>();
   private readonly teamNotificationListeners =
     new Set<TeamNotificationListener>();
   private readonly cloudEventListeners = new Map<
@@ -242,6 +252,30 @@ export class CloudApiSocket {
     this.chatNotificationListeners.add(listener);
     return () => {
       this.chatNotificationListeners.delete(listener);
+    };
+  }
+
+  subscribeChatMentionCandidatesChanged(listener: () => void): () => void {
+    this.chatMentionCandidatesListeners.add(listener);
+    return () => { this.chatMentionCandidatesListeners.delete(listener); };
+  }
+
+  /**
+   * The reader's read state or mute changed on another device or window. Like
+   * notifications, it never opens the socket by itself.
+   */
+  subscribeChatChannelState(listener: ChatChannelStateListener): () => void {
+    this.chatChannelStateListeners.add(listener);
+    return () => {
+      this.chatChannelStateListeners.delete(listener);
+    };
+  }
+
+  /** A message's reactions changed in a channel this socket reads. */
+  subscribeChatReactions(listener: ChatReactionsListener): () => void {
+    this.chatReactionsListeners.add(listener);
+    return () => {
+      this.chatReactionsListeners.delete(listener);
     };
   }
 
@@ -499,7 +533,9 @@ export class CloudApiSocket {
     this.offeredFeatureListeners.clear();
     this.connectionListeners.clear();
     this.chatNotificationListeners.clear();
+    this.chatChannelStateListeners.clear();
     this.chatPresenceListeners.clear();
+    this.chatReactionsListeners.clear();
     this.teamNotificationListeners.clear();
     this.cloudEventListeners.clear();
     this.quoteSubscriptions.clear();
@@ -575,12 +611,42 @@ export class CloudApiSocket {
       return;
     }
 
+    if (
+      parsed?.type === "chat.reactions" &&
+      typeof parsed.channelId === "string" &&
+      typeof parsed.data?.messageId === "string"
+    ) {
+      const update: ChatReactionsUpdate = {
+        channelId: parsed.channelId,
+        messageId: parsed.data.messageId,
+        reactions: normalizeChatReactions(parsed.data.reactions),
+      };
+      for (const listener of this.chatReactionsListeners) {
+        listener(update);
+      }
+      return;
+    }
+
     if (parsed?.type === "chat.notification" && parsed.data) {
       const notification = normalizeChatNotification(
         parsed.data as ChatNotification,
       );
       for (const listener of this.chatNotificationListeners) {
         listener(notification);
+      }
+      return;
+    }
+
+    if (parsed?.type === "chat.mentions_changed") {
+      for (const listener of this.chatMentionCandidatesListeners) listener();
+      return;
+    }
+    if (parsed?.type === "chat.channel_state") {
+      const state = normalizeChatChannelStateFrame(parsed.data);
+      if (state) {
+        for (const listener of this.chatChannelStateListeners) {
+          listener(state);
+        }
       }
       return;
     }

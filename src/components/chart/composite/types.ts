@@ -70,6 +70,12 @@ interface CompositeMarketTimeScale {
   endTime: number;
   anchorSeriesId: string;
   cadenceMs: number;
+  /**
+   * Wall-clock time one slot stands for before the first observation: the
+   * loaded bars' own average, closed sessions included. Absent means
+   * `cadenceMs`.
+   */
+  historyMsPerSlot?: number;
   anchors: Array<{
     timestamp: number;
     position: number;
@@ -146,6 +152,12 @@ export interface CompositeCursorValue {
   unit: string;
   value: number | null;
   point: TimeSeriesPoint | null;
+  /**
+   * Under a cursor, the value is the series' last one before the cursor's
+   * time, which it has no observation at: another venue's hours, a coarser
+   * cadence, a dataset that lags.
+   */
+  carried?: boolean;
 }
 
 export interface CompositeChartScene {
@@ -161,8 +173,16 @@ export interface CompositeChartScene {
   cursorDate: Date | null;
   cursorXRatio: number | null;
   cursorValues: CompositeCursorValue[];
+  /**
+   * The panels before they were thinned to the plot's pixels, which the
+   * cursor reads values from: a thinned line or a bucket of candles has no
+   * point at most of the bars it stands for.
+   */
+  cursorPanels?: CompositePanelScene[];
   /** IANA zone the time axis and cursor read in: the venue's for intraday market bars, else UTC. */
   timeZone?: string;
+  /** The newest observation's time, in view or not. */
+  newestTime?: number;
 }
 
 export interface BuildCompositeChartSceneOptions {
@@ -204,6 +224,27 @@ export interface CompositeChartXAxis {
   formatCursor?: (xRatio: number) => string;
 }
 
+/**
+ * A crosshair shared between charts, as the last instant of the bar it is
+ * on. The chart subscribes itself, so a move re-renders the charts and not
+ * the panes around them.
+ */
+interface CompositeCursorLink {
+  subscribe(listener: () => void): () => void;
+  /**
+   * Another chart's cursor, shown in place of this chart's own: on the last
+   * bar at or before it, and not at all outside the view. Null while this
+   * chart's cursor is the shared one, or there is none.
+   */
+  time(): number | null;
+  /** Whether this chart's cursor is the shared one. */
+  held(): boolean;
+  /** Reports this chart's cursor, or null when it leaves. */
+  publish(time: number | null): void;
+  /** Clears the shared cursor wherever it is, as Esc on a chart showing it does. */
+  clear(): void;
+}
+
 export interface CompositeChartProps {
   series: ResolvedSeries[];
   /** Optional legend model; can include hidden series that are not plotted. */
@@ -230,6 +271,11 @@ export interface CompositeChartProps {
   /** Permit panning into an older unloaded window so the owner can backfill it. */
   allowHistoricalBackfill?: boolean;
   cursorDate?: Date | null;
+  /**
+   * A crosshair shared with other charts. By default an interactive chart
+   * with a time axis in a pane shares its layout tab's; null keeps it out.
+   */
+  cursorLink?: CompositeCursorLink | null;
   viewport?: {
     start: Date;
     end: Date;

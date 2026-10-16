@@ -1,15 +1,29 @@
-import type { HeadlessPaneDefinition } from "../../../types/plugin";
+import type { HeadlessPaneColumn, HeadlessPaneDefinition, HeadlessPaneRow } from "../../../types/plugin";
+import type { DataTableColumn } from "../../../components";
 import type { AppAttentionPayload, AppChart } from "../../../api-client/app-attention";
 import type { HiringBoard, HiringPayload } from "../../../api-client/hiring";
 import { fetchAppRank, fetchAttention } from "./client";
-import { appsModel, hiringModel, type AttentionKind } from "./model";
+import { appsModel, appsPreviewNote, attentionNumber, hiringModel, hiringPreviewNote, remoteText, type AttentionKind } from "./model";
+
+/**
+ * Numbers print as the pane draws them: shares to a tenth, ratings and
+ * z-scores to a hundredth, counts whole, and a remote share with the roles it
+ * is measured on. Exports keep the full value.
+ */
+function reportColumn(column: DataTableColumn): HeadlessPaneColumn {
+  if (column.align !== "right") return { key: column.id, header: column.label, align: column.align };
+  const format = (value: unknown) => typeof value === "number" ? attentionNumber(column.id, value) : value == null ? "-" : String(value);
+  return { key: column.id, header: column.label, align: column.align, format,
+    ...(column.id === "remote" ? { textFormat: (value: unknown, row: HeadlessPaneRow) => typeof value === "number"
+      ? remoteText(value, typeof row.remoteKnown === "number" ? row.remoteKnown : null) ?? "-" : "-" } : {}) };
+}
 
 export function attentionHeadless(kind: AttentionKind): HeadlessPaneDefinition<"bundle"> {
   return {
     shape: "bundle",
     freshness: kind === "hiring"
-      ? { source: "Company careers sites", status: "not-a-feed", basis: "observed job postings" }
-      : { source: "App Store and Google Play charts", status: "not-a-feed", basis: "observed chart ranks" },
+      ? { source: "Company careers sites", status: "not-a-feed", basis: "observed job postings", dataset: true }
+      : { source: "App Store and Google Play charts", status: "not-a-feed", basis: "observed chart ranks", dataset: true },
     argument: { kind: "ticker", optional: true, placeholder: "ticker", description: "Company ticker, including exchange for non-US listings. Omit for the global board." },
     options: [
       { key: "limit", type: "string", defaultValue: "100", description: "Rows per REST page, up to 200 for hiring and 500 for apps." },
@@ -24,8 +38,8 @@ export function attentionHeadless(kind: AttentionKind): HeadlessPaneDefinition<"
       ] : []),
     ],
     discovery: { aliases: [kind === "hiring" ? "HIRE" : "APPS"], dataRequirements: ["Gloom Cloud account"], limitations: kind === "hiring"
-      ? ["Pro: full weekly history and evidence; free preview", "Observed requisitions, not headcount or confirmed office openings", "History begins with retained captures; incomplete snapshots cannot imply hiring freezes"]
-      : ["Pro: full chart history and evidence; free preview", "Public top charts are an observed subset, not downloads or revenue", "Grossing feeds are unavailable; written reviews are distinct from ratings", "Mappings use evidenced ownership; unmapped apps stay visible"] },
+      ? ["Pro: full weekly history and evidence; free preview.", "Observed requisitions, not headcount or confirmed office openings.", "History begins with retained captures; incomplete snapshots cannot imply hiring freezes."]
+      : ["Pro: full chart history and evidence; free preview.", "Public top charts are an observed subset, not downloads or revenue.", "Grossing feeds are unavailable; written reviews are distinct from ratings.", "Mappings use evidenced ownership; unmapped apps stay visible."] },
     describe: (args) => `${kind === "hiring" ? "Hiring momentum" : "App attention"}${args.symbols[0] ? ` | ${args.symbols[0]}` : ""}`,
     async load(args, ctx) {
       if (kind === "apps" && typeof args.options.appId === "string" && args.options.appId) {
@@ -36,13 +50,16 @@ export function attentionHeadless(kind: AttentionKind): HeadlessPaneDefinition<"
       const data = await fetchAttention(kind, args.symbols[0], { limit: Number(args.options.limit) || 100, offset: Number(args.options.offset) || 0, ...(typeof args.options.country === "string" ? { country: args.options.country } : {}), ...(typeof args.options.chart === "string" ? { chart: args.options.chart as AppChart } : {}), days: Number(args.options.days) || 90 }, ctx.apiClient);
       const model = kind === "hiring" ? hiringModel(data as HiringPayload | HiringBoard) : appsModel(data as AppAttentionPayload);
       const offset = Number(args.options.offset) || 0;
-      const nextOffset = kind === "hiring" && "total" in data ? offset + data.companies.length < data.total ? offset + data.companies.length : null : (data as AppAttentionPayload).page?.nextOffset ?? null;
+      // The free preview ignores the offset, so it has no next page to point at.
+      const nextOffset = kind === "hiring" && "total" in data ? !data.preview && offset + data.companies.length < data.total ? offset + data.companies.length : null : (data as AppAttentionPayload).page?.nextOffset ?? null;
+      const lock = kind === "hiring" ? hiringPreviewNote(data as HiringPayload | HiringBoard) : appsPreviewNote(data as AppAttentionPayload);
+      const notes = [...model.notices, ...(nextOffset !== null ? [`Additional observations available with --offset ${nextOffset}.`] : [])];
       return {
-        complete: !model.preview && nextOffset === null,
-        errors: [...model.notices, ...(model.preview ? ["Additional rows and history require Gloom Pro."] : [])],
-        ...(nextOffset !== null ? { notes: [`Additional observations available with --offset ${nextOffset}.`] } : {}),
+        complete: !model.preview && !model.partial && nextOffset === null,
+        ...(lock ? { errors: [lock] } : {}),
+        ...(notes.length ? { notes } : {}),
         sections: Object.entries(model.sections).map(([key, section]) => ({ title: key === "mix" ? kind === "hiring" ? "Role family" : "Countries" : key,
-          columns: section.columns.map((column) => ({ key: column.id, header: column.label, align: column.align })),
+          columns: section.columns.map(reportColumn), empty: section.empty,
           rows: section.rows.map((row) => ({ ...row.values, ...(row.url ? { sourceUrl: row.url } : {}), ...(row.details ? { evidence: row.details } : {}) })) })),
         metadata: { nextOffset, asOf: model.asOf, preview: model.preview, lockedRows: model.locked, unit: model.chart.unit, provenance: data },
       };

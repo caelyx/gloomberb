@@ -3,6 +3,7 @@ import { CloudChatApi } from "./chat";
 import { CloudApiSocket } from "./socket";
 import { createTestSocketDeps, installTestWebSocket, type TestWebSocket } from "../test-support/cloud-api";
 import { toRequestEnvelope, readRequestInit } from "../utils/http-proxy-response";
+import { localUtcOffsetMinutes } from "../utils/local-utc-offset";
 
 const originalWebSocket = globalThis.WebSocket;
 
@@ -50,6 +51,20 @@ test("offers images only once the server says it takes them, and asks for them o
   expect(requests.map((request) => request.features)).toEqual(["chat.attachments", "chat.attachments"]);
 });
 
+test("membership invalidations reach subscribed mention caches and stop after unsubscribe", async () => {
+  const { chat, ws, requests } = createChat(() => []);
+  let invalidations = 0;
+  const stop = chat.subscribeMentionCandidatesChanged(() => { invalidations++; });
+  ws.receive({ type: "chat.mentions_changed", data: {} });
+  expect(invalidations).toBe(1);
+  expect(requests).toHaveLength(0);
+  stop();
+  ws.receive({ type: "chat.mentions_changed", data: {} });
+  expect(invalidations).toBe(1);
+  await chat.getMentionCandidates("team:one/desk");
+  expect(requests[0]?.path).toBe("/chat/channels/team%3Aone%2Fdesk/mention-candidates");
+});
+
 test("a REST answer carrying attachments proves support before the socket is ready", async () => {
   const { chat } = createChat((path) => (path.startsWith("/chat/channels/everyone/messages")
     ? [{ id: "m1", channelId: "everyone", content: "", replyToId: null, createdAt: "2026-10-05T00:00:00Z", user: { id: "u1", username: "ada", displayName: "Ada" }, attachments: [] }]
@@ -86,6 +101,31 @@ test("keeps the Discord origin and ghost account type of a message and drops val
   expect("accountType" in unknown!.user).toBe(false);
   expect("origin" in unknown!).toBe(false);
   expect(app!.origin).toBe("app");
+});
+
+test("keeps the badges, clock and desks the server sends and drops what it does not promise", async () => {
+  const message = (id: string, user: Record<string, unknown>) => ({
+    id, channelId: "everyone", content: id, replyToId: null, createdAt: "2026-10-05T00:00:00Z", user: { id, username: id, displayName: id, ...user },
+  });
+  const { chat } = createChat(() => [
+    message("staff", { badges: ["team", "pro", "moderator"], utcOffsetMinutes: 120, desks: ["options", 3, ""] }),
+    message("odd", { badges: "pro", utcOffsetMinutes: 1200, desks: "options" }),
+    message("old", {}),
+  ]);
+  const [staff, odd, old] = await chat.getMessages("everyone");
+  expect(staff!.user).toMatchObject({ badges: ["team", "pro"], utcOffsetMinutes: 120, desks: ["options"] });
+  for (const user of [odd!.user, old!.user]) {
+    expect(["badges", "utcOffsetMinutes", "desks"].filter((key) => key in user)).toEqual([]);
+  }
+});
+
+test("reports this machine's UTC offset with the chat state, or nothing when it names no zone", async () => {
+  const { chat, requests } = createChat((path) => (path.startsWith("/chat/state")
+    ? { channels: [], onlineCount: 0, channelStates: [], notifications: [] }
+    : []));
+  await chat.getState();
+  const offset = localUtcOffsetMinutes();
+  expect(requests.at(-1)!.path).toBe(offset === null ? "/chat/state" : `/chat/state?utcOffset=${offset}`);
 });
 
 test("reads the Discord link with mirroring on and linking available unless the server says otherwise", async () => {

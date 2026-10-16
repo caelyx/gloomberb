@@ -471,6 +471,23 @@ function mergeFundamentals(primary: Fundamentals | undefined, fallback: Fundamen
     // A fallback cannot retrospectively denominate an older cached snapshot.
     delete merged.financialCurrency;
   }
+  if (merged) {
+    // A conversion, or an EPS currency apart from the amounts', describes the currency it came with, never one
+    // merged from elsewhere.
+    const denominated = primary?.financialCurrency ? primary : merged.financialCurrency ? fallback : undefined;
+    if (denominated?.ttmConversion) merged.ttmConversion = denominated.ttmConversion;
+    else delete merged.ttmConversion;
+    if (denominated?.epsCurrency) merged.epsCurrency = denominated.epsCurrency;
+    else delete merged.epsCurrency;
+    // The rate a trailing P/E converted its EPS at pairs with that multiple.
+    const trailing = primary?.trailingPE != null ? primary : fallback;
+    if (trailing?.trailingPEConversion) merged.trailingPEConversion = trailing.trailingPEConversion;
+    else delete merged.trailingPEConversion;
+    // An enterprise value check describes the EV it came with, or its withdrawal.
+    const valued = primary?.enterpriseValue != null || primary?.unavailableFields?.includes("enterpriseValue") ? primary : fallback;
+    if (valued?.enterpriseValueCheck) merged.enterpriseValueCheck = valued.enterpriseValueCheck;
+    else delete merged.enterpriseValueCheck;
+  }
   return redactUnavailableFundamentals(merged);
 }
 
@@ -533,6 +550,7 @@ export function mergeRefreshedFinancials(cached: TickerFinancials, fresh: Ticker
   for (const field of RETRACTABLE_VALUATION_FIELDS) {
     if (!currencyConflict && typeof statistics[field] === "number" && Number.isFinite(statistics[field])) update[field] = statistics[field];
   }
+  if (!currencyConflict && statistics.enterpriseValueCheck) update.enterpriseValueCheck = statistics.enterpriseValueCheck;
   let fundamentals = mergeFundamentals(update, merged.fundamentals);
   // The source serving a multiple or yield without its per-share base has
   // withdrawn that base, so an older one must not keep repricing the figure.

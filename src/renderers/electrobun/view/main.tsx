@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "../../../app";
 import { applyLanguageFromConfig } from "../../../i18n";
 import { debugLog } from "../../../utils/debug-log";
+import { capturePaneImage } from "../../../utils/dom-screenshot";
 import { measurePerfAsync } from "../../../utils/perf-marks";
 import {
   backendRequest,
@@ -20,6 +21,7 @@ import {
   installElectrobunCloudApiFetchTransport,
   installElectrobunHttpFetchTransport,
 } from "./http-fetch";
+import { installElectrobunAppBadgeHost } from "./app-badge-host";
 import { installElectrobunUpdateHost } from "./update-host";
 import { installScreenshotWatermark } from "./screenshot-watermark";
 import { installElectrobunWindowFullscreenTracking } from "./window-fullscreen";
@@ -38,11 +40,11 @@ import { prepareDetachedSnapshot } from "./desktop/window/snapshot";
 import { createElectrobunAppServices } from "./app-services";
 import { getRendererPlugins } from "../../../plugins/catalog-ui";
 import { loadDesktopExternalPlugin, loadDesktopExternalPlugins } from "./external-plugins";
-import { activateUpdatedPlugins } from "../../../plugins/builtin/plugin-marketplace/activation";
-import { getMarketplaceHost, setPluginManager, type PluginManager } from "../../../plugins/builtin/plugin-marketplace/store";
+import { activateUpdatedPlugins } from "../../../plugins/marketplace/activation";
+import { getMarketplaceHost, setPluginManager, type PluginManager } from "../../../plugins/marketplace/store";
 import { remoteNotesFilesIO, setNotesFilesIO } from "../../../plugins/builtin/notes/files";
 import { NOTES_FILES_CAPABILITY_ID } from "../../../capabilities";
-import { loadOfficialPluginIds } from "../../../plugins/builtin/plugin-marketplace/feed";
+import { loadOfficialPluginIds } from "../../../plugins/marketplace/feed";
 import { crashReportsEnabled, installCrashReporter, reportCrash } from "../../../telemetry/crash-reports";
 import { browserDoNotTrack, installWindowCrashListeners } from "../../../telemetry/crash-reports-dom";
 import { currentTelemetryConfig } from "../../../telemetry/live-config";
@@ -146,6 +148,7 @@ async function boot() {
   installElectrobunCapabilityStreamClient();
   installFocusScopeRelease();
   installElectrobunWindowFullscreenTracking();
+  if (init.windowKind === "main") installElectrobunAppBadgeHost();
   installDomMarketDataFrames();
   installScreenshotWatermark();
   const desktopSnapshot = init.windowKind === "detached" && init.paneId && init.desktopSnapshot
@@ -213,6 +216,7 @@ async function boot() {
     ? {
       registerHandler: setElectrobunRemoteRequestHandler,
       terminalDevice: { kind: "desktop" as const, name: init.hostName?.trim() || "Gloom desktop" },
+      capturePane: capturePaneImage,
     }
     : undefined;
   measurePerfAsync("startup.electrobun.root-render", async () => {

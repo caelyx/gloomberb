@@ -398,13 +398,27 @@ function useUpdatePaneLayout(options: { saveDelayMs?: number } = {}) {
   }, [dispatch, saveDelayMs, stateRef]);
 }
 
-/** Keep a content-derived pane title in its saved layout, without exposing config writes. */
-export function usePaneTitle(title: string, paneId?: string): void {
+/**
+ * Rewrites this pane's own instance (binding, title, settings) in one saved
+ * layout update, for a pane that changes what it shows in place, as INS does
+ * when its ranking opens a company.
+ */
+export function useUpdatePaneInstance(paneId?: string): (update: (instance: PaneInstanceConfig) => PaneInstanceConfig) => void {
+  const id = useScopedPaneId(paneId);
+  const updateLayout = useUpdatePaneLayout();
+  return useCallback((update: (instance: PaneInstanceConfig) => PaneInstanceConfig) => {
+    updateLayout((layout) => findPaneInstance(layout, id) ? updatePaneInstance(layout, id, update) : layout);
+  }, [id, updateLayout]);
+}
+
+/** Keep a content-derived pane title in its saved layout, without exposing config writes. Null leaves the title alone. */
+export function usePaneTitle(title: string | null, paneId?: string): void {
   const id = useScopedPaneId(paneId);
   // A follower's title changes with every cursor move in its source; that is
   // not worth a config write per step.
   const updateLayout = useUpdatePaneLayout({ saveDelayMs: LOW_PRIORITY_CONFIG_SAVE_DEBOUNCE_MS });
   useEffect(() => {
+    if (title == null) return;
     updateLayout((layout) => {
       const pane = findPaneInstance(layout, id);
       return !pane || pane.title === title ? layout
