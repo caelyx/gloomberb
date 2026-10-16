@@ -1,4 +1,5 @@
 import { canonicalExchange } from "../utils/exchanges";
+import { isTradingWeekday } from "./market/freshness";
 import { isPublishedApacClosure, PUBLISHED_APAC_CLOSURES } from "./published-apac-sessions";
 import { isPublishedCnClosure, publishedYearsCn } from "./published-cn-sessions";
 import { isPublishedJpxClosure, publishedYearsJpx } from "./published-jpx-sessions";
@@ -10,13 +11,17 @@ interface PublishedClosures {
   isClosure(date: string): boolean;
 }
 
+// Weekly closes and the weekend rule below assume a Monday-to-Friday week, so a
+// venue that trades Sunday to Thursday (BHB, MSX, EGX) has no calendar here.
+const isMondayToFriday = (venue: string) => [0, 1, 2, 3, 4, 5, 6].every((day) => isTradingWeekday(venue, day) === (day >= 1 && day <= 5));
+
 const NON_US_CALENDARS = new Map<string, PublishedClosures>([
   ["JPX", { years: publishedYearsJpx(), isClosure: isPublishedJpxClosure }],
   ["NSE", { years: publishedYearsNse(), isClosure: isPublishedNseClosure }],
   ["BSE", { years: publishedYearsNse(), isClosure: isPublishedNseClosure }],
   ["SSE", { years: publishedYearsCn(), isClosure: isPublishedCnClosure }],
   ["SZSE", { years: publishedYearsCn(), isClosure: isPublishedCnClosure }],
-  ...Object.entries(PUBLISHED_APAC_CLOSURES).map(([venue, closures]): [string, PublishedClosures] => [venue, {
+  ...Object.entries(PUBLISHED_APAC_CLOSURES).filter(([venue]) => isMondayToFriday(venue)).map(([venue, closures]): [string, PublishedClosures] => [venue, {
     years: Object.keys(closures).map(Number),
     isClosure: (date) => isPublishedApacClosure(venue, date),
   }]),

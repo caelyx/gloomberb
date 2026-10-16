@@ -48,6 +48,9 @@ test("venues with published closures qualify their sessions across their own hol
   // A Good Friday week closes on Thursday on the venue's own calendar.
   expect(publishedWeekClose("2026-04-03", "ASX")).toBe("2026-04-02");
   expect(publishedWeekClose("2023-04-07", "ASX")).toBeNull();
+  // A Sunday-to-Thursday venue's closures do not fit a Monday-to-Friday week.
+  expect(qualify(["2026-10-11", "2026-10-12"], "EGX").issue?.kind).toBe("unsupported-venue");
+  expect(publishedWeekClose("2026-10-16", "EGX")).toBeNull();
 });
 
 test("Carter closure is included and Saturday New Year's Day does not invent a Friday closure", () => {
