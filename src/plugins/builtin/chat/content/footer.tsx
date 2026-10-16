@@ -8,12 +8,16 @@ import { useRendererHost, useUiCapabilities } from "../../../../ui";
 import { useOptionalDialog, type PromptContext } from "../../../../ui/dialog";
 import { chatAuthorName, isDiscordGhost } from "../ghost-user";
 import { chatMessageOpenTargets, type ChatOpenTarget } from "./open-targets";
+import { chatMessagePaneLinks, type ChatMessagePaneLink } from "../pane-links/model";
 import { openChatImageViewer } from "../attachments/desktop";
+import { canReactToMessage } from "../reactions";
 
 /**
  * The chat pane's keys, shown in its footer and listed in its pane menu. The
  * hints are the bindings for everything but Enter and `i`, which the chat's
  * own handler owns because they depend on the composer and the selection.
+ * With no message selected both open the composer, as a click on it does, so
+ * the footer leaves that out and only the pane menu lists Compose.
  */
 export function useChatFooter({
   composing,
@@ -27,6 +31,7 @@ export function useChatFooter({
   focusComposer,
   catalog,
   openTicker,
+  openPaneLink,
   openAttachPicker,
   profilePopoverUser,
   showProfilePopover,
@@ -45,6 +50,8 @@ export function useChatFooter({
   needsProfileSetup,
   openProfileSetup,
   authorMessageAction,
+  reactionsEnabled = false,
+  openReactionPicker,
 }: {
   /**
    * The composer or the New DM overlay owns the keyboard. Hints about the
@@ -62,6 +69,8 @@ export function useChatFooter({
   focusComposer: () => void;
   catalog: Record<string, InlineTickerCatalogEntry>;
   openTicker: (symbol: string) => void;
+  /** Opens what a message's chip stands for. */
+  openPaneLink: (link: ChatMessagePaneLink) => void;
   /** Opens the composer's file picker; null where images cannot be attached. */
   openAttachPicker: (() => void) | null;
   profilePopoverUser: ChatUserSummary | null;
@@ -84,18 +93,26 @@ export function useChatFooter({
   openProfileSetup: () => void;
   /** "Message @author" for the selected message, where its author can be written to. */
   authorMessageAction: { label: string; run: () => void } | null;
+  /** The server takes reactions and you can send. */
+  reactionsEnabled?: boolean;
+  /** Opens the reaction picker for the message at an index. */
+  openReactionPicker?: (index: number) => void;
 }) {
   const dialog = useOptionalDialog();
   const rendererHost = useRendererHost();
-  const content = selectedMessage?.content ?? "";
+  const { links: paneLinks, content } = chatMessagePaneLinks(selectedMessage);
   const attachments = selectedMessage?.attachments;
   const openTargets = useMemo(
-    () => chatMessageOpenTargets(content, catalog, attachments),
-    [attachments, catalog, content],
+    () => chatMessageOpenTargets(content, catalog, attachments, paneLinks),
+    [attachments, catalog, content, paneLinks],
   );
   const { nativePaneChrome } = useUiCapabilities();
 
   const openTarget = useCallback((target: ChatOpenTarget) => {
+    if (target.kind === "pane") {
+      openPaneLink(target.link);
+      return;
+    }
     if (target.kind === "ticker") {
       openTicker(target.symbol);
       return;
@@ -111,7 +128,7 @@ export function useChatFooter({
       return;
     }
     void rendererHost.openExternal(target.url);
-  }, [dialog, nativePaneChrome, openTicker, rendererHost, selectedMessage]);
+  }, [dialog, nativePaneChrome, openPaneLink, openTicker, rendererHost, selectedMessage]);
 
   // One target opens at once; several ask which, in the order the message reads.
   const openSelectedTargets = useCallback(async () => {
@@ -157,12 +174,15 @@ export function useChatFooter({
   }, [closeProfilePopover, selectedIdx]);
 
   const canEdit = canSend && !!selectedMessage && selectedMessage.id === latestEditableMessageId;
+  const canReact = reactionsEnabled && !!openReactionPicker && !!selectedMessage && canReactToMessage(selectedMessage);
   const replyToId = selectedMessage?.replyToId ?? null;
   const onlyTarget = openTargets.length === 1 ? openTargets[0]! : null;
   const failedSend = selectedMessage?.clientStatus === "failed";
   const canAttachImages = !!openAttachPicker;
   const openTargetTitle = onlyTarget
-    ? onlyTarget.kind === "ticker" ? `Open $${onlyTarget.symbol}` : onlyTarget.kind === "image" ? "Open Image" : "Open Link"
+    ? onlyTarget.kind === "ticker"
+      ? `Open $${onlyTarget.symbol}`
+      : onlyTarget.kind === "image" ? "Open Image" : onlyTarget.kind === "pane" ? "Open Pane" : "Open Link"
     : openTargets.every((target) => target.kind === "ticker")
       ? "Open Ticker…"
       : openTargets.every((target) => target.kind === "link")
@@ -188,6 +208,7 @@ export function useChatFooter({
     setChannelNotificationsEnabled,
     toggleAuthorProfile,
     authorMessageAction,
+    openReactionPicker,
   });
   latest.current = {
     beginEditMessage,
@@ -206,6 +227,7 @@ export function useChatFooter({
     setChannelNotificationsEnabled,
     toggleAuthorProfile,
     authorMessageAction,
+    openReactionPicker,
   };
   const authorMessageLabel = composing ? null : authorMessageAction?.label ?? null;
 
@@ -215,12 +237,11 @@ export function useChatFooter({
     if (!composing && selectedMessage) {
       if (canSend && failedSend) hints.push({ id: "retry", key: "Enter", label: "retry", title: "Send Again", onPress: () => latest.current.retryMessage(latest.current.selectedIdx) });
       else if (canSend) hints.push({ id: "reply", key: "Enter", label: "reply", title: "Reply", onPress: () => latest.current.beginReplyTo(latest.current.selectedIdx, { deferFocus: true }) });
+      if (canReact) hints.push({ id: "react", key: "+", label: " react", title: "Add Reaction", onPress: () => latest.current.openReactionPicker?.(latest.current.selectedIdx) });
       if (canEdit) hints.push({ id: "edit", key: "e", label: "dit", title: "Edit Message", onPress: () => { latest.current.beginEditMessage(latest.current.selectedIdx, { deferFocus: true }); } });
       if (openTargets.length > 0) hints.push({ id: "open", key: "o", label: "pen", title: openTargetTitle, onPress: () => { void latest.current.openSelectedTargets(); } });
       // Every author but a Discord ghost has a card, if only their name and a way to write to them.
       if (author) hints.push({ id: "profile", key: "p", label: "rofile", title: "Show Profile", onPress: () => latest.current.toggleAuthorProfile() });
-    } else if (!composing && canSend) {
-      hints.push({ id: "compose", key: "i", label: " compose", title: "Compose", onPress: () => queueMicrotask(() => latest.current.focusComposer()) });
     }
     if (canSend && notificationChannelId) {
       const channelId = notificationChannelId;
@@ -240,6 +261,9 @@ export function useChatFooter({
     }
 
     const menu: ContextMenuItem[] = [];
+    if (!composing && !selectedMessage && canSend) {
+      menu.push({ id: "compose", label: "Compose", accelerator: "Enter", onSelect: () => queueMicrotask(() => latest.current.focusComposer()) });
+    }
     // No key of its own: a stray press would start a conversation. The pane
     // menu (.) and a right-click on the name reach it.
     if (authorMessageLabel) {
@@ -257,6 +281,11 @@ export function useChatFooter({
     if (replyToId) {
       menu.push({ id: "original-message", label: "Go to Original Message", onSelect: () => latest.current.jumpToMessage(replyToId) });
     }
+    // The message as its author wrote it, markdown and all; a selection copies what the row draws.
+    const messageText = composing ? "" : selectedMessage?.content ?? "";
+    if (messageText) {
+      menu.push({ id: "copy-message", label: "Copy Message Text", onSelect: () => { void rendererHost.copyText(messageText); } });
+    }
     if (needsProfileSetup) {
       menu.push({ id: "profile-setup", label: "Set Up Profile", onSelect: () => latest.current.openProfileSetup() });
     }
@@ -271,6 +300,7 @@ export function useChatFooter({
     failedSend,
     canCycleChannels,
     canEdit,
+    canReact,
     canFocusSidebar,
     canSend,
     composing,
@@ -280,6 +310,7 @@ export function useChatFooter({
     notificationsEnabled,
     openTargetTitle,
     openTargets.length,
+    rendererHost,
     replyToId,
     selectedIdx,
     selectedMessage,

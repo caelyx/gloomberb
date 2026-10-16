@@ -1,5 +1,7 @@
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
+import { explainRefusal } from "../shared/cloud-denied";
 import { fetchEstimates } from "./client";
+import { estimateRevisionsLockNote } from "./lock-note";
 import { estimateCurrent, periodLabel, pinnedEstimatePeriods } from "./model";
 export const estimateRevisionsHeadless: HeadlessPaneDefinition<"bundle"> = {
   shape: "bundle",
@@ -27,11 +29,11 @@ export const estimateRevisionsHeadless: HeadlessPaneDefinition<"bundle"> = {
   ],
   discovery: {
     aliases: ["EM", "GUID", "EEO"],
-    dataRequirements: ["Gloom Cloud analyst snapshots"],
+    dataRequirements: ["Free Gloom sign-in", "Gloom Cloud analyst snapshots"],
     limitations: [
-      "Actual collection days and provider backfills remain separate",
-      "Range dispersion is not standard deviation",
-      "Guidance has no inferred numeric comparison",
+      "Actual collection days and provider backfills remain separate.",
+      "Range dispersion is not standard deviation.",
+      "Guidance has no inferred numeric comparison.",
     ],
   },
   describe: (args) => `Estimate revisions ${args.symbols[0] ?? ""}`,
@@ -42,7 +44,12 @@ export const estimateRevisionsHeadless: HeadlessPaneDefinition<"bundle"> = {
       symbol,
       instrument?.exchange ?? "",
       ctx.apiClient,
-    );
+    ).catch((error: unknown) => {
+      throw explainRefusal(error, estimateRevisionsLockNote, {
+        symbol: args.symbols[0] ?? null,
+        token: ctx.settings?.tab === "guidance" ? "GUID" : "EM",
+      });
+    });
     const periods = pinnedEstimatePeriods(
       data.periods,
       args.options.period,

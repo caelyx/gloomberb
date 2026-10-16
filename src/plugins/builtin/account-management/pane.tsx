@@ -9,6 +9,7 @@ import {
   usePaneTabs,
   type DataTableCell,
   type DataTableColumn,
+  type MultiSelectDialogButtonHandle,
   type StatItem,
 } from "../../../components";
 import { useAppSelector, usePaneAppConfig } from "../../../state/app/context";
@@ -34,12 +35,13 @@ import { FRAMED_TEXTAREA_DESKTOP_STYLE } from "../../../components/ui/fields";
 import { apiClient, type AccountProfile, type CloudPricing } from "../../../api-client";
 import { chatController } from "../chat/controller";
 import { SignInWall } from "../cloud/auth-actions";
-import { loadUpgradeOffer } from "../cloud/upgrade-dialog";
+import { loadUpgradeOffer } from "../../../account/upgrade-dialog";
 import { openMcpConnectDialog } from "../cloud/mcp-connect/dialog";
 import { TeamsAccountTab } from "../cloud/team/acm-tab";
 import { AgentsAccountTab } from "../cloud/terminal-relay/acm-tab";
 import {
   CheckboxRow,
+  DeskChoiceRow,
   FieldRow,
   PublicAnalyticsGroup,
   accountFieldLabelWidth,
@@ -49,18 +51,21 @@ import {
   buildPublishedProfileAnalyticsPreview,
   buildProfileAnalyticsPreview,
   buildPortfolioChoices,
+  chatCardUpdate,
   computeCumulativeReturn,
   countPortfolioHoldings,
   emptyToNull,
-  formatCloudMonthlyPrice,
   formatPlan,
-  formatTrialEnd,
-  formatTrialOffer,
   portfolioOptionIds,
   profileToDraft,
   type AccountDraft,
   type AccountFieldKey,
 } from "./model";
+import {
+  formatCloudMonthlyPrice,
+  formatTrialEnd,
+  formatTrialOffer,
+} from "../../../account/billing";
 import { PasswordChangeDialog } from "./password-dialog";
 import { CalendarAccountTab } from "./calendar-tab";
 import { useAccountManagementFooter } from "./footer";
@@ -99,6 +104,9 @@ const ACCOUNT_TAB_FIELD_ORDER: Record<AccountManagementTab, AccountFieldKey[]> =
   profile: [
     "profilePublic",
     "acceptUnknownDms",
+    "showLocalTime",
+    "showDesks",
+    "desks",
     "username",
     "name",
     "company",
@@ -165,9 +173,10 @@ function PlanComparison({
     };
   }, [activePlan, proCellBg]);
   const height = PLAN_COMPARISON_ROWS.length + 1;
+  const { nativePaneChrome } = useUiCapabilities();
 
   return (
-    <Box flexDirection="column" width={width} height={height}>
+    <Box flexDirection="column" width={width} height={nativePaneChrome ? undefined : height}>
       <DataTableView<PlanRow, PlanColumn>
         columns={columns}
         items={[...PLAN_COMPARISON_ROWS]}
@@ -175,6 +184,7 @@ function PlanComparison({
         rootWidth={width}
         rootHeight={height}
         virtualize={false}
+        fitRows
         sortColumnId={null}
         sortDirection="asc"
         getItemKey={(row) => row.capability}
@@ -232,9 +242,12 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
   const { nativePaneChrome } = useUiCapabilities();
   const bioRef = useRef<TextareaRenderable | null>(null);
   const portfolioSelectRef = useRef<SelectControl | null>(null);
+  const deskPickerRef = useRef<MultiSelectDialogButtonHandle | null>(null);
   const refreshedSyncRevisionRef = useRef<number | null>(null);
   const draftRef = useRef(draft);
   draftRef.current = draft;
+  const profileRef = useRef(profile);
+  profileRef.current = profile;
 
   const formWidth = Math.max(24, Math.min(70, width - 2));
   const contentWidth = formWidth;
@@ -243,7 +256,13 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
   const formLabelWidth = accountFieldLabelWidth(formWidth);
   const fieldLabelWidth = accountFieldLabelWidth(fieldWidth);
   const bodyHeight = Math.max(5, height);
-  const fieldOrder = ACCOUNT_TAB_FIELD_ORDER[activeTab];
+  // Chat's card settings show once the server keeps them; the desks only while showing them is on.
+  const chatCardSupported = profile?.showLocalTime !== undefined;
+  const fieldOrder = useMemo(() => ACCOUNT_TAB_FIELD_ORDER[activeTab].filter((field) => {
+    if (field === "showLocalTime" || field === "showDesks") return chatCardSupported;
+    if (field === "desks") return chatCardSupported && draft.showDesks;
+    return true;
+  }), [activeTab, chatCardSupported, draft.showDesks]);
   const accountTabs = ACCOUNT_TAB_DEFS.map((tab) => ({ ...tab, label: t(tab.label) }));
 
   const planAccess = useMemo(() => resolvePlanAccess(profile), [profile]);
@@ -575,6 +594,11 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
     void openMcpConnectDialog(dialog, { viewportWidth: viewport.width });
   }, [dialog, viewport.width]);
 
+  const openDeskPicker = useCallback(() => {
+    setActiveField("desks");
+    deskPickerRef.current?.open();
+  }, []);
+
   const openPortfolioPicker = useCallback(async () => {
     setActiveField("sharedPortfolioId");
     portfolioSelectRef.current?.open();
@@ -617,6 +641,7 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
         chatEmailNotificationsEnabled: current.chatEmailNotificationsEnabled,
         weeklyRoundupEnabled: current.weeklyRoundupEnabled,
         positionAlertsEnabled: current.positionAlertsEnabled,
+        ...chatCardUpdate(profileRef.current, current),
       });
       setProfile(nextProfile);
       setDraft(profileToDraft(nextProfile));
@@ -734,6 +759,7 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
     // Behind the sign-in wall the fields are not there, and Enter is the wall's.
     focused: focused && activeTab !== "teams" && activeTab !== "calendar" && activeTab !== "agents" && (hasSession || apiClient.isSignedIn()),
     openAssistants,
+    openDeskPicker,
     openPasswordDialog,
     openPortfolioDialog: openPortfolioPicker,
     openUpgrade,
@@ -792,6 +818,42 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
                   onChange={(checked) => setDraftValue("acceptUnknownDms", checked)}
                 />
               </FieldRow>
+
+              {chatCardSupported ? (
+                <>
+                  <FieldRow twoColumns={twoColumns}>
+                    <CheckboxRow
+                      label={t("Local Time")}
+                      checked={draft.showLocalTime}
+                      active={activeField === "showLocalTime"}
+                      nodeRef={fieldNodeRef("showLocalTime")}
+                      width={fieldWidth}
+                      onFocus={() => setActiveField("showLocalTime")}
+                      onChange={(checked) => setDraftValue("showLocalTime", checked)}
+                    />
+                    <CheckboxRow
+                      label={t("What I Trade")}
+                      checked={draft.showDesks}
+                      active={activeField === "showDesks"}
+                      nodeRef={fieldNodeRef("showDesks")}
+                      width={fieldWidth}
+                      onFocus={() => setActiveField("showDesks")}
+                      onChange={(checked) => setDraftValue("showDesks", checked)}
+                    />
+                  </FieldRow>
+                  {draft.showDesks ? (
+                    <DeskChoiceRow
+                      desks={draft.desks}
+                      active={activeField === "desks"}
+                      width={formWidth}
+                      controlRef={deskPickerRef}
+                      nodeRef={fieldNodeRef("desks")}
+                      onFocus={() => setActiveField("desks")}
+                      onChange={(desks) => setDraftValue("desks", desks)}
+                    />
+                  ) : null}
+                </>
+              ) : null}
 
               <FieldRow twoColumns={twoColumns}>
                 {textField("username", t("Username"), t("username"))}
@@ -957,19 +1019,23 @@ export function AccountManagementPane({ focused, width, height }: PaneProps) {
                 />
               </Box>
               <Box flexDirection="row" gap={1}>
-                <Button
-                  label={t("Change Password")}
-                  active={activeField === "passwordAction"}
-                  onPress={openPasswordDialog}
-                  disabled={!!busy}
-                />
-                <Button
-                  label={busy === "delete" ? t("Deleting...") : t("Delete Account")}
-                  variant="danger"
-                  active={activeField === "deleteAccountAction"}
-                  onPress={() => { void deleteAccount(); }}
-                  disabled={!!busy}
-                />
+                <Box ref={fieldNodeRef("passwordAction")} flexDirection="row">
+                  <Button
+                    label={t("Change Password")}
+                    active={activeField === "passwordAction"}
+                    onPress={openPasswordDialog}
+                    disabled={!!busy}
+                  />
+                </Box>
+                <Box ref={fieldNodeRef("deleteAccountAction")} flexDirection="row">
+                  <Button
+                    label={busy === "delete" ? t("Deleting...") : t("Delete Account")}
+                    variant="danger"
+                    active={activeField === "deleteAccountAction"}
+                    onPress={() => { void deleteAccount(); }}
+                    disabled={!!busy}
+                  />
+                </Box>
               </Box>
             </>
           ) : null}

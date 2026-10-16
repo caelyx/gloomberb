@@ -1,7 +1,7 @@
 import type { Dispatch } from "react";
 import { apiClient } from "../../../api-client";
 import { t } from "../../../i18n";
-import { teamCollectionLocalId } from "../../../plugins/builtin/cloud/team/collections";
+import { teamCollectionLocalId } from "../../../team/collections";
 import type { DataProvider } from "../../../types/data-provider";
 import type { AppTickerRepositoryPort } from "../../../core/app-service-ports";
 import type { PluginRegistry } from "../../../plugins/registry";
@@ -23,11 +23,12 @@ import {
   isManualPortfolio,
   resolveManualPositionCurrency,
   setManualPortfolioPosition,
-} from "../../../plugins/builtin/portfolio-list/mutations";
+} from "../../../portfolio/mutations";
 import type { CommandBarFieldValue } from "./types";
 import type { WorkflowStringValues } from "./broker";
 import { coerceFieldString } from "../helpers";
 import { slugifyName } from "../../../utils/slugify";
+import { readTypedNumber } from "../../../utils/decimal-comma";
 import { resolveTickerInputOrThrow } from "./ops";
 import { resolveCollectionTicker } from "./collection-ticker";
 
@@ -232,14 +233,14 @@ export function createCommandBarCollectionWorkflowActions(options: {
         throw new Error("Choose a manual portfolio.");
       }
 
-      const shares = Number(coerceFieldString(values.shares));
+      // 18,50, 1.234,5 and 123.456 read as typed; 1,234 could be either reading and fails naming both.
+      const shares = readTypedNumber(coerceFieldString(values.shares), "Shares");
       if (!Number.isFinite(shares) || shares <= 0) {
         throw new Error("Shares must be greater than 0.");
       }
 
-      const rawAvgCost = coerceFieldString(values.avgCost).trim();
-      const avgCost = Number(rawAvgCost);
-      if (!rawAvgCost || !Number.isFinite(avgCost)) {
+      const avgCost = readTypedNumber(coerceFieldString(values.avgCost), "Avg Cost");
+      if (!Number.isFinite(avgCost)) {
         throw new Error("Avg Cost must be a valid number.");
       }
 

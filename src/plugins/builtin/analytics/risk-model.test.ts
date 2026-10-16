@@ -4,9 +4,11 @@ import {
   buildPortfolioRisk,
   portfolioRiskRequests,
   portfolioRiskTickers,
+  riskCoverageHeadline,
   riskCoverageNotices,
   riskCoverageShortfall,
   riskCoverageText,
+  riskExclusionText,
 } from "./risk-model";
 import {
   BEYOND_SIZE_REASON,
@@ -28,6 +30,7 @@ import {
 import { portfolioOptionGreeks } from "./risk-options";
 import { parsePortfolioRiskEvidence } from "./risk-evidence";
 import { createTestTicker } from "../../../test-support/ticker";
+import type { CloudQuotePayload } from "../../../api-client/types";
 const portfolio: Portfolio = {
   id: "local",
   name: "Test basket",
@@ -78,6 +81,8 @@ test("a broker account estimates on the holdings that qualify and lists every ot
   expect(model.coverage).toMatchObject({ holdings: 94, covered: 85, unvalued: 0, marketValue: 468_560, coveredValue: 365_500, sufficient: true });
   expect(model.coverage.share).toBeCloseTo(365_500 / 468_560, 10);
   expect(riskCoverageText(model.coverage)).toBe("covers 78% of market value \u00b7 9 holdings left out");
+  // The report and the pane name what is left out, by the same covered share.
+  expect(riskExclusionText(model.coverage)).toBe("excludes EUR2, TWD1 +7 more, 22% of value");
   expect(riskCoverageNotices(model.coverage)).toEqual([
     "EUR2 (4.3% of market value) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
     "TWD1 (4.0% of market value) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
@@ -105,6 +110,7 @@ test("a broker account estimates on the holdings that qualify and lists every ot
   const bound = (await brokerModel(unvalued)).model.coverage;
   expect(bound.unvalued).toBe(1);
   expect(riskCoverageText(bound)).toBe("covers at most 78% of market value \u00b7 9 holdings left out");
+  expect(riskExclusionText(bound)).toBe("excludes EUR2, TWD1 +7 more, at least 22% of value");
   expect(riskCoverageNotices(bound).at(-1)).toBe("UNQ3 (value unknown) is excluded from the risk estimate: daily history unavailable.");
 });
 
@@ -117,6 +123,9 @@ test("foreign listings with daily FX closes enter the basket in USD and the foot
   expect(model.coverage).toMatchObject({ covered: 91, converted: 6, coveredValue: 453_560, sufficient: true });
   expect(riskCoverageText(model.coverage)).toBe(
     "covers 96% of market value \u00b7 3 holdings left out \u00b7 6 holdings converted from local currency",
+  );
+  expect(riskCoverageHeadline(model.coverage)).toBe(
+    "excludes UNQ1, UNQ2 +1 more, 4% of value \u00b7 6 holdings converted from local currency",
   );
   const jpy = model.holdings.find((row) => row.symbol === "JPY1")!;
   // 500 shares at 3,000 JPY, marked at the current rate of 0.0068 USD per yen.
@@ -159,7 +168,8 @@ test("below half of market value the basket views estimate nothing and say why",
   expect(model.metrics.every((row) => row.value == null)).toBe(true);
   expect(model.factors.every((row) => row.value == null)).toBe(true);
   expect(model.rows.correlation).toEqual([]);
-  expect(model.book).toBeNull();
+  // Concentration needs no return history, so it still reads the whole priced book.
+  expect(model.book?.gross).toBe(108_560);
   expect(model.holdings.every((row) => row.weight == null)).toBe(true);
   expect(riskCoverageShortfall(model.coverage)).toEqual({
     title: "Qualifying holdings cover 5% of market value; basket estimates need 50%.",
@@ -189,6 +199,26 @@ test("factor proxies resolve on their own listing venue", () => {
   expect(factor.samples).toBe(60);
   expect(factor.value).not.toBeNull();
 });
+test("after the close a holding is marked at its regular close, not its after-hours print, and says so", () => {
+  const snapshot = market();
+  const withSpy = (quote: Partial<CloudQuotePayload>) => ({
+    ...snapshot,
+    histories: snapshot.histories.map((row) => row.instrument.symbol === "SPY" ? { ...row, quote: { ...row.quote!, ...quote } } : row),
+  });
+  const spy = (model: ReturnType<typeof buildPortfolioRisk>) => model.rows.holdings.find((row) => row.label === "SPY");
+  // Monday's close was 110; the quote's price is the 108 printed after hours.
+  const closed = buildPortfolioRisk(portfolio, [holding("SPY", 40)], withSpy({
+    price: 108, marketState: "POSTPOST", changeSessionDate: "2026-09-21", regularClose: 110,
+    regularCloseSessionDate: "2026-09-21", regularChange: 1, regularChangePercent: 0.92, lastUpdated: Date.parse("2026-09-21T23:59:00Z"),
+  }));
+  expect(closed.coverage.marketValue).toBe(4_400);
+  expect(spy(closed)).toMatchObject({ asOf: "2026-09-21", detail: expect.stringContaining("40 shares; 4,400.00 USD at 2026-09-21 close") });
+  expect(closed.notes.filter((row) => row.includes("no current quote"))).toEqual([]);
+  // While the session trades the quote marks it.
+  const open = buildPortfolioRisk(portfolio, [holding("SPY", 40)], withSpy({ price: 108, marketState: "REGULAR" }));
+  expect(open.coverage.marketValue).toBe(4_320);
+  expect(spy(open)?.detail).toMatch(/^40 shares; 4,320\.00 USD; history /);
+});
 test("only held positions marked at a close raise the close-mark warning", () => {
   // Factor proxies with no current quote never weight a holding.
   const snapshot = market(["IWM", "IWD", "IWF", "MTUM", "IEF", "HYG"]);
@@ -216,7 +246,10 @@ test("a short is left out of the basket with its reason and counts in the market
     { id: "ARCA:IWM", symbol: "IWM", reason: "Short positions: signed exposure history required", value: 110, share: 0.25 },
   ]);
   expect(model.holdings.map((row) => row.weight)).toEqual([1, null]);
-  expect(model.book?.gross).toBe(330);
+  expect(riskExclusionText(model.coverage)).toBe("excludes IWM, 25% of value");
+  // Concentration reads the whole priced book, the short at its gross value; the weights above are the basket's.
+  expect(model.book?.gross).toBe(440);
+  expect(model.book?.top).toBe(0.75);
   expect(model.metrics[2]!.value).toBeCloseTo(0, 8);
 });
 test("a crypto holding is excluded by name with its reason, not folded into the equity basket", () => {
@@ -230,6 +263,36 @@ test("a crypto holding is excluded by name with its reason, not folded into the 
   expect(riskCoverageNotices(model.coverage)).toEqual([
     "ETH-USD (value unknown) is excluded from the risk estimate: crypto is not covered by the equity basket.",
   ]);
+});
+test("a depositary receipt is an equity in the basket, and what is still left out is named in one headline", () => {
+  const receipt = (symbol: string, assetCategory: string) => createTestTicker(symbol, symbol, {
+    exchange: "ARCA",
+    assetCategory,
+    portfolios: ["local"],
+    positions: [{ portfolio: "local", shares: 2, broker: "manual" }],
+  });
+  const crypto = (symbol: string) => createTestTicker(symbol, symbol, {
+    exchange: "CCC",
+    portfolios: ["local"],
+    positions: [{ portfolio: "local", shares: 1, broker: "manual" }],
+  });
+  const adr = [holding("SPY", 3), receipt("IWM", "American Depositary Receipt")];
+  const covered = buildPortfolioRisk(portfolio, adr, market());
+  expect(covered.coverage).toMatchObject({ covered: 2, share: 1, leftOut: [] });
+  expect(riskExclusionText(covered.coverage)).toBeNull();
+  // The concentration lines count the receipt: 330 and 220 of 550, not 330 alone.
+  expect(covered.book?.top).toBeCloseTo(0.6, 12);
+  expect(covered.book?.effectiveHoldings).toBeCloseTo(1 / (0.6 ** 2 + 0.4 ** 2), 12);
+
+  // A holding the basket cannot take stays named: one, then two, then "+N more", with the combined share.
+  const one = buildPortfolioRisk(portfolio, [...adr, crypto("ETH-USD")], market());
+  expect(riskExclusionText(one.coverage)).toBe("excludes ETH-USD, value unknown");
+  const short = buildPortfolioRisk(portfolio, [...adr, holding("IEF", -1)], market());
+  expect(riskExclusionText(short.coverage)).toBe("excludes IEF, 17% of value");
+  const several = buildPortfolioRisk(portfolio, [...adr, holding("IEF", -1), holding("HYG", -1), holding("IWD", -1)], market());
+  expect(riskExclusionText(several.coverage)).toBe("excludes IEF, HYG +1 more, 38% of value");
+  const two = buildPortfolioRisk(portfolio, [...adr, holding("IEF", -1), holding("HYG", -1)], market());
+  expect(riskExclusionText(two.coverage)).toBe("excludes IEF, HYG, 29% of value");
 });
 test("imported option snapshots use signed dollar sensitivities, preserve scope and reject stale or mixed currencies", () => {
   const position = {

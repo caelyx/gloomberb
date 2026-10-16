@@ -5,7 +5,11 @@ import { resolveCurrencyUnit } from "../../../utils/currency-units";
 import {
   getPortfolioPositionMetrics,
   resolvePortfolioMarketValue,
-} from "../portfolio-list/position-metrics";
+} from "../../../portfolio/position-metrics";
+import type { Quote } from "../../../types/financials";
+import type { CloudQuotePayload } from "../../../api-client/types";
+import { getCompletedRegularSessionDisplay } from "../../../market-data/market/status";
+import { quoteTradingDay } from "../../../market-data/quotes/day-range";
 import type { DatedReturn } from "./metrics";
 import {
   computeWeightedPortfolioReturns,
@@ -17,6 +21,7 @@ import {
   regressReturns,
   rollingBasketRisk,
   rollingBeta,
+  sinceBasketRisk,
   subtractReturns,
 } from "./risk-math";
 import {
@@ -44,8 +49,12 @@ interface PortfolioRiskHolding {
   /** Gross current value in the portfolio currency, for the covered share only; null when nothing values it. */
   marketValue: number | null;
   priceAsOf: string | null;
-  /** "close" when no current quote arrived and the latest completed close marks the holding. */
-  markSource?: "quote" | "close" | null;
+  /**
+   * "close" when no current quote arrived and the latest completed close marks
+   * the holding; "regular-close" when the quote's regular session is over and
+   * its close marks it, not a pre-market or after-hours print.
+   */
+  markSource?: "quote" | "close" | "regular-close" | null;
   /** The listing currency its closes were converted from at daily FX closes; null for a USD listing. */
   convertedFrom: string | null;
   historyAsOf: string | null;
@@ -130,6 +139,22 @@ export interface RiskShifts {
   rates: number;
   volatility: number;
 }
+/** The benchmark the basket's returns, active return and tracking error are measured against. */
+const RISK_BENCHMARK = "SPY";
+
+/**
+ * The window the risk rows cover: the trailing 60 sessions, or, with `since:
+ * "filed"`, every session since the filing date of a portfolio imported from
+ * a 13F.
+ */
+export interface RiskWindowRequest {
+  since?: "filed";
+}
+
+/** Why a portfolio asked for risk since its filing shows the trailing window instead. */
+export const sinceFallbackNote = (portfolio: Pick<Portfolio, "name">) =>
+  `"${portfolio.name}" was not imported from a 13F, so it has no filing date; the risk rows cover the trailing 60 sessions.`;
+
 const DEFAULT_RISK_SHIFTS: RiskShifts = {
   equity: -10,
   rates: 100,
@@ -152,6 +177,19 @@ function quoteDate(value: number | undefined): string | null {
   return Number.isFinite(value) && value! > 0
     ? new Date(value!).toISOString()
     : null;
+}
+/**
+ * A current quote's close once its regular session is over (after hours,
+ * overnight, through a weekend, and in the pre-market while the quote reports
+ * the last close), as `portfolio show --close` values a book: a pre-market or
+ * after-hours print never marks a holding. Null while the session trades.
+ */
+function regularCloseMark(quote: CloudQuotePayload): { price: number; date: string } | null {
+  const read: Quote = { ...quote, change: quote.change ?? Number.NaN, changePercent: quote.changePercent ?? Number.NaN,
+    priceBasis: quote.priceBasis === "nav" ? undefined : quote.priceBasis };
+  const close = getCompletedRegularSessionDisplay(read);
+  const date = quote.regularCloseSessionDate ?? quoteTradingDay(read);
+  return close && Number.isFinite(close.price) && close.price > 0 && date ? { price: close.price, date } : null;
 }
 function positions(ticker: TickerRecord, id: string) {
   return ticker.metadata.positions.filter(
@@ -229,22 +267,52 @@ function outsideValue(
   const value = resolvePortfolioMarketValue(metrics, unit != null && Number.isFinite(unit) ? unit : null)?.gross;
   return value != null && Number.isFinite(value) ? value : null;
 }
-const coveragePercent = (share: number) => Math.floor(share * 100);
+// The epsilon keeps 29 of 100 at 29%, not the 28 that 0.29 * 100 rounds down to.
+const coveragePercent = (share: number) => Math.floor(share * 100 + 1e-9);
 const holdingCount = (count: number) => `${count} holding${count === 1 ? "" : "s"}`;
 const shareText = (share: number) =>
   share < 0.001 ? "under 0.1%" : `${(share * 100).toFixed(1)}%`;
+const convertedText = (coverage: RiskCoverage) =>
+  coverage.converted ? `${holdingCount(coverage.converted)} converted from local currency` : null;
 /**
  * "covers 78% of market value · 9 holdings left out · 2 converted from local
  * currency", or null when every holding is in the basket in its own USD listing.
+ * The compact result for Ask Gloom reads this form; the report and the pane
+ * name what is left out with `riskCoverageHeadline`.
  */
 export function riskCoverageText(coverage: RiskCoverage | undefined): string | null {
   if (!coverage) return null;
-  const converted = coverage.converted ? `${holdingCount(coverage.converted)} converted from local currency` : null;
+  const converted = convertedText(coverage);
   if (!coverage.leftOut.length) return converted;
   const covers = coverage.share == null
     ? "covers an unknown share of market value"
     : `covers ${coverage.unvalued ? "at most " : ""}${coveragePercent(coverage.share)}% of market value`;
   return [covers, `${holdingCount(coverage.leftOut.length)} left out`, ...(converted ? [converted] : [])].join(" · ");
+}
+/** Holdings named before "+N more" in the exclusion text. */
+const NAMED_EXCLUSIONS = 2;
+/**
+ * What the basket leaves out, by name and combined share, from the same
+ * covered share every other line reads: "excludes SQM, 12% of value" or
+ * "excludes SQM, ALB +1 more, 41% of value". The share is the complement of the
+ * covered percent, so the two always add to 100; it reads "at least" while a
+ * holding has no value, and a holding nothing values is named with "value
+ * unknown". Null when every holding is in the basket.
+ */
+export function riskExclusionText(coverage: RiskCoverage | undefined): string | null {
+  if (!coverage?.leftOut.length) return null;
+  const named = coverage.leftOut.slice(0, NAMED_EXCLUSIONS).map((row) => row.symbol).join(", ");
+  const more = coverage.leftOut.length - NAMED_EXCLUSIONS;
+  const names = more > 0 ? `${named} +${more} more` : named;
+  if (coverage.share == null || !coverage.leftOut.some((row) => (row.share ?? 0) > 0))
+    return `excludes ${names}, value unknown`;
+  const percent = 100 - coveragePercent(coverage.share);
+  return `excludes ${names}, ${coverage.unvalued ? "at least " : ""}${percent > 0 ? `${percent}%` : "under 1%"} of value`;
+}
+/** The line that leads what the basket views cover: what is left out, then what converted from local currency. */
+export function riskCoverageHeadline(coverage: RiskCoverage | undefined): string | null {
+  if (!coverage) return null;
+  return [riskExclusionText(coverage), convertedText(coverage)].filter(Boolean).join(" · ") || null;
 }
 /** A reason reads as the tail of a sentence, so its first word loses its capital unless it is an acronym ("FX", "USD"). */
 const lowerFirst = (text: string) => (/^[A-Z][a-z]/.test(text) ? text[0]!.toLowerCase() + text.slice(1) : text);
@@ -293,6 +361,7 @@ export function buildPortfolioRisk(
   market: RiskMarketSnapshot,
   evidence: PortfolioRiskEvidence | null = null,
   shifts: RiskShifts = DEFAULT_RISK_SHIFTS,
+  window: RiskWindowRequest = {},
 ) {
   if (
     ![shifts.equity, shifts.rates, shifts.volatility].every(Number.isFinite) ||
@@ -327,12 +396,16 @@ export function buildPortfolioRisk(
     const history = byId.get(id),
       quote = history?.quote,
       lots = positions(ticker, portfolio.id);
-    // A current quote marks the holding; otherwise its latest completed close does.
+    // A current quote marks the holding, at its close once the regular session
+    // is over; otherwise its latest completed close does. A converted quote's
+    // session fields are still in its listing currency, and its venue has no
+    // extended prints to leave out.
     const close = history?.closeMark ?? null;
+    const regularClose = !close && quote && !quote.stale && !history?.converted ? regularCloseMark(quote) : null;
     const mark = close
       ? { price: close.price, currency: close.currency, stale: false }
       : quote
-        ? { price: quote.price, currency: quote.currency, stale: !!quote.stale }
+        ? { price: regularClose?.price ?? quote.price, currency: quote.currency, stale: !!quote.stale }
         : null;
     const quantity = signedQuantity(lots);
     // A converted listing is marked and returned in USD; its own currency is what the holding records.
@@ -359,7 +432,7 @@ export function buildPortfolioRisk(
         : null) ??
       history?.error ??
       (!history ? "Daily history unavailable" : null);
-    const priceDate = close ? close.date : quoteDate(quote?.lastUpdated);
+    const priceDate = close ? close.date : regularClose ? regularClose.date : quoteDate(quote?.lastUpdated);
     const marked =
       mark &&
       mark.currency === portfolio.currency &&
@@ -396,7 +469,7 @@ export function buildPortfolioRisk(
           ? Math.abs(value)
           : outsideValue(ticker, portfolio, quote ?? history?.listing ?? null, rates),
       priceAsOf: priceDate,
-      markSource: close ? "close" : quote ? "quote" : null,
+      markSource: close ? "close" : regularClose ? "regular-close" : quote ? "quote" : null,
       convertedFrom,
       historyAsOf: history?.asOf ?? null,
       returns,
@@ -434,10 +507,14 @@ export function buildPortfolioRisk(
   };
   // Weights renormalize over the covered basket; nothing outside it is approximated into it.
   const members = sufficient ? qualifying : [];
-  const book = members.length ? concentration(members) : null;
+  const basketWeights = members.length ? concentration(members) : null;
   for (const holding of members)
     holding.weight =
-      book?.rows.find((row) => row.id === holding.id)?.weight ?? null;
+      basketWeights?.rows.find((row) => row.id === holding.id)?.weight ?? null;
+  // Concentration needs a value, not a return history: it reads every holding that has one, left out of the basket or not.
+  const book = concentration(
+    valued.filter((row) => row.marketValue! > 0).map((row) => ({ id: row.id, value: row.marketValue })),
+  );
   const closeMarked = members.filter((row) => row.markSource === "close").length;
   const converted = members.filter((row) => row.convertedFrom != null).length;
   const held = new Set(holdings.map((row) => row.id));
@@ -475,9 +552,15 @@ export function buildPortfolioRisk(
     );
     return (instrument && byId.get(riskInstrumentId(instrument))?.returns) || [];
   };
-  const benchmark = proxy("SPY"),
+  const benchmark = proxy(RISK_BENCHMARK),
     sample = pairedReturns(basket, benchmark);
-  const metrics = rollingBasketRisk(sample);
+  // Since the filing only for a portfolio that has one; any other keeps the trailing window and says why.
+  const filed = window.since === "filed" ? portfolio.importedFrom?.filed ?? null : null;
+  if (window.since === "filed" && !filed)
+    notes.push(sinceFallbackNote(portfolio));
+  const metrics = filed
+    ? sinceBasketRisk(sample, filed, RISK_BENCHMARK)
+    : rollingBasketRisk(sample, undefined, RISK_BENCHMARK);
   const factors = [
     { id: "market", label: "Market (SPY)", series: benchmark },
     {
@@ -552,7 +635,9 @@ export function buildPortfolioRisk(
       if (factor.samples === 0)
         warnings.push(`${factor.label}: no matched factor history`);
   if (sufficient && metrics.every((row) => row.value == null))
-    warnings.push("Fewer than 60 consecutive matched completed daily returns.");
+    warnings.push(filed
+      ? `No completed session since the 13F filing on ${filed} yet.`
+      : "Fewer than 60 consecutive matched completed daily returns.");
   const performance = evidence?.performance
     ? calculateAccountPerformance(evidence.performance)
     : null;
@@ -578,7 +663,7 @@ export function buildPortfolioRisk(
         ...row,
         percentile: row.rank.percentile,
         // The method (price returns at fixed current weights) is in docs; the footer keeps room for coverage.
-        detail: `${row.samples} sessions`,
+        detail: filed && row.value == null && TAIL_ROW_IDS.has(row.id) ? `${row.samples} sessions; needs 60` : `${row.samples} sessions`,
         ...(tail
           ? { amount: (row.value! / 100) * coverage.coveredValue, amountCurrency: coverage.currency, amountBase: coverage.coveredValue }
           : {}),
@@ -601,7 +686,7 @@ export function buildPortfolioRisk(
       asOf: row.priceAsOf,
       detail: row.leftOut
         ? row.leftOut
-        : `${row.quantity} shares; ${formatNumber(row.value ?? undefined)} ${row.currency}${row.markSource === "close" ? ` at ${row.priceAsOf} close` : ""}${row.convertedFrom ? ` from ${row.convertedFrom} at daily FX` : ""}; history ${row.historyAsOf}`,
+        : `${row.quantity} shares; ${formatNumber(row.value ?? undefined)} ${row.currency}${row.markSource === "close" || row.markSource === "regular-close" ? ` at ${row.priceAsOf} close` : ""}${row.convertedFrom ? ` from ${row.convertedFrom} at daily FX` : ""}; history ${row.historyAsOf}`,
       ...(row.leftOut ? { leftOut: row.leftOut } : {}),
     })),
     correlation: correlation.map((row) => ({
@@ -728,19 +813,19 @@ export function buildPortfolioRisk(
         id: "top",
         label: "Largest holding",
         value: book.top * 100,
-        unit: "% basket",
+        unit: "% value",
         percentile: null,
         asOf: market.fetchedAt,
-        detail: "Current value in the covered basket",
+        detail: "Current value of every priced holding",
       },
       {
         id: "top-five",
         label: "Largest five",
         value: book.topFive * 100,
-        unit: "% basket",
+        unit: "% value",
         percentile: null,
         asOf: market.fetchedAt,
-        detail: "Current value in the covered basket",
+        detail: "Current value of every priced holding",
       },
       {
         id: "hhi",
@@ -775,6 +860,10 @@ export function buildPortfolioRisk(
     warnings: [...new Set(warnings)],
     notes,
     fetchedAt: market.fetchedAt,
+    benchmark: RISK_BENCHMARK,
+    window: filed
+      ? { kind: "since-filed" as const, filed, start: metrics[0]?.startDate ?? null, sessions: metrics[0]?.samples ?? 0 }
+      : { kind: "trailing" as const, sessions: 60 },
   };
 }
 export type PortfolioRiskModel = ReturnType<typeof buildPortfolioRisk>;

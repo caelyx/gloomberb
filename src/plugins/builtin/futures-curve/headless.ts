@@ -1,8 +1,10 @@
 import type { FuturesContract, FuturesCurvePayload } from "../../../api-client/futures-curve";
+import { futuresSpecLines } from "../../../market-data/futures-contract";
 import type { HeadlessPaneColumn, HeadlessPaneDefinition, HeadlessPaneEntry, HeadlessPaneFreshness } from "../../../types/plugin";
+import { formatPercentRaw } from "../../../utils/format";
 import { newestReportTime, oldestReportTime } from "../../../utils/utc-time";
 import { fetchFuturesCurve, loadCurveSpot, loadFuturesCurveAsOf } from "./client";
-import { basisSpotSymbol, contractBasis, curveAsOfDate, curveBasisPercent, curveChangeText, curveContractCode, curvePrice, curveRoundedPrice, curveSpotLabel, curveSpreadLabel, curveTickText, curveTimestamp, curveUnitLabel, normalizeCurveRoot, thinContractCount, unsupportedCurveRootMessage, type ContractBasis } from "./model";
+import { basisSpotSymbol, BASIS_CONVENTION, blankBasisNote, catalogueCurveUnit, curveAsOfDate, curveBasisPercent, curveBasisRows, curveChangeText, curveContractCode, curvePrice, curveRoundedPrice, curveSpotLabel, curveSpotSource, curveSpreadLabel, curveTimestamp, curveUnitLabel, normalizeCurveRoot, shortDatedBasisNote, thinContractCount, unsupportedCurveRootMessage, type ContractBasis } from "./model";
 
 /** The root a report shows when none is given. */
 const DEFAULT_ROOT = "ES";
@@ -56,22 +58,41 @@ function contractColumns(root: string, settlementDate: string | null, options: {
   ];
 }
 
-/** What one contract is: the terms a hedge is sized on, once rather than on every row. */
+/**
+ * A section's fields in one order, each under its own name as a report
+ * titles it, then any field the server added since. Read from the rows, the
+ * order would follow the server's JSON, which a cached response reorders.
+ */
+function fieldColumns(order: readonly string[], fields: object, formats: Record<string, HeadlessPaneColumn["textFormat"]> = {}): HeadlessPaneColumn[] {
+  return [...order, ...Object.keys(fields).filter((key) => !order.includes(key))]
+    .map((key) => ({ key, header: key, ...formats[key] ? { textFormat: formats[key] } : {} }));
+}
+
+const FRONT_SPREAD_FIELDS = ["label", "frontSymbol", "nextSymbol", "value", "annualizedRollYield", "percentile", "rollPercentile",
+  "samples", "historyStart", "historyEnd", "asOf", "state"];
+const GHOST_FIELDS = ["symbol", "expiration", "price", "asOf"];
+/** The annualized roll yield reads as the percent it is (+32.36%); an export keeps the number. */
+const ROLL_YIELD_FORMAT = { annualizedRollYield: (value: unknown) => typeof value === "number" ? formatPercentRaw(value) : "--" };
+
+/** What one contract is: the terms a hedge is sized on, once rather than on every row, worded as `ticker` words them. */
 function specEntries(data: FuturesCurvePayload): HeadlessPaneEntry[] {
   const spec = data.spec;
-  if (!spec) return [];
-  return [
-    { key: "unit", label: "Unit", value: spec.unit },
-    { key: "size", label: "Contract size", value: spec.size },
-    { key: "tick", label: "Tick", value: spec.tick, formatted: curveTickText(spec) },
-    { key: "pointValue", label: "Point value", value: spec.pointValue, formatted: `$${spec.pointValue.toLocaleString("en-US")}` },
-    { key: "settlement", label: "Settlement", value: spec.settlement, formatted: spec.settlement === "cash" ? "cash settled" : "physical delivery" },
-  ];
+  // A root without terms still says what its prices count: Dutch TTF gas is euros per MWh.
+  if (!spec) {
+    const unit = catalogueCurveUnit(data.root);
+    return unit ? [{ key: "unit", label: "Unit", value: unit }] : [];
+  }
+  return futuresSpecLines(spec).map((line) => {
+    const value = spec[line.key as keyof typeof spec];
+    return { key: line.key, label: line.label, value, ...line.value === String(value) ? {} : { formatted: line.value } };
+  });
 }
 
 export const futuresCurveHeadless: HeadlessPaneDefinition<"bundle"> = {
   discovery: { aliases: ["CTM"], dataRequirements: ["Gloom Cloud futures curve endpoint"],
-    limitations: ["Listed-contract catalogues can be incomplete", "Ghosts and percentiles use the same listed contracts", "Cboe VIX is daily settlement"] },
+    limitations: ["Listed-contract catalogues can be incomplete.", "Ghosts and percentiles use the same listed contracts.", "Cboe VIX is daily settlement.",
+    "Ann Basis is simple actual/365 on the latest trade against the spot quote, and noisy under 30 days to expiry."],
+    intents: ["futures basis trade", "cash and carry", "basis against spot"] },
   shape: "bundle", argument: { kind: "free-text", optional: true, placeholder: "root", description: "FUT root such as CL, ES, ZN or VX, or a CME crypto root (BTC, ETH, SOL, XRP). Defaults to ES." },
   // Only the pane reads the tab; the report always carries both.
   options: [{ key: "tab", description: "Curve or the full contract table.", type: "enum",
@@ -91,10 +112,15 @@ export const futuresCurveHeadless: HeadlessPaneDefinition<"bundle"> = {
       date ? loadFuturesCurveAsOf(root, date, ctx.apiClient) : fetchFuturesCurve(root, ctx.apiClient),
       spotSymbol ? loadCurveSpot(spotSymbol, ctx.marketData, now) : null,
     ]);
-    const bases = spot ? data.contracts.map((row) => contractBasis(row, spot)) : [];
+    const bases = spot ? curveBasisRows(data.contracts, spot) : null;
     const unit = curveUnitLabel(data);
+    const terms = specEntries(data);
+    const source = spot ? curveSpotSource(spot) : null;
     const notices = [...args.argument ? [] : [`Showing ${DEFAULT_ROOT}. Try fn CTM ${EXAMPLE_ROOT}.`],
-      ...spot ? [spot.status === "ok" ? `Basis against ${curveSpotLabel(spot, root, now)}.` : `Basis blank: ${spot.reason}.`] : []];
+      ...spot ? [spot.status === "ok" ? `Basis against ${curveSpotLabel(spot, root, now)}${source ? ` (${source})` : ""}; not the CME reference rate.` : `Basis blank: ${spot.reason}.`] : []];
+    // The footnotes under the table: the convention, why a cell is blank, and where a short-dated rate is not to be trusted.
+    // Against a spot that is not usable every cell is blank for the spot's reason, which the notice above already gives.
+    const notes = spot && bases ? [BASIS_CONVENTION, ...spot.status === "ok" ? [blankBasisNote(data.contracts, bases), shortDatedBasisNote(data.contracts, bases, spot)].filter((note): note is string => !!note) : []] : [];
     // Dated by the contracts' own quotes; the same-contract history rows are a year of context, not observations.
     const quoted = data.contracts.map((row) => row.asOf);
     const freshness: HeadlessPaneFreshness = date
@@ -106,15 +132,17 @@ export const futuresCurveHeadless: HeadlessPaneDefinition<"bundle"> = {
       sections: [
         { title: "Contracts", columns: contractColumns(root, data.settlementDate ?? null,
           { basis: !!spot, last: data.source !== "cboe", notice: data.contracts.some((row) => row.firstNotice) }),
-          rows: data.contracts.map((row, index) => contractRow(row, data, root, !!date, bases[index])) },
-        { title: "Front spread", rows: [{ label: curveSpreadLabel(data.slope), ...data.slope, value: curveRoundedPrice(data.slope.value, root),
+          rows: data.contracts.map((row) => contractRow(row, data, root, !!date, bases?.get(row.symbol))) },
+        { title: "Front spread", columns: fieldColumns(FRONT_SPREAD_FIELDS, data.slope, ROLL_YIELD_FORMAT), rows: [{ label: curveSpreadLabel(data.slope), ...data.slope, value: curveRoundedPrice(data.slope.value, root),
           annualizedRollYield: data.slope.annualizedRollYield == null ? null : Number(data.slope.annualizedRollYield.toFixed(2)),
           percentile: rank(data.slope.percentile), rollPercentile: rank(data.slope.rollPercentile) }] },
-        ...data.spec ? [{ title: "Contract terms", entries: specEntries(data) }] : [],
-        ...data.ghosts.map((ghost) => ({ title: `${ghost.label} same-contract history`, rows: ghost.points.map((point) => ({ ...point })) })),
+        ...terms.length ? [{ title: "Contract terms", entries: terms }] : [],
+        ...data.ghosts.map((ghost) => ({ title: `${ghost.label} same-contract history`, columns: fieldColumns(GHOST_FIELDS, ghost.points[0] ?? {}),
+          rows: ghost.points.map((point) => ({ ...point })) })),
       ],
       errors: data.gaps,
-      metadata: { ...data, quoteUnit: unit, ...(spot ? { spot, basisBlankedThin: thinContractCount(bases) } : {}), ...(args.argument ? {} : { defaultArgument: DEFAULT_ROOT }),
+      ...(notes.length ? { notes } : {}),
+      metadata: { ...data, quoteUnit: unit, ...(spot && bases ? { spot, basisBlankedThin: thinContractCount(bases.values()) } : {}), ...(args.argument ? {} : { defaultArgument: DEFAULT_ROOT }),
         ...(notices.length ? { notices } : {}),
         complete: data.status === "available", percentileBasis: "Same-contract observations within one year; actual sample start/end retained" },
     };

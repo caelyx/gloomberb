@@ -2,7 +2,8 @@ import { getDockedPaneIds } from "../../layout/pane-manager";
 import { expect, test } from "bun:test";
 import { act } from "react";
 import { createOpenTuiTestHarness } from "../../renderers/opentui/test-utils";
-import { createTestDataProvider } from "../../test-support/data-provider";
+import { createTestDataProvider, createTestQuote } from "../../test-support/data-provider";
+import { AssetDataRouter } from "../../sources/provider-router";
 import { createBrowserResearchLayout, BROWSER_RESEARCH_PANE_ID } from "../../renderers/browser/config-host";
 import { createInitialState, type AppAction } from "../../state/app/context";
 import { createDefaultConfig, createPaneInstance, TICKER_RESEARCH_PANE_ID } from "../../types/config";
@@ -155,6 +156,33 @@ test.each(["floating", "docked", "only-floating"])("ticker research opens visibl
   else expect(getDockedPaneIds(layout)).toContain(source.instanceId);
 });
 
+// `DES NEE` binds the public listing; a ticker link names no route. Both are the one security without a broker.
+test("a ticker link brings forward the DES the command bar opened on the public listing, binding untouched", async () => {
+  const config = createDefaultConfig(":memory:");
+  const des = createPaneInstance(TICKER_RESEARCH_PANE_ID, { instanceId: "ticker-research:nee", title: "NEE",
+    binding: { kind: "fixed", symbol: "NEE", instrument: null, listing: { name: "NextEra Energy Inc.", exchange: "NYSE", currency: "USD", type: "Common Stock" } } });
+  config.layout = { dockRoot: null, instances: [des], floating: [{ instanceId: des.instanceId, x: 2, y: 2, width: 80, height: 20, zIndex: 1 }], detached: [] };
+  const stateRef = { current: createInitialState(config) };
+  stateRef.current.tickers.set("NEE", createTestTicker("NEE", "NextEra Energy Inc.", { exchange: "NYSE" }));
+  const focused: string[] = [];
+  let runtime!: ReturnType<typeof useAppTickerOpenRuntime>;
+  function Harness() {
+    runtime = useAppTickerOpenRuntime({ stateRef, dataProvider: createTestDataProvider(), tickerRepository: {} as any, dispatch() {},
+      pluginRegistry: { panes: new Map([[TICKER_RESEARCH_PANE_ID, { id: TICKER_RESEARCH_PANE_ID }]]), events: { emit() {} }, notify() {},
+        getTermSize: () => ({ width: 120, height: 40 }), getDisabledPaneOwner: () => null } as any,
+      buildPaneInstance: (paneId, options) => createPaneInstance(paneId, { ...options, instanceId: "ticker-research:second" }),
+      persistLayout: (layout) => { stateRef.current.config.layout = layout; },
+      activatePane: (paneId) => { focused.push(paneId); }, focusVisiblePane: (paneId) => { focused.push(paneId); },
+    });
+    return <text>Research</text>;
+  }
+  const rendered = await tui.render(<Harness />);
+  await act(async () => { await rendered.renderOnce(); });
+  await act(async () => { await runtime.openPinnedTicker("NEE", { floating: true, paneType: TICKER_RESEARCH_PANE_ID }); });
+  expect(focused).toEqual([des.instanceId]);
+  expect(stateRef.current.config.layout.instances).toEqual([des]);
+});
+
 // With Ticker Research off, its pane would be added and then hidden.
 test("opening a ticker while its pane's plugin is off offers to turn it on instead", async () => {
   const config = createDefaultConfig(":memory:");
@@ -209,4 +237,57 @@ test("opening a ticker while its pane's plugin is off offers to turn it on inste
   });
   expect(enabled).toEqual(["ticker-research"]);
   expect(layouts.at(-1)).toContain("ticker-detail:opened");
+});
+
+// GLO-822: Zcash on the crypto board did not open while the signed-in quote for ZEC-USD:CCC failed,
+// though search listed it. The open goes through the router the app uses, as a board row asks for it.
+test.each([
+  ["fails", true], ["prices another venue", true], ["fails", false],
+] as const)("a board row opens its listing when the listing's quote %s (listed: %p)", async (quoteOutcome, listed) => {
+  const stateRef = { current: createInitialState(createDefaultConfig(":memory:")) };
+  const notifications: string[] = [];
+  const created: string[] = [];
+  const dataProvider = new AssetDataRouter(null, [createTestDataProvider({
+    getQuote: async () => {
+      if (quoteOutcome === "fails") throw new Error("Cloud quotes are unavailable for ZEC-USD:CCC");
+      return createTestQuote({ symbol: "ZEC/USD", price: 1139, listingExchangeName: "BINANCE", exchangeName: "BINANCE" });
+    },
+    search: async () => listed
+      ? [{ providerId: "cloud", symbol: "ZEC-USD", name: "Zcash USD", exchange: "CCC", currency: "USD", type: "CRYPTOCURRENCY" }]
+      : [{ providerId: "cloud", symbol: "CBZEC-USD", name: "Coinbase Wrapped ZEC USD", exchange: "CCC", currency: "USD", type: "CRYPTOCURRENCY" }],
+  })]);
+  let runtime!: ReturnType<typeof useAppTickerOpenRuntime>;
+  function Harness() {
+    runtime = useAppTickerOpenRuntime({
+      stateRef,
+      dataProvider,
+      tickerRepository: {
+        loadTicker: async () => null,
+        createTicker: async (metadata: TickerRecord["metadata"]) => { created.push(metadata.ticker); return { metadata }; },
+      } as any,
+      dispatch() {},
+      pluginRegistry: { panes: new Map([[TICKER_RESEARCH_PANE_ID, { id: TICKER_RESEARCH_PANE_ID }]]), events: { emit() {} },
+        notify: ({ body }: { body: string }) => { notifications.push(body); },
+        getTermSize: () => ({ width: 120, height: 40 }), getDisabledPaneOwner: () => null } as any,
+      buildPaneInstance: (paneId, options) => createPaneInstance(paneId, { ...options, instanceId: "ticker-research:zec" }),
+      persistLayout: (layout) => { stateRef.current.config.layout = layout; },
+      activatePane() {}, focusVisiblePane() {},
+    });
+    return <text>Research</text>;
+  }
+  const rendered = await tui.render(<Harness />);
+  await act(async () => { await rendered.renderOnce(); });
+  await act(async () => {
+    await runtime.openPinnedTicker("ZEC-USD:CCC", { floating: true, paneType: TICKER_RESEARCH_PANE_ID, instrument: null });
+  });
+  const pane = stateRef.current.config.layout.instances.find((instance) => instance.instanceId === "ticker-research:zec");
+  if (listed) {
+    expect(notifications).toEqual([]);
+    expect(created).toEqual(["ZEC-USD:CCC"]);
+    expect(pane?.binding).toMatchObject({ kind: "fixed", symbol: "ZEC-USD:CCC", instrument: null, listing: { exchange: "CCC" } });
+  } else {
+    expect(notifications).toEqual(["Could not open ZEC-USD:CCC: no quote or listing found."]);
+    expect(created).toEqual([]);
+    expect(pane).toBeUndefined();
+  }
 });

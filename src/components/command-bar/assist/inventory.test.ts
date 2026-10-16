@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { apiClient, setCloudApiFetchTransport, type AssistCommandDescriptor } from "../../../api-client";
+import { apiClient, ASSIST_ARG_OPTION_LIMIT, setCloudApiFetchTransport, type AssistCommandDescriptor } from "../../../api-client";
 import { cotModule } from "../../../plugins/builtin/cot";
 import { econStatisticsModule } from "../../../plugins/builtin/econ-statistics";
 import { futuresCurveModule } from "../../../plugins/builtin/futures-curve";
@@ -160,9 +160,7 @@ describe("buildAssistCommandInventory", () => {
     ]);
   });
 
-  test("sends every built-in fixed-value list whole", async () => {
-    // A list past the server caps is left out of the request, and the
-    // assistant is back to guessing the argument.
+  test("sends every built-in fixed-value list whole, CTM's roots included", async () => {
     const inventory = buildAssistCommandInventory({
       commands: builtInCommands,
       pluginCommands: [],
@@ -182,6 +180,12 @@ describe("buildAssistCommandInventory", () => {
     const listed = inventory.filter((entry) => entry.arg?.options);
     expect(listed.map((entry) => entry.prefix)).toEqual(["TH", "LANG", "ECST", "VAL", "CTM", "COT"]);
     expect(sent.filter((entry) => entry.arg?.options)).toEqual(listed);
+    // CTM lists every FUT board root, VIX and the CME crypto roots: more than the old caps of 40 and 64, or the assistant
+    // guesses its root. The list must fit the request's cap whole, since a list over it is left out entirely.
+    const roots = sent.find((entry) => entry.prefix === "CTM")?.arg?.options ?? [];
+    expect(roots.length).toBeGreaterThan(64);
+    expect(roots.length).toBeLessThanOrEqual(ASSIST_ARG_OPTION_LIMIT);
+    expect(roots.map((option) => option.value)).toEqual(expect.arrayContaining(["ES", "SXO", "XAE", "VX", "BTC"]));
   });
 
   test("caps the inventory at the server limit", () => {

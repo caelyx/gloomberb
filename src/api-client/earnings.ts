@@ -1,3 +1,5 @@
+import type { EarningsDateStatus, EarningsEpsBasis } from "../types/financials";
+
 /** Before the open, during the session, after the close. */
 export type EarningsTiming = "bmo" | "dmh" | "amc";
 
@@ -25,6 +27,8 @@ interface EarningsRealizedMove {
   afterClose: number;
 }
 
+type EarningsActualSource = "calendar" | "press-release";
+
 export interface EarningsReport {
   symbol: string;
   name: string | null;
@@ -36,14 +40,26 @@ export interface EarningsReport {
   reportedAt: string | null;
   /** Fiscal quarter end month, YYYY-MM. */
   fiscalPeriod: string | null;
+  /** The company's cap as RV reads it: its latest snapshot at the regular session's price. */
   marketCap: number | null;
+  /** For an upcoming report, the consensus every earnings view shows, with `epsAnalysts` behind it. */
   epsEstimate: number | null;
   epsActual: number | null;
+  /**
+   * Where `epsActual` comes from: `press-release` is the company's own
+   * release, read the day it reports and provisional until the calendar's
+   * figure replaces it. Absent from older servers.
+   */
+  epsActualSource?: EarningsActualSource | null;
   epsAnalysts: number | null;
   revenueEstimate: number | null;
   revenueAnalysts: number | null;
   implied: EarningsImpliedMove | null;
   realized: EarningsRealizedMove | null;
+  /** Whether the date is out, announced or projected; absent from older servers. */
+  dateStatus?: EarningsDateStatus;
+  /** The reported figure's basis, null when it cannot be determined; absent from older servers. */
+  epsBasis?: EarningsEpsBasis | null;
 }
 
 export interface EarningsCalendarReport extends EarningsReport {
@@ -61,6 +77,8 @@ export interface EarningsCalendarPayload {
 
 interface EarningsHistoryReport extends EarningsReport {
   revenueActual: number | null;
+  /** `press-release` until the statements have the quarter; absent from older servers. */
+  revenueActualSource?: "statements" | "press-release" | null;
 }
 
 export interface EarningsHistoryPayload {

@@ -8,6 +8,14 @@ import {
 import type { Quote } from "../../../../types/financials";
 import type { TickerRecord } from "../../../../types/ticker";
 import { canonicalExchange, parsePublicTickerKey, publicTickerKey } from "../../../../utils/exchanges";
+import {
+  describeTickerChange,
+  isUsSymbolVenue,
+  quotedListing,
+  startTickerChangeLookup,
+  tickerChangeLine,
+  type TickerChange,
+} from "../../../../tickers/ticker-changes";
 
 const QUICK_ADD_MAX_QUERY_LENGTH = 32;
 const QUICK_ADD_SYMBOL_RE = /^[A-Z0-9][A-Z0-9.\-\s]*$/;
@@ -20,6 +28,8 @@ interface ResolvedQuickAdd {
   resolved: ResolvedTickerSearch;
   ticker: TickerRecord | null;
   quote: Quote | null;
+  /** The symbol changed (FB became META), as `watchlist add` says it. */
+  change: TickerChange | null;
 }
 
 export type QuickAddValidation =
@@ -135,6 +145,8 @@ export async function resolveQuickAddValidation({
   if (!registry) {
     return { status: "error", query, message: "Ticker lookup unavailable" };
   }
+  // Beside the search, so a symbol that changed (FB is now META) costs no wait.
+  const changes = startTickerChangeLookup(registry.marketData, query);
 
   try {
     const resolved = await resolveTickerSearch({
@@ -144,13 +156,15 @@ export async function resolveQuickAddValidation({
       dataProvider: registry.marketData,
     });
     if (!resolved) {
-      return { status: "missing", query, message: "No exact ticker match" };
+      const change = describeTickerChange(query, await changes.settle(), null);
+      return { status: "missing", query, message: tickerChangeLine(change) ?? "No exact ticker match" };
     }
 
     const symbol = resolved.symbol;
     const ticker = tickerForResolved(resolved, tickers);
     const cachedQuote = ticker ? financials.get(ticker.metadata.ticker)?.quote ?? null : null;
-    let quote = cachedQuote;
+    // A listing its own quote vouched for comes with it.
+    let quote = cachedQuote ?? (resolved.kind === "provider" ? resolved.quote ?? null : null);
     if (!quote) {
       try {
         quote = await registry.marketData.getQuote(
@@ -163,6 +177,12 @@ export async function resolveQuickAddValidation({
       }
     }
 
+    // A listing abroad is not the US symbol the changes are of.
+    const venue = resolved.kind === "provider" && resolved.result.exchange === "SMART"
+      ? resolved.result.primaryExchange
+      : exchangeFromResolved(resolved);
+    const payload = isUsSymbolVenue(venue) ? await changes.settle() : null;
+    const name = ticker?.metadata.name || (resolved.kind === "provider" ? resolved.result.name : "");
     return {
       status: tickerBelongsToCollection(ticker, collectionKind, collectionId) ? "duplicate" : "ready",
       query,
@@ -170,6 +190,7 @@ export async function resolveQuickAddValidation({
       resolved,
       ticker,
       quote,
+      change: describeTickerChange(query, payload, quote ? quotedListing(quote) : { name }),
     };
   } catch (error) {
     if (error instanceof AmbiguousTickerError && !(error instanceof AmbiguousContractError)) {

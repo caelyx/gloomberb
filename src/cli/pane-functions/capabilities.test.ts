@@ -18,8 +18,15 @@ import {
   isDataPaneForDomFallback,
   normalizeCapabilityOptions,
 } from "./capabilities";
-import { buildPaneCatalogEntries, filterPaneCatalogEntries, renderPaneCatalogReport, type PaneCatalogEntry } from "./catalog";
+import {
+  buildPaneCatalogEntries,
+  filterPaneCatalogEntries,
+  renderPaneCatalogReport,
+  selectPaneCatalogMatches,
+  type PaneCatalogEntry,
+} from "./catalog";
 import { createPaneCatalog } from "./discovery";
+import { findCatalogSeries } from "../series-search";
 import { parsePaneFunctionArgs } from "./options";
 
 const dummyPane = {
@@ -132,6 +139,20 @@ describe("pane function capabilities", () => {
       tab: "cashflow",
     })).toThrow("price-comparison does not support --tab");
   });
+
+  test("an option a function does not take is refused by the code the user typed, not its pane or capability id", () => {
+    const comparison = capabilityFor("comparison-chart-pane");
+    expect(() => normalizeCapabilityOptions(comparison, { tab: "cashflow" }, { code: "COMP" }))
+      .toThrow("COMP does not support --tab. Supported options: --rangePreset, --axisMode, --chartResolution.");
+    // The intraday chart's capability id is not its template id, and neither is what anyone types.
+    const intraday = capabilityFor("graph-intraday-price-pane");
+    expect(intraday.id).toBe("intraday-price-chart");
+    expect(() => normalizeCapabilityOptions(intraday, { interval: "5m" }, { code: "GIP" }))
+      .toThrow("GIP does not support --interval.");
+    // A function with no options says so.
+    expect(() => normalizeCapabilityOptions({ ...intraday, options: [] }, { range: "1Y" }, { code: "CDX" }))
+      .toThrow("CDX does not support --range. It has no options.");
+  });
 });
 
 describe("pane catalog search", () => {
@@ -239,7 +260,7 @@ describe("pane catalog search", () => {
     expect(order[4]).toBe("ZZZ");
   });
 
-  test("hedging searches put OSA first among the built-in functions", async () => {
+  test("hedging and put-selling searches put OSA first among the built-in functions", async () => {
     const context = { config: createDefaultConfig("/tmp/capabilities-test") } as MarketContext;
     const registry = await createPaneCatalog(context, getLoadablePlugins());
     try {
@@ -247,9 +268,136 @@ describe("pane catalog search", () => {
       for (const query of ["collar", "hedge", "hedging", "protective put", "put spread"]) {
         expect(filterPaneCatalogEntries(entries, query)[0]?.token, query).toBe("OSA");
       }
+      // Selling puts: OSA runs the trade, OMON picks the strike, VCA finds the rich premium.
+      for (const query of ["cash secured put", "csp", "put selling", "sell put", "short put", "wheel"]) {
+        const tokens = filterPaneCatalogEntries(entries, query).map(({ token }) => token);
+        expect(tokens[0], query).toBe("OSA");
+        expect(tokens.slice(0, 3).sort(), query).toEqual(["OMON", "OSA", "VCA"]);
+      }
     } finally {
       registry.destroy();
     }
+  });
+
+  test("crack spread and refining margin searches find G alone, with the per-barrel crack presets it charts", async () => {
+    const context = { config: createDefaultConfig("/tmp/capabilities-test") } as MarketContext;
+    const plugins = getLoadablePlugins();
+    const registry = await createPaneCatalog(context, plugins);
+    try {
+      const entries = await buildPaneCatalogEntries(registry, context);
+      for (const query of ["crack", "crack spread", "refining margin"]) {
+        const ranked = filterPaneCatalogEntries(entries, query);
+        expect(selectPaneCatalogMatches(ranked, query, 10).shown.map(({ token }) => token), query).toEqual(["G"]);
+        expect(findCatalogSeries(plugins, query).map(({ unit, expression }) => `${unit} ${expression}`).sort(), query).toEqual([
+          "USD/barrel (2*42*RB=F + 42*HO=F - 3*CL=F)/3",
+          "USD/barrel 42*HO=F - BZ=F",
+          "USD/barrel 42*HO=F - CL=F",
+        ]);
+      }
+    } finally {
+      registry.destroy();
+    }
+  });
+
+  test("a word found only in a flag's description is no match; a flag's own name, or every word together, is", () => {
+    const entry = (token: string, description: string, keys: Array<[string, string]>) => ({
+      token,
+      label: token,
+      description,
+      paneId: token.toLowerCase(),
+      paneName: token,
+      shortcut: token,
+      aliases: [],
+      keywords: [],
+      defaultSettings: {},
+      capability: {
+        ...capabilityFor(`${token.toLowerCase()}-pane`),
+        options: keys.map(([key, text]) => ({ key, type: "string" as const, description: text })),
+      },
+    });
+    const osa = entry("OSA", "Build positions and compare scenario P&L.", [
+      ["budgetBps", "Hedge budget in basis points of --nav."],
+      ["expiration", "Chain expiry for --strategy."],
+    ]);
+    // "budget" is OSA's hedge budget flag, not a function about budgets.
+    expect(filterPaneCatalogEntries([osa], "budget")).toEqual([]);
+    expect(filterPaneCatalogEntries([osa], "expiration").map(({ token }) => token)).toEqual(["OSA"]);
+    expect(filterPaneCatalogEntries([osa], "hedge budget").map(({ token }) => token)).toEqual(["OSA"]);
+  });
+
+  test("a query word starts a word, and joining words do not count", () => {
+    const entry = (token: string, description: string) => ({
+      token,
+      label: token,
+      description,
+      paneId: token.toLowerCase(),
+      paneName: token,
+      shortcut: token,
+      aliases: [],
+      keywords: [],
+      defaultSettings: {},
+      capability: capabilityFor(`${token.toLowerCase()}-pane`),
+    });
+    // "date" is in "update" and "to" in "stock"; neither is a date or a word.
+    const entries = [
+      entry("AAA", "Year to date returns by sector."),
+      entry("BBB", "Update a stock quote."),
+      entry("CCC", "Dated filings of each year."),
+    ];
+    expect(filterPaneCatalogEntries(entries, "year to date").map(({ token }) => token)).toEqual(["AAA", "CCC"]);
+    expect(filterPaneCatalogEntries(entries, "date").map(({ token }) => token)).toEqual(["AAA", "CCC"]);
+  });
+
+  test("two words typed as one find the functions that carry both, and a word that is neither finds nothing", () => {
+    const entry = (token: string, description: string) => ({
+      token,
+      label: token,
+      description,
+      paneId: token.toLowerCase(),
+      paneName: token,
+      shortcut: token,
+      aliases: [],
+      keywords: [],
+      defaultSettings: {},
+      capability: capabilityFor(`${token.toLowerCase()}-pane`),
+    });
+    const entries = [
+      entry("AAA", "Implied volatility surface and smiles."),
+      entry("BBB", "Volatility index closes."),
+      entry("CCC", "Surface temperature by ocean basin."),
+    ];
+    // BBB has "vol" and CCC "surf", but only AAA has both; a query that matches on its own is not cut.
+    expect(filterPaneCatalogEntries(entries, "volsurf").map(({ token }) => token)).toEqual(["AAA"]);
+    expect(filterPaneCatalogEntries(entries, "volatility").map(({ token }) => token)).toEqual(["AAA", "BBB"]);
+    expect(filterPaneCatalogEntries(entries, "zzqxvb")).toEqual([]);
+  });
+
+  test("a multi-word query lists the functions that carry every word, or the few closest, with the rest counted", () => {
+    const entry = (token: string, description: string) => ({
+      token,
+      label: token,
+      description,
+      paneId: token.toLowerCase(),
+      paneName: token,
+      shortcut: token,
+      aliases: [],
+      keywords: [],
+      defaultSettings: {},
+      capability: capabilityFor(`${token.toLowerCase()}-pane`),
+    });
+    const select = (entries: PaneCatalogEntry[], query: string, limit = 25) =>
+      selectPaneCatalogMatches(filterPaneCatalogEntries(entries, query), query, limit);
+
+    const some = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG"].map((token) => entry(token, "Price history by year."));
+    const complete = entry("ZZZ", "Price history by year to date.");
+    const loose = select(some, "price date");
+    // None has both words: the five closest, the rest left to a sharper query.
+    expect(loose).toMatchObject({ loose: true, hidden: 2 });
+    expect(loose.shown).toHaveLength(5);
+    expect(select([...some, complete], "year to date").shown.map(({ token }) => token)).toEqual(["ZZZ"]);
+    // --all lists every match.
+    expect(select(some, "price date", Number.POSITIVE_INFINITY)).toMatchObject({ hidden: 0, loose: false });
+    expect(select(some, "price date", Number.POSITIVE_INFINITY).shown).toHaveLength(7);
   });
 
   test("an alias opens its function even when other functions contain the same letters", () => {

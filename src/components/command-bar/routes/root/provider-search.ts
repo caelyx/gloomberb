@@ -2,9 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { AppState } from "../../../../state/app/context";
 import type { DataProvider } from "../../../../types/data-provider";
 import type { TickerSearchCandidate } from "../../../../tickers/search";
-import { searchTickerCandidates } from "../../../../tickers/search";
+import { LISTING_SEARCH_LIMIT, searchTickerCandidates } from "../../../../tickers/search";
 import {
-  COMMAND_BAR_TICKER_SEARCH_LIMIT,
   mergePlainRootTickerResults,
   mergeTickerSearchResultItems,
   QUICK_LOOK_TICKER_SEARCH_OPTIONS,
@@ -42,6 +41,8 @@ export function useRootProviderSearch(options: {
 }): {
   activeRootProviderResultsKey: string | null;
   orderedRootResults: ResultItem[];
+  /** False while the list is the local stand-in for a symbol search that has not answered. */
+  rootResultsCurrent: boolean;
   rootSearching: boolean;
   rootSectionOrder: CommandBarSectionOrder;
 } {
@@ -130,6 +131,7 @@ export function useRootProviderSearch(options: {
           searchContext: {
             preferBroker: true,
             interactive: true,
+            limit: LISTING_SEARCH_LIMIT,
             brokerId: activeSearchPortfolio?.brokerId,
             brokerInstanceId: activeSearchPortfolio?.brokerInstanceId,
           },
@@ -139,7 +141,8 @@ export function useRootProviderSearch(options: {
             if (requestId !== rootSearchRequestIdRef.current) return;
             publish(candidates);
           },
-          totalLimit: COMMAND_BAR_TICKER_SEARCH_LIMIT,
+          // The rows the CLI reads a symbol's listings from, so `CAR:` offers CAR Group on ASX (its eleventh).
+          totalLimit: LISTING_SEARCH_LIMIT,
           ...QUICK_LOOK_TICKER_SEARCH_OPTIONS,
         });
         if (requestId !== rootSearchRequestIdRef.current) return;
@@ -230,9 +233,13 @@ export function useRootProviderSearch(options: {
     ].join("\n");
   }, [rootPlainTickerSearchArg, rootProviderResults, rootProviderResultsQuery, rootTickerSearchArg]);
 
+  // The rows before the answer are for whatever the query matches locally, not the rows Enter will land on.
+  const rootResultsCurrent = !rootTickerSearchArg || (rootProviderResultsQuery === rootTickerSearchArg && !!rootProviderResults);
+
   return {
     activeRootProviderResultsKey,
     orderedRootResults,
+    rootResultsCurrent,
     rootSearching,
     rootSectionOrder,
   };

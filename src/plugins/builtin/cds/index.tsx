@@ -1,7 +1,8 @@
 import type { PaneTemplateCreateOptions } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
+import { fixedIncomeShortcut } from "../fixed-income/shortcut";
+import { SINGLE_NAME_CDS_SERIES } from "./series";
 import { CDS_PANE_ID } from "./model";
-import { CdsPane } from "./pane";
 import { cdsHeadless } from "./headless";
 
 
@@ -12,35 +13,27 @@ function explicitSymbol(options?: PaneTemplateCreateOptions): string | null {
 }
 
 export const cdsModule: PluginModule = {
-  panes: [{
-    id: CDS_PANE_ID,
-    name: "Single-Name CDS",
-    icon: "D",
-    component: CdsPane,
-    defaultPosition: "right",
-    tickerFollower: true,
-    defaultMode: "floating",
-    // Tall enough for the 5Y line above the trades, like Daily Short Volume.
-    defaultFloatingSize: { width: 92, height: 28 },
-  }],
+  series: SINGLE_NAME_CDS_SERIES,
   paneTemplates: [{
-    id: "cds-pane",
-    paneId: CDS_PANE_ID,
-    label: "Single-Name CDS",
-    description: "Single-name corporate CDS trades and 5Y spread history from DTCC public dissemination.",
-    keywords: ["cds", "credit", "default", "swap", "spread", "single name", "issuer", "dtcc", "protection"],
-    shortcut: { prefix: "CDS", argPlaceholder: "ticker", argKind: "ticker", argOptional: true },
-    headless: cdsHeadless,
-    createInstance: (_context, options) => {
-      const symbol = explicitSymbol(options);
-      return symbol
-        ? {
-          instanceId: `${CDS_PANE_ID}:${symbol}`,
-          title: `CDS ${symbol}`,
-          binding: { kind: "fixed", symbol },
-          placement: "floating",
-        }
-        : { instanceId: `${CDS_PANE_ID}:market`, title: "CDS", placement: "floating" };
-    },
+    ...fixedIncomeShortcut({
+      id: "cds-pane",
+      paneId: CDS_PANE_ID,
+      label: "Single-Name CDS",
+      description: "Single-name corporate CDS from DTCC public dissemination: with no argument, the issuers traded in the last 5 days with their 5Y spread; with a ticker or issuer, its 5Y spread history and trades.",
+      keywords: ["cds", "credit", "default", "swap", "spread", "single name", "issuer", "dtcc", "protection"],
+      shortcut: { prefix: "CDS", argPlaceholder: "ticker", argKind: "ticker", argOptional: true },
+      headless: cdsHeadless,
+      createInstance: (_context, options) => {
+        const symbol = explicitSymbol(options);
+        return symbol
+          ? {
+            instanceId: `${CDS_PANE_ID}:${symbol}`,
+            title: `CDS ${symbol}`,
+            binding: { kind: "fixed", symbol },
+            placement: "floating",
+          }
+          : { instanceId: `${CDS_PANE_ID}:market`, title: "CDS", placement: "floating" };
+      },
+    }, "credit", "single-name"),
   }],
 };

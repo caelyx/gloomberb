@@ -7,6 +7,43 @@ at page one, a warning paragraph above a chart, a title repeated in the body.
 This file says what the app does instead. [PLUGINS.md](../PLUGINS.md) has
 the APIs.
 
+## Principles
+
+These come first. Each is one rule, and a change that breaks one is wrong,
+not the rule. Details follow below.
+
+1. **One element, one look.** Every kind of element (button, tab, chip,
+   input, table, heading, empty or locked state, notice) has exactly one
+   convention, defined once in the shared kit. A pane never has its own.
+2. **Same role, same size.** Type size, weight, colour, spacing, radius and
+   borders come from tokens by role (body, heading, metadata, label,
+   positive, negative). No raw px, hex or font-size in pane or plugin code.
+3. **Levels differ on purpose.** Neighbouring levels differ by at least about
+   15% in size, or by weight, colour and space. A step of 1 or 2 px reads as
+   a mistake.
+4. **Extend the kit, never fork it.** If the kit lacks what a pane needs, add
+   it to the kit for every pane and migrate the callers. Never a pane-local
+   variant.
+5. **Plugins are panes.** Built-in and external plugins follow every rule
+   here and use the same components. No plugin ships its own look.
+6. **Change the class, test the whole app.** A UI change is made in the
+   shared component and checked against all panes and plugins before it
+   merges: before and after sheets of every view, not only the pane that
+   prompted it. A change that moves views it should not touch is wrong.
+7. **Look next to the neighbours.** A pane must look like it belongs beside
+   the news reader, a table pane and a form pane at the same width. If you
+   can tell it apart by its style rather than its content, fix it.
+8. **Exceptions are written down.** A real deviation (a dense table, a chart
+   axis) goes in the allowlist with a reason a reviewer accepted. No reason,
+   no exception.
+9. **The browser lays out the desktop and web.** Flex, wrapping and ellipsis,
+   not cell counts. The terminal keeps its own cell layout, byte for byte.
+
+A UI change says in its description what it was checked against: all views,
+both themes, a narrow and a wide pane. Rules 2, 6 and 8 are enforced by CI as
+the checks land (Linear GLO-768); until a check exists, the reviewer enforces
+them.
+
 ## 1. Anatomy
 
 **App chrome** (the shell's, never a pane's): the header holds the command
@@ -47,7 +84,8 @@ never goes there.
 | Limitation on content still worth reading | Inline beside that content | `Notice` |
 | Account state blocks the pane (signed out, unverified, plan) | Body | `SignInWall` (`cloud/auth-actions.tsx`) |
 | Plan gating that only degrades the pane (delayed data, upgrade hint) | Footer, shared wording | `useCloudAccessFooter` (`shared/cloud-upgrade.ts`) |
-| Retry, upgrade, or start button on an empty or failed state | Inside that state | `PaneStatusBody`/`EmptyState` `actions` |
+| Retry (or look again) from an empty or failed state | Inside that state, first, so it answers Enter | `PaneStatusBody`/`EmptyState` `retry` |
+| Upgrade or start button on an empty or failed state | Inside that state | `PaneStatusBody`/`EmptyState` `actions` |
 | An operation finished (saved, exported, failed) | Toast | `notify` |
 | Destructive or irreversible decision | Dialog | `ConfirmDialog`, `tone: "danger"` |
 | Per-instance configuration | Pane settings via the `...` menu | `settings` on the pane def, `usePaneSettingValue` |
@@ -55,7 +93,8 @@ never goes there.
 
 Nowhere: a row count as its own line, in the footer, in a tab label, or as "showing N of M";
 the pane's own name; fixed labels; generic key hints (`j/k`, `Enter to open`,
-`r to refresh`); explanatory paragraphs; the data provider.
+`r to refresh`, a sidebar's `<`/`>`, a key that focuses a message field Enter
+already focuses); explanatory paragraphs; the data provider.
 
 **The data provider is invisible.** Never show which vendor or internal
 route served the data: no `provider:gloomberb-cloud`, `gloomberb-cloud`,
@@ -85,6 +124,10 @@ the origin of a number. The one count the kit draws is the
   clickable. Hints follow the selection: a different array when a row is
   selected, a detail is open, a tab changes. A hint with no target is omitted
   or `disabled`, never a no-op.
+- A key that only repeats what Enter already does, or that adjusts the
+  layout rather than acting on what the pane shows, is not drawn: it goes in
+  `keys`, which binds it, and in `menu` with its `accelerator`, which lists
+  it. `PaneSidebar` does this for `<` and `>`; Chat does it for Compose.
 - `r` refreshes every pane. No per-pane refresh hint (PR #589). Built-in
   panes bind it with `usePaneRefreshKey(reload, { focused })`, or with
   `handleRefreshKey` inside a table's key handler.
@@ -125,8 +168,17 @@ Section headings read in title case, bright and bold: the kit capitalises
 lower-case words, so write acronyms in capitals and never a whole heading in
 capitals. Pass `onHeaderClick` only when the table sorts (without it headers
 are not interactive), and `selection={{ kind: "none" }}` for a static table.
+A section header can carry one quiet `action` at its right end for the whole
+group, such as the preset its rows are set to (the Plugins pane's starter
+pack); it is a setting you apply, not a filter, and it also gets a footer key.
 Never build a table from padded `Text` rows: the kit gives the header band,
-gutters and fill to the footer.
+gutters and fill to the footer. A few rows of figures inside a section (an
+overview's positions, a quote book, label and value pairs in columns) are a
+`ColumnGrid`: the terminal sets the columns at the cells you give them, and
+the desktop lays them out as one CSS grid counted in characters, so they
+follow a resize to the pixel and line up with their header. Text that can be
+wider than its track (a column that shrinks to `growFrom`) is clipped at the
+track at every frame of a resize, ending in an ellipsis.
 
 Pick by interaction: `DataTableView` (sortable columns, cursor, Enter opens),
 `DataTableStackView` (same, detail in the pane), `FeedDataTableStackView`
@@ -143,6 +195,12 @@ so the selected row reads in the selection color without each cell checking
 goes in a cell's `leading` or a column's `headerLeading`: the terminal skips
 it, the text keeps its own selection color, and exports read only the text.
 
+**A table set inline.** A short table that sits in a page between prose (keys in Help, a plan comparison) takes `fitRows` with `virtualize={false}`: the terminal gives it its rows, the desktop and the web make it exactly as tall as its header and rows, where a count of rows is short by the taller header bar. Its box takes no height there either.
+
+**The body under a bar.** What sits under a pane's tabs, query bar and figures takes the rest of the pane by flex on the desktop and the web: spread `FILL_REST` (`components/ui/fill.ts`) on its box, and on the pane's own root box, instead of the rows the terminal counts. A chrome bar is taller than a row there, so a body given `height - 1` rows runs past the footer by the difference. Tables, charts and the 3D surface in that box fill it to the footer. `SeriesListDetail` does this for a series list beside its detail. A pane that shows other panes as views under its own bars (Fixed Income) puts each in a box with `data-gloom-role="nested-pane-content"`, and the view's root takes that box the way a pane's root takes the pane.
+
+**Text that may not fit.** One line that can run past its room (a name in a table cell, a heading, a read under a chart) is `ClippedText`, or `SectionHeading` with a `width`: the terminal cuts it at a count of cells, the desktop and the web at the box's edge in CSS with an ellipsis. Siblings that must stay whole (a ticker, a kind badge) keep their room and the text gives way. Never pass a string already cut with `truncateToDisplayWidth` to a DOM render. `ClippedText` takes the caller's own terminal cut (`cut={truncateWithEllipsis}`) so the terminal frame stays as it was, a `lead` kept whole before the text, and `wrap` for a message or description the desktop should wrap rather than cut. An optional item that shows only when it fits beside the rest (a ticker after a name) goes in a row with `flexWrap: "wrap"`, one line tall and clipped: the browser moves what does not fit to the hidden line, as the terminal's count of columns dropped it.
+
 **Table + detail.** `DataTableStackView` is the "list, then open one" shape:
 Enter or click calls `onActivate`, the pane sets the open item, the stack
 shows `← Back` plus `detailTitle` and the detail. Esc, Backspace, the mouse
@@ -156,7 +214,19 @@ back button or clicking Back pops it. Rules:
 - `prefetchDetail` warms the cache once the cursor rests; it never mutates.
 - A detail read as text sits in a `DetailScrollBody` whose ref is the
   stack's `detailScrollRef`, so j/k step it a line at a time and the next
-  item starts at the top.
+  item starts at the top. An item's facts and text read through
+  `DetailReader` (`src/components/reader/detail-reader.tsx`): label and value
+  pairs, then the text in short paragraphs in the reader's type, across the
+  pane's width on the desktop and the web. `FeedDataTableStackView` takes the
+  facts as `detailFacts`; the Changelog and Trials details are the reference.
+- Reading text on the desktop and the web (the article reader, `DetailReader`,
+  Docs) takes one type scale, from `src/components/reader/reader-text.tsx`:
+  metadata, facts, tables and coverage at the app's own size (12px) and
+  dimmer; body 14px at line height 1.6; a lead 15px; section headings 16px
+  bold with space above them; a title 20px bold. In a column under 480px the
+  body is 13.2px and the levels above it follow. Levels differ by weight and
+  space as much as by size, so a reader sits beside the app's tables without
+  shouting. A pane does not set its own reading size.
 - Any other scrolling body is a `ScrollBox`. Leaving `scrollY` out means it
   scrolls vertically, with the wheel and, while the pane is focused, with the
   arrows, j/k, PageUp, PageDown, Home and End; `scrollY={false}` turns that off.
@@ -164,6 +234,9 @@ back button or clicking Back pops it. Rules:
 - A detail the user reads and comes back from is the stack, not a dialog or
   a floating pane. A new pane (`pinTicker`, `createPaneFromTemplate`) is for
   something kept beside the list.
+- A row's DES (`d`, a menu entry, a linked ticker) opens through
+  `useOpenDescription` (`shared/open-description.ts`), which brings forward
+  the DES already open for that listing instead of opening a second one.
 
 **Long lists.** A paged or cursored source appends on scroll and never shows
 page numbers or a Load more button. An offset-paged source loads through
@@ -301,6 +374,10 @@ header, with the detail's height.
   four or fewer short exclusive options, `multi`, `toggle`, `text` for a second
   field. One terminal row; on the desktop it scrolls sideways when narrow.
   Status never goes in the bar; units and as-of context may use `meta`.
+  The inline filter or view that picks a chart's range sets `chartRange`:
+  choosing the selected range again sends the pane's charts back to it, as `0`
+  does, so every chart's range strip behaves the same. Bind the range's number
+  keys the same way (`useSeriesList` does for a list beside a detail chart).
 - `useQueryBarSearch()` holds whether the search owns the keyboard; spread its
   `searchProps` into `search`. The bar already binds `/`, so a pane binds it
   again only to add a condition.
@@ -343,6 +420,11 @@ header, with the detail's height.
 - Destructive actions ask with `confirmDialog` (a `ConfirmDialog`) from a
   `variant="danger"` button or a footer hint, never a bare button that acts
   on first press.
+- A dialog's keys: the terminal names them in the `DialogFrame` footer line;
+  the desktop and the web put each on its button as a keycap
+  (`desktopShortcut`), put keys no button has and a note such as a deadline
+  beside the buttons (`DialogActions` `hints`), and draw no footer line
+  (`desktopFooter={null}`).
 - A form inside a stack detail follows the same rules; Back is the navigation
   Cancel and the footer goes empty while editing.
 
@@ -351,7 +433,8 @@ header, with the detail's height.
 - A list of conversations, channels or documents beside the selected one is
   `PaneSidebar` on the left (`PaneSidebarRow`, `PaneSidebarAction`,
   `ActionRow` section headers), width persisted and drag-resizable,
-  `shouldShowPaneSidebar` deciding whether the pane is big enough. Sidebar
+  `<` and `>` bound to its width and listed in the pane menu (not the
+  footer), `shouldShowPaneSidebar` deciding whether the pane is big enough. Sidebar
   when the user switches items many times a session; stack when they open
   one, read, and go back.
 - Loading: `useAsyncResource` + `useAutoRefresh` + `useUpdatedAgo`, seeded
@@ -382,11 +465,21 @@ header, with the detail's height.
   `preventDefault()` when it acts). Reserved: `j`/`k`/arrows move, Enter
   opens, Esc/Backspace back, `r` refresh, `Shift+R` refresh all, `!`
   warnings, `o` open source, `/` search, `.` pane menu, Tab/Shift+Tab next
-  pane or field, `h`/`l` tabs, `?` help, F1 the pane's help card, `` ` `` ticker search, `q` quit (terminal),
+  pane or field, `h`/`l` tabs, `<`/`>` the width of a resizable sidebar, `?` help, F1 the pane's help card, `` ` `` ticker search, `q` quit (terminal),
   `u` restart into a downloaded update or retry a failed one, `$` Pro upgrade, Ctrl+P command bar. `q`, `u`, `r`,
   `Shift+R`, `?` and `` ` `` reach the app before any pane. Table keys go
   through `onRootKeyDown` and `onDetailKeyDown` (return `true` when handled);
   global shortcuts through `registerShortcut` so Help lists them.
+- A key held down repeats, and an action should run once per press. The
+  shortcut registry drops the repeats (`event.repeat`) of command chords
+  (Ctrl, Cmd or Super with a key), Esc, function keys and the menu key before
+  any handler runs. The shell's own actions (pane keys, help, refresh, the
+  command bar) also refuse a repeat and any second trigger within 600 ms,
+  which covers a terminal that cannot say a key is a repeat and a native menu
+  accelerator. Plain keys still repeat, as movement keys must (arrows, page
+  keys, `j`/`k`, `+`/`-`), and a footer hint repeats only for those; a pane
+  key that opens a dialog, writes the clipboard, downloads or sends ignores
+  `event.repeat` itself.
 - Esc Esc closes the focused pane, and only an Esc nobody consumed counts
   as the first press. Consume Esc only when it backs out of something (a
   detail, a menu, a selection, a draft); with nothing to back out of, let it
@@ -412,6 +505,59 @@ header, with the detail's height.
   branch for a bar. Prefer `flexGrow`/`flexBasis={0}`/`overflow="hidden"`
   to hard heights; subtract the tab strip and `rootBefore` rows before passing
   `rootHeight`.
+- The desktop app and the web are an app, not a document: Ctrl/Cmd+A, a double
+  or triple click and a drag across panes select no text. Text people copy by
+  hand opts in: `<Text selectable>` for a run, `data-gloom-selectable="true"`
+  on the `Box` around a block (articles, answers, logs, code; `MarkdownText`
+  and the reader already do). Fields keep their own selection. Anything else
+  people need out of a pane is a copy action or an export, not a selection.
+  The terminal selects with the mouse as it always did.
+
+## 8b. Opening a function twice
+
+Opening a function that is already open focuses its window; a window is added
+only when none is open. That holds for every way in: the command bar, a
+notification or alert, a deep or share link, a shortcut, `pane.show` and
+`pane.createFromTemplate` from the Remote API, and an "Open" action in another
+pane. The host decides it in `createPaneTemplateOrThrow` from what the
+template's `createInstance` returns:
+
+- **One window per function** (Plugins, Unread, a board that takes no
+  argument): return no `instanceId` or a stable one (`"unread-inbox"`). Settings
+  the user changes later do not make it another window.
+- **One window per ticker or per query**: key the id by the argument
+  (`financial-analysis:AAPL`, `jobs:home`), put the ticker in `binding` and the
+  query in `settings`. The host also finds a pane that shows that ticker or
+  query under another id, such as one unlinked from a list.
+- **A window the user switches inside** (Chat changes channel in place) cannot
+  be named by an id: the id says what it was opened on, not what it shows. Its
+  `createInstance` reads `context.layout` and `context.focusedPaneId` and
+  returns the `instanceId` of the pane to reuse: the one already showing the
+  thing, else the focused one, else the one in front (`pickChatPaneToReuse`).
+  Only with none open does it return a new id.
+- **The spec holds identity, not preferences.** Binding, params and the
+  settings that say what the window shows (`channelId`, `symbols`, `board`);
+  never a view preference (live streaming, a range). The host matches a pane by
+  what the spec names and ignores the settings it leaves out, so a pane the user
+  has tuned is still found.
+- **Two functions on one pane type** (ERN and EVTS, MA and DIST, POWER and
+  EPWR, BI and THEM) tell their windows apart by binding, params and settings.
+  Declare the settings that name a window as `identitySettings` on the pane def
+  (`["board", "symbols", "symbolsText"]`; `[]` when binding and params say it
+  all). A window that picked up any other setting is still found, and a window
+  carrying an identity setting the function does not set is left to the function
+  that does. This reads what the window stores, so panes saved before the
+  declaration are found too. Without it a bare spec only matches a window with no
+  settings at all, because the host cannot tell whose settings are whose.
+- **New on purpose**: a blank form that builds something (`VIEW`), a function
+  that creates a list (`PF`), "Open in new pane" (`forceNewPane`) and Duplicate
+  Pane. Charts and quotes for different tickers are different specs, so they
+  are different windows.
+
+`workflow/pane-reuse.test.ts` opens every function in the catalog twice, after
+its pane picked up a setting, and lists the ones that still add a window with
+the reason. A new function that lands on that list fails the test: fix the
+template, or add it with its reason.
 
 ## 9. Checklist for a new pane or tab
 
@@ -428,8 +574,10 @@ header, with the detail's height.
 11. Data panes have a `headless` definition; fetching is in `client.ts`. It declares `freshness` (source, status, schedule) wherever "Gloom Cloud" and the status read from the rows would be wrong, so the report's source, as-of and status line is true.
 12. No `@opentui`, Electrobun or DOM imports; no cell-drawn chrome on the desktop.
 13. A missing repeated pattern went into the kit with its callers migrated, not into the pane.
-14. On the desktop tables and charts fill with flex, not terminal row arithmetic; nothing ends in a dead band above the footer.
+14. On the desktop and the web nothing is sized in cells: boxes fill with flex, percentages or CSS units, text wraps in CSS at the width it sits in (a reading measure is a CSS `max-width` in `ch`), and sizes are read from the laid-out page. Nothing ends in a dead band above the footer or a gap at the right edge. `bun run check:pane-layout` measures every function; `src/architecture/dom-cell-metrics.test.ts` keeps cell metrics out of DOM-only code, and its allowlist says for every file why the uses left stay (a shared API that speaks cells to every renderer, or a size the terminal shares by design).
 15. A chart with a table uses `ChartTableHeader`: named series, one shared selection, `chartTableLayout` at every size, no repeated numbers.
+16. Opening the function again focuses its window (8b): identity in the spec, preferences out of it, a stable `instanceId` for a one-window function.
+17. Nothing animates while its box is being resized. Motion tied to the layout (a glide, a fade, a pulse) reads `resizing` from `useSettledLayoutSize` (`src/ui/resize-settle.ts`), the one signal for a pane resize, a divider, a maximise or restore and a window resize; content placed in percentages of its box holds its layout while the size changes and is laid out once the size settles, as the heat map's tiles are (`useHeatTreemapScene`). `bun run check:pane-chrome --only "market heat map"` drags, resizes the window and maximises with real input and fails on a relayout per move or a tile animating.
 
 ## Reference implementations
 
@@ -456,6 +604,7 @@ All under `src/plugins/builtin/` unless noted.
 | Status, notice, empty state | `src/components/ui/status.tsx` |
 | Load-more helpers | `src/components/table-view-shared.tsx`, `src/components/paged-rows.ts` |
 | Stack | `src/components/data-table/stack-view.tsx`, `ui/page-stack-view.tsx` |
+| Item detail: facts, then the text across the pane | `clinical-trials/pane.tsx`, `changelog/index.tsx`, `src/components/reader/detail-reader.tsx` |
 | Figures, chart and table, selection drives the cursor | `short-volume/pane.tsx` |
 | Board whose chart follows the selected row | `credit-conditions/index.tsx` |
 | Chart over table layout, strip, selection | `src/components/chart-table/` |

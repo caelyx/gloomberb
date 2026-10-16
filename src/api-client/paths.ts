@@ -7,6 +7,7 @@ import { isUsListingExchange, normalizeSymbol, parsePublicTickerKey, publicTicke
 import { nonUsSecListingVenue } from "../utils/sec";
 import type { HistoryRetention } from "../sources/history-retention";
 import type { CloudBeneficialOwnersParams } from "./beneficial-owners";
+import type { CloudInsiderSignalsParams } from "./insider-signals";
 import type { RevenueBreakdownView } from "./revenue-breakdown";
 
 export type CloudHistoryParams = {
@@ -444,6 +445,14 @@ export function cloudSecBeneficialOwnersPath(params: CloudBeneficialOwnersParams
   return appendQuery("/cloud/sec/beneficial-owners", search);
 }
 
+/** Companies ranked by recent open-market insider buying. */
+export function cloudSecInsiderSignalsPath(params: CloudInsiderSignalsParams = {}): string {
+  const search = new URLSearchParams();
+  if (params.window != null) search.set("window", String(params.window));
+  if (params.limit != null) search.set("limit", String(params.limit));
+  return appendQuery("/cloud/sec/insider-signals", search);
+}
+
 export function cloudSecFilingDocumentsPath(
   params: CloudSecFilingParams,
 ): string {
@@ -574,6 +583,13 @@ export function cloudNewsPath(params: CloudNewsParams = {}): string {
   if (params.until) search.set("until", params.until.toISOString());
   if (params.cursor) search.set("cursor", params.cursor);
   return appendQuery("/news", search);
+}
+
+/** Stories whose headline, summary or publisher matches the text, best match first; the service takes at most 100. */
+export function cloudNewsSearchPath(query: string, limit?: number): string {
+  const search = new URLSearchParams({ query });
+  if (limit != null) search.set("limit", String(limit));
+  return appendQuery("/news/search", search);
 }
 
 export function cloudTickerTweetsPath(params: CloudTickerTweetsParams): string {

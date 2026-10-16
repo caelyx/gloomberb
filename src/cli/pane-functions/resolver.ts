@@ -10,11 +10,16 @@ import { applyChartComposerCapabilityOptions } from "../../plugins/builtin/chart
 import { parseChartSpec } from "../../plugins/builtin/chart-composer/chart-spec";
 import { normalizeTickerInput } from "../../tickers/search";
 import { slugifyName } from "../../utils/slugify";
-import { resolveCliListing } from "../listing-arg";
+import { ListingArgError, listingReadNotes, resolveCliListing, usListingsOnlyMessage } from "../listing-arg";
+import { listingAbroadVenue } from "../../utils/sec";
+import { splitSymbolArgs, stripStrayEdges } from "../symbol-args";
 import type { MarketContext } from "../types";
 import {
   buildPaneFunctionLookup,
   buildTemplateContext,
+  nearFunctionCodes,
+  suggestPaneFunctions,
+  type NearFunctionCode,
   type PaneFunctionCatalog,
 } from "./catalog";
 import {
@@ -106,27 +111,62 @@ function findPaneFunction(registry: PaneFunctionCatalog, target: string): { temp
 }
 
 /**
- * `fn ANR SAN --exchange EPA` is `fn ANR SAN:EPA`: a function that takes one
- * ticker gets the listing in its argument, and an exchange the app does not
- * know fails with the venues the symbol trades on.
+ * `fn ANR SAN --exchange EPA` is `fn ANR SAN:EPA`: a function that takes
+ * tickers gets each listing as `quote` reads it (`resolveCliListing`), so
+ * `fn ERN 7203:TSE` is Toyota in Tokyo and an exchange the app does not know
+ * fails with the venues the symbol trades on. With several symbols,
+ * `--exchange` names the venue of the ones that name none. A function whose
+ * data covers US listings only (`usListingsOnly`) answers a listing abroad
+ * with that and the company's US listing, and leaves it out of a list.
  */
 export async function applyListingArgument(
   registry: PaneFunctionCatalog,
   context: MarketContext,
   args: ParsedPaneFunctionArgs,
+  command: "fn" | "shot" = "fn",
 ): Promise<ParsedPaneFunctionArgs> {
   const found = args.target ? findPaneFunction(registry, args.target) : null;
-  if (!found?.pane || !args.arg || /\s/.test(args.arg)) return args;
+  if (!found?.pane || !args.arg) return args;
   const headless = getHeadlessPaneDefinition(found.template, found.pane);
-  const takesOneTicker = headless ? headless.argument.kind === "ticker" : found.template?.shortcut?.argKind === "ticker";
+  const kind = headless?.argument.kind ?? found.template?.shortcut?.argKind;
+  const takesOneTicker = kind === "ticker";
+  const takesList = kind === "tickers" || kind === "symbol-list" || (!headless && kind === "ticker-list");
   // A function with an exchange option of its own (DIST) keeps it.
-  if (!takesOneTicker || getPaneFunctionCapability(found.template, found.pane).options.some((option) => option.key === "exchange")) {
+  if (!(takesOneTicker || takesList) || (takesOneTicker && /\s/.test(args.arg))
+    || getPaneFunctionCapability(found.template, found.pane).options.some((option) => option.key === "exchange")) {
     return args;
   }
   const exchange = typeof args.options.exchange === "string" ? args.options.exchange : undefined;
-  const listing = await resolveCliListing(args.arg, exchange, context);
   const { exchange: _exchange, ...options } = args.options;
-  return { ...args, arg: listing.key, options, listing };
+  const typed = takesOneTicker ? [args.arg] : splitSymbolArgs([args.arg]);
+  if (typed.length === 0) return args;
+  let listings = await Promise.all(typed.map((raw) => resolveCliListing(raw, exchange, context, { ownExchangeWins: typed.length > 1 })));
+  // A separator stuck to the end of a pasted list (`UPST;`) is not part of a symbol; it is named.
+  const notes: string[] = takesOneTicker ? [] : stripStrayEdges(args.arg).notes;
+  const usOnly = headless?.usListingsOnly;
+  const abroad = usOnly ? listings.filter((listing) => listingAbroadVenue(listing.key) != null) : [];
+  if (usOnly && abroad.length > 0) {
+    const token = found.template?.shortcut?.prefix ?? args.target.toUpperCase();
+    const answers = await Promise.all(abroad.map(async (listing) => {
+      const answer = await usListingsOnlyMessage(usOnly, listing, context, (key) => `gloomberb ${command} ${token} ${key}`);
+      const hint = headless?.usListingsOnlyHint?.(listing.key);
+      return hint ? { ...answer, details: `${answer.details}\n${hint}` } : answer;
+    }));
+    listings = listings.filter((listing) => !abroad.includes(listing));
+    if (listings.length === 0) {
+      throw new ListingArgError(answers.map((answer) => answer.message).join("\n"), answers.map((answer) => answer.details).join("\n"));
+    }
+    notes.push(...answers.map((answer) => `${answer.message} ${answer.details.replaceAll("\n", " ")}`));
+  }
+  // One listing's notes come with its choice note; a list's are said here.
+  if (listings.length > 1) notes.unshift(...listings.flatMap(listingReadNotes));
+  return {
+    ...args,
+    arg: listings.map((listing) => listing.key).join(", "),
+    options,
+    ...(listings.length === 1 ? { listing: listings[0]! } : {}),
+    ...(notes.length > 0 ? { listingNotes: notes } : {}),
+  };
 }
 
 /**
@@ -144,11 +184,53 @@ function takeTableSection(
   return { options: rest, tableSection: section };
 }
 
+/** A name that opens no function: `details` list the closest ones and where to search for more. */
+export class UnknownPaneFunctionError extends Error {
+  constructor(name: string, readonly details: string, suggestion: string | null = null) {
+    super(`Unknown function or pane "${name}".${suggestion ? ` Did you mean ${suggestion}?` : ""}`);
+    this.name = "UnknownPaneFunctionError";
+  }
+}
+
+/** `RDCF (Reverse DCF)`, `ERN (Earnings) or EPS (EPS Estimates)`. */
+function nearCodesText(near: readonly NearFunctionCode[]): string {
+  const named = near.map(({ code, label }) => `${code} (${label})`);
+  return named.length > 1 ? `${named.slice(0, -1).join(", ")} or ${named.at(-1)}` : named[0]!;
+}
+
+/**
+ * A name that opens no function: the code it is one slip from (`did you mean
+ * RDCF?`) with the command that runs it on the same argument, the functions
+ * the catalog finds for it, and where to search. A name near no code and
+ * found by no search says so plainly and points at the whole catalog.
+ */
+async function unknownPaneFunctionError(
+  registry: PaneFunctionCatalog,
+  context: MarketContext,
+  name: string,
+  arg: string,
+  command: "fn" | "shot",
+): Promise<UnknownPaneFunctionError> {
+  const near = nearFunctionCodes(registry, name);
+  // A catalog that cannot be read still leaves the pointer to it.
+  const closest = (await suggestPaneFunctions(registry, context, name).catch(() => []))
+    .filter((entry) => !near.some(({ code }) => code === entry.token));
+  const tokenWidth = Math.max(0, ...closest.map((entry) => entry.token.length));
+  const word = /^[\w.:-]+$/.test(name) ? name : JSON.stringify(name);
+  const argument = arg.trim() ? ` ${/^[\w.:,=%+@/$^-]+$/.test(arg.trim()) ? arg.trim() : JSON.stringify(arg.trim())}` : "";
+  return new UnknownPaneFunctionError(name, [
+    ...near.length === 1 ? [`Run: gloomberb ${command} ${near[0]!.code}${argument}`] : [],
+    ...closest.length > 0
+      ? ["Closest matches:", ...closest.map((entry) => `  ${entry.token.padEnd(tokenWidth)}  ${entry.label}`), `Search the catalog: gloomberb catalog ${word}`]
+      : near.length > 0 ? [] : [`No function code is close to ${word}. List every function: gloomberb catalog`],
+  ].join("\n"), near.length > 0 ? nearCodesText(near) : null);
+}
+
 export async function resolvePaneFunction(
   registry: PaneFunctionCatalog,
   context: MarketContext,
   parsedArgs: ParsedPaneFunctionArgs,
-  resolutionSettings: { strictHeadlessOptions?: boolean; tableSection?: boolean } = {},
+  resolutionSettings: { strictHeadlessOptions?: boolean; tableSection?: boolean; command?: "fn" | "shot" } = {},
 ): Promise<ResolvedPaneFunction> {
   let args = parsedArgs;
   if (!args.target) {
@@ -156,13 +238,7 @@ export async function resolvePaneFunction(
   }
 
   const found = findPaneFunction(registry, args.target);
-  if (!found) {
-    const shortcuts = [...registry.paneTemplates.values()]
-      .map((template) => template.shortcut?.prefix)
-      .filter((prefix): prefix is string => !!prefix)
-      .sort();
-    throw new Error(`Unknown function or pane "${args.target}". Try one of: ${shortcuts.slice(0, 18).join(", ")}`);
-  }
+  if (!found) throw await unknownPaneFunctionError(registry, context, args.target, args.arg, resolutionSettings.command ?? "fn");
 
   const { template, pane } = found;
   if (!pane) {
@@ -177,18 +253,22 @@ export async function resolvePaneFunction(
     args = { ...args, options: taken.options };
     tableSection = taken.tableSection;
   }
+  // What the user types for the function, which every error about it names.
+  const token = template?.shortcut?.prefix ?? template?.id ?? pane.id;
   const normalizedOptions = normalizeCapabilityOptions(capability, args.options, {
     strict: args.requireBotSafe || (!!headless && resolutionSettings.strictHeadlessOptions === true),
+    code: token,
+    argument: args.arg || null,
   });
   const settings = {
     ...optionSettings(args.options),
     ...capabilityPaneSettings(capability, normalizedOptions),
   };
   if (args.requireBotSafe) {
-    validateTickerCardinality(capability, createOptions);
+    validateTickerCardinality(capability, createOptions, token);
   }
   const resolved: ResolvedPaneFunction = {
-    token: template?.shortcut?.prefix ?? template?.id ?? pane.id,
+    token,
     label: template?.label ?? pane.name,
     description: template?.description ?? `Open the ${pane.name} pane.`,
     shortcut: template?.shortcut?.prefix,
@@ -209,6 +289,7 @@ export async function resolvePaneFunction(
 function validateTickerCardinality(
   capability: PaneFunctionCapability,
   createOptions: PaneTemplateCreateOptions | undefined,
+  code: string,
 ): void {
   if (!capability.botSafe || capability.tickerCardinality === "none") return;
   const count = createOptions?.symbols?.length
@@ -229,5 +310,5 @@ function validateTickerCardinality(
       : capability.tickerCardinality === "two-or-more"
         ? "at least two tickers"
         : "one or two tickers";
-  throw new Error(`${capability.id} requires ${expectation}.`);
+  throw new Error(`${code} requires ${expectation}.`);
 }

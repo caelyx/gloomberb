@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { AnalystResearchData } from "../../../types/financials";
-import { buildEventRows, eventSourceNotice, formatEventMetric } from "./event-model";
+import { buildEventRows, eventSourceNotice, formatEventMetric, type EventFinancials } from "./event-model";
 
 test("ADR reported EPS and company revenue keep their distinct currencies", () => {
   const rows = buildEventRows({ symbol: "TSM", currency: "USD", dividends: [], splits: [],
@@ -94,7 +94,7 @@ test("fiscal period ends stay labeled and unknown EPS currency stays unknown", (
   const [row] = buildEventRows({ symbol: "COST", currency: "USD", dividends: [], splits: [],
     earnings: [{ date: "2026-05-31", dateType: "fiscal-period-end", epsActual: 4.93, difference: 0.01 }],
   }, null, null, "USD");
-  expect(row).toMatchObject({ dateType: "fiscal-period-end", detail: "Period end; +0.01 vs est" });
+  expect(row).toMatchObject({ dateType: "fiscal-period-end", detail: "Period end; basis unknown, +0.01 vs est" });
   expect(row?.epsCurrency).toBeUndefined();
 });
 
@@ -139,7 +139,98 @@ test("period aliases retain exact filing provenance and raw surprise inputs", ()
     { date: "2026-05-31", dateType: "fiscal-period-end", epsActual: 4.93, epsEstimate: 4.9231, difference: 0.0069, surprisePercent: 0.14 },
   ] }, null, { quarterlyStatements: [{ date: "2026-05-10", providerDate: "2026-05-31", dateSource: "sec", dateEvidence: evidence, totalRevenue: 70_527_000_000, currency: "USD" }] }, "USD");
   expect(row).toMatchObject({ date: "2026-05-10", providerPeriodDate: "2026-05-31", fiscalPeriodEnd: "2026-05-10", period: "May 2026", dateEvidence: evidence,
-    qRevenue: 70_527_000_000, epsEstimate: 4.9231, epsActual: 4.93, epsDifference: 0.0069, surprisePercent: 0.14, epsBasis: "provider-unspecified" });
+    qRevenue: 70_527_000_000, epsEstimate: 4.9231, epsActual: 4.93, epsDifference: 0.0069, surprisePercent: 0.14, epsBasis: "unknown" });
+});
+
+test("a resolved quarter shows ERN's figure, basis and fiscal quarter, and a pending report its date status and analysts", () => {
+  // CRWV as Gloom Cloud resolves it: the calendar's figures, labelled against the 10-Q diluted EPS.
+  const quarter = (date: string, fiscalPeriod: string, epsEstimate: number, epsActual: number) => ({
+    date, dateType: "announcement" as const, currency: "USD", time: "After Hours", fiscalPeriod, epsEstimate, epsActual,
+    difference: Math.round((epsActual - epsEstimate) * 100) / 100, epsBasis: "adjusted" as const, dateStatus: "reported" as const,
+  });
+  const rows = buildEventRows({ symbol: "CRWV", dividends: [], splits: [], earnings: [
+    { date: "2026-11-09", dateType: "announcement", currency: "USD", fiscalPeriod: "2026-09", epsEstimate: -1.52697, epsAnalysts: 18,
+      epsBasis: null, dateStatus: "projected" },
+    quarter("2026-08-11", "2026-06", -1.52, -1.32), quarter("2026-05-07", "2026-03", -1.17, -1.38),
+    quarter("2026-02-26", "2025-12", -0.61, -0.84), quarter("2025-11-10", "2025-09", -0.54, -0.31),
+  ] }, null, { financialCurrency: "USD", quarterlyStatements: [["2025-09-30", -0.22], ["2025-12-31", -0.89], ["2026-03-31", -1.4], ["2026-06-30", -1.14]]
+    .map(([date, eps]) => ({ date: date as string, eps: eps as number, totalRevenue: 2e9 })) }, "USD");
+  expect(rows.find((row) => row.date === "2026-08-11")).toMatchObject({ period: "Jun 2026", qEps: -1.32, qRevenue: 2e9, epsBasis: "adjusted",
+    detail: "adj, +0.20 vs est", value: "+13.16%", tone: "positive", fiscalPeriodEnd: "2026-06-30" });
+  expect(rows.find((row) => row.date === "2026-11-09")).toMatchObject({ earningsState: "pending", qEps: -1.52697, epsAnalysts: 18,
+    dateStatus: "projected", detail: "projected, 18 analysts" });
+  // With no trailing figure served, the TTM row is the statements' diluted EPS; all four quarters above it
+  // are adjusted, so their sum is the one thing it may add beside it.
+  const ttm = rows.find((row) => row.status === "TTM");
+  expect(ttm?.annualEps).toBeCloseTo(-3.65, 10);
+  expect(ttm).toMatchObject({ epsBasis: "GAAP", detail: "GAAP diluted (statements), adj sum -3.85" });
+});
+
+describe("the TTM row's EPS", () => {
+  // PLTR: ticker prints the served trailing 1.16, the statement quarters' diluted EPS add to 1.17 and the rows above
+  // are two adjusted quarters over two GAAP ones.
+  const quarter = (date: string, fiscalPeriod: string, epsActual: number, epsBasis: "gaap" | "adjusted" | null) => (
+    { date, dateType: "announcement" as const, currency: "USD", fiscalPeriod, epsActual, epsBasis, dateStatus: "reported" as const }
+  );
+  const earnings = (bases: Array<"gaap" | "adjusted" | null>) => [
+    quarter("2026-08-03", "2026-06", 0.31, bases[0]!), quarter("2026-05-04", "2026-03", 0.25, bases[1]!),
+    quarter("2026-02-02", "2025-12", 0.24, bases[2]!), quarter("2025-11-03", "2025-09", 0.18, bases[3]!),
+  ];
+  const financials = {
+    financialCurrency: "USD",
+    fundamentals: { eps: 1.16 },
+    quarterlyStatements: [["2025-09-30", 0.18], ["2025-12-31", 0.24], ["2026-03-31", 0.34], ["2026-06-30", 0.41]]
+      .map(([date, eps]) => ({ date: date as string, eps: eps as number, totalRevenue: 1e9, currency: "USD" })),
+  };
+  const ttm = (bases: Array<"gaap" | "adjusted" | null>, served: EventFinancials = financials) =>
+    buildEventRows({ symbol: "PLTR", dividends: [], splits: [], earnings: earnings(bases) }, null, served, "USD")
+      .find((row) => row.status === "TTM");
+
+  test("is the served GAAP diluted figure, never a sum of quarters of mixed basis", () => {
+    const row = ttm(["adjusted", "adjusted", "gaap", "gaap"]);
+    expect(row).toMatchObject({ annualEps: 1.16, epsCurrency: "USD", epsBasis: "GAAP", detail: "GAAP diluted" });
+    expect(row?.detail).not.toContain("sum");
+    // Neither the mixed sum of the four rows (0.98) nor the statements' (1.17).
+    expect(ttm(["adjusted", "adjusted", "gaap", "gaap"], { ...financials, fundamentals: { eps: undefined } })?.annualEps).toBeCloseTo(1.17, 10);
+  });
+
+  test("adds the adjusted sum only when all four matched quarters are adjusted", () => {
+    const row = ttm(["adjusted", "adjusted", "adjusted", "adjusted"]);
+    expect(row).toMatchObject({ annualEps: 1.16, detail: "GAAP diluted, adj sum 0.98" });
+    expect(ttm(["adjusted", "adjusted", "adjusted", null])?.detail).toBe("GAAP diluted");
+    expect(ttm(["adjusted", "adjusted", "adjusted", "gaap"])?.detail).toBe("GAAP diluted");
+  });
+
+  test("states the currency the trailing figure is in", () => {
+    expect(ttm(["gaap", "gaap", "gaap", "gaap"], { ...financials, fundamentals: { eps: 1.16, epsCurrency: "EUR" } })?.epsCurrency).toBe("EUR");
+  });
+});
+
+test("a REIT's pending report names the adjusted basis of its FFO consensus, as ERN does", () => {
+  const [row] = buildEventRows({ symbol: "PLD", dividends: [], splits: [], earnings: [
+    { date: "2026-10-15", dateType: "announcement", currency: "USD", fiscalPeriod: "2026-09", epsEstimate: 1.58, epsAnalysts: 2,
+      epsBasis: "adjusted", dateStatus: "confirmed" },
+  ] }, null, null, "USD");
+  expect(row).toMatchObject({ earningsState: "pending", qEps: 1.58, epsBasis: "adjusted", detail: "confirmed, 2 analysts, adj" });
+});
+
+test("a press release's figure reads provisional until the calendar's replaces it, as ERN and EVTS mark it", () => {
+  // The Travelers the morning of its report: its core EPS, read from the release before the calendar has the quarter.
+  const trv = (epsActualSource: "press-release" | undefined) => buildEventRows({ symbol: "TRV", dividends: [], splits: [], earnings: [
+    { date: "2026-10-16", dateType: "announcement", currency: "USD", fiscalPeriod: "2026-09", epsEstimate: 7.07, epsActual: 9.18,
+      difference: 2.11, epsBasis: "adjusted", dateStatus: "reported", ...(epsActualSource ? { epsActualSource } : {}) },
+  ] }, null, null, "USD").find((row) => row.date === "2026-10-16");
+  expect(trv("press-release")).toMatchObject({ qEps: 9.18, epsBasis: "adjusted", epsProvisional: true, detail: "adj, provisional, +2.11 vs est" });
+  const settled = trv(undefined);
+  expect(settled).toMatchObject({ qEps: 9.18, epsBasis: "adjusted", detail: "adj, +2.11 vs est" });
+  expect(settled?.epsProvisional).toBeUndefined();
+});
+
+test("a beat against a negative estimate reads as a beat", () => {
+  const [row] = buildEventRows({ symbol: "CRWV", dividends: [], splits: [], earnings: [
+    { date: "2026-08-11", dateType: "announcement", epsEstimate: -1.47, epsActual: -1.14, difference: 0.33, surprisePercent: -22.45 },
+  ] }, null, null, "USD");
+  expect(row).toMatchObject({ surprisePercent: 22.45, value: "+22.45%", tone: "positive", detail: "basis unknown, +0.33 vs est" });
 });
 
 test("missing or ambiguous fiscal periods and announcements cannot borrow a previous quarter's revenue", () => {
@@ -280,32 +371,23 @@ describe("event rows", () => {
     expect(ttm?.qRevenue).toBeUndefined();
   });
 
-  test("sums the reported quarter EPS shown above the TTM row instead of statement GAAP EPS", () => {
+  test("does not add reported quarters of unknown basis to the TTM row", () => {
     // UNH: reported (adjusted) 2.92, 2.11, 7.23, 6.38 against GAAP 2.59, 0.02, 6.90, 6.04.
     const reported = [["2025-09-30", 2.92], ["2025-12-31", 2.11], ["2026-03-31", 7.23], ["2026-06-30", 6.38]] as const;
     const actions = {
       symbol: "UNH",
       dividends: [],
       splits: [],
-      earnings: [
-        { date: "2026-10-13", dateType: "announcement" as const, epsEstimate: 4.15 },
-        ...reported.map(([date, epsActual]) => ({ date, dateType: "fiscal-period-end" as const, currency: "USD", epsActual })),
-      ],
+      earnings: reported.map(([date, epsActual]) => ({ date, dateType: "fiscal-period-end" as const, currency: "USD", epsActual })),
     };
     const financials = {
       financialCurrency: "USD",
       quarterlyStatements: [["2025-06-30", 4.08], ["2025-09-30", 2.59], ["2025-12-31", 0.02], ["2026-03-31", 6.9], ["2026-06-30", 6.04]]
         .map(([date, eps]) => ({ date: date as string, eps: eps as number, totalRevenue: 100 })),
     };
-    const ttm = () => buildEventRows(actions, null, financials, "USD").find((row) => row.status === "TTM");
-    expect(ttm()?.annualEps).toBeCloseTo(18.64, 10);
-    expect(ttm()).toMatchObject({ date: "2026-06-30", epsCurrency: "USD", annualRevenue: 400, detail: "sum" });
-
-    // A quarter without its reported row cannot be summed from the rows, so the statement TTM
-    // stays and is not labelled as their sum (ADBE: Gloom omitted two of the last four quarters).
-    actions.earnings.splice(1, 1);
-    expect(ttm()?.annualEps).toBeCloseTo(15.55, 10);
-    expect(ttm()?.detail).toBe("statement EPS");
+    const ttm = buildEventRows(actions, null, financials, "USD").find((row) => row.status === "TTM");
+    expect(ttm?.annualEps).toBeCloseTo(15.55, 10);
+    expect(ttm).toMatchObject({ date: "2026-06-30", epsCurrency: "USD", annualRevenue: 400, detail: "GAAP diluted (statements)" });
   });
 
   test("omits a TTM row when a flow metric is missing from one of the last four quarters", () => {
@@ -346,6 +428,8 @@ describe("event rows", () => {
     expect(rows[0]?.annualEps).toBeUndefined();
     expect(rows[2]?.qEps).toBeUndefined();
     expect(rows[2]?.annualEps).toBeUndefined();
+    const unlabelled = buildEventRows({ ...data, currency: undefined }, null, null, "");
+    expect(unlabelled.find((row) => row.status === "Dividend")?.value).toBe("0.26");
   });
 });
 

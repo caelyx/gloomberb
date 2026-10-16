@@ -27,7 +27,7 @@ import { Box, Text, TextAttributes, useRendererHost, useUiCapabilities } from ".
 import { useDialog, useDialogKeyboard, type DialogApi, type PromptContext } from "../../../../ui/dialog";
 import { isPlainKey } from "../../../../utils/keyboard";
 import { useCloudUpgradeAction } from "../../shared/cloud-upgrade";
-import { requestAuthDialog } from "../auth-dialog";
+import { requestAuthDialog } from "../../../../account/auth-dialog";
 import {
   currentMcpEndpointUrl,
   MCP_CLIENTS,
@@ -90,6 +90,7 @@ function SnippetBlock({ text, secret, width }: { text: string; secret: string | 
       backgroundColor={nativePaneChrome ? colors.bg : colors.panel}
       style={nativePaneChrome ? { padding: "8px 10px", borderRadius: 4 } : undefined}
       data-gloom-role="mcp-connect-snippet"
+      data-gloom-selectable="true"
     >
       {text.split("\n").map((line, index) => {
         const atEdge = !!secret && line.includes(secret);
@@ -247,6 +248,9 @@ function McpConnectDialog({
       subtitle={t("Gloom's research tools in Claude Code, Codex, Cursor or any MCP client.")}
       // Too narrow for the key line, which is a keyboard's business anyway (a phone).
       footer={narrow ? undefined : footer}
+      // The desktop's buttons show their keys, the client switch takes arrows
+      // like any segmented control, and the close button stands for Esc.
+      desktopFooter={null}
       onClose={dismiss}
     >
       <Box flexDirection="column" width={width} gap={1}>

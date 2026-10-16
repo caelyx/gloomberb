@@ -11,6 +11,10 @@ export type TickerInstrumentKind =
   | "currency"
   | "index"
   | "future"
+  /** A perpetual futures contract on a crypto or on-chain venue (BZUSDT:BINANCE): no expiry, trades around the clock. */
+  | "perpetual"
+  /** A binary event contract on a prediction-market venue (KALSHI:KXGREENLAND-29): no company, no financials, no options. */
+  | "prediction"
   | "option"
   | "bond"
   | "other";

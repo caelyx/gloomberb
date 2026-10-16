@@ -10,7 +10,10 @@ import { t, tf } from "../../../../i18n";
 import type { ChatContentController } from "./types";
 import { getComposerCursorOffset, moveComposerCursorToOffset } from "./composer-cursor";
 import { insertedText, pastedImagePaths } from "../attachments/transfer";
+import { composerMessage, joinComposerDraft, pastedShareChips, splitComposerDraft, type ComposerShareLink } from "../pane-links/composer";
 import { chatTextWithImages } from "../attachments/model";
+import { isManagedBot } from "../ghost-user";
+import { CHAT_PERSON_ICON_WIDTH } from "../people";
 
 interface MutableRef<T> {
   current: T;
@@ -43,6 +46,8 @@ export function useChatComposerRuntime({
   updateComposerRows,
   useDefaultControllerChannel,
   draftAttachmentCount = 0,
+  draftLinksRef,
+  setDraftLinks,
   onPastedImagePaths,
   onConversationStartError,
   onDiscordCommand,
@@ -74,6 +79,9 @@ export function useChatComposerRuntime({
   useDefaultControllerChannel: boolean;
   /** Images waiting in the composer: with any, a message may go without text. */
   draftAttachmentCount?: number;
+  /** The share links drawn as chips above the field; they go at the end of the message. */
+  draftLinksRef: MutableRef<ComposerShareLink[]>;
+  setDraftLinks: (links: ComposerShareLink[]) => void;
   /** Set where pasted file paths can attach (the terminal): the paths, and the text that named them. */
   onPastedImagePaths?: (paths: string[], pasted: string) => void;
   /** A `/dm` or `/group` command the server refused, with the names it asked for. */
@@ -104,13 +112,15 @@ export function useChatComposerRuntime({
     }
   }, [channelId, controller, setReplyTo, useDefaultControllerChannel]);
 
-  const persistDraft = useCallback((draft: string) => {
+  // The field's text is saved with the links of its chips, the way it will be sent.
+  const persistDraft = useCallback((text: string, links: readonly ComposerShareLink[] = draftLinksRef.current) => {
+    const draft = joinComposerDraft(text, links);
     if (useDefaultControllerChannel) {
       controller.setDraft(draft);
     } else {
       controller.setChannelDraft(channelId, draft);
     }
-  }, [channelId, controller, useDefaultControllerChannel]);
+  }, [channelId, controller, draftLinksRef, useDefaultControllerChannel]);
 
   const replaceLocalComposer = useCallback((draft: string, cursorOffset = draft.length) => {
     inputValueRef.current = draft;
@@ -135,13 +145,20 @@ export function useChatComposerRuntime({
     persistDraft(draft);
   }, [persistDraft, replaceLocalComposer]);
 
+  /** New chips above the field, saved with the text as it is. */
+  const replaceDraftLinks = useCallback((links: ComposerShareLink[]) => {
+    setDraftLinks(links);
+    persistDraft(inputValueRef.current, links);
+  }, [inputValueRef, persistDraft, setDraftLinks]);
+
   const beginReplyTo = useCallback((index: number, options?: { deferFocus?: boolean }) => {
     if (!canSend || index < 0 || index >= messages.length) return;
     const nextReplyTo = messages[index] ?? null;
     if (!nextReplyTo) return;
     if (editingMessageRef.current) {
+      setDraftLinks([]);
       replaceLocalComposer("");
-      persistDraft("");
+      persistDraft("", []);
     }
     setEditingMessage(null);
     setSelectedIdx(index);
@@ -167,6 +184,7 @@ export function useChatComposerRuntime({
     replaceLocalComposer,
     setEditingMessage,
     setFollowMessages,
+    setDraftLinks,
     setReplyTo,
     setSelectedIdx,
     useDefaultControllerChannel,
@@ -180,8 +198,11 @@ export function useChatComposerRuntime({
     setEditingMessage(message);
     setSelectedIdx(index);
     setFollowMessages(index === messages.length - 1);
-    replaceLocalComposer(message.content);
-    persistDraft(message.content);
+    // Links at the end of the message are chips again while it is edited.
+    const view = splitComposerDraft(message.content);
+    setDraftLinks(view.links);
+    replaceLocalComposer(view.text);
+    persistDraft(view.text, view.links);
     if (options?.deferFocus) {
       queueMicrotask(() => focusInput());
     } else {
@@ -196,6 +217,7 @@ export function useChatComposerRuntime({
     messages,
     persistDraft,
     replaceLocalComposer,
+    setDraftLinks,
     setEditingMessage,
     setFollowMessages,
     setSelectedIdx,
@@ -210,10 +232,11 @@ export function useChatComposerRuntime({
   const cancelEditMessage = useCallback(() => {
     if (!editingMessageRef.current) return;
     setEditingMessage(null);
+    setDraftLinks([]);
     replaceLocalComposer("");
-    persistDraft("");
+    persistDraft("", []);
     focusInput();
-  }, [focusInput, persistDraft, replaceLocalComposer, setEditingMessage]);
+  }, [focusInput, persistDraft, replaceLocalComposer, setDraftLinks, setEditingMessage]);
 
   const returnToComposer = useCallback(() => {
     setSelectedIdx(-1);
@@ -224,11 +247,12 @@ export function useChatComposerRuntime({
   }, [canSend, focusInput, setFollowMessages, setSelectedIdx]);
 
   const clearLocalComposer = useCallback(() => {
+    setDraftLinks([]);
     replaceLocalComposer("");
-  }, [replaceLocalComposer]);
+  }, [replaceLocalComposer, setDraftLinks]);
 
   const sendMessage = useCallback(() => {
-    const content = inputValueRef.current.trim();
+    const content = composerMessage(inputValueRef.current, draftLinksRef.current);
     const editing = editingMessageRef.current;
     // Images let a message, or an edit of one that has them, go without text.
     const imagesAllowEmpty = editing
@@ -244,7 +268,7 @@ export function useChatComposerRuntime({
         if (!accepted) return;
         setEditingMessage(null);
         clearLocalComposer();
-        persistDraft("");
+        persistDraft("", []);
         setSelectedIdx(-1);
         setFollowMessages(true);
       }).finally(() => {
@@ -266,6 +290,7 @@ export function useChatComposerRuntime({
       return;
     }
     if (composerCommand?.kind === "discord" && onDiscordCommand) {
+      setDraftLinks([]);
       replaceComposerDraft("");
       onDiscordCommand(composerCommand);
       return;
@@ -298,6 +323,7 @@ export function useChatComposerRuntime({
     channelIdRef,
     clearLocalComposer,
     controller,
+    draftLinksRef,
     inputValueRef,
     onChannelChange,
     onConversationStartError,
@@ -305,6 +331,7 @@ export function useChatComposerRuntime({
     expandDirectSection,
     persistDraft,
     replaceComposerDraft,
+    setDraftLinks,
     setEditingMessage,
     setFollowMessages,
     setSelectedIdx,
@@ -314,6 +341,16 @@ export function useChatComposerRuntime({
   const commitLocalDraft = useCallback((draft: string) => {
     if (applyingExternalDraftRef.current) return;
     const previousDraft = inputValueRef.current;
+    // A share link pasted at the end of the draft leaves the field for a chip
+    // above it, the one the sent message shows; the cursor stays where it was.
+    const inserted = insertedText(previousDraft, draft);
+    const textAfter = inserted ? draft.slice(inserted.start + inserted.text.length) : "";
+    const chips = inserted && inserted.text.length > 4 ? pastedShareChips(inserted.text, textAfter, draftLinksRef.current) : null;
+    if (inserted && chips) {
+      setDraftLinks([...draftLinksRef.current, ...chips]);
+      replaceComposerDraft(`${draft.slice(0, inserted.start)}${textAfter}`, inserted.start);
+      return;
+    }
     inputValueRef.current = draft;
     updateComposerRows(draft);
     persistDraft(draft);
@@ -324,21 +361,20 @@ export function useChatComposerRuntime({
     onComposerStateChange?.(draft, cursorOffset);
     if (onPastedImagePaths && !editingMessageRef.current) {
       // A file dropped on a terminal arrives as its path, typed in one go.
-      const inserted = insertedText(previousDraft, draft);
       const paths = inserted && inserted.text.length > 4 ? pastedImagePaths(inserted.text) : null;
       if (paths) onPastedImagePaths(paths, inserted!.text);
     }
   }, [
     applyingExternalDraftRef,
-    channelId,
-    controller,
+    draftLinksRef,
     inputRef,
     inputValueRef,
     onComposerStateChange,
     onPastedImagePaths,
     persistDraft,
+    replaceComposerDraft,
+    setDraftLinks,
     updateComposerRows,
-    useDefaultControllerChannel,
   ]);
 
   useEffect(() => {
@@ -398,7 +434,10 @@ export function useChatComposerRuntime({
   const replyPreview = replyTo
     ? formatInlinePreview(
       chatTextWithImages(replyTo.content, replyTo.attachments?.length ?? 0),
-      Math.max(contentWidth - ` replying to @${replyTo.user.username}: `.length - COMPOSER_ACTION_WIDTH - 1, 0),
+      Math.max(
+        contentWidth - ` replying to @${replyTo.user.username}`.length - (isManagedBot(replyTo.user) ? CHAT_PERSON_ICON_WIDTH + 1 : 2) - COMPOSER_ACTION_WIDTH - 1,
+        0,
+      ),
     )
     : "";
   const editingPreview = editingMessage
@@ -425,6 +464,7 @@ export function useChatComposerRuntime({
     inputPlaceholder,
     replyPreview,
     replaceComposerDraft,
+    replaceDraftLinks,
     returnToComposer,
     sendMessage,
   };

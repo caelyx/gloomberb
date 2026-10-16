@@ -58,6 +58,18 @@ export interface DataTableSectionHeader {
    * `onMouseDown` instead of `onActivate`.
    */
   expanded?: boolean;
+  /**
+   * A quiet control at the right end of the header that acts on the whole
+   * group, such as the preset its rows are set to. A header is not a stop for
+   * the cursor, so the pane gives the same action a key (a footer hint).
+   */
+  action?: {
+    /** What the control says, already translated: the group's current setting. */
+    label: string;
+    /** Desktop tooltip: what pressing it does. */
+    title?: string;
+    onPress: () => void;
+  };
 }
 
 /** Where `scrollToIndex` puts its row: the nearest edge, the middle, or the top of the viewport. */
@@ -138,6 +150,13 @@ export interface DataTableProps<
   emptyStateTitle: string;
   emptyStateHint?: string;
   virtualize?: boolean;
+  /**
+   * Every row shows and nothing scrolls: a table set inline in a page, such as
+   * a list of shortcuts. The terminal gives it the rows of the box it sits in;
+   * the desktop and the web make it exactly as tall as its header and rows,
+   * which a count of rows cannot, the header being a taller bar there.
+   */
+  fitRows?: boolean;
   overscan?: number;
   columnGap?: number;
   horizontalPadding?: number;

@@ -8,6 +8,7 @@ import type {
   HeadlessPaneLoadArgs,
   HeadlessRowsResult,
 } from "../../../types/plugin";
+import { explainRefusal } from "../shared/cloud-denied";
 import { resolveHeadlessIssuerListing } from "../shared/headless-market-data";
 import {
   callStatusLabel,
@@ -16,6 +17,7 @@ import {
   loadTranscriptWithClient,
   type EarningsCallsResult,
 } from "./data";
+import { callsLockNote } from "./lock-note";
 import {
   buildTranscriptSegments,
   findCallForQuarter,
@@ -65,6 +67,11 @@ const defaultDependencies: EarningsCallsHeadlessDependencies = {
   ),
   loadTranscript: (callId, context) => loadTranscriptWithClient(context.apiClient, callId),
 };
+
+/** A refused read says what the lock note says (CALLS is Pro whole), so a free account meets the same words as a signed-out one. */
+function explainDenied(ticker: string | null) {
+  return (error: unknown): never => { throw explainRefusal(error, callsLockNote, { symbol: ticker }); };
+}
 
 function callRow(call: CloudEarningsCallPayload) {
   return {
@@ -258,6 +265,11 @@ export function createEarningsCallsHeadless(
       },
     ],
     columns: CALL_COLUMNS,
+    // No aliases: the template's keywords stay the catalog's search terms.
+    discovery: {
+      dataRequirements: ["Gloom Cloud Pro account"],
+      limitations: ["Pro only, the list of calls included."],
+    },
     describe: (args) => {
       if (readsTranscript(args)) {
         return `Earnings Call Transcript | ${String(args.argument)} | ${String(args.options.quarter || "latest")}`;
@@ -266,7 +278,7 @@ export function createEarningsCallsHeadless(
     },
     async load(args, context) {
       const ticker = typeof args.argument === "string" ? args.argument : null;
-      const calls = await dependencies.loadCalls(ticker, 200, context);
+      const calls = await dependencies.loadCalls(ticker, 200, context).catch(explainDenied(ticker));
       if (!ticker || !readsTranscript(args)) {
         return projectEarningsCallsHeadless(calls, { ...args, options: { ...args.options, limit: args.options.limit ?? 50 } });
       }
@@ -280,7 +292,7 @@ export function createEarningsCallsHeadless(
         }
         throw new Error(`No ${quarter} earnings call found for ${ticker}.`);
       }
-      const transcript = await dependencies.loadTranscript(selected.id, context);
+      const transcript = await dependencies.loadTranscript(selected.id, context).catch(explainDenied(ticker));
       if (isPendingTranscript(transcript)) {
         throw new Error(`Transcript for ${ticker} ${quarter} is still being produced.`);
       }

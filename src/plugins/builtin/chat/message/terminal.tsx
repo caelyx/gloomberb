@@ -1,10 +1,18 @@
 import { Box, Text, TextAttributes, useRendererHost } from "../../../../ui";
 import { colors } from "../../../../theme/colors";
 import { t } from "../../../../i18n";
-import { formatInlinePreview, getMessageBodyTokenLines } from "../layout";
+import { formatInlinePreview, getMessageBodyTokenLines, MESSAGE_ACTION_WIDTH } from "../layout";
 import { chatImageLabel, chatImageReviewNote, chatReplyQuoteText } from "../attachments/model";
+import { isQuotedAuthorManagedBot } from "../ghost-user";
+import { ChatBotIcon } from "./person-icons";
+import { CHAT_PERSON_ICON_WIDTH } from "../people";
 import { ChatMessageActions, ChatMessageHeader } from "./header";
-import { ResponsiveTickerBadgeText } from "./inline-tokens";
+import { Button } from "../../../../components/ui";
+import { canReactToMessage } from "../reactions";
+import { TerminalChatReactions } from "./reactions";
+import { TerminalChatMessageRow } from "./inline-tokens";
+import { TerminalChatPaneChip } from "./pane-chip";
+import { chatMessagePaneLinks } from "../pane-links/model";
 import { useSlowPendingSend } from "./pending-send";
 import { getChatMessageRenderState } from "./render-state";
 import type { ChatMessageBaseProps } from "./types";
@@ -21,6 +29,7 @@ export function TerminalChatMessage({
   messages,
   selectedIdx,
   hoveredIdx,
+  highlighted,
   canSend,
   contentWidth,
   messageBodyWidth,
@@ -37,28 +46,47 @@ export function TerminalChatMessage({
   latestEditableMessageId,
   retryMessage,
   setHoveredIdx,
+  reactionsEnabled = false,
+  currentUserId = null,
+  toggleReaction,
+  openReactionPicker,
+  openPaneLink,
 }: TerminalChatMessageProps) {
   const rendererHost = useRendererHost();
   const slowSend = useSlowPendingSend(msg);
+  const canReact = reactionsEnabled && canReactToMessage(msg);
   const state = getChatMessageRenderState({
     msg,
     index,
     messages,
     selectedIdx,
     hoveredIdx,
+    highlighted,
     canSend,
     canEdit: msg.id === latestEditableMessageId,
+    canReact: canReact && !!openReactionPicker,
     slowSend,
     host: "terminal",
   });
-  const actionProps = { state, index, beginReplyTo, beginEditMessage, retryMessage };
+  const reactAction = openReactionPicker ? (
+    <Button stopPropagation
+      label={t("React")}
+      width={MESSAGE_ACTION_WIDTH}
+      variant={state.isSelected ? "primary" : "secondary"}
+      onPress={() => openReactionPicker(index)}
+    />
+  ) : null;
+  const actionProps = { state, index, beginReplyTo, beginEditMessage, retryMessage, reactAction };
   const attachments = msg.attachments ?? [];
+  // A share link is its chip's row; a message that was only one has no text row.
+  const { links: paneLinks, content } = chatMessagePaneLinks(msg);
   // An image-only message has no text row; its image rows start where the text would.
-  const bodyLines = msg.content.length > 0 || attachments.length === 0
-    ? getMessageBodyTokenLines(msg.content, messageBodyWidth, catalog)
+  const bodyLines = content.length > 0 || (attachments.length === 0 && paneLinks.length === 0)
+    ? getMessageBodyTokenLines(content, messageBodyWidth, catalog)
     : [];
   const reviewNote = chatImageReviewNote(msg);
   const imageColor = state.isSelected ? state.selectedTextColor : colors.textDim;
+  const quotedAuthorIsBot = !!msg.replyTo && isQuotedAuthorManagedBot(msg.replyTo, userByUsername);
   const setHovered = () => setHoveredIdx((current) => (current === index ? current : index));
   const clearHovered = () => setHoveredIdx((current) => (current === index ? null : current));
   const messageRowProps = {
@@ -81,11 +109,20 @@ export function TerminalChatMessage({
           }}
         >
           <Text fg={state.replyMetaColor}>{`${t("reply")} `}</Text>
-          <Text fg={state.replyAuthorColor}>{msg.replyTo.user.username}: </Text>
+          {quotedAuthorIsBot ? (
+            // The bot's icon stands where the colon would.
+            <>
+              <Text fg={state.replyAuthorColor}>{msg.replyTo.user.username}</Text>
+              <ChatBotIcon selectedColor={state.isSelected ? state.selectedTextColor : undefined} />
+              <Text fg={state.replyAuthorColor}> </Text>
+            </>
+          ) : (
+            <Text fg={state.replyAuthorColor}>{msg.replyTo.user.username}: </Text>
+          )}
           <Text fg={state.replyMetaColor}>
             {formatInlinePreview(
               chatReplyQuoteText(msg.replyTo),
-              Math.max(messageBodyWidth - `reply ${msg.replyTo.user.username}: `.length, 0),
+              Math.max(messageBodyWidth - `reply ${msg.replyTo.user.username}`.length - (quotedAuthorIsBot ? CHAT_PERSON_ICON_WIDTH + 1 : 2), 0),
             )}
           </Text>
         </Box>
@@ -112,11 +149,11 @@ export function TerminalChatMessage({
           position={state.grouped ? "relative" : undefined}
         >
           <Box width={messageBodyWidth} height={1}>
-            <ResponsiveTickerBadgeText
-              tokens={line}
-              prewrapped
+            <TerminalChatMessageRow
+              line={line}
               catalog={catalog}
               textColor={state.bodyColor}
+              mutedColor={state.bodyMutedColor}
               openTicker={openTicker}
               userByUsername={userByUsername}
               onUserHover={onUserHover}
@@ -128,6 +165,25 @@ export function TerminalChatMessage({
           {lineIndex === 0 && state.grouped && <ChatMessageActions floating {...actionProps} />}
         </Box>
       ))}
+      {paneLinks.map((link, linkIndex) => (
+        <Box
+          key={`${msg.id}:pane:${link.kind === "share" ? link.id : link.link.kind}`}
+          {...messageRowProps}
+          paddingLeft={3}
+          height={1}
+          flexDirection="row"
+          position={state.grouped && bodyLines.length === 0 && linkIndex === 0 ? "relative" : undefined}
+        >
+          <TerminalChatPaneChip
+            link={link}
+            width={messageBodyWidth}
+            selected={state.isSelected}
+            selectedTextColor={state.selectedTextColor}
+            onOpen={openPaneLink}
+          />
+          {state.grouped && bodyLines.length === 0 && linkIndex === 0 && <ChatMessageActions floating {...actionProps} />}
+        </Box>
+      ))}
       {attachments.map((attachment, imageIndex) => (
         <Box
           key={`${msg.id}:image:${attachment.id}`}
@@ -135,7 +191,7 @@ export function TerminalChatMessage({
           paddingLeft={3}
           height={1}
           flexDirection="row"
-          position={state.grouped && bodyLines.length === 0 && imageIndex === 0 ? "relative" : undefined}
+          position={state.grouped && bodyLines.length === 0 && paneLinks.length === 0 && imageIndex === 0 ? "relative" : undefined}
         >
           <Box
             height={1}
@@ -149,7 +205,7 @@ export function TerminalChatMessage({
               {formatInlinePreview(`[${chatImageLabel(attachment)}]`, messageBodyWidth)}
             </Text>
           </Box>
-          {state.grouped && bodyLines.length === 0 && imageIndex === 0 && <ChatMessageActions floating {...actionProps} />}
+          {state.grouped && bodyLines.length === 0 && paneLinks.length === 0 && imageIndex === 0 && <ChatMessageActions floating {...actionProps} />}
         </Box>
       ))}
       {reviewNote && (
@@ -159,6 +215,14 @@ export function TerminalChatMessage({
           </Text>
         </Box>
       )}
+      <TerminalChatReactions
+        msg={msg}
+        currentUserId={currentUserId}
+        canReact={canReact && !!toggleReaction}
+        onToggle={toggleReaction ?? (() => {})}
+        rowProps={messageRowProps}
+        width={messageBodyWidth}
+      />
     </Box>
   );
 }

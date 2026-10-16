@@ -1,9 +1,12 @@
 import { expect, test } from "bun:test";
+import { deriveHeadlessFreshness } from "../../../cli/pane-functions/freshness";
+import { headlessReportTables, renderHeadlessPaneText, serializeHeadlessPaneResult } from "../../../cli/pane-functions/headless";
 import { createDefaultConfig } from "../../../types/config";
 import type { HeadlessPaneContext } from "../../../types/headless";
 import type { TickerRecord } from "../../../types/ticker";
 import { createTestDataProvider, createTestQuote } from "../../../test-support/data-provider";
 import { createTestTicker } from "../../../test-support/ticker";
+import { setCliColorEnabledOverride } from "../../../utils/cli-output";
 import { collectionHoldingsHeadless } from "./headless";
 
 const BROKER = { id: "broker:ibkr-main:U1234567", name: "U1234567", currency: "USD", brokerId: "ibkr", brokerInstanceId: "ibkr-main", brokerAccountId: "U1234567" };
@@ -100,5 +103,57 @@ test("a watchlist reads by name, and an unknown id lists the ones that exist", a
   expect(watchlist.metadata).toMatchObject({ collection: { kind: "watchlist", id: "tech" }, tickers: 1 });
 
   await expect(collectionHoldingsHeadless.load(args("default"), context()))
-    .rejects.toThrow(`Unknown portfolio or watchlist "default". IDs: main, ${BROKER.id}, tech.`);
+    .rejects.toThrow(`Unknown portfolio or watchlist "default". Portfolios and watchlists: Main (main), U1234567 (${BROKER.id}), Tech (tech).`);
+});
+
+test("a watchlist and a portfolio date a pre-market quote nothing has traded in by the close they show, as quote does", async () => {
+  // Fri 16 Oct 2026 before 08:00 UTC trades: the price is Thursday's last after-hours print, the row shows Thursday's close.
+  const waiting = (symbol: string) => createTestQuote({
+    symbol, price: 500.4, change: 0.4, changePercent: 0.08, previousClose: 500, regularClose: 500, regularCloseSessionDate: "2026-10-15",
+    regularChange: 2, regularChangePercent: 0.4, changeSessionDate: "2026-10-16", marketState: "PRE", extendedSessionPrint: false,
+    listingExchangeName: "NASDAQ", lastUpdated: Date.parse("2026-10-15T23:59:00Z"),
+  });
+  const ctx = { ...context(), marketData: createTestDataProvider({ getQuote: async (symbol) => waiting(symbol) }) } as HeadlessPaneContext;
+  const close = Date.parse("2026-10-15T20:00:00Z");
+  expect((await collectionHoldingsHeadless.load(args("tech"), ctx)).rows[0]).toMatchObject({ price: 500, updatedAt: close });
+  const held = (await collectionHoldingsHeadless.load(args(BROKER.id), ctx)).rows.filter((row) => row.symbol);
+  expect(held.length).toBeGreaterThan(0);
+  expect(held.map((row) => row.updatedAt)).toEqual(held.map(() => close));
+});
+
+test("the text Ticker column names two listings of one symbol SAN:EPA and SAN:NYSE, while JSON and CSV keep the stored key", async () => {
+  const membership = { portfolios: ["main"], watchlists: ["growth"] };
+  const held = (portfolio: string) => ({ portfolio, shares: 5, avgCost: 10, currency: "USD", broker: "manual" });
+  // Sanofi under the bare key, Banco Santander's New York line under its venue key.
+  const san = [
+    createTestTicker("SAN", "Sanofi", { exchange: "EPA", positions: [held("main")], ...membership }),
+    createTestTicker("SAN:XNYS", "Banco Santander", { exchange: "NYSE", positions: [held("main")], ...membership }),
+  ];
+  const portfolio = { id: "main", name: "Main", currency: "USD", targetWeights: { SAN: 10, "SAN:XNYS": 20 } };
+  const ctx = {
+    config: { ...createDefaultConfig("/unused/pf-headless"), portfolios: [portfolio], watchlists: [{ id: "growth", name: "Growth" }] },
+    signal: new AbortController().signal,
+    marketData: createTestDataProvider({ getQuote: async (symbol) => createTestQuote({ symbol, price: 12 }) }),
+    resolvePortfolio: async () => ({ portfolio, tickers: san }),
+    resolveWatchlist: async () => san,
+  } as unknown as HeadlessPaneContext;
+  setCliColorEnabledOverride(false);
+
+  try {
+    for (const target of ["main", "growth"]) {
+      const result = await collectionHoldingsHeadless.load(args(target), ctx);
+      const text = renderHeadlessPaneText(collectionHoldingsHeadless, result, args(target), "PF");
+      expect(text.split("\n").filter((line) => /^SAN/.test(line)).map((line) => line.split(/\s+/)[0])).toEqual(["SAN:EPA", "SAN:NYSE"]);
+
+      // Rows, JSON and CSV read the stored key.
+      expect(result.rows.map((row) => row.symbol)).toEqual(["SAN", "SAN:XNYS"]);
+      const json = serializeHeadlessPaneResult(collectionHoldingsHeadless, result) as { rows: { symbol: string }[] };
+      expect(json.rows.map((row) => row.symbol)).toEqual(["SAN", "SAN:XNYS"]);
+      const freshness = deriveHeadlessFreshness(collectionHoldingsHeadless, result);
+      const table = headlessReportTables(collectionHoldingsHeadless, result, args(target), "PF", freshness, { complete: true, unavailableSymbols: [] }).tables[0]!;
+      expect(table.rows.map((row) => row[table.columns.indexOf("Ticker")])).toEqual(["SAN", "SAN:XNYS"]);
+    }
+  } finally {
+    setCliColorEnabledOverride(null);
+  }
 });

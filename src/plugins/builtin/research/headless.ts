@@ -12,6 +12,7 @@ import type {
 import { buildEventRows, eventSourceNotice, type EventRow } from "./event-model";
 import { EVENT_COLUMNS, loadEventSources } from "./event-sources";
 import { REPORTED_DATA } from "../shared/report-freshness";
+import { EPS_BASIS_NOTE } from "../shared/earnings-report";
 
 export interface EarningsEstimateSources {
   actions: CorporateActionsData | null;
@@ -81,7 +82,7 @@ function projectEarningsEstimatesHeadless(
       returned: rows.length,
       truncated: rows.length < matching.length,
       coverageNote: notice?.text,
-      epsBasis: "Provider EPS and consensus may be adjusted; accounting basis is unspecified. TTM EPS sums the reported quarter rows when all four match a statement period; otherwise it comes from statements.",
+      epsBasis: `${EPS_BASIS_NOTE} The TTM row's EPS is the GAAP diluted trailing figure ticker shows as EPS (TTM), or the four statement quarters' diluted EPS when none is served; reported quarters of different bases are never summed, and the row adds an adjusted sum only when all four quarters are adjusted.`,
       dateNote: "Fiscal period dates are not announcement dates. Revenue is attached only to an identified statement period.",
       unmatchedReportedPeriods,
     },

@@ -148,6 +148,14 @@ export const commands: Command[] = [
   },
 
   {
+    id: "share-pane",
+    prefix: "",
+    aliases: ["share pane", "share link", "copy link"],
+    label: "Share",
+    description: "Copy a link to the focused pane",
+    category: "Config",
+  },
+  {
     id: "pane-settings",
     prefix: "PS",
     label: "Pane Settings",
@@ -240,6 +248,14 @@ export const commands: Command[] = [
     prefix: "",
     label: "Check for Updates",
     description: "Check GitHub releases for a newer version",
+    category: "Config",
+  },
+  {
+    // Not "Update ...": "update" has to land on Check for Updates first.
+    id: "release-channel",
+    prefix: "",
+    label: "Release Channel",
+    description: "Update from stable releases, or from nightly builds as well",
     category: "Config",
   },
   {

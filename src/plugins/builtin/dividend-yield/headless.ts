@@ -8,8 +8,10 @@ import { dividendReferencePrice, fetchDividendData, type DividendData } from "./
 import type { DividendPayment } from "./types";
 import { formatDividendYield, toDividendRows } from "./view";
 import { formatDistributionAmount, formatPercent } from "../../../utils/format";
-import { currencyMinorDigits, formatMarketPriceWithCurrency } from "../../../market-data/market/format";
+import { forwardDividendBasis } from "../../../utils/forward-dividend";
+import { currencyPriceMinDigits, formatMarketPriceWithCurrency } from "../../../market-data/market/format";
 import type { Quote } from "../../../types/financials";
+import { regularSessionValuationPrice } from "../../../market-data/quotes/regular-session-valuation";
 import { dividendPriceStatus, dividendQuotePriceMetadata } from "./reference-price";
 
 const PAYMENT_COLUMNS = [
@@ -34,7 +36,8 @@ const defaultDependencies: DividendYieldHeadlessDependencies = {
     const exchange = instrument?.exchange ?? "";
     try {
       const quote = await context.marketData.getQuote(symbol, exchange);
-      currentPrice = quote.price ?? null;
+      // The regular session's price: after the close, the close rather than an after-hours print.
+      currentPrice = regularSessionValuationPrice(quote);
       currentPriceCurrency = quote.currency;
       referenceQuote = quote;
     } catch {
@@ -50,6 +53,12 @@ const defaultDependencies: DividendYieldHeadlessDependencies = {
 
 function dateEntry(label: string, date: Date | null) {
   return { label, value: date, formatted: date ? date.toISOString().slice(0, 10) : "—" };
+}
+
+/** The next pay date, when it is the one stated beside the ex-date the forward rate is dated by. */
+function forwardPayDate(metrics: DividendData["metrics"]): Date | null {
+  const exDate = metrics.nextExDividendDate?.toISOString().slice(0, 10);
+  return exDate != null && exDate === metrics.forwardRateAsOf ? metrics.nextPayDate : null;
 }
 
 function matchesType(payment: DividendPayment, type: string): boolean {
@@ -85,13 +94,15 @@ export function projectDividendYieldHeadless(
       {
         title: "Dividend metrics",
         entries: [
-          { label: "Price", value: data.price, ...(data.price != null && currency ? { formatted: formatMarketPriceWithCurrency(data.price, currency, { minimumFractionDigits: Math.min(2, currencyMinorDigits(currency)) }) } : {}) },
+          { label: "Price", value: data.price, ...(data.price != null && currency ? { formatted: formatMarketPriceWithCurrency(data.price, currency, { minimumFractionDigits: currencyPriceMinDigits(currency) }) } : {}) },
           ...(data.stale ? [{ label: "History status", value: "Stale cash history; recent distributions may be missing." }] : []),
           ...(priceStatus ? [{ label: "Price status", value: priceStatus === "stale"
             ? "Stale reference price; cash yield may be out of date."
             : "Reference price time unavailable; cash yield may be out of date." }] : []),
           { label: "Trailing yield", value: metrics.trailingYield, formatted: formatDividendYield(metrics.trailingYield) },
-          { label: "Forward yield", value: metrics.forwardYield, formatted: formatDividendYield(metrics.forwardYield) },
+          { label: "Forward yield", value: metrics.forwardYield, formatted: metrics.forwardYield == null ? formatDividendYield(null)
+            : `${formatDividendYield(metrics.forwardYield)} (${forwardDividendBasis(metrics.forwardRateAsOf,
+              { payDate: forwardPayDate(metrics), declared: data.declared, currency })})` },
           { label: "Trailing rate", value: metrics.trailingRate, formatted: currency ? formatDistributionAmount(metrics.trailingRate ?? undefined, currency) : "—" },
           { label: "Forward rate", value: metrics.forwardRate, formatted: currency ? formatDistributionAmount(metrics.forwardRate ?? undefined, currency) : "—" },
           { label: "Earnings Payout", value: metrics.payoutRatio, formatted: formatDividendYield(metrics.payoutRatio) },
@@ -127,7 +138,10 @@ export function projectDividendYieldHeadless(
       priceStale: data.priceStale ?? null,
       limitations: data.notes ?? [],
       yieldMethod: "Cash distributions with ex-dates in the preceding 12 months, one payment per period for a regular cadence, divided by the reference share price; excludes reinvestment and is not SEC yield or total return.",
-      forwardRateMethod: "Provider indicated annual cash rate, only when its currency units are comparable with the share price.",
+      forwardRateAsOf: metrics.forwardRateAsOf,
+      // Declared and unpaid, apart from the paid history the table and every figure read.
+      declaredDividends: data.declared ?? [],
+      forwardRateMethod: "Indicated annual cash rate, the one fundamentals use: the latest regular distribution annualized, or once the next one is declared that one, dated by its ex-date (forwardRateAsOf; a date still ahead is the declared distribution's). Only when its currency units are comparable with the share price.",
       paymentFrequencyMethod: "Cadence inferred from ex-dates in the last two years, unavailable when no cash was reported in the last year; not an announced payment schedule.",
     },
   };
