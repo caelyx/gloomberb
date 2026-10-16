@@ -7,17 +7,14 @@ import {
   type ChartSeriesCatalogItem,
 } from "../../../capabilities";
 import type { TimeSeriesFieldDefinition } from "../../../time-series/types";
-import {
-  FUTURES_CONTRACTS,
-  FUTURES_SECTOR_LABELS,
-} from "../futures/contracts";
-import { TREASURY_MATURITIES } from "../yield-curve/treasury-data";
+import type { SeriesCatalogEntry } from "../../../series/types";
 import {
   canonicalExchange,
   parsePublicTickerKey,
   publicTickerKey,
 } from "../../../utils/exchanges";
 import { parseSeriesExpression, type ParsedSeriesExpression } from "./series-expression";
+import { parseFormulaExpression } from "./formula";
 
 export interface SeriesCatalogInstrument {
   symbol: string;
@@ -26,13 +23,21 @@ export interface SeriesCatalogInstrument {
   assetCategory?: string;
 }
 
-export interface SeriesCatalogSuggestion {
+interface SeriesCatalogSuggestionText {
   id: string;
   label: string;
   description: string;
   detail: string;
-  expression: ParsedSeriesExpression;
 }
+
+/**
+ * One series to add, or a catalog formula (`42*HO=F - CL=F`): its legs join
+ * the chart with the study that weighs them.
+ */
+export type SeriesCatalogSuggestion = SeriesCatalogSuggestionText & (
+  | { expression: ParsedSeriesExpression; formula?: never }
+  | { formula: string; expression?: never }
+);
 
 export interface SeriesSearchAnalysis {
   directInstrument: SeriesCatalogInstrument | null;
@@ -271,50 +276,85 @@ function matchesAliasQuery(query: string, ...values: string[]): boolean {
   return tokens.length > 0 && tokens.every((token) => searchable.includes(token));
 }
 
-function coreAliasSuggestions(query: string): SeriesCatalogSuggestion[] {
-  const futures = FUTURES_CONTRACTS
-    .filter((contract) => matchesAliasQuery(
-      query,
-      `FUT:${contract.code}`,
-      contract.code,
-      contract.name,
-      `${contract.name} futures`,
-      contract.sector,
-      FUTURES_SECTOR_LABELS[contract.sector],
-    ))
-    .map((contract): SeriesCatalogSuggestion => ({
-      id: `${contract.symbol}:market.ohlcv`,
-      label: `FUT:${contract.code} · ${contract.name}`,
-      description: `${FUTURES_SECTOR_LABELS[contract.sector]} futures`,
-      detail: "Futures",
-      expression: {
-        kind: "security",
-        symbol: contract.symbol,
-        fieldId: "market.ohlcv",
-        label: contract.name,
-      },
-    }));
-  const treasuries = TREASURY_MATURITIES
-    .filter((treasury) => matchesAliasQuery(
-      query,
-      `UST:${treasury.maturity}`,
-      treasury.maturity,
-      treasury.seriesId,
-      `${treasury.maturity.replace("M", " month").replace("Y", " year")} US Treasury yield`,
-    ))
-    .map((treasury): SeriesCatalogSuggestion => ({
-      id: `fred:${treasury.seriesId}`,
-      label: `UST:${treasury.maturity} · Treasury Yield`,
-      description: `U.S. Treasury ${treasury.maturity} yield · FRED ${treasury.seriesId}`,
-      detail: "Treasury",
-      expression: {
-        kind: "economic",
-        provider: "fred",
-        seriesId: treasury.seriesId,
-        label: `${treasury.maturity} Treasury Yield`,
-      },
-    }));
-  return [...futures, ...treasuries];
+function suggestionId(expression: ParsedSeriesExpression): string {
+  if (expression.kind === "economic") return `fred:${expression.seriesId}`;
+  if (expression.kind === "capability") {
+    return chartSeriesSourceKey({ kind: "capability", capabilityId: expression.capabilityId, seriesId: expression.seriesId });
+  }
+  return `${publicTickerKey(expression.symbol, expression.exchange)}:${expression.fieldId}`;
+}
+
+function registeredMatchRank(entry: SeriesCatalogEntry, query: string): number {
+  const name = compact(entry.name);
+  const needle = compact(query);
+  if (name === needle || compact(entry.expression) === needle) return 0;
+  if (name.startsWith(needle)) return 1;
+  return 2;
+}
+
+/**
+ * Registered catalog series the query names: by name, expression, group or
+ * tags. A series that takes a ticker is filled in with the one the query
+ * names, or the chart's own; ticker fields come from the field ranking instead.
+ */
+function registeredSeriesSuggestions(
+  query: string,
+  registered: readonly SeriesCatalogEntry[],
+  analysis: SeriesSearchAnalysis,
+  defaultInstrument: SeriesCatalogInstrument,
+): SeriesCatalogSuggestion[] {
+  if (!query.trim() || registered.length === 0) return [];
+  const instrument = analysis.directInstrument ?? defaultInstrument;
+  const tickerQuery = analysis.directInstrument ? analysis.metricQuery : query;
+  const hits: Array<{ entry: SeriesCatalogEntry; rank: number } & (
+    | { expression: ParsedSeriesExpression; formula?: never }
+    | { formula: string; expression?: never }
+  )> = [];
+  for (const entry of registered) {
+    let template = entry.expression;
+    let text = query;
+    if (entry.input) {
+      // Ticker fields are ranked against the security below; options and pairs need their own symbol.
+      if (entry.input !== "ticker" || /^\{ticker\}:[A-Za-z]/.test(template) || !tickerQuery.trim()) continue;
+      const symbol = publicTickerKey(instrument.symbol, instrument.exchange);
+      template = template.replaceAll("{ticker}", template.startsWith("CAP:") ? encodeURIComponent(symbol) : symbol);
+      text = tickerQuery;
+    }
+    if (!matchesAliasQuery(text, entry.name, entry.expression, entry.id, entry.group ?? "", ...(entry.tags ?? []))) continue;
+    const parsed = parseSeriesExpression(template);
+    if (!parsed) {
+      if (!entry.input && catalogFormula(template)) hits.push({ entry, rank: registeredMatchRank(entry, text), formula: template });
+      continue;
+    }
+    const label = entry.input ? `${publicTickerKey(instrument.symbol, instrument.exchange)} · ${entry.name}` : entry.name;
+    hits.push({ entry, rank: registeredMatchRank(entry, text), expression: { ...parsed, label } });
+  }
+  hits.sort((left, right) => left.rank - right.rank || left.entry.name.length - right.entry.name.length);
+  return hits.map(({ entry, expression, formula }): SeriesCatalogSuggestion => {
+    const description = [entry.group, entry.unit, entry.frequency].filter(Boolean).join(" · ");
+    const detail = entry.group ?? "Series";
+    if (formula !== undefined) {
+      // A formula runs long: its name leads, and the formula is in the description.
+      const formulaDescription = [formula, entry.unit, entry.frequency].filter(Boolean).join(" · ");
+      return { id: `formula:${formula}`, label: entry.name, description: formulaDescription, detail, formula };
+    }
+    return {
+      id: suggestionId(expression),
+      label: expression.kind === "capability" ? expression.label ?? entry.name : `${entry.expression} · ${entry.name}`,
+      description,
+      detail,
+      expression,
+    };
+  });
+}
+
+/** Whether a catalog series is a formula G can chart: a registered one that does not read is left out. */
+function catalogFormula(expression: string): boolean {
+  try {
+    return parseFormulaExpression(expression) !== null;
+  } catch {
+    return false;
+  }
 }
 
 export function buildCapabilitySeriesSuggestions(
@@ -345,6 +385,7 @@ export function buildSeriesCatalogSuggestions(
   defaultInstrument: SeriesCatalogInstrument,
   searchedInstruments: readonly SeriesCatalogInstrument[] = [],
   limit = 8,
+  registered: readonly SeriesCatalogEntry[] = [],
 ): SeriesCatalogSuggestion[] {
   const exact = exactExpressionSuggestion(query.trim());
   const analysis = analyzeSeriesSearchQuery(query);
@@ -362,7 +403,7 @@ export function buildSeriesCatalogSuggestions(
     .sort((left, right) => right.score - left.score || left.field.label.localeCompare(right.field.label));
 
   const suggestions: SeriesCatalogSuggestion[] = exact ? [exact] : [];
-  for (const suggestion of coreAliasSuggestions(query)) {
+  for (const suggestion of registeredSeriesSuggestions(query, registered, analysis, defaultInstrument)) {
     if (!suggestions.some((entry) => entry.id === suggestion.id)) suggestions.push(suggestion);
   }
   const fieldLimit = instruments.length > 1 && !analysis.metricQuery ? 1 : rankedFields.length;

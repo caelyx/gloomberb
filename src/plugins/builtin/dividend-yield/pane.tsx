@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { regularSessionValuationPrice } from "../../../market-data/quotes/regular-session-valuation";
 import {
   chartTableChromeRows,
   ChartTableHeader,
@@ -21,6 +22,7 @@ import { colors, priceColor } from "../../../theme/colors";
 import { TextAttributes, useUiCapabilities } from "../../../ui";
 import { displayWidth, formatCurrency, formatDistributionAmount, formatPercentRaw } from "../../../utils/format";
 import { resolveCurrencyUnit } from "../../../utils/currency-units";
+import { forwardDividendNote } from "../../../utils/forward-dividend";
 import { nextHeaderSort } from "../../../utils/sort-values";
 import { handleRefreshKey, loadingErrorFooterInfo } from "../../../components/data-table/table-pane";
 import { SignInWall } from "../cloud/auth-actions";
@@ -71,13 +73,17 @@ function formatFrequency(freq: DividendMetrics["paymentFrequency"]): string {
  * clip them. The latest ex-date is the table's first row, so it shows only
  * when there is no table.
  */
-function buildMetricItems(metrics: DividendMetrics, currency: string, hasHistory: boolean, short: boolean): StatItem[] {
+function buildMetricItems(metrics: DividendMetrics, currency: string, hasHistory: boolean, short: boolean,
+  declared: DividendData["declared"]): StatItem[] {
   const exDate: StatItem[] = metrics.nextExDividendDate
     ? [{ id: "next-ex", label: "Next ex", value: formatDate(metrics.nextExDividendDate) }]
     : hasHistory ? [] : [{ id: "last-ex", label: "Last ex", value: formatDate(metrics.lastExDividendDate) }];
+  const forwardNote = metrics.forwardYield != null ? forwardDividendNote(metrics.forwardRateAsOf, { declared, currency }) : null;
   return [
     { id: "ttm-yield", label: short ? "TTM yld" : "TTM yield", value: formatDividendYield(metrics.trailingYield), color: priceColor(metrics.trailingYield ?? 0) },
-    { id: "forward-yield", label: short ? "Fwd yld" : "Fwd yield", value: formatDividendYield(metrics.forwardYield), color: priceColor(metrics.forwardYield ?? 0) },
+    // Dated by the distribution it annualizes, or marked declared (with its stated amount) beside the next ex-date; docs/research-data.md says how it is built.
+    { id: "forward-yield", label: short ? "Fwd yld" : "Fwd yield", value: formatDividendYield(metrics.forwardYield), color: priceColor(metrics.forwardYield ?? 0),
+      ...(forwardNote ? { detail: forwardNote } : {}) },
     { id: "ttm-rate", label: short ? "TTM/sh" : "TTM/share", value: formatRate(metrics.trailingRate, currency) },
     { id: "forward-rate", label: short ? "Fwd/sh" : "Fwd/share", value: formatRate(metrics.forwardRate, currency) },
     { id: "growth-1y", label: short ? "1Y chg" : "1Y growth", value: formatGrowth(metrics.growth1Y), color: priceColor(metrics.growth1Y ?? 0) },
@@ -133,7 +139,8 @@ export function DividendYieldPane({ focused, width, height, loadData = fetchDivi
   const cloudSession = useResearchCloudSession();
   const quoteCurrency = financials?.quote?.currency;
   const exchange = ticker?.metadata.exchange ?? "";
-  const quotePrice = financials?.quote?.price ?? null;
+  // The regular session's price: after the close, the close rather than an after-hours print.
+  const quotePrice = regularSessionValuationPrice(financials?.quote);
 
   const [sortPreference, setSortPreference] = useState<DividendSortPreference>(DEFAULT_SORT_PREFERENCE);
   // Null follows the table's first row, including after a reload.
@@ -219,13 +226,13 @@ export function DividendYieldPane({ focused, width, height, loadData = fetchDivi
   });
   // The header row, plus the scrollbar row once the columns overflow the pane.
   const tableChromeRows = chartTableChromeRows(columns, width);
-  const fullFigures = metrics ? buildMetricItems(metrics, currency, sortedRows.length > 0, false) : [];
+  const fullFigures = metrics ? buildMetricItems(metrics, currency, sortedRows.length > 0, false, data?.declared) : [];
   const keptFigures = chartTableLayout({
     width, height, figures: fullFigures, tableRows: sortedRows.length, tableChromeRows, chart: chartPoints.length >= 2 ? {} : null,
   }).figures;
   // The desktop grid never clips a label; the terminal shortens them rather than clip.
   const figures = metrics && !nativePaneChrome && labelsClip(keptFigures, width)
-    ? buildMetricItems(metrics, currency, sortedRows.length > 0, true) : fullFigures;
+    ? buildMetricItems(metrics, currency, sortedRows.length > 0, true, data?.declared) : fullFigures;
 
   const handleHeaderClick = useCallback((columnId: string) => {
     setSortPreference((current) => nextHeaderSort(current, columnId as DividendColumnId, {

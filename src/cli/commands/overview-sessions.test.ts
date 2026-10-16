@@ -3,7 +3,7 @@ import { apiClient } from "../../api-client";
 import type { Quote } from "../../types/financials";
 import { getExtendedSessionDisplay, getRegularSessionDisplay } from "../../market-data/market/status";
 import { createTestCliContext, type PrintedCliResult } from "../../test-support/cli-context";
-import { sessionQuotes } from "../../test-support/test-fixture-session-quotes";
+import { moverSessionPayload, sessionQuotes } from "../../test-support/test-fixture-session-quotes";
 import { setCliColorEnabledOverride, setCliWidthOverride } from "../../utils/cli-output";
 import { DEFAULT_CLI_OPTIONS } from "../options";
 import { serializeCliResult } from "../result";
@@ -76,4 +76,80 @@ test("indices and trending report an index level and a held name the same way", 
     { symbol: "NVDA", price: 199.1, extendedPrice: null },
   ]);
   expect(line("AAPL")).toMatch(/\$198\.78 +\+0\.51% +\$198\.80 \+0\.01%/);
+});
+
+test("movers gainers and active headline each row's regular session from the sessions the server sends", async () => {
+  // As /market/movers sends a row: the live print it is ranked by, and its quote's sessions beside it.
+  const listed = (quote: Quote) => ({
+    symbol: quote.symbol, name: `${quote.symbol} Inc.`, price: quote.price, change: quote.change, changePercent: quote.changePercent,
+    previousClose: quote.previousClose, volume: 2_000_000, currency: "USD", exchange: "NASDAQ", lastUpdated: quote.lastUpdated,
+    ...moverSessionPayload(quote),
+  });
+  const movers = spyOn(apiClient, "getMarketMovers");
+  const list = async (name: string, quotes: Quote[]) => {
+    movers.mockResolvedValue({ status: "success", data: { quotes: quotes.map(listed), source: "gloom", stale: false, asOf: "2026-10-10T20:00:00Z" } } as never);
+    return run("movers", [name], []);
+  };
+  try {
+    for (const state of ["weekend", "afterHours", "preMarket"] as const) {
+      const quote = sessionQuotes()[state];
+      const headline = getRegularSessionDisplay(quote)!;
+      const extended = getExtendedSessionDisplay(quote)!;
+      // XLK closed up, so Losers has no place for it.
+      for (const name of ["gainers", "active"]) {
+        const { rows, text, line } = await list(name, [quote]);
+        expect(rows[0]).toMatchObject({
+          symbol: "XLK", price: headline.price, change: headline.change, changePercent: headline.changePercent,
+          extendedSession: extended.session, extendedPrice: extended.price, extendedChangePercent: extended.changePercent,
+        });
+        expect(rows[0]).not.toHaveProperty("sessions");
+        expect(text).toContain(state === "preMarket" ? "Pre-Market" : "After Hours");
+        expect(line("XLK")).toMatch(state === "preMarket" ? /\$198\.78 +\+0\.51% +\$199\.50 \+0\.36%/ : /\$198\.78 +\+0\.51% +\$198\.80 \+0\.01%/);
+      }
+    }
+
+    // WFF on Saturday: Friday's close of 12.29, +499.51% from 2.05, then a 9.99 after-hours print.
+    const wff: Quote = {
+      ...sessionQuotes("WFF").weekend, price: 9.99, change: 7.94, changePercent: 387.32, previousClose: 2.05,
+      regularClose: 12.29, regularChange: 10.24, regularChangePercent: 499.51,
+    };
+    const gainers = await list("gainers", [sessionQuotes().weekend, wff]);
+    expect(gainers.rows.map((row) => row.symbol)).toEqual(["WFF", "XLK"]);
+    expect(gainers.line("WFF")).toMatch(/\$12\.29 +\+499\.51% +\$9\.99 -18\.71%/);
+
+    // In the regular session the list is the live quote, with no extended column.
+    const open = await list("active", [sessionQuotes().regular]);
+    expect(open.rows[0]).toMatchObject({ price: 199.1, changePercent: 0.6674, extendedSession: null, extendedPrice: null });
+    expect(open.text).not.toMatch(/After Hours|Pre-Market/);
+  } finally {
+    movers.mockRestore();
+  }
+});
+
+test("after the close movers ranks Gainers by the regular-session move it shows, or by the after-hours move with --session extended, and says which", async () => {
+  // Saturday: each closed Friday from 50 and printed after hours.
+  const closed = (symbol: string, close: number, last: number) => ({
+    symbol, name: `${symbol} Inc.`, price: last, change: last - 50, changePercent: (last / 50 - 1) * 100, previousClose: 50,
+    volume: 2_000_000, currency: "USD", exchange: "NASDAQ", lastUpdated: Date.parse("2026-10-09T23:58:00Z"),
+    regularClose: close, regularCloseSessionDate: "2026-10-09", regularChange: close - 50, regularChangePercent: (close / 50 - 1) * 100,
+    changeSessionDate: "2026-10-09", marketState: "CLOSED",
+  });
+  const movers = spyOn(apiClient, "getMarketMovers").mockResolvedValue({ status: "success", data: { source: "gloom", stale: false,
+    asOf: "2026-10-10T00:00:00Z", quotes: [
+      // As the server ranks them, by the latest print: CCC +58%, AAA +20%, BBB +8%.
+      closed("CCC", 48.2, 79), closed("AAA", 52.5, 60), closed("BBB", 55, 54),
+    ] } } as never);
+  try {
+    const regular = await run("movers", ["gainers"], []);
+    // CCC closed down 3.6%: up 64% after hours, it is no regular-session gainer.
+    expect(regular.rows.map((row) => [row.symbol, round(row.changePercent as number)])).toEqual([["BBB", 10], ["AAA", 5]]);
+    expect(regular.text.split("\n")[0]).toBe("Ranked by the regular-session move");
+    const extended = await run("movers", ["gainers", "--session", "extended"], []);
+    expect(extended.rows.map((row) => [row.symbol, round(row.extendedChangePercent as number)])).toEqual([["CCC", 63.9], ["AAA", 14.29]]);
+    expect(extended.text.split("\n")[0]).toBe("Ranked by the after-hours move");
+    // A list asks for more than it shows, so the rows a closed session drops leave it full.
+    expect(movers.mock.calls.every(([, count]) => count === 50)).toBe(true);
+  } finally {
+    movers.mockRestore();
+  }
 });

@@ -1,5 +1,5 @@
 import { apiClient } from "../../../api-client";
-import { parsePublicTickerKey } from "../../../utils/exchanges";
+import { usListingSymbol } from "../../../utils/sec";
 
 export interface ExpiryOpenInterest {
   date: string;
@@ -50,6 +50,14 @@ export interface GammaStrike {
   net: number;
 }
 
+interface GammaExpiry {
+  expiry: string;
+  calls: number;
+  /** Short, as a positive number. */
+  puts: number;
+  net: number;
+}
+
 export interface GammaPayload {
   version: 1;
   symbol: string;
@@ -72,14 +80,20 @@ export interface GammaPayload {
   bandWithBoxes?: { low: number; high: number } | null;
   flip: number | null;
   strikes: GammaStrike[];
+  /** Each priced expiry's totals, from the same legs as `total`; absent from older servers. */
+  byExpiry?: GammaExpiry[];
   quotesAsOf: string | null;
   warnings: string[];
 }
 
 export type OptionsPositioningApi = Pick<typeof apiClient, "optionsPositioning">;
 
-/** A listing key ("SPY:ARCX") keeps only its symbol; an index keeps its caret (^SPX). */
-export const positioningSymbol = (symbol: string) => parsePublicTickerKey(symbol.trim()).symbol.toUpperCase();
+/**
+ * A US listing key ("SPY:ARCX") keeps only its symbol; an index keeps its
+ * caret (^SPX). A listing abroad is refused: its bare symbol's chain is
+ * another company's (SAN:EPA's would be Banco Santander's).
+ */
+export const positioningSymbol = (symbol: string) => usListingSymbol(symbol, "Options data");
 
 const query = (symbol: string, expiry: string | null) =>
   new URLSearchParams({ symbol: positioningSymbol(symbol), ...(expiry ? { expiry } : {}) }).toString();

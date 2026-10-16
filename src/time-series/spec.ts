@@ -56,7 +56,16 @@ const STUDIES = new Set<ChartStudyKind>([
   "ratio",
   "spread",
   "correlation",
+  "formula",
 ]);
+
+/**
+ * A chart of capability series alone (CHOKE's vessel transits) is a dataset:
+ * dated by its newest observation, not by a market's session.
+ */
+export function isDatasetChart(spec: Pick<ChartSpec, "series">): boolean {
+  return spec.series.length > 0 && spec.series.every(({ source }) => source.kind === "capability");
+}
 
 export function isOhlcSeriesStyle(style: SeriesStyle): boolean {
   return style === "candles" || style === "ohlc" || style === "hlc";
@@ -336,6 +345,13 @@ function requiredInputCount(kind: ChartStudyKind): number {
   return kind === "ratio" || kind === "spread" || kind === "correlation" ? 2 : 1;
 }
 
+/** Whether a study has the inputs its kind takes: two for a pair, one or more for a formula, one for the rest. */
+export function hasStudyInputCount(study: Pick<ChartStudySpec, "kind" | "inputSeriesIds">): boolean {
+  return study.kind === "formula"
+    ? study.inputSeriesIds.length >= 1 && study.inputSeriesIds.length <= MAX_CHART_SERIES
+    : study.inputSeriesIds.length === requiredInputCount(study.kind);
+}
+
 /** Validates semantic constraints that normalization cannot safely guess. */
 export function validateChartSpec(spec: ChartSpec): ChartSpecValidationResult {
   const errors: ChartSpecIssue[] = [];
@@ -496,9 +512,10 @@ export function validateChartSpec(spec: ChartSpec): ChartSpecValidationResult {
     if (!panelIds.has(study.panelId)) {
       errors.push(issue(`${path}.panelId`, "missing-panel", `Panel ${study.panelId} does not exist.`));
     }
-    const inputCount = requiredInputCount(study.kind);
-    if (study.inputSeriesIds.length !== inputCount) {
-      errors.push(issue(`${path}.inputSeriesIds`, "wrong-input-count", `${study.kind} requires ${inputCount} input series.`));
+    if (!hasStudyInputCount(study)) {
+      errors.push(issue(`${path}.inputSeriesIds`, "wrong-input-count", study.kind === "formula"
+        ? `formula requires 1 to ${MAX_CHART_SERIES} input series.`
+        : `${study.kind} requires ${requiredInputCount(study.kind)} input series.`));
     }
     for (const inputId of study.inputSeriesIds) {
       if (!seriesIds.has(inputId)) {

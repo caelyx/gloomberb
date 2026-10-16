@@ -62,7 +62,7 @@ export const SECURITY_HEADERS = {
   // Downstream: frame-src admits YouTube's embedded player, which the bundled
   // gloom-abcnews plugin plays live and stories in (the web build cannot
   // resolve a stream URL of its own). Nothing else may be framed.
-  "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; frame-src https://www.youtube.com; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https:; connect-src 'self' https://api.github.com https://api.fiscaldata.treasury.gov https://plugins.gloom.sh; form-action 'self'; upgrade-insecure-requests",
+  "content-security-policy": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; frame-src https://www.youtube.com; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https:; connect-src 'self' https://api.github.com https://api.fiscaldata.treasury.gov https://plugins.gloom.sh https://gloom.sh; form-action 'self'; upgrade-insecure-requests",
   "cross-origin-opener-policy": "same-origin",
   "cross-origin-resource-policy": "same-origin",
   "permissions-policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",

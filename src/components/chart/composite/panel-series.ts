@@ -28,6 +28,7 @@ function sameSeriesMeta(left: ResolvedSeries, right: ResolvedSeries): boolean {
     && left.color === right.color
     && left.unit === right.unit
     && left.unitGroup === right.unitGroup
+    && left.statedUnit === right.statedUnit
     && left.priceAssetCategory === right.priceAssetCategory
     && left.nativeFrequency === right.nativeFrequency
     && left.timestampMode === right.timestampMode
@@ -39,6 +40,7 @@ function sameSeriesMeta(left: ResolvedSeries, right: ResolvedSeries): boolean {
     && left.interpolation === right.interpolation
     && left.warning === right.warning
     && left.hidden === right.hidden
+    && left.historyStart?.getTime() === right.historyStart?.getTime()
     && left.observationKind === right.observationKind
     && left.timeBasis?.kind === right.timeBasis?.kind
     && left.timeBasis?.timeZone === right.timeBasis?.timeZone

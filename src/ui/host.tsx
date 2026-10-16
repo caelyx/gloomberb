@@ -59,8 +59,8 @@ export interface ChartCrosshairOverlay {
   /** Level line and focus dot; null when only the column is known, as with a keyboard cursor. */
   pixelY: number | null;
   color: string;
-  /** Per-series dots on the cursor column, in bitmap pixels. */
-  markers?: readonly { pixelY: number; color: string }[];
+  /** Per-series dots on the cursor column, in bitmap pixels; hollow for a value carried from an earlier observation. */
+  markers?: readonly { pixelY: number; color: string; hollow?: boolean }[];
 }
 
 /**
@@ -113,6 +113,9 @@ export interface LiveBoxFrame {
   /** Offset from where the box is laid out, carried on the box's own layer. */
   dx?: number;
   dy?: number;
+  /** Position in place of the laid-out one (left and top in its parent): laid out again, with no layer of its own. */
+  x?: number;
+  y?: number;
   /** Size in place of the laid-out one: the box and what stretches inside it lay out again, nothing renders. */
   width?: number;
   height?: number;
@@ -133,6 +136,26 @@ export interface BoxRenderable {
    * so it costs no layout or repaint; a size lays out the box's own subtree.
    */
   setLiveFrame?: (frame: LiveBoxFrame | null) => void;
+  /**
+   * Desktop only: calls `listener` with the box's size in cells each time the
+   * browser lays it out at a new one (a ResizeObserver, after layout and
+   * before paint). Returns the unsubscribe.
+   */
+  observeSize?: (listener: (size: { width: number; height: number }) => void) => () => void;
+  /**
+   * Desktop only, for a surface root (a chart, a heat map): fills the box the
+   * surface sits in where its cells leave a fraction of a cell, refits when
+   * that box changes size at rest, and takes part in every resize (see
+   * `followsFrame`). Returns the untrack.
+   */
+  trackSurface?: () => () => void;
+  /** Desktop only: fits a tracked surface to its box again, after it renders at new cells. */
+  refitSurface?: () => void;
+  /**
+   * Desktop only, during a resize: the axes on which CSS keeps a tracked
+   * surface on the frame's size by itself, to the pixel.
+   */
+  followsFrame?: () => { x: boolean; y: boolean };
   [key: string]: unknown;
 }
 
@@ -164,6 +187,9 @@ export interface ScrollBoxRenderable {
   verticalScrollBar?: ScrollBarRenderable;
   scrollTo(target: number | { x?: number; y?: number }, y?: number): void;
   scrollToPixels?(target: number | { x?: number; y?: number }, y?: number): void;
+  /** A windowed list mounts and measures the target before finishing the scroll. */
+  scrollToItem?(key: string, options?: { align?: "auto" | "start" | "center" | "end"; offset?: number }): boolean;
+  scrollToEnd?(): void;
   /** Terminal only: the scrolled content, whose descendants carry their screen rows as laid out last. */
   content?: { findDescendantById?(id: string): { y: number; height: number } | undefined };
 }
@@ -212,6 +238,29 @@ export interface NativeFrameSpan {
   attributes: number;
 }
 
+/** One cell of a captured frame, in the colours it shows (inverse and dim applied). */
+interface NativeFrameCell {
+  /** Empty for the second cell of a wide character. */
+  char: string;
+  fg: string;
+  bg: string;
+  bold: boolean;
+}
+
+/** A picture of part of the screen, as `capturePaneImage` draws it. */
+export interface NativePaneImage {
+  png: Uint8Array;
+  width: number;
+  height: number;
+  /** The same picture as RGBA pixels, for a preview drawn in cells. */
+  pixels: Uint8ClampedArray;
+  /**
+   * The cells it was drawn from, row by row, for a preview where they fit.
+   * Absent when kitty images were drawn in: the cells under them are blank.
+   */
+  cells?: { cols: number; rows: number; cells: NativeFrameCell[] };
+}
+
 /** The last frame the terminal renderer drew, as styled rows. */
 export interface NativeFrameCapture {
   cols: number;
@@ -249,6 +298,11 @@ export interface NativeRendererHost {
   removePostProcessFn?(processFn: NativePostProcessFn): void;
   /** Terminal renderers only. Kitty graphics are drawn out of band and come back as blank cells. */
   captureFrame?(): NativeFrameCapture | null;
+  /**
+   * Terminal renderers only: a PNG of a rectangle of the frame shown now, in
+   * cells, its characters drawn in a bundled font and its kitty images put back.
+   */
+  capturePaneImage?(rect: { x: number; y: number; width: number; height: number }): Promise<NativePaneImage>;
   copyToClipboardOSC52?(text: string): boolean;
   write?(data: string | Uint8Array): boolean;
   captureMouseRenderable?(renderable: unknown): void;
@@ -262,7 +316,7 @@ export interface NativeRendererHost {
   /** Terminal renderers only: keeps kitty images clear of the panes, menus and dialogs drawn over them. */
   nativeSurfaceManager?: Pick<
     import("../components/chart/native/surface/manager").NativeSurfaceManager,
-    "setWindowState" | "upsertLocalOccluder" | "removeLocalOccluder"
+    "setWindowState" | "upsertLocalOccluder" | "removeLocalOccluder" | "visibleImages"
   >;
 }
 
@@ -422,6 +476,8 @@ interface HostQueryBarOption {
   selected: boolean;
   /** Shortcut key for the option. */
   hint?: string;
+  /** Tints the option's label, e.g. a status in its tone. */
+  color?: string;
 }
 
 export interface HostQueryBarItem {
@@ -467,6 +523,8 @@ export interface HostQueryBarProps {
   onClearAll?: () => void;
   /** Muted context at the right edge, e.g. the selected row's date. */
   meta?: string;
+  /** Drawn before the search and filters, e.g. the ticker the list is about. */
+  leading?: ReactNode;
   /** Opens one item's menu, e.g. from a pane shortcut. The token changes per request. */
   openRequest?: { id: string; token: number } | null;
 }
@@ -516,6 +574,8 @@ export interface HostMenuItem {
   selected?: boolean;
   /** The checkbox state in a multi-select menu. */
   checked?: boolean;
+  /** Tints the label, e.g. a status in its tone; the words carry the meaning. */
+  color?: string;
 }
 
 export interface HostMenuProps {
@@ -576,6 +636,9 @@ export interface UiHost {
   ListView?: ComponentType<any>;
   SegmentedControl?: ComponentType<any>;
   DialogFrame?: ComponentType<any>;
+  /** Props are `DialogActionsProps` / `DialogHintsProps` from components/ui/dialog-actions. */
+  DialogActions?: ComponentType<any>;
+  DialogHints?: ComponentType<any>;
   PageStackView?: ComponentType<any>;
   Tabs?: ComponentType<HostTabsProps>;
   Checkbox?: ComponentType<HostCheckboxProps>;
@@ -588,6 +651,8 @@ export interface UiHost {
   SelectField?: ComponentType<any>;
   QueryBar?: ComponentType<HostQueryBarProps>;
   DataTable?: ComponentType<any>;
+  /** Props are WindowedListProps from components/ui/windowed-list. */
+  WindowedList?: ComponentType<any>;
   createSyntaxStyle?(): SyntaxStyleLike;
   colorFromHex?(hex: string): unknown;
 }

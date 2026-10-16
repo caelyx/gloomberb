@@ -45,6 +45,15 @@ describe("report tables", () => {
     expect(table.rows).toEqual([["Revenue", 416.161], ["Net income", 112.01]]);
   });
 
+  test("a value drawn with its sign turned exports as drawn, every digit, not the rounded figure", () => {
+    // A short position kept positive and drawn negative: the export must still add up with the other sides.
+    const table = exportRowsTable("Gamma", [
+      { key: "calls", header: "Calls" },
+      { key: "puts", header: "Puts", format: (value) => `-${(Number(value) / 1e6).toFixed(2)}M` },
+    ], [{ calls: 57.13, puts: 1_139_604.2187 }]);
+    expect(table.rows).toEqual([[57.13, -1_139_604.2187]]);
+  });
+
   test("a table of metrics names each row's unit in its label; a column of mixed units gets a unit column", () => {
     const metrics = exportRowsTable("Backtest", [
       { key: "metric", header: "Metric" },
@@ -163,6 +172,10 @@ describe("report CSV and NDJSON", () => {
       "DAX,25087.27",
       "",
       "# Source: Gloom Cloud · Fri 9 Oct 2026 18:28 UTC · delayed",
+      "# Publisher: not published",
+      "# Observation date: 2026-10-09T18:28:00.000Z",
+      "# Publication time: not published",
+      "# Retrieval time: 2026-10-09T18:30:00.000Z",
       "# incomplete: 19 of 20 available",
       "# error: ^KS11: No quote provider available for ^KS11",
       "# note: Two bars are unavailable.",

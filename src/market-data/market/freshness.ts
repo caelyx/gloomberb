@@ -1,4 +1,4 @@
-import type { MarketState } from "../../types/financials";
+import type { MarketState, QuoteIndexSession } from "../../types/financials";
 import { canonicalExchange, EXCHANGE_TIME_ZONES, isUsListingExchange } from "../../utils/exchanges";
 import { hasPublishedApacCalendar, isPublishedApacClosure, isPublishedApacEarlyClose } from "../published-apac-sessions";
 import { hasPublishedCnCalendar, isPublishedCnClosure } from "../published-cn-sessions";
@@ -7,10 +7,11 @@ import { hasPublishedNseCalendar, isPublishedNseClosure } from "../published-nse
 import { getPublishedUsEquityCalendarDay, getPublishedUsEquityCalendarYears, getPublishedUsEquitySession } from "../published-us-sessions";
 import { quoteFutureToleranceMs } from "../quotes/clock";
 import { zonedDateKey, zonedDateTimeParts, zonedWallClockToUtcMs } from "../../utils/zoned-date-time";
+import { PERPETUAL_EXCHANGES } from "../../tickers/perpetual-listing";
 
-const ALWAYS_OPEN_EXCHANGES = new Set(["CCC"]);
+const ALWAYS_OPEN_EXCHANGES = new Set(["CCC", ...PERPETUAL_EXCHANGES]);
 
-/** Spot crypto venues have no equity open or close. */
+/** Spot crypto and perpetual futures venues have no equity open or close. */
 export function isAlwaysOpenExchange(exchange: string | undefined): boolean {
   return ALWAYS_OPEN_EXCHANGES.has(canonicalExchange(exchange));
 }
@@ -49,6 +50,7 @@ const REGULAR_OPEN_MINUTES: Record<string, number> = {
   FWB: 8 * 60,
   SWX: 9 * 60,
   VIE: 9 * 60,
+  WBDM: 9 * 60,
   OSL: 9 * 60,
   ICEX: 9 * 60 + 30,
   WSE: 9 * 60,
@@ -70,8 +72,11 @@ const REGULAR_OPEN_MINUTES: Record<string, number> = {
   TASE: 9 * 60 + 59,
   TADAWUL: 10 * 60,
   QE: 9 * 60 + 30,
+  BHB: 9 * 60 + 30,
   DFM: 10 * 60,
+  MSX: 10 * 60,
   KUWAIT: 9 * 60,
+  EGX: 10 * 60,
 };
 // Local regular close with the closing auction, rounded up. A close taken too
 // early would let a copy fetched during the auction pass as final.
@@ -85,6 +90,8 @@ const REGULAR_CLOSE_MINUTES: Record<string, number> = {
   JPX: 15 * 60 + 30, HKEX: 16 * 60 + 10, TWSE: 14 * 60 + 30, TPEX: 14 * 60 + 30,
   NSE: 16 * 60, BSE: 16 * 60, ASX: 16 * 60 + 15, SGX: 17 * 60 + 20, KRX: 16 * 60, KOSDAQ: 16 * 60,
   NZX: 17 * 60, SSE: 15 * 60 + 30, SZSE: 15 * 60 + 30,
+  // The Vienna MTF's ETPs and notes trade in continuous auctions to 17:30, with no closing auction.
+  WBDM: 17 * 60 + 30,
   BMV: 15 * 60 + 10, B3: 18 * 60 + 30, BYMA: 17 * 60 + 10, JSE: 17 * 60 + 15,
   // Monday to Thursday: trading at last ends 17:30, after the closing auction.
   // Not later: a complete 5-minute copy ends with its 17:09 bar, which must
@@ -96,23 +103,38 @@ const REGULAR_CLOSE_MINUTES: Record<string, number> = {
   // Continuous trading to 13:00, the closing auction to 13:10 and trading at
   // last to 13:15. A complete 5-minute copy ends with its 13:05 or 13:10 bar.
   QE: 13 * 60 + 15,
+  // Bahrain Bourse trades continuously to 13:00, with no closing auction.
+  BHB: 13 * 60,
   // Continuous trading to 14:45, the closing auction to 14:55 and trading at
   // the close to 15:00. A complete 5-minute copy ends with its 14:55 bar.
   DFM: 15 * 60,
+  // The Muscat Stock Exchange since 1 Jun 2026: continuous trading to 14:45,
+  // the closing auction to 14:55 and trade at last to 15:00. A complete
+  // 5-minute copy ends with its 14:55 bar.
+  MSX: 15 * 60,
   // Boursa Kuwait: continuous trading to 13:00, the closing auction to 13:10
   // and trade at last to 13:15. Not later than the auction's end: a complete
   // 5-minute copy ends with its 12:40 bar (the source still closes its
   // period at 12:45), which must reach the close less the half hour a
   // history copy may lag.
   KUWAIT: 13 * 60 + 10,
+  // The Egyptian Exchange: continuous trading to 14:15, the closing auction
+  // to 14:25 and trading at the close to 14:30.
+  EGX: 14 * 60 + 25,
 };
 // Venues whose week is not Monday to Friday, as their days off (0 is Sunday).
-// Tadawul, Qatar and Boursa Kuwait trade Sunday to Thursday. Dubai's DFM has
-// traded Monday to Friday since 2022, like the venues not listed here.
+// Tadawul, Qatar, Boursa Kuwait and the Egyptian Exchange trade Sunday to
+// Thursday. Dubai's DFM has traded Monday to Friday since 2022, like the
+// venues not listed here.
 const WEEKEND_DAYS: Record<string, readonly number[]> = {
   TADAWUL: [5, 6],
+  // Bahrain Bourse trades Sunday to Thursday.
+  BHB: [5, 6],
   QE: [5, 6],
+  // The Muscat Stock Exchange trades Sunday to Thursday.
+  MSX: [5, 6],
   KUWAIT: [5, 6],
+  EGX: [5, 6],
 };
 const DEFAULT_WEEKEND_DAYS: readonly number[] = [0, 6];
 // History only: venues whose chart source files their bars on another week,
@@ -263,7 +285,7 @@ function isPublishedClosure(exchange: string, date: string): boolean {
 }
 
 /** Whether `weekday` (0 is Sunday) is in the venue's trading week. */
-function isTradingWeekday(exchange: string, weekday: number, weekendDays?: readonly number[]): boolean {
+export function isTradingWeekday(exchange: string, weekday: number, weekendDays?: readonly number[]): boolean {
   return !(weekendDays ?? WEEKEND_DAYS[exchange] ?? DEFAULT_WEEKEND_DAYS).includes(weekday);
 }
 
@@ -341,6 +363,33 @@ export function latestRegularSessionClose(
     if (close != null && close <= time) return { date, close, timeZone };
   }
   return null;
+}
+
+/**
+ * When the venue's regular session on `date` (its local `YYYY-MM-DD`) closed,
+ * a published early close included. Null when the venue had no session that
+ * day or its hours are unknown.
+ */
+export function regularSessionCloseOn(exchange: string | undefined, date: string): number | null {
+  const timeZone = sessionCalendarTimeZone(exchange);
+  if (!timeZone || isoLocalDateToUtcDay(date) == null) return null;
+  const endOfDay = zonedWallClockToUtcMs(timeZone, Number(date.slice(0, 4)), Number(date.slice(5, 7)), Number(date.slice(8, 10)), 23, 59, 59);
+  const close = latestRegularSessionClose(exchange, endOfDay);
+  return close?.date === date ? close.close : null;
+}
+
+/** The US pre-market opens at 04:00 New York. */
+const US_PRE_MARKET_OPEN_MINUTES = 4 * 60;
+
+/**
+ * When a US listing's pre-market opened on `date` (its New York
+ * `YYYY-MM-DD`): 04:00 there. Null for any other venue, whose pre-market
+ * hours are not known, and for a date that does not parse.
+ */
+export function preMarketOpenOn(exchange: string | undefined, date: string): number | null {
+  if (!isUsListingExchange(canonicalExchange(exchange)) || isoLocalDateToUtcDay(date) == null) return null;
+  return zonedWallClockToUtcMs("America/New_York", Number(date.slice(0, 4)), Number(date.slice(5, 7)), Number(date.slice(8, 10)),
+    Math.floor(US_PRE_MARKET_OPEN_MINUTES / 60), US_PRE_MARKET_OPEN_MINUTES % 60, 0);
 }
 
 /**
@@ -444,7 +493,7 @@ export function isRegularSessionTime(
 /**
  * True when the venue's full-day closures for the year of `date` are
  * published: US venues, JPX, NSE, BSE, SSE, SZSE, KRX, KOSDAQ, TWSE, TPEX,
- * HKEX, SGX and ASX. Elsewhere a local holiday reads as a trading day.
+ * HKEX, SGX, ASX and EGX. Elsewhere a local holiday reads as a trading day.
  */
 export function hasPublishedSessionCalendar(exchange: string | undefined, date: string): boolean {
   const canonical = canonicalExchange(exchange);
@@ -503,7 +552,7 @@ function formatUsSessionState(timestampMs: number): UsSessionState {
   const minute = Number(parts.find((part) => part.type === "minute")?.value ?? "0");
   const totalMinutes = hour * 60 + minute;
 
-  if (totalMinutes < 4 * 60) return "PREPRE";
+  if (totalMinutes < US_PRE_MARKET_OPEN_MINUTES) return "PREPRE";
   if (totalMinutes < 9 * 60 + 30) return "PRE";
   if (totalMinutes < 16 * 60) return "REGULAR";
   if (totalMinutes < 20 * 60) return "POST";
@@ -659,4 +708,28 @@ function isTimestampStaleForExchangeSessionUnsafe(
     return !(isLocalTradingDay(canonical, currentDate, weekendDays) && (calendarDaysBehind > 1 || localWeekday(currentDate) === 1));
   }
   return false;
+}
+
+function readSessionWindow(value: unknown): { start: number; end: number } | null {
+  const { start, end } = (value ?? {}) as { start?: unknown; end?: unknown };
+  return typeof start === "number" && typeof end === "number" && Number.isFinite(start) && Number.isFinite(end) && end > start
+    ? { start, end }
+    : null;
+}
+
+/**
+ * The regular sessions an index quote carries, read without trusting the
+ * shape it arrived in: its zone, the session its day follows and the latest
+ * ones. Null when the zone or the current session is missing.
+ */
+export function readIndexSession(value: unknown): QuoteIndexSession | null {
+  const { timeZone, current, regular } = (value ?? {}) as { timeZone?: unknown; current?: unknown; regular?: unknown };
+  const now = readSessionWindow(current);
+  if (typeof timeZone !== "string" || !timeZone.includes("/") || !now) return null;
+  return {
+    timeZone,
+    current: now,
+    // The latest two: the one a print after the close belongs to, and the one before it.
+    regular: Array.isArray(regular) ? regular.flatMap((window) => readSessionWindow(window) ?? []).slice(-2) : [],
+  };
 }

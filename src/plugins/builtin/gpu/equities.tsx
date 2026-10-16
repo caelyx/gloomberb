@@ -10,17 +10,17 @@ import { useAssetData, useAsyncResource, useAutoRefresh, usePluginPaneState, use
 import { priceColor } from "../../../theme/colors";
 import { useThemeColors } from "../../../theme/theme-context";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
-import { Box, Text, TextAttributes } from "../../../ui";
+import { Box, TextAttributes, useUiCapabilities } from "../../../ui";
+import { ClippedText } from "../../../components/ui/display";
 import { publicTickerKey } from "../../../utils/exchanges";
-import { displayWidth, truncateToDisplayWidth } from "../../../utils/format";
+import { displayWidth } from "../../../utils/format";
 import { quoteBoardFooterInfo, quoteBoardStatus, renderQuoteBoardCell, useQuoteBoard } from "../shared/use-quote-board";
 import { GpuModelQuery } from "./board";
 import { loadGpuEquityHistory } from "./client";
-import { GPU_EQUITIES, GPU_EQUITY_GROUPS, gpuChange, gpuChangeColor, gpuEquityRows, gpuPrice, gpuShortSource, gpuVariant } from "./model";
+import { GPU_EQUITIES, GPU_EQUITY_GROUPS, gpuChange, gpuChangeColor, gpuChangesLocked, gpuEquityGap, gpuEquityRows, gpuPrice, gpuShortSource, gpuVariant, type GpuEquityRow } from "./model";
 
 const SYMBOLS = GPU_EQUITIES.map(({ symbol }) => symbol);
-type EquityRow = ReturnType<typeof gpuEquityRows>[number];
-type Row = SectionedRow<EquityRow>;
+type Row = SectionedRow<GpuEquityRow>;
 const rowKey = (row: Row) => row.key;
 
 function equityColumns(width: number): DataTableColumn[] {
@@ -39,8 +39,9 @@ function equityColumns(width: number): DataTableColumn[] {
 }
 
 /** Related shares by what ties them to GPU rents, each beside the list price that ties it. */
-export function GpuEquities({ board, model, setModel, reloadBoard, width, height, focused }: {
-  board: GpuBoardRow[]; model: string; setModel: (value: string) => void; reloadBoard: () => void; width: number; height: number; focused: boolean;
+export function GpuEquities({ board, models, locked, model, setModel, reloadBoard, width, height, focused }: {
+  board: GpuBoardRow[]; models: readonly string[]; locked: boolean; model: string; setModel: (value: string) => void; reloadBoard: () => void;
+  width: number; height: number; focused: boolean;
 }) {
   const colors = useThemeColors();
   const provider = useAssetData();
@@ -54,7 +55,7 @@ export function GpuEquities({ board, model, setModel, reloadBoard, width, height
   const history = useAsyncResource(loader);
   useAutoRefresh(history.updatedAt, history.load);
   usePaneRefreshKey(() => { reloadBoard(); refresh(); void history.reload(); }, { focused });
-  const rows = useMemo(() => gpuEquityRows(board, model || "H100"), [board, model]);
+  const rows = useMemo(() => gpuEquityRows(board, model || "H100", locked), [board, model, locked]);
   const items = useMemo(() => buildSectionedRows(GPU_EQUITY_GROUPS.map((group) => ({ label: group.label,
     items: rows.filter((row) => (group.roles as readonly string[]).includes(row.role)) })), (row) => row.symbol), [rows]);
   const historyMap = useMemo(() => new Map(history.data?.map((entry) => [entry.symbol, entry]) ?? []), [history.data]);
@@ -66,26 +67,32 @@ export function GpuEquities({ board, model, setModel, reloadBoard, width, height
   const dataRef = useRef({ quotes, historyMap });
   dataRef.current = { quotes, historyMap };
   const medium = width >= 100;
+  const desktop = !!useUiCapabilities().nativePaneChrome;
   const renderCell = useCallback((item: Row, column: DataTableColumn, _index: number, state: { selected: boolean }): DataTableCell => {
     if (!isSectionedItemRow(item)) return EMPTY_TABLE_CELL;
     const row = item.item;
     const reference = row.reference;
+    // A figure the free preview leaves out reads Pro; a share with no series names the one it lacks.
+    const lockedCell: DataTableCell = { text: "Pro", value: null, color: colors.textDim };
+    const gapCell = row.gap === "pro" ? lockedCell : { text: "" };
     switch (column.id) {
       case "symbol": return { text: row.symbol, color: colors.textBright, attributes: TextAttributes.BOLD };
       case "source": {
-        if (!reference) return { text: "", color: colors.textDim };
+        if (!reference) return { text: gpuEquityGap(row) ?? "", color: colors.textDim };
         const name = gpuShortSource(reference);
         const variant = [row.gpuModel, ...gpuVariant(reference)].join(" ");
         // The name keeps its room; the variant gives way first.
         const rest = Math.max(0, column.width - displayWidth(name) - 2);
-        return { text: `${name} ${variant}`, content: <Box flexDirection="row" height={1} overflow="hidden">
-          <Text fg={state.selected ? colors.selectedText : colors.text}>{truncateToDisplayWidth(name, column.width)}</Text>
-          {rest >= 4 ? <Text fg={state.selected ? colors.selectedText : colors.textDim}>{`  ${truncateToDisplayWidth(variant, rest)}`}</Text> : null}
+        // On the desktop the variant gives way first at the column's edge, by CSS.
+        return { text: `${name} ${variant}`, content: <Box flexDirection="row" height={1} overflow="hidden" {...(desktop ? { flexShrink: 1, minWidth: 0 } : {})}>
+          <ClippedText fg={state.selected ? colors.selectedText : colors.text} text={name} width={column.width} />
+          {desktop || rest >= 4 ? <ClippedText fg={state.selected ? colors.selectedText : colors.textDim} lead="  " text={variant} width={rest} flex="0 1000 auto" /> : null}
         </Box> };
       }
-      case "gpuPrice": return reference ? { text: gpuPrice(reference.pricePerGpuHr), value: reference.pricePerGpuHr, color: colors.textBright } : { text: "" };
+      case "gpuPrice": return reference ? { text: gpuPrice(reference.pricePerGpuHr), value: reference.pricePerGpuHr, color: colors.textBright } : gapCell;
       case "gpuChange": {
-        if (!reference) return { text: "" };
+        if (!reference) return gapCell;
+        if (gpuChangesLocked(reference)) return lockedCell;
         const value = reference.change7d;
         return value == null ? { text: "-", value: null, color: colors.textMuted } : { text: gpuChange(value), value, color: gpuChangeColor(value, colors) };
       }
@@ -100,9 +107,9 @@ export function GpuEquities({ board, model, setModel, reloadBoard, width, height
       default: return renderQuoteBoardCell(column.id as "price" | "changePercent", dataRef.current.quotes.get(row.symbol),
         { formatPrice: (quote) => gpuPrice(quote.price), formatChange: (quote) => gpuChange(quote.change) });
     }
-  }, [colors]);
+  }, [colors, desktop]);
   return <DataTableView<Row> columns={equityColumns(width)} items={items} rootWidth={width} rootHeight={height} focused={focused}
-    rootBefore={<GpuModelQuery rows={board} model={model || "H100"} setModel={setModel} width={width} allowAll={false} />}
+    rootBefore={<GpuModelQuery models={models} model={model || "H100"} setModel={setModel} width={width} allowAll={false} />}
     selection={{ kind: "id", selectedId: selected, getId: rowKey, onChange: (id) => setSelected(String(id)) }} getItemKey={rowKey}
     isNavigable={isSectionedItemRow} renderSectionHeader={renderSectionedRowHeader}
     getRowVersion={(row) => isSectionedItemRow(row) ? [quotes.get(row.item.symbol)?.quote?.lastUpdated, quotes.get(row.item.symbol)?.loading,

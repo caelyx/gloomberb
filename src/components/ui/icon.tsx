@@ -6,6 +6,7 @@ import { t } from "../../i18n";
 
 export type IconName =
   | "more"
+  | "help"
   | "close"
   | "zap"
   | "sqrt"
@@ -29,11 +30,16 @@ export type IconName =
   | "grip"
   | "image"
   | "thumbs-up"
-  | "thumbs-down";
+  | "thumbs-down"
+  | "ask"
+  | "bot"
+  | "team"
+  | "pro";
 
 /** Terminal glyph for each icon; the desktop host draws SVG. */
 export const ICON_GLYPHS: Record<IconName, string> = {
   more: "...",
+  help: "?",
   close: "x",
   zap: "⚡",
   sqrt: "√",
@@ -60,6 +66,15 @@ export const ICON_GLYPHS: Record<IconName, string> = {
   // show which thumb is chosen.
   "thumbs-up": "+1",
   "thumbs-down": "-1",
+  // Ask Gloom: a four-point spark.
+  ask: "✦",
+  // Who someone is in chat: a bot's square face, the Gloom mark (a core in a
+  // ring) for the team, a gem for Pro. Three shapes, so they read without
+  // colour, each one cell wide in any terminal: none is an emoji or a
+  // character East Asian terminals widen to two cells.
+  bot: "⍠",
+  team: "◉",
+  pro: "◊",
 };
 
 export interface IconProps {

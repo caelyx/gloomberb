@@ -206,8 +206,11 @@ async function readDevToolsPort(stderr: ReadableStream<Uint8Array>): Promise<num
   throw new Error(`Chrome did not start:\n${text.slice(-2000)}`);
 }
 
+/** Commands needed by page probes, also implemented by the chat WebKit driver. */
+export type PageCommands = Pick<Cdp, "send">;
+
 /** Runs `expression` in the page and returns its value; a thrown error or rejection fails the call. */
-export async function evaluate<T = any>(cdp: Cdp, expression: string, timeoutMs = 30_000): Promise<T> {
+export async function evaluate<T = any>(cdp: PageCommands, expression: string, timeoutMs = 30_000): Promise<T> {
   const result = await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, timeoutMs);
   if (result.exceptionDetails) {
     throw new Error(`Page error: ${result.exceptionDetails.exception?.description ?? result.exceptionDetails.text}`);
@@ -216,7 +219,7 @@ export async function evaluate<T = any>(cdp: Cdp, expression: string, timeoutMs 
 }
 
 /** Resolves after `count` animation frames in the page. */
-export function frames(cdp: Cdp, count = 1): Promise<void> {
+export function frames(cdp: PageCommands, count = 1): Promise<void> {
   return evaluate(cdp, `new Promise((done) => { let left = ${count}; const tick = () => (--left <= 0 ? done() : requestAnimationFrame(tick)); requestAnimationFrame(tick); })`);
 }
 
@@ -224,7 +227,7 @@ export function frames(cdp: Cdp, count = 1): Promise<void> {
  * Waits, a frame at a time, until `predicate` (a page expression) is truthy,
  * and returns its value; returns the last value after `timeoutMs`.
  */
-export function waitFor<T = any>(cdp: Cdp, predicate: string, timeoutMs = 3_000): Promise<T> {
+export function waitFor<T = any>(cdp: PageCommands, predicate: string, timeoutMs = 3_000): Promise<T> {
   return evaluate(cdp, `new Promise((done) => {
     const until = performance.now() + ${timeoutMs};
     const check = () => {
@@ -239,7 +242,7 @@ export function waitFor<T = any>(cdp: Cdp, predicate: string, timeoutMs = 3_000)
 
 type MouseType = "mouseMoved" | "mousePressed" | "mouseReleased";
 
-export function mouse(cdp: Cdp, type: MouseType, x: number, y: number, held: boolean): Promise<void> {
+export function mouse(cdp: PageCommands, type: MouseType, x: number, y: number, held: boolean): Promise<void> {
   return cdp.send("Input.dispatchMouseEvent", {
     type,
     x,
@@ -277,5 +280,51 @@ export async function drag(cdp: Cdp, from: Point, waypoints: Point[], steps = 12
     at = to;
   }
   await mouse(cdp, "mouseReleased", at.x, at.y, false);
+  await frames(cdp, 2);
+}
+
+/** DevTools modifier bits. */
+const MODIFIERS = { alt: 1, ctrl: 2, meta: 4, shift: 8 } as const;
+
+/**
+ * A real key press on the focused document: keydown and keyup for a letter
+ * with modifiers held, as a keyboard sends it, then a frame for the result.
+ */
+export async function pressKey(cdp: Cdp, letter: string, modifiers: Array<keyof typeof MODIFIERS> = []): Promise<void> {
+  const bits = modifiers.reduce((total, modifier) => total | MODIFIERS[modifier], 0);
+  const upper = letter.toUpperCase();
+  const key = modifiers.includes("shift") ? upper : letter.toLowerCase();
+  const base = { modifiers: bits, key, code: `Key${upper}`, windowsVirtualKeyCode: upper.charCodeAt(0), nativeVirtualKeyCode: upper.charCodeAt(0) };
+  await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base });
+  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  await frames(cdp, 2);
+}
+
+/** A key chord as DevTools describes it: `modifiers` is Alt 1, Ctrl 2, Meta 4, Shift 8. */
+export interface Chord { key: string; code: string; keyCode: number; modifiers: number }
+
+/**
+ * Holds `chord` for `holdMs`: one key down, then the auto-repeat keydowns the
+ * operating system sends while a key stays down (`autoRepeat`, which the page
+ * reads as `event.repeat`) every `intervalMs`, then key up. Real input events,
+ * so the page's own key handling runs, not a call into it. `flagRepeats: false`
+ * sends the same stream with no repeat flag, as a native menu accelerator
+ * reaches the page.
+ */
+export async function holdKey(cdp: Cdp, chord: Chord, holdMs: number, { intervalMs = 33, flagRepeats = true } = {}): Promise<void> {
+  const event = {
+    key: chord.key,
+    code: chord.code,
+    windowsVirtualKeyCode: chord.keyCode,
+    nativeVirtualKeyCode: chord.keyCode,
+    modifiers: chord.modifiers,
+  };
+  await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...event });
+  const until = performance.now() + holdMs;
+  while (performance.now() < until) {
+    await sleep(intervalMs);
+    await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", autoRepeat: flagRepeats, ...event });
+  }
+  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...event });
   await frames(cdp, 2);
 }

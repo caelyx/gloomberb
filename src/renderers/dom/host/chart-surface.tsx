@@ -2,8 +2,8 @@
 import {
   forwardRef,
   memo,
-  useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   type CSSProperties,
   type ReactNode,
@@ -20,7 +20,9 @@ import { WebBox } from "./box";
 const CanvasBitmap = memo(function CanvasBitmap({ bitmap }: { bitmap: BitmapSurface }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  useEffect(() => {
+  // In the commit: a new size clears the canvas, and a frame painted before
+  // the pixels land would show it blank.
+  useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const context = canvas.getContext("2d");
@@ -170,6 +172,11 @@ const ChartVectors = memo(function ChartVectors({ vectors }: { vectors: readonly
   );
 });
 
+/** Dashed like the last-price line the bitmap draws (6 px on, 5 px off). */
+function crosshairDashes(direction: "to bottom" | "to right", color: string): string {
+  return `repeating-linear-gradient(${direction}, ${color} 0 6px, transparent 6px 11px)`;
+}
+
 function ChartCrosshair({
   bitmap,
   crosshair,
@@ -187,29 +194,58 @@ function ChartCrosshair({
   return (
     <>
       <div
+        data-gloom-role="chart-crosshair-x"
         style={{
           position: "absolute",
           top: 0,
           bottom: 0,
           left: `${clampedX}%`,
           width: 1,
-          backgroundColor: crosshair.color,
+          backgroundImage: crosshairDashes("to bottom", crosshair.color),
           opacity: 0.78,
           transform: "translateX(-0.5px)",
           pointerEvents: "none",
           zIndex: 10,
         }}
       />
+      {crosshair.markers?.map((marker, index) => {
+        const markerY = bitmap.height <= 1 ? 0 : (marker.pixelY / (bitmap.height - 1)) * 100;
+        return (
+          // Where the cursor crosses each line: a dot on an observation, a
+          // ring where the line carries an earlier one.
+          <div
+            key={index}
+            data-gloom-role="chart-crosshair-marker"
+            data-hollow={marker.hollow ? "true" : undefined}
+            style={{
+              position: "absolute",
+              left: `${clampedX}%`,
+              top: `${Math.max(0, Math.min(100, markerY))}%`,
+              width: 8,
+              height: 8,
+              borderRadius: 8,
+              border: `1.5px solid ${marker.color}`,
+              backgroundColor: marker.hollow ? "var(--gloom-bg)" : marker.color,
+              boxShadow: "0 0 0 1.5px var(--gloom-bg)",
+              boxSizing: "border-box",
+              transform: "translate(-50%, -50%)",
+              pointerEvents: "none",
+              zIndex: 11,
+            }}
+          />
+        );
+      })}
       {clampedY === null ? null : (
         <>
           <div
+            data-gloom-role="chart-crosshair-y"
             style={{
               position: "absolute",
               left: 0,
               right: 0,
               top: `${clampedY}%`,
               height: 1,
-              backgroundColor: crosshair.color,
+              backgroundImage: crosshairDashes("to right", crosshair.color),
               opacity: 0.78,
               transform: "translateY(-0.5px)",
               pointerEvents: "none",

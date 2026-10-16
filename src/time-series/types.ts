@@ -1,6 +1,7 @@
 import type { ChartResolution, TimeRange } from "./range";
 import type { ChartResolutionSupport, ManualChartResolution } from "./resolution";
 import type { InstrumentRef } from "../market-data/request-types";
+import type { SeriesAttribution } from "../series/types";
 
 export const CHART_SPEC_VERSION = 2 as const;
 
@@ -66,7 +67,9 @@ export type ChartStudyKind =
   | "atr"
   | "ratio"
   | "spread"
-  | "correlation";
+  | "correlation"
+  /** A weighted sum of any number of series over a divisor: `(2*42*RB=F + 42*HO=F - 3*CL=F)/3`. */
+  | "formula";
 
 export interface ChartStudySpec {
   id: string;
@@ -155,6 +158,12 @@ export interface ResolvedSeries {
   /** Unit of rawValue, retained when presentation transforms change unit. */
   rawUnit?: string;
   unitGroup: string;
+  /**
+   * The unit the legend states beside each value, read bare as FUT prints its
+   * price beside its unit: what a futures price counts ("USD / gallon"), where
+   * the currency alone does not say it, and what a formula of them counts.
+   */
+  statedUnit?: string;
   /** Source instrument category used only for monetary market-price precision. */
   priceAssetCategory?: string;
   /** Volume basis established by the source instrument; omitted when unspecified. */
@@ -162,6 +171,11 @@ export interface ResolvedSeries {
   nativeFrequency: SeriesPeriod;
   /** Acquired market-history cadence; null is explicitly unknown, undefined is legacy or nonmarket. */
   historyResolution?: ManualChartResolution | null;
+  /**
+   * When known, the first bar this listing has at `historyResolution`: the
+   * source keeps nothing older, so the chart stops there instead of asking.
+   */
+  historyStart?: Date;
   /** Authored time basis retained for layout and cursor semantics. */
   timestampMode?: SeriesTimestampMode;
   dataShape: SeriesDataShape;
@@ -178,13 +192,17 @@ export interface ResolvedSeries {
    */
   listing?: { symbol: string; exchange: string };
   /** Price/volume observations and their derived studies, including 24/7
-   * markets. Independent of whether the chart compresses exchange sessions. */
-  observationKind?: "market";
+   * markets. Independent of whether the chart compresses exchange sessions.
+   * `dataset`: a capability's published observations (vessel transits),
+   * whose values the legend dates because they arrive days late. */
+  observationKind?: "market" | "dataset";
   /** Regular-session move supplied with the latest market quote. */
   latestChangePercent?: number;
   /** The previous session's close, set on a one-day chart's price series and drawn as its reference line. */
   priorClose?: number;
   points: TimeSeriesPoint[];
+  /** Who a report of a loaded series cites, when its loader names the dataset and publisher. */
+  attribution?: SeriesAttribution;
   /** Rejected valuation price inputs, retained independently of usable observations. */
   valuationPriceIssues?: import("./valuation-price").ValuationPriceIssue[];
   warning?: string;
@@ -203,6 +221,8 @@ export interface TimeSeriesFieldDefinition {
   id: string;
   label: string;
   shortLabel: string;
+  /** What a charted series is called after its symbol when that says more than `shortLabel`: the basis of its figures. */
+  seriesLabel?: string;
   sourceKind: ChartSeriesSource["kind"];
   dataShape: SeriesDataShape;
   unit: string;

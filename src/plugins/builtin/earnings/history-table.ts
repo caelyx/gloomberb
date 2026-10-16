@@ -3,10 +3,11 @@ import { TABLE_COLUMN_GAP, tableColumnWidth } from "../../../components/ui/table
 import { colors } from "../../../theme/colors";
 import { TextAttributes } from "../../../ui";
 import { datedYear, epsText, fiscalMonth, impliedText, moneyText, signedPercent, TIMING_LABEL } from "./format";
+import { epsBasisShort, showsEpsBasis } from "../shared/earnings-report";
 import type { HistoryRow } from "./history-model";
 
 type HistoryColumnId =
-  | "date" | "when" | "period" | "epsEstimate" | "epsActual" | "epsSurprise"
+  | "date" | "when" | "period" | "epsEstimate" | "analysts" | "epsActual" | "basis" | "epsSurprise"
   | "revenueEstimate" | "revenueActual" | "revenueSurprise" | "implied" | "move" | "ratio";
 
 export type HistoryColumn = DataTableColumn & { id: HistoryColumnId };
@@ -16,7 +17,9 @@ const ALL_COLUMNS: HistoryColumn[] = [
   { id: "when", label: "WHEN", width: 4, align: "left" },
   { id: "period", label: "QTR", width: 7, align: "left" },
   { id: "epsEstimate", label: "EPS EST", width: 7, align: "right" },
+  { id: "analysts", label: "ESTS", width: 4, align: "right" },
   { id: "epsActual", label: "EPS ACT", width: 7, align: "right" },
+  { id: "basis", label: "BASIS", width: 5, align: "left" },
   { id: "epsSurprise", label: "EPS SURP", width: 8, align: "right" },
   { id: "revenueEstimate", label: "SALES EST", width: 9, align: "right" },
   { id: "revenueActual", label: "SALES ACT", width: 9, align: "right" },
@@ -27,7 +30,9 @@ const ALL_COLUMNS: HistoryColumn[] = [
 ];
 
 /** Dropped first when the pane is narrow: the table keeps dates, the two moves and EPS. */
-const DROP_ORDER: HistoryColumnId[] = ["period", "revenueSurprise", "ratio", "revenueEstimate", "when", "epsSurprise", "revenueActual", "epsEstimate"];
+const DROP_ORDER: HistoryColumnId[] = [
+  "period", "analysts", "revenueSurprise", "ratio", "revenueEstimate", "when", "basis", "epsSurprise", "revenueActual", "epsEstimate",
+];
 
 /** The sales columns and what fills them; a company with no revenue on record shows none of them. */
 const SALES_COLUMNS: Partial<Record<HistoryColumnId, (row: HistoryRow) => number | null>> = {
@@ -53,7 +58,14 @@ function signed(value: number | null): DataTableCell {
   return { text: signedPercent(value), color: value == null || value === 0 ? colors.textDim : value > 0 ? colors.positive : colors.negative };
 }
 
-export function renderHistoryCell(row: HistoryRow, column: HistoryColumn): DataTableCell {
+/**
+ * The move so far on a report out today (reportMove), as EVTS shows it, until
+ * the first close after the report settles the row's own; "loading" while its
+ * quote is.
+ */
+export type LiveMove = (row: HistoryRow) => number | "loading" | null;
+
+export function renderHistoryCell(row: HistoryRow, column: HistoryColumn, liveMove?: LiveMove): DataTableCell {
   const dim = colors.textDim;
   switch (column.id) {
     case "date":
@@ -64,20 +76,30 @@ export function renderHistoryCell(row: HistoryRow, column: HistoryColumn): DataT
       return { text: fiscalMonth(row.fiscalPeriod), color: dim };
     case "epsEstimate":
       return { text: epsText(row.epsEstimate), color: dim };
+    case "analysts":
+      return { text: row.epsAnalysts == null ? "--" : String(row.epsAnalysts), color: dim };
     case "epsActual":
-      return { text: epsText(row.epsActual), color: colors.text };
+      // The company's press release's figure reads quieter until the calendar's replaces it.
+      return { text: epsText(row.epsActual), color: row.provisional ? colors.textMuted : colors.text };
+    case "basis":
+      return !showsEpsBasis(row)
+        ? { text: "--", color: dim }
+        : { text: epsBasisShort(row.epsBasis), color: row.epsBasis ? colors.textMuted : dim };
     case "epsSurprise":
       return signed(row.epsSurprise);
     case "revenueEstimate":
       return { text: moneyText(row.revenueEstimate), color: dim };
     case "revenueActual":
-      return { text: moneyText(row.revenueActual), color: colors.text };
+      return { text: moneyText(row.revenueActual), color: row.revenueProvisional ? colors.textMuted : colors.text };
     case "revenueSurprise":
       return signed(row.revenueSurprise);
     case "implied":
       return { text: impliedText(row.implied), color: row.upcoming ? colors.textBright : colors.text };
-    case "move":
-      return signed(row.move);
+    case "move": {
+      // The averages, VS IMPL and the chart wait for the settled move; the cell shows the move so far.
+      const live = row.move == null ? liveMove?.(row) ?? null : null;
+      return live === "loading" ? { text: "…", color: dim } : signed(row.move ?? live);
+    }
     case "ratio":
       return { text: row.moveRatio == null ? "--" : `${row.moveRatio.toFixed(1)}x`, color: row.moveRatio != null && row.moveRatio > 1 ? colors.warning : dim };
   }

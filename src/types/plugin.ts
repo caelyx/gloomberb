@@ -3,6 +3,7 @@ import type { AppTickerRepositoryPort } from "../core/app-service-ports";
 import type { HeadlessPaneDefinition, HeadlessPaneFreshness, HeadlessPaneOptionDef } from "./headless";
 
 export type {
+  HeadlessArgumentExpansion,
   HeadlessBundleResult,
   HeadlessBundleSection,
   HeadlessFreshnessStatus,
@@ -34,6 +35,7 @@ import type { PluginEvents } from "../plugins/event-bus";
 import type { PluginLogger } from "../utils/debug-log";
 import type { BrokerAdapter } from "./broker";
 import type { PluginCapability } from "../capabilities";
+import type { SeriesDefinition } from "../series/types";
 import type { CliGlobalOptions } from "../cli/options";
 import type { CliResult, CliResultRenderOptions } from "../cli/result";
 import type { ContextMenuContext, ContextMenuItem } from "./context-menu";
@@ -105,6 +107,18 @@ export interface PanePortableShareDef {
   prepare?(pane: PaneInstanceConfig, context: { tickers: ReadonlyMap<string, TickerRecord> }): PaneInstanceConfig;
 }
 
+/** What covers a pane when a report of it is refused: see `PaneDef.reportLockNote`. */
+export interface PaneLock {
+  /** Sign-in is the wall of a session that is missing or unverified; pro the one of a plan without access. */
+  gate: "sign-in" | "pro";
+  /** The first symbol the report was asked for, or null. */
+  symbol: string | null;
+  /** The function code the report was run for, for a pane that serves several (EM and GUID). */
+  token?: string;
+  /** The session is signed in and its email is not verified yet. */
+  verifyEmail?: boolean;
+}
+
 export interface PaneDef {
   id: string;
   name: string;
@@ -124,6 +138,24 @@ export interface PaneDef {
    * win over the binding.
    */
   tickerFollower?: boolean | ((pane: PaneInstanceConfig) => boolean);
+  /**
+   * For a pane type that two or more functions open (ERN and EVTS): the settings that say
+   * what a window shows, as against how (a range, a toggle, a column choice). Opening a
+   * function again focuses a window whose binding, params and settings match what the
+   * function opens; a window with a setting of its own that is not listed here is still that
+   * window, and one with a listed setting the function does not set belongs to another
+   * function and is left alone. Without it, a pane type opened by several functions is
+   * matched on its settings exactly, and a window that picked up any setting is not found.
+   * An empty list says binding and params alone name the window.
+   */
+  identitySettings?: readonly string[];
+  /**
+   * The title a saved window of this pane has, from its params and settings,
+   * for lists that name windows without rendering them (the Layouts browser).
+   * A pane that titles itself by what it shows ("Curve \u00b7 BZ") gives the same
+   * title here, so two of its windows are told apart before either is opened.
+   */
+  instanceTitle?(pane: PaneInstanceConfig): string | null;
   /** Renderer-neutral data model used by CLI functions, automation, and hosted tools. */
   headless?: HeadlessPaneDefinition;
   /**
@@ -133,7 +165,7 @@ export interface PaneDef {
    */
   reportFreshness?: Pick<HeadlessPaneFreshness, "source" | "status" | "basis">;
   /**
-   * Options a rendered-view report takes (`fn FXC --currencies USD,ZAR`):
+   * Options a rendered-view report takes (`fn OMON AAPL --strikes 10`):
    * each sets the pane setting of its key, is checked by its `normalize`, and
    * is listed with its example by `gloomberb catalog`.
    */
@@ -144,17 +176,65 @@ export interface PaneDef {
    * carries them in `data.metadata.notices`.
    */
   reportNotices?(settings: Readonly<Record<string, unknown>>): string[];
+  /**
+   * What a rendered-view report prints in place of the pane when a sign-in
+   * wall or the Pro lock covers all of it: what is locked, what can still be
+   * read without it and where, and how to unlock it. A `headless` pane's report
+   * prints it when the server refuses the read (401, 402 or 403). Without it
+   * the report prints the wall's own words, or the refusal. Either way it cites
+   * no source, since nothing was read.
+   */
+  reportLockNote?(lock: PaneLock): string;
+  /**
+   * What a rendered-view report needs before it shows anything, such as a
+   * sign-in: `gloomberb catalog` lists it under Requires, as it does a
+   * `headless` model's `discovery.dataRequirements`.
+   */
+  reportRequirements?: readonly string[];
+  /**
+   * A `shot` without `--height` grows to the pane's natural height, up to the
+   * height limit, so a fixed board (FUT) shows every row instead of cutting
+   * the last ones. Leave it off for long or paged lists.
+   */
+  shotFitsRows?: true;
+  /**
+   * A report of the pane grows to the whole text of the page its reader has
+   * open (a docs page), so it is not cut at the first screen. A list the reader
+   * opens from keeps its height.
+   */
+  shotFitsReader?: true;
   /** Add an Excel-compatible CSV action for the pane's single active DataTable. */
   tableExport?: true;
   settings?: PaneSettingsDef | ((context: PaneSettingsContext) => PaneSettingsDef | null);
   /** Portable sharing is public by default; list the few pane-owned fields that must remain local. */
   portableShare?: PanePortableShareDef;
   /**
+   * The person's own data the pane shows, so copying a public link to it,
+   * posting its picture in a bug report and attaching it to an Ask Gloom
+   * question ask first. A function decides
+   * per instance from what it shows now (a chat pane on a public channel, a
+   * quote of a ticker not held), and a function that returns null opts that
+   * instance out. Leave it off for market data. A pane that says nothing is
+   * still asked about when its plugin connects a broker (`holdings`) or the
+   * pane keeps fields private when shared (`portableShare.private`,
+   * `personal`), for plugins written before this field existed; declare it
+   * to say exactly what the pane shows.
+   */
+  personalData?: PanePersonalData | ((context: PanePersonalDataContext) => PanePersonalData | null);
+  /**
    * Compact controls surfaced next to the pane title. A key references a
    * toggle field in settings, or a two-option select field when `onValue` is set.
    */
   quickSettings?: readonly PaneQuickSettingDef[];
 }
+
+/**
+ * Kinds of personal data a pane can show: `holdings` (positions, balances,
+ * orders, profit and loss), `account` (account numbers, email, plan),
+ * `messages` (private conversations) and `personal` (the person's own data
+ * of a kind the pane does not name).
+ */
+export type PanePersonalData = "holdings" | "account" | "messages" | "personal";
 
 /**
  * An option of a rendered-view report, which sets the pane setting of its key,
@@ -198,6 +278,11 @@ export interface PaneSettingsContext {
   paneState: Record<string, unknown>;
   activeTicker: string | null;
   activeCollectionId: string | null;
+}
+
+/** What `PaneDef.personalData` decides from: the pane's settings context and the tickers with their positions. */
+export interface PanePersonalDataContext extends PaneSettingsContext {
+  tickers: ReadonlyMap<string, TickerRecord>;
 }
 
 export interface PaneSettingOption {
@@ -302,6 +387,8 @@ interface PaneTemplateShortcut {
   prefix: string;
   /** Other mnemonics for the same view (FFIP for WIRP). They open it when typed but are not listed as separate rows. */
   aliases?: readonly string[];
+  /** Keep this shortcut executable when typed, but omit its pane from command-bar browse rows. Defaults to true. */
+  showInBrowse?: boolean;
   argPlaceholder?: string;
   argKind?: "text" | "ticker" | "ticker-list";
   /**
@@ -769,6 +856,12 @@ export interface AppNotificationRequest {
     label: string;
     onClick: () => void;
   };
+  /**
+   * What a built-in notice is about, so the Unread list can keep it after the
+   * toast is gone and open it again: `price:<alertId>`, `catalyst:<eventId>`
+   * or `team:<cardId>`. Other values are not kept.
+   */
+  refId?: string;
   /** Rendered next to `action`. Use for a dismissing counterpart such as snooze. */
   secondaryAction?: {
     label: string;
@@ -806,6 +899,12 @@ export interface GloomPluginContext {
   registerShortcut(shortcut: KeyboardShortcut): void;
   registerTickerAction(action: TickerAction): void;
   registerContextMenuProvider(provider: ContextMenuProviderDef): void;
+  /**
+   * Adds a series to the data catalog and the chart composer, at any time
+   * after setup starts (after loading a list, say). Throws when the definition
+   * is invalid or its id is taken; the returned function removes it again.
+   */
+  registerSeries(series: SeriesDefinition): () => void;
   registerSyncContributor(contributor: SyncContributor): () => void;
   registerSyncTransport(transport: SyncTransport): () => void;
   watchNewsQuery?(
@@ -845,7 +944,7 @@ export interface GloomPluginContext {
   pinTicker(symbol: string, options?: PinTickerOptions): void;
   navigateTicker(symbol: string, options?: { sourcePaneId?: string | null }): void;
   openPaneSettings(paneId?: string): void;
-  /** Copies a live share link for a pane instance (the focused pane when omitted). */
+  /** Shares a pane instance (the focused pane when omitted): copies a live link to it. */
   sharePane(paneId?: string): void;
 
   on<K extends keyof PluginEvents>(event: K, handler: (payload: PluginEvents[K]) => void): () => void;
@@ -943,6 +1042,12 @@ export interface GloomPlugin {
   paneTemplates?: PaneTemplateDef[];
   broker?: BrokerAdapter;
   capabilities?: PluginCapability[];
+  /**
+   * Series the plugin adds to the data catalog, chartable against any other
+   * catalog entry. A definition that fails validation is skipped and logged;
+   * `ctx.registerSeries` adds series later and throws instead.
+   */
+  series?: readonly SeriesDefinition[];
   slots?: Partial<{
     [K in keyof GloomSlots]: (props: GloomSlots[K]) => ReactNode;
   }>;

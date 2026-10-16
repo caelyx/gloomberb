@@ -5,6 +5,20 @@ export type SessionConfidence = "explicit" | "derived" | "unknown";
 export type QuoteDataSource = "live" | "delayed" | "snapshot";
 export type QuoteDelivery = "stream" | "poll";
 
+/**
+ * The regular sessions an index quote carries, dated by its source: the
+ * calendar its publisher's name does not give (SNP, DJI, NASDAQ GIDS). Times
+ * are ms.
+ */
+export interface QuoteIndexSession {
+  /** The zone the sessions' dates are read in. */
+  timeZone: string;
+  /** The regular session the quote's day follows: today's, or the next one while it has not opened. */
+  current: { start: number; end: number };
+  /** The latest regular sessions, oldest first. */
+  regular: Array<{ start: number; end: number }>;
+}
+
 export interface QuoteFieldProvenance {
   providerId: string;
   dataSource?: QuoteDataSource;
@@ -90,16 +104,45 @@ export interface Quote extends DepositaryReceiptFacts {
   fullExchangeName?: string;
   listingExchangeName?: string;
   listingExchangeFullName?: string;
+  /**
+   * The board whose line priced the quote, when Gloom Cloud read another one
+   * than the listing asked for: a KOSDAQ code saved as 247540:KRX is quoted
+   * from KOSDAQ and still named KRX in the listing fields (quoteTradingExchange).
+   */
+  tradingExchangeName?: string;
   routingExchangeName?: string;
   routingExchangeFullName?: string;
   marketState?: MarketState;
   sessionConfidence?: SessionConfidence;
+  /** An index's own regular sessions, for the open its pre-market waits for and the close its last print was. */
+  indexSession?: QuoteIndexSession;
   preMarketPrice?: number;
   preMarketChange?: number;
   preMarketChangePercent?: number;
   postMarketPrice?: number;
   postMarketChange?: number;
   postMarketChangePercent?: number;
+  /**
+   * Whether the quote holds a trade from the pre-market or after-hours
+   * session in progress (marketState PRE or POST). False when nothing has
+   * traded in it yet: the extended fields, or the price, are then the regular
+   * price carried forward, and their flat move is no move. Absent in the other
+   * sessions and when the source does not say.
+   */
+  extendedSessionPrint?: boolean;
+  /**
+   * The overnight session's price (a US listing trading 20:00 to 04:00 New
+   * York, Sunday night to Friday morning, while its exchange is closed): set
+   * only while that session is in progress and `price` is an observation from
+   * it, beside the closed exchange's marketState. Like an after-hours print,
+   * the quote keeps the last regular session's close, move and range.
+   */
+  overnightPrice?: number;
+  /** overnightPrice against the completed regular session's close, as postMarketChange is. */
+  overnightChange?: number;
+  overnightChangePercent?: number;
+  /** A trade printed in the session, or the midpoint of its bid and ask while nothing has traded in it. */
+  overnightPriceKind?: "trade" | "mark";
   bid?: number;
   ask?: number;
   bidSize?: number;
@@ -123,6 +166,46 @@ export interface QuoteContribution extends Quote {
 
 export type QuoteContributionMap = Record<string, QuoteContribution>;
 
+/** How a fundamentals block's trailing figures were converted from the currency the company reports in. */
+export interface TtmConversion {
+  /** The reporting currency the figures were converted from. */
+  from: string;
+  /** Units of `financialCurrency` per unit of `from` for revenue, income and cash flow; absent when not measured. */
+  rate?: number;
+  /** YYYY-MM-DD the converted figures were fetched. */
+  asOf?: string;
+  /** EPS is converted at the rate of each report date, so a P/E on it divides a spot price by EPS at older rates. */
+  eps?: "report_date";
+}
+
+/**
+ * How a served enterprise value ties to market cap + total debt - cash from the latest balance sheet served beside it.
+ * `matches` within 5%; `differs` beyond it (or beyond 2% on the other side of the market cap from net debt), within
+ * 0.7x to 1.5x, shown labelled as the provider's; `withdrawn` outside that band, with no EV or EV/revenue; `unchecked`
+ * without a recent balance sheet carrying both lines.
+ */
+export interface EnterpriseValueCheck {
+  status: "matches" | "differs" | "withdrawn" | "unchecked";
+  /** The provider's enterprise value, served as `enterpriseValue` unless withdrawn. */
+  source: number;
+  currency: string;
+  marketCap: number;
+  totalDebt?: number;
+  cash?: number;
+  /** YYYY-MM-DD of the balance sheet the debt and cash come from. */
+  balanceSheetDate?: string;
+  /** marketCap + totalDebt - cash. */
+  computed?: number;
+}
+
+/** How a trailing P/E converts the EPS it divides by, when that EPS is in another currency than the price. */
+export interface TrailingPEConversion {
+  /** The currency of the trailing EPS. */
+  from: string;
+  /** Units of the quote's (major) currency per unit of `from`. */
+  rate: number;
+}
+
 export interface Fundamentals extends DepositaryReceiptFacts {
   /** Every share count here is on this basis, the basis of the listing's price and market cap; absent when unproven. */
   shareBasis?: ShareBasis;
@@ -131,8 +214,14 @@ export interface Fundamentals extends DepositaryReceiptFacts {
   source?: "gloom";
   fetchedAt?: string;
   stale?: boolean;
-  /** Currency of reported revenue, income, and cash flows; may differ from the listing. */
+  /** Currency of the trailing revenue, income, cash flows and EPS (EPS unless `epsCurrency` says otherwise); may differ from the listing and the statements. */
   financialCurrency?: string;
+  /** Set when the trailing figures were converted from the reporting currency into `financialCurrency`. */
+  ttmConversion?: TtmConversion;
+  /** Set when the trailing EPS is in another currency than `financialCurrency`: the listing's, converted from the reporting currency at each report date's rate. */
+  epsCurrency?: string;
+  /** Set when `trailingPE` divides the price by the trailing EPS converted from another currency. */
+  trailingPEConversion?: TrailingPEConversion;
   /** Provider-reported issuer market cap; marketCapCurrency identifies its units when known. */
   marketCap?: number;
   marketCapCurrency?: string;
@@ -147,6 +236,8 @@ export interface Fundamentals extends DepositaryReceiptFacts {
   pegRatio?: number;
   enterpriseValue?: number;
   enterpriseToRevenue?: number;
+  /** Set where Gloom Cloud checked `enterpriseValue` against market cap + total debt - cash; pairs with that value only. */
+  enterpriseValueCheck?: EnterpriseValueCheck;
   /** Explicit provider retractions; omitted fields alone remain eligible for fallback. */
   unavailableFields?: Array<"enterpriseValue" | "enterpriseToRevenue">;
   operatingCashFlow?: number;
@@ -170,15 +261,17 @@ export interface Fundamentals extends DepositaryReceiptFacts {
   return3Y?: number;
   lastQuarterGrowth?: number;
   sharesOutstanding?: number;
-  /** Free float: shares outstanding less insider and strategic holdings. */
+  /** Free float: shares outstanding less insider and strategic holdings, never above `sharesOutstanding`. */
   floatShares?: number;
   beta?: number;
-  /** Shares sold short at the source's latest settlement. */
+  /** Shares short at the latest FINRA settlement, the one `SI` and `SIW` show; dated by `shortInterestDate`. */
   sharesShort?: number;
-  /** Shares short over float from the same observation, as a fraction (0.0127 for 1.27%). */
+  /** `sharesShort` over `floatShares`, as a fraction (0.0127 for 1.27%). */
   shortPercentOfFloat?: number;
-  /** Days to cover: shares short over average daily volume. */
+  /** Days to cover as FINRA states it for the settlement: shares short over the period's average daily volume. */
   shortRatio?: number;
+  /** The settlement date (YYYY-MM-DD) of `sharesShort`, `shortPercentOfFloat` and `shortRatio`. */
+  shortInterestDate?: string;
   /** Fractions of shares outstanding. */
   insiderPercentHeld?: number;
   institutionPercentHeld?: number;
@@ -291,6 +384,20 @@ export interface DividendAction {
   amount: number;
 }
 
+/**
+ * A distribution the issuer has declared and not yet paid, as the source
+ * states it. Kept apart from the paid `dividends`: no history, yield or growth
+ * figure takes it.
+ */
+export interface DeclaredDividendAction {
+  exDate: string;
+  /** Per share, in the listing's dividend currency (`currency`). */
+  amount: number;
+  declarationDate?: string;
+  recordDate?: string;
+  payDate?: string;
+}
+
 export interface SplitAction {
   date: string;
   description?: string;
@@ -302,6 +409,16 @@ export interface SplitAction {
   toFactor?: number;
 }
 
+/**
+ * How a reported EPS relates to the company's statements: `gaap` is the
+ * quarter's diluted EPS as the statements report it; `adjusted` is the
+ * consensus-basis figure, which leaves out items the statements include.
+ */
+export type EarningsEpsBasis = "gaap" | "adjusted";
+
+/** A report that is out, a date the company announced, or a date projected from its past reports. */
+export type EarningsDateStatus = "reported" | "confirmed" | "projected";
+
 export interface EarningsAction {
   date: string;
   dateType?: "announcement" | "fiscal-period-end";
@@ -311,6 +428,15 @@ export interface EarningsAction {
   epsActual?: number;
   difference?: number;
   surprisePercent?: number;
+  /** Fiscal quarter end month, YYYY-MM, when the report's quarter is known. */
+  fiscalPeriod?: string;
+  /** Analysts behind `epsEstimate`, when known. */
+  epsAnalysts?: number;
+  /** Null when the basis cannot be determined; absent from sources that do not say. */
+  epsBasis?: EarningsEpsBasis | null;
+  dateStatus?: EarningsDateStatus;
+  /** `press-release` when `epsActual` is the company's release's, provisional until the calendar has the quarter. */
+  epsActualSource?: "press-release";
 }
 
 export interface CorporateActionsData {
@@ -325,6 +451,8 @@ export interface CorporateActionsData {
   micCode?: string;
   exchangeTimezone?: string;
   dividends: DividendAction[];
+  /** Declared and unpaid, for the listings Gloom Cloud has them for; absent elsewhere and from older servers. */
+  declaredDividends?: DeclaredDividendAction[];
   splits: SplitAction[];
   earnings: EarningsAction[];
 }
@@ -661,6 +789,12 @@ export interface PricePoint {
   low?: number;
   close: number;
   volume?: number;
+  /** The bar's period had not ended when it was served: its close is the latest price, and it may have no volume yet. */
+  partial?: boolean;
+  /** The bar's prices were rebuilt from shorter bars where the source left it empty or too coarse. */
+  filled?: boolean;
+  /** A future's session that has closed but whose settlement is not confirmed yet: its close is the last trade. */
+  unsettled?: boolean;
 }
 
 export interface StatementHistoryAttempt {
@@ -774,4 +908,10 @@ export interface OptionsChain {
   realtimeEligible?: boolean;
   /** ISO timestamp for the upstream options snapshot. */
   asOf?: string;
+  /**
+   * The session the chain's open interest counts, YYYY-MM-DD, as Gloom Cloud
+   * states it; null when none of its counts is dated. Absent from a source
+   * that does not say (an older server, another provider).
+   */
+  openInterestAsOf?: string | null;
 }

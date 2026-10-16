@@ -3,6 +3,7 @@ import type { DataTableCell, DataTableColumn } from "../../../components";
 import { scalarPoint, staticSeries } from "../../../components/chart/static/series";
 import { getTableWidth } from "../../../components/ui/table-layout";
 import { formatCompact } from "../../../utils/format";
+import { isUsListingExchange, publicTickerKey } from "../../../utils/exchanges";
 import type { ThemeColors } from "../../../theme/colors";
 export const PERP_TABS = ["board", "rankings", "compare", "history", "evidence"] as const;
 export type PerpTab = typeof PERP_TABS[number];
@@ -21,7 +22,49 @@ export const compact = (n: number | null | undefined) => n == null ? "--" : form
 export const time = (s: string | null | undefined) => s ? `${s.slice(0, 10)} ${s.slice(11, 16)} UTC` : "--";
 /** A list row's observation, month to minute: the header names UTC and the footer the full as-of. */
 const observed = (s: string | null | undefined) => s ? `${s.slice(5, 10)} ${s.slice(11, 16)}` : "--";
+/**
+ * The listed security a market tracks, as DES, FA and G take it: a US listing by its symbol, the key a stock is
+ * saved and opened under, and a listing abroad with its venue (`NET:XLON`), so they open the security the premium
+ * is measured against. Null for crypto, indices, commodities and any market without one.
+ */
+export function underlyingTicker(row: Pick<PerpBoardRow, "underlyingSymbol" | "underlying" | "equityMatch">): string | null {
+  const symbol = row.underlyingSymbol?.trim().toUpperCase();
+  if (!symbol) return null;
+  const listing = row.equityMatch?.underlying.symbol.toUpperCase() === symbol ? row.equityMatch.underlying.exchange
+    : row.underlying?.symbol.toUpperCase() === symbol ? row.underlying.listingExchange : undefined;
+  return !listing || isUsListingExchange(listing) ? symbol : publicTickerKey(symbol, listing);
+}
 export const marketLabel = (row: PerpBoardRow) => row.dex && row.dex !== "default" ? `${row.baseAsset} · ${row.dex.toUpperCase()}` : row.baseAsset;
+
+/**
+ * Plain names for markets, as the Market column writes the contracts to try, nearest first. A name the board does
+ * not spell: bitcoin is BTC, and Brent is BZ on the Binance board and BRENTOIL on Hyperliquid's xyz dex. Keys are
+ * lower case letters and digits only, so "Brent Crude" and "brent-crude" are one.
+ */
+const PLAIN_NAMES: Readonly<Record<string, readonly string[]>> = {
+  bitcoin: ["BTC"], ethereum: ["ETH"], ether: ["ETH"], solana: ["SOL"], dogecoin: ["DOGE"], ripple: ["XRP"],
+  brent: ["BZ", "BRENTOIL · XYZ"], brentcrude: ["BZ", "BRENTOIL · XYZ"], wti: ["CL"], wticrude: ["CL"], naturalgas: ["NATGAS · XYZ"],
+};
+/** A pair as exchanges and charts write it: BTC-USD, BTC/USD, BTCUSD, BTCUSDT, BTC-PERP, BTC/USDT:USDT. */
+const QUOTED_PAIR = /^([A-Z0-9]{1,15}?)([-/_ ]?)(?:USDT|USDC|USD|PERP)(?::[A-Z]{3,4})?$/;
+
+/**
+ * The names to try for an input that names no market as typed: a plain name's contracts, or the base asset of a pair.
+ * Empty for an input that is neither; the caller has already tried it as typed.
+ */
+export function perpBaseCandidates(input: string): string[] {
+  const plain = PLAIN_NAMES[input.toLowerCase().replace(/[^a-z0-9]/g, "")];
+  if (plain) return [...plain];
+  const pair = QUOTED_PAIR.exec(input.trim().toUpperCase());
+  return pair ? [pair[1]!] : [];
+}
+/** The base asset a Market column label names: `BRENTOIL · XYZ` is BRENTOIL. */
+export const baseOfLabel = (label: string) => label.split("·")[0]!.trim();
+/** The base asset of a pair written with a separator (BTC-USD, BTC/USD), which no board symbol spells; null for anything else. */
+export function separatedPairBase(input: string): string | null {
+  const pair = QUOTED_PAIR.exec(input.trim().toUpperCase());
+  return pair?.[2] ? pair[1]! : null;
+}
 /** What the contract is, in plain words: perpetual futures never expire and trade around the clock. */
 export const perpDescription = (row: Pick<PerpBoardRow, "venue">) =>
   `Perpetual futures (24/7 ${row.venue === "hyperliquid" || row.venue === "dydx" ? "on-chain" : venueName(row.venue)} market)`;
@@ -32,6 +75,8 @@ export function readingTime(observedAt: string | null | undefined, now = Date.no
   const iso = new Date(read).toISOString();
   return `${iso.slice(0, 10) === new Date(now).toISOString().slice(0, 10) ? "" : `${iso.slice(0, 10)} `}${iso.slice(11, 16)} UTC`;
 }
+/** What the APR % column is: the current rate carried forward a year, never funding that was paid. */
+export const APR_FOOTNOTE = "APR = current 8h rate × 3 × 365: a simple annualisation of the current funding rate, not funding actually paid.";
 export const fundingInterval = (row: Pick<PerpBoardRow, "fundingIntervalHours" | "fundingKind">) => row.fundingIntervalHours ? `${row.fundingIntervalHours}h${row.fundingKind === "last-paid" ? " paid" : row.fundingKind === "continuous" ? " continuous" : ""}` : "--";
 export const HISTORY_METRICS = ["funding", "oi", "premium", "price", "long-short"] as const;
 export type HistoryMetric = typeof HISTORY_METRICS[number];
@@ -127,12 +172,14 @@ const PERP_COLUMNS: Record<PerpColumnId, DataTableColumn> = {
 };
 // Columns in reading order, then the order a narrow pane gives them up in.
 export const BOARD_COLUMNS: PerpColumnId[] = ["market", "venue", "markPrice", "fundingRate", "premium", "openInterestUsd", "oiChange24h", "longShare", "fundingApr", "priceChange24h", "observedAt"];
-// The venue goes last: the same market trades on several, and only the venue tells those rows apart. The long share
-// is what the board and the comparison are read for, so a 100-column pane keeps it and the annualised funding, which
-// only restates the funding rate, goes first (the 24h OI change next on the board, the per-interval rate on Compare).
-const BOARD_DROPS: PerpColumnId[] = ["observedAt", "fundingApr", "priceChange24h", "oiChange24h", "longShare", "premium", "markPrice", "openInterestUsd", "venue"];
+// The venue goes last: the same market trades on several, and only the venue tells those rows apart. Venues are polled
+// apart, so when each row was observed stays until only the venue is left to give up. The long share is what the board
+// and the comparison are read for, so a 100-column pane keeps it beside the observation time: the annualised funding,
+// which only restates the funding rate, goes first (the 24h OI change next on the board, the per-interval rate on
+// Compare), and the premium before the long share.
+const BOARD_DROPS: PerpColumnId[] = ["fundingApr", "priceChange24h", "oiChange24h", "premium", "longShare", "markPrice", "openInterestUsd", "observedAt", "venue"];
 export const COMPARE_COLUMNS: PerpColumnId[] = ["venue", "symbol", "markPrice", "fundingRate", "fundingRate8h", "premium", "openInterestUsd", "oiChange24h", "longShare", "fundingApr", "observedAt"];
-const COMPARE_DROPS: PerpColumnId[] = ["observedAt", "fundingApr", "oiChange24h", "fundingRate", "longShare", "premium", "markPrice", "openInterestUsd", "symbol"];
+const COMPARE_DROPS: PerpColumnId[] = ["fundingApr", "oiChange24h", "fundingRate", "premium", "longShare", "markPrice", "openInterestUsd", "observedAt", "symbol"];
 export const RANKING_COLUMNS: PerpColumnId[] = ["market", "venue", "value", "openInterestUsd"];
 
 /** The columns that fit the pane, the least read going first; before the last of them goes, a long market name gives up its tail. */

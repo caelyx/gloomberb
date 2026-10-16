@@ -19,10 +19,11 @@ import {
   withCurrencyMinorDigits,
 } from "../../../../market-data/market/format";
 import type { OverviewFunctionLink, PositionTableRow, StatField } from "./types";
-import { getPortfolioPositionMetrics, getPortfolioQuoteDisplay, resolvePortfolioMarketValue, resolvePortfolioPositionPnl, portfolioPnlPercent, signedPositionDirection } from "../../portfolio-list/position-metrics";
-import { liveDividendYield, liveForwardPE, liveMarketCapitalization, liveTrailingPE } from "../../portfolio-list/live-valuation";
+import { getPortfolioPositionMetrics, getPortfolioQuoteDisplay, resolvePortfolioMarketValue, resolvePortfolioPositionPnl, portfolioPnlPercent, signedPositionDirection } from "../../../../portfolio/position-metrics";
+import { liveDividendYield, liveForwardPE, liveMarketCapitalization, liveTrailingPE } from "../../../../market-data/quotes/live-valuation";
+import { atRegularSessionPrice } from "../../../../market-data/quotes/regular-session-valuation";
 import { formatReportedMoney } from "../../../../utils/reported-money";
-import { fundamentalsCurrency, reportedEnterpriseValue } from "../../../../utils/fundamentals";
+import { enterpriseValueCheck, fundamentalsCurrency, fundamentalsEpsCurrency, reportedEnterpriseValue } from "../../../../utils/fundamentals";
 import { formatShortDate } from "../../../../utils/datetime-format";
 import { safeExternalUrl } from "../../../../utils/external-url";
 
@@ -130,7 +131,7 @@ export function buildOverviewStats({
     stats.push({ label: "Fwd P/E", value: formatPriceEarnings(forwardPE) });
   }
   if (fundamentals?.eps != null) {
-    stats.push({ label: "EPS", value: money(fundamentals.eps, true) });
+    stats.push({ label: "EPS", value: formatReportedMoney(fundamentals.eps, fundamentalsEpsCurrency({ fundamentals, financialCurrency }), true) });
   }
   if (fundamentals?.pegRatio != null) {
     stats.push({ label: "PEG", value: formatPriceEarnings(fundamentals.pegRatio, 2) });
@@ -182,11 +183,20 @@ export function buildOverviewStats({
       valueColor: priceColor(fundamentals.revenueGrowth),
     });
   }
-  const enterpriseValue = reportedEnterpriseValue(fundamentals);
+  // At the regular session price, as the market cap above it is, with the check moved beside it.
+  const priced = atRegularSessionPrice({ quote, fundamentals }).fundamentals;
+  const enterpriseValue = reportedEnterpriseValue(priced);
   if (fundamentals?.unavailableFields?.includes("enterpriseValue")) {
     stats.push({ label: "EV", value: "—" });
   } else if (enterpriseValue != null) {
-    stats.push({ label: "EV", value: formatCompactCurrency(enterpriseValue, quoteCurrency) });
+    // More than 5% from market cap + debt - cash: the provider's, with the computed figure where it fits.
+    const check = enterpriseValueCheck(priced);
+    const computed = check?.status === "differs" && check.computed != null ? formatCompact(check.computed) : undefined;
+    stats.push({
+      label: "EV",
+      value: formatCompactCurrency(enterpriseValue, quoteCurrency),
+      detail: computed ? [`provider vs ${computed}`, "provider"] : undefined,
+    });
   }
   if (finite(fundamentals?.beta)) {
     stats.push({ label: "Beta", value: formatNumber(fundamentals.beta, 2), link: RELATIONSHIP_GRAPH });

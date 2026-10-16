@@ -138,6 +138,18 @@ describe("formatMarketPriceWithCurrency", () => {
     expect(formatMarketPriceWithCurrency(1.084567, "USD", { isCashBalance: true })).toBe("$1.084567");
   });
 
+  test("an index level is points, with no currency symbol, wherever it is formatted", () => {
+    // Keyed on the instrument, as the quote table, the quote monitor and the pane cards all format it.
+    const index = { assetCategory: "INDEX" };
+    expect(formatMarketPriceWithCurrency(7805.45, "USD", index)).toBe("7,805.45");
+    expect(formatMarketPriceWithCurrency(67744.29, "JPY", { ...index, priceBasis: "per-unit" })).toBe("67,744.29");
+    expect(formatMarketChangeWithCurrency(-1.79, "USD", index)).toBe("-1.79");
+    expect(formatMarketChangeWithCurrency(38.22, "GBP", index)).toBe("+38.22");
+    // A stock or an ETF is money; an index ETF is not an index.
+    expect(formatMarketPriceWithCurrency(7805.45, "USD", { assetCategory: "ETF" })).toBe("$7,805.45");
+    expect(formatMarketChangeWithCurrency(-1.79, "USD", { assetCategory: "STK" })).toBe("-$1.79");
+  });
+
   test("formats position cost values with tighter equity precision", () => {
     expect(formatMarketCostWithCurrency(119.3687, "HKD", { assetCategory: "STK" })).toBe("HK$119.37");
     expect(formatMarketCostWithCurrency(50.9507, "USD", { assetCategory: "OPT", multiplier: 100 })).toBe("$50.9507");
@@ -207,6 +219,18 @@ test("contract price precision does not change units, signed/zero/missing semant
   expect(formatMarketChangeWithCurrency(.001, "USD", { assetCategory: "BOND" })).toBe("—");
 });
 
+test("a negative zero reads as zero, and only it: a move a cell rounded to nothing is never signed", () => {
+  // A table that pre-rounds its change (Number(x.toFixed(2))) hands over -0 for -0.004.
+  expect(formatPriceObservation(Number((-0.004).toFixed(2)), { minimumFractionDigits: 2 })).toBe("0.00");
+  expect(formatPriceObservation(-0, { minimumFractionDigits: 2, maxWidth: 6 })).toBe("0.00");
+  expect(formatMarketPrice(-0, { assetCategory: "STK" })).toBe(formatMarketPrice(0, { assetCategory: "STK" }));
+  // Real moves keep their sign and digits.
+  expect(formatPriceObservation(-0.004, { minimumFractionDigits: 2 })).toBe("-0.004");
+  expect(formatPriceObservation(-0.01, { minimumFractionDigits: 2 })).toBe("-0.01");
+  expect(formatPriceObservation(0.01, { minimumFractionDigits: 2 })).toBe("0.01");
+  expect(formatMarketPrice(-37.63, { assetCategory: "STK" })).toBe("-37.63");
+});
+
 test("untyped observations retain source decimals with bounded widths and missing/zero distinctions", () => {
   expect(formatPriceObservation(-37.63001)).toBe("-37.63001");
   expect(formatPriceObservation(0, { minimumFractionDigits: 2 })).toBe("0.00");
@@ -229,6 +253,51 @@ test("money prices pad to the currency's minor unit without cutting crypto, FX o
   expect(pad(1.138045, "USD", { assetCategory: "CURRENCY" })).toBe("$1.138045");
   expect(pad(3025, "JPY", { assetCategory: "EQUITY" })).toBe("¥3,025");
   expect(pad(87, "USD", { assetCategory: "BOND", priceBasis: "percent-of-par" })).toBe("87% par");
+});
+
+describe("three-decimal currencies", () => {
+  const plain = { assetCategory: "EQUITY" };
+  const padded = (value: number, currency: string) =>
+    formatMarketPriceWithCurrency(value, currency, withCurrencyMinorDigits(plain, currency));
+
+  test("prices keep the mill whether or not the cell pads to the minor unit", () => {
+    for (const currency of ["OMR", "BHD", "KWD", "JOD", "TND"]) {
+      expect(formatMarketPriceWithCurrency(1.366, currency, plain)).toBe(`${currency}1.366`);
+      expect(padded(1.366, currency)).toBe(`${currency}1.366`);
+      expect(padded(1.37, currency)).toBe(`${currency}1.370`);
+      expect(padded(0.462, currency)).toBe(`${currency}0.462`);
+      expect(padded(1_234.5, currency)).toBe(`${currency}1,234.500`);
+    }
+    expect(formatMarketCostWithCurrency(1.366, "OMR", plain)).toBe("OMR1.366");
+    expect(formatMarketCostWithCurrency(1.37, "OMR", plain)).toBe("OMR1.370");
+  });
+
+  test("live quotes hold three decimals at and above one unit, and four below it", () => {
+    const live = (values: number[], previousClose: number, currency = "OMR") =>
+      values.map((value) => formatMarketPriceWithCurrency(value, currency, liveQuoteFormatOptions({ instrumentType: "EQUITY", previousClose }, currency)));
+    expect(live([1.366, 1.37, 12], 1.35)).toEqual(["OMR1.366", "OMR1.370", "OMR12.000"]);
+    expect(live([1.366], 1.35, "kwd")).toEqual(["KWD1.366"]);
+    expect(live([0.462, 0.4], 0.45)).toEqual(["OMR0.4620", "OMR0.4000"]);
+    expect(stablePriceFractionDigits({ assetCategory: "EQUITY", currency: "BHD", referencePrice: 1.1 })).toBe(3);
+  });
+
+  test("a change is signed at the mill, and a move below half a mill is unsigned", () => {
+    expect(formatMarketChangeWithCurrency(0.016, "OMR", plain)).toBe("+OMR\u00a00.016");
+    expect(formatMarketChangeWithCurrency(-0.004, "OMR", plain, 1.366)).toBe("-OMR\u00a00.004");
+    expect(formatMarketChangeWithCurrency(0.0002, "OMR", plain, 1.366)).toBe("OMR\u00a00.000");
+    expect(formatMarketChangeWithCurrency(0.004, "USD", plain, 150)).toBe("$0.00");
+  });
+
+  test("USD, EUR and JPY prices are unchanged", () => {
+    expect(formatMarketPriceWithCurrency(1.366, "USD", plain)).toBe("$1.37");
+    expect(padded(1.366, "USD")).toBe("$1.37");
+    expect(padded(309.9, "EUR")).toBe("€309.90");
+    expect(padded(3025, "JPY")).toBe("¥3,025");
+    expect(formatMarketCostWithCurrency(1.366, "USD", plain)).toBe("$1.37");
+    expect(formatMarketChangeWithCurrency(0.016, "USD", plain)).toBe("+$0.02");
+    expect(formatMarketChangeWithCurrency(1.366, "JPY", plain)).toBe("+¥1.37");
+    expect(formatMarketPriceWithCurrency(1.366, "USD", liveQuoteFormatOptions({ instrumentType: "EQUITY", previousClose: 1.35 }, "USD"))).toBe("$1.37");
+  });
 });
 
 // Streamed quotes re-render several times a second. Decimals chosen from each

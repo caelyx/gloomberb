@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { act } from "react";
 import { createOpenTuiTestHarness } from "../renderers/opentui/test-utils";
-import { MarkdownText } from "./markdown-text";
+import { MarkdownText, markdownLinks } from "./markdown-text";
 
 const tui = createOpenTuiTestHarness();
 
@@ -13,9 +13,9 @@ const COMPARISON = [
   "| Tax/distribution character | Distributions can vary and are not equivalent to bond interest | Mostly dividends and capital appreciation |",
 ].join("\n");
 
-async function render(text: string, width: number): Promise<string[]> {
+async function render(text: string, width: number, onOpenLink?: (href: string) => void): Promise<string[]> {
   await act(async () => {
-    await tui.render(<MarkdownText text={text} lineWidth={width} />, { width, height: 40 });
+    await tui.render(<MarkdownText text={text} lineWidth={width} onOpenLink={onOpenLink} />, { width, height: 40 });
   });
   await act(async () => {
     await tui.setup().renderOnce();
@@ -120,3 +120,32 @@ describe("MarkdownText inline marks", () => {
     ]);
   });
 });
+
+describe("MarkdownText links", () => {
+  // Release notes and model answers keep their links as written; only a
+  // reader that handles links (DOCS) reads them as links.
+  test("a link reads as its label only for a reader that opens links", async () => {
+    const text = "See [the **keys**](/docs/layout-shortcuts) and | [x] stays.";
+    expect(await render(text, 80)).toEqual(["See [the keys](/docs/layout-shortcuts) and | [x] stays."]);
+    expect(await render(text, 80, () => {})).toEqual(["See the keys and | [x] stays."]);
+  });
+
+  test("a picture stays as written even for a reader that opens links", async () => {
+    const text = "![Chart](https://gloom.sh/chart.png) and [the docs](https://gloom.sh/docs).";
+    expect(await render(text, 80, () => {})).toEqual(["![Chart](https://gloom.sh/chart.png) and the docs."]);
+  });
+
+  test("lists the links a text reads, whole labels in reading order", () => {
+    expect(markdownLinks([
+      "- Read [the **keys**](/docs/keys), not `[code](/no)`, and ![a picture](/shot.png).",
+      "",
+      "| Name | Where |",
+      "|---|---|",
+      "| Diff | [Full diff](https://example.com/diff) |",
+    ].join("\n"))).toEqual([
+      { label: "the keys", href: "/docs/keys" },
+      { label: "Full diff", href: "https://example.com/diff" },
+    ]);
+  });
+});
+

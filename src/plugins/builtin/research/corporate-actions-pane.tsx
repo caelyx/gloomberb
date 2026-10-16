@@ -45,6 +45,7 @@ import {
   buildEventRows,
   eventSourceNotice,
   formatEventMetric,
+  type EventFinancials,
   type EventRow,
   type EventStatus,
 } from "./event-model";
@@ -283,8 +284,14 @@ export function buildEventDetail({
   if (row.status !== "Earnings") return sections;
 
   const comparison: EventDetailBlock[] = [
-    detailRow("Actual", earningsInput(row.epsActual, row.epsCurrency)),
-    detailRow("Consensus", earningsInput(row.epsEstimate, row.epsCurrency)),
+    ...(row.dateStatus && row.dateStatus !== "reported" ? [detailRow("Report date", row.date, row.dateStatus)] : []),
+    detailRow("Actual", earningsInput(row.epsActual, row.epsCurrency),
+      row.epsActual == null ? undefined : [row.epsBasis === "unknown" ? "basis unknown" : row.epsBasis,
+        row.epsProvisional ? "provisional, from the company's press release" : null].filter(Boolean).join(", ") || undefined),
+    // An upcoming estimate names its basis when it is adjusted (a REIT's FFO consensus).
+    detailRow("Consensus", earningsInput(row.epsEstimate, row.epsCurrency),
+      [row.epsAnalysts != null ? `${row.epsAnalysts} analysts` : null,
+        row.epsActual == null && row.epsBasis === "adjusted" ? "adjusted" : null].filter(Boolean).join(", ") || undefined),
   ];
   if (row.epsDifference != null) comparison.push(detailRow("Difference", earningsInput(row.epsDifference, row.epsCurrency)));
   if (row.surprisePercent != null) {
@@ -418,13 +425,20 @@ export function CorporateActionsView({
   const { symbol, ticker, exchange, currency } = useSymbolBinding();
   useCompanyDisclosureLinks(symbol);
   // The shared ticker snapshot already subscribes to financials for this pane.
-  // Only the statements are read, so the rows do not rebuild on price ticks.
+  // Only the statements and the trailing EPS are read, so the rows do not rebuild on price ticks.
   const { financials: tickerFinancials } = usePaneTicker();
   const quarterlyStatements = tickerFinancials?.quarterlyStatements;
   const financialCurrency = tickerFinancials?.financialCurrency;
-  const financialsData = useMemo(
-    () => (quarterlyStatements || financialCurrency ? { quarterlyStatements: quarterlyStatements ?? [], financialCurrency } : null),
-    [financialCurrency, quarterlyStatements],
+  const trailingEps = tickerFinancials?.fundamentals?.eps;
+  const trailingEpsCurrency = tickerFinancials?.fundamentals?.epsCurrency;
+  const fundamentalsCurrency = tickerFinancials?.fundamentals?.financialCurrency;
+  const financialsData = useMemo<EventFinancials | null>(
+    () => (quarterlyStatements || financialCurrency || trailingEps != null ? {
+      quarterlyStatements: quarterlyStatements ?? [],
+      financialCurrency,
+      fundamentals: { eps: trailingEps, epsCurrency: trailingEpsCurrency, financialCurrency: fundamentalsCurrency },
+    } : null),
+    [financialCurrency, fundamentalsCurrency, quarterlyStatements, trailingEps, trailingEpsCurrency],
   );
   const actionsLoader = useCallback((nextSymbol: string, nextExchange: string, forceRefresh: boolean) => {
     if (!dataProvider?.getCorporateActions) throw new Error("Corporate actions source unavailable");

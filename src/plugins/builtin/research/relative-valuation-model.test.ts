@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Quote, TickerFinancials } from "../../../types/financials";
-import { relativeValuationValues, withLiveQuote } from "./relative-valuation-model";
+import { formatRelativePrice, relativeValuationValues, withLiveQuote } from "./relative-valuation-model";
 
 const snapshot: TickerFinancials = {
   annualStatements: [],
@@ -14,6 +14,14 @@ function live(overrides: Partial<Quote>): Quote {
   return { symbol: "PLD", price: 110, change: 11, changePercent: 11, currency: "USD", lastUpdated: 2_000, ...overrides };
 }
 
+test("a missing price currency stays blank, and an explicit code still prints", () => {
+  expect(formatRelativePrice(10, null)).toBe("10.00");
+  expect(formatRelativePrice(10, undefined)).toBe("10.00");
+  expect(formatRelativePrice(10, "USD")).toBe("$10.00");
+  expect(formatRelativePrice(10, "EUR")).toBe("€10.00");
+  expect(formatRelativePrice(null, "USD")).toBe("-");
+});
+
 test("a live quote moves price-based values with the price and keeps the fundamentals", () => {
   const values = relativeValuationValues(withLiveQuote(snapshot, live({})));
   expect(values.price).toBe(110);
@@ -22,6 +30,19 @@ test("a live quote moves price-based values with the price and keeps the fundame
   expect(values.fcfYield).toBeCloseTo(50 / 1_100);
   expect(values.reportedMultiples.trailingPE).toBeCloseTo(22);
   expect(values.reportedMultiples.forwardPE).toBeCloseTo(17.6);
+});
+
+test("a live after-hours print leaves Last and the price-derived values at the close and gets its own field", () => {
+  // The live quote's price is the print, as Gloom Cloud sends it after the close, with the close beside it.
+  const values = relativeValuationValues(withLiveQuote(snapshot, live({
+    price: 112, change: 12, changePercent: 12, previousClose: 100, regularClose: 110, regularCloseSessionDate: "2026-10-09",
+    regularChange: 10, regularChangePercent: 10, changeSessionDate: "2026-10-09", marketState: "POST", listingExchangeName: "NYSE",
+  })));
+  expect(values).toMatchObject({ price: 110, change: 10, changePercent: 10, extendedSession: "POST", extendedPrice: 112 });
+  expect(values.extendedChangePercent).toBeCloseTo(200 / 110);
+  expect(values.marketCap).toBeCloseTo(1_100);
+  expect(values.reportedMultiples.trailingPE).toBeCloseTo(22);
+  expect(values.fcfYield).toBeCloseTo(50 / 1_100);
 });
 
 test("an older, stale or differently priced quote leaves the snapshot alone", () => {

@@ -1,11 +1,21 @@
 import { type ReactNode, type Ref } from "react";
-import { Checkbox, FieldLabel, SelectButton, type ChoiceDialogChoice } from "../../../components";
+import {
+  Button,
+  Checkbox,
+  FieldLabel,
+  MultiSelectDialogButton,
+  SelectButton,
+  type ChoiceDialogChoice,
+  type MultiSelectDialogButtonHandle,
+} from "../../../components";
+import { chatDeskChoices } from "../chat/people";
 import { Box, Text, TextAttributes, type BoxRenderable } from "../../../ui";
 import { colors } from "../../../theme/colors";
 import { truncateWithEllipsis } from "../../../utils/text-wrap";
 import type { SelectControl } from "../../../components/ui/select-button";
 import type { ProfileAnalyticsPreview } from "./model";
 import { t } from "../../../i18n";
+import { ClippedText } from "../../../components/ui/display";
 
 export function accountFieldLabelWidth(width: number) {
   const preferred = width >= 28 ? 16 : Math.max(10, Math.floor(width * 0.42));
@@ -123,16 +133,12 @@ export function PublicAnalyticsGroup({
           const valueWidth = Math.max(1, metricWidth - labelTextWidth - 1);
           return (
             <Box key={metric.id} width={metricWidth} height={1} flexDirection="row" gap={1}>
-              <Text fg={colors.textDim}>{truncateWithEllipsis(metric.label, labelTextWidth)}</Text>
-              <Text fg={metricColor(metric.tone)} attributes={TextAttributes.BOLD}>
-                {truncateWithEllipsis(metric.value, valueWidth)}
-              </Text>
+              <ClippedText fg={colors.textDim} text={metric.label} width={labelTextWidth} cut={truncateWithEllipsis} />
+              <ClippedText fg={metricColor(metric.tone)} attributes={TextAttributes.BOLD} text={metric.value} width={valueWidth} cut={truncateWithEllipsis} />
             </Box>
           );
         }) : detail ? (
-          <Text fg={colors.textMuted}>
-            {truncateWithEllipsis(detail, detailWidth)}
-          </Text>
+          <ClippedText fg={colors.textMuted} text={detail} width={detailWidth} cut={truncateWithEllipsis} />
         ) : null}
       </Box>
       {metrics.length === 0 && displayPreview.subtitle ? (
@@ -145,6 +151,49 @@ export function PublicAnalyticsGroup({
           {disclaimer}
         </Text>
       ) : null}
+    </Box>
+  );
+}
+
+/**
+ * The desks chat shows beside your name, once What I Trade is on: pre-filled
+ * from your answer to "What do you trade?", coarse words only.
+ */
+export function DeskChoiceRow({
+  desks,
+  active,
+  width,
+  controlRef,
+  nodeRef,
+  onFocus,
+  onChange,
+}: {
+  desks: string[];
+  active: boolean;
+  width: number;
+  controlRef?: Ref<MultiSelectDialogButtonHandle>;
+  nodeRef?: Ref<BoxRenderable>;
+  onFocus: () => void;
+  onChange: (desks: string[]) => void;
+}) {
+  const labelWidth = Math.min(accountFieldLabelWidth(width), Math.max(1, width - 2));
+  return (
+    <Box ref={nodeRef} height={1} flexDirection="row" gap={1} alignItems="center" width={width} onMouseOver={onFocus}>
+      <FieldLabel label={t("Trades")} active={active} maxWidth={labelWidth} />
+      <MultiSelectDialogButton
+        ref={controlRef}
+        label={t("Trades")}
+        title={t("What I Trade")}
+        options={chatDeskChoices().map((choice) => ({ value: choice.value, label: t(choice.label) }))}
+        selectedValues={desks}
+        emptyLabel={t("None")}
+        onOpenChange={(open) => { if (open) onFocus(); }}
+        onChange={onChange}
+        // The label beside it already says Trades: the button shows the picks.
+        renderTrigger={({ summary, disabled, openDialog }) => (
+          <Button label={summary} variant="secondary" active={active} disabled={disabled} onPress={() => openDialog()} />
+        )}
+      />
     </Box>
   );
 }

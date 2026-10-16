@@ -25,9 +25,24 @@ interface ViewBundleOptions {
   aliasRules?: AliasRule[];
   failureMessage: string;
   missingEntryMessage: string;
+  /**
+   * Leave identifiers unminified (whitespace and syntax still are), so the
+   * components keep their names and a page audit can say which one drew an
+   * element (`scripts/pane-chrome/ui-audit.ts`). Bun's `keepNames` alone did
+   * not keep them.
+   */
+  keepNames?: boolean;
 }
 
-const ELECTROBUN_VIEW_DIR = join(process.cwd(), "src", "renderers", "electrobun", "view");
+/** Bun's minify setting: everything, or everything but identifiers when names are kept. */
+function minifyOption(keepNames: boolean | undefined) {
+  return keepNames ? { whitespace: true, syntax: true, identifiers: false } : true;
+}
+
+// From this file rather than the working directory, so a build started from
+// any folder (`gloomberb shot` run from a checkout or a package install) finds
+// the sources.
+const ELECTROBUN_VIEW_DIR = join(import.meta.dir, "..", "electrobun", "view");
 
 /**
  * Where the world map finds its land data, relative to the map's
@@ -35,7 +50,7 @@ const ELECTROBUN_VIEW_DIR = join(process.cwd(), "src", "renderers", "electrobun"
  * never draws that map, leaves the data out.
  */
 export const WORLD_MAP_DATA_SPECIFIER = "./natural-earth/index.chunk.js";
-const DOM_RENDERER_DIR = join(process.cwd(), "src", "renderers", "dom");
+const DOM_RENDERER_DIR = import.meta.dir;
 
 export function electrobunViewPath(...parts: string[]): string {
   return join(ELECTROBUN_VIEW_DIR, ...parts);
@@ -57,6 +72,7 @@ export async function buildViewBundle({
   aliasRules = [],
   failureMessage,
   missingEntryMessage,
+  keepNames,
 }: ViewBundleOptions): Promise<{ script: string; stylesheet: string | null }> {
   const chunks = new Map<string, string>();
   const result = await Bun.build({
@@ -66,7 +82,7 @@ export async function buildViewBundle({
     format: "esm",
     splitting: false,
     sourcemap,
-    minify: true,
+    minify: minifyOption(keepNames),
     define: {
       "process.env.NODE_ENV": "\"production\"",
       __GLOOM_WORLD_MAP_DATA__: JSON.stringify(WORLD_MAP_DATA_SPECIFIER),
@@ -85,7 +101,7 @@ export async function buildViewBundle({
 
   const script = result.outputs.find((output) => output.kind === "entry-point" && output.path.endsWith(".js"));
   if (!script) throw new Error(missingEntryMessage);
-  await buildLazyChunks(outdir, chunks, failureMessage);
+  await buildLazyChunks(outdir, chunks, failureMessage, keepNames);
 
   const stylesheet = result.outputs.find((output) => output.path.endsWith(".css"))?.path ?? null;
   if (stylesheet) await writeFile(stylesheet, withTitlebarOverlayHeight(await readFile(stylesheet, "utf8")));
@@ -106,20 +122,26 @@ export async function writeElectrobunViewPage(options: PageOptions): Promise<str
       __GLOOMBERB_API_URL__: JSON.stringify(process.env.GLOOMBERB_API_URL ?? ""),
     },
   });
-  const stylesheet = withTitlebarOverlayHeight(await readFile(join(DOM_RENDERER_DIR, "styles.css"), "utf8"));
+  const stylesheet = await readViewStylesheet();
   const entrySrc = `./${relative(options.outdir, script).replaceAll("\\", "/")}`;
   const htmlPath = join(options.outdir, "index.html");
   await writeFile(htmlPath, renderElectrobunViewHtml({ ...options, stylesheet, entrySrc }));
   return htmlPath;
 }
 
-function renderElectrobunViewHtml({
+/** The DOM renderer's stylesheet, sized for the titlebar, which a view page inlines. */
+export async function readViewStylesheet(): Promise<string> {
+  return withTitlebarOverlayHeight(await readFile(join(DOM_RENDERER_DIR, "styles.css"), "utf8"));
+}
+
+/** A view page: the stylesheet inline, the bootstrap script, then the bundle at `entrySrc`. */
+export function renderElectrobunViewHtml({
   title,
   loadingText,
   stylesheet,
   bootstrapScript,
   entrySrc,
-}: PageOptions & { stylesheet: string; entrySrc: string }): string {
+}: Pick<PageOptions, "title" | "loadingText" | "bootstrapScript"> & { stylesheet: string; entrySrc: string }): string {
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -172,7 +194,7 @@ function lazyChunkPlugin(rootOutdir: string, emitDir: string, chunks: Map<string
 }
 
 /** Builds each lazy chunk on its own, and the chunks those load in turn. */
-async function buildLazyChunks(rootOutdir: string, chunks: Map<string, string>, failureMessage: string): Promise<void> {
+async function buildLazyChunks(rootOutdir: string, chunks: Map<string, string>, failureMessage: string, keepNames?: boolean): Promise<void> {
   const built = new Set<string>();
   let pending = [...chunks.entries()];
   while (pending.length) {
@@ -188,7 +210,7 @@ async function buildLazyChunks(rootOutdir: string, chunks: Map<string, string>, 
         format: "esm",
         splitting: false,
         sourcemap: "none",
-        minify: true,
+        minify: minifyOption(keepNames),
         plugins: [lazyChunkPlugin(rootOutdir, dirname(output), nested)],
       });
       if (!result.success) {

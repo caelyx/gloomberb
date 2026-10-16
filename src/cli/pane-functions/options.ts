@@ -9,7 +9,9 @@ import {
 } from "../../plugins/builtin/ticker-detail/financials/ratios";
 import type { PaneRuntimeState } from "../../core/state/app/state";
 import type { NormalizedPaneFunctionOptions } from "./capabilities";
-import type { ListingArg } from "../listing-arg";
+import type { CliListing } from "../listing-arg";
+import { splitSymbolArgs } from "../symbol-args";
+import { numberErrorMessage } from "../../utils/decimal-comma";
 
 const DEFAULT_SHOT_WIDTH = 1280;
 const DEFAULT_SHOT_HEIGHT = 720;
@@ -34,6 +36,8 @@ export interface ParsedPaneFunctionArgs {
   outputPath: string | null;
   width: number;
   height: number;
+  /** `--height` was given; without it a pane that fits its rows (FUT) grows to show them all. */
+  heightGiven?: true;
   /** Theme id override for screenshots; null keeps the configured theme. */
   theme: string | null;
   /** Render scale: 1.5 renders two thirds as many cells at 1.5x size, so text reads larger at the same pixel size. */
@@ -47,8 +51,15 @@ export interface ParsedPaneFunctionArgs {
   /** `--explain`: follow a report with the meaning of the terms it shows. */
   explain?: boolean;
   requireBotSafe: boolean;
+  /** `shot --strict`: exit with the unusable-shot code when the capture shows no usable data. */
+  strict?: boolean;
   /** The listing a one-ticker function's argument named, once `applyListingArgument` has resolved it. */
-  listing?: ListingArg;
+  listing?: CliListing;
+  /**
+   * What `applyListingArgument` says about a list's listings: what a typed
+   * code was read as, and the ones left out of data that covers US listings only.
+   */
+  listingNotes?: string[];
 }
 
 export interface ParsedPaneCatalogArgs {
@@ -87,11 +98,13 @@ export function parsePaneFunctionArgs(args: string[], globalOptions: { limit?: n
   let outputPath: string | null = null;
   let width = DEFAULT_SHOT_WIDTH;
   let height = DEFAULT_SHOT_HEIGHT;
+  let heightGiven = false;
   let theme: string | null = null;
   let scale = 1;
   let watermark: string | null = null;
   let status = true;
   let explain = false;
+  let strict = false;
   let requireBotSafe = false;
   const clamped: ShotSizeClamp[] = [];
 
@@ -120,6 +133,10 @@ export function parsePaneFunctionArgs(args: string[], globalOptions: { limit?: n
       explain = true;
       continue;
     }
+    if (normalizeOptionKey(key) === "strict" && inlineValue === undefined) {
+      strict = true;
+      continue;
+    }
     const next = args[index + 1];
     const nextValue = inlineValue === undefined && next && !next.startsWith("--") ? args[++index] : true;
     const value: string | true = inlineValue ?? nextValue ?? true;
@@ -132,7 +149,10 @@ export function parsePaneFunctionArgs(args: string[], globalOptions: { limit?: n
       const size = parseShotSize(normalizedKey, value);
       if (size.used !== size.requested) clamped.push(size);
       if (normalizedKey === "width") width = size.used;
-      else height = size.used;
+      else {
+        height = size.used;
+        heightGiven = true;
+      }
     } else if (normalizedKey === "theme" && value !== true) {
       theme = value.trim() || null;
     } else if (normalizedKey === "scale" && value !== true) {
@@ -157,7 +177,9 @@ export function parsePaneFunctionArgs(args: string[], globalOptions: { limit?: n
   return {
     target, arg, options, outputPath, width, height, theme, scale, watermark, status, requireBotSafe,
     ...(clamped.length > 0 ? { clamped } : {}),
+    ...(heightGiven ? { heightGiven: true as const } : {}),
     ...(explain ? { explain } : {}),
+    ...(strict ? { strict } : {}),
   };
 }
 
@@ -233,8 +255,9 @@ const RESERVED_OPTION_KEYS = new Set([
 
 function parseScale(value: string): number {
   const parsed = Number.parseFloat(value);
-  if (!Number.isFinite(parsed) || parsed < 0.5 || parsed > 4) {
-    throw new Error(`--scale must be a number between 0.5 and 4, got "${value}".`);
+  // parseFloat reads "2,5" as 2, so a comma is refused before it can pass.
+  if (value.includes(",") || !Number.isFinite(parsed) || parsed < 0.5 || parsed > 4) {
+    throw new Error(numberErrorMessage(`--scale must be a number between 0.5 and 4, got "${value}".`, value));
   }
   return parsed;
 }
@@ -275,10 +298,8 @@ export function buildCreateOptions(
     try {
       createOptions.symbols = parseTickerListInput(raw);
     } catch {
-      createOptions.symbols = raw
-        .split(",")
-        .map((entry) => cleanTickerInput(entry))
-        .filter(Boolean);
+      // Past the list limit, every symbol stays: a pasted list splits as `quote` splits it.
+      createOptions.symbols = splitSymbolArgs([raw]).map(cleanTickerInput);
     }
   }
 

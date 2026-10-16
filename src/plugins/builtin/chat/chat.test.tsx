@@ -1,17 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { act } from "react";
+import { act, useState } from "react";
 import { AppContext, createInitialState } from "../../../state/app/context";
 import { createStaticAppStore } from "../../../test-support/app-store";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
-import { colors } from "../../../theme/colors";
+import { colors, hoverBg } from "../../../theme/colors";
 import { createDefaultConfig } from "../../../types/config";
 import type { ChatMessage } from "../../../api-client";
 import { apiClient } from "../../../api-client";
 import { PluginRenderProvider } from "../../runtime";
 import { setSharedRegistryForTests } from "../../registry";
 import { ChatContent } from "./content";
+import { MESSAGE_HIGHLIGHT_MS } from "./content/row-activity";
 import { SLOW_SEND_THRESHOLD_MS } from "./message/pending-send";
+import { chatHighlightBg } from "./message/render-state";
+import { chatBotNameColor } from "./people";
+import { ICON_GLYPHS } from "../../../components/ui/icon";
 import { ChatStatusWidget } from "./status-widget";
+import { estimateMessageHeight } from "./layout";
 import {
   createChatTestHarness,
   createController,
@@ -215,6 +220,34 @@ describe("ChatContent", () => {
     frame = tui.frame();
     expect(frame).toContain("> @bravo");
     expect(frame).not.toContain("@charlie");
+  });
+
+  test("fills a cold mention menu with silent members without another keystroke or read", async () => {
+    const pending = Promise.withResolvers<Awaited<ReturnType<typeof apiClient.getChatMentionCandidates>>>();
+    let reads = 0;
+    apiClient.getChatMentionCandidates = () => { reads++; return pending.promise; };
+    const controller = createController({ messages: [makeNamedMessage(1, "alpha")] });
+    await renderFocusedComposerWithDraft(controller, "@");
+    expect(tui.frame()).toContain("@alpha");
+    expect(tui.frame()).not.toContain("@quiet");
+    await act(async () => {
+      pending.resolve([
+        { id: "u-alpha", username: "alpha", displayName: "Alpha", channelActivityAt: null, conversationActivityAt: null },
+        { id: "u-quiet", username: "quiet", displayName: "Silent Member", channelActivityAt: null, conversationActivityAt: null },
+      ]);
+      await pending.promise;
+    });
+    await flushFrame();
+    expect(tui.frame()).toContain("@quiet");
+    await act(async () => { await tui.setup().mockInput.typeText("Sil"); });
+    await flushFrame();
+    expect(tui.frame()).toContain("@quiet");
+    expect(tui.frame()).not.toContain("@alpha");
+    expect(reads).toBe(1);
+    const event = await emitKeypress({ name: "tab", sequence: "\t" });
+    await flushFrame();
+    expect(tui.frame()).toContain("> @quiet");
+    expect(event.defaultPrevented).toBe(true);
   });
 
   test("tab accepts the current mention suggestion without pane cycling", async () => {
@@ -523,29 +556,255 @@ describe("ChatContent", () => {
     expect(bodySpan!.fg.toInts().join(",")).toBe(expectedSelectedFg);
   });
 
-  test("selects the exact message requested by a chat deep link", async () => {
-    const controller = createController({
-      messages: [makeMessage(1), makeMessage(2)],
+  describe("a message a chat deep link opened on", () => {
+    const bodyBg = (text: string) => {
+      const span = tui.setup().captureSpans().lines
+        .filter((line) => lineText(line).includes(text))
+        .flatMap((line) => line.spans)
+        .find((candidate) => candidate.text.includes(text));
+      return span?.bg.toInts().join(",");
+    };
+    const highlighted = hexToRgbaInts(chatHighlightBg());
+
+    async function openOnFirstMessage() {
+      const controller = createController({ messages: [makeMessage(1), makeMessage(2)] });
+      let handled = 0;
+      await mountChat(controller, {
+        width: 72,
+        height: 12,
+        targetMessageId: "m1",
+        onTargetMessageHandled: () => {
+          handled += 1;
+        },
+      });
+      expect(handled).toBe(1);
+      return controller;
+    }
+
+    test("is marked, not selected: a selection would stay until someone cleared it", async () => {
+      await openOnFirstMessage();
+
+      expect(bodyBg("message 1")).toBe(highlighted);
+      // The text keeps its usual colour: the selected look is the keyboard's cursor.
+      const bodySpan = tui.setup().captureSpans().lines
+        .filter((line) => lineText(line).includes("message 1"))
+        .flatMap((line) => line.spans)
+        .find((candidate) => candidate.text.includes("message 1"));
+      expect(bodySpan!.fg.toInts().join(",")).not.toBe(hexToRgbaInts(colors.selectedText));
     });
-    let handled = 0;
 
-    await mountChat(controller, {
-      width: 72,
-      height: 12,
-      targetMessageId: "m1",
-      onTargetMessageHandled: () => {
-        handled += 1;
-      },
+    test("goes back to normal on a key press", async () => {
+      await openOnFirstMessage();
+
+      await emitKeypress({ name: "x", sequence: "x" });
+      await flushFrame();
+
+      expect(bodyBg("message 1")).not.toBe(highlighted);
     });
 
-    const expectedSelectedFg = hexToRgbaInts(colors.selectedText);
-    const frame = tui.setup().captureSpans();
-    const bodyLine = frame.lines.find((line) => lineText(line).includes("message 1"));
-    const bodySpan = bodyLine?.spans.find((span) => span.text.includes("message 1"));
+    test("goes back to normal on a wheel turn over the list", async () => {
+      await openOnFirstMessage();
 
-    expect(handled).toBe(1);
-    expect(bodySpan).toBeDefined();
-    expect(bodySpan!.fg.toInts().join(",")).toBe(expectedSelectedFg);
+      await act(async () => {
+        await tui.setup().mockMouse.scroll(20, 4, "up");
+        await tui.setup().renderOnce();
+      });
+      await flushFrame();
+
+      expect(bodyBg("message 1")).not.toBe(highlighted);
+    });
+
+    test("goes back to normal when a message arrives", async () => {
+      const controller = await openOnFirstMessage();
+
+      await act(async () => {
+        (controller as any).mergeMessages([makeMessage(3)]);
+      });
+      await flushFrame();
+
+      expect(bodyBg("message 1")).not.toBe(highlighted);
+    });
+
+    test("goes back to normal on its own", async () => {
+      await openOnFirstMessage();
+      expect(bodyBg("message 1")).toBe(highlighted);
+
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, MESSAGE_HIGHLIGHT_MS + 100));
+      });
+      await flushFrame();
+
+      expect(bodyBg("message 1")).not.toBe(highlighted);
+    });
+
+    // The pane clears a handled target, so a notification for the same message
+    // clicked again names it anew: the open window has to jump a second time.
+    test("is marked again when the same message is named a second time", async () => {
+      const controller = createController({ messages: [makeMessage(1), makeMessage(2)] });
+      const state = createInitialState(createDefaultConfig("/tmp/gloomberb-chat"));
+      let nameMessage: (messageId: string | undefined) => void = () => {};
+      let handled = 0;
+      function Pane() {
+        const [target, setTarget] = useState<string | undefined>("m1");
+        nameMessage = setTarget;
+        return (
+          <AppContext value={createStaticAppStore(state)}>
+            <PluginRenderProvider pluginId="gloomberb-cloud" runtime={createTestPluginRuntime()}>
+              <ChatContent
+                controller={controller}
+                width={72}
+                height={12}
+                focused
+                targetMessageId={target}
+                onTargetMessageHandled={() => {
+                  handled += 1;
+                  setTarget(undefined);
+                }}
+              />
+            </PluginRenderProvider>
+          </AppContext>
+        );
+      }
+      await act(async () => {
+        await tui.render(<Pane />, { width: 72, height: 12 });
+      });
+      await flushFrame();
+      expect(handled).toBe(1);
+      expect(bodyBg("message 1")).toBe(highlighted);
+
+      await emitKeypress({ name: "x", sequence: "x" });
+      await flushFrame();
+      expect(bodyBg("message 1")).not.toBe(highlighted);
+
+      await act(async () => {
+        nameMessage("m1");
+      });
+      await flushFrame();
+      expect(handled).toBe(2);
+      expect(bodyBg("message 1")).toBe(highlighted);
+    });
+
+    test("leaves the list following new messages, which a selection would not", async () => {
+      const controller = createController({ messages: [makeMessage(1), makeMessage(2), makeMessage(3), makeMessage(4), makeMessage(5), makeMessage(6)] });
+      await mountChat(controller, { width: 60, height: 13, targetMessageId: "m6" });
+
+      await act(async () => {
+        (controller as any).mergeMessages([makeMessage(7)]);
+      });
+      await flushFrame();
+
+      expect(tui.frame()).toContain("message 7");
+    });
+  });
+
+  describe("the row under the pointer", () => {
+    const bodyBg = (text: string) => {
+      const span = tui.setup().captureSpans().lines
+        .filter((line) => lineText(line).includes(text))
+        .flatMap((line) => line.spans)
+        .find((candidate) => candidate.text.includes(text));
+      return span?.bg.toInts().join(",");
+    };
+    const hovered = hexToRgbaInts(hoverBg());
+
+    async function hoverMessage(controller: ReturnType<typeof createController>, text: string) {
+      await mountChat(controller, { width: 72, height: 12 });
+      // The channel list draws once it has loaded, and moves the messages right.
+      // A busy CI machine takes longer than the default 600 ms to load it.
+      await tui.waitForFrameToContain("#everyone", 60);
+      const rows = tui.frame().split("\n");
+      const row = rows.findIndex((line) => line.includes(text));
+      expect(row).toBeGreaterThanOrEqual(0);
+      await act(async () => {
+        await tui.setup().mockMouse.moveTo(rows[row]!.indexOf(text) + 1, row);
+        await tui.setup().renderOnce();
+      });
+      await flushFrame();
+      expect(bodyBg(text)).toBe(hovered);
+    }
+
+    test("is let go when a message arrives, which moves every row after it", async () => {
+      const controller = createController({ messages: [makeMessage(1), makeMessage(2), makeMessage(3)] });
+      await hoverMessage(controller, "message 2");
+
+      await act(async () => {
+        (controller as any).mergeMessages([makeMessage(4)]);
+      });
+      await flushFrame();
+
+      expect(bodyBg("message 2")).not.toBe(hovered);
+    });
+
+    test("is let go when a key is pressed", async () => {
+      const controller = createController({ messages: [makeMessage(1), makeMessage(2), makeMessage(3)] });
+      await hoverMessage(controller, "message 2");
+
+      await emitKeypress({ name: "x", sequence: "x" });
+      await flushFrame();
+
+      expect(bodyBg("message 2")).not.toBe(hovered);
+    });
+  });
+
+  describe("new messages while the reader is scrolled back", () => {
+    const manyMessages = () => Array.from({ length: 14 }, (_, index) => makeMessage(index + 1));
+
+    async function scrollBack(controller: ReturnType<typeof createController>) {
+      await mountChat(controller, { width: 60, height: 13 });
+      await act(async () => {
+        await tui.setup().mockMouse.scroll(20, 4, "up");
+        await tui.setup().mockMouse.scroll(20, 4, "up");
+        await tui.setup().renderOnce();
+      });
+      await flushFrame();
+    }
+
+    test("leave the view where it is and offer the newest message", async () => {
+      const controller = createController({ messages: manyMessages() });
+      await scrollBack(controller);
+      const before = tui.frame();
+      expect(before).not.toContain("1 new message");
+
+      await act(async () => {
+        (controller as any).mergeMessages([makeMessage(15)]);
+      });
+      await flushFrame();
+
+      const frame = tui.frame();
+      expect(frame).toContain("1 new message");
+      expect(frame).not.toContain("message 15");
+    });
+
+    test("show the control, which takes the reader to the newest message when pressed", async () => {
+      const controller = createController({ messages: manyMessages() });
+      await scrollBack(controller);
+      await act(async () => {
+        (controller as any).mergeMessages([makeMessage(15), makeMessage(16)]);
+      });
+      await flushFrame();
+      expect(tui.frame()).toContain("2 new messages");
+
+      await tui.clickFrameText("2 new messages");
+      await flushFrame();
+
+      const frame = tui.frame();
+      expect(frame).toContain("message 16");
+      expect(frame).not.toContain("new messages");
+    });
+
+    test("do not count as new for a reader who is at the bottom", async () => {
+      const controller = createController({ messages: manyMessages() });
+      await mountChat(controller, { width: 60, height: 13 });
+
+      await act(async () => {
+        (controller as any).mergeMessages([makeMessage(15)]);
+      });
+      await flushFrame();
+
+      const frame = tui.frame();
+      expect(frame).toContain("message 15");
+      expect(frame).not.toContain("new message");
+    });
   });
 
   test("grows the composer for multi-line drafts", async () => {
@@ -914,6 +1173,35 @@ describe("ChatContent", () => {
     expect(frame).not.toContain("message 1");
   });
 
+  test("selects nothing when scrolling to the top loads older messages", async () => {
+    const controller = createController({
+      messages: [makeMessage(4), makeMessage(5), makeMessage(6), makeMessage(7), makeMessage(8), makeMessage(9), makeMessage(10)],
+    });
+    let loadCount = 0;
+    controller.loadOlderMessages = async () => {
+      loadCount += 1;
+      (controller as any).mergeMessages([makeMessage(1), makeMessage(2), makeMessage(3)], { notifyMentions: false });
+    };
+
+    await mountChat(controller, { width: 60, height: 13 });
+    // By wheel, as a mouse reader does: no key puts a cursor on a message.
+    for (let turn = 0; turn < 12; turn += 1) {
+      await act(async () => {
+        await tui.setup().mockMouse.scroll(20, 4, "up");
+        await tui.setup().renderOnce();
+      });
+    }
+    await flushFrame();
+
+    expect(loadCount).toBeGreaterThan(0);
+    const rowBg = (text: string) => tui.setup().captureSpans().lines
+      .filter((line) => lineText(line).includes(text))
+      .flatMap((line) => line.spans)
+      .find((span) => span.text.includes(text))?.bg.toInts().join(",");
+    // The message that was at the top before the page came in, and the one the reader sees now.
+    expect(rowBg("message 4")).not.toBe(hexToRgbaInts(colors.selected));
+  });
+
   test("renders ticker badges and opens a floating Ticker Research pane on click", async () => {
     const controller = createController({
       messages: [{
@@ -1025,6 +1313,49 @@ describe("ChatContent", () => {
     expect(frame).not.toContain("therquery=parametersfgot");
   });
 
+  test("draws markdown in the rows the list measures: marks gone, a list item hung, a quote barred on each row, a reply quoting it plainly", async () => {
+    const message: ChatMessage = {
+      id: "m1",
+      channelId: "everyone",
+      content: [
+        "**No price yet:** it hasn't traded, `search CLAU`",
+        "- a list item long enough to wrap onto a second row",
+        "> a quote long enough to wrap onto a second row too",
+      ].join("\n"),
+      replyToId: null,
+      createdAt: "2026-03-28T00:00:00.000Z",
+      user: { id: "u1", username: "ada", displayName: "Ada" },
+    };
+    const controller = createController({
+      messages: [message, {
+        id: "m2",
+        channelId: "everyone",
+        content: "thanks",
+        replyToId: "m1",
+        replyTo: { content: message.content, user: { id: "u1", username: "ada" } },
+        createdAt: "2026-03-28T00:10:00.000Z",
+        user: { id: "u2", username: "quill", displayName: "Quill" },
+      }],
+    });
+
+    await mountChat(controller, { width: 40, height: 14 });
+
+    const lines = tui.frame().split("\n").map((line) => line.trimEnd());
+    const header = lines.findIndex((line) => line.startsWith(" ada "));
+    const reply = lines.findIndex((line) => line.includes("reply ada:"));
+    expect(lines.slice(header + 1, reply)).toEqual([
+      "   No price yet: it hasn't traded,",
+      "   search CLAU",
+      "   \u2022 a list item long enough to wrap",
+      "     onto a second row",
+      "   \u2502 a quote long enough to wrap",
+      "   \u2502 onto a second row too",
+    ]);
+    expect(lines[reply]).toBe("  reply ada: No price yet: it has...");
+    // The list is scrolled by these heights, so they must be the rows drawn.
+    expect(estimateMessageHeight(message, 38)).toBe(reply - header);
+  });
+
   test("draws a row per image in the terminal, with no blank text row for an image-only message", async () => {
     const image = (id: string, width: number, height: number, size: number) => ({
       id, mime: "image/png", width, height, size, url: `https://api.example/chat/attachments/${id}`,
@@ -1102,6 +1433,143 @@ describe("ChatContent", () => {
     await tui.clickFrameText(" cy ");
     await flushFrame();
     expect(tui.frame()).toContain("@cy");
+  });
+
+  test("marks a bot with its icon in its own colour always, staff and Pro with theirs only on the row in play, and nothing moves", async () => {
+    const at = (second: number) => `2026-03-28T00:00:${String(second).padStart(2, "0")}.000Z`;
+    const controller = createController({
+      messages: [
+        { id: "m1", channelId: "everyone", content: "ask me anything", replyToId: null, createdAt: at(0), user: { id: "b1", username: "gloombot", displayName: "Gloombot", accountType: "managed_llm" } },
+        { id: "m2", channelId: "everyone", content: "from a person", replyToId: null, createdAt: at(10), user: { id: "u1", username: "bob", displayName: "Bob", accountType: "human" } },
+        { id: "m3", channelId: "everyone", content: "a guest speaking", replyToId: null, createdAt: at(20), user: { id: "d1", username: null, displayName: "Grace H", accountType: "discord" }, origin: "discord" },
+        { id: "m4", channelId: "everyone", content: "shipping it", replyToId: null, createdAt: at(30), user: { id: "s1", username: "wren", displayName: "Wren", accountType: "human", badges: ["team", "pro"], utcOffsetMinutes: 120, desks: ["options", "futures"] } },
+        { id: "m5", channelId: "everyone", content: "long only", replyToId: null, createdAt: at(40), user: { id: "p1", username: "otto", displayName: "Otto", accountType: "human", badges: ["pro"] } },
+      ],
+    });
+
+    await mountChat(controller, { width: 60, height: 24 });
+
+    const { bot, team, pro } = ICON_GLYPHS;
+    // The renderer holds a pointer move that follows another within a frame and acts on it from a timer:
+    // the row or the card is not drawn on the first read, so each read waits for what it checks.
+    const POINTER_ATTEMPTS = 40;
+    const anyIcon = new RegExp(`[${bot}${team}${pro}]`);
+    const rows = () => tui.frame().split("\n").map((row) => row.trimEnd());
+    const header = (author: string) => rows().find((row) => row.startsWith(` ${author} `))!;
+    expect(header("gloombot")).toMatch(new RegExp(`^ gloombot ${bot} \\S`));
+    expect(header("bob")).not.toMatch(anyIcon);
+    expect(header("Grace H")).not.toMatch(anyIcon);
+    // Nobody's pointer is on them: no Team or Pro, and no room kept for them.
+    expect(header("wren")).not.toMatch(anyIcon);
+    expect(header("otto")).not.toMatch(anyIcon);
+
+    // A bot's name and its icon have their own colour; a person's name keeps the one every name has.
+    const spanColour = (text: string) => tui.setup().captureSpans().lines
+      .flatMap((line) => line.spans)
+      .find((span) => span.text.trim() === text)?.fg.toInts().join(",");
+    expect(spanColour("gloombot")).toBe(hexToRgbaInts(chatBotNameColor()));
+    expect(spanColour(bot)).toBe(hexToRgbaInts(chatBotNameColor()));
+    expect(spanColour("bob")).toBe(hexToRgbaInts(colors.positive));
+
+    // The pointer on wren's message: Team and Pro after the time, the name and the time where they were.
+    const resting = header("wren");
+    const body = rows().findIndex((row) => row.includes("shipping it"));
+    await act(async () => {
+      await tui.setup().mockMouse.moveTo(30, body);
+      await tui.setup().renderOnce();
+    });
+    await flushFrame();
+    await tui.waitForFrameToContain(`${team} ${pro}`, POINTER_ATTEMPTS);
+    const pointed = header("wren");
+    expect(pointed).toMatch(new RegExp(` ${team} ${pro} `));
+    expect(pointed.indexOf(team)).toBeGreaterThan(resting.length - 1);
+    expect(pointed.slice(0, resting.length)).toBe(resting);
+    expect(header("otto")).not.toMatch(anyIcon);
+
+    // The terminal has no tooltip: pointing at an icon opens the card, which shows the icons beside the handle and says what they are.
+    await act(async () => {
+      await tui.setup().mockMouse.moveTo(pointed.indexOf(team), rows().findIndex((row) => row.startsWith(" wren ")));
+      await tui.setup().renderOnce();
+    });
+    await flushFrame();
+    const card = await tui.waitForFrameToContain(`@wren ${team} ${pro}`, POINTER_ATTEMPTS);
+    expect(card).toContain("Gloom team · Pro");
+    expect(card).toMatch(/Local time \d\d:\d\d/);
+    expect(card).toContain("Trades Options, Futures");
+
+    // A bot's card says what it is, and has no clock.
+    await emitKeypress({ name: "escape", sequence: "\u001b" });
+    await flushFrame();
+    await tui.clickFrameText("gloombot");
+    await flushFrame();
+    const botCard = await tui.waitForFrameToContain(`@gloombot ${bot}`, POINTER_ATTEMPTS);
+    expect(botCard).toContain("Bot run by Gloom");
+    expect(botCard).not.toContain("Local time");
+  });
+
+  test("at 70 columns the bot's icon fits beside its name, a quote and the reply being written, and a long staff row keeps its actions", async () => {
+    const at = (second: number) => `2026-03-28T00:00:${String(second).padStart(2, "0")}.000Z`;
+    const bot = { id: "b1", username: "deskbot", displayName: "Deskbot", accountType: "managed_llm" as const };
+    const staff = { id: "s1", username: "a_staff_member_with_a_long_nam", displayName: "Staff", accountType: "human" as const, badges: ["team" as const, "pro" as const] };
+    const quoted = "Futures are flat into the open and the calendar stays quiet until ten, with nothing else after the bell.";
+    const controller = createController({
+      messages: [
+        { id: "m1", channelId: "everyone", content: quoted, replyToId: null, createdAt: at(0), user: bot, reactions: [] },
+        { id: "m2", channelId: "everyone", content: "thanks", replyToId: "m1", replyTo: { content: quoted, user: { id: "b1", username: "deskbot" } }, createdAt: at(10), user: staff, reactions: [] },
+        { id: "m3", channelId: "everyone", content: quoted, replyToId: null, createdAt: at(20), user: bot, reactions: [] },
+      ],
+    });
+
+    await mountChat(controller, { width: 70, height: 18 });
+    const rows = () => tui.frame().split("\n").map((row) => row.trimEnd());
+    const { bot: botIcon, team, pro } = ICON_GLYPHS;
+
+    // The quote of a bot's message: the icon stands where the colon would, and the preview ends in an ellipsis inside the row.
+    const quote = rows().find((row) => row.trimStart().startsWith("reply deskbot"))!;
+    expect(quote).toContain(`reply deskbot ${botIcon} Futures`);
+    expect(quote.endsWith("...")).toBe(true);
+
+    // The newest message, a bot's, selected: its icon and its actions all show.
+    await emitKeypress({ name: "up", sequence: "\u001b[A" });
+    await flushFrame();
+    const botHeader = rows().filter((row) => row.startsWith(" deskbot ")).at(-1)!;
+    expect(botHeader).toMatch(new RegExp(` deskbot ${botIcon} .*Reply +React`));
+
+    // A 30-character staff name with Reply and React, selected: the name whole, both icons, and the actions in the row.
+    await emitKeypress({ name: "up", sequence: "\u001b[A" });
+    await flushFrame();
+    const staffHeader = rows().find((row) => row.startsWith(` ${staff.username} `))!;
+    expect(staffHeader).toMatch(new RegExp(` ${team} ${pro} +Reply +React$`));
+
+    // Replying to the bot: the composer names it with its icon and keeps Cancel whole.
+    await emitKeypress({ name: "down", sequence: "\u001b[B" });
+    await emitKeypress({ name: "return", sequence: "\r" });
+    await flushFrame();
+    const replying = rows().find((row) => row.includes("replying to @deskbot"))!;
+    expect(replying).toMatch(new RegExp(`replying to @deskbot ${botIcon} Futures.*\\.\\.\\. +Cancel$`));
+  });
+
+  test("a row too narrow for both icons drops Pro before the role and keeps the name and the actions, and a hidden clock never shows", async () => {
+    const controller = createController({
+      messages: [
+        { id: "m1", channelId: "everyone", content: "hi", replyToId: null, createdAt: "2026-03-28T00:00:00.000Z", user: { id: "s1", username: "longer_staff_name", displayName: "Staff", accountType: "human", badges: ["team", "pro"] } },
+      ],
+    });
+
+    // One cell short of both icons once Reply is counted.
+    await mountChat(controller, { width: 41, height: 12 });
+    await emitKeypress({ name: "up", sequence: "\u001b[A" });
+    await flushFrame();
+
+    const header = tui.frame().split("\n").find((row) => row.startsWith(" longer_staff_name "))!.trimEnd();
+    expect(header).toContain(` ${ICON_GLYPHS.team} `);
+    expect(header).not.toContain(ICON_GLYPHS.pro);
+    expect(header).toMatch(/Reply$/);
+
+    await tui.clickFrameText("longer_staff_name");
+    await flushFrame();
+    expect(tui.frame()).toContain("Gloom team · Pro");
+    expect(tui.frame()).not.toContain("Local time");
   });
 
   test("shows a saved-login read-only footer when a session token is cached", async () => {

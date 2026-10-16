@@ -74,6 +74,11 @@
             "access": "preview"
           },
           {
+            "code": "EPWR",
+            "name": "EU Power, Carbon & Gas",
+            "description": "Day-ahead power prices for 32 European markets in EUR/MWh, the EU carbon allowance (EUA) auction price in EUR/tCO2, and European gas storage: % full, TWh and daily injection and withdrawal for the EU and each member state against a year ago and the five-year range."
+          },
+          {
             "code": "SPLC",
             "name": "Supply Chain",
             "description": "Pro global supply chain evidence from filings, company announcements, calls and news, with trust tiers, original quotes, native units, four-hop graphs, ranked paths and a free preview.",
@@ -106,7 +111,7 @@
           {
             "code": "JOBS",
             "name": "Hiring",
-            "description": "Hiring read from the company's own careers system: open roles over time, by function and location, new roles, pay ranges. Alone, every covered company ranked.",
+            "description": "Pro hiring read from the company's own careers system: open roles over time, by function and location, new roles, pay ranges. Alone, every covered company ranked.",
             "access": "pro"
           },
           {
@@ -145,6 +150,7 @@
         "panes": [
           "changelog",
           "connections",
+          "docs",
           "help",
           "layout-marketplace",
           "plugin-marketplace"
@@ -171,6 +177,11 @@
             "code": "CONN",
             "name": "Connections",
             "description": "Inspect live request and socket health."
+          },
+          {
+            "code": "DOCS",
+            "name": "Docs",
+            "description": "Read the docs and Academy lessons in the app: search them, or open a function's entry."
           }
         ]
       },
@@ -237,7 +248,7 @@
           {
             "code": "TRIAL",
             "name": "Clinical Trials",
-            "description": "Search ClinicalTrials.gov studies by condition, drug, or sponsor. Shows phase, status, and sponsor."
+            "description": "Search ClinicalTrials.gov studies by condition, drug, or sponsor. Filter by status, phase and sponsor class; listed sponsors show their ticker."
           }
         ]
       },
@@ -280,8 +291,8 @@
     },
     {
       "id": "credit",
-      "name": "Credit & Bonds",
-      "description": "Single-name, index and sovereign CDS, credit spreads, Treasury auctions, a bond calculator, credit documents and covenants, and debt maturities.",
+      "name": "Credit & Fixed Income",
+      "description": "Credit markets, issuer debt, corporate bonds, Treasury auctions and debt, and dealer positions.",
       "tagline": "CDS, credit spreads, auctions and bonds.",
       "categories": [
         "macro",
@@ -296,21 +307,20 @@
       ],
       "contributes": {
         "panes": [
-          "bond-calculator",
-          "cds",
-          "cdx-board",
-          "credit-conditions",
-          "credit-documents",
-          "debt-maturities",
-          "treasury-auctions"
+          "fixed-income"
         ],
         "capabilities": [],
         "broker": false,
         "shortcuts": [
           {
+            "code": "FI",
+            "name": "Fixed Income",
+            "description": "Credit markets, issuer debt, corporate bonds, Treasury auctions and debt, and dealer positions."
+          },
+          {
             "code": "CDS",
             "name": "Single-Name CDS",
-            "description": "Single-name corporate CDS trades and 5Y spread history from DTCC public dissemination."
+            "description": "Single-name corporate CDS from DTCC public dissemination: with no argument, the issuers traded in the last 5 days with their 5Y spread; with a ticker or issuer, its 5Y spread history and trades."
           },
           {
             "code": "CDX",
@@ -325,7 +335,7 @@
           {
             "code": "CRD",
             "name": "Credit Spreads",
-            "description": "ICE BofA US corporate option-adjusted spreads from FRED."
+            "description": "ICE BofA option-adjusted spreads from FRED: US investment grade and high yield by rating, and euro high yield."
           },
           {
             "code": "AUCT",
@@ -336,6 +346,21 @@
             "code": "YAS",
             "name": "Bond Calculator",
             "description": "Price, yield, accrued interest, duration, convexity and Treasury spread for a fixed coupon bond."
+          },
+          {
+            "code": "TRACE",
+            "name": "Corporate Bond Tape",
+            "description": "Latest corporate and agency bond sales: issuer, coupon, price, yield, and grade."
+          },
+          {
+            "code": "DTS",
+            "name": "Treasury Cash and Debt",
+            "description": "Treasury operating cash for the latest day, and debt held by the public for the last 20 business days."
+          },
+          {
+            "code": "PDLR",
+            "name": "Primary Dealer Positions",
+            "description": "Weekly net positions and settlement fails in Treasuries and mortgage-backed securities."
           },
           {
             "code": "CRDOC",
@@ -512,7 +537,7 @@
           {
             "code": "CALLS",
             "name": "Earnings Calls",
-            "description": "Earnings call transcripts with speaker attribution, analyst Q&A, and extracted guidance. Alone, every transcribed call; with a ticker, that company's calls.",
+            "description": "Pro earnings call transcripts with speaker attribution, analyst Q&A, and extracted guidance. Alone, every transcribed call; with a ticker, that company's calls.",
             "access": "pro"
           },
           {
@@ -616,9 +641,9 @@
     },
     {
       "id": "futures-commodities",
-      "name": "Futures & Commodities",
-      "description": "Futures board and curves, CFTC positioning, and EIA petroleum and gas storage.",
-      "tagline": "Futures, curves, positioning, energy data.",
+      "name": "Commodities & Energy",
+      "description": "Futures markets, curves, CFTC positioning, EIA inventories, and crop and oil and gas balances.",
+      "tagline": "Futures, curves, positioning, inventories and balances.",
       "categories": [
         "markets",
         "macro"
@@ -632,23 +657,20 @@
       ],
       "contributes": {
         "panes": [
-          "cot",
-          "doe",
-          "futures",
-          "futures-curve"
+          "commodities-energy"
         ],
         "capabilities": [],
         "broker": false,
         "shortcuts": [
           {
             "code": "FUT",
-            "name": "Futures Board",
-            "description": "Front-month futures across equity index, rates, energy, metals, agriculture, livestock, and FX with last price, session change, search, and collapsible sectors."
+            "name": "Commodities & Energy",
+            "description": "Futures markets, curves, positioning, inventories, crop balances, and oil and gas balances."
           },
           {
             "code": "CTM",
             "name": "Futures Curve",
-            "description": "Listed futures contracts, historical curves, roll yield and open interest including VIX and CME crypto futures."
+            "description": "Listed futures contracts, historical curves, roll yield and open interest including VIX and CME crypto futures, which add basis against spot: Ann Basis = (Last / spot - 1) × 365 / days to expiry, simple actual/365."
           },
           {
             "code": "COT",
@@ -664,6 +686,16 @@
             "code": "NGS",
             "name": "Natural Gas Storage",
             "description": "EIA weekly working gas in storage, lower 48 and by region, against a year ago and the five-year range."
+          },
+          {
+            "code": "PSD",
+            "name": "Crop Balances",
+            "description": "World balances for wheat, corn, soybeans and cotton, with season-average price forecasts when a table is published."
+          },
+          {
+            "code": "JODI",
+            "name": "Oil and Gas Balances",
+            "description": "Latest monthly crude oil and natural gas production, demand, trade and stocks for the largest countries."
           }
         ]
       },
@@ -913,7 +945,7 @@
           {
             "code": "NI",
             "name": "Topic News",
-            "description": "Market news by topic code (MNA, CB, ENERGY, REG, CRYPTO, EARN, IPO) or sector"
+            "description": "Market news by topic code (MNA, CB, ENERGY, REG, CRYPTO, EARN, IPO) or sector, and public fund letters (LTR)"
           },
           {
             "code": "FIRST",
@@ -1024,7 +1056,7 @@
           {
             "code": "GEX",
             "name": "Dealer Gamma",
-            "description": "Net dealer gamma by strike, its total, flip level and the range for the dealer assumption."
+            "description": "Net dealer gamma by strike, its total, flip level, call and put walls and the range for the dealer assumption."
           },
           {
             "code": "OVME",
@@ -1123,7 +1155,7 @@
           {
             "code": "INS",
             "name": "Insider",
-            "description": "Insider transaction activity for the selected ticker."
+            "description": "Insider transactions for a ticker; alone, the companies whose insiders are buying."
           },
           {
             "code": "SI",
@@ -1179,7 +1211,7 @@
           {
             "code": "PF",
             "name": "Collection Pane",
-            "description": "Open another pane for the current portfolio or watchlist"
+            "description": "Holdings, weights and P&L of a portfolio or watchlist; set target weights to see drift and the trades that rebalance"
           },
           {
             "code": "PORT",
@@ -1301,9 +1333,7 @@
           "volatility-term-structure",
           "yield-curve"
         ],
-        "capabilities": [
-          "market-valuation"
-        ],
+        "capabilities": [],
         "broker": false,
         "shortcuts": [
           {
@@ -1339,7 +1369,7 @@
           {
             "code": "CBR",
             "name": "Central Bank Rates",
-            "description": "G20 policy rates, last observed changes and dated historical context."
+            "description": "Policy rates of the G20, SNB, Norges Bank, Riksbank and RBNZ, last observed changes and dated historical context."
           },
           {
             "code": "VIX",
@@ -1542,7 +1572,7 @@
           {
             "code": "CAT",
             "name": "Data Catalog",
-            "description": "Browse and search the series Custom Chart already knows: securities, options, crypto, FRED, treasuries, and futures."
+            "description": "Browse and search every series a chart can draw: securities, rates, credit, economic data, volatility, sentiment, positioning and your own files."
           },
           {
             "code": "GP",
@@ -1626,7 +1656,7 @@
           {
             "code": "DVD",
             "name": "Dividend Yield",
-            "description": "Cash distribution history, trailing cash yield, indicated rates when available, and growth. Future payments are not forecast."
+            "description": "Cash distribution history, trailing cash yield, forward yield from the latest distribution, and growth. Future payments are not forecast."
           },
           {
             "code": "RDCF",

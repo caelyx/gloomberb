@@ -1,5 +1,6 @@
 import type { PaneReportOptionDef, PaneSettingsDef, TickerResearchTabProps } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
+import { holdsActiveTicker } from "../../../shares/pane-image";
 import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
 import type { OptionsViewProps } from "./types";
 import { OptionsView } from "./view";
@@ -99,6 +100,8 @@ export const optionsModule: PluginModule = {
       component: OptionsPane,
       defaultPosition: "right",
       tickerFollower: true,
+      // An option the person holds shows their position.
+      personalData: (context) => (holdsActiveTicker(context) ? "holdings" : null),
       defaultMode: "floating",
       defaultFloatingSize: { width: 112, height: 28 },
       quickSettings: [LIVE_STREAMING_QUICK_SETTING],
@@ -132,7 +135,8 @@ export const optionsModule: PluginModule = {
       paneId: "options",
       label: "Options",
       description: "Options chain for the selected ticker.",
-      keywords: ["options", "chain", "calls", "puts", "omon"],
+      // Where a put seller picks the strike; OSA owns the exact put-selling phrases and ranks first on them.
+      keywords: ["options", "chain", "calls", "puts", "omon", "cash-secured puts", "selling puts", "short-put strikes", "csp strikes", "wheel strikes"],
       shortcut: "OMON",
       settings: (_symbol, _context, options) => {
         const expiration = readOptionExpiration(options?.values?.expiration);

@@ -16,9 +16,13 @@ import {
   customViewCreateOptions,
   customViewInstanceSettings,
   parseViewSpecOr,
+  trialLoadViewSource,
+  type ViewSpec,
 } from "../plugins/builtin/custom-view";
 import { findPaneInstance, getPlacedPaneInstanceIds, type PaneInstanceConfig, resolvePaneInstance } from "../types/config";
 import type { DesktopWindowBridge } from "../types/desktop-window";
+import { settleTypedListingKey } from "../tickers/listing-venues";
+import { isSharedExchangeCode, parsePublicTickerKey, typedExchangeCode } from "../utils/exchanges";
 import { applyJsonPatch } from "./json-patch";
 import { revisionFor } from "./revision";
 import type {
@@ -33,7 +37,7 @@ import type {
 import type { RemoteUiRegistry } from "./semantic-tree";
 import { commandBarResultsFromNodes, isCommandBarInputNode } from "./command-bar";
 import { findCommandBarResult, findMatchingUiNode } from "./matching";
-import { REMOTE_AGENT_HELP, remoteControlSchema } from "./schema";
+import { REMOTE_AGENT_HELP, REMOTE_OPERATIONS, remoteControlSchema } from "./schema";
 import {
   fail,
   mutationSummary,
@@ -41,8 +45,16 @@ import {
   ok,
   optionalNumber,
   optionalString,
+  RemoteOperationError,
   stringInput,
 } from "./controller-utils";
+import {
+  PANE_SCREENSHOT_MAX_BYTES,
+  PANE_SCREENSHOT_MAX_EDGE,
+  PANE_SCREENSHOT_MIN_WIDTH,
+  paneScreenshotScale,
+  type CapturePane,
+} from "./pane-screenshot";
 import {
   buildGridDockRoot,
   regionToDockPosition,
@@ -78,10 +90,14 @@ interface AppRemoteControllerOptions {
    * they decline or `signal` aborts. Without it such operations refuse.
    */
   confirmChange?: (prompt: RemoteChangePrompt, signal?: AbortSignal) => Promise<boolean>;
+  /** Paints one pane of this window as a PNG; absent where there are no pixels (the TUI). */
+  capturePane?: CapturePane;
 }
 
 /** Operations whose dry run resolves what they would change instead of echoing the input. */
 const PLANNED_OPERATIONS = new Set(["watchlist.add", "watchlist.remove"]);
+/** Reads change nothing, so their answer carries no layout or command-bar state. */
+const READ_OPERATIONS = new Set(REMOTE_OPERATIONS.filter((entry) => entry.sideEffectLevel === "none").map((entry) => entry.id));
 
 // A command with a wizard closes the bar and opens its form, so every call says whether one is open.
 const DEFAULT_MUTATION_INCLUDE: RemoteStateInclude[] = ["app", "layout", "panes", "commandBar", "form"];
@@ -116,6 +132,7 @@ export function createAppRemoteController({
   isDialogOpen = isAnyDialogOpen,
   closeTopmostDialog = dismissTopmostDialog,
   confirmChange,
+  capturePane,
 }: AppRemoteControllerOptions) {
   const { buildIncludedState, getResource, patchTarget } = createRemoteResources({
     dispatch,
@@ -130,8 +147,26 @@ export function createAppRemoteController({
     return mutationSummary(getState(), extra);
   };
 
-  const queryMarketData = async (request: RemoteMarketDataRequest): Promise<unknown> => {
+  /**
+   * The listing a request names, a code that names several venues (7203:TSE,
+   * or 7203 with exchange TSE) read as the one its symbol trades on, as every
+   * command reads it.
+   */
+  const settledListing = async (rawSymbol: string, rawExchange: string | undefined) => {
+    const symbol = normalizedMarketDataSymbol(rawSymbol);
+    const exchange = normalizedOptionalExchange(rawExchange);
+    const typed = exchange && isSharedExchangeCode(exchange) && !parsePublicTickerKey(symbol).exchange ? `${symbol}:${exchange}` : symbol;
+    if (!isSharedExchangeCode(typedExchangeCode(typed))) return { symbol, exchange };
+    const settled = (await settleTypedListingKey(typed, {
+      store: pluginRegistry.tickerRepository,
+      dataProvider: pluginRegistry.marketData,
+    })).toUpperCase();
+    return settled === typed ? { symbol, exchange } : { symbol: settled, exchange: parsePublicTickerKey(settled).exchange };
+  };
+
+  const queryMarketData = async (named: RemoteMarketDataRequest): Promise<unknown> => {
     const marketData = pluginRegistry.marketData;
+    const request = "symbol" in named ? { ...named, ...await settledListing(named.symbol, named.exchange) } : named;
     switch (request.operation) {
       case "search":
         return (await marketData.search(requiredMarketDataText(request.query, "query")))
@@ -283,6 +318,50 @@ export function createAppRemoteController({
     return getAfterMutationSummary({ invokedNode: node, result });
   };
 
+  /** The focused pane, or the one asked for, as the window draws it now. */
+  const screenshotPane = async (input: Record<string, unknown>): Promise<unknown> => {
+    if (!capturePane) {
+      throw new RemoteOperationError(
+        "unsupported",
+        "Pane screenshots need the Gloom desktop app: the terminal (TUI) app draws text, not pixels. Read the pane's content instead.",
+      );
+    }
+    const width = input.width;
+    if (width !== undefined && (
+      typeof width !== "number" || !Number.isInteger(width) || width < PANE_SCREENSHOT_MIN_WIDTH || width > PANE_SCREENSHOT_MAX_EDGE
+    )) {
+      throw new Error(`width must be a whole number of pixels from ${PANE_SCREENSHOT_MIN_WIDTH} to ${PANE_SCREENSHOT_MAX_EDGE}.`);
+    }
+    const state = getState();
+    const layout = state.config.layout;
+    const asked = optionalString(input, "paneId");
+    const instance = asked
+      ? resolvePaneInstance(layout, asked)
+      : state.focusedPaneId ? findPaneInstance(layout, state.focusedPaneId) : undefined;
+    if (!instance) {
+      throw new Error(asked ? `No pane "${asked}" is open in this layout. Read app://panes for the open ones.` : "No pane is focused. Pass paneId.");
+    }
+    if ((layout.detached ?? []).some((entry) => entry.instanceId === instance.instanceId)) {
+      throw new Error(`Pane "${instance.instanceId}" is in its own window; dock it to capture it.`);
+    }
+    const shot = await capturePane({
+      instanceId: instance.instanceId,
+      scaleFor: (screen) => paneScreenshotScale(screen, width as number | undefined),
+      maxBytes: PANE_SCREENSHOT_MAX_BYTES,
+      minWidth: PANE_SCREENSHOT_MIN_WIDTH,
+    });
+    return {
+      pane: {
+        instanceId: instance.instanceId,
+        paneId: instance.paneId,
+        ...(instance.title ? { title: instance.title } : {}),
+      },
+      image: { mimeType: "image/png", data: shot.pngBase64, width: shot.width, height: shot.height, bytes: shot.bytes },
+      screen: shot.screen,
+      ...(shot.reduced ? { reduced: true } : {}),
+    };
+  };
+
   const workflowDeps = () => ({
     dataProvider: pluginRegistry.marketData,
     tickerRepository: pluginRegistry.tickerRepository,
@@ -322,10 +401,24 @@ export function createAppRemoteController({
   const call = (operation: string, rawInput: unknown, dryRun: boolean | undefined, context: RemoteCallContext): Promise<unknown> => (
     PLANNED_OPERATIONS.has(operation)
       ? changeWatchlist(operation, asRecord(rawInput), dryRun, context)
-      : runAutomated(() => callOperation(operation, rawInput, dryRun))
+      : runAutomated(() => callOperation(operation, rawInput, dryRun, context))
   );
 
-  const callOperation = async (operation: string, rawInput: unknown, dryRun?: boolean): Promise<unknown> => {
+  /**
+   * A view's source loads once before the view is kept, so a function that
+   * does not exist or cannot read answers with its own error instead of
+   * leaving a pane that never fills. What the load noted comes back as warnings.
+   */
+  const checkViewSource = async (spec: ViewSpec, action: "create" | "update", signal?: AbortSignal): Promise<string[]> => {
+    try {
+      return await trialLoadViewSource(spec, getState().config, { registry: pluginRegistry, signal });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`The view's source did not load, so ${action === "create" ? "no view was created" : "the view was left as it was"}. ${reason}`);
+    }
+  };
+
+  const callOperation = async (operation: string, rawInput: unknown, dryRun?: boolean, context: RemoteCallContext = {}): Promise<unknown> => {
     const input = asRecord(rawInput);
     const dryRunResult = () => ({ operation, input, dryRun: true });
     if (dryRun) return dryRunResult();
@@ -363,6 +456,8 @@ export function createAppRemoteController({
         pluginRegistry.hidePane(paneId);
         return getAfterMutationSummary({ affectedPaneIds: [paneId] });
       }
+      case "pane.screenshot":
+        return screenshotPane(input);
       case "pane.createFromTemplate":
         await pluginRegistry.createPaneFromTemplateAsync(
           stringInput(input, "templateId"),
@@ -373,13 +468,13 @@ export function createAppRemoteController({
         // ASKG and the local agent both land here, so one validator decides.
         const parsed = parseViewSpecOr(input.spec);
         if ("error" in parsed) throw new Error(parsed.error);
+        const loadWarnings = await checkViewSource(parsed.spec, "create", context.signal);
         await pluginRegistry.createPaneFromTemplateAsync(
           CUSTOM_VIEW_TEMPLATE_ID,
           customViewCreateOptions(parsed.spec, optionalString(input, "name")),
         );
-        return getAfterMutationSummary({
-          ...(parsed.result.warnings.length ? { warnings: parsed.result.warnings.map((entry) => entry.message) } : {}),
-        });
+        const warnings = [...parsed.result.warnings.map((entry) => entry.message), ...loadWarnings];
+        return getAfterMutationSummary(warnings.length ? { warnings } : undefined);
       }
       case "view.update": {
         const paneId = stringInput(input, "paneId");
@@ -389,14 +484,18 @@ export function createAppRemoteController({
         const instance = findPaneInstance(getState().config.layout, instanceId);
         if (!instance) throw new Error(`No pane instance "${paneId}".`);
         if (instance.paneId !== CUSTOM_VIEW_PANE_ID) throw new Error(`Pane "${paneId}" is not a custom view.`);
+        const loadWarnings = await checkViewSource(parsed.spec, "update", context.signal);
+        // The load took time; write onto the view as it is now, if it is still there.
+        const current = findPaneInstance(getState().config.layout, instanceId);
+        if (!current) throw new Error(`The view "${paneId}" was closed while its source loaded.`);
         let layout = setPaneSettings(getState().config.layout, instanceId, {
-          ...instance.settings,
+          ...current.settings,
           ...customViewInstanceSettings(parsed.spec),
         });
         const name = optionalString(input, "name");
         if (name) layout = updatePaneInstance(layout, instanceId, (entry: PaneInstanceConfig) => ({ ...entry, title: name }));
         pluginRegistry.updateLayout(layout);
-        return getAfterMutationSummary({ affectedPaneIds: [instanceId] });
+        return getAfterMutationSummary({ affectedPaneIds: [instanceId], ...(loadWarnings.length ? { warnings: loadWarnings } : {}) });
       }
       case "pane.setState":
         dispatch({
@@ -571,7 +670,8 @@ export function createAppRemoteController({
           return ok(await queryMarketData(request));
         case "call": {
           const data = await call(request.operation, request.input, request.dryRun, context);
-          return ok(data, undefined, buildIncludedState(request.include, request.dryRun ? [] : DEFAULT_MUTATION_INCLUDE));
+          const defaults = request.dryRun || READ_OPERATIONS.has(request.operation) ? [] : DEFAULT_MUTATION_INCLUDE;
+          return ok(data, undefined, buildIncludedState(request.include, defaults));
         }
         case "patch": {
           const target = patchTarget(request.resource);

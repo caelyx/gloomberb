@@ -67,6 +67,19 @@ export function commonStyle(props: Record<string, unknown>): CSSProperties {
   };
 }
 
+/**
+ * Whether a run of text can be selected. The page is not selectable by
+ * default (styles.css); `true` opts a run in and `false` keeps it out inside
+ * a selectable block. Both spellings: WebKit, the macOS app's WKWebView and
+ * Safari, ignores the unprefixed property, which is how interface text became
+ * selectable there while Chrome kept it plain.
+ */
+export function selectionStyle(selectable: unknown): CSSProperties {
+  if (typeof selectable !== "boolean") return {};
+  const value = selectable ? "text" : "none";
+  return { userSelect: value, WebkitUserSelect: value };
+}
+
 export function textStyle(props: TextProps): CSSProperties {
   const attributes = props.attributes;
   const shouldWrap = props.wrapText || props.wrapMode === "word" || props.wrapMode === "char";
@@ -91,6 +104,7 @@ export function textStyle(props: TextProps): CSSProperties {
     maxWidth: cellWidth(props.maxWidth),
     minWidth: cellWidth(props.minWidth) ?? 0,
     flexShrink: shouldWrap ? 1 : 0,
+    ...selectionStyle(props.selectable),
   };
 }
 
@@ -108,7 +122,7 @@ export function cleanDomProps(props: Record<string, unknown>): Record<string, un
     "cursorColor", "selectionBg", "selectionFg", "showCursor", "keyBindings", "wrapText", "wrapMode",
     "initialValue", "value", "onInput", "onChange", "onSubmit", "onEscape", "onCursorChange", "onMouse",
     "scrollX", "scrollY", "focusable", "bitmap", "bitmaps", "crosshair", "vectors", "text", "font",
-    "hoverBackgroundColor",
+    "hoverBackgroundColor", "joinPastedLines", "stickyScroll", "stickyStart", "onStickyPinChange",
   ]) {
     delete next[key];
   }

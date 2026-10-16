@@ -2,6 +2,7 @@ import type { ExchangeRateSnapshot } from "./exchange-rate";
 import type {
   AnalystResearchData,
   CorporateActionsData,
+  EarningsEpsBasis,
   Quote,
   QuoteMetadata,
   TickerFinancials,
@@ -14,6 +15,7 @@ import type { ChartResolutionSupport, ManualChartResolution } from "../time-seri
 import type { BrokerContractRef, InstrumentSearchResult } from "./instrument";
 import type { CachePolicyMap } from "./persistence";
 import type { CachedQueryHandle } from "../data/cached-query";
+import type { TickerChanges } from "./ticker-changes";
 
 export type CachedAssetMethod = "getExchangeRate" | "getHolders" | "getAnalystResearch" | "getCorporateActions"
   | "getOptionsChain" | "getSecFilings" | "getSecFilingDocuments" | "getSecFilingContent" | "getArticleSummary";
@@ -93,6 +95,8 @@ export interface EarningsEvent {
   epsRevisionDown7d?: number | null;
   epsRevisionDown30d?: number | null;
   epsActual: number | null;
+  /** "adjusted" when the estimate is the consensus on the adjusted basis the company's reports are on (a REIT's FFO), not a GAAP forecast. */
+  epsBasis?: EarningsEpsBasis | null;
   revenueEstimate: number | null;
   revenueLow?: number | null;
   revenueHigh?: number | null;
@@ -139,6 +143,11 @@ export interface SearchRequestContext {
    */
   interactive?: boolean;
   /**
+   * Rows to ask a catalogue for. Every listing of a symbol several companies
+   * use (CAR: Avis, Carrefour, CAR Group) takes more than a keystroke's ten.
+   */
+  limit?: number;
+  /**
    * Called when a later source improves the result the search already returned,
    * typically a broker adding contract detail to a symbol the cloud found
    * first. Receives the full merged list, not a delta.
@@ -161,6 +170,26 @@ export interface QuoteBatchResult {
   target: QuoteSubscriptionTarget;
   quote: Quote | null;
   error?: unknown;
+}
+
+export interface QuoteBatchOptions {
+  forceRefresh?: boolean;
+  /**
+   * Answer from the local cache alone, stale and expired quotes included, and
+   * never reach the network: what a board paints before its refresh lands. A
+   * provider with no cache answers every target with no quote.
+   */
+  cacheOnly?: boolean;
+  /**
+   * Ask the sources even for a target whose cached quote is still fresh; that
+   * copy answers only when they cannot. A command that prints quotes once
+   * shows the service's quote of the moment, so every form of one listing
+   * (BRK.B saved on NYSE, BRK-B, BRK.B:NYSE) prints the same quote, never
+   * each form's own copy from whenever it was last asked for.
+   */
+  revalidate?: boolean;
+  /** The caller stopped waiting; a transport that can abandon the request does. */
+  signal?: AbortSignal;
 }
 
 export interface TickerFinancialsBatchResult {
@@ -188,7 +217,7 @@ export interface AssetDataProvider {
    */
   primaryMarketSourceName?(): string | null | Promise<string | null>;
   getCachedFinancialsForTargets?(targets: CachedFinancialsTarget[], options?: { allowExpired?: boolean; includeStaleQuotes?: boolean }): Map<string, TickerFinancials> | Promise<Map<string, TickerFinancials>>;
-  getQuotesBatch?(targets: QuoteSubscriptionTarget[], options?: { forceRefresh?: boolean }): Promise<QuoteBatchResult[]>;
+  getQuotesBatch?(targets: QuoteSubscriptionTarget[], options?: QuoteBatchOptions): Promise<QuoteBatchResult[]>;
   getTickerFinancialsBatch?(targets: CachedFinancialsTarget[], options?: { forceRefresh?: boolean }): Promise<TickerFinancialsBatchResult[]>;
   getTickerFinancials(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<TickerFinancials>;
   getQuote(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<Quote>;
@@ -201,6 +230,11 @@ export interface AssetDataProvider {
   getHolders?(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<HolderData>;
   getAnalystResearch?(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<AnalystResearchData>;
   getCorporateActions?(ticker: string, exchange?: string, context?: MarketDataRequestContext): Promise<CorporateActionsData>;
+  /**
+   * A US symbol's changes: where the issuer that held it trades now (FB is
+   * META), or what its holder was called before. Null when none is on record.
+   */
+  getTickerChanges?(symbol: string, options?: { signal?: AbortSignal }): Promise<TickerChanges | null>;
   getEarningsCalendar?(symbols: string[], context?: MarketDataRequestContext): Promise<EarningsEvent[]>;
   getSecFilingDocuments?(filing: SecFilingItem): Promise<SecFilingDocument[]>;
   getSecFilingContent?(filing: SecFilingItem): Promise<string | null>;

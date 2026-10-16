@@ -2,11 +2,16 @@ import type {
   ChatAccountType,
   ChatAttachment,
   ChatChannel,
+  ChatChannelState,
   ChatDiscordLink,
   ChatMessage,
   ChatMessageOrigin,
   ChatNotification,
+  ChatReaction,
+  ChatReactionUser,
   ChatStateResponse,
+  ChatUserBadge,
+  ChatUserSummary,
   CloudSavedSearch,
   CloudSearchHit,
   CloudSearchResponse,
@@ -15,6 +20,7 @@ import type {
   TeamNotification,
 } from "./types";
 import { normalizeTimestamp } from "../utils/timestamp";
+import { parseChatPaneLink } from "./chat-pane-link";
 
 /**
  * Saved-search writes answer with either the record itself or `{ search }`.
@@ -80,17 +86,37 @@ export function normalizeChatAttachments(value: unknown): ChatAttachment[] {
 const CHAT_ACCOUNT_TYPES: readonly string[] = ["human", "managed_llm", "discord"] satisfies ChatAccountType[];
 const CHAT_MESSAGE_ORIGINS: readonly string[] = ["app", "discord"] satisfies ChatMessageOrigin[];
 
-/** A value a newer server adds that this client does not know reads as absent: a human, a message from the app. */
-function chatUserWithKnownAccountType(user: ChatMessage["user"]): ChatMessage["user"] {
-  if (!user || user.accountType === undefined || CHAT_ACCOUNT_TYPES.includes(user.accountType)) return user;
-  const { accountType: _unknown, ...known } = user;
-  return known;
+const CHAT_USER_BADGES: readonly string[] = ["team", "pro"] satisfies ChatUserBadge[];
+
+/**
+ * A value a newer server adds that this client does not know reads as absent:
+ * a human, a message from the app, no badge. A clock or desks that are not
+ * what the server promises are dropped rather than shown wrong.
+ */
+function normalizeChatUser(user: ChatUserSummary): ChatUserSummary {
+  if (!user || typeof user !== "object") return user;
+  const { accountType, badges, utcOffsetMinutes, desks, ...rest } = user;
+  const knownBadges = Array.isArray(badges)
+    ? CHAT_USER_BADGES.filter((badge) => badges.includes(badge as ChatUserBadge)) as ChatUserBadge[]
+    : [];
+  const knownDesks = Array.isArray(desks) ? desks.filter((desk): desk is string => typeof desk === "string" && !!desk) : [];
+  const offset = typeof utcOffsetMinutes === "number" && Number.isInteger(utcOffsetMinutes)
+    && utcOffsetMinutes >= -12 * 60 && utcOffsetMinutes <= 14 * 60
+    ? utcOffsetMinutes
+    : null;
+  return {
+    ...rest,
+    ...(accountType !== undefined && CHAT_ACCOUNT_TYPES.includes(accountType) ? { accountType } : {}),
+    ...(knownBadges.length > 0 ? { badges: knownBadges } : {}),
+    ...(offset !== null ? { utcOffsetMinutes: offset } : {}),
+    ...(knownDesks.length > 0 ? { desks: knownDesks } : {}),
+  };
 }
 
 export function normalizeChatMessage(message: ChatMessage): ChatMessage {
   const normalized: ChatMessage = {
     ...message,
-    user: chatUserWithKnownAccountType(message.user),
+    user: normalizeChatUser(message.user),
     content: typeof message.content === "string" ? message.content : "",
     createdAt: normalizeTimestamp(message.createdAt),
     ...(message.editedAt
@@ -98,9 +124,15 @@ export function normalizeChatMessage(message: ChatMessage): ChatMessage {
       : {}),
   };
   if ("attachments" in message) normalized.attachments = normalizeChatAttachments(message.attachments);
+  if ("reactions" in message) normalized.reactions = normalizeChatReactions(message.reactions);
   if (message.origin !== undefined && !CHAT_MESSAGE_ORIGINS.includes(message.origin)) delete normalized.origin;
   if (message.attachmentReview !== "pending" && message.attachmentReview !== "failed") {
     delete normalized.attachmentReview;
+  }
+  if ("paneLink" in message) {
+    const paneLink = parseChatPaneLink(message.paneLink);
+    if (paneLink) normalized.paneLink = paneLink;
+    else delete normalized.paneLink;
   }
   return normalized;
 }
@@ -117,6 +149,35 @@ export function normalizeChatDiscordLink(value: unknown): ChatDiscordLink {
   };
 }
 
+/** Reactions as the server sent them, dropping anything malformed. */
+export function normalizeChatReactions(value: unknown): ChatReaction[] {
+  if (!Array.isArray(value)) return [];
+  const reactions: ChatReaction[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object") continue;
+    const raw = entry as Record<string, unknown>;
+    if (typeof raw.emoji !== "string" || !raw.emoji) continue;
+    const count = typeof raw.count === "number" && Number.isFinite(raw.count) ? Math.max(0, Math.floor(raw.count)) : 0;
+    if (count === 0) continue;
+    const users = Array.isArray(raw.users)
+      ? raw.users.flatMap((user): ChatReactionUser[] => {
+        if (!user || typeof user !== "object") return [];
+        const candidate = user as Record<string, unknown>;
+        if (typeof candidate.id !== "string") return [];
+        const accountType = candidate.accountType;
+        return [{
+          id: candidate.id,
+          username: typeof candidate.username === "string" ? candidate.username : null,
+          displayName: typeof candidate.displayName === "string" ? candidate.displayName : "User",
+          ...(accountType === "human" || accountType === "managed_llm" || accountType === "discord" ? { accountType } : {}),
+        }];
+      })
+      : [];
+    reactions.push({ emoji: raw.emoji, count, me: raw.me === true, users });
+  }
+  return reactions;
+}
+
 export function normalizeChatMessages(messages: ChatMessage[]): ChatMessage[] {
   return messages.map((message) => normalizeChatMessage(message));
 }
@@ -131,6 +192,26 @@ export function normalizeChatNotification(
   };
 }
 
+/** A `chat.channel_state` frame, or null when it is not one. */
+export function normalizeChatChannelStateFrame(data: unknown): ChatChannelState | null {
+  if (!data || typeof data !== "object") return null;
+  const state = data as Partial<ChatChannelState>;
+  if (
+    typeof state.channelId !== "string"
+    || typeof state.notificationsEnabled !== "boolean"
+    || typeof state.unreadCount !== "number"
+    || (state.lastReadMessageId !== null && typeof state.lastReadMessageId !== "string")
+  ) {
+    return null;
+  }
+  return {
+    channelId: state.channelId,
+    notificationsEnabled: state.notificationsEnabled,
+    lastReadMessageId: state.lastReadMessageId,
+    unreadCount: state.unreadCount,
+  };
+}
+
 export function normalizeChatChannel(
   channel: ChatChannel,
   fallbackKind: ChatChannel["kind"] = "public",
@@ -139,6 +220,9 @@ export function normalizeChatChannel(
     ...channel,
     kind: channel.kind ?? fallbackKind,
     created_at: normalizeTimestamp(channel.created_at),
+    ...(typeof channel.lastMessageAt === "string" ? { lastMessageAt: normalizeTimestamp(channel.lastMessageAt) } : {}),
+    ...(channel.dmUser ? { dmUser: normalizeChatUser(channel.dmUser) } : {}),
+    ...(Array.isArray(channel.members) ? { members: channel.members.map(normalizeChatUser) } : {}),
   };
 }
 

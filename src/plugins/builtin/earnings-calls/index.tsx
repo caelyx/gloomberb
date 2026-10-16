@@ -2,10 +2,11 @@ import type { PluginModule } from "../plugin-module";
 import { attachEarningsCallsPersistence, resetEarningsCallsPersistence } from "./data";
 import { EarningsCallsPane, EARNINGS_CALLS_PANE_ID } from "./pane";
 import { earningsCallsHeadless } from "./headless";
+import { callsLockNote } from "./lock-note";
 
 
 const description =
-  "Earnings call transcripts with speaker attribution, analyst Q&A, and extracted guidance. Alone, every transcribed call; with a ticker, that company's calls.";
+  "Pro earnings call transcripts with speaker attribution, analyst Q&A, and extracted guidance. Alone, every transcribed call; with a ticker, that company's calls.";
 
 function explicitSymbol(options?: { arg?: string; symbol?: string | null }): string | null {
   const symbol = (options?.symbol ?? options?.arg ?? "").trim().toUpperCase();
@@ -32,6 +33,7 @@ export const earningsCallsModule: PluginModule = {
   panes: [
     {
       id: EARNINGS_CALLS_PANE_ID,
+      reportLockNote: callsLockNote,
       name: "Earnings Calls",
       icon: "C",
       component: EarningsCallsPane,

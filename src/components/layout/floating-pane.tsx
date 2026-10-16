@@ -1,6 +1,7 @@
 import { Box, Text, useUiCapabilities, type BoxRenderable } from "../../ui";
 import type { ReactNode, RefObject } from "react";
 import { colors, floatingPaneBg } from "../../theme/colors";
+import { useThemeColors } from "../../theme/theme-context";
 import { PaneBodyFrame, getPaneWindowAttributes } from "./pane/frame";
 import { PaneHeader, type PaneHeaderQuickSetting } from "./pane/header";
 import { PaneHeaderTabsProvider, usePaneHeaderTabsHost } from "./pane/header-tabs";
@@ -30,6 +31,9 @@ interface FloatingPaneWrapperProps {
   onHeaderMouseDragEnd?: (event: any) => void;
   onHeaderContextMenu?: (event: any) => void;
   onActionMouseDown?: (event: any) => void;
+  onHelpMouseDown?: (event: any) => void;
+  /** Ask Gloom about the pane, from the button beside the `?`. */
+  onAskMouseDown?: (event: any) => void;
   onCloseMouseDown?: (event: any) => void;
   onRestoreMouseDown?: (event: any) => void;
   fullscreen?: boolean;
@@ -83,6 +87,8 @@ export function FloatingPaneWrapper({
   onHeaderMouseDragEnd,
   onHeaderContextMenu,
   onActionMouseDown,
+  onHelpMouseDown,
+  onAskMouseDown,
   onCloseMouseDown,
   onRestoreMouseDown,
   fullscreen = false,
@@ -95,7 +101,8 @@ export function FloatingPaneWrapper({
 }: FloatingPaneWrapperProps) {
   const { nativePaneChrome } = useUiCapabilities();
   const { headerTabs, contextValue: headerTabsContext } = usePaneHeaderTabsHost(nativePaneChrome === true);
-  const bg = floatingPaneBg(focused);
+  const palette = useThemeColors();
+  const bg = floatingPaneBg(focused, palette);
   const showFooter = hasPaneFooterContent(footer);
   const reserveFooter = shouldReservePaneFooter(nativePaneChrome, showFooter);
   const renderFooter = reserveFooter || showFooter;
@@ -144,6 +151,8 @@ export function FloatingPaneWrapper({
         onHeaderMouseDragEnd={onHeaderMouseDragEnd}
         onHeaderContextMenu={onHeaderContextMenu}
         onActionMouseDown={onActionMouseDown}
+        onHelpMouseDown={onHelpMouseDown}
+        onAskMouseDown={onAskMouseDown}
         onCloseMouseDown={onCloseMouseDown}
         onRestoreMouseDown={onRestoreMouseDown}
         fullscreen={fullscreen}

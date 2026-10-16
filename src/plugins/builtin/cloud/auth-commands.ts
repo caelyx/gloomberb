@@ -1,8 +1,8 @@
 import type { GloomPluginContext } from "../../../types/plugin";
 import { apiClient } from "../../../api-client";
 import { chatController } from "../chat/controller";
-import { requestAuthDialog } from "./auth-dialog";
-import { requestDeviceSignInDialog } from "./device-signin-dialog";
+import { requestAuthDialog } from "../../../account/auth-dialog";
+import { requestDeviceSignInDialog } from "../../../account/device-signin-dialog";
 
 export function registerCloudAuthCommands(ctx: GloomPluginContext): void {
   ctx.registerCommand({

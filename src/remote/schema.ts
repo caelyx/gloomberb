@@ -7,6 +7,11 @@ import type {
   RemoteSideEffectLevel,
   RemoteWriteTier,
 } from "./types";
+import {
+  PANE_SCREENSHOT_MAX_BYTES,
+  PANE_SCREENSHOT_MAX_EDGE,
+  PANE_SCREENSHOT_MIN_WIDTH,
+} from "./pane-screenshot";
 
 export const REMOTE_RESOURCES: RemoteResourceSchema[] = [
   { uri: "app://snapshot", description: "Current app snapshot including layout, focus, panes, command bar, and plugin/capability catalogs. app.activePanel is deprecated and always \"left\"; read app.focusedPaneId." },
@@ -128,6 +133,28 @@ export const REMOTE_OPERATIONS: RemoteOperationSchema[] = [
   op("pane.show", "Show or focus a pane type.", "{ paneId: string }", "local-write", paneIdInput),
   op("pane.focus", "Focus a pane instance or pane type.", "{ paneId: string }", "local-write", paneIdInput),
   op("pane.close", "Close a pane instance or pane type.", "{ paneId: string }", "local-write", paneIdInput),
+  {
+    ...op(
+      "pane.screenshot",
+      "Capture one pane as a PNG, as it looks on screen now: the focused pane, or paneId (an instance id or pane type from app://panes). "
+        + "It only reads what is already on the person's own screen. Desktop app only: the terminal (TUI) app draws text, not pixels. "
+        + `The image is twice the pane's on-screen size by default, at most ${PANE_SCREENSHOT_MAX_EDGE} px on its longer side and ${PANE_SCREENSHOT_MAX_BYTES / 1024} KB; `
+        + `width asks for another width (${PANE_SCREENSHOT_MIN_WIDTH} to ${PANE_SCREENSHOT_MAX_EDGE} px). `
+        + "A pane in its own window, behind another tab or in another layout is not drawn here and cannot be captured.",
+      "{ paneId?: string, width?: number }",
+      "none",
+      objectSchema({
+        paneId: { type: "string", minLength: 1, description: "Pane instance id or pane type. Defaults to the focused pane." },
+        width: {
+          type: "integer",
+          minimum: PANE_SCREENSHOT_MIN_WIDTH,
+          maximum: PANE_SCREENSHOT_MAX_EDGE,
+          description: "Image width in pixels; the height keeps the pane's proportions.",
+        },
+      }),
+    ),
+    returnsImage: true,
+  },
   op(
     "pane.createFromTemplate",
     "Open a pane from a registered template. It only opens the pane: it adds nothing to a portfolio or watchlist.",
@@ -138,14 +165,18 @@ export const REMOTE_OPERATIONS: RemoteOperationSchema[] = [
   op(
     "view.create",
     "Create a custom view pane: a table from a data function with columns, a filter, and a sort. "
-      + "spec = { source: { pane: <tool name or pane id>, argument?, options? }, projection: { columns?: [{ key, label?, transform? }], filters?: [{ key, op, value }], sort?: { by, direction }, limit? }, presentation?: { title?, symbolKey? } }.",
+      + "The source loads once first; if it cannot, no pane opens and the answer is its error. "
+      + "spec = { source: { pane: <function code>, argument?: <one string>, options?: { <flag>: <value> } }, projection: { columns?: [{ key, label?, transform? }], filters?: [{ key, op, value }], sort?: { by, direction }, limit? }, presentation?: { title?, symbolKey? } }. "
+      + "pane is a function code (app://pane-templates says what each does), never an invented name; an unknown one is answered with the closest codes and the valid ones. "
+      + "argument is always one string, several tickers separated by spaces: \"CME AAPL\". "
+      + "options sets the function's own flags; a wrong flag or value is answered with the ones it takes.",
     "{ name?: string, spec: object }",
     "local-write",
     objectSchema({ name: stringSchema, spec: openObjectSchema }, ["spec"]),
   ),
   op(
     "view.update",
-    "Replace the spec of an existing custom view pane. Same spec shape as view.create.",
+    "Replace the spec of an existing custom view pane. Same spec and sources as view.create; a source that cannot load leaves the view as it was.",
     "{ paneId: string, spec: object, name?: string }",
     "local-write",
     objectSchema({ paneId: requiredStringSchema, spec: openObjectSchema, name: stringSchema }, ["paneId", "spec"]),
@@ -166,7 +197,7 @@ export const REMOTE_OPERATIONS: RemoteOperationSchema[] = [
   ),
   op(
     "ticker.navigate",
-    "Navigate a ticker into the best available ticker research target.",
+    "Show any ticker in the ticker research pane the user is on, or the best available one, as in \"switch to MSFT\".",
     "{ symbol: string, sourcePaneId?: string }",
     "local-write",
     objectSchema({ symbol: requiredStringSchema, sourcePaneId: stringSchema }, ["symbol"]),
@@ -185,7 +216,8 @@ export const REMOTE_OPERATIONS: RemoteOperationSchema[] = [
   ),
   op(
     "ticker.select",
-    "Select a ticker in a target pane.",
+    "Move the cursor of a portfolio or watchlist pane to a ticker on its list, so the panes that follow the list show it. "
+      + "To show any ticker in a ticker pane, use ticker.navigate.",
     "{ symbol: string, paneId?: string }",
     "local-write",
     objectSchema({ symbol: requiredStringSchema, paneId: stringSchema }, ["symbol"]),
@@ -420,6 +452,7 @@ export const REMOTE_AGENT_HELP = {
     "A form with covered: true has another dialog over it, such as a listing picker or a sign-in; its controls wait until that one is answered or closed with app.closeDialog.",
     "Pane settings open in their own dialog, not as command-bar rows; change one with pane.setSetting, read them from app://pane-settings/{paneId}, and close the dialog with app.closeDialog.",
     "watchlist.add and watchlist.remove wait while the person answers a confirmation in the app and return what changed; with dryRun they return what would change without asking.",
+    "pane.screenshot returns the pane's PNG as base64 in image.data, with its pixel size; the terminal (TUI) app answers that it needs the desktop app.",
     "Use ui.invokeMatching only after checking app-level operations; it is intentionally generic and depends on visible semantic controls.",
   ],
 };
@@ -449,13 +482,25 @@ export function writeTierForSideEffectLevel(
   }
 }
 
-export function remoteOperationDescriptors(): RemoteOperationDescriptor[] {
-  return REMOTE_OPERATIONS.map(({ id, title, description, writeTier, inputSchema }) => ({
-    name: remoteOperationToolName(id),
-    title,
-    description,
-    writeTier,
-    inputSchema,
+/**
+ * An operation's description with what only the running app knows. `viewSources`
+ * is the list of functions a custom view can read (`describeViewSources`), said
+ * once, in the operation that creates a view.
+ */
+export function remoteOperationDescription(
+  { id, description }: Pick<RemoteOperationSchema, "id" | "description">,
+  viewSources = "",
+): string {
+  return id === "view.create" && viewSources ? `${description} ${viewSources}` : description;
+}
+
+export function remoteOperationDescriptors(viewSources = ""): RemoteOperationDescriptor[] {
+  return REMOTE_OPERATIONS.map((operation) => ({
+    name: remoteOperationToolName(operation.id),
+    title: operation.title,
+    description: remoteOperationDescription(operation, viewSources),
+    writeTier: operation.writeTier,
+    inputSchema: operation.inputSchema,
   }));
 }
 

@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { PluginModule } from "../plugin-module";
+import type { PaneProps } from "../../../types/plugin";
+import { useShortcut } from "../../../react/input";
+import { isDetailBackNavigationKey } from "../../../utils/back-navigation";
+import { useAppDispatch, useAppStateRef, usePaneInstance, useUpdatePaneInstance } from "../../../state/app/context";
+import { resolveTickerOpenTarget, tickerOpenFailureMessage } from "../../../tickers/open-target";
+import { getSharedRegistry } from "../../registry";
 import {
   useResolvedEntryValue,
   useSecFilingsQuery,
@@ -16,13 +22,15 @@ import {
   sortStackItems,
   useExternalLinkFooter,
   usePaneFooter,
+  usePaneMenuItems,
   usePaneNoticeFooter,
   useTableLoadMore,
   type StackSortPreference,
   type StatItem,
 } from "../../../components";
-import { useDebouncedPluginPaneState, usePluginPaneState } from "../../runtime";
-import { mayBeUsEquityTicker } from "../../../utils/sec";
+import { useDebouncedPluginPaneState, usePluginAppActions, usePluginPaneState } from "../../runtime";
+import { mayBeSecEquityListing, mayBeUsEquityTicker, noSecReportsNotice, nonUsSecListingVenue } from "../../../utils/sec";
+import { parsePublicTickerKey } from "../../../utils/exchanges";
 import { formatCompact } from "../../../utils/format";
 import { nextHeaderSort } from "../../../utils/sort-values";
 import { formatShortDate } from "../../../utils/datetime-format";
@@ -48,6 +56,7 @@ import {
 import { formatInsiderName } from "./display";
 import { insiderHeadless } from "./headless";
 import { isInsiderForm } from "./insider-data";
+import { filesAsForeignPrivateIssuer, insiderEmptyNotice, isOtherIssuerFiling } from "./issuer";
 import { relevantInsiderAmendments } from "./amendments";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
 import {
@@ -60,6 +69,9 @@ import {
 } from "./table-model";
 import { renderInsiderCell } from "./table";
 import { InsiderDetail, insiderDetailTitle } from "./detail";
+import { InsiderSignalsView } from "./signals";
+import { insiderSignalsCache } from "./signals-client";
+import { INSIDER_SIGNALS_TITLE } from "./signals-model";
 
 
 const FORM4_PAGE_SIZE = 20;
@@ -117,7 +129,13 @@ function summaryItems(figures: InsiderSummaryFigures, typeFilter: InsiderTypeFil
   return items;
 }
 
-function InsiderView({ width, height, focused }: { width: number; height: number; focused: boolean }) {
+function InsiderView({ width, height, focused, onBack }: {
+  width: number;
+  height: number;
+  focused: boolean;
+  /** Back to the ranking this company was opened from, when it was. */
+  onBack?: () => void;
+}) {
   const { ticker } = usePaneTickerIdentity();
   const tickerKey = ticker?.metadata.ticker ?? "none";
   const [selectedId, setSelectedId] = usePluginPaneState<string | null>(`insider:selectedId:${tickerKey}`, null);
@@ -130,7 +148,9 @@ function InsiderView({ width, height, focused }: { width: number; height: number
     [setOpenItemIdState],
   );
   const [sort, setSort] = useState<StackSortPreference<InsiderColumnId>>({ columnId: "date", direction: "desc" });
-  const eligibleTicker = mayBeUsEquityTicker(ticker);
+  const eligibleTicker = mayBeSecEquityListing(ticker);
+  // A listing abroad is looked up by its company; an empty list means it files nothing with the SEC.
+  const abroadVenue = ticker ? nonUsSecListingVenue(ticker.metadata.ticker, ticker.metadata.exchange) : null;
   const instrument = instrumentFromTicker(ticker, ticker?.metadata.ticker ?? null);
 
   const filingsEntry = useSecFilingsQuery(
@@ -185,6 +205,17 @@ function InsiderView({ width, height, focused }: { width: number; height: number
     scopeKey: `${ticker?.metadata.ticker ?? "none"}:${ticker?.metadata.exchange ?? ""}`,
     targets: visibleForm4Filings,
   });
+  // The list also holds the Form 4s the company filed as an owner of another
+  // company's shares, which only their documents tell apart. Until one of its
+  // own is read, the pages are read on to the end, so a list of none says so.
+  const ownerFilingsShown = useMemo(() => visibleForm4Filings.some((filing) => (
+    isOtherIssuerFiling(filing, contentMap.get(filing.accessionNumber))
+  )), [contentMap, visibleForm4Filings]);
+  const ownFilingShown = useMemo(() => visibleForm4Filings.some((filing) => (
+    contentMap.has(filing.accessionNumber) && !isOtherIssuerFiling(filing, contentMap.get(filing.accessionNumber))
+  )), [contentMap, visibleForm4Filings]);
+  const searchingOwn = !ownFilingShown && pendingCount === 0 && shownCount < form4Filings.length;
+  const noOwnFilings = !loading && !ownFilingShown && pendingCount === 0 && shownCount >= form4Filings.length;
 
   const allParsed: ParsedFiling[] = useMemo(() => visibleForm4Filings.flatMap((filing) => {
     const hasContent = contentMap.has(filing.accessionNumber);
@@ -223,13 +254,13 @@ function InsiderView({ width, height, focused }: { width: number; height: number
   // load here until it fills a page, back to a year at most.
   const oldestShown = visibleForm4Filings[visibleForm4Filings.length - 1]?.filingDate;
   const oldestShownTime = oldestShown ? new Date(oldestShown).getTime() : Number.NaN;
-  const wantsOlderFilings = (typeFilter !== "all" || nameFilter != null)
+  const wantsOlderFilings = (typeFilter !== "all" || nameFilter != null || ownerFilingsShown)
     && shown.length < Math.max(FORM4_PAGE_SIZE, height)
     && shownCount < Math.min(form4Filings.length, AUTO_FILL_FILING_CAP)
     && oldestShownTime >= Date.now() - AUTO_FILL_DAYS * DAY_MS;
   useEffect(() => {
-    if (wantsOlderFilings && pendingCount === 0) loadNextPage();
-  }, [loadNextPage, pendingCount, shownCount, wantsOlderFilings]);
+    if (searchingOwn || (wantsOlderFilings && pendingCount === 0)) loadNextPage();
+  }, [loadNextPage, pendingCount, searchingOwn, shownCount, wantsOlderFilings]);
 
   const summary = useMemo(() => buildInsiderSummaryFigures(parsed, Date.now(), allParsed), [parsed, allParsed]);
   // A page loading in on scroll clears the totals until it is read; the last
@@ -309,6 +340,18 @@ function InsiderView({ width, height, focused }: { width: number; height: number
     ],
   } : null), [focused, openAdjacent, openIndex, sortedRows.length]);
 
+  // Opened from the ranking: Esc, Backspace or the mouse back button returns
+  // to it once no transaction is open, and the pane menu lists it.
+  useShortcut((event) => {
+    if (!focused || !onBack || openRow || !isDetailBackNavigationKey(event)) return;
+    event.preventDefault?.();
+    event.stopPropagation?.();
+    onBack();
+  });
+  usePaneMenuItems("insider:back", () => onBack ? [
+    { id: "insider-back", label: `Back to ${INSIDER_SIGNALS_TITLE}`, accelerator: "Esc", onSelect: onBack },
+  ] : null, [onBack]);
+
   const pendingLabel = pendingCount > 0 ? `loading ${pendingCount}...` : "";
   const footerInfo = useMemo(() => [
     ...(pendingLabel ? [{ id: "pending", parts: [{ text: pendingLabel, tone: "muted" as const }] }] : []),
@@ -349,19 +392,21 @@ function InsiderView({ width, height, focused }: { width: number; height: number
   if (!ticker) {
     return <EmptyState title="No ticker selected." message="Select a ticker to view insider activity." />;
   }
-  if (!eligibleTicker) return renderFilingNotice("Insider transactions are only shown for US equities.", width);
+  if (!eligibleTicker) return renderFilingNotice("Insider transactions are only shown for US equities.");
   if (authWall) return <SignInWall placement="insider-signin" action="view insider transactions" needsVerification={cloudSession.needsVerification} />;
   if (loading && allFilings.length === 0) return <Spinner label="Loading insider filings..." />;
   if (error && allFilings.length === 0) return <EmptyState title="Insider filings unavailable." message={error} />;
-  if (!loading && form4Filings.length === 0) {
-    return renderFilingNotice(`No Form 4 filings found for ${ticker.metadata.ticker}.`, width);
+  if (noOwnFilings) {
+    return renderFilingNotice(abroadVenue && allFilings.length === 0
+      ? noSecReportsNotice({ symbol: parsePublicTickerKey(ticker.metadata.ticker).symbol, exchange: abroadVenue, name: ticker.metadata.name ?? null })
+      : insiderEmptyNotice(filesAsForeignPrivateIssuer(allFilings)));
   }
 
   // Until a filing is read there is nothing to say; after that the empty
   // list says how far back the filings it has read go, while older ones load.
   const oldestRead = allParsed.findLast((entry) => !entry.isLoading)?.filing.filingDate;
   const since = oldestRead ? ` since ${formatShortDate(oldestRead, { utc: true })}` : "";
-  const emptyTitle = typeCounts.all === 0 && (pendingCount > 0 || wantsOlderFilings)
+  const emptyTitle = typeCounts.all === 0 && (pendingCount > 0 || wantsOlderFilings || searchingOwn)
     ? "Loading Form 4 transactions..."
     : typeFilter === "trades"
       ? `No open-market buys or sells${nameFilter ? " by this insider" : ""}${since}.`
@@ -434,13 +479,72 @@ function InsiderView({ width, height, focused }: { width: number; height: number
   );
 }
 
+/**
+ * INS on a ticker is that company's insider transactions; without one it is
+ * the ranking of companies whose insiders are buying. A row of the ranking
+ * opens its company here, and Back returns to the ranking.
+ */
+function InsiderPane({ width, height, focused }: PaneProps) {
+  const { symbol: paneSymbol } = usePaneTickerIdentity();
+  const instance = usePaneInstance();
+  const updateInstance = useUpdatePaneInstance();
+  const [fromRanking, setFromRanking] = usePluginPaneState<boolean>("insider:signals:return", false);
+  const stateRef = useAppStateRef();
+  const dispatch = useAppDispatch();
+  const { notify } = usePluginAppActions();
+  // The layout first: saving it restores the pane state it was saved with, so
+  // pane state written before it would be lost.
+  const showCompany = useCallback((symbol: string) => {
+    updateInstance((current) => ({ ...current, binding: { kind: "fixed", symbol }, title: `INS ${symbol}` }));
+    setFromRanking(true);
+  }, [setFromRanking, updateInstance]);
+  // A company the app has not seen yet is looked up first, as the command bar does for `INS CTSO`.
+  const openCompany = useCallback(async (symbol: string) => {
+    if (stateRef.current.tickers.has(symbol)) {
+      showCompany(symbol);
+      return;
+    }
+    const registry = getSharedRegistry();
+    try {
+      const target = registry ? await resolveTickerOpenTarget({
+        query: symbol,
+        tickers: stateRef.current.tickers,
+        dataProvider: registry.marketData,
+        tickerRepository: registry.tickerRepository,
+      }) : null;
+      if (!registry || !target) {
+        notify({ body: tickerOpenFailureMessage(symbol), type: "error" });
+        return;
+      }
+      dispatch({ type: "UPDATE_TICKER", ticker: target.ticker });
+      if (target.created) registry.events.emit("ticker:added", { symbol: target.symbol, ticker: target.ticker });
+      showCompany(target.symbol);
+    } catch (error) {
+      notify({ body: error instanceof Error ? error.message : tickerOpenFailureMessage(symbol), type: "error" });
+    }
+  }, [dispatch, notify, showCompany, stateRef]);
+  const backToRanking = useCallback(() => {
+    updateInstance((current) => ({ ...current, binding: { kind: "none" }, title: INSIDER_SIGNALS_TITLE }));
+    setFromRanking(false);
+  }, [setFromRanking, updateInstance]);
+
+  // No ticker at all is the ranking; a pane linked to a list keeps its own
+  // empty state while the list has nothing selected.
+  if (!paneSymbol && instance?.binding?.kind !== "follow") {
+    return <InsiderSignalsView width={width} height={height} focused={focused} onOpen={(symbol) => void openCompany(symbol)} />;
+  }
+  // Only while the pane still shows the company it opened; linked or retargeted, it is an ordinary INS.
+  const canGoBack = fromRanking && instance?.binding?.kind === "fixed";
+  return <InsiderView width={width} height={height} focused={focused} onBack={canGoBack ? backToRanking : undefined} />;
+}
+
 export const insiderModule: PluginModule = {
   panes: [
     {
       id: "insider",
       name: "Insider",
       icon: "I",
-      component: InsiderView,
+      component: InsiderPane,
       defaultPosition: "right",
       tickerFollower: true,
       defaultMode: "floating",
@@ -455,16 +559,19 @@ export const insiderModule: PluginModule = {
         id: "insider-pane",
         paneId: "insider",
         label: "Insider",
-        description: "Insider transaction activity for the selected ticker.",
-        keywords: ["insider", "form 4", "ownership", "transactions", "ins"],
+        description: "Insider transactions for a ticker; alone, the companies whose insiders are buying.",
+        keywords: ["insider", "form 4", "ownership", "transactions", "ins", "insider buying", "cluster buying"],
         shortcut: "INS",
-        canCreate: (_context, options) => !options?.ticker || mayBeUsEquityTicker(options.ticker),
+        canCreate: (_context, options) => !options?.ticker || mayBeSecEquityListing(options.ticker),
+        // Typed alone with no active ticker it ranks the market's insider buying.
+        withoutTickerTitle: INSIDER_SIGNALS_TITLE,
       }),
       headless: insiderHeadless,
     },
   ],
 
   setup(ctx) {
+    insiderSignalsCache.attach(ctx.persistence);
     ctx.registerTickerResearchTab({
       id: "insider",
       name: "Insider",
@@ -473,5 +580,9 @@ export const insiderModule: PluginModule = {
       instruments: ["equity"],
       isVisible: ({ ticker }) => mayBeUsEquityTicker(ticker),
     });
+  },
+
+  dispose() {
+    insiderSignalsCache.reset();
   },
 };

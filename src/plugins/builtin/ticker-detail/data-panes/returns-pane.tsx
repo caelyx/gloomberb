@@ -10,6 +10,7 @@ import {
   useQueryBarSearch,
   type DataTableCell,
   type DataTableColumn,
+  type PaneFooterSegment,
   type PaneHint,
 } from "../../../../components";
 import { usePaneRefreshKey } from "../../../../components/data-table/table-pane";
@@ -19,14 +20,11 @@ import {
   type ChartResolutionSupport,
   type ManualChartResolution,
 } from "../../../../time-series/resolution";
-import { fetchHistoryResult, InvalidHistoryResultError } from "../../../../sources/history-result";
 import { historyCoverageNotice } from "../../../../sources/history-coverage";
-import { historyRetentionNotice, isHistoryRetentionError } from "../../../../sources/history-retention";
 import { cleanFloat32Price, historyPriceDecimals } from "../../../../cli/history-rows";
 import { formatPriceObservation, quoteFormatOptions } from "../../../../market-data/market/format";
 import { usePaneTicker } from "../../../../state/app/context";
 import type { PaneProps } from "../../../../types/plugin";
-import type { PricePoint } from "../../../../types/financials";
 import { colors, priceColor } from "../../../../theme/colors";
 import { formatPercent } from "../../../../utils/format";
 import { publicTickerKey } from "../../../../utils/exchanges";
@@ -37,16 +35,14 @@ import { useBoundTicker, useTickerRequest } from "../../shared/ticker-request";
 import {
   availableReturnResolutions,
   buildReturnRows,
+  closedMarketNote,
   effectiveReturnResolution,
-  endsAtLatestBar,
-  latestBarTime,
   RETURN_RANGES,
-  returnLookbackMs,
-  returnSupportRange,
-  returnVisibleFrom,
   type ReturnRange,
   type ReturnRow,
 } from "./returns-model";
+import { loadReturnSeries, type ReturnSeries } from "./returns-history";
+import { formingHistoryBar, formingHistoryBarText, historyBarDate } from "./history-bars";
 
 type ReturnColumnId = "time" | "price" | "intervalChange" | "intervalPercent" | "cumulativeChange" | "cumulativePercent";
 type ReturnColumn = DataTableColumn & { id: ReturnColumnId };
@@ -63,15 +59,6 @@ const COLUMNS: ReturnColumn[] = [
   { id: "cumulativeChange", label: "TOTAL $", width: 10, align: "right", flexGrow: 1 },
   { id: "cumulativePercent", label: "TOTAL %", width: 9, align: "right", flexGrow: 1 },
 ];
-
-interface ReturnSeries {
-  points: PricePoint[];
-  visibleFrom: number;
-  visibleTo: number;
-  coverageStart?: string;
-  range: ReturnRange;
-  resolution: ManualChartResolution;
-}
 
 function formatDateTime(date: Date): string {
   const iso = date.toISOString();
@@ -121,14 +108,6 @@ function sortValue(row: ReturnRow, id: ReturnColumnId): number | null {
   }
 }
 
-function historyErrorMessage(error: unknown, resolution: ManualChartResolution): Error {
-  const label = getChartResolutionLabel(resolution);
-  if (isHistoryRetentionError(error)) return new Error(historyRetentionNotice(error.retention, label, null));
-  // The source answered at another cadence than asked: those bars are not this interval's returns.
-  if (error instanceof InvalidHistoryResultError) return new Error(`${label} bars are unavailable for this ticker`);
-  return error instanceof Error ? error : new Error(String(error));
-}
-
 export function ReturnsPane({ focused, width, height }: PaneProps) {
   const dataProvider = useAssetData();
   const { symbol, exchange, ticker } = useBoundTicker();
@@ -162,36 +141,15 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
 
   const loader = useCallback(async (nextSymbol: string, nextExchange: string, forceRefresh: boolean): Promise<ReturnSeries> => {
     if (!dataProvider) throw new Error("Market data unavailable");
-    const sourceSupport = await supportRequest;
-    const interval = effectiveReturnResolution(range, resolution, sourceSupport);
-    const now = Date.now();
-    const visibleFrom = returnVisibleFrom(range, interval, now);
-    const start = new Date(visibleFrom - returnLookbackMs(range, interval, sourceSupport));
-    const end = new Date(now);
-    const context = forceRefresh ? { cacheMode: "refresh" as const } : undefined;
-    let result;
-    try {
-      // Exact bounds first, then the interval's range history, as charts do
-      // when a source keeps no bars for the exact window.
-      result = await fetchHistoryResult(dataProvider, nextSymbol, nextExchange, { kind: "detail", start, end, interval }, context);
-      if (!result?.points.length) {
-        result = await fetchHistoryResult(dataProvider, nextSymbol, nextExchange, { kind: "resolution", range: returnSupportRange(range), resolution: interval }, context) ?? result;
-      }
-    } catch (error) {
-      throw historyErrorMessage(error, interval);
-    }
-    if (!result) throw new Error("Price history unavailable");
-    const latest = latestBarTime(result.points);
-    return {
-      points: result.points,
-      // A closed market leaves a short window ending now without bars, so it
-      // ends at the latest bar instead.
-      visibleFrom: endsAtLatestBar(range) && latest !== null ? returnVisibleFrom(range, interval, latest) : visibleFrom,
-      visibleTo: now,
-      ...(result.coverageStart ? { coverageStart: result.coverageStart } : {}),
+    return loadReturnSeries(dataProvider, {
+      symbol: nextSymbol,
+      exchange: nextExchange,
       range,
-      resolution: interval,
-    };
+      resolution,
+      support: await supportRequest,
+      now: Date.now(),
+      forceRefresh,
+    });
   }, [dataProvider, range, resolution, supportRequest]);
   const { data, loading, error, reload } = useTickerRequest(loader, symbol, exchange);
   usePaneRefreshKey(reload, { focused: focused && !searchActive });
@@ -228,7 +186,22 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
   const hints = useMemo<PaneHint[]>(() => (
     table.searchable ? [{ id: "search", key: "/", label: "search", onPress: focusSearch }] : []
   ), [focusSearch, table.searchable]);
-  usePaneStatusFooter({ registrationId: "returns", loading, error, hints });
+  // A weekly or monthly interval's newest bar is its week or month so far when that has not ended.
+  const newestDate = returnRows[0] ? new Date(returnRows[0].timestamp).toISOString().slice(0, 10) : undefined;
+  const forming = useMemo(
+    () => data ? formingHistoryBar(data.resolution, newestDate, data.venue || undefined, Date.now()) : null,
+    [data, newestDate],
+  );
+  const formingKey = forming ? returnRows[0]?.key : undefined;
+  const barSize = data?.resolution ?? shownResolution;
+  // A shut market's window ends at its last session, which the footer names.
+  const marketInfo = useMemo<PaneFooterSegment[]>(() => [
+    ...data?.lastSession
+      ? [{ id: "market", parts: [{ text: closedMarketNote(data.lastSession, data.visibleTo), tone: "muted" as const }] }]
+      : [],
+    ...forming && newestDate ? [{ id: "forming", parts: [{ text: formingHistoryBarText(forming, newestDate), tone: "muted" as const }] }] : [],
+  ], [data, forming, newestDate]);
+  usePaneStatusFooter({ registrationId: "returns", loading, error, hints, info: marketInfo });
 
   const integrityNotice = priceHistoryIntegrityNotice(returnRows.filter((row) => row.inconsistent).length);
   const coverageNotice = data ? historyCoverageNotice(data.coverageStart, data.visibleFrom) : null;
@@ -245,8 +218,15 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
 
   const renderCell = useCallback((row: ReturnRow, column: ReturnColumn): DataTableCell => {
     switch (column.id) {
-      case "time":
-        return { text: formatDateTime(new Date(row.timestamp)), value: new Date(row.timestamp).toISOString(), color: colors.textDim };
+      case "time": {
+        const shown = formatDateTime(new Date(row.timestamp));
+        // A daily or longer bar is a date; a month's reads as the month, and one still running says so.
+        return {
+          text: shown.length > 10 ? shown : historyBarDate(shown, barSize, row.key === formingKey),
+          value: new Date(row.timestamp).toISOString(),
+          color: colors.textDim,
+        };
+      }
       case "price":
         return { text: formatMaybePrice(row.price, priceDecimals, column.width), value: exportPrice(row.price, priceDecimals), color: colors.textBright, attributes: TextAttributes.BOLD };
       case "intervalChange":
@@ -258,7 +238,7 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
       case "cumulativePercent":
         return { text: formatMaybePercent(row.cumulativePercent), value: row.cumulativePercent === null ? null : row.cumulativePercent * 100, color: priceColor(row.cumulativePercent ?? 0) };
     }
-  }, [priceDecimals]);
+  }, [barSize, formingKey, priceDecimals]);
 
   return (
     <DataTableView<ReturnRow, ReturnColumn>
@@ -307,7 +287,9 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
         ["Ticker", symbol ? publicTickerKey(symbol, exchange) : ""],
         ["Range", data?.range ?? range],
         ["Interval", getChartResolutionLabel(data?.resolution ?? shownResolution)],
+        ...(forming && newestDate ? [["Partial bar", `${newestDate}, ${formingHistoryBarText(forming, newestDate)}`]] : []),
         ["Window", data ? `after ${new Date(data.visibleFrom).toISOString()} through ${new Date(data.visibleTo).toISOString()}` : ""],
+        ...(data?.lastSession ? [["Market", closedMarketNote(data.lastSession, data.visibleTo)]] : []),
         ["Time zone", "UTC, bar open"],
         ["Basis", "Price returns of bar closes; dividends are not included"],
         ...(coverageNotice ? [["Coverage", coverageNotice]] : []),
