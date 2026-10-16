@@ -21,6 +21,15 @@ export interface TickerBadgeListProps {
   width: number;
   fallbackColor?: string;
   liveQuote?: boolean;
+  /**
+   * The source names these as listed tickers (an SEC filer's ticker, the
+   * pane's own symbol): each is drawn as a badge as it is, with no lookup
+   * and no quote. A lookup that fails prints a symbol as plain text, so a
+   * column of looked-up symbols can mix chips and bare words.
+   */
+  listed?: boolean;
+  /** Opens a badge; by default the symbol is resolved and opened as a ticker link would be. */
+  onOpen?: (symbol: string) => void;
 }
 
 function badgeStatus(entry: InlineTickerCatalogEntry | undefined): TickerBadgeStatus {
@@ -34,6 +43,8 @@ export function TickerBadgeList({
   width,
   fallbackColor = colors.textBright,
   liveQuote = true,
+  listed = false,
+  onOpen,
 }: TickerBadgeListProps) {
   const [hoveredSymbol, setHoveredSymbol] = useState<string | null>(null);
   /**
@@ -51,8 +62,8 @@ export function TickerBadgeList({
     [symbols],
   );
   const tickerTexts = useMemo(
-    () => named.map((symbol) => `$${symbol}`),
-    [named],
+    () => (listed ? [] : named.map((symbol) => `$${symbol}`)),
+    [listed, named],
   );
   /**
    * Quotes are only worth fetching where they can be read. A column with no
@@ -70,7 +81,7 @@ export function TickerBadgeList({
     ),
     [chrome, named, width],
   );
-  const liveQuotes = liveQuote && slack >= MIN_CHANGE_WIDTH;
+  const liveQuotes = liveQuote && !listed && slack >= MIN_CHANGE_WIDTH;
   const { catalog, openTicker } = useInlineTickers(tickerTexts, {
     liveQuotes,
     settleMs: BADGE_LIST_SETTLE_MS,
@@ -79,7 +90,9 @@ export function TickerBadgeList({
   /**
    * Every symbol keeps its chip; only the spare columns buy prices. The budget
    * is spent left to right, so the first badges in a cell show their change and
-   * the ones that would overflow quietly shrink back to the symbol.
+   * the ones that would overflow quietly shrink back to the symbol. It is spent
+   * on resting text only: a hovered chip keeps its width, so hovering one never
+   * moves the others.
    */
   const budgets = useMemo(() => {
     let remaining = slack;
@@ -91,13 +104,12 @@ export function TickerBadgeList({
         status: badgeStatus(catalog[symbol]),
         quote: catalog[symbol]?.quote ?? null,
         liveQuote: liveQuotes,
-        hovered: hoveredSymbol === symbol,
         maxTextWidth: budget,
       });
       remaining -= displayWidth(chosen) - base;
       return budget;
     });
-  }, [catalog, hoveredSymbol, liveQuotes, named, slack]);
+  }, [catalog, liveQuotes, named, slack]);
 
   return (
     <Box flexDirection="row" width={width} height={1} overflow="hidden">
@@ -125,7 +137,7 @@ export function TickerBadgeList({
             onHoverEnd={() => {
               setHoveredSymbol((current) => (current === symbol ? null : current));
             }}
-            onOpen={openTicker}
+            onOpen={onOpen ?? openTicker}
           />
         );
       })}

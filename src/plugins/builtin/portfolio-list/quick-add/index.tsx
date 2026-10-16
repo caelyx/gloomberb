@@ -15,9 +15,10 @@ import { formatPercentRaw } from "../../../../utils/format";
 import { formatMarketPrice } from "../../../../market-data/market/format";
 import { listingChoiceQuery, upsertTickerFromSearchResult } from "../../../../tickers/search";
 import type { TickerRecord } from "../../../../types/ticker";
-import { addTickerToPortfolio, addTickerToWatchlist } from "../mutations";
+import { addTickerToPortfolio, addTickerToWatchlist } from "../../../../portfolio/mutations";
 import { captureAttentionAction } from "../../../../telemetry/attention-counts";
 import { publicTickerKey } from "../../../../utils/exchanges";
+import { tickerChangeLine } from "../../../../tickers/ticker-changes";
 import {
   IDLE_VALIDATION,
   isPlausibleTickerQuery,
@@ -30,6 +31,8 @@ import {
 } from "./resolution";
 
 const QUICK_ADD_DEBOUNCE_MS = 300;
+/** The pane key that opens the add row, as its footer hint shows it. */
+export const QUICK_ADD_KEY = "a";
 
 export type { QuickAddCollectionKind } from "./resolution";
 
@@ -37,10 +40,13 @@ function QuickAddPreview({
   validation,
   collectionKind,
   submitting,
+  cleared,
 }: {
   validation: QuickAddValidation;
   collectionKind: QuickAddCollectionKind;
   submitting: boolean;
+  /** The field was emptied after the add failed: the line names what was typed. */
+  cleared: boolean;
 }) {
   if (submitting) {
     return <Text fg={colors.textDim}>{t("adding...")}</Text>;
@@ -55,7 +61,7 @@ function QuickAddPreview({
   }
 
   if (validation.status === "missing" || validation.status === "error") {
-    return <Text fg={colors.textMuted}>{t(validation.message)}</Text>;
+    return <Text fg={colors.textMuted}>{cleared ? `${validation.query}  ${t(validation.message)}` : t(validation.message)}</Text>;
   }
 
   if (validation.status === "choose") {
@@ -80,15 +86,20 @@ function QuickAddPreview({
   const exchange = exchangeLabelFromValidation(validation);
   const showSymbol = normalizeQuickAddQuery(validation.symbol) !== validation.query;
   const symbolPrefix = showSymbol ? `${validation.symbol} ` : "";
+  // A symbol whose company moved on says where it went before it is added, ahead of the
+  // name of what lists there now; the add notice prints the whole line.
+  const change = validation.change?.kind === "moved" ? validation.change : null;
+  const moved = change?.listed ? `${change.issuer ?? `the former ${change.symbol}`} trades as ${change.tradesAs}` : change?.note;
 
   return (
     <Box flexDirection="row" overflow="hidden">
-      <Text fg={colors.textDim}>{`${symbolPrefix}${priceText} `}</Text>
-      <Text fg={changeValue == null ? colors.textDim : priceColor(changeValue)}>
+      <Text fg={colors.textDim} flexShrink={0}>{`${symbolPrefix}${priceText} `}</Text>
+      <Text fg={changeValue == null ? colors.textDim : priceColor(changeValue)} flexShrink={0}>
         {formatPercentRaw(changeValue)}
       </Text>
-      {name ? <Text fg={colors.textMuted}>{`  ${name}`}</Text> : null}
-      {exchange ? <Text fg={colors.textDim}>{`  ${exchange}`}</Text> : null}
+      {moved ? <Text fg={colors.warning} flexShrink={0}>{`  ${moved}`}</Text> : null}
+      {name && (!change || change.listed) ? <Text fg={colors.textMuted}>{`  ${name}`}</Text> : null}
+      {exchange && !change ? <Text fg={colors.textDim}>{`  ${exchange}`}</Text> : null}
     </Box>
   );
 }
@@ -101,6 +112,7 @@ export function QuickAddTickerInput({
   width,
   onAdded,
   onFocusChange,
+  focusRequest = 0,
 }: {
   collectionId: string;
   collectionKind: QuickAddCollectionKind;
@@ -109,6 +121,12 @@ export function QuickAddTickerInput({
   width: number;
   onAdded: (symbol: string) => void;
   onFocusChange?: (focused: boolean) => void;
+  /**
+   * Bumped by a control outside the row, such as the empty table's
+   * "+ ticker" button, to open it. A click there focuses the pane in the same
+   * press, so the row opens once the pane is focused.
+   */
+  focusRequest?: number;
 }) {
   const dispatch = useAppDispatch();
   const { notify } = usePluginAppActions();
@@ -132,9 +150,31 @@ export function QuickAddTickerInput({
     setInputFocused(false);
   }, []);
 
+  const handledFocusRequestRef = useRef(focusRequest);
+  useEffect(() => {
+    if (focusRequest === handledFocusRequestRef.current || !focused) return;
+    handledFocusRequestRef.current = focusRequest;
+    focusInput();
+  }, [focusInput, focusRequest, focused]);
+
+  // A symbol with no listing leaves the field, so the next one typed replaces
+  // it instead of running on (OMV.VIREP.MC); the line under it still says what
+  // failed until something is typed.
+  const keepFailureRef = useRef(false);
   const resetInput = useCallback(() => {
+    keepFailureRef.current = false;
     setInputValue("");
     setValidation(IDLE_VALIDATION);
+  }, []);
+
+  const clearFailedInput = useCallback((failure: QuickAddValidation) => {
+    keepFailureRef.current = true;
+    validationSeqRef.current += 1;
+    setInputValue("");
+    // The focused field keeps its own text and cursor until told, as the chart composer's add field is.
+    inputRef.current?.editBuffer?.setText?.("");
+    inputRef.current?.setCursorOffset?.(0);
+    setValidation(failure);
   }, []);
 
   // `NET:` is the command bar's venue dropdown. Choosing a row adds it here.
@@ -162,15 +202,20 @@ export function QuickAddTickerInput({
     }
   }, [blurInput, focused, inputFocused]);
 
+  // Read when a lookup runs, so a quote tick does not look the typed symbol up again.
+  const tickersRef = useRef(tickers);
+  tickersRef.current = tickers;
+  const financialsRef = useRef(financials);
+  financialsRef.current = financials;
   const validateQuery = useCallback((query: string): Promise<QuickAddValidation> => {
     return resolveQuickAddValidation({
       query,
       collectionId,
       collectionKind,
-      tickers,
-      financials,
+      tickers: tickersRef.current,
+      financials: financialsRef.current,
     });
-  }, [collectionId, collectionKind, financials, tickers]);
+  }, [collectionId, collectionKind]);
 
   useEffect(() => {
     const query = normalizeQuickAddQuery(inputValue);
@@ -178,9 +223,10 @@ export function QuickAddTickerInput({
     const seq = validationSeqRef.current;
 
     if (!query) {
-      setValidation(IDLE_VALIDATION);
+      if (!keepFailureRef.current) setValidation(IDLE_VALIDATION);
       return;
     }
+    keepFailureRef.current = false;
 
     if (listingChoiceQuery(query)) {
       setValidation(IDLE_VALIDATION);
@@ -239,6 +285,7 @@ export function QuickAddTickerInput({
             collection: collectionName,
           }),
         });
+        resetInput();
         return;
       }
       if (currentValidation.status !== "ready") {
@@ -248,6 +295,8 @@ export function QuickAddTickerInput({
             ? "Ticker lookup is still in progress."
             : currentValidation.message;
         notify({ type: "error", body });
+        // Only a symbol nothing lists leaves the field. A lookup that failed (offline) keeps what was typed, to try again.
+        if (currentValidation.status === "missing") clearFailedInput(currentValidation);
         return;
       }
 
@@ -295,13 +344,13 @@ export function QuickAddTickerInput({
       }
 
       onAdded(result.ticker.metadata.ticker);
-      notify({
-        type: "success",
-        body: tf("Added {symbol} to {collection}.", {
-          symbol: result.ticker.metadata.ticker,
-          collection: collectionName,
-        }),
+      const added = tf("Added {symbol} to {collection}.", {
+        symbol: result.ticker.metadata.ticker,
+        collection: collectionName,
       });
+      // As `watchlist add` prints it: FB now lists another security, Meta trades as META.
+      const change = tickerChangeLine(currentValidation.change);
+      notify({ type: "success", body: change ? `${added} ${change}.` : added });
       resetInput();
       queueMicrotask(() => inputRef.current?.focus?.());
     } catch {
@@ -311,6 +360,7 @@ export function QuickAddTickerInput({
       setSubmitting(false);
     }
   }, [
+    clearFailedInput,
     collectionId,
     collectionKind,
     collectionName,
@@ -350,7 +400,7 @@ export function QuickAddTickerInput({
 
   // The row shows only its placeholder, so the footer says which key reaches it.
   usePaneFooter("portfolio-list:quick-add", () => ({
-    hints: inputFocused ? [] : [{ id: "add", key: "a", label: "dd", onPress: focusInput }],
+    hints: inputFocused ? [] : [{ id: "add", key: QUICK_ADD_KEY, label: "dd", onPress: focusInput }],
   }), [focusInput, inputFocused]);
 
   return (
@@ -376,6 +426,7 @@ export function QuickAddTickerInput({
           validation={validation}
           collectionKind={collectionKind}
           submitting={submitting}
+          cleared={!inputValue}
         />
       )}
     />

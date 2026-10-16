@@ -26,8 +26,21 @@ export interface ButtonProps {
   onPress?: () => void;
   variant?: ButtonVariant;
   disabled?: boolean;
+  /**
+   * The action it started is still running (a retry waiting for its answer).
+   * It reads as disabled and ignores presses, but keeps its key, so it does not
+   * change size and the key does not fall through to something else.
+   */
+  pending?: boolean;
+  /** What it says while pending, such as "Retrying...". Without it the label stays. */
+  pendingLabel?: string;
   active?: boolean;
   shortcut?: string;
+  /**
+   * The key that presses it, as a keycap on the desktop and the web only: for
+   * a dialog button whose key the terminal names in the footer line instead.
+   */
+  desktopShortcut?: string;
   /** Tooltip, when it should say more than the label. */
   title?: string;
   width?: number;
@@ -81,11 +94,14 @@ export function Button({
   displayLabel,
   children,
   expanded,
-  onPress,
+  onPress: pressAction,
   variant = "secondary",
   disabled = false,
+  pending = false,
+  pendingLabel,
   active = false,
   shortcut,
+  desktopShortcut,
   width,
   height,
   compact = false,
@@ -94,17 +110,21 @@ export function Button({
   title,
 }: ButtonProps) {
   const colors = useThemeColors();
-  const label = t(rawLabel);
+  const label = t(pending && pendingLabel ? pendingLabel : rawLabel);
+  if (pending && pendingLabel) displayLabel = undefined;
+  // A pending press is ignored, but the button stays its scope's primary action.
+  const onPress = pressAction && pending ? () => {} : pressAction;
   const scopedShortcut = useScopedButtonAction(label, onPress, disabled);
   shortcut = shortcut ?? scopedShortcut;
+  const inert = disabled || pending;
   const remoteScope = useRemoteUiScope();
   useRemoteUiNode({
     role: "button",
     label,
-    disabled,
+    disabled: inert,
     actions: {
       press: () => {
-        if (!disabled) onPress?.();
+        if (!inert) onPress?.();
       },
     },
     metadata: { variant, active, shortcut, expanded, ...(remoteScope ? { scope: remoteScope } : {}) },
@@ -118,9 +138,10 @@ export function Button({
         expanded={expanded}
         onPress={onPress}
         variant={variant}
-        disabled={disabled}
+        disabled={inert}
+        pending={pending}
         active={active}
-        shortcut={shortcut}
+        shortcut={shortcut ?? desktopShortcut}
         title={title}
         width={width}
         height={height}
@@ -131,7 +152,7 @@ export function Button({
     );
   }
 
-  const palette = resolveButtonColors(variant, active, disabled, colors);
+  const palette = resolveButtonColors(variant, active, inert, colors);
 
   return (
     <Box
@@ -139,20 +160,20 @@ export function Button({
       height={height ?? 1}
       flexDirection="row"
       backgroundColor={palette.bg}
-      cursor={disabled ? "default" : "pointer"}
+      cursor={inert ? "default" : "pointer"}
       onMouseDown={(event: { preventDefault?: () => void; stopPropagation?: () => void }) => {
         if (stopPropagation) {
           event.preventDefault?.();
           event.stopPropagation?.();
         }
-        if (!disabled) onPress?.();
+        if (!inert) onPress?.();
       }}
     >
       {children ?? <Text fg={palette.fg} attributes={active ? TextAttributes.BOLD : 0}>
         {compact ? displayLabel ?? label : ` ${displayLabel ?? label} `}
       </Text>}
       {shortcut && (
-        <Text fg={disabled ? colors.textMuted : colors.textDim}>
+        <Text fg={inert ? colors.textMuted : colors.textDim}>
           {` ${shortcut}`}
         </Text>
       )}

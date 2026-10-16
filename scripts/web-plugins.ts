@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "fs";
-import { join, relative } from "path";
+import { basename, join, relative } from "path";
 
 import { bundleExternalPlugin } from "../src/plugins/bundle";
 import { installPluginHostModules } from "../src/plugins/host-modules";
@@ -51,7 +51,7 @@ function pluginPackageDir(packageName: string): string {
   return dir;
 }
 
-async function readCompiledPlugin(outputPath: string, packageName: string): Promise<GloomPlugin> {
+async function readCompiledPlugin(outputPath: string, packageName: string, requireWeb = true): Promise<GloomPlugin> {
   let mod: unknown;
   try {
     mod = await import(outputPath);
@@ -65,7 +65,7 @@ async function readCompiledPlugin(outputPath: string, packageName: string): Prom
   if (!plugin) {
     throw new Error(`${packageName} does not export a valid GloomPlugin.`);
   }
-  if (!pluginSupportsTarget(plugin, "web")) {
+  if (requireWeb && !pluginSupportsTarget(plugin, "web")) {
     throw new Error(
       `${packageName} does not declare the "web" target, so it cannot ship in the web build. `
         + "Remove it from WEB_BUNDLED_PLUGIN_PACKAGES.",
@@ -122,24 +122,48 @@ function readManifest(dir: string, packageName: string): unknown {
  *
  * The per-package directory keeps the entry name the plugin chose, so nothing
  * here has to guess whether it compiled `index.tsx` or something else.
+ * `minify: false` keeps the components' names for the UI audit.
  */
-export async function compileWebBundledPlugins(outDir: string): Promise<CompiledWebPlugin[]> {
+export async function compileWebBundledPlugins(outDir: string, { minify = true }: { minify?: boolean } = {}): Promise<CompiledWebPlugin[]> {
   await installPluginHostModules();
 
   const compiled: CompiledWebPlugin[] = [];
   for (const packageName of WEB_BUNDLED_PLUGIN_PACKAGES) {
-    const dir = pluginPackageDir(packageName);
-    const result = await bundleExternalPlugin(dir, join(outDir, packageName), {
-      minify: true,
-      define: { "process.env.NODE_ENV": '"production"' },
-    });
-    const plugin = await readCompiledPlugin(result.outputPath, packageName);
-    compiled.push({
-      packageName,
-      plugin,
-      hosts: mergeManifestHosts(packageName, plugin, readManifest(dir, packageName)),
-      file: relative(outDir, result.outputPath).replaceAll("\\", "/"),
-    });
+    compiled.push(await compileOne(pluginPackageDir(packageName), outDir, packageName, minify, true));
   }
   return compiled;
+}
+
+/**
+ * Compiles plugins checked out elsewhere (the registry's, for the UI audit) the
+ * same way, without holding them to the web target: the audit draws every
+ * plugin's panes, and one that cannot run in a browser shows that. One that
+ * does not compile is left out with a warning.
+ */
+export async function compileExtraWebPlugins(outDir: string, dirs: readonly string[], { minify = true }: { minify?: boolean } = {}): Promise<CompiledWebPlugin[]> {
+  await installPluginHostModules();
+  const compiled: CompiledWebPlugin[] = [];
+  for (const dir of dirs) {
+    try {
+      compiled.push(await compileOne(dir, outDir, basename(dir), minify, false));
+    } catch (error) {
+      console.warn(`Left out ${basename(dir)}: ${error instanceof Error ? error.message.split("\n")[0] : error}`);
+    }
+  }
+  return compiled;
+}
+
+async function compileOne(dir: string, outDir: string, packageName: string, minify: boolean, requireWeb: boolean): Promise<CompiledWebPlugin> {
+  const result = await bundleExternalPlugin(dir, join(outDir, packageName), {
+    minify,
+    define: { "process.env.NODE_ENV": '"production"' },
+  });
+  const plugin = await readCompiledPlugin(result.outputPath, packageName, requireWeb);
+  return {
+    packageName,
+    plugin,
+    // Downstream: a web-bundled plugin's manifest is checked and its hosts proxied; the audit's extras only draw.
+    hosts: requireWeb ? mergeManifestHosts(packageName, plugin, readManifest(dir, packageName)) : [...(plugin.hosts ?? [])],
+    file: relative(outDir, result.outputPath).replaceAll("\\", "/"),
+  };
 }

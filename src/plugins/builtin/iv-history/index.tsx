@@ -1,4 +1,6 @@
+import { isOnPortfolio } from "../../../shares/pane-image";
 import type { PluginModule } from "../plugin-module";
+import { IV_SERIES } from "./series";
 import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
 import { ivHistoryHeadless, ivScreenHeadless } from "./headless";
 import { IvHistoryPane } from "./pane";
@@ -6,6 +8,7 @@ import { IvScreenPane, VCA_SCOPE_OPTIONS } from "./screen-pane";
 
 
 export const ivHistoryModule: PluginModule = {
+  series: IV_SERIES,
   panes: [{
     id: "iv-history", name: "Implied Volatility History", icon: "V", component: IvHistoryPane,
     defaultPosition: "right", tickerFollower: true, defaultMode: "floating", defaultFloatingSize: { width: 118, height: 36 },
@@ -18,6 +21,8 @@ export const ivHistoryModule: PluginModule = {
     id: "iv-screen", name: "Volatility Rich/Cheap", icon: "V", component: IvScreenPane,
     defaultPosition: "right", defaultMode: "floating", defaultFloatingSize: { width: 96, height: 32 },
     tableExport: true, headless: ivScreenHeadless,
+    // Linked to a portfolio, it lists what the person holds.
+    personalData: (context) => (context.settings.scope === "collection" && isOnPortfolio(context) ? "holdings" : null),
     settings: { title: "Volatility Rich/Cheap", fields: [
       { key: "scope", label: "Universe", type: "select", options: [...VCA_SCOPE_OPTIONS] },
       { key: "symbols", label: "Custom symbols", type: "text", placeholder: "AAPL, MSFT, SPY" },
@@ -32,7 +37,9 @@ export const ivHistoryModule: PluginModule = {
     {
       id: "iv-screen-pane", paneId: "iv-screen", label: "Volatility Rich/Cheap",
       description: "IV rank, percentile, one-year IV, term slope, skew and IV/HV across a list, ranked rich to cheap.",
-      keywords: ["vca", "rich", "cheap", "iv rank", "implied volatility", "screen"],
+      // Where a put seller finds rich premium; OSA owns the exact put-selling phrases and ranks first on them.
+      keywords: ["vca", "rich", "cheap", "iv rank", "implied volatility", "screen", "cash-secured puts", "selling puts", "short-put candidates",
+        "csp candidates", "wheel candidates"],
       shortcut: { prefix: "VCA", argKind: "ticker-list" as const, argOptional: true }, headless: ivScreenHeadless,
       createInstance: (_context, options) => ({
         title: "VCA", placement: "floating" as const,

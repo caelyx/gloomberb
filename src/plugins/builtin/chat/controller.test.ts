@@ -3,6 +3,7 @@ import {
   apiClient,
   type ChatAttachment,
   type ChatChannel,
+  type ChatChannelState,
   type ChatMessage,
   type ChatNotification,
   type ChatStateResponse,
@@ -41,13 +42,18 @@ const originalGetSession = apiClient.getSession.bind(apiClient);
 const originalGetMessages = apiClient.getMessages.bind(apiClient);
 const originalGetChannels = apiClient.getChannels.bind(apiClient);
 const originalGetChatPresence = apiClient.getChatPresence.bind(apiClient);
+const originalGetChatMentionCandidates = apiClient.getChatMentionCandidates;
 const originalGetChatState = apiClient.getChatState.bind(apiClient);
 const originalGetAccountProfile = apiClient.getAccountProfile.bind(apiClient);
 const originalUpdateChatChannelState = apiClient.updateChatChannelState.bind(apiClient);
 const originalMarkChatNotificationsDelivered = apiClient.markChatNotificationsDelivered.bind(apiClient);
 const originalSubscribeChatNotifications = apiClient.subscribeChatNotifications.bind(apiClient);
+const originalSubscribeChatChannelState = apiClient.subscribeChatChannelState.bind(apiClient);
+const originalGetUnseenChatNotificationIds = apiClient.getUnseenChatNotificationIds.bind(apiClient);
 const originalSubscribeChatPresence = apiClient.subscribeChatPresence.bind(apiClient);
+const originalSubscribeSocketConnection = apiClient.subscribeSocketConnection;
 const originalEditMessage = apiClient.editMessage.bind(apiClient);
+const originalSendMessage = apiClient.sendMessage.bind(apiClient);
 
 const SERVER_CHAT_CHANNELS: ChatChannel[] = [
   { id: "everyone", name: "everyone", created_at: "2026-03-26T12:10:05.684Z" },
@@ -59,6 +65,21 @@ const SERVER_CHAT_CHANNELS: ChatChannel[] = [
 async function flushMicrotasks() {
   await Promise.resolve();
   await Promise.resolve();
+}
+
+/**
+ * A banner in the background waits a moment and asks the server first
+ * (GLO-788); tests run that wait at zero and let it finish.
+ */
+function withoutBackgroundDelay(controller: ChatController): ChatController {
+  (controller as any).alerts.backgroundDelayMs = 0;
+  return controller;
+}
+
+async function settleBackgroundAlerts() {
+  await new Promise((resolve) => setTimeout(resolve, 1));
+  await flushMicrotasks();
+  await flushMicrotasks();
 }
 
 function recentChatTimestamp(offsetMs = 60_000) {
@@ -97,6 +118,7 @@ class TrackingPersistence extends MemoryPersistence {
 
 beforeEach(() => {
   apiClient.getChatPresence = async () => ({ onlineCount: 0 });
+  apiClient.getChatMentionCandidates = async () => { throw new Error("Fixture has no member endpoint"); };
   apiClient.getChatState = async () => ({
     channels: SERVER_CHAT_CHANNELS,
     onlineCount: 0,
@@ -116,6 +138,8 @@ beforeEach(() => {
   });
   apiClient.markChatNotificationsDelivered = async () => ({ delivered: 1 });
   apiClient.subscribeChatNotifications = () => () => {};
+  apiClient.subscribeChatChannelState = () => () => {};
+  apiClient.getUnseenChatNotificationIds = async (ids) => ids;
   apiClient.subscribeChatPresence = () => () => {};
 });
 
@@ -131,13 +155,18 @@ afterEach(() => {
   apiClient.getMessages = originalGetMessages;
   apiClient.getChannels = originalGetChannels;
   apiClient.getChatPresence = originalGetChatPresence;
+  apiClient.getChatMentionCandidates = originalGetChatMentionCandidates;
   apiClient.getChatState = originalGetChatState;
   apiClient.getAccountProfile = originalGetAccountProfile;
   apiClient.updateChatChannelState = originalUpdateChatChannelState;
   apiClient.markChatNotificationsDelivered = originalMarkChatNotificationsDelivered;
   apiClient.subscribeChatNotifications = originalSubscribeChatNotifications;
+  apiClient.subscribeChatChannelState = originalSubscribeChatChannelState;
+  apiClient.getUnseenChatNotificationIds = originalGetUnseenChatNotificationIds;
   apiClient.subscribeChatPresence = originalSubscribeChatPresence;
+  apiClient.subscribeSocketConnection = originalSubscribeSocketConnection;
   apiClient.editMessage = originalEditMessage;
+  apiClient.sendMessage = originalSendMessage;
 });
 
 describe("ChatController", () => {
@@ -1053,6 +1082,137 @@ describe("ChatController", () => {
     expect(calls[1]?.opts?.after).toBe("m2");
   });
 
+  test("a page read before the session was restored is read again as the account, with its own reactions", async () => {
+    const persistence = new MemoryPersistence();
+    const controller = createController();
+    const page = (me: boolean) => [chatMessage({
+      id: "m1",
+      content: "rates",
+      createdAt: "2026-03-28T00:00:00.000Z",
+      user: { id: "u2", username: "bob", displayName: "Bob" },
+      reactions: [{ emoji: "👍", count: 1, me, users: [] }],
+    })];
+    const calls: Array<string | undefined> = [];
+    let signedIn = false;
+    apiClient.getMessages = async (_channelId, opts) => {
+      calls.push(opts?.after);
+      return opts?.after ? [] : page(signedIn);
+    };
+
+    // The pane mounted and read the channel before the plugin restored the session.
+    await controller.refreshMessages();
+    expect(controller.getSnapshot().messages[0]?.reactions?.[0]?.me).toBe(false);
+
+    persistSession(persistence, { emailVerified: true });
+    controller.attachPersistence(persistence);
+    signedIn = true;
+    await controller.refreshMessages();
+    await controller.refreshMessages();
+
+    expect(calls).toEqual([undefined, undefined, "m1"]);
+    expect(controller.getSnapshot().messages[0]?.reactions?.[0]?.me).toBe(true);
+  });
+
+  describe("reactions made while a channel was not read live", () => {
+    let thumbs = 1;
+    let calls: Array<string | undefined> = [];
+    const page = (channelId: string) => [chatMessage({
+      id: "m1",
+      channelId,
+      content: "a generic fixture message",
+      createdAt: "2026-03-28T00:00:00.000Z",
+      user: { id: "u2", username: "bob", displayName: "Bob" },
+      reactions: [{ emoji: "👍", count: thumbs, me: false, users: [] }],
+    })];
+    const thumbsHeld = (controller: ChatController, channelId: string) => (
+      controller.getSnapshot(channelId).messages[0]?.reactions?.[0]?.count
+    );
+
+    beforeEach(() => {
+      thumbs = 1;
+      calls = [];
+      apiClient.connectChannel = () => ({
+        send: async () => {
+          throw new Error("not implemented");
+        },
+        close: () => {},
+      });
+    });
+
+    test("a channel read live again reads its latest page in full", async () => {
+      const persistence = new MemoryPersistence();
+      const controller = createController();
+      apiClient.getMessages = async (channelId, opts) => {
+        // The default channel stays read live throughout.
+        if (channelId === "options") calls.push(opts?.after);
+        return opts?.after ? [] : page(channelId);
+      };
+      persistSession(persistence, { emailVerified: true });
+      controller.attachPersistence(persistence);
+
+      const detach = controller.attachChannelView("options");
+      controller.ensureConnection("options");
+      await controller.refreshChannelMessages("options");
+      detach();
+      (controller as any).ensureOpenChannelConnections();
+
+      // Reacted to while another channel was open: newer messages alone miss it.
+      thumbs = 2;
+      await controller.refreshChannelMessages("options");
+      expect(thumbsHeld(controller, "options")).toBe(1);
+
+      controller.attachChannelView("options");
+      controller.ensureConnection("options");
+      await controller.refreshChannelMessages("options");
+
+      expect(calls).toEqual([undefined, "m1", undefined]);
+      expect(thumbsHeld(controller, "options")).toBe(2);
+    });
+
+    test("after the socket comes back, a channel read live reads its latest page in full, after a catch-up already out", async () => {
+      const persistence = new MemoryPersistence();
+      const controller = createController();
+      const catchUp = Promise.withResolvers<ChatMessage[]>();
+      let holdCatchUp = false;
+      let socketEvent: ((event: "ready" | "closed") => void) | null = null;
+      apiClient.subscribeSocketConnection = (listener) => {
+        socketEvent = listener;
+        return () => {
+          socketEvent = null;
+        };
+      };
+      apiClient.getMessages = async (channelId, opts) => {
+        calls.push(opts?.after);
+        if (opts?.after) return holdCatchUp ? catchUp.promise : [];
+        return page(channelId);
+      };
+      persistSession(persistence, { emailVerified: true });
+      controller.attachPersistence(persistence);
+      (controller as any).realtime.ensureRealtimeSubscriptions();
+      controller.ensureConnection();
+      await controller.refreshMessages();
+
+      // The first hello is not a comeback.
+      socketEvent!("ready");
+      await flushMicrotasks();
+      expect(calls).toEqual([undefined]);
+
+      holdCatchUp = true;
+      const catchingUp = controller.refreshMessages();
+      socketEvent!("closed");
+      thumbs = 2;
+      socketEvent!("ready");
+      catchUp.resolve([]);
+      await catchingUp;
+      for (let attempt = 0; attempt < 20 && thumbsHeld(controller, "everyone") !== 2; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+
+      expect(calls).toEqual([undefined, "m1", undefined]);
+      expect(thumbsHeld(controller, "everyone")).toBe(2);
+    });
+  });
+
   test("shows a pending message immediately and replaces it when the send succeeds", async () => {
     const persistence = new MemoryPersistence();
     const controller = createController();
@@ -1365,6 +1525,46 @@ describe("ChatController", () => {
     expect(controller.getSnapshot().messages).toEqual([stored]);
   });
 
+  test("posts a shared pane as its own message, leaving the channel's draft and images alone", async () => {
+    const persistence = new MemoryPersistence();
+    const controller = createController();
+    persistSession(persistence, { emailVerified: true });
+    controller.attachPersistence(persistence);
+    controller.setNotifier(() => {});
+    controller.setChannelDraft("everyone", "half written");
+
+    const uploaded: string[] = [];
+    controller.uploadAttachment = async (_channelId, upload) => {
+      uploaded.push(upload.name);
+      return { id: `img_${uploaded.length}`, mime: upload.type, width: 564, height: 600, size: 4, url: `https://api.example/img_${uploaded.length}` };
+    };
+    const sends: Array<{ channelId: string; content: string; attachmentIds?: string[] }> = [];
+    apiClient.sendMessage = async (channelId, content, _replyToId, clientMessageId, attachmentIds) => {
+      sends.push({ channelId, content, attachmentIds });
+      if (sends.length === 1) throw new Error("server offline");
+      return chatMessage({ id: "m7", content, createdAt: new Date().toISOString(), clientMessageId, attachments: [] });
+    };
+    const picture = { name: "portfolio-list.png", type: "image/png", data: new Uint8Array(4), previewUrl: "data:image/png;base64,AAAA" };
+
+    // A send that fails stays in the channel to retry, and the share says why.
+    await expect(controller.postImage("everyone", picture, " up 3% ")).rejects.toThrow("server offline");
+    expect(controller.getSnapshot().messages.at(-1)).toMatchObject({
+      content: "up 3%",
+      clientStatus: "failed",
+      attachments: [{ id: "img_1", url: "data:image/png;base64,AAAA" }],
+    });
+
+    const message = await controller.postImage("everyone", picture, "");
+    expect(message.id).toBe("m7");
+    expect(sends.map(({ content, attachmentIds }) => ({ content, attachmentIds }))).toEqual([
+      { content: "up 3%", attachmentIds: ["img_1"] },
+      { content: "", attachmentIds: ["img_2"] },
+    ]);
+    expect(controller.getSnapshot().messages.map((entry) => entry.id)).toContain("m7");
+    expect(controller.getSnapshot().draft).toBe("half written");
+    expect(controller.getSnapshot().draftAttachments).toEqual([]);
+  });
+
   test("holds a send while images upload, takes four, and reports the server's refusal on the image", async () => {
     const persistence = new MemoryPersistence();
     const controller = createController();
@@ -1481,9 +1681,10 @@ describe("ChatController", () => {
 
   test("delivers background notifications while the focused chat stays unread", async () => {
     const persistence = new MemoryPersistence();
-    const controller = createController();
+    const controller = withoutBackgroundDelay(createController());
     const notifications: AppNotificationRequest[] = [];
     const deliveredIds: string[][] = [];
+    const seenFlags: Array<boolean | undefined> = [];
 
     persistSession(persistence, { emailVerified: true });
 
@@ -1491,8 +1692,9 @@ describe("ChatController", () => {
       notifications.push(notification);
       return { toastVisible: false, desktopRequested: true };
     });
-    apiClient.markChatNotificationsDelivered = async (ids) => {
+    apiClient.markChatNotificationsDelivered = async (ids, options) => {
       deliveredIds.push(ids);
+      seenFlags.push(options?.seen);
       return { delivered: ids.length };
     };
     controller.attachPersistence(persistence);
@@ -1500,6 +1702,8 @@ describe("ChatController", () => {
     controller.setAppActive(false);
 
     (controller as any).handleChatNotification(mentionNotification());
+    expect(notifications).toEqual([]);
+    await settleBackgroundAlerts();
 
     expect(notifications).toEqual([{
       title: "#everyone",
@@ -1509,6 +1713,8 @@ describe("ChatController", () => {
     }]);
     expect(controller.getSnapshot().unreadMentionCount).toBe(1);
     expect(deliveredIds).toEqual([["n1"]]);
+    // A banner on a computer nobody may be at: the phone push still goes.
+    expect(seenFlags).toEqual([false]);
 
     controller.setAppActive(true);
     await flushMicrotasks();
@@ -1517,9 +1723,9 @@ describe("ChatController", () => {
     detachView();
   });
 
-  test("keeps undeliverable background notifications pending for email fallback", () => {
+  test("keeps undeliverable background notifications pending for email fallback", async () => {
     const persistence = new MemoryPersistence();
-    const controller = createController();
+    const controller = withoutBackgroundDelay(createController());
     const deliveredIds: string[][] = [];
     let desktopAvailable = false;
     let presentationCount = 0;
@@ -1538,15 +1744,132 @@ describe("ChatController", () => {
 
     const notification = mentionNotification({ type: "reply" });
     (controller as any).handleChatNotification(notification);
+    await settleBackgroundAlerts();
 
     expect(presentationCount).toBe(1);
     expect(deliveredIds).toEqual([]);
 
     desktopAvailable = true;
     (controller as any).handleChatNotification({ ...notification, id: "n2" });
+    await settleBackgroundAlerts();
 
     expect(presentationCount).toBe(2);
     expect(deliveredIds).toEqual([["n2"]]);
+  });
+
+  test("holds a background banner and drops it when the message was read on another device meanwhile", async () => {
+    const persistence = new MemoryPersistence();
+    const controller = withoutBackgroundDelay(createController());
+    let presentationCount = 0;
+    const deliveredIds: string[][] = [];
+    const asked: string[][] = [];
+
+    persistSession(persistence, { emailVerified: true });
+    controller.setNotifier(() => {
+      presentationCount += 1;
+      return { toastVisible: false, desktopRequested: true };
+    });
+    apiClient.markChatNotificationsDelivered = async (ids) => {
+      deliveredIds.push(ids);
+      return { delivered: ids.length };
+    };
+    apiClient.getUnseenChatNotificationIds = async (ids) => {
+      asked.push(ids);
+      return [];
+    };
+    controller.attachPersistence(persistence);
+    controller.setAppActive(false);
+
+    (controller as any).handleChatNotification(mentionNotification());
+    await settleBackgroundAlerts();
+    // The same notification again, as a reconnect hands it back.
+    (controller as any).handleChatNotification(mentionNotification());
+    await settleBackgroundAlerts();
+
+    expect(asked).toEqual([["n1"]]);
+    expect(presentationCount).toBe(0);
+    expect(deliveredIds).toEqual([["n1"]]);
+  });
+
+  test("still raises a background banner when the server cannot say whether it was seen", async () => {
+    const persistence = new MemoryPersistence();
+    const controller = withoutBackgroundDelay(createController());
+    let presentationCount = 0;
+
+    persistSession(persistence, { emailVerified: true });
+    controller.setNotifier(() => {
+      presentationCount += 1;
+      return { toastVisible: false, desktopRequested: true };
+    });
+    apiClient.getUnseenChatNotificationIds = async () => {
+      throw new ApiRequestError("Not found", 404);
+    };
+    controller.attachPersistence(persistence);
+    controller.setAppActive(false);
+
+    (controller as any).handleChatNotification(mentionNotification());
+    await settleBackgroundAlerts();
+
+    expect(presentationCount).toBe(1);
+  });
+
+  test("a popped-out window leaves background banners to the main window", async () => {
+    const persistence = new MemoryPersistence();
+    const controller = withoutBackgroundDelay(createController());
+    const notifications: AppNotificationRequest[] = [];
+    const deliveredIds: string[][] = [];
+
+    persistSession(persistence, { emailVerified: true });
+    controller.setRaisesBackgroundAlerts(false);
+    controller.setNotifier((notification) => {
+      notifications.push(notification);
+      return { toastVisible: true, desktopRequested: false };
+    });
+    apiClient.markChatNotificationsDelivered = async (ids) => {
+      deliveredIds.push(ids);
+      return { delivered: ids.length };
+    };
+    controller.attachPersistence(persistence);
+    controller.setAppActive(false);
+
+    (controller as any).handleChatNotification(mentionNotification());
+    await settleBackgroundAlerts();
+    expect(notifications).toEqual([]);
+    expect(deliveredIds).toEqual([]);
+
+    // In front of the reader, it still shows its own toast.
+    controller.setAppActive(true);
+    (controller as any).handleChatNotification(mentionNotification({ id: "n2", messageId: "m2" }));
+    expect(notifications).toHaveLength(1);
+    expect(deliveredIds).toEqual([["n2"]]);
+  });
+
+  test("never raises a notification for a message already read here, when a reconnect hands it back", () => {
+    const persistence = new MemoryPersistence();
+    const controller = createController();
+    const notifications: AppNotificationRequest[] = [];
+    const delivered: Array<{ ids: string[]; seen?: boolean }> = [];
+
+    persistSession(persistence, { emailVerified: true });
+    controller.setNotifier((notification) => {
+      notifications.push(notification);
+      return { toastVisible: true, desktopRequested: false };
+    });
+    apiClient.markChatNotificationsDelivered = async (ids, options) => {
+      delivered.push({ ids, seen: options?.seen });
+      return { delivered: ids.length };
+    };
+    controller.attachPersistence(persistence);
+    (controller as any).mergeMessages([
+      chatMessage({ id: "m1", content: "hey @ada", createdAt: "2026-03-28T00:00:00.000Z", user: { id: "u2", username: "bob", displayName: "Bob" } }),
+      chatMessage({ id: "m2", content: "you there?", createdAt: "2026-03-28T00:01:00.000Z", user: { id: "u2", username: "bob", displayName: "Bob" } }),
+    ]);
+    controller.attachView(true)();
+
+    (controller as any).handleChatNotification(mentionNotification(), { countUnread: false });
+
+    expect(notifications).toEqual([]);
+    expect(delivered).toEqual([{ ids: ["n1"], seen: true }]);
   });
 
   test("marks mentions viewed when a chat view opens", () => {
@@ -1646,6 +1969,11 @@ describe("ChatController", () => {
     const controller = createController();
     const notifications: AppNotificationRequest[] = [];
     const deliveredIds: string[][] = [];
+    let channelStateListener: ((state: ChatChannelState) => void) | undefined;
+    apiClient.subscribeChatChannelState = (listener) => {
+      channelStateListener = listener;
+      return () => {};
+    };
 
     persistSession(persistence, { emailVerified: true });
     apiClient.getSession = async () => ({
@@ -1715,6 +2043,57 @@ describe("ChatController", () => {
       desktop: "when-inactive",
     }]);
     expect(deliveredIds).toEqual([["n1"]]);
+
+    // Read on another device: the count (and the Dock badge) clears here
+    // without waiting for the next refocus.
+    channelStateListener?.({
+      channelId: "options",
+      notificationsEnabled: true,
+      lastReadMessageId: "m2",
+      unreadCount: 0,
+    });
+    expect(controller.getSnapshot("options").channelStates.find((entry) => entry.channelId === "options")).toMatchObject({
+      unreadCount: 0,
+      lastReadMessageId: "m2",
+    });
+  });
+
+  test("mark all read reads each unread channel through its newest message, loading one not on this device first", async () => {
+    const persistence = new MemoryPersistence();
+    const controller = createController();
+    const readThrough: Array<[string, string | undefined]> = [];
+    persistSession(persistence, { emailVerified: true });
+    apiClient.updateChatChannelState = async (channelId, body) => {
+      readThrough.push([channelId, body.readThroughMessageId]);
+      return { channelId, notificationsEnabled: false, lastReadMessageId: body.readThroughMessageId ?? null, unreadCount: 0 };
+    };
+    const bob = { id: "u2", username: "bob", displayName: "Bob" };
+    apiClient.getMessages = async (channelId) => (channelId === "options"
+      ? [
+        chatMessage({ id: "o1", channelId: "options", content: "0DTE flow into the close", createdAt: "2026-03-28T00:01:00.000Z", user: bob }),
+        chatMessage({ id: "o2", channelId: "options", content: "SPX 5800 calls again", createdAt: "2026-03-28T00:02:00.000Z", user: bob }),
+      ]
+      : []);
+    controller.attachPersistence(persistence);
+    const everyone = (controller as any).ensureChannelState("everyone");
+    everyone.messages = [
+      chatMessage({ id: "e1", content: "the marker", createdAt: "2026-03-28T00:00:00.000Z", user: bob }),
+      chatMessage({ id: "e2", content: "@ada did you see CPI?", createdAt: "2026-03-28T00:03:00.000Z", user: bob }),
+    ];
+    everyone.lastViewedMessageId = "e1";
+    everyone.unreadCount = 1;
+    const options = (controller as any).ensureChannelState("options");
+    options.unreadCount = 2;
+    const help = (controller as any).ensureChannelState("help");
+    help.messages = [chatMessage({ id: "h1", channelId: "help", content: "read already", createdAt: "2026-03-28T00:00:00.000Z" })];
+    help.lastViewedMessageId = "h1";
+
+    controller.markAllChannelsRead();
+    await flushMicrotasks();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(readThrough).toEqual([["everyone", "e2"], ["options", "o2"]]);
+    expect(controller.getSnapshot().channelStates.filter((state) => state.unreadCount > 0)).toEqual([]);
   });
 
   test("toggles channel notifications optimistically and keeps the channel connected", async () => {
@@ -2007,5 +2386,49 @@ describe("ChatController", () => {
     expect(persistence.getState<{ lastCursor: string }>("channel:everyone", { schemaVersion: 1 })).toMatchObject({
       lastCursor: "m4",
     });
+  });
+
+  test("dates DMs from the server's last message and moves one in every open view when a message arrives", async () => {
+    const persistence = new MemoryPersistence();
+    const controller = createController();
+    const dms: ChatChannel[] = [
+      { id: "dm:alice", name: "alice", kind: "direct", created_at: "2026-03-01T00:00:00.000Z", lastMessageAt: "2026-04-01T10:00:00.000Z" },
+      { id: "dm:bob", name: "bob", kind: "direct", created_at: "2026-03-02T00:00:00.000Z", lastMessageAt: "2026-04-02T10:00:00.000Z" },
+      { id: "dm:carol", name: "carol", kind: "direct", created_at: "2026-03-03T00:00:00.000Z", lastMessageAt: null },
+    ];
+    apiClient.getChatState = async () => ({
+      channels: [...SERVER_CHAT_CHANNELS, ...dms],
+      onlineCount: 0,
+      channelStates: [],
+      notifications: [],
+    });
+    persistSession(persistence, { emailVerified: true });
+    controller.attachPersistence(persistence);
+    await controller.refreshChatState();
+
+    const before = controller.getSnapshot("options").conversationActivity;
+    // An empty DM counts from when it was started.
+    expect(before).toEqual({
+      "dm:alice": Date.parse("2026-04-01T10:00:00.000Z"),
+      "dm:bob": Date.parse("2026-04-02T10:00:00.000Z"),
+      "dm:carol": Date.parse("2026-03-03T00:00:00.000Z"),
+    });
+    expect(controller.getSnapshot("options").conversationActivity).toBe(before);
+
+    // A pane reading #options, not the DM, still hears that the DM moved.
+    const seen: Array<Record<string, number>> = [];
+    const unsubscribe = controller.subscribe("options", (snapshot) => { seen.push(snapshot.conversationActivity); });
+    seen.length = 0;
+    (controller as any).mergeMessages("dm:carol", [chatMessage({
+      id: "m1",
+      channelId: "dm:carol",
+      content: "hi",
+      createdAt: "2026-04-05T09:00:00.000Z",
+      user: { id: "u3", username: "carol", displayName: "Carol" },
+    })]);
+    unsubscribe();
+
+    expect(seen.at(-1)).toEqual({ ...before, "dm:carol": Date.parse("2026-04-05T09:00:00.000Z") });
+    expect(controller.getSnapshot("options").conversationActivity).toBe(seen.at(-1)!);
   });
 });

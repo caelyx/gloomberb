@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { DataProvider } from "../../../types/data-provider";
 import type { PricePoint } from "../../../types/financials";
 import type { BoardQuoteMap } from "../shared/use-quote-board";
-import type { FuturesContract } from "./contracts";
+import type { FuturesContract } from "../../../market-data/futures-board";
 import {
   frontContractCandidates,
   frontContractReturns,
@@ -54,8 +54,9 @@ function loadHistory(provider: DataProvider, symbol: string): Promise<void> {
 
 /**
  * 1W, 1M and YTD returns for each board row, measured on the contract its
- * quote prices rather than on the continuous alias. Histories load only while
- * `enabled` (a returns column is on screen and the pane can be seen).
+ * quote prices rather than on the continuous alias. Histories load only for
+ * `contracts`, the rows the board lists, and only while `enabled` (a returns
+ * column is on screen and the pane can be seen).
  */
 export function useFrontContractReturns(
   contracts: readonly FuturesContract[],

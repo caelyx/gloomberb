@@ -1,6 +1,6 @@
 import { apiClient } from "../../../api-client";
 import type { GloomPlugin } from "../../../types/plugin";
-import { teamStore } from "../cloud/team/store";
+import { teamStore } from "../../../team/store";
 import { notesCliCommand } from "./cli";
 import { exportNotesToDirectory, exportSourceLabel } from "./export";
 import { NotesFiles } from "./files";
@@ -81,6 +81,7 @@ export const notesPlugin: GloomPlugin = {
       id: "quick-notes",
       reportFreshness: { source: "Your notes", status: "not-a-feed", basis: "your notes" },
       name: "Notes",
+      personalData: "messages",
       icon: "N",
       component: QuickNotesPane,
       defaultPosition: "right",

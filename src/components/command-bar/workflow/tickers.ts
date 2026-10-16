@@ -2,14 +2,15 @@ import type { Dispatch } from "react";
 import type { AppAction, AppState } from "../../../state/app/context";
 import type { AppTickerRepositoryPort } from "../../../core/app-service-ports";
 import type { PluginRegistry } from "../../../plugins/registry";
-import { isManualPortfolio } from "../../../plugins/builtin/portfolio-list/mutations";
+import { isManualPortfolio } from "../../../portfolio/mutations";
 import type { DataProvider } from "../../../types/data-provider";
 import type { Portfolio, TickerRecord, Watchlist } from "../../../types/ticker";
 import { AmbiguousTickerError, resolveTickerSearch, upsertTickerFromSearchResult } from "../../../tickers/search";
 import { parseTickerListInput } from "../../../tickers/list";
 import { resolveTickerOpenTarget, type TickerOpenTarget } from "../../../tickers/open-target";
+import { settleTypedListingKey } from "../../../tickers/listing-venues";
 import { tickerHasListingSuffix } from "../../../sources/listing-symbols";
-import { parsePublicTickerKey, publicTickerKey } from "../../../utils/exchanges";
+import { isSharedExchangeCode, parsePublicTickerKey, publicTickerKey, typedExchangeCode } from "../../../utils/exchanges";
 import { captureAttentionAction } from "../../../telemetry/attention-counts";
 
 export interface SharedWorkflowDeps {
@@ -148,8 +149,16 @@ export async function resolveTickerInput(
   const state = deps.getState();
   let resolvedTicker;
   try {
-    const query = rawInput?.trim() || activeTicker || "";
-    if (options.preserveListingKey && (parsePublicTickerKey(query).exchange || tickerHasListingSuffix(query.toUpperCase()))) {
+    let query = rawInput?.trim() || activeTicker || "";
+    if (options.preserveListingKey) {
+      // 7203:TSE is the venue its symbol trades on among those TSE names, kept as 7203:JPX would be.
+      query = await settleTypedListingKey(query, {
+        store: { loadTicker: (key) => deps.tickerRepository.loadTicker(key), loadAllTickers: async () => [...state.tickers.values()] },
+        dataProvider: deps.dataProvider,
+      });
+    }
+    const namedVenue = !!parsePublicTickerKey(query).exchange && !isSharedExchangeCode(typedExchangeCode(query));
+    if (options.preserveListingKey && (namedVenue || tickerHasListingSuffix(query.toUpperCase()))) {
       // Commands and incoming layouts must preserve the same validated listing
       // key, including when the repository already stores a bare-symbol holding.
       const target = await resolveTickerOpenTarget({
@@ -197,14 +206,13 @@ export async function resolveTickerInputOrThrow(
   return resolved;
 }
 
-export async function applyCollectionMembershipChange(
+/** The ticker with the collection added to or removed from it; `changed` is false when it already was as asked. */
+export function withCollectionMembership(
   ticker: TickerRecord,
   kind: CollectionKind,
   action: CollectionMembershipAction,
   collectionId: string,
-  deps: SharedWorkflowDeps,
-): Promise<{ changed: boolean; ticker: TickerRecord }> {
-  const recordAttention = captureAttentionAction();
+): { changed: boolean; ticker: TickerRecord } {
   const field = kind === "watchlist" ? "watchlists" : "portfolios";
   const currentValues = ticker.metadata[field];
   const nextValues = action === "add"
@@ -215,19 +223,35 @@ export async function applyCollectionMembershipChange(
     return { changed: false, ticker };
   }
 
-  const nextTicker: TickerRecord = {
-    ...ticker,
-    metadata: {
-      ...ticker.metadata,
-      [field]: nextValues,
+  return {
+    changed: true,
+    ticker: {
+      ...ticker,
+      metadata: {
+        ...ticker.metadata,
+        [field]: nextValues,
+      },
     },
   };
-  await deps.tickerRepository.saveTicker(nextTicker);
-  deps.dispatch({ type: "UPDATE_TICKER", ticker: nextTicker });
+}
+
+export async function applyCollectionMembershipChange(
+  ticker: TickerRecord,
+  kind: CollectionKind,
+  action: CollectionMembershipAction,
+  collectionId: string,
+  deps: SharedWorkflowDeps,
+): Promise<{ changed: boolean; ticker: TickerRecord }> {
+  const recordAttention = captureAttentionAction();
+  const result = withCollectionMembership(ticker, kind, action, collectionId);
+  if (!result.changed) return result;
+
+  await deps.tickerRepository.saveTicker(result.ticker);
+  deps.dispatch({ type: "UPDATE_TICKER", ticker: result.ticker });
   if (kind === "watchlist" && action === "add") {
-    recordAttention(publicTickerKey(nextTicker.metadata.ticker, nextTicker.metadata.exchange), "watchlist_add");
+    recordAttention(publicTickerKey(result.ticker.metadata.ticker, result.ticker.metadata.exchange), "watchlist_add");
   }
-  return { changed: true, ticker: nextTicker };
+  return result;
 }
 
 export async function resolveTickerListInput(

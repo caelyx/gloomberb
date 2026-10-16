@@ -3,22 +3,34 @@ import { FINANCIAL_VINTAGE_NOTICE, SEC_EPS_BASIS_NOTICE } from "../../../utils/f
 import { graphRowsForFinancials, summarizeResolvedSeries } from "../../../time-series/reporting";
 import { priceHistoryIntegrityNotices, chartPriceHistoryIntegrityNotices } from "../../../time-series/market";
 import type { HeadlessPaneContext, HeadlessPaneDefinition, HeadlessPaneFreshness, HeadlessSeries, HeadlessSeriesResult } from "../../../types/headless";
-import type { CapabilitySeriesSource, ChartResolutionResult, ChartSeriesSpec, ChartSpec, ChartViewportSpec } from "../../../time-series/types";
+import type { CapabilitySeriesSource, ChartResolutionResult, ChartSeriesSource, ChartSeriesSpec, ChartSpec, ChartViewportSpec, ResolvedSeries } from "../../../time-series/types";
 import { resolveGeoChartSeries } from "../world-venue-map/geo-series";
 import { GEO_SERIES_CAPABILITY_ID } from "./series-expression";
 import { mergePriceHistoryWindows, priceHistoryAcquisitionIdentity, priceHistoryTailAcquisition, resolveChartSpecData } from "../../../time-series/resolve";
-import { intersectChartResolutionSupport, isIntradayResolution, normalizeChartResolutionSupport, type ManualChartResolution } from "../../../time-series/resolution";
-import { intradaySessionDates, loadIntradayWindow, resolveIntradayRequest, type IntradayRequest, type IntradayWindow, type LoadedIntradayWindow } from "./session-history";
+import {
+  getSupportMaxRange,
+  intersectChartResolutionSupport,
+  isIntradayResolution,
+  normalizeChartResolutionSupport,
+  type ManualChartResolution,
+} from "../../../time-series/resolution";
+import type { ChartResolution } from "../../../time-series/range";
+import { intradaySessionDates, intradaySessionTimeZone, loadIntradayWindow, resolveIntradayRequest, type IntradayRequest, type IntradayWindow, type LoadedIntradayWindow } from "./session-history";
 import { createSnapshotDataProvider, snapshotInstrumentKey, type SnapshotMarketData } from "../../../market-data/snapshot-provider";
 import type { InstrumentRef } from "../../../market-data/request-types";
 import type { HistorySession } from "../../../types/price-history";
 import type { TickerFinancials, PricePoint, Quote } from "../../../types/financials";
 import { chartQuoteOverrideKeyForTarget, getLiveChartQuoteTargets } from "../../../time-series/live-quotes";
 import { createChartSeriesResolver } from "../../../capabilities";
-import { parsePublicTickerKey, publicTickerKey, resolveExchangeTimeZone } from "../../../utils/exchanges";
+import { loadFuturesContractTerms, loadFuturesPriceUnit } from "../../../market-data/futures-contract";
+import { parsePublicTickerKey, publicTickerKey } from "../../../utils/exchanges";
 import { parseChartSpec } from "./chart-spec";
 import { paneSchemas } from "./headless-schema";
 import { barHistoryFreshness, REPORTED_DATA } from "../shared/report-freshness";
+import type { BarPeriodToDate } from "../../../market-data/market/bar-period";
+import { formingHistoryBar } from "../ticker-detail/data-panes/history-bars";
+import { inferSeriesFrequency } from "../../../series/csv";
+import { isDatasetChart } from "../../../time-series/spec";
 
 export interface ChartPaneModel extends HeadlessSeriesResult {
   /** The renderer consumes the full model; generic reports project series and metadata. */
@@ -122,6 +134,7 @@ export async function loadChartPaneModel(
       }
     },
     resolveCapabilitySeries: headlessCapabilityResolver(context),
+    loadFuturesPriceUnit: (symbol) => loadFuturesPriceUnit(symbol, (key) => loadFuturesContractTerms(key, context.apiClient)),
     loadFredSeries: async (request) => ({
       data: await context.apiClient.getCloudFredSeries(request.seriesId, {
         startDate: request.startDate,
@@ -209,18 +222,160 @@ export async function loadChartPaneModel(
   };
 }
 
+const DAY_MS = 24 * 60 * 60_000;
+const PERIOD_MONTHS = { monthly: 1, quarterly: 3, annual: 12 } as const;
+type Periodicity = keyof typeof PERIOD_MONTHS;
+
+/**
+ * The period a series of period dates publishes in, from the spacing of its
+ * dates, when its newest date starts one (FRED dates August's CPI 1 Aug).
+ */
+function seriesPeriodicity(dates: readonly Date[]): Periodicity | null {
+  const frequency = inferSeriesFrequency(dates.map((date) => ({ date, value: 0 })));
+  if (frequency !== "monthly" && frequency !== "quarterly" && frequency !== "annual") return null;
+  const newest = dates.reduce((latest, date) => (date > latest ? date : latest));
+  return newest.getUTCDate() === 1 && newest.getUTCMonth() % PERIOD_MONTHS[frequency] === 0 ? frequency : null;
+}
+
+/**
+ * An economic chart's dates: each series observes a period or a day, never an
+ * instant, so the chart is dated by the day of its newest observation, with
+ * the oldest series' newest when they end apart, and by the period when every
+ * series publishes in the same one: `Aug 2026 (monthly)`, not `Sat 1 Aug 2026
+ * 00:00 UTC`. Nothing for a chart with any other series.
+ */
+export function economicChartDates(series: readonly HeadlessSeries[], spec: Pick<ChartSpec, "series">): Pick<HeadlessPaneFreshness, "asOf" | "oldest" | "periodicity"> {
+  if (!spec.series.length || spec.series.some(({ source }) => source.kind !== "economic")) return {};
+  const ends: string[] = [];
+  const periods = new Set<Periodicity | null>();
+  for (const entry of series) {
+    const dates = entry.points.flatMap((point) => (point.value ?? point.close) == null ? [] : [new Date(point.date)]);
+    if (!dates.length) continue;
+    // A date at midnight UTC is a day; anything else is an observation time and keeps it.
+    if (dates.some((date) => !Number.isFinite(date.getTime()) || date.getTime() % DAY_MS !== 0)) return {};
+    ends.push(dates.reduce((latest, date) => (date > latest ? date : latest)).toISOString().slice(0, 10));
+    periods.add(seriesPeriodicity(dates));
+  }
+  if (!ends.length) return {};
+  ends.sort();
+  const [periodicity] = periods.size === 1 ? [...periods] : [null];
+  return {
+    asOf: ends.at(-1)!,
+    ...(ends[0] !== ends.at(-1) ? { oldest: ends[0]! } : {}),
+    ...(periodicity ? { periodicity } : {}),
+  };
+}
+
+/**
+ * Who a chart cites when each of its series names its own dataset (CBR's
+ * policy rates: `FRED series ECBDFR`); nothing, so Gloom Cloud, otherwise.
+ */
+function seriesAttribution(series: readonly HeadlessSeries[]): Pick<HeadlessPaneFreshness, "source" | "publisher"> {
+  const cited = series.map((entry) => (entry as HeadlessSeries & Pick<ResolvedSeries, "attribution">).attribution);
+  if (!cited.length || cited.some((attribution) => !attribution)) return {};
+  const publishers = [...new Set(cited.map((attribution) => attribution!.publisher))];
+  return {
+    source: [...new Set(cited.map((attribution) => attribution!.source))].join(", "),
+    ...(publishers.every(Boolean) ? { publisher: publishers.join(", ") } : {}),
+  };
+}
+
 /**
  * Price series are bar histories, stale once bars of the coarsest size stop
- * arriving; fundamentals, valuations and economic series are reported data.
+ * arriving; fundamentals, valuations and economic series are reported data,
+ * economic series dated by their periods (`economicChartDates`). A chart of
+ * capability series alone (CHOKE's vessel transits) is a dataset, dated by its
+ * newest observation and how far behind that is.
  */
-function chartFreshness(series: readonly HeadlessSeries[]): HeadlessPaneFreshness {
+function chartFreshness(series: readonly HeadlessSeries[], spec: ChartSpec): HeadlessPaneFreshness {
   const order = ["1wk", "1mo"];
   const resolutions = series.map((entry) => (entry as HeadlessSeries & { historyResolution?: string }).historyResolution);
-  if (!series.length || resolutions.some((resolution) => !resolution)) return { ...REPORTED_DATA, basis: "reported and published data" };
+  const dataset = isDatasetChart(spec);
+  if (!series.length || resolutions.some((resolution) => !resolution)) {
+    return { ...REPORTED_DATA, basis: "reported and published data", ...(dataset ? { dataset } : {}), ...economicChartDates(series, spec), ...seriesAttribution(series) };
+  }
   const coarsest = resolutions.reduce((worst, resolution) => (
     order.indexOf(resolution!) > order.indexOf(worst!) ? resolution : worst
   ), resolutions[0]);
-  return barHistoryFreshness(coarsest);
+  const forming = formingPriceBar(series);
+  // A history: its first bars are not stale data, so the line dates it by the bar still forming alone.
+  return { ...barHistoryFreshness(coarsest), ...(forming ? { periodToDate: forming, oldest: null } : {}) };
+}
+
+/**
+ * The first series whose newest weekly or monthly bar is a week or month that
+ * had not ended, as `history` and HP date it: the report is then dated by how
+ * far that bar runs (`month to date, through Fri 16 Oct 2026`), not by the
+ * first day of the period the bar is dated by.
+ */
+function formingPriceBar(series: readonly HeadlessSeries[]): BarPeriodToDate | null {
+  for (const entry of series as ReadonlyArray<HeadlessSeries & Partial<Pick<ResolvedSeries, "historyResolution" | "timeBasis" | "listing">>>) {
+    const last = entry.points.at(-1);
+    const time = last ? new Date(last.date).getTime() : Number.NaN;
+    if (!entry.historyResolution || !Number.isFinite(time)) continue;
+    const venue = entry.timeBasis?.exchange || entry.listing?.exchange || undefined;
+    const forming = formingHistoryBar(entry.historyResolution, new Date(time).toISOString().slice(0, 10), venue, Date.now());
+    if (forming) return forming;
+  }
+  return null;
+}
+
+/** What a chart series was asked as: a listing as typed (`USDZAR=X`, `SAN:EPA`), a FRED series by its ID. */
+function askedSymbol(source: ChartSeriesSource): string {
+  switch (source.kind) {
+    case "security": return publicTickerKey(source.instrument.symbol, source.instrument.exchange || undefined);
+    case "economic": return source.seriesId.toUpperCase();
+    case "capability": return `CAP:${source.capabilityId}:${source.seriesId}`;
+  }
+}
+
+/**
+ * The bars a market series was served in (`1mo`), else how often the series
+ * observes (`quarterly`), else how far apart its points are (a FRED series
+ * charts at its own frequency, `daily` for DEXSFUS).
+ */
+function servedInterval(series: Pick<ResolvedSeries, "historyResolution" | "nativeFrequency"> & Pick<HeadlessSeries, "points">): string | undefined {
+  if (series.historyResolution) return series.historyResolution;
+  if (series.nativeFrequency && series.nativeFrequency !== "auto") return series.nativeFrequency;
+  const spacing = inferSeriesFrequency(series.points.map((point) => ({ date: point.date, value: 0 })));
+  return spacing === "irregular" ? undefined : spacing;
+}
+
+/** A dropped resolution, as JSON's `metadata.resolution` states it. */
+export interface ChartResolutionDrop {
+  requested: ManualChartResolution;
+  returned: ManualChartResolution;
+  range: string;
+  reason: string;
+}
+
+/**
+ * A bar size asked for that the chart's price series did not come back in:
+ * what was asked, what was returned and why, so a report never hands back
+ * monthly bars for `--chartResolution 1d` without saying so. Null when every
+ * price series is in the bars asked for, or none was asked.
+ */
+export function chartResolutionDrop(
+  requested: ChartResolution,
+  viewport: Pick<ChartViewportSpec, "range" | "dateWindow">,
+  series: ReadonlyArray<Pick<ResolvedSeries, "historyResolution"> & { symbol?: string }>,
+  support: ChartResolutionResult["resolutionSupport"],
+): { drop: ChartResolutionDrop; warning: string } | null {
+  if (requested === "auto") return null;
+  const dropped = series.filter((entry) => entry.historyResolution && entry.historyResolution !== requested);
+  const returned = dropped[0]?.historyResolution;
+  if (!returned) return null;
+  const range = viewport.dateWindow ? "this window" : viewport.range;
+  const symbols = [...new Set(dropped.flatMap((entry) => entry.symbol ? [entry.symbol] : []))];
+  const maxRange = support?.length ? getSupportMaxRange(support, requested) : null;
+  const reason = !support?.length ? `the source returned ${returned} bars`
+    : maxRange == null ? `the source does not serve ${requested} bars`
+      : `${requested} bars go back ${maxRange} at most`;
+  const on = symbols.length > 0 ? ` on ${symbols.join(" and ")}` : "";
+  return {
+    drop: { requested, returned, range, reason },
+    warning: `${requested} is not available for ${range}${on} (${reason}); returning ${returned} bars.`,
+  };
 }
 
 export function chartHeadless(template: keyof typeof paneSchemas): HeadlessPaneDefinition<"series"> {
@@ -290,13 +445,30 @@ export function chartHeadless(template: keyof typeof paneSchemas): HeadlessPaneD
             target, symbol, exchange, points, bufferedPoints: data.priceHistory, start, end, session: data.priceHistorySession, sourceKey: data.priceHistorySourceKey,
             rangePreset: spec.viewport.range === "1W" ? "1W" : "1D",
             resolution: historyResolution, requestedSession: null,
-            sessionDates: intradaySessionDates(points, resolveExchangeTimeZone(exchange) ?? "UTC"),
+            sessionDates: intradaySessionDates(points, intradaySessionTimeZone(symbol, exchange)),
             unavailableReason: points.length ? null : model.chart.errors[0] ?? `No intraday price history is available for ${symbol} for the requested window.`,
           });
         }
       }
       model.snapshot.intradayHistories = intradayHistories;
-      model.freshness = chartFreshness(model.series);
+      // Exports name each series by what it was asked as and the bars or frequency it came back in.
+      const asked = new Map(parsed.series.map((series) => [series.id, askedSymbol(series.source)]));
+      model.series = model.series.map((series) => {
+        const symbol = asked.get(series.id);
+        const interval = servedInterval(series as HeadlessSeries & Pick<ResolvedSeries, "historyResolution" | "nativeFrequency">);
+        return { ...series, ...(symbol ? { symbol } : {}), ...(interval ? { interval } : {}) };
+      });
+      const dropped = chartResolutionDrop(
+        parsed.viewport.resolution,
+        model.spec.viewport,
+        (model.series as Array<HeadlessSeries & Pick<ResolvedSeries, "historyResolution"> & { derived?: boolean }>).filter((series) => !series.derived),
+        model.chart.resolutionSupport,
+      );
+      if (dropped) {
+        model.warnings = [...model.warnings ?? [], dropped.warning];
+        model.metadata = { ...model.metadata, resolution: dropped.drop };
+      }
+      model.freshness = chartFreshness(model.series, model.spec);
       const priceDomainFailures = intradayHistories.flatMap(({ symbol, exchange, priceDomainFailure }) =>
         priceDomainFailure ? [{ symbol, exchange, ...priceDomainFailure }] : []);
       if (priceDomainFailures.length) {

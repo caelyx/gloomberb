@@ -9,8 +9,6 @@ import { historyStatistics } from "../../../components/chart/curve/model";
 import type { MarketBoardRow } from "../../../components/market-board";
 import type { PricePoint } from "../../../types/financials";
 
-export const CDX_PANE_ID = "cdx-board";
-
 const YEAR_DAYS = 365;
 /** A level older than this is not the current market. */
 const STALE_DAYS = 5;
@@ -18,6 +16,14 @@ const STALE_DAYS = 5;
 /** The history the board draws, as dated closes. */
 function pointHistory(points: readonly CreditBoardPoint[]): PricePoint[] {
   return points.map((point) => ({ date: new Date(`${point.date}T00:00:00Z`), close: point.level }));
+}
+
+/**
+ * The units a quote's level and moves are in, as exports name them: a spread
+ * and its moves in bp; HY and EM quote in price, and move in points of it.
+ */
+export function quoteUnits(quote: CreditIndexQuote): { level: "bp" | "price"; move: "bp" | "pts" } {
+  return quote === "spread" ? { level: "bp", move: "bp" } : { level: "price", move: "pts" };
 }
 
 /** Spreads in bp with a decimal; prices as quoted, to the cent. */
@@ -90,8 +96,9 @@ export function formatContract(maturity: string | null): string {
 export interface CdxRow extends MarketBoardRow {
   index: CdxBoardIndex;
   year: YearStatistics;
-  /** The 1W move as shown. */
+  /** The 1W and 1M moves as shown. */
   week: number | null;
+  month: number | null;
 }
 
 export function cdxRows(indexes: readonly CdxBoardIndex[], asOf: string | null): CdxRow[] {
@@ -112,6 +119,7 @@ export function cdxRows(indexes: readonly CdxBoardIndex[], asOf: string | null):
       index,
       year,
       week: shown(index.quote, index.change1W),
+      month: shown(index.quote, index.change1M ?? null),
     };
   });
 }

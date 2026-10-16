@@ -387,7 +387,9 @@ describe("resolveChartSpecData", () => {
     expect(resolved.series[0]?.points[0]?.value).toBe(42);
   });
 
-  test("resolves capability coverage for each effective panned viewport and caches by structured bounds", async () => {
+  test("keeps a panned dataset loaded to its newest observation, so the view can go back to it", async () => {
+    // A daily series published days late, served only for the dates asked, as the map's series route does.
+    const newest = Date.parse("2026-02-26T00:00:00.000Z");
     const spec: ChartSpec = chartSpec({
       viewport: { range: "1M", resolution: "auto" },
       series: [chartSeries({
@@ -403,7 +405,10 @@ describe("resolveChartSpecData", () => {
       now: new Date("2026-03-01T00:00:00.000Z"),
       resolveCapabilitySeries: async (_source: any, viewport: ChartSpec["viewport"]) => {
         requested.push(viewport);
-        const date = new Date(viewport.dateWindow!.start);
+        const from = Date.parse(viewport.dateWindow!.start.slice(0, 10));
+        const to = Math.min(Date.parse(viewport.dateWindow!.end.slice(0, 10)), newest);
+        const points = [];
+        for (let time = from; time <= to; time += 86_400_000) points.push({ date: new Date(time), observedAt: new Date(time), value: 1 });
         return {
           id: "provider",
           label: "Provider",
@@ -417,22 +422,27 @@ describe("resolveChartSpecData", () => {
           axis: "left" as const,
           panelId: "main",
           interpolation: "none" as const,
-          points: [{ date, observedAt: date, value: 1 }],
+          points,
         };
       },
     };
-    const firstViewport = { start: new Date("2026-01-01T00:00:00.000Z"), end: new Date("2026-01-08T00:00:00.000Z") };
-    const secondViewport = { start: new Date("2026-02-01T00:00:00.000Z"), end: new Date("2026-02-08T00:00:00.000Z") };
+    const rangeWindow = { start: "2026-02-01T00:00:00.000Z", end: "2026-03-01T00:00:00.000Z" };
+    const olderViewport = { start: new Date("2026-01-01T00:00:00.000Z"), end: new Date("2026-01-08T12:00:00.000Z") };
+    const zoomedViewport = { start: new Date("2026-02-03T00:00:00.000Z"), end: new Date("2026-02-10T12:00:00.000Z") };
 
-    await resolveChartSpecData(spec, sources, cache, { requestViewport: firstViewport });
-    const panned = await resolveChartSpecData(spec, sources, cache, { requestViewport: secondViewport });
-    await resolveChartSpecData(spec, sources, cache, { requestViewport: firstViewport });
+    const panned = await resolveChartSpecData(spec, sources, cache, { requestViewport: olderViewport });
+    const zoomed = await resolveChartSpecData(spec, sources, cache, { requestViewport: zoomedViewport });
+    await resolveChartSpecData(spec, sources, cache, { requestViewport: olderViewport });
 
-    expect(panned.series[0]?.points[0]?.date.toISOString()).toBe(secondViewport.start.toISOString());
-    expect(panned.viewport).toEqual(secondViewport);
+    // The view stays where the user put it; the series runs on to the newest observation.
+    expect(panned.viewport).toEqual(olderViewport);
+    expect(panned.series[0]?.points.at(-1)?.date.toISOString()).toBe("2026-01-08T00:00:00.000Z");
+    expect(panned.bufferedSeries?.[0]?.points.at(-1)?.date.getTime()).toBe(newest);
+    expect(zoomed.viewport).toEqual(zoomedViewport);
+    expect(zoomed.bufferedSeries?.[0]?.points.at(-1)?.date.getTime()).toBe(newest);
     expect(requested.map((viewport) => viewport.dateWindow)).toEqual([
-      { start: firstViewport.start.toISOString(), end: firstViewport.end.toISOString() },
-      { start: secondViewport.start.toISOString(), end: secondViewport.end.toISOString() },
+      { start: olderViewport.start.toISOString(), end: rangeWindow.end },
+      rangeWindow,
     ]);
     expect(chartSeriesSourceKey({ kind: "capability", capabilityId: "a", seriesId: "b:c" }))
       .not.toBe(chartSeriesSourceKey({ kind: "capability", capabilityId: "a-b", seriesId: "c" }));
@@ -1114,7 +1124,8 @@ describe("resolveChartSpecData", () => {
     expect(spec.viewport.resolution).toBe("auto");
     expect(detailedRequests).toHaveLength(1);
     expect(detailedRequests[0]?.resolution).toBe("15m");
-    expect(detailedRequests[0]?.end).toBe("2025-01-17T00:00:00.001Z");
+    // Half a view past the view's end: what a pan forward reaches first.
+    expect(detailedRequests[0]?.end).toBe("2025-01-20T12:00:00.001Z");
     expect(result.viewport?.start.toISOString()).toBe("2025-01-10T00:00:00.000Z");
     expect(result.viewport?.end.toISOString()).toBe("2025-01-17T00:00:00.000Z");
     expect(result.series[0]?.timeBasis).toMatchObject({
@@ -1122,6 +1133,55 @@ describe("resolveChartSpecData", () => {
       timeZone: "America/New_York",
       cadenceMs: 15 * 60 * 1_000,
     });
+  });
+
+  test("asks for the older part of a panned window a capped source answered short, and stops where the source has nothing older", async () => {
+    // Thirty-minute bars on weekdays from FIRST; one answer holds the newest 1,000 of a window.
+    const FIRST = Date.parse("2025-03-03T14:30:00.000Z");
+    const bars = Array.from({ length: 570 }, (_, day) => FIRST + day * 86_400_000)
+      .filter((day) => new Date(day).getUTCDay() % 6 !== 0)
+      .flatMap((day) => Array.from({ length: 13 }, (_, slot) => day + slot * 1_800_000))
+      .map((time) => ({ date: new Date(time), open: 10, high: 11, low: 9, close: 10, volume: 1 }));
+    const requests: Array<[number, number]> = [];
+    const answer = (start: Date, end: Date) => bars.filter(({ date }) => date >= start && date < end).slice(-1_000);
+    const provider = createTestDataProvider({
+      getTickerFinancials: async () => emptyFinancials(),
+      getChartResolutionSupport: () => [{ resolution: "30m", maxRange: "6M" }, { resolution: "1d", maxRange: "ALL" }],
+      getPriceHistoryForResolutionWithMetadata: async () => ({ points: bars.slice(-1_000), resolution: "30m" }),
+      getDetailedPriceHistoryWithMetadata: async (_symbol, _exchange, start, end) => {
+        requests.push([start.getTime(), end.getTime()]);
+        return { points: answer(start, end), resolution: "30m" };
+      },
+    });
+    const spec = chartSpec({
+      viewport: { range: "3M", resolution: "30m" },
+      series: [chartSeries({ source: { kind: "security", instrument: { symbol: "TEST", exchange: "NASDAQ" }, fieldId: "market.ohlcv" }, style: "candles" })],
+    });
+    const sources = { dataProvider: provider, now: new Date("2026-10-01T00:00:00.000Z"), loadFredSeries: async () => fredLoad() };
+    const cache = new ChartResolveCache();
+    await resolveChartSpecData(spec, sources, cache);
+
+    // A view back in May asks for six months to its end and gets the newest
+    // 1,000 bars, from mid-February; the months before are asked for next.
+    const may = await resolveChartSpecData(spec, sources, cache, {
+      requestViewport: { start: new Date("2026-03-01T00:00:00.000Z"), end: new Date("2026-06-01T00:00:00.000Z") },
+    });
+    const [window, older] = requests;
+    expect(requests).toHaveLength(2);
+    expect(older![0]).toBe(window![0]);
+    expect(older![1]).toBe(answer(new Date(window![0]), new Date(window![1]))[0]!.date.getTime());
+    const firstLoaded = may.bufferedSeries?.[0]?.points[0]?.date.getTime() ?? 0;
+    expect(firstLoaded - window![0]).toBeLessThan(4 * 86_400_000);
+    expect(may.bufferedSeries?.[0]?.historyStart).toBeUndefined();
+
+    // A view at the first bar gets an answer that starts late without being
+    // cut short: the history starts there, and the chart says so.
+    const edge = await resolveChartSpecData(spec, sources, cache, {
+      requestViewport: { start: new Date("2025-02-01T00:00:00.000Z"), end: new Date("2025-05-01T00:00:00.000Z") },
+    });
+    expect(requests).toHaveLength(3);
+    expect(edge.bufferedSeries?.[0]?.historyStart?.getTime()).toBe(FIRST);
+    expect(edge.warnings).toContain("30m history starts Mar 3, 2025.");
   });
 
   test("accumulates historical windows without replacing the current tail", async () => {
@@ -1898,11 +1958,13 @@ describe("resolveChartSpecData", () => {
       });
 
       expect(result.errors).toEqual([]);
-      expect(result.viewport?.end.getTime()).toBe(elapsed ? quoteTime : now);
+      // Without the quote the chart ends at its newest bar, not at the reference time after it.
+      expect(result.viewport?.end.getTime()).toBe(elapsed ? quoteTime : now - 86_400_000);
       const price = result.series.find((entry) => entry.id === "price");
       const sma = result.series.find((entry) => entry.id === "sma");
       expect(price?.points.at(-1)?.date.getTime()).toBe(elapsed ? quoteTime : now - 86_400_000);
-      expect(price?.points.at(-1)?.close).toBe(elapsed ? 129 : 100);
+      // After the close the daily bar takes the regular close (130), not the 129 after-hours print.
+      expect(price?.points.at(-1)?.close).toBe(elapsed ? 130 : 100);
       expect(price?.latestChangePercent).toBe(elapsed ? 30 : undefined);
       expect(sma?.points.at(-1)?.date.getTime()).toBe(elapsed ? quoteTime : now - 86_400_000);
     } finally { clock.mockRestore(); }
@@ -1944,13 +2006,40 @@ describe("resolveChartSpecData", () => {
       ] }),
       now: new Date(now),
       quoteOverrides: new Map([[chartQuoteOverrideKeyForSource(source), {
-        symbol: "SQQQ", price: 100, postMarketPrice: 105, currency: "USD", change: 0, changePercent: 0,
+        symbol: "SQQQ", price: 101, postMarketPrice: 105, currency: "USD", change: 0, changePercent: 0,
         lastUpdated: now - 60_000, marketState: "POST",
       }]]),
     });
     expect(result.errors).toEqual([]);
     expect(result.series[0]?.points).toHaveLength(1);
-    expect(result.series[0]?.points[0]?.value).toBe(105);
+    // The after-hours quote reaches the day's bar at the regular close, not its extended print.
+    expect(result.series[0]?.points[0]?.value).toBe(101);
+  });
+
+  test("a closed market's last daily candle is its regular close, as history serves it", async () => {
+    // CRWV after Thursday's after-hours session: Gloom Cloud's price is the 68.10 print, its close 69.69 beside it.
+    const now = Date.parse("2026-10-16T03:45:00Z");
+    const source = { kind: "security" as const, instrument: { symbol: "CRWV", exchange: "NASDAQ" }, fieldId: "market.ohlcv" };
+    const history = [
+      { date: new Date("2026-10-14T00:00:00Z"), open: 71.74, high: 72.52, low: 64.41, close: 65.78, volume: 111_214_200 },
+      { date: new Date("2026-10-15T00:00:00Z"), open: 61.43, high: 69.76, low: 59.51, close: 69.69, volume: 130_000_400 },
+    ];
+    const result = await resolveChartSpecData(chartSpec({
+      viewport: { range: "1M", resolution: "1d" },
+      series: [chartSeries({ source, style: "candles" })],
+    }), {
+      dataProvider: createTestDataProvider({ getPriceHistoryForResolution: async () => history }),
+      now: new Date(now),
+      quoteOverrides: new Map([[chartQuoteOverrideKeyForSource(source), {
+        symbol: "CRWV", price: 68.1, currency: "USD", change: 2.32, changePercent: 3.53, previousClose: 65.78,
+        listingExchangeName: "NASDAQ", marketState: "POSTPOST", changeSessionDate: "2026-10-15",
+        regularClose: 69.69, regularCloseSessionDate: "2026-10-15", regularChange: 3.91, regularChangePercent: 5.944,
+        lastUpdated: Date.parse("2026-10-15T23:59:59Z"),
+      }]]),
+    });
+    expect(result.errors).toEqual([]);
+    expect(result.series[0]?.points.map((point) => point.value)).toEqual([65.78, 69.69]);
+    expect(result.series[0]?.points.at(-1)).toMatchObject({ open: 61.43, high: 69.76, low: 59.51 });
   });
 
   test("reuses raw source loads while live quotes recompute the chart tail", async () => {
@@ -2578,7 +2667,7 @@ describe("Auto charts a young listing over the range it has traded", () => {
         expect(result.errors).toEqual([]);
         expect(result.resolution).toBe("5m");
         expect(result.series[0]?.points).toHaveLength(sessions.length * 78);
-        expect(result.viewport).toEqual({ start: new Date(`${sessions[0]}T13:30:00Z`), end: NOW });
+        expect(result.viewport).toEqual({ start: new Date(`${sessions[0]}T13:30:00Z`), end: new Date(`${sessions.at(-1)}T19:55:00Z`) });
       }
     }
   });

@@ -19,8 +19,9 @@ import type { QuoteSubscriptionTarget } from "../../../types/data-provider";
 import type { TickerFinancials } from "../../../types/financials";
 import { normalizeSymbol } from "../../../utils/exchanges";
 import { colors, priceColor } from "../../../theme/colors";
+import { extendedSessionStateLabel, type ExtendedSession } from "../../../market-data/market/status";
 import { compareSortValues, nextHeaderSort, type SortDirection } from "../../../utils/sort-values";
-import { formatCompact, formatCurrency, formatLevelPercent, formatNumber, formatPercent, formatPercentRaw } from "../../../utils/format";
+import { formatCompact, formatLevelPercent, formatNumber, formatPercent, formatPercentRaw } from "../../../utils/format";
 import { parseDisplayDate } from "../../../utils/datetime-format";
 import { convertMarketCapitalization } from "../../../utils/market-capitalization";
 import { usePluginTickerActions } from "../../runtime";
@@ -28,9 +29,10 @@ import { handleRefreshKey, useClampSelectedIndex } from "../../../components/dat
 import { useAsyncResource } from "../../../react/async-resource";
 import { useBoundTicker as useSymbolBinding } from "../shared/ticker-request";
 import { useFxRatesMap } from "../../../market-data/hooks";
-import { RELATIVE_VALUATION_STALE_FUNDAMENTALS_NOTICE, relativeValuationValues, withLiveQuote } from "./relative-valuation-model";
+import { RELATIVE_VALUATION_STALE_FUNDAMENTALS_NOTICE, formatRelativePrice, relativeValuationValues, withLiveQuote } from "./relative-valuation-model";
 
-type RelativeColumnId = "symbol" | "price" | "changePercent" | "marketCap" | "trailingPE" | "forwardPE" | "evSales" | "fcfYield" | "revenueGrowth" | "operatingMargin";
+type ExtendedColumnId = "preMarket" | "afterHours" | "overnight";
+type RelativeColumnId = "symbol" | "price" | "changePercent" | ExtendedColumnId | "marketCap" | "trailingPE" | "forwardPE" | "evSales" | "fcfYield" | "revenueGrowth" | "operatingMargin";
 type RelativeColumn = DataTableColumn & { id: RelativeColumnId };
 type RelativeRow = ReturnType<typeof relativeValuationValues> & {
   symbol: string;
@@ -45,7 +47,24 @@ function relativeSymbolsFromPane(symbol: string | null, paneSettings: Record<str
   return symbol ? [symbol] : [];
 }
 
-function buildRelativeColumns(baseCurrency: string): RelativeColumn[] {
+const EXTENDED_COLUMN_IDS: Record<ExtendedSession, ExtendedColumnId> = { PRE: "preMarket", POST: "afterHours", OVERNIGHT: "overnight" };
+
+/** The extended sessions some peer has a print for, in the order their columns go. */
+function extendedSessionsOf(rows: readonly RelativeRow[]): ExtendedSession[] {
+  return (["PRE", "POST", "OVERNIGHT"] as const).filter((session) => rows.some((row) => row.extendedSession === session));
+}
+
+/** A peer's move in the extended-session column `columnId`, from the close in LAST. */
+function extendedMove(row: RelativeRow, columnId: ExtendedColumnId): number | null {
+  return row.extendedSession != null && EXTENDED_COLUMN_IDS[row.extendedSession] === columnId ? row.extendedChangePercent : null;
+}
+
+/**
+ * LAST and CHG% are the regular session, as `quote` reads them; a PRE-MKT,
+ * AFTER-HRS or OVERNIGHT column, named as BI and MOST name it, follows CHG%
+ * for each session in `extendedSessions`.
+ */
+function buildRelativeColumns(baseCurrency: string, extendedSessions: readonly ExtendedSession[]): RelativeColumn[] {
   const symbolWidth = 8;
   const priceWidth = 10;
   const pctWidth = 8;
@@ -55,6 +74,9 @@ function buildRelativeColumns(baseCurrency: string): RelativeColumn[] {
     { id: "symbol", label: "TICKER", width: symbolWidth, align: "left" },
     { id: "price", label: "LAST", width: priceWidth, align: "right" },
     { id: "changePercent", label: "CHG%", width: pctWidth, align: "right" },
+    ...extendedSessions.map((session): RelativeColumn => ({
+      id: EXTENDED_COLUMN_IDS[session], label: extendedSessionStateLabel(session), width: 9, align: "right",
+    })),
     { id: "marketCap", label: `MCAP ${baseCurrency}`, width: capWidth, align: "right" },
     { id: "trailingPE", label: "P/E", width: metricWidth, align: "right" },
     { id: "forwardPE", label: "FWD", width: metricWidth, align: "right" },
@@ -74,7 +96,9 @@ interface RelativeSortPreference {
 const DEFAULT_RELATIVE_SORT: RelativeSortPreference = { columnId: "marketCap", direction: "desc" };
 
 function relativeSortValue(row: RelativeRow, columnId: RelativeColumnId): string | number | null {
-  return columnId === "symbol" ? row.symbol.toLocaleLowerCase() : row[columnId];
+  if (columnId === "symbol") return row.symbol.toLocaleLowerCase();
+  if (columnId === "preMarket" || columnId === "afterHours" || columnId === "overnight") return extendedMove(row, columnId);
+  return row[columnId];
 }
 
 function sortRelativeRowIndices(
@@ -135,7 +159,10 @@ export function RelativeValuationPane({ focused, width, height }: PaneProps) {
   const error = symbols.length > 0 ? peerSnapshot.error : "No tickers selected";
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [sortPreference, setSortPreference] = useState<RelativeSortPreference>(DEFAULT_RELATIVE_SORT);
-  const baseCurrency = useAppSelector((state) => state.config.baseCurrency);
+  const appBaseCurrency = useAppSelector((state) => state.config.baseCurrency);
+  // `--currency` on a capture asks for another currency than the app's.
+  const capCurrency = typeof pane?.settings?.capCurrency === "string" ? pane.settings.capCurrency : null;
+  const baseCurrency = capCurrency ?? appBaseCurrency;
   const quoteTargets = useMemo<QuoteSubscriptionTarget[]>(() => symbols.map((peer) => ({
     symbol: peer,
     exchange: "",
@@ -153,7 +180,12 @@ export function RelativeValuationPane({ focused, width, height }: PaneProps) {
     };
   }), [liveQuotes, peers]);
   const fxRates = useFxRatesMap([baseCurrency, ...rows.map((row) => row.marketCapCurrency)]);
-  const columns = useMemo(() => buildRelativeColumns(baseCurrency), [baseCurrency]);
+  // A pre-market or after-hours print gets its own column when a peer has one.
+  const extendedSessionsKey = extendedSessionsOf(rows).join(",");
+  const columns = useMemo(
+    () => buildRelativeColumns(baseCurrency, extendedSessionsKey ? extendedSessionsKey.split(",") as ExtendedSession[] : []),
+    [baseCurrency, extendedSessionsKey],
+  );
 
   const comparableRows = useMemo(() => rows.map((row) => ({
     ...row, marketCap: convertMarketCapitalization(row.marketCap, row.marketCapCurrency, baseCurrency, fxRates),
@@ -180,8 +212,11 @@ export function RelativeValuationPane({ focused, width, height }: PaneProps) {
 
   usePaneNoticeFooter({
     registrationId: "relative-valuation-notices",
-    notices: rows.filter((row) => row.fundamentalsProvenance?.stale)
-      .map((row) => `${row.symbol}: ${RELATIVE_VALUATION_STALE_FUNDAMENTALS_NOTICE}.`),
+    notices: [
+      ...rows.filter((row) => row.fundamentalsProvenance?.stale)
+        .map((row) => `${row.symbol}: ${RELATIVE_VALUATION_STALE_FUNDAMENTALS_NOTICE}.`),
+      ...rows.flatMap((row) => row.evSalesUnavailable ? [`${row.symbol}: ${row.evSalesUnavailable}`] : []),
+    ],
     focused,
   });
 
@@ -192,9 +227,15 @@ export function RelativeValuationPane({ focused, width, height }: PaneProps) {
       case "symbol":
         return { text: row.symbol, color: row.error || row.quoteStale || row.fundamentalsProvenance?.stale ? colors.warning : colors.textBright, attributes: TextAttributes.BOLD };
       case "price":
-        return { text: row.price != null ? formatCurrency(row.price, row.currency ?? "USD") : "-", color: colors.text };
+        return { text: formatRelativePrice(row.price, row.currency), color: colors.text };
       case "changePercent":
         return { text: row.changePercent != null ? formatPercentRaw(row.changePercent) : "-", color: priceColor(row.changePercent ?? 0) };
+      case "preMarket":
+      case "afterHours":
+      case "overnight": {
+        const move = extendedMove(row, column.id);
+        return { text: move != null ? formatPercentRaw(move) : "-", value: move, color: move == null ? colors.textDim : priceColor(move) };
+      }
       case "marketCap":
         return { text: formatCompact(row.marketCap ?? undefined, { fixedDecimals: true }), color: colors.textDim };
       case "trailingPE":
@@ -202,7 +243,10 @@ export function RelativeValuationPane({ focused, width, height }: PaneProps) {
       case "forwardPE":
         return { text: formatPriceEarnings(row.notMeaningful.forwardPE ? NOT_MEANINGFUL : row.reportedMultiples.forwardPE), color: colors.text };
       case "evSales":
-        return { text: formatNumber(row.evSales ?? undefined, 1), color: colors.text };
+        // A withdrawn EV says so; the footer says why.
+        return row.evSales == null && row.evSalesUnavailable
+          ? { text: "EV n/a", color: colors.textDim }
+          : { text: formatNumber(row.evSales ?? undefined, 1), color: colors.text };
       case "fcfYield":
         return { text: formatLevelPercent(row.fcfYield ?? undefined), color: priceColor(row.fcfYield ?? 0) };
       case "revenueGrowth":

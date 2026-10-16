@@ -68,10 +68,10 @@ const QUOTES: FunctionFreshness = { free: "15 minutes delayed, crypto real-time"
 /** US option chains and the quotes behind them. */
 const OPTIONS: FunctionFreshness = { free: DELAYED, pro: REAL_TIME };
 const FX: FunctionFreshness = { free: DELAYED, pro: REAL_TIME };
-/** Open interest settles once a session; spot and the quotes behind gamma follow the plan. */
+/** Open interest is counted once a session and reaches Gloom about two sessions late; spot and the quotes behind gamma follow the plan. */
 const OPX_DATA: FunctionFreshness = {
-  free: "Open interest as of the prior session; spot and gamma 15 minutes delayed",
-  pro: "Open interest as of the prior session; spot and gamma real-time",
+  free: "Open interest about two sessions old, its date in the footer; spot and gamma 15 minutes delayed",
+  pro: "Open interest about two sessions old, its date in the footer; spot and gamma real-time",
 };
 const NEWS: FunctionFreshness = { free: "12 hours delayed", pro: REAL_TIME };
 const US_SCANNER: FunctionFreshness = { free: DELAYED, pro: REAL_TIME };
@@ -119,7 +119,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["GP"],
   },
   GIP: {
-    summary: "One or five sessions of intraday candles with the session boundaries marked.",
+    summary: "One or five sessions of intraday candles, down to 1-minute bars, with the session boundaries marked.",
     usage: ["GIP TSLA"],
     keys: CHART_KEYS,
     data: QUOTES,
@@ -175,7 +175,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["DDIS"],
   },
   HP: {
-    summary: "Daily open, high, low, close and volume in a scrollable table.",
+    summary: "Open, high, low, close and volume in a scrollable table: daily bars over 3M to start, weekly for 5Y and monthly for ALL. The newest bar is marked to date while its day, week or month runs on.",
     usage: ["HP AAPL"],
     keys: [key("t", " range")],
     data: QUOTES,
@@ -225,7 +225,8 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["RV"],
   },
   EQS: {
-    summary: "Screen covered stocks on valuation, growth, margins, liquidity, short interest, insider activity and 13F holders, then rank the matches by any metric.",
+    summary: "Screen covered stocks on valuation, growth, margins, liquidity, volatility, short interest, insider activity and 13F holders, then rank the matches by any metric. "
+      + "ATR% is the 14-session average true range as a percent of the last close. IV rank is a rank, not an IV percentile: 0 is the lowest 30-day implied volatility of the past 52 weeks and 100 the highest.",
     usage: ["EQS"],
     keys: [key("a", "dd criterion"), key("m", "etric"), key("s", "ave screen"), key("o", "pen research")],
     data: same("Daily snapshot, statements as filed"),
@@ -240,14 +241,14 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["OMON"],
   },
   OPX: {
-    summary: "Open interest by strike for one expiry with max pain and spot marked, every expiry's open interest, put/call ratio and max pain, and dealer gamma (GEX) by strike with its flip level and a range for the dealer assumption. MAXPAIN opens it too.",
+    summary: "Open interest by strike for one expiry with max pain and spot marked, every expiry's open interest, put/call ratio, max pain and net dealer gamma, and dealer gamma (GEX) by strike with its flip level, call and put walls and a range for the dealer assumption. MAXPAIN opens it too.",
     usage: ["OPX", "OPX SPY", "OPX SPX"],
     keys: [TABS, OPEN],
     data: OPX_DATA,
     bloomberg: ["OPX"],
   },
   GEX: {
-    summary: "Net dealer gamma by strike across every expiry or one, with the total, the flip level and a range for the dealer assumption. The GEX tab of OPX.",
+    summary: "Net dealer gamma by strike across every expiry or one, with the total, the flip level, the call and put walls and a range for the dealer assumption. The GEX tab of OPX.",
     usage: ["GEX", "GEX SPY", "GEX SPX"],
     keys: [TABS],
     data: OPX_DATA,
@@ -263,8 +264,10 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
   },
   OSA: {
     summary: "Build a multi-leg options position and value it at any spot, date and vol shift: payoff, P&L grid, breakevens and Greeks. European pricing, so no early exercise. "
-      + "With a NAV and a budget in bps it sizes the position as a hedge: contracts, premium, notional protected and coverage of an equity sleeve.",
+      + "With a NAV and a budget in bps it sizes the position as a hedge: contracts, premium, notional protected and coverage of an equity sleeve. "
+      + "--strategy csp sells a cash-secured put: cash secured, premium, yield on cash and annualised, distance out of the money, break-even, days to expiry and an earnings flag.",
     usage: ["OSA AAPL", "gloomberb fn OSA AAPL --strategy vertical --expiration 2027-01-15",
+      "gloomberb fn OSA KO --strategy csp --strike 85 --expiration 2026-11-20",
       "gloomberb fn OSA SPY --strategy put --strike 700 --expiration 2027-01-15 --nav 100m --budget-bps 50 --sleeve 100m"],
     keys: [key("a", "dd leg"), key("c", "hain"), key("d", "ate"), key("v", "ol shift")],
     data: OPTIONS,
@@ -272,14 +275,14 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
   },
   OVDV: {
     summary: "The implied volatility surface fitted from option quotes: 3D sheet, table, smiles, ATM term structure, 25-delta skew and forwards, live or on stored daily closes.",
-    usage: ["OVDV NVDA", "gloomberb fn OVDV NVDA --tab skew --expiration 2027-01-15"],
+    usage: ["OVDV NVDA", "gloomberb fn OVDV NVDA --tab skew --expiration 2027-01-15", "gloomberb fn OVDV SPY --date 2026-10-09 --tab skew"],
     keys: [key("v", "iew"), key("c", "hain"), key("m", "ore expiries"), key("t", " stored dates")],
     data: { free: `${DELAYED}; stored dates at the close`, pro: "Real-time; stored dates at the close" },
     bloomberg: ["OVDV"],
   },
   HIVG: {
     summary: "Daily 30-day, 90-day and one-year at-the-money implied vol since February 2024 against realized vol, with each measure's 52-week rank and percentile.",
-    usage: ["HIVG AAPL"],
+    usage: ["HIVG AAPL", "gloomberb fn HIVG SPY --lookback ALL --csv"],
     keys: [key("s", "urface")],
     data: IV_DAILY,
     bloomberg: ["HIVG", "GV"],
@@ -392,7 +395,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["ERN"],
   },
   DVD: {
-    summary: "Cash distributions, trailing yield, indicated rate when available, and payout growth. Future payments are not forecast.",
+    summary: "Cash distributions, trailing yield, the forward yield fundamentals show (the latest distribution annualized, or the declared one once announced), and payout growth. Future payments are not forecast.",
     usage: ["DVD KO"],
     keys: [STEP],
     data: same("Daily"),
@@ -717,7 +720,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["RRG"],
   },
   HM: {
-    summary: "The largest US stocks and ETFs as a treemap sized by the square root of market cap or assets, or by plain market cap in its settings, and colored by the day's move.",
+    summary: "The largest US stocks and ETFs as a treemap sized by the day's move, or by market cap or its square root (assets for ETFs) in its settings, and colored by the day's move.",
     usage: ["HM"],
     keys: [OPEN],
     data: QUOTES,
@@ -746,14 +749,14 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   FUT: {
-    summary: "Front-month futures across equity index, rates, energy, metals, agriculture, livestock and FX with last price and session change, grouped by sector.",
+    summary: "Each root's most active futures contract across equity index, equity sectors, rates, energy, metals, agriculture, livestock and FX with last price, unit and session change, grouped by sector.",
     usage: ["FUT"],
     keys: [SEARCH, OPEN],
     data: same(DELAYED),
     bloomberg: ["GLCO"],
   },
   CTM: {
-    summary: "A futures root's listed contracts as a curve against a week and a month ago, with roll yield, contango or backwardation, and each contract's price, open interest and volume. Takes a FUT root, VX or a CME crypto root (BTC, ETH, SOL, XRP), which also shows each contract's premium to spot and annualised basis against the USD pair quote.",
+    summary: "A futures root's listed contracts as a curve against a week and a month ago, with roll yield, contango or backwardation, and each contract's price, open interest and volume. Takes a FUT root, VX or a CME crypto root (BTC, ETH, SOL, XRP), which also shows each contract's premium to spot and annualised basis against the USD pair quote: Ann Basis = (Last / spot - 1) × 365 / days to expiry, simple actual/365.",
     usage: ["CTM GC", "CTM BTC"],
     keys: [key("d", "ate"), key("c", "urrent"), STEP],
     data: same("Delayed, usually 10 minutes; VIX at settlement"),
@@ -780,6 +783,22 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     data: same("Weekly, on release"),
     bloomberg: ["DOE"],
   },
+  PSD: {
+    summary: "World production, use, trade and ending stocks for wheat, corn, soybeans and cotton, by country and latest market year. Season-average price forecasts appear when USDA publishes them. The Crops tab of Commodities & Energy.",
+    usage: ["PSD"],
+    keys: [TABS],
+    data: same("Monthly, as USDA updates the market-year tables"),
+    bloomberg: [],
+    docs: "https://gloom.sh/docs/functions",
+  },
+  JODI: {
+    summary: "Latest monthly crude oil and natural gas balances for countries: production, imports, exports and stocks, and demand for natural gas. The Oil & Gas tab of Commodities & Energy.",
+    usage: ["JODI"],
+    keys: [TABS],
+    data: same("Monthly, as the latest country reports arrive"),
+    bloomberg: [],
+    docs: "https://gloom.sh/docs/functions",
+  },
   POWER: {
     summary: "Pro: global power interconnection queues, recorded MW history, completion and withdrawal cohorts, large-load requests and approvals, utility exposure and generation capacity. Open a project for primary evidence and revisions; mapped companies link to DES, FA, G and SPLC.",
     usage: ["POWER", "POWER NEE"],
@@ -795,6 +814,14 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     data: same("Hourly asks and AWS spot; other published prices every 6 or 24 hours"),
     access: "preview",
     bloomberg: [],
+  },
+  EPWR: {
+    summary: "Day-ahead power prices for 32 European markets in EUR/MWh, the EU carbon allowance (EUA) auction price in EUR/tCO2, and European gas storage. Each market shows its latest delivery day, the change on the day before, 7- and 30-day averages, a year ago and where it sits in its 52-week range, with its year charted and its history from 2015; the EUA shows its latest auction day, how the auction was covered, and its auctions since 2020. EPWR GAS shows the EU and each member state's storage as of its latest gas day: % full, TWh, injection and withdrawal in GWh/day, against a year ago and the five-year range, with the year charted against last year and that range. The Prices tab of POWER.",
+    usage: ["EPWR", "EPWR DE", "EPWR UK", "EPWR EUA", "EPWR GAS", "EPWR GAS DE"],
+    keys: [key("o", "pen Ember or GIE AGSI+"), key("g", "raph"), key("c", "arbon")],
+    data: same("Daily; each market as of its latest published delivery day, usually a few days back; the EUA on each auction day; gas storage by gas day, published each evening, the latest day estimated until confirmed"),
+    bloomberg: [],
+    docs: "POWER",
   },
   NGS: {
     summary: "Lower 48 working gas in storage and each region's, the week's injection or withdrawal against a year ago and the five-year average, charted over the year. The Gas Storage tab of DOE.",
@@ -850,7 +877,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
   MAP: {
     summary: "Trading venues around the world with open or closed status, local time and time to the next session change. Layers add ships, chokepoints, ports, pipelines, fields, LNG terminals and airports to the same map, each with a table of what is in view and the companies it links to.",
     usage: ["MAP", "MAP ships", "MAP energy", "MAP air", "MAP ports"],
-    keys: [SEARCH, OPEN, key("d", "es"), key("+", " zoom in")],
+    keys: [SEARCH, key("d", "es"), key("m", " pan map"), key("+", " zoom in")],
     data: same("Venues live from exchange calendars; ships live, chokepoints and ports daily, the rest reference data"),
     bloomberg: [],
   },
@@ -885,7 +912,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["ECAN"],
   },
   CBR: {
-    summary: "Policy rates for the G20 central banks with the last move, its date and a one-year percentile; open one for its history.",
+    summary: "Policy rates for the G20 central banks, the SNB, Norges Bank, the Riksbank and the RBNZ with the last move, its date and a one-year percentile; open one for its history.",
     usage: ["CBR"],
     keys: [OPEN, OPEN_SOURCE],
     data: same("As each bank publishes, can lag a few days"),
@@ -906,8 +933,8 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["WIRP", "FFIP"],
   },
   CRD: {
-    summary: "ICE BofA US corporate option-adjusted spreads by rating bucket and high yield, with the day's change.",
-    usage: ["CRD"],
+    summary: "ICE BofA option-adjusted spreads: US investment grade and high yield by rating, and euro high yield, with the day's change.",
+    usage: ["CRD", "CRD --region euro"],
     keys: [OPEN],
     data: same("Daily close, published the next day"),
     bloomberg: ["CRD"],
@@ -919,6 +946,34 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     data: same("Daily, after each auction"),
     bloomberg: ["AUCT"],
   },
+  FI: {
+    summary: "A single workspace for credit markets, issuer debt, corporate bonds, Treasury auctions and debt, and primary dealer positions.",
+    usage: ["FI"],
+    keys: [TABS],
+    data: same("As each market publishes"),
+    bloomberg: [],
+  },
+  TRACE: {
+    summary: "Recent corporate and agency bond sales with issuer, coupon, price, yield, and grade. Add an issuer to narrow the tape.",
+    usage: ["TRACE", "TRACE Ford"],
+    keys: [SEARCH],
+    data: same("As trades are published"),
+    bloomberg: [],
+  },
+  DTS: {
+    summary: "US Treasury daily operating cash and debt held by the public, with recent business days for debt.",
+    usage: ["DTS"],
+    keys: [TABS],
+    data: same("Daily, as Treasury publishes"),
+    bloomberg: [],
+  },
+  PDLR: {
+    summary: "Weekly primary dealer net positions and settlement fails across Treasuries and mortgage-backed securities.",
+    usage: ["PDLR"],
+    keys: [TABS],
+    data: same("Weekly, as published"),
+    bloomberg: [],
+  },
   BTMM: {
     summary: "Funding rates (SOFR, EFFR, IORB), Treasury bill yields and their curve, and Fed liquidity from reserves to the reverse repo, each with its one-year percentile.",
     usage: ["BTMM"],
@@ -927,15 +982,15 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["BTMM"],
   },
   CDS: {
-    summary: "Single-name corporate CDS trades and 5Y spread history from DTCC public dissemination, by issuer with trade count and spread.",
+    summary: "Single-name corporate CDS from DTCC public dissemination. CDS alone lists the issuers traded in the last 5 days with trade count, last trade and 5Y spread, to rank them by; with a ticker or issuer, its 5Y spread (level, date, 1M change, range) and its trades.",
     usage: ["CDS", "CDS F"],
     keys: [OPEN, STEP],
     data: same("Delayed, as trades are disseminated"),
     bloomberg: ["CDS"],
   },
   CDX: {
-    summary: "CDX IG, HY and EM with iTraxx Main and Crossover on the run: the 5Y level, 1D and 1W moves, 1Y percentile and the day's print count. IG and iTraxx in spread, HY and EM in price. Sovereign CDS is the other tab.",
-    usage: ["CDX"],
+    summary: "CDX IG, HY and EM with iTraxx Main and Crossover on the run: the 5Y level, 1D, 1W and 1M moves, 1Y percentile and the day's print count. IG and iTraxx in spread, HY and EM in price. Naming an index adds its daily history. Sovereign CDS is the other tab.",
+    usage: ["CDX", "CDX XOVER"],
     keys: [TABS, OPEN],
     data: same("Delayed, as trades are disseminated"),
     bloomberg: ["CDX"],
@@ -1013,8 +1068,8 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: ["13F"],
   },
   INS: {
-    summary: "Insider buys, sells, awards and gifts from Form 4 filings, with insider name, size and price. US equities.",
-    usage: ["INS NVDA"],
+    summary: "Insider buys, sells, awards and gifts from Form 4 filings, with insider name, size and price. US equities. Alone it ranks the companies whose insiders are buying in the open market, with why.",
+    usage: ["INS NVDA", "INS"],
     keys: [OPEN, key("f", "ilter")],
     data: AS_FILED,
     bloomberg: ["INS"],
@@ -1034,6 +1089,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     keys: [key("a", "dd"), OPEN, key("s", " grid")],
     data: QUOTES,
     bloomberg: [],
+    docs: "https://gloom.sh/docs/portfolio",
   },
   PORT: {
     summary: "Benchmark-relative risk, factor betas, and index, rate and VIX stress shifts for a portfolio. The Overview view in pane settings has P&L, Sharpe, beta and sector allocation.",
@@ -1051,7 +1107,7 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     docs: "PORT",
   },
   ALRT: {
-    summary: "Your price alerts with current price, distance to target and trigger state, plus market and filing event alerts.",
+    summary: "Your price alerts with current price, distance to target and trigger state, plus alerts days before earnings, CPI or FOMC and market and filing event alerts.",
     usage: ["ALRT"],
     keys: [key("a", "dd alert"), key("e", "dit"), key("d", "elete"), key("m", "re-arm")],
     data: QUOTES,
@@ -1224,9 +1280,9 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     bloomberg: [],
   },
   PL: {
-    summary: "What Gloomberb is made of: switch built-ins on and off, one by one or with a starter pack, and install plugins from GitHub.",
+    summary: "What Gloomberb is made of: switch built-ins on and off, one by one or by applying a starter pack, and install plugins from GitHub.",
     usage: ["PL"],
-    keys: [key("e", "nable"), key("a", " packs"), key("i", "nstall"), SEARCH],
+    keys: [key("e", "nable"), key("a", "pply pack"), key("i", "nstall"), SEARCH],
     data: null,
     bloomberg: [],
   },
@@ -1300,6 +1356,13 @@ export const FUNCTION_HELP: Readonly<Record<string, FunctionHelp>> = {
     keys: [TABS, key("s", "end feedback")],
     data: null,
     bloomberg: ["HELP"],
+  },
+  DOCS: {
+    summary: "The docs and Academy lessons, searchable, inside the app. The ? on a pane opens that pane's entry; Back returns to where you were.",
+    usage: ["DOCS", "DOCS OMON", "DOCS options chain"],
+    keys: [SEARCH, OPEN, key("o", "pen in browser")],
+    data: null,
+    bloomberg: [],
   },
   FB: {
     summary: "A message and an optional screenshot, sent with scrubbed logs and app details; works signed out. FEEDBACK and BUG open it too.",

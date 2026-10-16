@@ -1,6 +1,6 @@
 /** @jsxImportSource react */
 import { createRoot } from "react-dom/client";
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { TapeClientContext } from "../../../plugins/builtin/time-sales/use-tape";
 import { createSnapshotTapeClient } from "../../../plugins/builtin/time-sales/snapshot-client";
 import type { TapeSnapshot } from "../../../api-client/tape";
@@ -72,6 +72,8 @@ declare global {
     __GLOOM_CLI_SHOT_PENDING__?: number;
     __GLOOM_CLI_SHOT_ERROR__?: string;
     __GLOOM_CLI_SHOT_SEMANTIC_UI__?: RemoteUiNodeSnapshot[];
+    /** Redraws the pane this many cells tall and waits for it to settle again: a capture growing to fit its rows. */
+    __GLOOM_CLI_SHOT_RESIZE__?: (heightCells: number) => void;
   }
 }
 
@@ -186,11 +188,13 @@ async function restoreShotCloudSession(): Promise<void> {
  * the cloud is one source among several: analyst rating price targets and part
  * of the corporate action history come from providers the router merges in.
  */
-async function requestShotMarketData<T>(operation: string, args: unknown[]): Promise<T> {
+async function requestShotMarketData<T>(operation: string, args: unknown[], signal?: AbortSignal): Promise<T> {
   const response = await window.fetch(SHOT_MARKET_BRIDGE_PATH, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ operation, args }),
+    // A board that stops waiting for a slow batch drops it, so the capture is not held for it.
+    ...(signal ? { signal } : {}),
   });
   const result = await response.json() as { ok: boolean; data?: T; error?: string };
   if (!result.ok) throw new Error(result.error ?? `Screenshot data request failed: ${operation}`);
@@ -229,6 +233,17 @@ function isShotLoadingTextVisible(): boolean {
   return document.querySelector(SHOT_LOADING_SELECTOR) !== null;
 }
 
+/**
+ * A WebGL surface still being drawn: its first frame is not on the canvas, or
+ * a refreshed mesh is mid-morph. A frame with no mesh counts as drawn, so an
+ * empty sheet fails the capture's checks instead of holding it until timeout.
+ */
+function hasUndrawnSurface(): boolean {
+  return document.querySelector(
+    '[data-gloom-surface-renderer="webgl"]:not([data-gloom-surface-state="drawn"]):not([data-gloom-surface-state="blank"])',
+  ) !== null;
+}
+
 /** A chart pane holds the capture by publishing `ready: false` on its chart-data node. */
 function hasUnresolvedChartData(): boolean {
   return (window.__GLOOM_CLI_SHOT_SEMANTIC_UI__ ?? []).some((node) => (
@@ -259,6 +274,7 @@ function waitForShotReadiness(): () => void {
       pendingShotWork === 0
       && !isShotLoadingTextVisible()
       && !hasUnresolvedChartData()
+      && !hasUndrawnSurface()
       && !changedSinceLastFrame
     ) {
       stableFrames += 1;
@@ -287,8 +303,11 @@ function createShotDataProvider(payload: DesktopPaneShotPayload): DataProvider {
     id: payload.marketDataProviderId ?? cloudProvider.id,
     getQuote: (symbol, exchange, context) => requestShotMarketData<Quote>("getQuote", [symbol, exchange, context]),
     getQuoteMetadata: (symbol, exchange, context) => requestShotMarketData<QuoteMetadata | null>("getQuoteMetadata", [symbol, exchange, context]),
-    getQuotesBatch: (targets) => requestShotMarketData<QuoteBatchResult[]>("getQuotesBatch", [targets])
-      .catch(() => targets.map((target) => ({ target, quote: null }))),
+    getQuotesBatch: (targets, options) => {
+      const { signal, ...sent } = options ?? {};
+      return requestShotMarketData<QuoteBatchResult[]>("getQuotesBatch", [targets, sent], signal)
+        .catch(() => targets.map((target) => ({ target, quote: null })));
+    },
     getOptionsChain: (symbol, exchange, expirationDate, context) => requestShotMarketData<OptionsChain>("getOptionsChain", [symbol, exchange, expirationDate, context]),
     getPriceHistory: (symbol, exchange, range, context) => requestShotMarketData<PricePoint[]>("getPriceHistory", [symbol, exchange, range, context])
       .then(revivePricePoints).catch(() => []),
@@ -438,7 +457,20 @@ function ShotPane({ payload, registry }: { payload: DesktopPaneShotPayload; regi
   } as Pick<AppState, "config" | "paneState">;
   const title = getPaneDisplayTitle(titleState, instance, pane, registry.panes);
   const width = payload.widthCells;
-  const height = payload.heightCells;
+  const [height, setHeight] = useState(payload.heightCells);
+  useEffect(() => {
+    let cancelReadiness: (() => void) | null = null;
+    window.__GLOOM_CLI_SHOT_RESIZE__ = (heightCells) => {
+      window.__GLOOM_CLI_SHOT_READY__ = false;
+      setHeight(heightCells);
+      cancelReadiness?.();
+      cancelReadiness = waitForShotReadiness();
+    };
+    return () => {
+      cancelReadiness?.();
+      delete window.__GLOOM_CLI_SHOT_RESIZE__;
+    };
+  }, []);
   // PORT keeps what its basket covers, so a capture never reads as the whole account.
   return (
     <PaneShotFrame paneId={instance.instanceId} title={title} width={width} height={height} statusLine={payload.statusLine === true} preserveStatus={["time-sales", "gpu", "hiring", "apps", "catalysts", "litigation", "perps", "members", "analytics"].includes(pane.id)}>

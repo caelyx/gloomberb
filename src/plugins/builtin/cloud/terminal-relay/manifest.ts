@@ -1,6 +1,7 @@
 import {
   REMOTE_OPERATIONS,
   REMOTE_RESOURCES,
+  remoteOperationDescription,
   remoteOperationToolName,
 } from "../../../../remote/schema";
 import type {
@@ -8,6 +9,8 @@ import type {
   RemoteSideEffectLevel,
   RemoteWriteTier,
 } from "../../../../remote/types";
+import { getSharedRegistry } from "../../../registry";
+import { describeViewSources, type ViewSourceCatalog } from "../../custom-view/sources";
 import {
   operationPolicy,
   patchPolicy,
@@ -58,6 +61,7 @@ const DESTRUCTIVE_OPERATIONS = new Set(["layout.delete", "pane.close", "layout.c
 const IDEMPOTENT_OPERATIONS = new Set([
   "pane.show",
   "pane.focus",
+  "pane.screenshot",
   "ticker.select",
   "ticker.switchTab",
   "layout.switch",
@@ -93,16 +97,20 @@ function readTool(
 
 const RESOURCE_LIST = REMOTE_RESOURCES.map(({ uri }) => uri).join(", ");
 
-function buildTools(): TerminalRelayTool[] {
+function buildTools(viewSources = ""): TerminalRelayTool[] {
   const operations = REMOTE_OPERATIONS.map((operation): TerminalRelayTool => {
     const { policy } = operationPolicy(operation.id);
     const external = operation.sideEffectLevel === "external-side-effect"
       || operation.sideEffectLevel === "external-trade"
       || operation.sideEffectLevel === "network-write";
+    // The relay hands an image result to the assistant as a picture, not as base64 text.
+    const text = operation.returnsImage
+      ? `${operation.description} The PNG comes back as an image, with the pane and its pixel size as text.`
+      : remoteOperationDescription(operation, viewSources);
     return {
       name: remoteOperationToolName(operation.id),
       title: operation.title,
-      description: describe(operation.description, operation.sideEffectLevel, policy),
+      description: describe(text, operation.sideEffectLevel, policy),
       inputSchema: operation.inputSchema,
       tier: operation.sideEffectLevel,
       writeTier: operation.writeTier,
@@ -210,9 +218,17 @@ function buildTools(): TerminalRelayTool[] {
 const TOOLS = buildTools();
 const TOOLS_BY_NAME = new Map(TOOLS.map((tool) => [tool.name, tool]));
 
-/** What the app announces to Gloom Cloud. */
-export function terminalRelayToolDescriptors(): TerminalRelayToolDescriptor[] {
-  return TOOLS.map(({ binding: _binding, ...descriptor }) => descriptor);
+/**
+ * What the app announces to Gloom Cloud. The tool that creates a view names
+ * the functions it can read from the running registry, installed plugins
+ * included. The snapshot Gloom Cloud keeps for before a terminal connects is
+ * made with no registry, so it carries the rule and not the list: a view can
+ * only be created from an open terminal, which announces its own.
+ */
+export function terminalRelayToolDescriptors(
+  catalog: ViewSourceCatalog | undefined = getSharedRegistry(),
+): TerminalRelayToolDescriptor[] {
+  return buildTools(catalog ? describeViewSources(catalog) : "").map(({ binding: _binding, ...descriptor }) => descriptor);
 }
 
 /** The app's own table: a name it did not generate is never run. */

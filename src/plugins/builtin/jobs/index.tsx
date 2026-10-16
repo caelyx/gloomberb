@@ -1,12 +1,14 @@
 import { publicTickerBindingSymbol } from "../../../tickers/selection";
 import type { PluginModule } from "../plugin-module";
+import { JOBS_SERIES } from "./series";
 import { resetJobsCache } from "./client";
 import { jobsHeadless } from "./headless";
+import { jobsLockNote } from "./lock-note";
 import { JOBS_PANE_ID, JobsPane, JobsResearchTab } from "./pane";
 
 
 const description =
-  "Hiring read from the company's own careers system: open roles over time, by function and location, new roles, pay ranges. Alone, every covered company ranked.";
+  "Pro hiring read from the company's own careers system: open roles over time, by function and location, new roles, pay ranges. Alone, every covered company ranked.";
 
 function explicitSymbol(options?: { arg?: string; symbol?: string | null }): string | null {
   const symbol = (options?.symbol ?? options?.arg ?? "").trim().toUpperCase();
@@ -14,6 +16,7 @@ function explicitSymbol(options?: { arg?: string; symbol?: string | null }): str
 }
 
 export const jobsModule: PluginModule = {
+  series: JOBS_SERIES,
   setup(ctx) {
     ctx.registerTickerResearchTab({
       id: "jobs",
@@ -31,6 +34,7 @@ export const jobsModule: PluginModule = {
   panes: [
     {
       id: JOBS_PANE_ID,
+      reportLockNote: jobsLockNote,
       name: "Hiring",
       icon: "J",
       component: JobsPane,

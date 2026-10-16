@@ -10,6 +10,8 @@ import {
 } from "../../../components";
 import type { DataTableViewProps } from "../../../components/data-table/view";
 import { handleRefreshKey } from "../../../components/data-table/table-pane";
+import { useChartViewReset } from "../../../components/chart/core/view-reset";
+import { FILL_REST } from "../../../components/ui/fill";
 import { useShortcut } from "../../../react/input";
 import { Box, ScrollBox, useUiCapabilities } from "../../../ui";
 import { isPlainKey } from "../../../utils/keyboard";
@@ -40,7 +42,8 @@ export function shouldPersistSelection({
 
 /**
  * Filter, selection and keys for a series list beside its detail: `/` focuses
- * the filter, `r` reloads, and a range option's `hint` key picks that range.
+ * the filter, `r` reloads, and a range option's `hint` key picks that range. A
+ * range marked `chartRange` sends the detail chart back to it when chosen again.
  */
 export function useSeriesList<Item, R extends string>({
   focused,
@@ -62,10 +65,11 @@ export function useSeriesList<Item, R extends string>({
   selectedId: string;
   onSelect: (id: string) => void;
   reload: () => void;
-  range: Pick<QueryBarView<R>, "value" | "options" | "onChange">;
+  range: Pick<QueryBarView<R>, "value" | "options" | "onChange" | "chartRange">;
 }) {
   const [query, setQuery] = useState("");
   const { active: searchFocused, searchProps } = useQueryBarSearch();
+  const resetChartView = useChartViewReset();
 
   // The table leaves `r` to this handler, which also answers with no table focused.
   useShortcut((event) => {
@@ -75,7 +79,8 @@ export function useSeriesList<Item, R extends string>({
     if (!picked) return;
     event.preventDefault?.();
     event.stopPropagation?.();
-    range.onChange(picked.value);
+    if (range.chartRange && picked.value === range.value) resetChartView();
+    else range.onChange(picked.value);
   });
 
   const normalizedQuery = query.trim().toLowerCase();
@@ -171,13 +176,17 @@ export function SeriesListDetail<Row, Column extends DataTableColumn, R extends 
   // pane height leaves its lower content clipped outside the scroll viewport.
   const detailHeight = split ? bodyHeight : Math.max(1, bodyHeight - tableHeight);
   const bodyFocused = focused && !list.searchFocused;
+  // On the desktop and the web the query bar is taller than a row, so the
+  // split table and the detail take what is left under it by flex and end at
+  // the pane footer; the row counts above stay the terminal's.
+  const fill = nativePaneChrome ? FILL_REST : null;
 
   return (
-    <Box flexDirection="column" width={width} height={height}>
+    <Box flexDirection="column" width={width} {...(fill ?? { height })}>
       <QueryBar width={width} search={{ ...list.search, placeholder: searchPlaceholder }} filters={filters} view={list.range} />
-      <Box flexDirection={split ? "row" : "column"} flexGrow={1} overflow="hidden">
+      <Box flexDirection={split ? "row" : "column"} flexGrow={1} overflow="hidden" {...(fill ? { flexBasis: 0, minHeight: 0 } : {})}>
         <Box flexDirection="column" width={listWidth} flexShrink={0}>
-          <Box flexDirection="column" width={listWidth} height={tableHeight} flexShrink={0} overflow="hidden">
+          <Box flexDirection="column" width={listWidth} overflow="hidden" {...(fill && split ? fill : { height: tableHeight, flexShrink: 0 })}>
             <DataTableView<Row, Column>
               focused={bodyFocused}
               rootWidth={listWidth}
@@ -201,8 +210,8 @@ export function SeriesListDetail<Row, Column extends DataTableColumn, R extends 
           </Box>
         </Box>
 
-        <Box flexDirection="column" flexGrow={1} width={detailWidth} height={detailHeight} overflow="hidden">
-          <ScrollBox height={detailHeight} scrollY focusable={false}>
+        <Box flexDirection="column" width={detailWidth} overflow="hidden" {...(fill ? split ? { flexGrow: 1, minHeight: 0 } : fill : { flexGrow: 1, height: detailHeight })}>
+          <ScrollBox scrollY focusable={false} {...(fill ? fill : { height: detailHeight })}>
             {renderDetail({ width: detailContentWidth, height: detailHeight, focused: bodyFocused })}
           </ScrollBox>
         </Box>

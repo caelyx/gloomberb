@@ -1,9 +1,10 @@
 import { apiClient } from "../../../api-client";
 import type { FuturesCurvePayload } from "../../../api-client/futures-curve";
 import { createPluginCache } from "../../../data/plugin-cache";
+import { isFuturesContractSpec } from "../../../market-data/futures-contract";
 import { loadCloudResource, unavailableOnServer } from "../shared/cloud-resource";
 import type { DataProvider } from "../../../types/data-provider";
-import { archivedFuturesCurve, curveLookbackDate, curveSpot, normalizeCurveRoot, unsupportedCurveRootMessage, type CurveSpot } from "./model";
+import { archivedFuturesCurve, curveLookbackDate, curveSpot, normalizeCurveRoot, unsupportedCurveRootMessage, withTradedExpirations, type CurveSpot } from "./model";
 
 export const futuresCurveCache = createPluginCache<FuturesCurvePayload>({
   kind: "futures-curve", source: "gloom-cloud", schemaVersion: 1,
@@ -14,12 +15,8 @@ const timestamp = (value: unknown) => typeof value === "string" && Number.isFini
 const date = (value: unknown) => timestamp(value) && new Date(value as string).toISOString().slice(0, 10) === value;
 const rank = (value: unknown) => value === null || typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100;
 const optionalDate = (value: unknown) => value === undefined || value === null || date(value);
-const positiveNumber = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value > 0;
 /** Contract terms the pane computes with; a curve from before the server sent them has none. */
-const validSpec = (spec: unknown) => spec === undefined || spec === null || typeof spec === "object"
-  && typeof (spec as Record<string, unknown>).unit === "string" && typeof (spec as Record<string, unknown>).size === "string"
-  && ["tick", "tickValue", "pointValue"].every((key) => positiveNumber((spec as Record<string, unknown>)[key]))
-  && ["physical", "cash"].includes(String((spec as Record<string, unknown>).settlement));
+const validSpec = (spec: unknown) => spec === undefined || spec === null || isFuturesContractSpec(spec);
 
 export function validateFuturesCurve(data: FuturesCurvePayload, root: string): FuturesCurvePayload {
   if (!data || data.root !== root || !Array.isArray(data.contracts) || !Array.isArray(data.ghosts)
@@ -63,19 +60,19 @@ export function validateFuturesCurve(data: FuturesCurvePayload, root: string): F
 export async function fetchFuturesCurve(root: string, client: Pick<typeof apiClient, "getCloudFuturesCurve"> = apiClient): Promise<FuturesCurvePayload> {
   const normalized = normalizeCurveRoot(root);
   if (!normalized) throw new Error(unsupportedCurveRootMessage(root));
-  try { return validateFuturesCurve(await client.getCloudFuturesCurve(normalized), normalized); }
+  try { return withTradedExpirations(validateFuturesCurve(await client.getCloudFuturesCurve(normalized), normalized)); }
   catch (error) { throw unavailableOnServer(error, "Futures curves are not available yet."); }
 }
 
 export function getCachedFuturesCurve(root: string): FuturesCurvePayload | null {
   const cached = futuresCurveCache.get(root, { allowExpired: true });
   // The pane revalidates this copy on mount; only the source or a failed refresh makes it stale.
-  return cached?.data ?? null;
+  return cached?.data ? withTradedExpirations(cached.data) : null;
 }
 
 export async function loadFuturesCurve(root: string, force = false): Promise<FuturesCurvePayload> {
   const { payload, stale, refreshError } = await loadCloudResource(futuresCurveCache, root, () => fetchFuturesCurve(root), { force });
-  return { ...payload, stale: stale || payload.stale, gaps: [...payload.gaps, ...(refreshError ? [refreshError] : [])] };
+  return { ...withTradedExpirations(payload), stale: stale || payload.stale, gaps: [...payload.gaps, ...(refreshError ? [refreshError] : [])] };
 }
 
 /** The archived curve on a past date with the curves a week and a month before it. */

@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import type { PaneTemplateDef } from "../../types/plugin";
 import {
+  buildCreateOptions,
   optionPaneState,
   parseArgumentsOption,
   parsePaneFunctionArgs,
@@ -55,8 +57,27 @@ describe("pane function CLI args", () => {
     expect(() => parsePaneFunctionArgs(["GC", "--width", "wide"])).toThrow('--width takes a size in pixels from 720 to 2400, got "wide".');
   });
 
+  test("a comma where --scale reads a number is refused, with the dotted number to type", () => {
+    expect(() => parsePaneFunctionArgs(["GC", "--scale", "2,5"])).toThrow('--scale must be a number between 0.5 and 4, got "2,5"; use a dot: 2.5');
+    expect(() => parsePaneFunctionArgs(["GC", "--scale", "9"])).toThrow('--scale must be a number between 0.5 and 4, got "9".');
+  });
+
+  test("a ticker list past the pane's limit keeps every symbol, split as a pasted list is", () => {
+    const list = { id: "list", paneId: "list", label: "List", description: "List", shortcut: { prefix: "LST", argPlaceholder: "tickers", argKind: "ticker-list" } } as PaneTemplateDef;
+    const symbols = Array.from({ length: 12 }, (_, index) => `S${index + 1}`);
+    expect(buildCreateOptions(list, symbols.join(", "))?.symbols).toEqual(symbols);
+    expect(buildCreateOptions(list, symbols.map((symbol) => symbol.toLowerCase()).join("\n"))?.symbols).toEqual(symbols);
+  });
+
   test("--explain is a switch, so the token after it stays the function's argument", () => {
     expect(parsePaneFunctionArgs(["AUCT", "--explain", "bill"])).toMatchObject({ target: "AUCT", arg: "bill", explain: true, options: {} });
+  });
+
+  test("--strict is a switch, so the token after it stays the function's argument", () => {
+    expect(parsePaneFunctionArgs(["OVDV", "--strict", "SPY", "--tab", "term"])).toMatchObject({
+      target: "OVDV", arg: "SPY", strict: true, options: { tab: "term" },
+    });
+    expect(parsePaneFunctionArgs(["OVDV", "SPY"]).strict).toBeUndefined();
   });
 
   test("expands --arguments key-value pairs", () => {

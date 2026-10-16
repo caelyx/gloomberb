@@ -2,9 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { ApiRequestError } from "../../../api-client/errors";
 import type { FuturesContract, FuturesCurveAsOfPayload, FuturesCurvePayload } from "../../../api-client/futures-curve";
 import { fetchFuturesCurve, validateFuturesCurve } from "./client";
-import { FUTURES_CONTRACTS } from "../futures/contracts";
+import { FUTURES_CONTRACTS } from "../../../market-data/futures-board";
 import type { CompositeAxisDomain } from "../../../components/chart/composite/types";
-import { annualisedBasisPct, archivedFuturesCurve, basisSpotSymbol, contractBasis, CURVE_ROOTS, curveAsOfDate, curveAxisPrice, curveBasisPercent, curveBasisRows, curveChangeText, curveContractChanges, curveContractMonth, curvePrice, curveRank, curveRootForTicker, curveSpot, curveSpotLabel, curveSpreadLabel, daysToExpiry, futuresCurveSeries, newestQuote, normalizeCurveRoot, sortCurveContracts, thinContractCount, thinContractsNotice, vsSpotPct } from "./model";
+import { annualisedBasisPct, archivedFuturesCurve, basisSpotSymbol, blankBasisNote, contractBasis, CURVE_ROOTS, curveAsOfDate, curveAxisPrice, curveBasisPercent, curveBasisRows, curveChangeText, curveContractChanges, curveContractMonth, curvePrice, curveRank, curveRootForTicker, curveSpot, curveSpotLabel, curveSpotSource, curveSpreadLabel, curveUnitLabel, daysToExpiry, futuresCurveSeries, newestQuote, normalizeCurveRoot, shortDatedBasisNote, sortCurveContracts, thinContractCount, thinContractsNotice, vsSpotPct } from "./model";
 import { futuresCurveModule } from "./index";
 
 const first: FuturesContract = { symbol: "CLX26.NYM", label: "Nov 2026", expiration: "2026-10-20",
@@ -55,6 +55,7 @@ test("normalizes FUT aliases before cloud request and handles missing endpoints 
   await fetchFuturesCurve("cl=f", { getCloudFuturesCurve: async (root) => { requested.push(root); return payload(); } });
   expect(requested).toEqual(["CL"]);
   await expect(fetchFuturesCurve("BAD", { getCloudFuturesCurve: async () => { throw new Error("should not request"); } })).rejects.toThrow("No futures curve for BAD");
+  expect(normalizeCurveRoot("ttf=f")).toBe("TTF");
   await expect(fetchFuturesCurve("CL", { getCloudFuturesCurve: async () => { throw new ApiRequestError("Not found", 404); } })).rejects.toThrow("not available yet");
   const denied = new ApiRequestError("Forbidden", 403);
   await expect(fetchFuturesCurve("CL", { getCloudFuturesCurve: async () => { throw denied; } })).rejects.toBe(denied);
@@ -108,6 +109,65 @@ test("CME crypto roots are listed with prices at their tick, and FUT's board kee
   expect(curveChangeText(-0.0935, "XRP")).toBe("-0.0935");
 });
 
+test("Dutch TTF gas is a curve root that reads in euros per MWh at its 0.001 tick", () => {
+  expect(["ttf", "TTF=F", " ttf "].map(normalizeCurveRoot)).toEqual(["TTF", "TTF", "TTF"]);
+  expect(["TTF", "TTF=F"].map(curveRootForTicker)).toEqual(["TTF", "TTF"]);
+  expect(CURVE_ROOTS.find((row) => row.value === "TTF")).toBeDefined();
+  expect(curvePrice(81.434, "TTF")).toBe("81.434");
+  expect(curvePrice(62.72, "TTF")).toBe("62.720");
+  expect(curveChangeText(2.5849999, "TTF")).toBe("+2.585");
+  expect(curveChangeText(-0.088, "TTF")).toBe("-0.088");
+  const ttf = { ...payload(), root: "TTF", currency: "EUR", quoteUnit: "EUR", spec: null };
+  // The server sends no contract terms for the euro contract, so the catalogue says what a price counts.
+  expect(curveUnitLabel(ttf)).toBe("EUR / MWh");
+  // A root with neither terms nor a catalogue unit reads its quote unit, and the server's terms win.
+  expect(curveUnitLabel({ ...payload(), spec: null })).toBe("USD");
+  expect(curveUnitLabel({ ...ttf, spec: { unit: "EUR / MWh", size: "1 MW", pointValue: 1, tick: 0.001, tickValue: 0.001, settlement: "cash" } })).toBe("EUR / MWh");
+  // A past TTF curve keeps the archive's euro rather than defaulting to dollars.
+  const past = archivedFuturesCurve("TTF", { root: "TTF", name: "Dutch TTF Natural Gas", date: "2026-10-02", asOf: "2026-10-02", currency: "EUR", quoteUnit: "EUR",
+    archiveStart: "2020-11-30", gaps: [], spec: null, contracts: [{ contract: "TTFX26", symbol: "TTFX26.NYM", label: "Nov 26", deliveryMonth: "2026-11", expiration: "2026-10-29",
+      tradeDate: "2026-10-02", price: 74.76, volume: 458, openInterest: 1449, asOf: "2026-10-02T04:00:00.000Z", stale: false, settled: true }] },
+  { "1W": null, "1M": null }, "2026-10-11T00:00:00Z");
+  expect(past.contracts[0]).toMatchObject({ currency: "EUR", quoteUnit: "EUR" });
+  expect(curveUnitLabel(past)).toBe("EUR / MWh");
+});
+
+test("every FUT board root opens a curve, as a typed code or an =F symbol; the cursor keeps a security's code", async () => {
+  const requested: string[] = [];
+  for (const row of FUTURES_CONTRACTS) {
+    for (const typed of [row.code, row.code.toLowerCase(), row.symbol]) expect(normalizeCurveRoot(typed)).toBe(row.code);
+    expect(CURVE_ROOTS.some((root) => root.value === row.code)).toBe(true);
+    await fetchFuturesCurve(row.symbol, { getCloudFuturesCurve: async (root) => { requested.push(root); return { ...payload(), root }; } });
+  }
+  expect(requested).toEqual(FUTURES_CONTRACTS.map((row) => row.code));
+  // Zoom, KC wheat's, live cattle's, lean hogs' and aluminum's codes are listed securities too, as are those of a sector ETF
+  // (XAR), Goldmoney (XAU), Sensient (SXT) and the micros listed abroad: under the cursor they open the curve only as the
+  // future's symbol, while a typed argument always means the future.
+  const securities = ["ZM", "KE", "LE", "HE", "ALI", "EMD", "RS1", "MES", "MYM", "M2K", "SXT", "SXI", "SOX", "XAU", "XAR", "RX", "MCL", "MNG", "HH"];
+  for (const row of FUTURES_CONTRACTS) {
+    expect(curveRootForTicker(row.symbol)).toBe(row.code);
+    expect(curveRootForTicker(row.code.toLowerCase())).toBe(securities.includes(row.code) ? null : row.code);
+  }
+  // No bare-code row has a security answering to it, so those open from the cursor like ES always has.
+  expect(["ZL", "OJ", "LBR", "ZW", "TTF", "SXO"].map(curveRootForTicker)).toEqual(["ZL", "OJ", "LBR", "ZW", "TTF", "SXO"]);
+  const template = futuresCurveModule.paneTemplates![0]!;
+  const open = (arg: string | undefined, activeTicker: string | null) => template.createInstance!({ activeTicker } as never, { arg } as never);
+  expect(await open(undefined, "ZM")).toMatchObject({ title: "Curve · ES", params: { root: "ES" } });
+  expect(await open("ZM", "ZM")).toMatchObject({ title: "Curve · ZM", params: { root: "ZM" } });
+  expect(await open(undefined, "ZM=F")).toMatchObject({ title: "Curve · ZM", params: { root: "ZM" } });
+  expect(await open(undefined, "ALI")).toMatchObject({ title: "Curve · ES", params: { root: "ES" } });
+  expect(await open(undefined, "OJ")).toMatchObject({ title: "Curve · OJ", params: { root: "OJ" } });
+});
+
+test("roots the server sends no terms for read their catalogue unit, each price at its tick", () => {
+  const curve = (root: string, quoteUnit: string) => ({ ...payload(), root, currency: quoteUnit, quoteUnit, spec: null });
+  expect([["ALI", "USD"], ["OJ", "USX"], ["LBR", "USD"], ["LE", "USX"], ["HE", "USX"]].map(([root, unit]) => curveUnitLabel(curve(root!, unit!))))
+    .toEqual(["USD / metric ton", "US cents / lb", "USD / 1,000 board ft", "US cents / lb", "US cents / lb"]);
+  // Soybean meal to a dime, live cattle and lean hogs to 0.025 cents, lumber to 50 cents.
+  expect([["ZM", 368.7], ["ZL", 67.72], ["KE", 719.25], ["OJ", 149.95], ["LE", 224.975], ["HE", 75.05], ["LBR", 533], ["ALI", 3172.5]]
+    .map(([root, price]) => curvePrice(price as number, root as string))).toEqual(["368.70", "67.72", "719.25", "149.95", "224.975", "75.050", "533.00", "3172.50"]);
+});
+
 test("a crypto root opens from a typed argument, a crypto ticker or a futures symbol, never from the equity under the cursor", async () => {
   expect(["btc", "ETH", "sol=f", " xrp "].map(normalizeCurveRoot)).toEqual(["BTC", "ETH", "SOL", "XRP"]);
   // BTC and ETH are Grayscale's mini trusts, SOL an equity too: the bare symbol is theirs.
@@ -119,12 +179,12 @@ test("a crypto root opens from a typed argument, a crypto ticker or a futures sy
 
   const template = futuresCurveModule.paneTemplates![0]!;
   const open = (arg: string | undefined, activeTicker: string | null) => template.createInstance!({ activeTicker } as never, { arg } as never);
-  expect(await open("BTC", "AAPL")).toMatchObject({ title: "CTM BTC", params: { root: "BTC" } });
-  expect(await open(undefined, "BTC")).toMatchObject({ title: "CTM ES", params: { root: "ES" } });
-  expect(await open(undefined, "ETH-USD")).toMatchObject({ title: "CTM ETH", params: { root: "ETH" } });
-  expect(await open(undefined, "SOL")).toMatchObject({ title: "CTM ES" });
+  expect(await open("BTC", "AAPL")).toMatchObject({ title: "Curve · BTC", params: { root: "BTC" } });
+  expect(await open(undefined, "BTC")).toMatchObject({ title: "Curve · ES", params: { root: "ES" } });
+  expect(await open(undefined, "ETH-USD")).toMatchObject({ title: "Curve · ETH", params: { root: "ETH" } });
+  expect(await open(undefined, "SOL")).toMatchObject({ title: "Curve · ES" });
   // An explicit argument still wins over the cursor.
-  expect(await open("XRP", "BTC-USD")).toMatchObject({ title: "CTM XRP" });
+  expect(await open("XRP", "BTC-USD")).toMatchObject({ title: "Curve · XRP" });
   const requested: string[] = [];
   await fetchFuturesCurve("btc", { getCloudFuturesCurve: async (root) => { requested.push(root); return { ...payload(), root }; } });
   expect(requested).toEqual(["BTC"]);
@@ -250,6 +310,41 @@ describe("basis against spot", () => {
     // A quote from an earlier UTC day carries its date.
     expect(curveSpotLabel(spot, "BTC", SPOT_AT + 86_400_000)).toBe("spot BTC-USD 67,250.10 · 2026-10-09 07:25 UTC");
     expect(curveSpotLabel(curveSpot("XRP-USD", { price: 1.3978, lastUpdated: SPOT_AT }, SPOT_AT), "XRP", SPOT_AT)).toBe("spot XRP-USD 1.3978 · 07:25 UTC");
+  });
+
+  test("the quote path's own listing and feed stay beside the spot, and the footer names them only when the quote reports them", () => {
+    const reported = curveSpot("BTC-USD", { ...btc, listingExchangeName: "CCC", dataSource: "live" }, SPOT_AT);
+    expect(reported).toMatchObject({ status: "ok", venue: "CCC", feed: "real-time" });
+    expect(curveSpotSource(reported)).toBe("CCC, real-time");
+    expect(curveSpotSource(curveSpot("BTC-USD", { ...btc, exchangeName: " CCC ", dataSource: "delayed" }, SPOT_AT))).toBe("CCC, delayed");
+    // A stale spot still says what it was, and a snapshot is neither real-time nor delayed.
+    expect(curveSpot("BTC-USD", { ...btc, listingExchangeName: "CCC", dataSource: "snapshot" }, SPOT_AT + 3_600_000)).toMatchObject({ status: "stale", venue: "CCC" });
+    expect(curveSpot("BTC-USD", { ...btc, listingExchangeName: "CCC", dataSource: "snapshot" }, SPOT_AT)).not.toHaveProperty("feed");
+    // A quote that reports neither is not given a venue it did not name.
+    expect(curveSpotSource(curveSpot("BTC-USD", btc, SPOT_AT))).toBeNull();
+    expect(curveSpot("BTC-USD", btc, SPOT_AT)).not.toHaveProperty("venue");
+  });
+
+  test("a blank basis names its contracts and cause, and a short-dated rate says what 10 bp of spot noise does to it", () => {
+    const spot = curveSpot("BTC-USD", btc, SPOT_AT);
+    const row = (code: string, expiration: string, extra: Partial<FuturesContract> = {}): FuturesContract =>
+      ({ ...first, symbol: `${code}.CME`, expiration, price: 67_500, stale: false, asOf: "2026-10-09T07:24:00Z", ...extra });
+    const rows = [row("BTCV26", "2026-10-27"), row("BTCX26", "2026-11-27"),
+      // Printed hours (and a day) before the spot, unpriced, and flagged stale by the server.
+      row("BTCZ26", "2026-12-25", { asOf: "2026-10-09T05:00:00Z" }), row("BTCF27", "2027-01-29", { asOf: "2026-10-08" }),
+      row("BTCG27", "2027-02-26", { price: null }), row("BTCH27", "2027-03-26", { stale: true })];
+    const basis = curveBasisRows(rows, spot);
+    expect(blankBasisNote(rows, basis)).toBe("Basis blank for BTCZ26, BTCF27 (last trade over 1h before the spot quote); BTCG27 (no price); BTCH27 (price over two sessions old).");
+    // 18 days: 10 bp of spot is 0.1% x 365 / 18 = 2.0 points a year. Beyond 30 days nothing is said.
+    expect(shortDatedBasisNote(rows, basis, spot)).toBe("Ann Basis is noisy under 30 days to expiry: 10 bp of spot noise moves BTCV26 (18d) by ±2.0 points.");
+    const nearer = [row("BTCU26", "2026-10-14"), rows[0]!, row("BTCT26", "2026-10-09")];
+    expect(shortDatedBasisNote(nearer, curveBasisRows(nearer, spot), spot))
+      .toBe("Ann Basis is noisy under 30 days to expiry: 10 bp of spot noise moves BTCU26 (5d) by ±7.3 points, BTCV26 (18d) by ±2.0 points.");
+    // A curve with every cell filled, or one past 30 days, has nothing to say; a spot that is not usable blanks the cells for its own reason.
+    expect(blankBasisNote(rows.slice(0, 2), curveBasisRows(rows.slice(0, 2), spot))).toBeNull();
+    expect(shortDatedBasisNote(rows.slice(1, 2), curveBasisRows(rows.slice(1, 2), spot), spot)).toBeNull();
+    expect(shortDatedBasisNote(rows, curveBasisRows(rows, curveSpot("BTC-USD", btc, SPOT_AT + 3_600_000)), curveSpot("BTC-USD", btc, SPOT_AT + 3_600_000))).toBeNull();
+    expect(shortDatedBasisNote(rows, basis, null)).toBeNull();
   });
 
   test("only the four crypto roots have a spot, and the basis columns sort with blanks last", () => {

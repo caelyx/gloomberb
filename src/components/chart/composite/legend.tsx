@@ -1,11 +1,17 @@
 import { useEffect, useRef } from "react";
-import { Box, ScrollBox, Text, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
+import { Box, ScrollBox, Span, Text, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { colors as themeColors, hoverBg } from "../../../theme/colors";
 import { CANONICAL_EXCHANGE_ALIASES } from "../../../utils/exchanges";
 import { displayWidth, formatPercentRaw, truncateToDisplayWidth } from "../../../utils/format";
 import type { ResolvedSeries } from "../../../time-series/types";
 import { consumeChartMouseEvent, type ChartMouseEvent } from "../core/pointer";
-import { formatCompositePointDetails, formatCompositeSeriesValue, seriesPriceReference } from "./format";
+import {
+  formatCompositeCarriedStamp,
+  formatCompositeDatasetDate,
+  formatCompositePointDetails,
+  formatCompositeSeriesValue,
+  seriesPriceReference,
+} from "./format";
 import type { CompositeChartProps, CompositeChartScene } from "./types";
 import { seriesCueCssBackground, type SeriesLineCue } from "./series-cues";
 
@@ -17,7 +23,8 @@ const DOT_MARKER = "● ";
 const DOM_DOT_CELLS = 2;
 const DOM_LINE_CELLS = 3;
 
-function legendValue(
+/** A series' value as the legend prints it, in the series' own unit. */
+function formatLegendSeriesValue(
   series: ResolvedSeries,
   value: number | null,
   formatValue: CompositeChartProps["formatValue"],
@@ -44,6 +51,44 @@ function axisPriceReference(scene: CompositeChartScene | null, series: ResolvedS
   return own;
 }
 
+/**
+ * A dataset's values arrive days late, so the legend dates them. Idle, one
+ * date leads the legend when it is every value's; otherwise, and under the
+ * cursor for a value older than the cursor's date, each carries its own.
+ */
+function legendValueDates(
+  series: readonly ResolvedSeries[],
+  scene: CompositeChartScene | null,
+  cursorValueById: ReadonlyMap<string, CompositeChartScene["cursorValues"][number]>,
+): { lead: string | null; own: ReadonlyMap<string, string> } {
+  const dates = new Map<string, Date>();
+  let valued = 0;
+  for (const entry of series) {
+    const cursorValue = cursorValueById.get(entry.id);
+    if (cursorValue?.value == null) continue;
+    valued += 1;
+    if (entry.observationKind === "dataset" && cursorValue.point) dates.set(entry.id, cursorValue.point.date);
+  }
+  const text = new Map([...dates].map(([id, date]) => [id, formatCompositeDatasetDate(date, scene?.endTime)] as const));
+  const cursorDate = scene?.cursorDate;
+  if (cursorDate) {
+    const cursorDay = cursorDate.toISOString().slice(0, 10);
+    const own = new Map([...text].filter(([id]) => dates.get(id)!.toISOString().slice(0, 10) !== cursorDay));
+    // Any other value carried from before the cursor says when it is from:
+    // another venue's last bar, a coarser series, the last print before a halt.
+    for (const entry of series) {
+      const cursorValue = cursorValueById.get(entry.id);
+      if (dates.has(entry.id) || !cursorValue?.carried || cursorValue.value == null || !cursorValue.point) continue;
+      own.set(entry.id, formatCompositeCarriedStamp(cursorValue.point.date, cursorDate, scene?.timeZone));
+    }
+    return { lead: null, own };
+  }
+  const shared = new Set(text.values());
+  return text.size > 0 && text.size === valued && shared.size === 1
+    ? { lead: [...shared][0]!, own: new Map() }
+    : { lead: null, own: text };
+}
+
 const LISTED_TICKER_PATTERN = /(^|[\s(])([A-Z0-9^][A-Z0-9.^=/-]*):([A-Z0-9]{2,})(?=$|[\s),])/g;
 
 /** `Volume AAPL:XNAS Price` → `Volume AAPL Price`, for a legend name that must shorten. */
@@ -51,6 +96,42 @@ function withoutListingExchange(label: string): string {
   return label.replace(LISTED_TICKER_PATTERN, (match, lead: string, symbol: string, exchange: string) => (
     CANONICAL_EXCHANGE_ALIASES[exchange] ? `${lead}${symbol}` : match
   ));
+}
+
+/** The legend's marker for a series on the desktop: its line as the plot strokes it, or a dot. */
+function CompositeSeriesSwatch({ series, cue, filled = true }: {
+  series: ResolvedSeries;
+  cue: SeriesLineCue | null;
+  filled?: boolean;
+}) {
+  return cue ? (
+    // The line as the plot strokes it: solid, dashed, dotted or heavy.
+    <Box
+      flexShrink={0}
+      style={{
+        width: 16,
+        height: Math.max(2, Math.round(cue.thickness)),
+        marginInlineEnd: 6,
+        background: seriesCueCssBackground(cue, series.color),
+        opacity: filled ? 1 : 0.35,
+      }}
+      data-gloom-role="composite-chart-legend-marker"
+      data-gloom-cue={cue.id}
+    />
+  ) : (
+    <Box
+      flexShrink={0}
+      style={{
+        width: 8,
+        height: 8,
+        marginInlineEnd: 6,
+        borderRadius: 999,
+        border: `1px solid ${series.color}`,
+        backgroundColor: filled ? series.color : "transparent",
+      }}
+      data-gloom-role="composite-chart-legend-marker"
+    />
+  );
 }
 
 export function CompositeLegend({
@@ -91,6 +172,7 @@ export function CompositeLegend({
   const cursorValueById = new Map(
     scene?.cursorValues.map((entry) => [entry.seriesId, entry] as const) ?? [],
   );
+  const valueDates = legendValueDates(series, scene, cursorValueById);
   const entries = series.map((entry) => {
     const cue = lineCues.get(entry.id) ?? null;
     const marker = cue ? `${cellPlot ? cue.glyph : cue.sample} ` : DOT_MARKER;
@@ -103,14 +185,20 @@ export function CompositeLegend({
         && Number.isFinite(entry.latestChangePercent)
       ? ` ${formatPercentRaw(entry.latestChangePercent)}`
       : "";
+    const ownDate = valueDates.own.get(entry.id);
+    // Carried from an earlier observation: another venue's closed session, a coarser series.
+    const carried = !!scene?.cursorDate && !!cursorValue?.carried && cursorValue.value != null;
+    // What a futures price counts, beside its number as FUT prints it.
+    const statedUnit = entry.points.length > 0 && !formatValue && entry.statedUnit ? ` ${entry.statedUnit}` : "";
+    const valueTail = `${ownDate ? ` ${ownDate}` : ""}${changeText}`;
     const valueText = entry.points.length === 0
       ? entry.hidden ? "" : "no data"
-      : `${legendValue(
+      : `${formatLegendSeriesValue(
         entry,
         cursorValue?.value ?? null,
         formatValue,
         scene,
-      )}${changeText}`;
+      )}${statedUnit}${valueTail}`;
     const fullText = [entry.label, valueText].filter(Boolean).join(" ");
     const details = formatCompositePointDetails(cursorValue?.point);
     const exactTotal = entry.unitGroup.split(":")[0] === "currency-total"
@@ -132,8 +220,11 @@ export function CompositeLegend({
       width: Math.max(1, displayWidth(text)) + markerWidth,
       labelWidth,
       valueText,
+      statedUnit,
+      valueTail,
       toggleable,
       tooltip,
+      carried,
     };
   });
   type LegendEntry = (typeof entries)[number];
@@ -150,7 +241,8 @@ export function CompositeLegend({
   // One cell in from the pane border, so the first marker and the legend text
   // line up with the query bar and tables above and below the chart.
   const inset = width > 1 ? 1 : 0;
-  const innerWidth = Math.max(0, width - inset);
+  const leadWidth = valueDates.lead ? displayWidth(valueDates.lead) + 1 : 0;
+  const innerWidth = Math.max(0, width - inset - leadWidth);
   const resolvedAccessoryWidth = accessory
     ? Math.max(1, Math.min(innerWidth, Math.floor(accessoryWidth ?? 14)))
     : 0;
@@ -253,6 +345,11 @@ export function CompositeLegend({
       zIndex={accessory ? 40 : 20}
       data-gloom-role="composite-chart-legend"
     >
+      {valueDates.lead ? (
+        <Box width={leadWidth} height={1} flexShrink={0} data-gloom-role="composite-chart-legend-date">
+          <Text fg={themeColors.textMuted}>{valueDates.lead}</Text>
+        </Box>
+      ) : null}
       {seriesWidth > 0 ? (
         <ScrollBox
           ref={scrollRef}
@@ -266,8 +363,9 @@ export function CompositeLegend({
           data-gloom-role="composite-chart-legend-scroll"
         >
           <Box flexDirection="row" width={desiredSeriesWidth} height={1} gap={1}>
-            {entries.map(({ entry, cue, marker, text, toggleable, tooltip, width: entryWidth }, index) => {
+            {entries.map(({ entry, cue, marker, text, statedUnit, valueTail, toggleable, tooltip, carried, width: entryWidth }, index) => {
               const entryVisible = visibleSeriesIds.has(entry.id);
+              const unitAt = statedUnit ? text.length - statedUnit.length - valueTail.length : -1;
               return (
               <Box
                 key={entry.id}
@@ -291,41 +389,25 @@ export function CompositeLegend({
                   ? `${entryVisible ? "Hide" : "Show"} `
                   : ""}${tooltip}`}
                 data-visible={entryVisible ? "true" : "false"}
+                data-carried={carried ? "true" : undefined}
                 title={isDesktopWeb ? tooltip : undefined}
               >
-                {isDesktopWeb && cue ? (
-                  // The line as the plot strokes it: solid, dashed, dotted or heavy.
-                  <Box
-                    flexShrink={0}
-                    style={{
-                      width: 16,
-                      height: Math.max(2, Math.round(cue.thickness)),
-                      marginInlineEnd: 6,
-                      background: seriesCueCssBackground(cue, entry.color),
-                      opacity: entryVisible ? 1 : 0.35,
-                    }}
-                    data-gloom-role="composite-chart-legend-marker"
-                    data-gloom-cue={cue.id}
-                  />
-                ) : isDesktopWeb ? (
-                  <Box
-                    flexShrink={0}
-                    style={{
-                      width: 8,
-                      height: 8,
-                      marginInlineEnd: 6,
-                      borderRadius: 999,
-                      border: `1px solid ${entry.color}`,
-                      backgroundColor: entryVisible ? entry.color : "transparent",
-                    }}
-                    data-gloom-role="composite-chart-legend-marker"
-                  />
+                {isDesktopWeb ? (
+                  <CompositeSeriesSwatch series={entry} cue={cue} filled={entryVisible} />
                 ) : (
                   <Text fg={entryVisible ? entry.color : themeColors.textMuted}>{marker}</Text>
                 )}
                 {/* The filled/hollow marker already says whether a series is
                     shown; the word only repeated it in every legend slot. */}
-                <Text fg={entryVisible ? themeColors.text : themeColors.textDim}>{text}</Text>
+                <Text fg={entryVisible && !carried ? themeColors.text : themeColors.textDim}>
+                  {unitAt >= 0 ? (
+                    <>
+                      {text.slice(0, unitAt)}
+                      <Span fg={themeColors.textDim}>{statedUnit}</Span>
+                      {valueTail}
+                    </>
+                  ) : text}
+                </Text>
               </Box>
               );
             })}

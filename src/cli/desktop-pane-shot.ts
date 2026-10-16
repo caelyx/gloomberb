@@ -1,7 +1,7 @@
 import type { TapeCapture } from "../plugins/builtin/time-sales/snapshot-client";
 import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join, resolve, sep } from "path";
+import { join } from "path";
 import { encodeRpcValue } from "../renderers/electrobun/shared/rpc-codec";
 import type { AppConfig } from "../types/config";
 import type { ChartResolutionResult } from "../time-series/types";
@@ -21,10 +21,8 @@ import { readVisibleKeyValues } from "./visible-key-values";
 import { scrollTruncationReasons } from "./scroll-truncation";
 import { SHOT_API_PROXY_PREFIX, SHOT_HTTP_BRIDGE_PATH, SHOT_MARKET_BRIDGE_PATH } from "./desktop-pane-shot-routes";
 import { SESSION_COOKIE_NAMES } from "../api-client/session-cookie";
-import {
-  electrobunViewPath,
-  writeElectrobunViewPage,
-} from "../renderers/dom/build-assets";
+import { renderElectrobunViewHtml } from "../renderers/dom/build-assets";
+import { loadShotView, SHOT_VIEW_SCRIPT, SHOT_VIEW_STYLESHEET, type ShotViewFiles } from "./desktop-pane-shot-view";
 import { errorMessage } from "../utils/errors";
 
 export interface DesktopPaneShotIntradayHistory {
@@ -60,6 +58,14 @@ export interface DesktopPaneShotPayload {
    * once the pane has loaded. Absent for `--no-status` and for reports.
    */
   statusLine?: boolean;
+  /**
+   * The tallest the capture may grow, in cells, to show every row its tables
+   * scroll past or all the text its reader scrolls past; absent keeps the
+   * requested height (`--height`, most panes).
+   */
+  maxHeightCells?: number;
+  /** The `data-gloom-role`s of the scrolling boxes the capture grows to fit; the tables' bodies when absent. */
+  fitRoles?: string[];
   tickers: TickerRecord[];
   /** Broker accounts as last synced, by profile, so a broker portfolio shows its equity and cash. */
   brokerAccounts?: Record<string, BrokerAccount[]>;
@@ -105,6 +111,8 @@ interface DesktopPaneShotRenderedCell {
   text: string;
   /** The ISO instant behind a cell whose text shortens a time ("Wed 11:27"), from the table cell's export value. */
   instant?: string;
+  /** The full-precision number behind a cell whose text rounds it (a trade of -9.4596), from the same export value. */
+  value?: number;
 }
 
 export interface DesktopPaneShotRenderedRow {
@@ -115,8 +123,19 @@ export interface DesktopPaneShotRenderedRow {
   cells: DesktopPaneShotRenderedCell[];
 }
 
+interface DesktopPaneShotSurface {
+  renderer: string;
+  state: string;
+}
+
 export interface DesktopPaneShotRenderResult {
   visibleText: string;
+  /**
+   * The visible text a line per block of the page, as the browser lays it out,
+   * where `visibleText` has run them together: the words of a pane that is prose
+   * and not a table, to be read as paragraphs. Absent in a capture that did not read it.
+   */
+  visibleLines?: string[];
   /**
    * The rows a report reads, when a table reports every row (an option chain's
    * strike window) rather than those in the viewport; `rows` stays what the
@@ -127,6 +146,8 @@ export interface DesktopPaneShotRenderResult {
   reportTruncationReasons?: string[];
   /** Text of the pane footers, where a pane says whether its data is live, delayed or stale. */
   footerText?: string;
+  /** How each 3D surface in the view was drawn: `webgl`, `software` (a CPU raster) or `grid` (the 2D stand-in), and its last frame's state. */
+  surfaces?: DesktopPaneShotSurface[];
   visibleKeyValues?: Array<{ label: string; text: string }>;
   rows: DesktopPaneShotRenderedRow[];
   truncated: boolean;
@@ -145,9 +166,15 @@ export interface DesktopPaneShotRenderResult {
 
 /**
  * The status line variants for a capture, longest first, worked out from what
- * the pane rendered; null leaves the footer row empty.
+ * the pane rendered; null leaves the footer row empty. `dates` says what the
+ * line dates (`CaptureStatusLine`): the pane's own data, whose `as of` text is
+ * then left out rather than repeat the date, or the quotes on screen.
  */
-type ShotStatusLine = (rendered: DesktopPaneShotRenderResult) => readonly string[] | null | Promise<readonly string[] | null>;
+interface ShotStatusLineVariants {
+  variants: readonly string[];
+  dates?: "data" | "quotes" | null;
+}
+type ShotStatusLine = (rendered: DesktopPaneShotRenderResult) => ShotStatusLineVariants | null | Promise<ShotStatusLineVariants | null>;
 
 type CdpResponse = {
   id?: number;
@@ -176,7 +203,8 @@ const SHOT_MODE_CSS = [
   + " line-height: var(--cell-h); font-size: 12px; letter-spacing: 0.02em; color: var(--gloom-text-dim, #888);"
   + " pointer-events: none; z-index: 1000; }";
 
-const CHROME_POLL_ATTEMPTS = 80;
+// Chrome gets 30 s (300 polls x 100 ms) to open its DevTools port: 8 s was not enough on a busy machine.
+const CHROME_POLL_ATTEMPTS = 300;
 const SHOT_READY_TIMEOUT_MS = 45_000;
 const CDP_CALL_TIMEOUT_MS = 10_000;
 const DEFAULT_DEVICE_SCALE_FACTOR = 2;
@@ -187,14 +215,12 @@ export async function renderDesktopPaneScreenshot(
   apiProxy: DesktopPaneShotApiProxy,
   options: { captureImage?: boolean; bridge?: DesktopPaneShotBridge; statusLine?: ShotStatusLine } = {},
 ): Promise<DesktopPaneShotRenderResult> {
+  const chrome = await findChromeExecutable();
+  const view = await loadShotView();
   const tempDir = await mkdtemp(join(tmpdir(), "gloom-pane-shot-"));
   let server: ReturnType<typeof Bun.serve> | null = null;
   try {
-    const outdir = join(tempDir, "assets");
-    await mkdir(outdir, { recursive: true });
-    await buildShotPage(outdir, payload);
-    server = serveShotPage(outdir, apiProxy, options.bridge ?? null);
-    const chrome = await findChromeExecutable();
+    server = serveShotPage(view, shotPageHtml(view, payload), apiProxy, options.bridge ?? null);
     return await capturePageScreenshot({
       chrome,
       url: new URL("/", server.url).href,
@@ -205,6 +231,13 @@ export async function renderDesktopPaneScreenshot(
       userDataDir: join(tempDir, "chrome-profile"),
       captureImage: options.captureImage !== false,
       statusLine: payload.statusLine ? options.statusLine : undefined,
+      ...(payload.maxHeightCells ? {
+        fitRows: {
+          heightCells: payload.heightCells,
+          maxHeightCells: payload.maxHeightCells,
+          roles: payload.fitRoles ?? ["data-table-body-scroll"],
+        },
+      } : {}),
     });
   } finally {
     server?.stop(true);
@@ -212,16 +245,12 @@ export async function renderDesktopPaneScreenshot(
   }
 }
 
-async function buildShotPage(outdir: string, payload: DesktopPaneShotPayload): Promise<string> {
+/** The page for one capture: the shared view, with this capture's pane and data in its bootstrap script. */
+function shotPageHtml(view: ShotViewFiles, payload: DesktopPaneShotPayload): string {
   const payloadJson = JSON.stringify(encodeRpcValue(payload)).replace(/</g, "\\u003c");
-  return writeElectrobunViewPage({
-    entrypoint: electrobunViewPath("cli-pane-shot-entry.tsx"),
-    outdir,
-    aliasRules: [
-      ["backend-rpc", "native-stubs/backend-rpc.ts"],
-    ],
-    failureMessage: "Failed to build desktop pane screenshot renderer.",
-    missingEntryMessage: "Desktop pane screenshot build did not produce a JavaScript entrypoint.",
+  return renderElectrobunViewHtml({
+    stylesheet: view.get(SHOT_VIEW_STYLESHEET) ?? "",
+    entrySrc: `./${SHOT_VIEW_SCRIPT}`,
     title: "Gloomberb Pane Shot",
     loadingText: "Rendering pane...",
     bootstrapScript: `
@@ -253,11 +282,11 @@ async function buildShotPage(outdir: string, payload: DesktopPaneShotPayload): P
 }
 
 function serveShotPage(
-  outdir: string,
+  view: ShotViewFiles,
+  html: string,
   apiProxy: DesktopPaneShotApiProxy,
   bridge: DesktopPaneShotBridge | null,
 ): ReturnType<typeof Bun.serve> {
-  const staticRoot = resolve(outdir);
   return Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
@@ -273,7 +302,7 @@ function serveShotPage(
       if (url.pathname === SHOT_HTTP_BRIDGE_PATH) {
         return runShotHttpBridge(request, bridge);
       }
-      return serveShotAsset(url, staticRoot);
+      return serveShotAsset(url, view, html);
     },
   });
 }
@@ -308,21 +337,22 @@ async function runShotHttpBridge(
   }
 }
 
-async function serveShotAsset(url: URL, staticRoot: string): Promise<Response> {
+function serveShotAsset(url: URL, view: ShotViewFiles, html: string): Response {
   let pathname: string;
   try {
     pathname = decodeURIComponent(url.pathname);
   } catch {
     return new Response("Bad request", { status: 400 });
   }
-  const relativePath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
-  const filePath = resolve(staticRoot, relativePath);
-  if (filePath !== staticRoot && !filePath.startsWith(`${staticRoot}${sep}`)) {
-    return new Response("Not found", { status: 404 });
+  if (pathname === "/" || pathname === "/index.html") {
+    return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
   }
-  const file = Bun.file(filePath);
-  if (!(await file.exists())) return new Response("Not found", { status: 404 });
-  return new Response(file);
+  const path = pathname.replace(/^\/+/, "");
+  const body = view.get(path);
+  if (body === undefined) return new Response("Not found", { status: 404 });
+  // A module script is only run when served as JavaScript.
+  const type = path.endsWith(".js") ? "text/javascript" : path.endsWith(".css") ? "text/css" : "text/plain";
+  return new Response(body, { headers: { "Content-Type": `${type}; charset=utf-8` } });
 }
 
 async function proxyShotApiRequest(
@@ -405,15 +435,21 @@ async function findChromeExecutable(): Promise<string> {
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
     Bun.which("google-chrome"),
+    Bun.which("google-chrome-stable"),
     Bun.which("chromium"),
     Bun.which("chromium-browser"),
+    // Windows installs Chrome outside PATH, per machine or per user.
+    ...["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"].map((name) => {
+      const dir = process.env[name];
+      return dir ? join(dir, "Google", "Chrome", "Application", "chrome.exe") : null;
+    }),
   ].filter((value): value is string => !!value);
 
   for (const candidate of candidates) {
     const file = Bun.file(candidate);
     if (await file.exists()) return candidate;
   }
-  throw new Error("Could not find Chrome or Chromium to render the desktop pane screenshot.");
+  throw new Error("Drawing a pane needs Google Chrome or Chromium, and neither was found. Install one, or set CHROME_PATH to its executable.");
 }
 
 async function capturePageScreenshot({
@@ -426,6 +462,7 @@ async function capturePageScreenshot({
   userDataDir,
   captureImage,
   statusLine,
+  fitRows,
 }: {
   chrome: string;
   url: string;
@@ -436,6 +473,7 @@ async function capturePageScreenshot({
   userDataDir: string;
   captureImage: boolean;
   statusLine?: ShotStatusLine;
+  fitRows?: { heightCells: number; maxHeightCells: number; roles: readonly string[] };
 }): Promise<DesktopPaneShotRenderResult> {
   await mkdir(userDataDir, { recursive: true });
   const port = 43000 + Math.floor(Math.random() * 10000);
@@ -481,10 +519,11 @@ async function capturePageScreenshot({
       color: { r: 0, g: 0, b: 0, a: 0 },
     });
     await waitForShotReady(session);
+    if (fitRows) await growToFitRows(session, { widthPx, heightPx, deviceScaleFactor, ...fitRows });
     const rendered = await readRenderedPaneState(session);
     if (captureImage && statusLine) {
-      const variants = await statusLine(rendered);
-      rendered.statusLine = variants?.length ? await fitShotStatusLine(session, variants) : null;
+      const line = await statusLine(rendered);
+      rendered.statusLine = line?.variants.length ? await fitShotStatusLine(session, line) : null;
     }
     if (captureImage) {
       const screenshot = await session.send("Page.captureScreenshot", {
@@ -504,6 +543,45 @@ async function capturePageScreenshot({
     proc.kill();
     await proc.exited.catch(() => {});
   }
+}
+
+/**
+ * Grows the viewport and the pane by the rows their tables scroll past, or the
+ * text a reader's body scrolls past, up to `maxHeightCells`, then waits for the
+ * taller pane to settle: a board a default capture would cut (FUT's last
+ * sectors) shows every row, and a docs page its whole text.
+ */
+async function growToFitRows(session: CdpSession, size: {
+  widthPx: number;
+  heightPx: number;
+  deviceScaleFactor: number;
+  heightCells: number;
+  maxHeightCells: number;
+  roles: readonly string[];
+}): Promise<void> {
+  const selector = size.roles.map((role) => `[data-gloom-role="${role}"]`).join(", ");
+  const result = await session.send("Runtime.evaluate", {
+    expression: `Math.max(0, ...[...document.querySelectorAll(${JSON.stringify(selector)})]
+      .map((element) => element.scrollHeight - element.clientHeight))`,
+    returnByValue: true,
+  }) as { result?: { value?: unknown } };
+  const overflowPx = Number(result.result?.value);
+  // One pixel is subpixel layout, not a hidden row.
+  if (!Number.isFinite(overflowPx) || overflowPx <= 1) return;
+  const cellPx = size.heightPx / size.heightCells;
+  const heightCells = Math.min(size.maxHeightCells, size.heightCells + Math.ceil(overflowPx / cellPx));
+  if (heightCells <= size.heightCells) return;
+  await session.send("Emulation.setDeviceMetricsOverride", {
+    width: size.widthPx,
+    height: Math.round(heightCells * cellPx),
+    deviceScaleFactor: size.deviceScaleFactor,
+    mobile: false,
+  });
+  await session.send("Runtime.evaluate", {
+    expression: `window.__GLOOM_CLI_SHOT_RESIZE__ && window.__GLOOM_CLI_SHOT_RESIZE__(${heightCells})`,
+    returnByValue: true,
+  });
+  await waitForShotReady(session);
 }
 
 const LOADING_STATE_PATTERNS = [
@@ -586,6 +664,7 @@ async function readRenderedPaneState(session: CdpSession): Promise<DesktopPaneSh
         const table = element.closest('[data-gloom-role="data-table"]');
         return !!table && reportedTables.has(table);
       };
+      const managesRows = (element) => element.getAttribute("data-gloom-role") === "data-table-body-scroll";
       const markScrollTruncation = (element) => {
         if (!(element instanceof HTMLElement) || !isVisible(element)) return;
         const reasons = scrollReasons({
@@ -595,8 +674,10 @@ async function readRenderedPaneState(session: CdpSession): Promise<DesktopPaneSh
           scrollLeft: element.scrollLeft,
           scrollWidth: element.scrollWidth,
           clientWidth: element.clientWidth,
-          scrollbarY: element.getAttribute("data-gloom-scrollbar-y") === "visible",
-          scrollbarX: element.getAttribute("data-gloom-scrollbar-x") === "visible",
+          // A scroll box draws its scrollbar by default and its content is all in the page, so its
+          // measures say what is cut; only a table's body holds rows it has not drawn.
+          scrollbarY: managesRows(element) && element.getAttribute("data-gloom-scrollbar-y") === "visible",
+          scrollbarX: managesRows(element) && element.getAttribute("data-gloom-scrollbar-x") === "visible",
         });
         reasons.forEach((reason) => truncationReasons.add(reason));
         if (!inReportedTable(element)) reasons.forEach((reason) => reportTruncationReasons.add(reason));
@@ -633,6 +714,7 @@ async function readRenderedPaneState(session: CdpSession): Promise<DesktopPaneSh
                 if (!reportedTables.has(table)) reportTruncationReasons.add("one or more cells are visibly clipped");
               }
               const instant = cell.getAttribute("data-gloom-cell-instant");
+              const exact = Number(cell.getAttribute("data-gloom-cell-value") || "NaN");
               return {
                 ...(typeof semanticColumn.id === "string" ? { columnId: semanticColumn.id } : {}),
                 columnLabel: typeof semanticColumn.label === "string"
@@ -640,6 +722,7 @@ async function readRenderedPaneState(session: CdpSession): Promise<DesktopPaneSh
                   : headers[cellIndex] || (values.length === 1 ? "Row" : String(cellIndex + 1)),
                 text,
                 ...(instant ? { instant } : {}),
+                ...(Number.isFinite(exact) ? { value: exact } : {}),
               };
             }).filter((cell) => cell.text.length > 0);
             if (cells.length === 0) return;
@@ -690,6 +773,10 @@ async function readRenderedPaneState(session: CdpSession): Promise<DesktopPaneSh
           .filter(Boolean)
           .join(" "),
         visibleKeyValues: (${readVisibleKeyValues.toString()})(root),
+        surfaces: [...root.querySelectorAll('[data-gloom-surface-renderer]')].filter(isVisible).map((element) => ({
+          renderer: element.getAttribute("data-gloom-surface-renderer") || "",
+          state: element.getAttribute("data-gloom-surface-state") || "",
+        })),
         error: window.__GLOOM_CLI_SHOT_ERROR__ || "",
         loadingStateDetected: root.querySelector('[data-gloom-status="loading"]') !== null,
         errorStateDetected: root.querySelector('[data-gloom-status="error"]') !== null,
@@ -713,6 +800,7 @@ async function readRenderedPaneState(session: CdpSession): Promise<DesktopPaneSh
         visibleText?: string;
         footerText?: string;
         visibleKeyValues?: Array<{ label: string; text: string }>;
+        surfaces?: DesktopPaneShotSurface[];
         error?: string;
         loadingStateDetected?: boolean;
         errorStateDetected?: boolean;
@@ -743,10 +831,15 @@ async function readRenderedPaneState(session: CdpSession): Promise<DesktopPaneSh
   if (textShowsEllipsis && !truncationReasons.includes("one or more cells are visibly clipped")) {
     truncationReasons.push("one or more cells are visibly clipped");
   }
+  const visibleLines = (value?.visibleText ?? "").split("\n")
+    .map((line) => line.replace(/\u00a0/g, " ").trimEnd())
+    .filter((line) => line.trim().length > 0);
   return {
     visibleText,
+    visibleLines,
     footerText: typeof value?.footerText === "string" ? value.footerText : "",
     visibleKeyValues: Array.isArray(value?.visibleKeyValues) ? value.visibleKeyValues : [],
+    ...(Array.isArray(value?.surfaces) && value.surfaces.length > 0 ? { surfaces: value.surfaces } : {}),
     rows,
     truncated: value?.truncated === true || textShowsEllipsis,
     truncationReasons,
@@ -765,11 +858,11 @@ async function readRenderedPaneState(session: CdpSession): Promise<DesktopPaneSh
 }
 
 /** Draws the first variant that fits the pane footer, and returns what it drew. */
-async function fitShotStatusLine(session: CdpSession, variants: readonly string[]): Promise<string | null> {
+async function fitShotStatusLine(session: CdpSession, { variants, dates }: ShotStatusLineVariants): Promise<string | null> {
   const result = await session.send("Runtime.evaluate", {
     expression: `(() => {
       const fit = window.__GLOOM_CLI_SHOT_FIT_STATUS__;
-      return fit ? fit(${JSON.stringify(variants)}) : null;
+      return fit ? fit(${JSON.stringify(variants)}, ${JSON.stringify({ dates: dates ?? null })}) : null;
     })()`,
     awaitPromise: true,
     returnByValue: true,

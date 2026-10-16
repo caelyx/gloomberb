@@ -10,12 +10,14 @@ import { useFxRatesMap } from "../../../market-data/hooks";
 import { formatMarketPriceWithCurrency, formatSignedMarketPrice, liveQuoteFormatOptions } from "../../../market-data/market/format";
 import {
   exchangeShortName,
+  extendedSessionLineLabel,
   getExtendedSessionDisplay,
   getRegularSessionDisplay,
-  marketStateColor,
-  marketStateLabel,
+  quoteSessionColor,
+  quoteSessionLabel,
 } from "../../../market-data/market/status";
 import { appendQuoteToPriceReturnHistory, buildPriceReturnFields } from "../../../market-data/performance";
+import { fitFuturesContractLines, futuresContractLines, futuresSettleText, isFuturesInstrument, type FuturesContractLine } from "../../../market-data/futures-contract";
 import { useViewport } from "../../../react/input";
 import { useAppSelector } from "../../../state/app/context";
 import { colors, priceColor } from "../../../theme/colors";
@@ -25,6 +27,8 @@ import type { TickerRecord } from "../../../types/ticker";
 import { Box, ScrollBox, Text, useUiCapabilities } from "../../../ui";
 import { publicTickerKey, resolveExchangeTimeZone } from "../../../utils/exchanges";
 import { convertCurrency, displayWidth, formatPercentRaw, truncateToDisplayWidth } from "../../../utils/format";
+import { enterpriseValueReconciliationNote } from "../../../utils/fundamentals";
+import { atRegularSessionPrice } from "../../../market-data/quotes/regular-session-valuation";
 import { zonedDateKey } from "../../../utils/zoned-date-time";
 import { sharesOutstandingInReceipts } from "../../../utils/depositary-receipt";
 import {
@@ -36,10 +40,13 @@ import {
   rangeRowChrome,
   textGridColumns,
 } from "./overview/components";
+import { useFuturesContractTerms } from "./overview/futures-contract";
 import { buildOverviewStats, buildPositionRows, buildProfileFields } from "./overview/model";
-import type { OverviewFunctionLink } from "./overview/types";
+import type { OverviewFunctionLink, StatField } from "./overview/types";
 import { describeFundamentalMarketCap } from "../../../utils/market-capitalization";
-import { liveFiftyTwoWeekRange, liveMarketCapitalization } from "../portfolio-list/live-valuation";
+import { liveFiftyTwoWeekRange, liveMarketCapitalization } from "../../../market-data/quotes/live-valuation";
+import { instrumentTypeLabel } from "../../../tickers/instrument-kind";
+import { ClippedText } from "../../../components/ui/display";
 
 /** Cells between the Day and 52W ranges when they share a row. */
 const RANGE_PAIR_GAP = 4;
@@ -48,9 +55,24 @@ const RANGE_INLINE_MIN_TRACK = 10;
 /** Desktop px between the logo and the name and price beside it. */
 const LOGO_GAP_PX = 6;
 
+/**
+ * Grid rows a futures Contract block may take. It sits above the chart, so a
+ * short pane keeps the chart in view by dropping the least useful terms.
+ */
+function contractRowBudget(height: number | undefined): number {
+  if (height == null || height >= 32) return Number.POSITIVE_INFINITY;
+  return height >= 24 ? 3 : 2;
+}
+
+function contractField(line: FuturesContractLine): StatField {
+  return { label: line.label, value: line.value, ...(line.warning ? { valueColor: colors.warning } : {}) };
+}
+
 interface OverviewTabProps {
   perpetuals?: ReactNode;
   width?: number;
+  /** The tab's height; a short one keeps fewer futures contract terms. */
+  height?: number;
   focused?: boolean;
   ticker: TickerRecord | null;
   financials: TickerFinancials | null;
@@ -65,7 +87,7 @@ export function OverviewTab(props: OverviewTabProps) {
   return <ResolvedOverviewTab {...props} ticker={props.ticker} />;
 }
 
-function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpenChart, onOpenFunction, perpetuals }: OverviewTabProps & { ticker: TickerRecord }) {
+function ResolvedOverviewTab({ width, height, focused = false, ticker, financials, onOpenChart, onOpenFunction, perpetuals }: OverviewTabProps & { ticker: TickerRecord }) {
   const baseCurrency = useAppSelector((state) => state.config.baseCurrency);
   const { width: termWidth } = useViewport();
   const { fractionalViewport = false, nativePaneChrome, cellWidthPx = 8, cellHeightPx = 18, pixelRatio = 1 } = useUiCapabilities();
@@ -78,6 +100,9 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
   const instrumentType = quote?.instrumentType?.trim()
     || financials?.quoteMetadata?.instrumentType?.trim()
     || ticker.metadata.assetCategory;
+  // A futures symbol's settlement and contract terms load beside the quote, never in its way.
+  const futuresSymbol = quote?.symbol || ticker.metadata.ticker;
+  const contractTerms = useFuturesContractTerms(isFuturesInstrument(futuresSymbol, instrumentType) ? futuresSymbol : null);
   const exchangeRates = useFxRatesMap([
     baseCurrency,
     ticker.metadata.currency,
@@ -92,7 +117,7 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
   const industry = ticker.metadata.industry ?? profile?.industry;
   const description = profile?.description?.trim();
   const listingVenue = exchangeShortName(
-    quote?.listingExchangeName ?? quote?.exchangeName,
+    quote?.tradingExchangeName ?? quote?.listingExchangeName ?? quote?.exchangeName,
     quote?.listingExchangeFullName ?? quote?.fullExchangeName,
   );
   const routingVenue = exchangeShortName(quote?.routingExchangeName, quote?.routingExchangeFullName);
@@ -120,13 +145,15 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
     panelId: "price",
     timeBasis: chartTimeZone ? { kind: "market", timeZone: chartTimeZone } : undefined,
   });
+  // A provider EV off market cap + debt - cash, or why a withdrawn one is unavailable, at the
+  // regular session price the EV beside it is shown at.
+  const enterpriseValueNote = enterpriseValueReconciliationNote(atRegularSessionPrice({ quote, fundamentals }).fundamentals);
   usePaneNoticeFooter({
     registrationId: "overview-notices",
     notices: [
       ...(!quote && financials ? [t("Current quote unavailable. Other research data is still available.")] : []),
       ...(priceSeries.warning ? [priceSeries.warning] : []),
-      ...(fundamentals?.unavailableFields?.includes("enterpriseValue")
-        ? [t("Enterprise value unavailable: the source observation failed validation.")] : []),
+      ...(enterpriseValueNote ? [enterpriseValueNote] : []),
       ...(capitalization?.provenance.kind === "fundamentals" && !capitalization.live
         ? [`Market cap: ${describeFundamentalMarketCap(capitalization.provenance)}.`] : []),
     ],
@@ -147,7 +174,8 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
   // The pane title already names the ticker, so the line leads with the company and drops a name that only repeats it.
   const companyName = [ticker.metadata.name, quote?.name].find((name) => name && name !== ticker.metadata.ticker) ?? "";
   const venueText = listingVenue ? (companyName ? ` (${listingVenue})` : listingVenue) : "";
-  const marketStateText = quote?.marketState ? t(marketStateLabel(quote.marketState)) : "";
+  const sessionLabel = quoteSessionLabel(quote);
+  const marketStateText = sessionLabel ? t(sessionLabel) : "";
   const hasIdentityLine = Boolean(companyName || venueText || marketStateText);
   // The desktop logo is a square from the top of the company name's capitals down to the
   // price's baseline, so its edges meet the text's and the three read as one block. The
@@ -163,6 +191,12 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
   const logoPx = quote ? logoBottomPx - logoTopPx : cellHeightPx * 2;
   const logoCells = hasLogo ? Math.ceil((logoPx + LOGO_GAP_PX) / cellWidthPx) : 0;
   const quoteTextWidth = Math.max(1, quoteSummaryWidth - logoCells);
+  // The exchange settlement, dated by its session: a futures price is its latest trade.
+  const settleLabel = t("Settle");
+  const settleText = contractTerms
+    ? truncateToDisplayWidth(futuresSettleText(contractTerms, quote),
+      Math.max(1, quoteTextWidth - displayWidth(settleLabel) - 1))
+    : "";
   const quoteChangeCells = figureCells(quoteChangeText, "sub") + 1 + figureCells(quotePercentText, "sub");
   const stackQuoteChange = quoteChangeCells > quoteTextWidth;
   const stackQuoteSummary = figureCells(quotePriceText) + 2 + quoteChangeCells > quoteTextWidth;
@@ -186,6 +220,10 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
   const rangeInline = hasDayRange && yearRange != null
     && rangeHalfWidth - rangeRowChrome(rangeLabelWidth, rangeEndpointCells) >= RANGE_INLINE_MIN_TRACK;
   const rangeWidth = rangeInline ? rangeHalfWidth : contentWidth;
+  const contractLines = contractTerms ? futuresContractLines(contractTerms, futuresSymbol) : [];
+  // Columns that keep every term whole; a narrow pane stacks them in one.
+  const contractColumns = textGridColumns(contractLines.map(contractField), contentWidth);
+  const contractFields = fitFuturesContractLines(contractLines, contractColumns * contractRowBudget(height)).map(contractField);
   const stats = buildOverviewStats({
     quote,
     fundamentals,
@@ -200,7 +238,7 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
     today: zonedDateKey(Date.now(), chartTimeZone ?? "America/New_York"),
   });
   const profileFields = buildProfileFields({
-    instrumentType,
+    instrumentType: instrumentTypeLabel(instrumentType, quote?.name || ticker.metadata.name),
     sector,
     industry,
     profile,
@@ -228,8 +266,22 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
         // On the desktop the header keeps half a row clear of the tab bar's edge.
         style={nativePaneChrome ? { paddingTop: Math.round(cellHeightPx / 2) } : undefined}
       >
-        <Box flexDirection={quoteBookInline ? "row" : "column"} gap={quoteBookInline ? 2 : 0} width={contentWidth}>
-          <Box flexDirection="row" width={quoteSummaryWidth} flexShrink={0} minWidth={0} overflow="hidden">
+        <Box
+          flexDirection={quoteBookInline ? "row" : "column"}
+          gap={quoteBookInline && !nativePaneChrome ? 2 : 0}
+          width={nativePaneChrome ? undefined : contentWidth}
+          style={nativePaneChrome && quoteBookInline ? { columnGap: "2ch" } : undefined}
+        >
+          <Box
+            flexDirection="row"
+            width={nativePaneChrome ? undefined : quoteSummaryWidth}
+            // On the desktop the summary takes what the book beside it leaves, so the book keeps to the pane's right edge.
+            flexGrow={nativePaneChrome && quoteBookInline ? 1 : undefined}
+            flexShrink={nativePaneChrome && quoteBookInline ? 1 : 0}
+            flexBasis={nativePaneChrome && quoteBookInline ? 0 : undefined}
+            minWidth={0}
+            overflow="hidden"
+          >
             <CompanyLogo
               symbol={ticker.metadata.ticker}
               assetCategory={ticker.metadata.assetCategory}
@@ -242,11 +294,11 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
             {hasIdentityLine && (
               <Box flexDirection="row" minWidth={0} overflow="hidden">
                 {companyName && (
-                  <Text fg={colors.textDim}>{truncateToDisplayWidth(companyName, companyNameWidth)}</Text>
+                  <ClippedText fg={colors.textDim} text={companyName} width={companyNameWidth} />
                 )}
                 {venueText && <Text flexShrink={0} fg={colors.textDim}>{venueText}</Text>}
                 {quote?.marketState && (
-                  <Text flexShrink={0} fg={marketStateColor(quote.marketState)}>
+                  <Text flexShrink={0} fg={quoteSessionColor(quote)}>
                     {companyName || venueText ? " " : ""}{marketStateText}
                   </Text>
                 )}
@@ -268,13 +320,19 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
             )}
             {extendedQuote && (
               <Box flexDirection="row" gap={2}>
-                <Text fg={colors.textDim}>{extendedQuote.session === "PRE" ? t("Pre-Market") : t("After-Hours")}:</Text>
+                <Text fg={colors.textDim}>{extendedSessionLineLabel(extendedQuote, t)}:</Text>
                 <Text fg={priceColor(extendedQuote.change ?? 0)}>
                   {formatMarketPriceWithCurrency(extendedQuote.price, quote?.currency, moneyOptions)}
                 </Text>
                 <Text fg={priceColor(extendedQuote.change ?? 0)}>
                   {formatSignedMarketPrice(extendedQuote.change, moneyOptions)} ({formatPercentRaw(extendedQuote.changePercent)})
                 </Text>
+              </Box>
+            )}
+            {settleText && (
+              <Box flexDirection="row" gap={1} minWidth={0} overflow="hidden">
+                <Text flexShrink={0} fg={colors.textDim}>{settleLabel}</Text>
+                <Text fg={colors.text}>{settleText}</Text>
               </Box>
             )}
             {metadataParts.length > 0 && (
@@ -284,11 +342,17 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
           </Box>
 
           {quote && hasBidAsk && (
-            <QuoteBook quote={quote} assetCategory={moneyOptions.assetCategory} width={quoteBookWidth} />
+            <QuoteBook
+              quote={quote}
+              assetCategory={moneyOptions.assetCategory}
+              width={quoteBookWidth}
+              // The terminal's 30% of the width between 24 and 32 cells, in characters.
+              desktopWidth={quoteBookInline ? "clamp(24ch, 30%, 32ch)" : "min(100%, 32ch)"}
+            />
           )}
         </Box>
 
-        {perpetuals}
+        {perpetuals && <PaneLinkMenu>{perpetuals}</PaneLinkMenu>}
 
         {(hasDayRange || yearRange) && quote && (
           <Box flexDirection={rangeInline ? "row" : "column"} gap={rangeInline ? RANGE_PAIR_GAP : 0} width={contentWidth}>
@@ -320,6 +384,13 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
                 priceOptions={moneyOptions}
               />
             )}
+          </Box>
+        )}
+
+        {contractFields.length > 0 && (
+          <Box flexDirection="column">
+            <SectionHeading title={t("Contract")} />
+            <FundamentalsGrid fields={contractFields} width={contentWidth} columns={contractColumns} />
           </Box>
         )}
 
@@ -384,9 +455,10 @@ function ResolvedOverviewTab({ width, focused = false, ticker, financials, onOpe
 
         {/* Description — last, collapsed */}
         {description && (
-          <Box flexDirection="column" width={contentWidth}>
+          <Box flexDirection="column" width={nativePaneChrome ? undefined : contentWidth}>
             <SectionHeading title={t("Description")} />
-            <Text fg={colors.text} width={contentWidth} wrapMode="word" wrapText>{description}</Text>
+            {/* The desktop wraps it at the pane's own width, so it follows a resize to the pixel. */}
+            <Text fg={colors.text} width={nativePaneChrome ? undefined : contentWidth} wrapMode="word" wrapText>{description}</Text>
           </Box>
         )}
       </Box>

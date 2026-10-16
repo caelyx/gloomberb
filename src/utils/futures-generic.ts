@@ -7,7 +7,7 @@
  * ratio-adjusts, A difference-adjusts, neither leaves prices as traded.
  */
 
-import { parsePublicTickerKey } from "./exchanges";
+import { canonicalExchange, parsePublicTickerKey } from "./exchanges";
 
 export type FuturesGenericRoll =
   | { rule: "open-interest" }
@@ -28,18 +28,15 @@ export interface FuturesGeneric {
 
 /** Roots Gloom Cloud archives daily, by the venue that lists them. */
 const ROOT_VENUES: Readonly<Record<string, string>> = Object.fromEntries(([
-  ["CME", ["ES", "NQ", "RTY", "6E", "6J", "6B", "6A", "6C", "6S", "SR3", "LE", "GF", "HE", "LBR", "DC", "CSC", "GD", "BTC", "ETH", "SOL", "XRP"]],
-  ["CBT", ["YM", "ZT", "ZF", "ZN", "ZB", "UB", "ZQ", "ZC", "ZS", "ZW", "ZM", "ZL", "KE", "ZO", "ZR"]],
-  ["NYM", ["CL", "BZ", "NG", "RB", "HO", "PL", "PA", "B0", "TTF"]],
+  ["CME", ["ES", "NQ", "RTY", "EMD", "RS1", "NKD", "NIY", "MES", "MNQ", "M2K",
+    "XAE", "XAB", "XAI", "XAY", "XAP", "XAV", "XAF", "XAK", "XAZ", "XAU", "XAR", "SXO", "SXR", "SXT", "SXB", "SXI", "SOX",
+    "6E", "6J", "6B", "6A", "6C", "6S", "SR3", "LE", "GF", "HE", "LBR", "DC", "CSC", "GD", "BTC", "ETH", "SOL", "XRP"]],
+  ["CBT", ["YM", "MYM", "RX", "ZT", "ZF", "ZN", "ZB", "UB", "ZQ", "ZC", "ZS", "ZW", "ZM", "ZL", "KE", "ZO", "ZR"]],
+  ["NYM", ["CL", "QM", "MCL", "BZ", "NG", "QG", "MNG", "HH", "RB", "HO", "PL", "PA", "B0", "TTF"]],
   ["CMX", ["GC", "SI", "HG", "ALI", "HRC", "UX"]],
   ["NYB", ["KC", "SB", "CC", "CT", "OJ"]],
   ["CFE", ["VX"]],
 ] as const).flatMap(([venue, roots]) => roots.map((root) => [root, venue])));
-
-/** Other names quotes give each venue, which a listing may carry as its exchange. */
-const VENUE_NAMES: Readonly<Record<string, readonly string[]>> = {
-  NYM: ["NYMEX", "NY MERCANTILE"], CBT: ["CBOT"], CMX: ["COMEX"], NYB: ["ICE FUTURES", "NYBOT"], CFE: ["CBOE FUTURES"],
-};
 
 /** Bloomberg's codes where they differ from the exchange's. */
 const ALIASES: Readonly<Record<string, string>> = {
@@ -83,9 +80,9 @@ export function futuresGenericListing(symbol: string, exchange?: string | null):
   const key = parsePublicTickerKey(symbol);
   const generic = parseFuturesGeneric(key.symbol);
   if (!generic) return null;
-  const venue = (key.exchange || exchange || "").trim().toUpperCase();
-  const own = ROOT_VENUES[generic.root]!;
-  return !venue || venue === own || VENUE_NAMES[own]?.includes(venue) ? generic : null;
+  // The alias table names each venue by its code, however a quote spells it (NYMEX is NYM).
+  const venue = key.exchange || canonicalExchange(exchange ?? "");
+  return !venue || venue === ROOT_VENUES[generic.root] ? generic : null;
 }
 
 const FUTURES_VENUES = new Set(Object.values(ROOT_VENUES));
@@ -98,9 +95,8 @@ const FUTURES_VENUES = new Set(Object.values(ROOT_VENUES));
  */
 export function futuresListingVenue(symbol: string, exchange?: string | null): { venue: string; root: string | null } | null {
   const ticker = symbol.trim().toUpperCase();
-  const named = (exchange ?? "").trim().toUpperCase();
-  const venue = FUTURES_VENUES.has(named) ? named
-    : Object.entries(VENUE_NAMES).find(([, names]) => names.includes(named))?.[0] ?? null;
+  const named = canonicalExchange(exchange ?? "");
+  const venue = FUTURES_VENUES.has(named) ? named : null;
   const coded = /^([A-Z0-9]{1,4}?)(?:=F|[FGHJKMNQUVXZ]\d{2}(?:\.[A-Z]+)?)$/.exec(ticker)?.[1]
     ?? /^([A-Z]{2})-Y\.[A-Z]+$/.exec(ticker)?.[1];
   const root = futuresGenericListing(ticker, venue ?? named)?.root ?? (coded ? ALIASES[coded] ?? coded : null);
@@ -134,14 +130,33 @@ function futuresGenericOrdinal(position: number): string {
   return `${position}${tens >= 11 && tens <= 13 ? "th" : ["th", "st", "nd", "rd"][position % 10] ?? "th"}`;
 }
 
+/** Equity index, sector and industry futures, the S&P GSCI and VIX: their prices are index points. */
+const POINT_ROOTS: ReadonlySet<string> = new Set(["ES", "NQ", "RTY", "YM", "GD", "VX", "EMD", "RS1", "NKD", "NIY", "MES", "MNQ", "M2K", "MYM", "RX",
+  "XAE", "XAB", "XAI", "XAY", "XAP", "XAV", "XAF", "XAK", "XAZ", "XAU", "XAR", "SXO", "SXR", "SXT", "SXB", "SXI", "SOX"]);
+
 /**
  * How a generic's price reads: index and VIX futures in points (not dollars),
  * Treasury futures in 32nds of par; everything else in its quote currency.
  */
 export function futuresGenericPriceBasis(generic: Pick<FuturesGeneric, "root">): "points" | "thirty-seconds" | null {
-  if (["ES", "NQ", "RTY", "YM", "GD", "VX"].includes(generic.root)) return "points";
+  if (POINT_ROOTS.has(generic.root)) return "points";
   if (["ZT", "ZF", "ZN", "ZB", "UB"].includes(generic.root)) return "thirty-seconds";
   return null;
+}
+
+/**
+ * How a futures listing's price reads, whichever form it takes: a generic by
+ * its root (VX1 points, TY1 32nds), and a continuous (`ES=F`, `SXO=F`) or
+ * listed contract (`SXOZ26.CME`) of an index, sector or industry root in index
+ * points, on the root's own venue or with none. The quote keeps its currency
+ * for what a tick is worth. Null for every other listing, a security that
+ * shares a root's code on another venue (XAU on Toronto, the XAR ETF) included.
+ */
+export function futuresListingPriceBasis(symbol: string, exchange?: string | null): "points" | "thirty-seconds" | null {
+  const generic = futuresGenericListing(symbol, exchange);
+  if (generic) return futuresGenericPriceBasis(generic);
+  const listing = futuresListingVenue(symbol, exchange);
+  return listing?.root && ROOT_VENUES[listing.root] === listing.venue && POINT_ROOTS.has(listing.root) ? "points" : null;
 }
 
 /** Whether a root's date rules count back from first notice or from last trade. */

@@ -22,7 +22,7 @@ const ticker: TickerRecord = createTestTicker("AAPL", "Apple", {
 });
 const quote = { symbol: "AAPL", price: 90, currency: "USD", change: -5, changePercent: -5.26, previousClose: 95, lastUpdated: Date.now() };
 
-test("CLI rejects blank acquisition cost and bare CASH before resolving or writing a ticker, and accepts explicit zero", async () => {
+test("CLI rejects a blank or ambiguous acquisition cost and bare CASH before resolving or writing a ticker, and accepts explicit zero, a decimal comma and a three-decimal cost", async () => {
   const config = createDefaultConfig("/unused-cost-parser");
   let reads = 0;
   const saved: TickerRecord[] = [];
@@ -31,17 +31,24 @@ test("CLI rejects blank acquisition cost and bare CASH before resolving or writi
     dataProvider: createTestDataProvider(),
   }).context;
   for (const cost of ["", "  ", "NaN"]) {
-    await expect(portfolioCliCommand.execute(["position", "set", "main", "AAPL", "10", cost], ctx)).rejects.toThrow("Average cost must be a valid number");
+    await expect(portfolioCliCommand.execute(["position", "set", "main", "AAPL", "10", cost], ctx)).rejects.toThrow("Average cost must be a number such as 1234.5, 1,234.5 or 1.234,5");
     expect(saved).toEqual([]);
     expect(reads).toBe(0);
   }
+  // A cost that reads two ways is refused naming both, never stored as either.
+  await expect(portfolioCliCommand.execute(["position", "set", "main", "AAPL", "10", "1,234"], ctx)).rejects.toThrow("1234 (thousands) or 1.234 (decimal comma)");
+  expect(reads).toBe(0);
   // Bare CASH once resolved to the company trading as CASH and valued the cash as its shares.
   await expect(portfolioCliCommand.execute(["position", "set", "main", "CASH", "500000", "1", "USD"], ctx)).rejects.toThrow("cash line");
   expect(reads).toBe(0);
   const logger = spyOn(console, "log").mockImplementation(() => {});
-  try { await portfolioCliCommand.execute(["position", "set", "main", "AAPL", "10", "0"], ctx); }
-  finally { logger.mockRestore(); }
-  expect(saved[0]?.metadata.positions[0]?.avgCost).toBe(0);
+  try {
+    await portfolioCliCommand.execute(["position", "set", "main", "AAPL", "10", "0"], ctx);
+    await portfolioCliCommand.execute(["position", "set", "main", "AAPL", "10", "18,50"], ctx);
+    // A cost per share is a price, not an amount of its currency: a lone dot is a decimal point.
+    await portfolioCliCommand.execute(["position", "set", "main", "AAPL", "10", "123.456"], ctx);
+  } finally { logger.mockRestore(); }
+  expect(saved.map((record) => record.metadata.positions[0]?.avgCost)).toEqual([0, 18.5, 123.456]);
 });
 
 test("ticker and collection CLI reconcile short P&L and withhold totals for a missing holding", async () => {
@@ -269,4 +276,25 @@ test("a broker account's saved cash stands in for cash entered by hand, so it is
   expect(metadata).toMatchObject({ total: 10_000, cash: { source: "broker", amount: 1_000, value: 1_000, weight: 10 } });
   expect(data[0]).toMatchObject({ marketValue: 9_000, weight: 90, targetWeight: 80, drift: 10, tradeValue: -1_000 });
   expect(data[0].tradeShares).toBeCloseTo(-1_000 / 90, 8);
+});
+
+test("portfolio show --explain follows the report with the terms its table shows, and --json lists them", async () => {
+  const config = createDefaultConfig("/unused-explain");
+  config.portfolios = [{ id: "main", name: "Main", currency: "USD", targetWeights: { AAPL: 50 } }];
+  const held: TickerRecord = { metadata: { ...ticker.metadata, positions: [{ portfolio: "main", shares: 10, avgCost: 80, currency: "USD", broker: "manual" }] } };
+  const dependencies = { config, store: { loadAllTickers: async () => [held] }, dataProvider: createTestDataProvider({ getQuote: async () => quote }) };
+  const output: string[] = [];
+  const logger = spyOn(console, "log").mockImplementation((...args) => { output.push(args.join(" ")); });
+  try { await portfolioCliCommand.execute(["show", "Main", "--explain"], createTestCliContext(dependencies).context); }
+  finally { logger.mockRestore(); }
+  const text = output.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  const terms = text.slice(text.indexOf("Terms"));
+  expect(text.indexOf("Terms")).toBeGreaterThan(text.indexOf("TOTAL"));
+  for (const term of ["Weight", "Target", "Drift", "Trade", "Percentage point (pp)"]) expect(terms).toContain(`  ${term}  `);
+
+  const cli = createTestCliContext(dependencies, { format: "json" });
+  await portfolioCliCommand.execute(["show", "Main", "--explain"], cli.context);
+  expect(cli.printed[0]!.result.metadata?.glossary).toMatchObject([{ term: "Weight" }, { term: "Target" }, { term: "Drift" }, { term: "Trade" }, { term: "Percentage point", short: "pp" }]);
+  // Only show reads it; another action says where it belongs.
+  await expect(portfolioCliCommand.execute(["target", "show", "Main", "--explain"], cli.context)).rejects.toThrow("--explain is an option of portfolio show");
 });

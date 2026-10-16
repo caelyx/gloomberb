@@ -323,11 +323,15 @@ function EtfBoard({ collectionId, focused, width, height, rootBefore }: EtfBoard
           text: row.loading && row.return1Y === null ? "…" : row.return1Y !== null ? formatPercentRaw(shownPercent(row.return1Y)) : "—",
           color: row.return1Y !== null ? priceColor(shownPercent(row.return1Y)) : colors.textDim,
         };
-      case "bar":
+      case "bar": {
+        const signed = row.changePercent !== null ? formatPercentRaw(shownPercent(row.changePercent)) : "—";
         return {
-          text: "",
-          content: <SectorMoveBar changePercent={row.changePercent} width={column.width} />,
+          text: signed,
+          content: <Box flexDirection="row" width={column.width} overflow="hidden" aria-label={signed}>
+            <SectorMoveBar changePercent={row.changePercent} width={column.width} />
+          </Box>,
         };
+      }
     }
   }, []);
 
@@ -395,6 +399,8 @@ export const sectorsModule: PluginModule = {
       name: "Sector Performance",
       icon: "S",
       component: SectorPerformancePane,
+      // BI and THEM open this pane: THEM sets the theme param; the ETF lists are preferences.
+      identitySettings: [],
       defaultPosition: "right",
       defaultMode: "floating",
       defaultFloatingSize: { width: 82, height: 18 },

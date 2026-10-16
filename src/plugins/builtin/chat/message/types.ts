@@ -1,6 +1,7 @@
 import type { InlineTickerCatalogEntry } from "../../../../state/hooks/inline-tickers";
 import type { ChatAttachment, ChatMessage, ChatUserSummary } from "../../../../api-client";
 import type { BoxRenderable } from "../../../../ui";
+import type { ChatMessagePaneLink } from "../pane-links/model";
 
 /** The name or @mention a user's card opens beside, where the renderer places cards next to it. */
 export type ChatUserAnchor = BoxRenderable | null;
@@ -17,6 +18,8 @@ export interface ChatMessageBaseProps {
   messages: ChatMessage[];
   selectedIdx: number;
   hoveredIdx: number | null;
+  /** A message the reader was sent to, marked for a moment. */
+  highlighted?: boolean;
   canSend: boolean;
   catalog: Record<string, InlineTickerCatalogEntry>;
   userByUsername: Map<string, ChatUserSummary>;
@@ -34,4 +37,16 @@ export interface ChatMessageBaseProps {
   retryMessage?: (index: number) => void;
   /** An image did not load, perhaps because its signed link expired. */
   onImageLoadError?: (attachment: ChatAttachment) => void;
+  /** The server takes reactions and you can send: chips toggle and React is on offer. */
+  reactionsEnabled?: boolean;
+  currentUserId?: string | null;
+  /** Adds or takes back your reaction with one emoji. */
+  toggleReaction?: (messageId: string, emoji: string) => void;
+  /** Opens the reaction picker for a message. */
+  openReactionPicker?: (index: number) => void;
+  /** The message whose picker is open on the desktop. */
+  reactionPickerMessageId?: string | null;
+  closeReactionPicker?: () => void;
+  /** Opens what a chip under the message stands for: a shared pane, a Wire post's story or calendar. */
+  openPaneLink: (link: ChatMessagePaneLink) => void;
 }

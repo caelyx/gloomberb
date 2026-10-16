@@ -1,6 +1,7 @@
 import type {
   CachedFinancialsTarget,
   MarketDataRequestContext,
+  QuoteBatchOptions,
   QuoteBatchResult,
   QuoteSubscriptionTarget,
   TickerFinancialsBatchResult,
@@ -48,8 +49,11 @@ export class ProviderRouterBatchRoutes {
 
   async getQuotesBatch(
     targets: QuoteSubscriptionTarget[],
-    options: { forceRefresh?: boolean } = {},
+    options: QuoteBatchOptions = {},
   ): Promise<QuoteBatchResult[]> {
+    if (options.cacheOnly) return targets.map((target) => ({ target, quote: this.cachedQuote(target) }));
+    // The signal is the caller's; providers are asked as before.
+    const providerOptions = { forceRefresh: options.forceRefresh };
     const forceRefresh = options.forceRefresh === true;
     const results = new Array<QuoteBatchResult | null>(targets.length).fill(null);
     const misses: Array<{ index: number; target: QuoteSubscriptionTarget }> = [];
@@ -69,7 +73,7 @@ export class ProviderRouterBatchRoutes {
         : isProviderQuoteUsableForCurrentSession(rawCached.value, target.exchange, target.symbol, { recentAnswer: !rawCached.stale }))
         ? rawCached
         : null;
-      if (cached && !forceRefresh && !cached.stale) {
+      if (cached && !forceRefresh && !cached.stale && !options.revalidate) {
         if (brokerSourceKeys.includes(cached.sourceKey)) {
           misses.push({ index, target });
           return;
@@ -77,6 +81,7 @@ export class ProviderRouterBatchRoutes {
         results[index] = { target, quote: cached.value };
         return;
       }
+      // Revalidated, a fresh copy is still what the quote route answers when no source does.
       misses.push({ index, target });
     });
 
@@ -91,7 +96,7 @@ export class ProviderRouterBatchRoutes {
         providerIndexes.set(key, bucket);
       }
       const uniqueTargets = [...providerIndexes.values()].map((bucket) => bucket[0]!.target);
-      const batchResults = await batchProvider.getQuotesBatch!(uniqueTargets, options).catch(() => []);
+      const batchResults = await batchProvider.getQuotesBatch!(uniqueTargets, providerOptions).catch(() => []);
       for (const item of batchResults) {
         if (!isProviderQuoteUsableForCurrentSession(item.quote, item.target.exchange, item.target.symbol, { recentAnswer: true })) continue;
         const key = this.quoteBatchKey(item.target);
@@ -137,7 +142,10 @@ export class ProviderRouterBatchRoutes {
         this.deps.resources, this.deps.getEntityKey(target.symbol, context.instrument),
         financialHistoryVariants(this.deps.getTickerVariantCandidates(target.exchange), context)[0] ?? "", this.deps.getProviderSourceKeys(),
       );
-      if (cached.value?.quote && !forceRefresh && target.statementHistory !== "extended" && (!needsFinancialProfile(cached.value) || profileAttempted)) {
+      // The selection wraps a cached quote even when no financials were ever
+      // fetched; a quote alone has no fundamentals, so it is not a hit.
+      const fetched = cached.brokerRecord != null || (cached.providerRecords?.length ?? 0) > 0;
+      if (fetched && cached.value?.quote && !forceRefresh && target.statementHistory !== "extended" && (!needsFinancialProfile(cached.value) || profileAttempted)) {
         results[index] = { target, financials: cached.value };
         return;
       }
@@ -192,6 +200,18 @@ export class ProviderRouterBatchRoutes {
     }));
 
     return results.map((result, index) => result ?? { target: targets[index]!, financials: null });
+  }
+
+  /** The newest cached quote for a target from any source, however old: what a board paints first. */
+  private cachedQuote(target: QuoteSubscriptionTarget): Quote | null {
+    const context = target.context;
+    const entityKey = this.deps.getEntityKey(target.symbol, context?.instrument);
+    const variantKeys = this.deps.getTickerVariantCandidates(target.exchange);
+    const sourceKeys = [
+      ...this.deps.getBrokerCandidatesForContext(context, false).map((candidate) => this.deps.brokerSourceKey(candidate)),
+      ...this.deps.getProviderSourceKeys(),
+    ];
+    return selectCachedResource<Quote>(this.deps.resources, "quote", entityKey, variantKeys, sourceKeys, true)?.value ?? null;
   }
 
   private quoteBatchKey(target: QuoteSubscriptionTarget): string {

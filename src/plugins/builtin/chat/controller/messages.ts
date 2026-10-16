@@ -39,9 +39,21 @@ export function isSameMessageRevision(current: ChatMessage, incoming: ChatMessag
     && attachmentKey(current) === attachmentKey(incoming);
 }
 
+// Both lists are replaced on edits, reactions, pagination and send transitions.
+// A draft save, upload progress or presence update changes neither. Keep the
+// projection's identity then: subscribers must not redraw the entire transcript.
+const visibleMessages = new WeakMap<ChannelRuntimeState, {
+  messages: ChatMessage[];
+  pending: ChatMessage[];
+  visible: ChatMessage[];
+}>();
+
 export function getVisibleMessages(channel: ChannelRuntimeState): ChatMessage[] {
-  return [...channel.messages, ...channel.pendingMessages]
-    .sort(compareMessages);
+  const cached = visibleMessages.get(channel);
+  if (cached?.messages === channel.messages && cached.pending === channel.pendingMessages) return cached.visible;
+  const visible = [...channel.messages, ...channel.pendingMessages].sort(compareMessages);
+  visibleMessages.set(channel, { messages: channel.messages, pending: channel.pendingMessages, visible });
+  return visible;
 }
 
 function mergeStoredMessages(channel: ChannelRuntimeState, messages: ChatMessage[]): ChatMessage[] {
@@ -49,10 +61,15 @@ function mergeStoredMessages(channel: ChannelRuntimeState, messages: ChatMessage
   const incoming = new Map<string, ChatMessage>();
   for (const message of channel.messages) merged.set(message.id, message);
   for (const message of messages) {
-    if (!merged.has(message.id)) {
+    const current = merged.get(message.id);
+    if (!current) {
       incoming.set(message.id, message);
     }
-    merged.set(message.id, message);
+    // A live copy (an edit) leaves reactions out; the ones held stay.
+    merged.set(
+      message.id,
+      current?.reactions && message.reactions === undefined ? { ...message, reactions: current.reactions } : message,
+    );
   }
   for (const message of messages) {
     for (const [id, current] of merged) {

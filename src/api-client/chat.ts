@@ -4,6 +4,7 @@ import {
   normalizeChatDiscordLink,
   normalizeChatMessage,
   normalizeChatMessages,
+  normalizeChatReactions,
   normalizeChatState,
 } from "./normalizers";
 import { CHAT_ATTACHMENTS_FEATURE, type CloudApiSocket } from "./socket";
@@ -11,12 +12,15 @@ import type {
   ChatAttachment,
   ChatChannel,
   ChatChannelState,
+  ChatMentionCandidate,
   ChatDiscordLink,
   ChatMessage,
   ChatNotification,
+  ChatReactionsUpdate,
   ChatStateResponse,
 } from "./types";
 import type { CloudApiRequest } from "./request";
+import { localUtcOffsetMinutes } from "../utils/local-utc-offset";
 type ChatNotificationListener = (notification: ChatNotification) => void;
 type ChatPresenceListener = (onlineCount: number) => void;
 
@@ -115,6 +119,14 @@ export class CloudChatApi {
     this.emitAttachmentSupport();
   }
 
+  getMentionCandidates(channelId: string): Promise<ChatMentionCandidate[]> {
+    return this.request(`/chat/channels/${encodeURIComponent(channelId)}/mention-candidates`);
+  }
+
+  subscribeMentionCandidatesChanged(listener: () => void): () => void {
+    return this.options.socket.subscribeChatMentionCandidatesChanged(listener);
+  }
+
   async getChannels(): Promise<ChatChannel[]> {
     const channels =
       await this.request<ChatChannel[]>("/chat/channels");
@@ -125,8 +137,15 @@ export class CloudChatApi {
     return this.request<{ onlineCount: number }>("/chat/presence");
   }
 
+  /**
+   * Channels, unread counts and pending notifications. It also reports this
+   * machine's current offset from UTC, so the card others open on you shows
+   * your local time; a server that predates it ignores the parameter.
+   */
   async getState(): Promise<ChatStateResponse> {
-    const state = await this.request<ChatStateResponse>("/chat/state");
+    const offset = localUtcOffsetMinutes();
+    const query = offset === null ? "" : `?${new URLSearchParams({ utcOffset: String(offset) })}`;
+    const state = await this.request<ChatStateResponse>(`/chat/state${query}`);
     this.noteMessages((state.notifications ?? []).map((notification) => notification?.message));
     return normalizeChatState(state);
   }
@@ -144,16 +163,40 @@ export class CloudChatApi {
     );
   }
 
+  /**
+   * `seen`: the app showed them where the reader was looking (the open
+   * channel, a toast in the foreground), which also cancels the phone push
+   * waiting on them. A server that predates it ignores the field.
+   */
   async markNotificationsDelivered(
     notificationIds: string[],
+    options: { seen?: boolean } = {},
   ): Promise<{ delivered: number }> {
     return this.request<{ delivered: number }>(
       "/chat/notifications/delivered",
       {
         method: "POST",
+        body: JSON.stringify({ notificationIds, ...(options.seen ? { seen: true } : {}) }),
+      },
+    );
+  }
+
+  /**
+   * The notifications among these the reader has neither read nor been shown
+   * in front of them, on any device. Throws on a server without the route
+   * (404); the caller raises the alert then, as before.
+   */
+  async getUnseenNotificationIds(notificationIds: string[]): Promise<string[]> {
+    const answer = await this.request<{ notificationIds?: unknown }>(
+      "/chat/notifications/unseen",
+      {
+        method: "POST",
         body: JSON.stringify({ notificationIds }),
       },
     );
+    return Array.isArray(answer?.notificationIds)
+      ? answer.notificationIds.filter((id): id is string => typeof id === "string")
+      : notificationIds;
   }
 
   async openDirectChannel(target: {
@@ -258,6 +301,30 @@ export class CloudChatApi {
     return normalizeChatMessage(message);
   }
 
+  /**
+   * Sets your reaction with one emoji on a message; setting what is already
+   * there changes nothing. Answers the message's reactions as they stand.
+   */
+  async setReaction(
+    channelId: string,
+    messageId: string,
+    emoji: string,
+    reacted: boolean,
+  ): Promise<ChatReactionsUpdate> {
+    const answer = await this.request<{ reactions?: unknown }>(
+      `/chat/channels/${channelId}/messages/${messageId}/reactions`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ emoji, reacted }),
+      },
+    );
+    return { channelId, messageId, reactions: normalizeChatReactions(answer?.reactions) };
+  }
+
+  subscribeReactions(listener: (update: ChatReactionsUpdate) => void): () => void {
+    return this.options.socket.subscribeChatReactions(listener);
+  }
+
   /** Whether this account is tied to a Discord person. Throws a 404 or 501 `ApiRequestError` on a server without Discord sync. */
   async getDiscordLink(): Promise<ChatDiscordLink> {
     return normalizeChatDiscordLink(await this.options.request<unknown>("/chat/discord/link"));
@@ -291,6 +358,10 @@ export class CloudChatApi {
 
   subscribeNotifications(listener: ChatNotificationListener): () => void {
     return this.options.socket.subscribeChatNotifications(listener);
+  }
+
+  subscribeChannelState(listener: (state: ChatChannelState) => void): () => void {
+    return this.options.socket.subscribeChatChannelState(listener);
   }
 
   subscribePresence(listener: ChatPresenceListener): () => void {

@@ -8,6 +8,8 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type ReactNode,
+  type RefObject,
 } from "react";
 import { EmptyState } from "../../../components/ui/status";
 import { usePaneInstance } from "../../../state/app/context";
@@ -26,6 +28,7 @@ import {
   hasMeaningfulTableHorizontalOverflow,
 } from "../../../components/ui/table-layout";
 import { WEB_CELL_HEIGHT, WEB_CELL_WIDTH } from "../../../theme/font-scale";
+import { isLiveResizing, onLiveResizeEnd } from "../../../ui/live-resize";
 import { useScrollbarActivity } from "../scrollbar-activity";
 import { useHorizontalScrollEdges } from "../host/overflow-fade";
 import {
@@ -104,6 +107,7 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
   emptyStateTitle,
   emptyStateHint,
   virtualize = true,
+  fitRows = false,
   overscan = 3,
   columnGap = 1,
   horizontalPadding = 1,
@@ -214,12 +218,29 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
     scheduleVisibleRangeMeasure();
     const element = bodyElementRef.current;
     if (!element || typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => {
+    const measure = () => {
       scheduleViewportWidthMeasure();
       scheduleVisibleRangeMeasure();
+    };
+    // While the pointer resizes the pane, its columns stretch by CSS and the
+    // pane renders the table at the new size a few times a second; measuring
+    // on every cell the body crosses would render it once per cell. It is
+    // measured once the resize ends, a frame after its layout lands.
+    let measureAfterResize = false;
+    const observer = new ResizeObserver(() => {
+      if (isLiveResizing()) measureAfterResize = true;
+      else measure();
+    });
+    const stopListening = onLiveResizeEnd(() => {
+      if (!measureAfterResize) return;
+      measureAfterResize = false;
+      measure();
     });
     observer.observe(element);
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      stopListening();
+    };
   }, [measureViewportWidth, scheduleViewportWidthMeasure, scheduleVisibleRangeMeasure]);
 
   useEffect(() => {
@@ -307,30 +328,43 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
     const frozenCell = freezeFirstColumn && overflowEdges.start
       ? body?.querySelector<HTMLElement>('[data-gloom-role="data-table-header-cell"]')
       : null;
+    // The gap after it is the next column's margin, as laid out.
+    const following = frozenCell?.nextElementSibling;
+    const gap = following ? parseFloat(following.ownerDocument.defaultView?.getComputedStyle(following).marginLeft ?? "") || 0 : 0;
     const next = frozenCell && body
-      ? Math.max(0, frozenCell.getBoundingClientRect().right - body.getBoundingClientRect().left + columnGap * WEB_CELL_WIDTH)
+      ? Math.max(0, frozenCell.getBoundingClientRect().right - body.getBoundingClientRect().left + gap)
       : 0;
-    setFrozenEdgePx((current) => current === next ? current : next);
-  }, [columnGap, columns, freezeFirstColumn, overflowEdges.start, viewportWidth]);
+    // Set only on a change: a state update from a layout effect costs the render a second commit.
+    if (next !== frozenEdgePx) setFrozenEdgePx(next);
+  }, [columnGap, columns, freezeFirstColumn, frozenEdgePx, overflowEdges.start, viewportWidth]);
 
   const rootStyle: CSSProperties = {
     position: "relative",
     display: "flex",
     flexDirection: "column",
-    flex: "1 1 0px",
+    // A table set inline in a page is as tall as its header and rows.
+    flex: fitRows ? "0 0 auto" : "1 1 0px",
     width: "100%",
     minWidth: 0,
     minHeight: 0,
     backgroundColor: CSS_BG,
     overflow: "hidden",
+    // Its width comes from where it sits, never from its columns. When the
+    // columns overflow, the content is laid out at their full width; in a box
+    // that sizes to its content (a pane's side beside a sidebar), that widened
+    // the box until they fit, which turned the scrolling off and narrowed it
+    // again: a measure and a render every frame, at rest.
+    contain: "inline-size",
   };
   const bodyScrollerStyle: CSSProperties = {
     width: "100%",
-    flex: "1 1 0px",
+    // What is kept to the columns in view (a section header's action) measures the body in `cqw`.
+    containerType: "inline-size",
+    flex: fitRows ? "0 0 auto" : "1 1 0px",
     minWidth: 0,
     minHeight: 0,
     overflowX: horizontalScrollEnabled ? "auto" : "hidden",
-    overflowY: "auto",
+    overflowY: fitRows ? "hidden" : "auto",
     backgroundColor: CSS_BG,
     // The table runs to the pane footer. A partly visible last row is how every
     // scrolling list reads; trimming the viewport to whole rows left a blank
@@ -386,7 +420,7 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
             columns={columns}
             freezeFirstColumn={freezeFirstColumn}
             scrollLeft={frozenScrollLeft}
-            viewportWidth={viewportWidth}
+            viewportWidth={freezeFirstColumn ? viewportWidth : 0}
             columnGap={columnGap}
             horizontalPadding={horizontalPadding}
             focusPane={focusPane}
@@ -398,21 +432,9 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
           />
           {items.length === 0 ? (
             emptyContent ?? (
-              <div
-                data-gloom-role="data-table-empty"
-                style={{
-                  width: viewportWidth > 0 ? viewportWidth * WEB_CELL_WIDTH : "100%",
-                  maxWidth: "100%",
-                  boxSizing: "border-box",
-                  position: "sticky",
-                  left: 0,
-                  padding: `${WEB_CELL_HEIGHT}px ${WEB_CELL_WIDTH}px`,
-                  color: CSS_TEXT_DIM,
-                  lineHeight: "var(--cell-h)",
-                }}
-              >
+              <EmptyBody body={bodyElementRef}>
                 <EmptyState title={emptyStateTitle} hint={emptyStateHint} />
-              </div>
+              </EmptyBody>
             )
           ) : measurePerf(
             "data-table.desktop.render-virtual-rows",
@@ -433,7 +455,9 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
                     columns={columns}
                     freezeFirstColumn={freezeFirstColumn}
                     scrollLeft={frozenScrollLeft}
-                    viewportWidth={viewportWidth}
+                    // Only a frozen first column places itself by it: every
+                    // other row stays memoized when the viewport changes width.
+                    viewportWidth={freezeFirstColumn ? viewportWidth : 0}
                     columnGap={columnGap}
                     horizontalPadding={horizontalPadding}
                     focusPane={focusPane}
@@ -491,6 +515,44 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
           style={overflowFadeStyle("right", overflowEdges.scrollbarRight, overflowEdges.scrollbarBottom)}
         />
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * An empty table's message, as wide as the body shows: it stays in view
+ * however wide the columns scroll. Read from the body's laid-out width, and
+ * set on the element, so a resize does not render the table.
+ */
+function EmptyBody({ body, children }: { body: RefObject<HTMLDivElement | null>; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const element = ref.current, scroller = body.current;
+    if (!element || !scroller) return;
+    const fit = () => {
+      element.style.width = scroller.clientWidth > 0 ? `${scroller.clientWidth}px` : "100%";
+    };
+    fit();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(fit);
+    observer.observe(scroller);
+    return () => observer.disconnect();
+  }, [body]);
+  return (
+    <div
+      ref={ref}
+      data-gloom-role="data-table-empty"
+      style={{
+        maxWidth: "100%",
+        boxSizing: "border-box",
+        position: "sticky",
+        left: 0,
+        padding: `${WEB_CELL_HEIGHT}px ${WEB_CELL_WIDTH}px`,
+        color: CSS_TEXT_DIM,
+        lineHeight: "var(--cell-h)",
+      }}
+    >
+      {children}
     </div>
   );
 }

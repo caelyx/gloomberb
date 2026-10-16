@@ -5,7 +5,7 @@ import type { Quote, TickerFinancials } from "../../../types/financials";
 import type { TickerRecord } from "../../../types/ticker";
 import { blendHex, colors } from "../../../theme/colors";
 import { buildPortfolioSummaryNotices, buildPortfolioSummarySegments } from "./summary";
-import { adoptHeldPortfolioCurrencies } from "./mutations";
+import { adoptHeldPortfolioCurrencies } from "../../../portfolio/mutations";
 import {
   calculatePortfolioSummaryTotals,
   getColumnValue,
@@ -683,6 +683,25 @@ describe("watchlist and portfolio LAST, CHG and CHG% around the close", () => {
       previousClose: 2788, marketState: "CLOSED", listingExchangeName: "JPX", lastUpdated: Date.parse("2026-10-08T06:30:00Z") } });
     expect(shown(closed, "price", "change", "change_pct", "ext_hours")).toEqual(["2,800", "+12", "+0.43%", "—"]);
     expect(sorted(closed, "price", "change_pct")).toEqual([2800, 0.43]);
+  });
+
+  test("valued at the regular close, MKT VAL, P&L, DAY and the totals follow LAST, and AS OF UTC dates each row by the price it uses", () => {
+    const posted = createFinancials({ quote: afterHours });
+    const latest: ColumnContext = { ...defaultColumnContext, now: Date.parse("2026-10-09T01:00:00Z") };
+    const atClose: ColumnContext = { ...latest, valuationBasis: "regular-close" };
+    const value = (context: ColumnContext, id: string) => getSortValue(column(id), ticker, posted, context);
+    const text = (context: ColumnContext, id: string) => getColumnValue(column(id), ticker, posted, context).text;
+    expect(value(latest, "mkt_value")).toBeCloseTo(1653.9, 8);
+    expect(text(latest, "as_of")).toBe("Thu 22:22");
+    // At the close: LAST times the shares, the session's move, and the venue's close (16:00 New York).
+    expect(value(atClose, "mkt_value")).toBe(10 * 160.57);
+    expect(value(atClose, "pnl")).toBeCloseTo(605.7, 8);
+    expect(value(atClose, "day_pnl")).toBeCloseTo(-70.3, 8);
+    expect(text(atClose, "as_of")).toBe("Thu 20:00");
+    expect(value(atClose, "as_of")).toBe(Date.parse("2026-10-08T20:00:00Z"));
+    const totals = calculatePortfolioSummaryTotals([ticker], new Map([["AAPL", posted]]), "USD", new Map([["USD", 1]]), true, "main", "regular-close");
+    expect(totals.totalMktValue).toBe(10 * 160.57);
+    expect(totals.dailyPnl).toBeCloseTo(-70.3, 8);
   });
 
   test("the watchlist Avg Day is the mean of the CHG% column after the close, while portfolio DAY stays live", () => {

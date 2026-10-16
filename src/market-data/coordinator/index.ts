@@ -1,5 +1,5 @@
 import type { CachedAssetArgs, CachedAssetMethod, CachedAssetValue, DataProvider, SecFilingDocument, SecFilingItem } from "../../types/data-provider";
-import type { OptionsChain, PricePoint, Quote, TickerFinancials } from "../../types/financials";
+import type { CorporateActionsData, OptionsChain, PricePoint, Quote, TickerFinancials } from "../../types/financials";
 import { fetchHistoryResult, type HistoryResultRequest } from "../../sources/history-result";
 import type { ChartRequest, InstrumentRef, OptionsRequest, SecFilingsRequest } from "../request-types";
 import { QueryStore, type QueryStoreRetention } from "../query-store";
@@ -21,8 +21,10 @@ import {
 } from "../selectors";
 import { resolveTickerFinancialsQuoteState } from "../quotes/resolution";
 import { measurePerf } from "../../utils/perf-marks";
+import { startTickerChangeLookup, type TickerChangeLookup } from "../../tickers/ticker-changes";
+import { fateListing, loadListingFate, NO_FATE, type ListingFate } from "../../tickers/listing-fate";
 import { hasLikelyQuoteUnitMismatch } from "../../utils/currency-units";
-import { hasUsablePriceHistory } from "../../utils/price-history";
+import { hasUsablePriceHistory, normalizePriceHistory } from "../../utils/price-history";
 import { fxFreshUntil } from "../../utils/fx-market-hours";
 import {
   createBaselineChartRequest,
@@ -218,6 +220,10 @@ export class MarketDataCoordinator {
     return this.events.getVersion();
   }
 
+  getKeyVersion(key: string): number {
+    return this.events.getKeyVersion(key);
+  }
+
   getKeysVersion(keys: readonly string[]): number {
     return this.events.getKeysVersion(keys);
   }
@@ -288,6 +294,37 @@ export class MarketDataCoordinator {
     const financials = buildTickerFinancialsSnapshot(snapshotEntry, quoteEntry, chartEntry);
     this.financialsSnapshotCache.set(key, { snapshotEntry, quoteEntry, chartEntry, financials });
     return financials;
+  }
+
+  /**
+   * The ticker change lookup for an instrument's symbol (`startTickerChangeLookup`), through
+   * this coordinator's source: what `listingFateGate` reads beside the quote. A broker's
+   * contract has none.
+   */
+  lookupTickerChanges(instrument: InstrumentRef): TickerChangeLookup {
+    const listing = fateListing(instrument);
+    return startTickerChangeLookup(listing ? this.dataProvider : null, listing?.symbol ?? "", listing?.exchange);
+  }
+
+  /**
+   * What became of an instrument's listing (`loadListingFate`): its quote as this store
+   * has or loads it, its changes from `lookupTickerChanges`. A line that trades waits only
+   * a short grace for the lookup once its quote is in; a stopped one waits for it.
+   */
+  async loadListingFate(instrument: InstrumentRef): Promise<ListingFate> {
+    const listing = fateListing(instrument);
+    if (!listing) return NO_FATE;
+    const quote = this.loadQuote(instrument).then(resolveEntryData, () => null);
+    return loadListingFate(listing, this.dataProvider, { quote, changes: this.lookupTickerChanges(instrument) });
+  }
+
+  /**
+   * The instrument's dividends, splits and earnings dates from this coordinator's source,
+   * which caches them; null from a source that has none.
+   */
+  async loadCorporateActions(instrument: InstrumentRef): Promise<CorporateActionsData | null> {
+    if (!this.dataProvider.getCorporateActions) return null;
+    return this.dataProvider.getCorporateActions(instrument.symbol, instrument.exchange ?? "");
   }
 
   primeCachedFinancials(entries: Array<{ instrument: InstrumentRef; financials: TickerFinancials }>): void {
@@ -392,7 +429,7 @@ export class MarketDataCoordinator {
     const key = buildChartKey(request);
     this.chartRequests.set(key, request);
     const current = this.chartStore.get(key);
-    const currentData = normalizeFreshChartData(resolveEntryData(current), request, current.history);
+    const currentData = normalizeFreshChartData(resolveEntryData(current), request, current.history, current.fetchedAt);
     if (!options.forceRefresh && currentData.length > 0 && hasFreshEntryData(current, CHART_CACHE_TTL_MS)) {
       if (currentData !== resolveEntryData(current)) {
         return this.chartStore.update(key, (entry) =>
@@ -425,7 +462,9 @@ export class MarketDataCoordinator {
         const result = await load(requested) ?? await load({ kind: "range", range: request.bufferRange });
         if (!result) throw new Error("No chart history method is available");
         const { points, ...history } = result;
-        const data = normalizeFreshChartData(points, request, history);
+        // The router answers a copy short of the latest session only when a
+        // refetch failed, and that saved copy beats an empty chart.
+        const data = normalizePriceHistory(points);
         const source = result.sourceKey ?? this.dataProvider.id;
         const status = hasUsablePriceHistory(data) ? "success" : "empty";
         const attempts = [createAttempt(source, startedAt, status, status === "empty" ? "NO_DATA" : undefined)];

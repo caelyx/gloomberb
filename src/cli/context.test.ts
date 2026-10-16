@@ -1,12 +1,113 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync } from "fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
+import { apiClient } from "../api-client";
+import { initDataDir, loadConfig, saveConfig } from "../data/config/store";
 import type { CliCommandContext } from "../types/plugin";
 import type { CliServicesContext, ConfigContext, MarketContext } from "./types";
 import {
   ensureCliServicesReady,
+  initConfigData,
+  initMarketData,
   withCliServices,
   withConfigData,
   withMarketData,
 } from "./context";
+
+const originalGloomberbHome = process.env.GLOOMBERB_HOME;
+const originalSessionEnv = process.env.GLOOMBERB_SESSION_TOKEN;
+const originalApiSession = apiClient.getSessionToken();
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  if (originalGloomberbHome === undefined) delete process.env.GLOOMBERB_HOME;
+  else process.env.GLOOMBERB_HOME = originalGloomberbHome;
+  if (originalSessionEnv === undefined) delete process.env.GLOOMBERB_SESSION_TOKEN;
+  else process.env.GLOOMBERB_SESSION_TOKEN = originalSessionEnv;
+  apiClient.setSessionToken(originalApiSession);
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+/** A profile folder nothing has created yet, as on a machine that never ran Gloomberb. */
+async function freshProfile(): Promise<string> {
+  const parent = await mkdtemp(join(tmpdir(), "gloomberb-cli-context-"));
+  tempDirs.push(parent);
+  return join(parent, "profile");
+}
+
+/** config.json as written, without the folder it names, so two profiles compare. */
+async function savedSettings(home: string): Promise<Record<string, unknown>> {
+  const { dataDir: _dataDir, ...rest } = JSON.parse(await readFile(join(home, "config.json"), "utf-8"));
+  return rest;
+}
+
+describe("CLI data folder on a new profile", () => {
+  test("the first command creates it as the app's first launch does, leaving onboarding to the app", async () => {
+    const home = await freshProfile();
+    process.env.GLOOMBERB_HOME = home;
+
+    const context = await initConfigData();
+    context.persistence.close();
+    expect(context.dataDir).toBe(home);
+    expect(existsSync(join(home, ".gloomberb-cache.db"))).toBe(true);
+    // The app opens onboarding when its config does not say it finished.
+    expect(context.config.onboardingComplete).toBeUndefined();
+
+    const appHome = await freshProfile();
+    await mkdir(appHome, { recursive: true });
+    await initDataDir(appHome);
+    expect(await savedSettings(home)).toEqual(await savedSettings(appHome));
+
+    // Later commands read that config instead of writing defaults over it.
+    await saveConfig({ ...(await loadConfig(home)), theme: "paper" });
+    const again = await initConfigData();
+    again.persistence.close();
+    expect(again.config.theme).toBe("paper");
+  });
+
+  test("a config.json it cannot read is left alone rather than reset to defaults", async () => {
+    const home = await freshProfile();
+    process.env.GLOOMBERB_HOME = home;
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, "config.json"), "{ \"theme\": ", "utf-8");
+
+    await expect(initConfigData()).rejects.toThrow(`Could not read ${join(home, "config.json")}.`);
+    expect(await readFile(join(home, "config.json"), "utf-8")).toBe("{ \"theme\": ");
+  });
+});
+
+describe("CLI market data and the saved Cloud session", () => {
+  /** Signs in the way the app does: its saved session sits in the profile's plugin state. */
+  async function saveCloudSession(home: string, sessionToken: string): Promise<void> {
+    process.env.GLOOMBERB_HOME = home;
+    const seed = await initConfigData();
+    seed.persistence.pluginState.set("gloomberb-cloud", "resume:session", { sessionToken }, 1);
+    seed.persistence.close();
+  }
+
+  test("a signed-in profile starts with its session, so a Pro account is not quoted 15 minutes late", async () => {
+    delete process.env.GLOOMBERB_SESSION_TOKEN;
+    apiClient.setSessionToken(null);
+    const home = await freshProfile();
+    await saveCloudSession(home, "saved-pro-session");
+
+    const market = await initMarketData();
+    market.persistence.close();
+    expect(apiClient.getSessionToken()).toBe("saved-pro-session");
+  });
+
+  test("a signed-out profile starts without one", async () => {
+    delete process.env.GLOOMBERB_SESSION_TOKEN;
+    apiClient.setSessionToken("left-over-session");
+    process.env.GLOOMBERB_HOME = await freshProfile();
+
+    const market = await initMarketData();
+    market.persistence.close();
+    expect(apiClient.getSessionToken()).toBeNull();
+  });
+});
 
 function initializer<K extends "initConfigData" | "initMarketData" | "initServices", T>(
   key: K,

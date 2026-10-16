@@ -5,7 +5,8 @@ import type { CatalystResponse, CatalystDetail, CatalystFilters, CatalystStatus,
 import type { KpisPayload, GuidancePayload, KpiQueryOptions } from "./company-kpis";
 import { companyDisclosurePath } from "./company-kpis";
 import type { PowerBoard, PowerDetail, PowerFilter, PowerHistory } from "./power";
-import type { PerpBoardPayload, PerpHistoryPayload, PerpRankingsPayload, PerpBoardQuery, PerpHistoryQuery, PerpMarketPayload } from "./perps";
+import type { PerpBoardPayload, PerpEquitiesPayload, PerpEquityListing, PerpHistoryPayload, PerpRankingsPayload, PerpBoardQuery, PerpHistoryQuery,
+  PerpMarketPayload } from "./perps";
 import type { ExposureRequest, ExposurePayload, ExposureScenario } from "./exposure";
 import type { SupplyChainPayload, SupplyOptions } from "./supply-chain";
 import { supplyGraphQuery, type GraphOptions, type GraphPayload } from "./supply-chain-graph";
@@ -22,19 +23,25 @@ import {
   type GoingConcernParams,
   type InsolvencyNoticesParams,
 } from "./distress";
+import type { LettersParams } from "./letters";
 import type { IpoCalendarParams, IpoCalendarPayload } from "./ipo";
+import type { TickerChanges } from "../types/ticker-changes";
+import type { OrganizationTickersResponse } from "./organization-tickers";
 import type { CryptoMarketsPayload } from "./crypto-markets";
 import type { CentralBankRatesPayload } from "./central-bank-rates";
 import type { EstimateRevisionsPayload } from "./estimate-revisions";
 import type { MoneyMarketsPayload } from "./money-markets";
-import type { CloudCurveId, CloudCurveView, CloudWorldCurves } from "./yield-curves";
+import type { CloudCurveHistory, CloudCurveId, CloudCurveView, CloudWorldCurves } from "./yield-curves";
 import type { CdxBoardPayload, CloudCreditBoardParams, SovrBoardPayload } from "./credit-boards";
 import type { ShortVolumePayload, ShortVolumeScope } from "./short-volume";
 import type { BeneficialOwnersPayload, CloudBeneficialOwnersParams } from "./beneficial-owners";
+import type { CloudInsiderSignalsParams, InsiderSignalsPayload } from "./insider-signals";
 import type { SocialMentionDayPosts, SocialMentionsPayload, SocialMentionsRange } from "./social-mentions";
 import type { FuturesContractTermsPayload, FuturesCurveAsOfPayload, FuturesCurvePayload } from "./futures-curve";
 import type { CotBoardPayload, CotContractPayload, CotFamily, CotClass } from "./cot";
-import type { DoeBoardPayload } from "./doe";
+import type { DoeBoardPayload, DoePricesPayload } from "./doe";
+import type { JodiBoardPayload, PsdBoardPayload } from "./commodity-balances";
+import type { CarbonBoard, CarbonHistory, EuropePowerBoard, EuropePowerHistory, GasStorageBoard, GasStorageHistory, GasStorageSeasonal } from "./europe-energy";
 import type { GpuBoardPayload, GpuEventsPayload, GpuHistoryPayload, GpuHistoryQuery } from "./gpu";
 import type { CpiBoardPayload } from "./cpi";
 import type { TapeSnapshot } from "./tape";
@@ -76,6 +83,7 @@ import {
   cloudExchangeRatePath,
   cloudSec13FPath,
   cloudSecBeneficialOwnersPath,
+  cloudSecInsiderSignalsPath,
   cloudSecFilingContentPath,
   cloudSecFilingDocumentsPath,
   cloudSecFilingsPath,
@@ -85,6 +93,7 @@ import {
   cloudMarketSearchPath,
   cloudMarketSymbolPath,
   cloudNewsPath,
+  cloudNewsSearchPath,
   cloudOptionsChainPath,
   cloudSavedSearchPath,
   cloudSavedSearchesPath,
@@ -109,6 +118,7 @@ import type {
   CloudAnalystResearchPayload,
   CloudShortInterestPayload,
   CloudCdsHistoryResponse,
+  CloudCdsLevelsResponse,
   CloudCdsResponse,
   CloudCongressHousePayload,
   CloudEarningsCallListPayload,
@@ -136,6 +146,7 @@ import type {
   CloudMarketResponse,
   CloudMarketScreenerCategory,
   CloudMarketScreenerPayload,
+  CloudMoverSession,
   CloudNewsListResponse,
   CloudNewsPayload,
   CloudSavedSearch,
@@ -276,8 +287,10 @@ export class CloudDataApi {
     return this.request(`/news/article-summary?${new URLSearchParams({ url })}`);
   }
 
-  getMarketMovers(category: "day_gainers" | "day_losers" | "most_actives", count = 25, refresh = false): Promise<CloudMarketResponse<MarketMoversPayload>> {
+  /** `session` is what Gainers and Losers are ranked by (see CloudMoverSession). */
+  getMarketMovers(category: "day_gainers" | "day_losers" | "most_actives", count = 25, refresh = false, session?: CloudMoverSession): Promise<CloudMarketResponse<MarketMoversPayload>> {
     const params = new URLSearchParams({ category, count: String(count), mode: refresh ? "refresh" : "cache-first" });
+    if (session && category !== "most_actives") params.set("session", session);
     return this.request(`/market/movers?${params}`);
   }
 
@@ -293,12 +306,17 @@ export class CloudDataApi {
     return this.requestMarketSymbol("/market/dividends", symbol, exchange);
   }
 
-  /** Gainers, losers and most active, or the pre-market, after-hours and gap lists with a `side`. */
+  /**
+   * Gainers, losers and most active, or the pre-market, after-hours and gap
+   * lists with a `side`. `session` is what Gainers and Losers are ranked by
+   * (see CloudMoverSession).
+   */
   async getCloudMarketScreener<Category extends CloudMarketScreenerCategory | CloudSessionMoversCategory>(
     category: Category,
     count = 25,
     mode: "cache-first" | "refresh" = "cache-first",
     side?: CloudSessionMoversSide,
+    session?: CloudMoverSession,
   ): Promise<CloudMarketResponse<Category extends CloudSessionMoversCategory ? CloudSessionMoversPayload : CloudMarketScreenerPayload>> {
     const requestedCount = Number.isFinite(count) ? Math.round(count) : 25;
     const params = new URLSearchParams({
@@ -307,6 +325,7 @@ export class CloudDataApi {
       mode,
     });
     if (side && isSessionMoversCategory(category)) params.set("side", side);
+    if (session && (category === "gainers" || category === "losers")) params.set("session", session);
     return this.request(`/market/screener?${params.toString()}`);
   }
 
@@ -370,6 +389,26 @@ export class CloudDataApi {
       symbol,
       exchange,
     );
+  }
+
+  /** Where the issuer that held a US symbol trades now, or what the symbol's holder was called before. */
+  async getCloudTickerChanges(
+    symbol: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<CloudMarketResponse<TickerChanges>> {
+    return this.request<CloudMarketResponse<TickerChanges>>(
+      `/market/ticker-changes?${new URLSearchParams({ symbol: symbol.trim().toUpperCase() })}`,
+      options.signal ? { signal: options.signal } : undefined,
+    );
+  }
+
+  /** The listed company each organization name resolves to, if any: a trial's lead sponsors, a page at a time. */
+  async getCloudOrganizationTickers(names: readonly string[], signal?: AbortSignal): Promise<OrganizationTickersResponse> {
+    return this.request<OrganizationTickersResponse>("/market/organization-tickers", {
+      method: "POST",
+      body: JSON.stringify({ names }),
+      signal,
+    });
   }
 
   async getCloudHistory(
@@ -517,6 +556,9 @@ export class CloudDataApi {
     const query = exchange === undefined ? "" : `?${new URLSearchParams({ identity: "listing", exchange })}`;
     return this.request(`/cloud/perps/equity/${encodeURIComponent(symbol)}${query}`);
   }
+  async getCloudPerpsEquities(listings: readonly PerpEquityListing[]): Promise<PerpEquitiesPayload> {
+    return this.request("/cloud/perps/equities", { method: "POST", body: JSON.stringify({ listings }) });
+  }
   async getCloudPerpsMarket(marketId: string): Promise<PerpMarketPayload> { return this.request(`/cloud/perps/market?${new URLSearchParams({ marketId })}`); }
 
   async analyzeCloudExposure(request: ExposureRequest): Promise<ExposurePayload> {
@@ -556,6 +598,18 @@ export class CloudDataApi {
     return this.request<DoeBoardPayload>("/cloud/doe/board");
   }
 
+  async getCloudDoePrices(): Promise<DoePricesPayload> {
+    return this.request<DoePricesPayload>("/cloud/doe/prices");
+  }
+
+  getCloudJodiBoard(signal?: AbortSignal): Promise<JodiBoardPayload> {
+    return this.request<JodiBoardPayload>("/cloud/jodi/board", { signal });
+  }
+
+  getCloudPsdBoard(signal?: AbortSignal): Promise<PsdBoardPayload> {
+    return this.request<PsdBoardPayload>("/cloud/psd/board", { signal });
+  }
+
   async getCloudAttention(window: AttentionWindow = "now", symbol?: string): Promise<AttentionPayload> {
     const path = symbol ? `/cloud/attention/${encodeURIComponent(symbol)}` : "/cloud/attention";
     return this.request<AttentionPayload>(`${path}?window=${window}`);
@@ -574,6 +628,50 @@ export class CloudDataApi {
   async getCloudPowerProject(id: string, query: Pick<PowerFilter, "offset" | "limit"> = {}, signal?: AbortSignal): Promise<PowerDetail> {
     const params = new URLSearchParams(Object.entries(query).filter(([, value]) => value !== undefined).map(([key, value]) => [key, String(value)]));
     return this.request<PowerDetail>(`/cloud/power/projects/${encodeURIComponent(id)}?${params}`, { signal });
+  }
+
+  /** European day-ahead power prices by country, latest day first per market. */
+  async getCloudEuropePower(): Promise<EuropePowerBoard> {
+    return this.request<EuropePowerBoard>("/cloud/europe-energy/power", { signal: AbortSignal.timeout(30_000) });
+  }
+
+  /** One market's daily day-ahead prices from `from` (all of them without one), oldest first. */
+  async getCloudEuropePowerHistory(code: string, from?: string | null): Promise<EuropePowerHistory> {
+    const query = from ? `?${new URLSearchParams({ from })}` : "";
+    return this.request<EuropePowerHistory>(
+      `/cloud/europe-energy/power/${encodeURIComponent(code)}/history${query}`,
+      { signal: AbortSignal.timeout(30_000) },
+    );
+  }
+
+  /** The EU carbon allowance (EUA) auction price as of its latest auction day, with the latest auctions. */
+  async getCloudEuropeCarbon(): Promise<CarbonBoard> {
+    return this.request<CarbonBoard>("/cloud/europe-energy/carbon", { signal: AbortSignal.timeout(30_000) });
+  }
+
+  /** The daily EUA auction price from `from` (every auction day since 2020 without one), oldest first. */
+  async getCloudEuropeCarbonHistory(from?: string | null): Promise<CarbonHistory> {
+    const query = from ? `?${new URLSearchParams({ from })}` : "";
+    return this.request<CarbonHistory>(`/cloud/europe-energy/carbon/history${query}`, { signal: AbortSignal.timeout(30_000) });
+  }
+
+  /** European gas storage: the EU aggregate and each member state as of its latest gas day. */
+  async getCloudEuropeGas(): Promise<GasStorageBoard> {
+    return this.request<GasStorageBoard>("/cloud/europe-energy/gas", { signal: AbortSignal.timeout(30_000) });
+  }
+
+  /** One area's gas days from `from` (all kept without one), oldest first. */
+  async getCloudEuropeGasHistory(code: string, from?: string | null): Promise<GasStorageHistory> {
+    const query = from ? `?${new URLSearchParams({ from })}` : "";
+    return this.request<GasStorageHistory>(
+      `/cloud/europe-energy/gas/${encodeURIComponent(code)}/history${query}`,
+      { signal: AbortSignal.timeout(30_000) },
+    );
+  }
+
+  /** One area's latest year against last year and its five-year range, day by day. */
+  async getCloudEuropeGasSeasonal(code: string): Promise<GasStorageSeasonal> {
+    return this.request<GasStorageSeasonal>(`/cloud/europe-energy/gas/${encodeURIComponent(code)}/seasonal`, { signal: AbortSignal.timeout(30_000) });
   }
 
   async getCloudGpuBoard(): Promise<GpuBoardPayload> {
@@ -606,6 +704,15 @@ export class CloudDataApi {
   async getCloudCurve(curve: CloudCurveId, date?: string | null): Promise<CloudCurveView> {
     const query = date ? `?${new URLSearchParams({ date })}` : "";
     return this.request<CloudCurveView>(`/cloud/econ/curves/${encodeURIComponent(curve)}${query}`, { signal: AbortSignal.timeout(30_000) });
+  }
+
+  /** One tenor of a curve from `from` (all stored sessions without one), oldest first. */
+  async getCloudCurveHistory(curve: CloudCurveId, tenor: string, from?: string | null): Promise<CloudCurveHistory> {
+    const query = new URLSearchParams({ tenor, ...(from ? { from } : {}) });
+    return this.request<CloudCurveHistory>(
+      `/cloud/econ/curves/${encodeURIComponent(curve)}/history?${query}`,
+      { signal: AbortSignal.timeout(30_000) },
+    );
   }
 
   /** Each market's latest curve and the session before, each on its own date. */
@@ -674,6 +781,12 @@ export class CloudDataApi {
     return this.request<unknown>(`/public/insolvency-notices${distressQuery(params)}`, { signal: signalWithTimeout(options?.signal, 30_000) });
   }
 
+  async getPublicLetters(params: LettersParams = {}, options?: { signal?: AbortSignal }): Promise<unknown> {
+    const { kinds, ...rest } = params;
+    const query = distressQuery({ kind: kinds?.length ? kinds.join(",") : undefined, ...rest });
+    return this.request<unknown>(`/public/letters${query}`, { signal: signalWithTimeout(options?.signal, 30_000) });
+  }
+
   async getCloudIpoCalendar(params: IpoCalendarParams = {}, options?: { signal?: AbortSignal }): Promise<IpoCalendarPayload> {
     const query = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) {
@@ -723,6 +836,11 @@ export class CloudDataApi {
 
   async getCloudCdsHistory(params: CloudCdsHistoryParams): Promise<CloudCdsHistoryResponse> {
     return this.request<CloudCdsHistoryResponse>(cloudCdsHistoryPath(params), { signal: AbortSignal.timeout(30_000) });
+  }
+
+  /** Every listed issuer's latest 5Y level in one request. */
+  async getCloudCdsLevels(): Promise<CloudCdsLevelsResponse> {
+    return this.request<CloudCdsLevelsResponse>("/cloud/credit/cds/levels", { signal: AbortSignal.timeout(30_000) });
   }
 
   async getCloudCdxBoard(params: CloudCreditBoardParams = {}): Promise<CdxBoardPayload> {
@@ -836,6 +954,15 @@ export class CloudDataApi {
     });
   }
 
+  async getCloudSecInsiderSignals(
+    params: CloudInsiderSignalsParams = {},
+    options?: { signal?: AbortSignal },
+  ): Promise<InsiderSignalsPayload> {
+    return this.request<InsiderSignalsPayload>(cloudSecInsiderSignalsPath(params), {
+      signal: options?.signal,
+    });
+  }
+
   async getCloudSecFilingDocuments(
     params: CloudSecFilingParams,
   ): Promise<CloudSecDocumentsResponse> {
@@ -855,8 +982,11 @@ export class CloudDataApi {
   async getCloudSec13F(
     path: string,
     params: Record<string, string | number | undefined> = {},
+    options?: { signal?: AbortSignal },
   ): Promise<unknown> {
-    return this.request<unknown>(cloudSec13FPath(path, params));
+    return this.request<unknown>(cloudSec13FPath(path, params), {
+      signal: options?.signal,
+    });
   }
 
   /**
@@ -929,6 +1059,13 @@ export class CloudDataApi {
     params: CloudNewsParams = {},
   ): Promise<CloudNewsListResponse> {
     return this.request<CloudNewsListResponse>(cloudNewsPath(params));
+  }
+
+  async searchCloudNews(
+    query: string,
+    limit?: number,
+  ): Promise<CloudNewsListResponse> {
+    return this.request<CloudNewsListResponse>(cloudNewsSearchPath(query, limit));
   }
 
   async getCloudNewsStory(storyId: string): Promise<CloudNewsPayload> {
