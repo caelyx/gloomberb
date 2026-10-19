@@ -1,63 +1,50 @@
 import { describe, expect, test } from "bun:test";
 import type { ApplicationMenuItemConfig } from "electrobun/bun";
-import { buildDesktopApplicationMenu, ELECTROBUN_APPLICATION_MENU_ACTION } from "./index";
+import { applicationMenuAction, buildDesktopApplicationMenu, ELECTROBUN_APPLICATION_MENU_ACTION } from "./index";
 import { applicationMenuCommand, createApplicationMenuGate } from "./click";
 
-function menuCommands(items: ApplicationMenuItemConfig[]): unknown[] {
+function menuActions(items: ApplicationMenuItemConfig[]): string[] {
   return items.flatMap((item) => {
-    const entry = item as { action?: string; data?: unknown; submenu?: ApplicationMenuItemConfig[] };
+    const entry = item as { action?: string; submenu?: ApplicationMenuItemConfig[] };
     return [
-      ...(entry.action === ELECTROBUN_APPLICATION_MENU_ACTION ? [entry.data] : []),
-      ...(entry.submenu ? menuCommands(entry.submenu) : []),
+      ...(entry.action ? [entry.action] : []),
+      ...(entry.submenu ? menuActions(entry.submenu) : []),
     ];
   });
 }
 
+// Electrobun clears an item's `data` on its first click, so every later click
+// arrives with the action string alone.
+function clickWithoutData(action: string) {
+  return applicationMenuCommand({ data: { action, data: undefined } });
+}
+
 describe("applicationMenuCommand", () => {
-  // A menu item whose command the click handler drops does nothing, by mouse
-  // or by keyboard menu navigation.
-  test("passes through every command the menu bar sends", () => {
-    const commands = menuCommands(buildDesktopApplicationMenu("darwin"));
-    expect(commands.length).toBeGreaterThan(0);
-    for (const command of commands) {
-      expect(applicationMenuCommand({
-        data: { action: ELECTROBUN_APPLICATION_MENU_ACTION, data: command },
-      })).toEqual(command as never);
+  // An item whose command cannot be read back from its action works once per
+  // launch, or not at all, by mouse or by accelerator.
+  test("reads every menu item's command from its action alone", () => {
+    const actions = menuActions(buildDesktopApplicationMenu("darwin"));
+    expect(actions.length).toBeGreaterThan(0);
+    const prefix = `${ELECTROBUN_APPLICATION_MENU_ACTION}:`;
+    for (const action of actions) {
+      expect(action.startsWith(prefix)).toBe(true);
+      expect(clickWithoutData(action)).toEqual(JSON.parse(decodeURIComponent(action.slice(prefix.length))));
     }
   });
 
-  test("ignores events for other actions", () => {
-    expect(applicationMenuCommand({
-      data: {
-        action: "gloom.other-action",
-        data: { type: "open-command-bar", query: "DES " },
-      },
-    })).toBeNull();
-  });
-
-  test("ignores unknown command types", () => {
-    expect(applicationMenuCommand({
-      data: {
-        action: ELECTROBUN_APPLICATION_MENU_ACTION,
-        data: { type: "unknown-command" },
-      },
-    })).toBeNull();
-  });
-
-  test("ignores plugin workflow commands without a command id", () => {
-    expect(applicationMenuCommand({
-      data: {
-        action: ELECTROBUN_APPLICATION_MENU_ACTION,
-        data: { type: "open-plugin-workflow" },
-      },
-    })).toBeNull();
+  test("ignores other actions, unknown commands and malformed payloads", () => {
+    const command = encodeURIComponent(JSON.stringify({ type: "open-command-bar", query: "DES " }));
+    expect(clickWithoutData(`gloom.other-action:${command}`)).toBeNull();
+    expect(clickWithoutData(ELECTROBUN_APPLICATION_MENU_ACTION)).toBeNull();
+    expect(clickWithoutData(`${ELECTROBUN_APPLICATION_MENU_ACTION}:%E0%A4%A`)).toBeNull();
+    expect(clickWithoutData(applicationMenuAction({ type: "unknown-command" } as never))).toBeNull();
   });
 });
 
 describe("buildDesktopApplicationMenu", () => {
   // A form item that only pre-fills the bar leaves the user one Enter short.
   test("opens the File menu's forms directly", () => {
-    const commands = menuCommands(buildDesktopApplicationMenu("darwin"));
+    const commands = menuActions(buildDesktopApplicationMenu("darwin")).map(clickWithoutData);
     for (const actionId of ["new-portfolio", "new-watchlist", "set-portfolio-position", "add-broker-account"]) {
       expect(commands).toContainEqual({ type: "open-builtin-workflow", actionId });
     }

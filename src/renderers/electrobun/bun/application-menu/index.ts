@@ -12,6 +12,15 @@ export type ElectrobunApplicationMenuCommand =
   | { type: "open-devtools" }
   | { type: "new-window" };
 
+/**
+ * The command rides in the item's action string, not its `data`: Electrobun
+ * keeps `data` in a registry that it clears on the item's first click, so every
+ * later click of the same item arrives with no data. The action string is kept.
+ */
+export function applicationMenuAction(command: ElectrobunApplicationMenuCommand): string {
+  return `${ELECTROBUN_APPLICATION_MENU_ACTION}:${encodeURIComponent(JSON.stringify(command))}`;
+}
+
 function commandItem(
   label: string,
   command: ElectrobunApplicationMenuCommand,
@@ -19,8 +28,7 @@ function commandItem(
 ): ApplicationMenuItemConfig {
   return {
     label,
-    action: ELECTROBUN_APPLICATION_MENU_ACTION,
-    data: command,
+    action: applicationMenuAction(command),
     ...(options.accelerator ? { accelerator: options.accelerator } : {}),
   };
 }
