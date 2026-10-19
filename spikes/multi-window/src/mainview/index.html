@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multi-window spike</title>
+  <style>
+    :root { color-scheme: dark; --bg: #111418; --fg: #e6e6e6; --muted: #8a93a0; --accent: #f5a524; --ok: #3fb950; --bad: #f85149; --line: #2a3038; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif; }
+    /* hiddenInset title bar: leave room for the traffic lights and make the strip draggable */
+    .titlebar { height: 38px; padding-left: 84px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid var(--line); }
+    .electrobun-webkit-app-region-drag { -webkit-app-region: drag; }
+    .who { font-weight: 600; font-size: 15px; }
+    .badge { padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+    .badge.on { color: #111; background: var(--ok); border-color: var(--ok); }
+    main { padding: 12px 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; height: calc(100% - 38px); }
+    section { min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+    h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 8px 0 0; }
+    button { font: inherit; color: var(--fg); background: #1c2128; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+    button:hover { border-color: var(--accent); }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+    th { color: var(--muted); font-weight: 500; }
+    .counter { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .counters { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .counters div { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+    .counters small { color: var(--muted); display: block; }
+    input { font: inherit; color: var(--fg); background: #0b0d10; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; width: 100%; }
+    #log { flex: 1; min-height: 120px; overflow: auto; margin: 0; padding: 8px; background: #0b0d10; border: 1px solid var(--line); border-radius: 6px; font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+    .overlay { position: fixed; inset: 0; display: none; align-items: flex-start; justify-content: center; padding-top: 18vh; background: rgba(0,0,0,.45); }
+    .overlay.open { display: flex; }
+    .bar { width: min(560px, 90vw); background: #1c2128; border: 1px solid var(--accent); border-radius: 10px; padding: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.5); }
+    .bar .src { color: var(--muted); margin-top: 6px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="titlebar electrobun-webkit-app-region-drag">
+    <span class="who" id="who">…</span>
+    <span class="badge" id="native-badge">native: key window</span>
+    <span class="badge" id="dom-badge">DOM: focused</span>
+    <span class="badge" id="fs-badge">full screen</span>
+  </div>
+  <main>
+    <section>
+      <h2>Actions</h2>
+      <div class="row">
+        <button id="fs-on">Enter full screen (API)</button>
+        <button id="fs-off">Exit full screen (API)</button>
+        <button id="activate-other">Activate other window</button>
+        <button id="open-w2">Open window 2</button>
+        <button id="close-self">Close this window</button>
+      </div>
+      <div class="row" id="display-buttons"></div>
+
+      <h2>Command bar opens (this window)</h2>
+      <div class="counters">
+        <div><small>Cmd-K via menu</small><span class="counter" id="c-menu-k">0</span></div>
+        <div><small>Cmd-K via DOM keydown</small><span class="counter" id="c-dom-k">0</span></div>
+        <div><small>Backtick via DOM</small><span class="counter" id="c-dom-tick">0</span></div>
+        <div><small>Search Ticker via menu</small><span class="counter" id="c-menu-tick">0</span></div>
+      </div>
+
+      <h2>Typing check (backtick must still type here)</h2>
+      <input id="typing" placeholder="Type here, including ` — it should appear, and must not open the bar">
+
+      <h2>Windows (host view)</h2>
+      <table><thead><tr><th>Window</th><th>Display</th><th>Full screen</th><th>Frame</th></tr></thead><tbody id="windows"></tbody></table>
+      <h2>Displays</h2>
+      <table><thead><tr><th>Id</th><th>Primary</th><th>Bounds</th><th>Scale</th></tr></thead><tbody id="displays"></tbody></table>
+    </section>
+    <section>
+      <h2>Event log (all windows, from host)</h2>
+      <pre id="log"></pre>
+    </section>
+  </main>
+  <div class="overlay" id="overlay">
+    <div class="bar">
+      <input id="bar-input" placeholder="Fake command bar — Esc to close">
+      <div class="src" id="bar-src"></div>
+    </div>
+  </div>
+  <script src="index.js"></script>
+</body>
+</html>

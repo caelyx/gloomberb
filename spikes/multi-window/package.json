@@ -1,0 +1,14 @@
+{
+  "name": "gloomberb-multi-window-spike",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Throwaway spike: Electrobun multi-window behaviour on macOS (two displays, full screen, focus, Cmd-K routing).",
+  "type": "module",
+  "scripts": {
+    "dev": "electrobun dev",
+    "build": "electrobun build"
+  },
+  "devDependencies": {
+    "electrobun": "1.18.1"
+  }
+}
