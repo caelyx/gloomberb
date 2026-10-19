@@ -1,4 +1,4 @@
-import { getDockedPaneIds } from "../layout/pane-manager";
+import { findPaneLocation, getDockedPaneIds } from "../layout/pane-manager";
 import type { AppState } from "../state/app/context";
 import type { LayoutConfig, PaneInstanceConfig } from "../types/config";
 import { revisionFor } from "./revision";
@@ -69,20 +69,31 @@ export function activeLayoutRev(state: AppState): string {
   });
 }
 
-function panePlacement(layout: LayoutConfig, instanceId: string): "docked" | "floating" | "detached" | "hidden" {
-  if (getDockedPaneIds(layout).includes(instanceId)) return "docked";
-  if (layout.floating.some((entry) => entry.instanceId === instanceId)) return "floating";
-  if ((layout.detached ?? []).some((entry) => entry.instanceId === instanceId)) return "detached";
-  return "hidden";
+/** A pane in a secondary window is placed `"window"`, with the window's id beside it. */
+function panePlacement(layout: LayoutConfig, instanceId: string): {
+  placement: "docked" | "floating" | "detached" | "window" | "hidden";
+  windowId?: string;
+} {
+  const location = findPaneLocation(layout, instanceId);
+  if (!location) return { placement: "hidden" };
+  if (location.window !== "main") return { placement: "window", windowId: location.window };
+  return { placement: location.kind };
 }
 
 export function paneSnapshot(state: AppState, pane: PaneInstanceConfig) {
   return {
     ...pane,
-    placement: panePlacement(state.config.layout, pane.instanceId),
+    ...panePlacement(state.config.layout, pane.instanceId),
     focused: state.focusedPaneId === pane.instanceId,
     runtimeState: state.paneState[pane.instanceId] ?? {},
   };
+}
+
+function windowPaneIds(layout: LayoutConfig): Record<string, string[]> {
+  return Object.fromEntries((layout.windows ?? []).map((window) => [
+    window.id,
+    [...getDockedPaneIds({ ...layout, dockRoot: window.dockRoot }), ...window.floating.map((entry) => entry.instanceId)],
+  ]));
 }
 
 export function mutationSummary(state: AppState, extra: Record<string, unknown> = {}) {
@@ -97,6 +108,7 @@ export function mutationSummary(state: AppState, extra: Record<string, unknown> 
     dockedPaneIds: getDockedPaneIds(state.config.layout),
     floatingPaneIds: state.config.layout.floating.map((entry) => entry.instanceId),
     detachedPaneIds: (state.config.layout.detached ?? []).map((entry) => entry.instanceId),
+    ...(state.config.layout.windows?.length ? { windowPaneIds: windowPaneIds(state.config.layout) } : {}),
     ...extra,
   };
 }

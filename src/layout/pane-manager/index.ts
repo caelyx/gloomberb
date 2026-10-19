@@ -19,6 +19,7 @@ export {
 } from "./dock-tree";
 
 export {
+  findPaneLocation,
   getLayoutPreview,
   getLeafRect,
   isPaneDetached,

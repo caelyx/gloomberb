@@ -714,3 +714,33 @@ test("a terminal that syncs leaves a desktop pane in its own window", async () =
     cloud: cloud.config()?.layout.detached.map((entry) => entry.instanceId),
   }).toEqual({ desktop: ["help:window"], cloud: ["help:window"] });
 });
+
+test("a terminal that syncs leaves a desktop's secondary windows as they are", async () => {
+  const cloud = createSharedCloud();
+  const desktop = createDevice(cloud, "desktop");
+  const layout = desktop.state.config.layout;
+  const windows = [{
+    id: "w2",
+    dockRoot: { kind: "pane" as const, instanceId: "help:w2" },
+    floating: [{ instanceId: "about:w2", x: 10, y: 10, width: 60, height: 20, zIndex: 52 }],
+  }];
+  desktop.dispatch({
+    type: "UPDATE_LAYOUT",
+    layout: {
+      ...layout,
+      instances: [...layout.instances, createPaneInstance("help", { instanceId: "help:w2" }), createPaneInstance("help", { instanceId: "about:w2" })],
+      windows,
+    },
+  });
+  await desktop.sync("startup");
+  const terminal = createDevice(cloud, "terminal", { terminal: true });
+  await terminal.sync("startup");
+  await terminal.sync("poll");
+  await desktop.sync("poll");
+
+  expect({
+    desktop: desktop.state.config.layout.windows,
+    terminal: terminal.state.config.layout.windows,
+    cloud: cloud.config()?.layout.windows,
+  }).toEqual({ desktop: windows, terminal: windows, cloud: windows });
+});
