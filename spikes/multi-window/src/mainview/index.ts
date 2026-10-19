@@ -4,7 +4,14 @@ import type { HostState, SpikeRpcSchema, WindowKey } from "../shared/rpc";
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 
 let me: WindowKey | null = null;
-const counts = { menuK: 0, domK: 0, domTick: 0, menuTick: 0 };
+const counts = { menuK: 0, domK: 0, domTick: 0, menuTick: 0, deduped: 0, repeats: 0 };
+
+// Run 2: the proposed fix for Cmd-K firing twice. One press reaches the page both as a menu
+// accelerator and as a keydown, 0–6 ms apart in run 1; whichever comes second within this
+// window is dropped. A mouse click on the menu item has no keydown, so it always gets through.
+const CMD_K_DEDUPE_MS = 150;
+let lastMenuCmdK = -Infinity;
+let lastDomCmdK = -Infinity;
 
 const rpc = Electroview.defineRPC<SpikeRpcSchema>({
   maxRequestTime: 10_000,
@@ -13,6 +20,14 @@ const rpc = Electroview.defineRPC<SpikeRpcSchema>({
     messages: {
       menuCommand: ({ command, nativeActive }) => {
         if (command === "command-bar") {
+          const now = performance.now();
+          lastMenuCmdK = now;
+          if (now - lastDomCmdK < CMD_K_DEDUPE_MS) {
+            counts.deduped += 1;
+            sendLog("menu-cmd-k-deduped", { msSinceDomCmdK: Math.round(now - lastDomCmdK) });
+            renderCounts();
+            return;
+          }
           counts.menuK += 1;
           toggleBar(`menu accelerator (host thought key window = ${nativeActive ?? "none"})`);
         } else {
@@ -55,8 +70,20 @@ function toggleBar(source: string): void {
 document.addEventListener("keydown", (event) => {
   const typingTarget = event.target instanceof HTMLInputElement && event.target.id === "typing";
   if (event.key === "k" && event.metaKey) {
-    // If Cmd-K also arrives here while the menu accelerator fires, the counters show both
-    // and the bar toggles open then closed: that is the double-fire to look for.
+    if (event.repeat) {
+      // Gloomberb's page shortcuts already run once per press (src/app/global-shortcuts.ts).
+      counts.repeats += 1;
+      renderCounts();
+      return;
+    }
+    const now = performance.now();
+    lastDomCmdK = now;
+    if (now - lastMenuCmdK < CMD_K_DEDUPE_MS) {
+      counts.deduped += 1;
+      sendLog("dom-cmd-k-deduped", { msSinceMenuCmdK: Math.round(now - lastMenuCmdK) });
+      renderCounts();
+      return;
+    }
     counts.domK += 1;
     sendLog("dom-keydown-cmd-k", { defaultPrevented: event.defaultPrevented });
     toggleBar("DOM keydown Cmd-K");
@@ -98,6 +125,8 @@ function renderCounts(): void {
   $("c-dom-k").textContent = String(counts.domK);
   $("c-dom-tick").textContent = String(counts.domTick);
   $("c-menu-tick").textContent = String(counts.menuTick);
+  $("c-deduped").textContent = String(counts.deduped);
+  $("c-repeats").textContent = String(counts.repeats);
 }
 
 const rect = (r: { x: number; y: number; width: number; height: number } | null) =>

@@ -1,5 +1,7 @@
 # Multi-window spike (macOS)
 
+> **Run 2 (follow-up):** see [RUN2.md](RUN2.md). Run 1 results: [results/RESULTS.md](results/RESULTS.md).
+
 This is a throwaway Electrobun app. It checks the macOS behaviours the secondary-window plan depends on, before any work happens in Gloomberb itself. It uses the same Electrobun version as Gloomberb (1.18.1), and the same title-bar style (`hiddenInset`) and native renderer. Gloomberb's patch to Electrobun only adds a Windows icon, so it is not applied here.
 
 It opens two windows, **MAIN** and **WINDOW 2**. Window 2 opens on your second display if one is connected. Each window shows:

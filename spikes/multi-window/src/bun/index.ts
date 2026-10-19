@@ -103,6 +103,37 @@ function safeIsFullScreen(window: BrowserWindow): boolean {
   try { return window.isFullScreen() === true; } catch { return false; }
 }
 
+// Run 2: read a window's frame back after setting it, to measure the upward creep run 1 saw on the
+// second display. With SPIKE_CORRECT_FRAMES=1, a mismatch is corrected once by setting the frame
+// again, to test whether a single correction step is enough.
+const CORRECT_FRAMES = process.env.SPIKE_CORRECT_FRAMES === "1";
+
+function verifyFrame(key: WindowKey, requested: Rect, reason: string): void {
+  const report = (when: string) => {
+    const window = windows.get(key);
+    if (!window) return null;
+    const actual = safeFrame(window);
+    const delta = actual
+      ? { dx: actual.x - requested.x, dy: actual.y - requested.y, dw: actual.width - requested.width, dh: actual.height - requested.height }
+      : null;
+    log("frame-readback", {
+      key, reason, when, requested, actual, delta,
+      requestedDisplayId: displayContaining(requested)?.id ?? null,
+      actualDisplayId: displayContaining(actual)?.id ?? null,
+      correctFrames: CORRECT_FRAMES,
+    });
+    return { window, delta };
+  };
+  report("immediate");
+  setTimeout(() => {
+    const result = report("after 300ms");
+    if (!result?.delta || !CORRECT_FRAMES || reason.startsWith("correction")) return;
+    if (result.delta.dx === 0 && result.delta.dy === 0) return;
+    result.window.setFrame(requested.x, requested.y, requested.width, requested.height);
+    verifyFrame(key, requested, `correction of ${reason}`);
+  }, 300);
+}
+
 function hostState(): HostState {
   const statuses: WindowStatus[] = [...windows].map(([key, window]) => {
     const frame = safeFrame(window);
@@ -144,6 +175,7 @@ function createRpc(key: WindowKey): SpikeRpc {
           const frame = { x: wa.x + 40, y: wa.y + 40, width: Math.min(1100, wa.width - 80), height: Math.min(750, wa.height - 80) };
           log("request-move-to-display", { key, displayId, frame });
           window.setFrame(frame.x, frame.y, frame.width, frame.height);
+          verifyFrame(key, frame, "moveToDisplay");
           setTimeout(broadcastState, 300);
           return true;
         },
@@ -251,6 +283,8 @@ function openWindow(key: WindowKey): BrowserWindow {
     broadcastState();
   });
 
+  if (!saved?.fullscreen) verifyFrame(key, frame, saved ? "create (restored frame)" : "create (default frame)");
+
   if (saved?.fullscreen) {
     // Same as Gloomberb's main window today: restore immediately after creation.
     log("restore-fullscreen-immediate", { key });
@@ -268,15 +302,15 @@ ApplicationMenu.setApplicationMenu([
     submenu: [
       { role: "about" },
       { type: "divider" },
-      { label: "Quit Spike", action: MENU_ACTION, data: { command: "quit" }, accelerator: "CmdOrCtrl+Q" },
+      { label: "Quit Spike", action: `${MENU_ACTION}:quit`, accelerator: "CmdOrCtrl+Q" },
     ],
   },
   {
     label: "File",
     submenu: [
       // Same shape as Gloomberb: no accelerator for backtick (a bare key would swallow the character).
-      { label: "Search Ticker...", action: MENU_ACTION, data: { command: "ticker-search" } },
-      { label: "Open Window 2", action: MENU_ACTION, data: { command: "open-window-2" }, accelerator: "CmdOrCtrl+Shift+N" },
+      { label: "Search Ticker...", action: `${MENU_ACTION}:ticker-search` },
+      { label: "Open Window 2", action: `${MENU_ACTION}:open-window-2`, accelerator: "CmdOrCtrl+Shift+N" },
     ],
   },
   {
@@ -290,7 +324,7 @@ ApplicationMenu.setApplicationMenu([
     label: "View",
     submenu: [
       // Same accelerator string Gloomberb serialises for the command-bar action.
-      { label: "Open Command Bar", action: MENU_ACTION, data: { command: "command-bar" }, accelerator: "CmdOrCtrl+K" },
+      { label: "Open Command Bar", action: `${MENU_ACTION}:command-bar`, accelerator: "CmdOrCtrl+K" },
     ],
   },
   {
@@ -305,11 +339,13 @@ ApplicationMenu.setApplicationMenu([
 
 ApplicationMenu.on("application-menu-clicked", (event: unknown) => {
   // Electrobun wraps the `{action, data}` payload in an event's `data`; accept a bare payload too.
-  type Payload = { action?: string; data?: { command?: string } };
+  // The command rides in the action string: Electrobun 1.18.1 deletes `data` after an item's
+  // first click (the bug run 1 found; fixed the same way in Gloomberb #13).
+  type Payload = { action?: string };
   const wrapped = (event as { data?: Payload }).data;
   const data = typeof wrapped?.action === "string" ? wrapped : (event as Payload);
-  if (data?.action !== MENU_ACTION) return;
-  const command = data.data?.command;
+  if (!data?.action?.startsWith(`${MENU_ACTION}:`)) return;
+  const command = data.action.slice(MENU_ACTION.length + 1);
   log("menu-clicked", { command, nativeActive, domActive });
   switch (command) {
     case "quit":
@@ -333,7 +369,7 @@ ApplicationMenu.on("application-menu-clicked", (event: unknown) => {
 
 // ---- start -----------------------------------------------------------------
 
-log("spike-start", { displays: displays(), remembered, logPath: LOG_PATH, framesPath: FRAMES_PATH });
+log("spike-start", { displays: displays(), remembered, logPath: LOG_PATH, framesPath: FRAMES_PATH, correctFrames: CORRECT_FRAMES });
 openWindow("main");
 openWindow("w2");
 setTimeout(broadcastState, 1000);
