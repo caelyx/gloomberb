@@ -35,10 +35,13 @@ import {
   deactivateExternalPlugin,
   desktopPluginManager,
 } from "../external-plugins";
-import { MAIN_WINDOW_RPC_KEY } from "../window/focus";
+import { MAIN_WINDOW_RPC_KEY, windowIdFromSecondaryRpcKey } from "../window/focus";
+import type { RememberedWindowStore } from "../window/remembered-frame";
 import { handleDesktopBackendRequest } from "./backend-requests";
 import { DesktopCapabilityBridge } from "./capability-bridge";
 import { DesktopDetachedWindowManager } from "./detached-windows";
+import { DesktopSecondaryWindowManager } from "./secondary-windows";
+import { secondaryWindowMayRequest } from "./secondary-window-writes";
 import { handleDesktopHostRequest } from "./host-requests";
 import { handleHttpFetch } from "./http-fetch";
 import { DesktopHttpStreamBridge } from "./http-stream";
@@ -105,6 +108,11 @@ export class DesktopBackend {
     getWindowKey: this.rpcs.getRpcWindowKey,
   });
   readonly detachedWindows = new DesktopDetachedWindowManager(this);
+  readonly secondaryWindows: DesktopSecondaryWindowManager;
+  /** Saves the main window's frame; set once it is open, so an exit can save it first. */
+  mainWindowTracker: { flush(): void } | null = null;
+  /** Set when the app starts to exit, so the windows closing on the way out do not move their panes. */
+  exiting = false;
   /** Each pane type's plugin, for hiding popped-out windows with their plugin. */
   paneOwners: ReadonlyMap<string, string> = new Map();
 
@@ -114,6 +122,13 @@ export class DesktopBackend {
   private remoteControlServer: RemoteControlServer | null = null;
   private readonly pendingDeepLinks: string[] = [];
   private readonly contextMenuRequestRpcs = new Map<string, DesktopRpc>();
+  /** The window with native focus, by channel key; null while the app is in the background. */
+  private activeWindowKey: string | null = null;
+  private readonly ignoredSecondaryRequests = new Set<string>();
+
+  constructor(rememberedWindows: RememberedWindowStore) {
+    this.secondaryWindows = new DesktopSecondaryWindowManager(this, rememberedWindows);
+  }
 
   requireConfig(): AppConfig {
     if (!this.config) throw new Error("Backend config has not been initialized.");
@@ -178,7 +193,7 @@ export class DesktopBackend {
       getServices: () => this.requireServices(),
     });
     this.workspace = createDesktopWorkspace(config, this.getSessionSnapshot());
-    this.detachedWindows.reconcile();
+    this.reconcileWindows();
     return { config, services };
   }
 
@@ -201,10 +216,58 @@ export class DesktopBackend {
       await saveConfig(nextConfig);
     }
     if (options.reconcileWindows !== false) {
-      this.detachedWindows.reconcile();
+      this.reconcileWindows();
     }
     this.stateBroadcaster.sendDesktopState(this.requireWorkspace().getSnapshot());
     return this.requireWorkspace().getSnapshot();
+  }
+
+  /** Opens and closes popped-out and secondary windows to match the open layout tab. */
+  reconcileWindows(): void {
+    this.detachedWindows.reconcile();
+    this.secondaryWindows.reconcile();
+  }
+
+  closeAllWindows(): void {
+    this.detachedWindows.closeAll();
+    this.secondaryWindows.closeAll();
+  }
+
+  windowForRpcKey(windowKey: string | undefined): BrowserWindow | null {
+    if (windowKey === MAIN_WINDOW_RPC_KEY) return this.mainWindow;
+    return this.secondaryWindows.getWindowForRpcKey(windowKey) ?? this.detachedWindows.getWindowForRpcKey(windowKey);
+  }
+
+  focusWindowForRpcKey(windowKey: string | undefined): boolean {
+    const windowId = windowIdFromSecondaryRpcKey(windowKey);
+    return windowId ? this.secondaryWindows.focus(windowId) : this.detachedWindows.focusWindowForRpcKey(windowKey);
+  }
+
+  /**
+   * Native focus, which arrives for every switch between this app's windows,
+   * unlike a view's own focus events. A blur only clears the window it is for,
+   * so a blur arriving after the next window's focus changes nothing.
+   */
+  noteWindowFocus(windowKey: string, focused: boolean): void {
+    if (focused) this.activeWindowKey = windowKey;
+    else if (this.activeWindowKey === windowKey) this.activeWindowKey = null;
+  }
+
+  /**
+   * Quits the app, once: the main window's frame is saved, every window
+   * closes and services stop. Closing the main window by any route ends here,
+   * since it holds the state the other windows show.
+   */
+  exitApp(): void {
+    if (this.exiting) return;
+    this.exiting = true;
+    this.mainWindowTracker?.flush();
+    this.closeAllWindows();
+    this.teardownServices();
+    const window = this.mainWindow;
+    this.mainWindow = null;
+    window?.close();
+    Utils.quit();
   }
 
   /** Stops what a closed window was streaming or subscribed to. */
@@ -275,7 +338,7 @@ export class DesktopBackend {
 
   runApplicationMenuCommand(command: ElectrobunApplicationMenuCommand): void {
     if (command.type === "open-devtools") {
-      this.mainWindow?.webview.openDevTools();
+      (this.windowForRpcKey(this.activeWindowKey ?? MAIN_WINDOW_RPC_KEY) ?? this.mainWindow)?.webview.openDevTools();
       return;
     }
     const rpc = this.readyMainWindowRpc();
@@ -300,12 +363,7 @@ export class DesktopBackend {
   }
 
   private quit(): void {
-    this.detachedWindows.closeAll();
-    this.teardownServices();
-    const window = this.mainWindow;
-    this.mainWindow = null;
-    window?.close();
-    Utils.quit();
+    this.exitApp();
   }
 
   private restart(message: DesktopRestartMessage = {}): void {
@@ -325,7 +383,9 @@ export class DesktopBackend {
       console.error("[desktop-recovery] failed to schedule restart", summarizeError(error));
       throw error;
     }
-    this.detachedWindows.closeAll();
+    this.exiting = true;
+    this.mainWindowTracker?.flush();
+    this.closeAllWindows();
     this.teardownServices();
     Utils.quit();
   }
@@ -450,6 +510,13 @@ export class DesktopBackend {
   }
 
   private async handleRequest(rpc: DesktopRpc, request: DesktopBackendRequest) {
+    if (windowIdFromSecondaryRpcKey(this.rpcs.getRpcWindowKey(rpc)) && !secondaryWindowMayRequest(request.method)) {
+      if (!this.ignoredSecondaryRequests.has(request.method)) {
+        this.ignoredSecondaryRequests.add(request.method);
+        console.error("[desktop-window] ignored a secondary window's request; its state is a view", { method: request.method });
+      }
+      return null;
+    }
     switch (request.method) {
       case "init":
         return this.initialize(rpc, request.payload);
@@ -470,6 +537,8 @@ export class DesktopBackend {
       case "desktop.dockDetachedPane":
       case "desktop.closeDetachedPane":
       case "desktop.focusDetachedPane":
+      case "desktop.movePaneToNewWindow":
+      case "desktop.movePaneToMainWindow":
         return handleDesktopWorkspaceRequest(this, request);
       case "pluginState.setMany":
       case "pluginState.delete":

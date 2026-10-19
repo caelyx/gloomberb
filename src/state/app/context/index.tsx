@@ -25,7 +25,7 @@ import type { DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindo
 import { setPaneSetting, setPaneSettings, updatePaneInstance } from "../../../pane-settings";
 import { useTickerFinancials } from "../../../market-data/hooks";
 import { hasAmbiguousTickerContracts, resolveInstrumentForPane, resolveListingForPane, tickerForInstrument } from "../../../core/state/app/instrument";
-import { materializeDetachedLayouts } from "../../../core/state/app/layout";
+import { getPaneOrder, materializeDetachedLayouts } from "../../../core/state/app/layout";
 import {
   APP_SESSION_ID,
   APP_SESSION_SCHEMA_VERSION,
@@ -427,6 +427,20 @@ export function usePaneTitle(title: string | null, paneId?: string): void {
   }, [id, title, updateLayout]);
 }
 
+/**
+ * A secondary window never sends its state back, so a snapshot from the main
+ * window would undo what was done here: the window keeps its own focus and the
+ * state of the panes in its own grid.
+ */
+function keepSecondaryWindowLocalState(snapshot: DesktopSharedStateSnapshot, local: AppState): DesktopSharedStateSnapshot {
+  const ownPaneIds = getPaneOrder(snapshot.config.layout);
+  const paneState = { ...snapshot.paneState };
+  for (const paneId of ownPaneIds) {
+    if (local.paneState[paneId]) paneState[paneId] = local.paneState[paneId];
+  }
+  return { ...snapshot, paneState, focusedPaneId: local.focusedPaneId };
+}
+
 export function AppProvider({
   config,
   children,
@@ -553,7 +567,8 @@ export function AppProvider({
 
   useEffect(() => {
     if (!desktopBridge) return;
-    return desktopBridge.subscribeState((snapshot) => {
+    return desktopBridge.subscribeState((incoming) => {
+      const snapshot = desktopBridge.kind === "window" ? keepSecondaryWindowLocalState(incoming, stateRef.current) : incoming;
       if (desktopBridge.kind === "main" && typeof snapshot.mainStateRevision === "number") {
         if (snapshot.mainStateRevision < latestMainStateRevisionRef.current) return;
         latestMainStateRevisionRef.current = Math.max(
@@ -611,7 +626,7 @@ export function AppProvider({
   }, [desktopBridge, state.themePreview]);
 
   useEffect(() => {
-    if (desktopBridge?.kind !== "detached" || !desktopBridge.subscribeThemePreview) return;
+    if (!desktopBridge || desktopBridge.kind === "main" || !desktopBridge.subscribeThemePreview) return;
     return desktopBridge.subscribeThemePreview((preview) => {
       dispatch({ type: "PREVIEW_THEME", theme: preview.theme });
     });

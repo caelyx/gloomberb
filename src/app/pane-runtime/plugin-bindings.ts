@@ -7,7 +7,7 @@ import type { AppTickerRepositoryPort } from "../../core/app-service-ports";
 import { openFormModal } from "../../components/form-modal";
 import { t } from "../../i18n";
 import { openBrokerAddFlow } from "../../plugins/builtin/broker-manager/add-request";
-import { getPanelFocusTarget } from "../../core/state/app/layout";
+import { getPaneOrder, getPanelFocusTarget } from "../../core/state/app/layout";
 import { getVisiblePaneCycleOrder } from "../../components/layout/pane/cycle-order";
 import {
   collectDisabledPaneIds,
@@ -266,9 +266,11 @@ export function bindAppPanePluginRegistry({
     },
     focusPane: (paneId, layout) => {
       if (isDetachedWindow) {
-        if (paneId === detachedPaneId) {
-          dispatch({ type: "FOCUS_PANE", paneId });
-        }
+        // A popped-out window focuses its pane; a secondary window, the panes in its own grid.
+        const ownPane = detachedPaneId
+          ? paneId === detachedPaneId
+          : getPaneOrder(stateRef.current.config.layout).includes(paneId);
+        if (ownPane) dispatch({ type: "FOCUS_PANE", paneId });
         return;
       }
       const instanceId = resolvePaneTarget(paneId);

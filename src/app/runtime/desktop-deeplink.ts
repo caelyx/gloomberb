@@ -634,7 +634,7 @@ export function useDesktopDeepLinkRuntime({
   }, [initialized, pluginRegistry]);
 
   useEffect(() => {
-    if (!initialized || desktopWindowKind === "detached" || !desktopDeepLinkBridge) return;
+    if (!initialized || (desktopWindowKind && desktopWindowKind !== "main") || !desktopDeepLinkBridge) return;
     return desktopDeepLinkBridge.subscribe((deeplink) => {
       handleDesktopDeepLink(deeplink.url, { dispatch, pluginRegistry, stateRef });
     });

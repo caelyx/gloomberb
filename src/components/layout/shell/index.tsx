@@ -126,6 +126,9 @@ export function Shell({
   const uiKind = useUiHost().kind;
   const shortcutDisplayMode = getShortcutDisplayMode(uiKind);
   const keybindings = useKeybindings();
+  // A secondary window shows its grid read-only for now: its layout is a view
+  // of the main window's state, and edits to it would not reach the saved layout.
+  const secondaryWindow = desktopWindowBridge?.kind === "window";
   const openCommandBar = useCallback(() => {
     dispatch({ type: "SET_COMMAND_BAR", open: true, query: "" });
   }, [dispatch]);
@@ -205,6 +208,7 @@ export function Shell({
   // Every edit here starts from the visible layout, so the panes it hides go
   // back in before the layout is saved, rather than being deleted with it.
   const persistLayout = useCallback((editedLayout: LayoutConfig, options?: { pushHistory?: boolean; focusedPaneId?: string | null }) => {
+    if (secondaryWindow) return;
     const nextLayout = restoreShellHiddenPanes(
       stateRef.current.config.layout,
       editedLayout,
@@ -224,7 +228,7 @@ export function Shell({
       currentState.paneState,
       hasFocusTarget ? (options.focusedPaneId ?? null) : currentState.focusedPaneId,
     ));
-  }, [disabledPaneIds, dispatch, pluginRegistry, stateRef]);
+  }, [disabledPaneIds, dispatch, pluginRegistry, secondaryWindow, stateRef]);
 
   const focusPane = useCallback((paneId: string) => {
     dispatch({ type: "FOCUS_PANE", paneId });
@@ -850,12 +854,14 @@ export function Shell({
           <AsciiText text="Gloomberb" font="wordmark" color={colors.textMuted} />
           <Box height={1} />
           {/* An empty layout starts at the command bar: a click opens it, the key is beside it. */}
-          <Button
-            label="Search or run a command"
-            shortcut={formatAdvertisedChord(keybindings, "command-bar", shortcutDisplayMode) || undefined}
-            onPress={openCommandBar}
-            stopPropagation
-          />
+          {!secondaryWindow ? (
+            <Button
+              label="Search or run a command"
+              shortcut={formatAdvertisedChord(keybindings, "command-bar", shortcutDisplayMode) || undefined}
+              onPress={openCommandBar}
+              stopPropagation
+            />
+          ) : null}
         </Box>
       </Box>
 
