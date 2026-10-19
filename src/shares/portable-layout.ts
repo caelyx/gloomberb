@@ -3,6 +3,7 @@ import { foldPaneLayout } from "../data/config/store/fold-panes";
 import { swapDefaultPortfolioAgeColumn } from "../data/config/store/portfolio-as-of-column";
 import { publicTickerBindingSymbol } from "../tickers/selection";
 import { pinFollowingPane } from "../layout/pane-follow";
+import { flattenSecondaryWindows } from "../layout/pane-manager/secondary-windows";
 import {
   CURRENT_CONFIG_VERSION,
   removePaneInstances,
@@ -487,11 +488,13 @@ export interface PublishableLayoutContext {
 }
 
 function publishableLayout(
-  publicLayout: LayoutConfig,
+  sourceLayout: LayoutConfig,
   paneState: Record<string, PaneRuntimeState>,
   panes: ReadonlyMap<string, PaneDef>,
   context: PublishableLayoutContext = {},
 ): LayoutMarketplacePayload {
+  // The share format has no secondary windows; their panes travel floating.
+  const publicLayout = flattenSecondaryWindows(sourceLayout);
   const ids = new Map(publicLayout.instances.map((instance, index) => [instance.instanceId, `p${index + 1}`]));
   const projectedState: Record<string, PaneRuntimeState> = {};
   const instances = publicLayout.instances.map((sourceInstance) => {

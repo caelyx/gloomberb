@@ -603,6 +603,7 @@ export function createSystemCliCommands(): CliCommandDef[] {
           panes: layout.layout.instances.length,
           floating: layout.layout.floating.length,
           detached: layout.layout.detached.length,
+          windows: (layout.layout.windows ?? []).length,
         }));
         ctx.printResult({ data: rows });
       });

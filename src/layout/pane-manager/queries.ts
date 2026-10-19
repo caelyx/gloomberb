@@ -62,10 +62,28 @@ export function resolveFloating(
   return result;
 }
 
+export interface PaneLocation {
+  /** `"main"`, or the id of the secondary window that holds the pane. */
+  window: "main" | string;
+  kind: "docked" | "floating" | "detached";
+}
+
+/** Where a pane sits across the main window, its pop-out windows and secondary windows. */
+export function findPaneLocation(layout: LayoutConfig, instanceId: string): PaneLocation | null {
+  if (findDockLeaf(layout, instanceId)) return { window: "main", kind: "docked" };
+  if (layout.floating.some((entry) => entry.instanceId === instanceId)) return { window: "main", kind: "floating" };
+  if ((layout.detached ?? []).some((entry) => entry.instanceId === instanceId)) return { window: "main", kind: "detached" };
+  for (const window of layout.windows ?? []) {
+    if (collectDockLeafRefs(window.dockRoot).some((leaf) => leaf.instanceId === instanceId)) {
+      return { window: window.id, kind: "docked" };
+    }
+    if (window.floating.some((entry) => entry.instanceId === instanceId)) return { window: window.id, kind: "floating" };
+  }
+  return null;
+}
+
 export function isPaneInLayout(layout: LayoutConfig, instanceId: string): boolean {
-  return !!findDockLeaf(layout, instanceId)
-    || layout.floating.some((entry) => entry.instanceId === instanceId)
-    || (layout.detached ?? []).some((entry) => entry.instanceId === instanceId);
+  return findPaneLocation(layout, instanceId) !== null;
 }
 
 export function isPaneDetached(layout: LayoutConfig, instanceId: string): boolean {

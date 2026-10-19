@@ -280,6 +280,19 @@ function sanitizeDetachedEntries(value: unknown, validInstanceIds: Set<string>):
     }));
 }
 
+function sanitizeWindows(value: unknown, validInstanceIds: Set<string>): NonNullable<LayoutConfig["windows"]> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object" && !Array.isArray(entry))
+    .filter((entry) => typeof entry.id === "string" && entry.id.length > 0)
+    .map((entry) => ({
+      id: entry.id as string,
+      // Trees are checked by normalizePaneLayout, as the main dock tree is.
+      dockRoot: (entry.dockRoot ?? null) as LayoutConfig["dockRoot"],
+      floating: sanitizeFloatingEntries(entry.floating, validInstanceIds),
+    }));
+}
+
 export function sanitizeLayout(
   value: unknown,
   fallback: LayoutConfig,
@@ -298,12 +311,14 @@ export function sanitizeLayout(
   const dockRoot = (value as { dockRoot?: LayoutConfig["dockRoot"] }).dockRoot ?? null;
   const floating = sanitizeFloatingEntries((value as { floating?: unknown }).floating, validInstanceIds);
   const detached = sanitizeDetachedEntries((value as { detached?: unknown }).detached, validInstanceIds);
+  const windows = sanitizeWindows((value as { windows?: unknown }).windows, validInstanceIds);
 
   const layout: LayoutConfig = {
     dockRoot,
     instances,
     floating,
     detached,
+    ...(windows.length > 0 ? { windows } : {}),
   };
 
   const normalized = normalizePaneLayout(layout, {

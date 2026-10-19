@@ -108,4 +108,33 @@ describe("restoreHiddenPanes", () => {
     expect(restored.instances.filter((instance) => instance.instanceId === "cds-float")).toHaveLength(1);
     expect(restored.floating.filter((entry) => entry.instanceId === "cds-float")).toHaveLength(1);
   });
+
+  test("hidden panes in a secondary window go back into that window", () => {
+    const saved: LayoutConfig = {
+      dockRoot: { kind: "pane", instanceId: "list" },
+      instances: [
+        createPaneInstance("portfolio-list", { instanceId: "list" }),
+        createPaneInstance("world-venue-map", { instanceId: "map" }),
+        createPaneInstance("econ", { instanceId: "eco" }),
+        createPaneInstance("cds", { instanceId: "cds-float", binding: { kind: "fixed", symbol: "GM" } }),
+        createPaneInstance("econ", { instanceId: "eco-alone" }),
+      ],
+      floating: [],
+      detached: [],
+      windows: [
+        {
+          id: "w2",
+          dockRoot: { kind: "split", axis: "horizontal", ratio: 0.4, first: { kind: "pane", instanceId: "map" }, second: { kind: "pane", instanceId: "eco" } },
+          floating: [{ instanceId: "cds-float", x: 10, y: 5, width: 40, height: 12 }],
+        },
+        { id: "w3", dockRoot: { kind: "pane", instanceId: "eco-alone" }, floating: [] },
+      ],
+    };
+    const shown = show(saved);
+    expect(shown.windows).toEqual([{ id: "w2", dockRoot: { kind: "pane", instanceId: "map" }, floating: [] }, { id: "w3", dockRoot: null, floating: [] }]);
+    expect(restoreHiddenPanes(saved, shown, isHidden)).toEqual(saved);
+    // An edit that drops window 3 still keeps its hidden pane.
+    const restored = restoreHiddenPanes(saved, { ...shown, windows: shown.windows!.slice(0, 1) }, isHidden);
+    expect(restored.windows).toEqual(saved.windows);
+  });
 });

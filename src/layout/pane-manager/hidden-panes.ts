@@ -1,4 +1,4 @@
-import type { DockLayoutNode, DockSplitNode, LayoutConfig, PaneInstanceConfig } from "../../types/config";
+import type { DockLayoutNode, DockSplitNode, LayoutConfig, PaneInstanceConfig, SecondaryWindowLayout } from "../../types/config";
 import { collectDockLeafRefs, getDockedInstanceIds, getNodeAtPath, replaceNodeAtPath } from "./dock-tree";
 
 /**
@@ -150,11 +150,46 @@ export function restoreHiddenPanes(
     .filter((instance) => !editedIds.has(instance.instanceId) && isHidden(instance))
     .map((instance) => instance.instanceId));
   if (hidden.size === 0) return edited;
+  const windows = restoreHiddenWindows(saved.windows ?? [], edited.windows ?? [], hidden);
   return {
     ...edited,
     dockRoot: restoreHiddenDockTree(saved.dockRoot, edited.dockRoot, hidden),
     instances: restoreHiddenEntries(saved.instances, edited.instances, hidden),
     floating: restoreHiddenEntries(saved.floating, edited.floating, hidden),
     detached: restoreHiddenEntries(saved.detached ?? [], edited.detached ?? [], hidden),
+    ...(windows.length > 0 ? { windows } : {}),
   };
+}
+
+/**
+ * Each secondary window's hidden panes go back into that window. A window the
+ * edit dropped comes back holding only its hidden panes, so none is lost.
+ */
+function restoreHiddenWindows(
+  saved: readonly SecondaryWindowLayout[],
+  edited: readonly SecondaryWindowLayout[],
+  hidden: ReadonlySet<string>,
+): SecondaryWindowLayout[] {
+  const empty: SecondaryWindowLayout = { id: "", dockRoot: null, floating: [] };
+  const savedById = new Map(saved.map((window) => [window.id, window] as const));
+  const editedIds = new Set(edited.map((window) => window.id));
+  const restore = (savedWindow: SecondaryWindowLayout, editedWindow: SecondaryWindowLayout): SecondaryWindowLayout => ({
+    ...editedWindow,
+    id: savedWindow.id,
+    dockRoot: restoreHiddenDockTree(savedWindow.dockRoot, editedWindow.dockRoot, hidden),
+    floating: restoreHiddenEntries(savedWindow.floating, editedWindow.floating, hidden),
+  });
+  const holdsHidden = (window: SecondaryWindowLayout) => (
+    getDockedInstanceIds(window.dockRoot).some((instanceId) => hidden.has(instanceId))
+    || window.floating.some((entry) => hidden.has(entry.instanceId))
+  );
+  return [
+    ...edited.map((window) => {
+      const savedWindow = savedById.get(window.id);
+      return savedWindow ? restore(savedWindow, window) : window;
+    }),
+    ...saved
+      .filter((window) => !editedIds.has(window.id) && holdsHidden(window))
+      .map((window) => restore(window, { ...empty, id: window.id })),
+  ];
 }

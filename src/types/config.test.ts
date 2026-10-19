@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
+  cloneLayout,
   createPaneInstance,
   findPaneInstance,
+  getPlacedPaneInstanceIds,
   findPrimaryPaneInstance,
   materializeDetachedPanesAsFloating,
   normalizePaneLayout,
+  removePaneInstances,
+  removeUnreachablePaneInstances,
   resolveFollowBindingInstance,
   resolvePaneInstance,
   type LayoutConfig,
@@ -184,5 +188,84 @@ describe("normalizePaneLayout", () => {
       quote: { kind: "follow", sourceInstanceId: "list" },
     });
     expect(bindings(normalizePaneLayout(layout))).toEqual({ list: { kind: "none" }, ins: { kind: "none" } });
+  });
+});
+
+describe("secondary windows", () => {
+  const pane = (instanceId: string) => createPaneInstance("portfolio-list", { instanceId });
+  const leaf = (instanceId: string) => ({ kind: "pane" as const, instanceId });
+  const rect = (instanceId: string) => ({ instanceId, x: 1, y: 2, width: 30, height: 10 });
+
+  function layoutWithWindows(): LayoutConfig {
+    return {
+      dockRoot: leaf("main-dock"),
+      instances: ["main-dock", "w2-dock-a", "w2-dock-b", "w2-float", "w3-dock"].map(pane),
+      floating: [],
+      detached: [],
+      windows: [
+        {
+          id: "w2",
+          dockRoot: { kind: "split", axis: "horizontal", ratio: 0.5, first: leaf("w2-dock-a"), second: leaf("w2-dock-b") },
+          floating: [rect("w2-float")],
+        },
+        { id: "w3", dockRoot: leaf("w3-dock"), floating: [] },
+      ],
+    };
+  }
+
+  test("normalising, cloning and garbage collection keep window panes and empty windows", () => {
+    const layout = { ...layoutWithWindows(), windows: [...layoutWithWindows().windows!, { id: "empty", dockRoot: null, floating: [] }] };
+    expect(normalizePaneLayout(layout).windows).toEqual(layout.windows);
+    expect(cloneLayout(layout).windows).toEqual(layout.windows);
+    expect(cloneLayout(layout).windows![0]).not.toBe(layout.windows[0]);
+    expect(getPlacedPaneInstanceIds(layout).sort()).toEqual(["main-dock", "w2-dock-a", "w2-dock-b", "w2-float", "w3-dock"]);
+    const collected = removeUnreachablePaneInstances(layout);
+    expect(collected.instances.map((instance) => instance.instanceId).sort()).toEqual(["main-dock", "w2-dock-a", "w2-dock-b", "w2-float", "w3-dock"]);
+    expect(collected.windows).toEqual(layout.windows);
+  });
+
+  test("a pane placed twice keeps only its highest-priority place", () => {
+    // Priority: main dock, then window docks in order, then detached, main floating, window floating.
+    const layout: LayoutConfig = {
+      dockRoot: leaf("a"),
+      instances: ["a", "b", "c", "d"].map(pane),
+      floating: [rect("c"), rect("d")],
+      detached: [rect("b")],
+      windows: [
+        { id: "w2", dockRoot: { kind: "split", axis: "vertical", ratio: 0.5, first: leaf("a"), second: leaf("b") }, floating: [rect("c")] },
+        { id: "w2", dockRoot: leaf("d"), floating: [] },
+        { id: "w3", dockRoot: leaf("b"), floating: [rect("d"), rect("e")] },
+      ],
+    };
+    const normalized = normalizePaneLayout(layout);
+    expect(normalized.dockRoot).toEqual(leaf("a"));
+    expect(normalized.windows).toEqual([
+      { id: "w2", dockRoot: leaf("b"), floating: [] },
+      { id: "w3", dockRoot: null, floating: [] },
+    ]);
+    expect(normalized.detached).toEqual([]);
+    expect(normalized.floating).toEqual([rect("c"), rect("d")]);
+  });
+
+  test("removing a pane takes it out of its window", () => {
+    const removed = removePaneInstances(layoutWithWindows(), ["w2-dock-a", "w2-float"]);
+    expect(removed.windows).toEqual([
+      { id: "w2", dockRoot: leaf("w2-dock-b"), floating: [] },
+      { id: "w3", dockRoot: leaf("w3-dock"), floating: [] },
+    ]);
+  });
+
+  test("terminal materialisation leaves windows untouched", () => {
+    const layout = { ...layoutWithWindows(), detached: [rect("main-dock-2")], instances: [...layoutWithWindows().instances, pane("main-dock-2")] };
+    const materialized = materializeDetachedPanesAsFloating(layout);
+    expect(materialized.windows).toEqual(layout.windows);
+    expect(materialized.floating.map((entry) => entry.instanceId)).toEqual(["main-dock-2"]);
+  });
+
+  test("a layout without windows stays without the field", () => {
+    const layout = createLayout([pane("solo")]);
+    layout.dockRoot = leaf("solo");
+    expect("windows" in normalizePaneLayout(layout)).toBe(false);
+    expect("windows" in cloneLayout(layout)).toBe(false);
   });
 });

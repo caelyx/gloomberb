@@ -195,6 +195,32 @@ describe("sanitizeLayout", () => {
     expect(reopened.layouts[0]?.layout.instances.map(pane => pane.binding)).toEqual(layout.instances.map(pane => pane.binding));
   });
 
+  test("disk reload keeps secondary windows in the active and every saved layout", async () => {
+    const dataDir = await createTempConfigDir();
+    const pane = (instanceId: string) => ({ instanceId, paneId: "portfolio-list", binding: { kind: "none" } });
+    const windows = [{
+      id: "w2",
+      dockRoot: { kind: "split", axis: "vertical", ratio: 0.5, first: { kind: "pane", instanceId: "w2-a" }, second: { kind: "pane", instanceId: "w2-b" } },
+      floating: [{ instanceId: "w2-float", x: 3, y: 4, width: 50, height: 20 }],
+    }, { id: "empty", dockRoot: null, floating: [] }];
+    const layout = {
+      dockRoot: { kind: "pane", instanceId: "main" },
+      instances: ["main", "w2-a", "w2-b", "w2-float"].map(pane),
+      floating: [],
+      detached: [],
+      // Malformed entries are dropped; the good windows survive.
+      windows: [...windows, { dockRoot: null, floating: [] }, { id: "", dockRoot: null, floating: [] }, "junk"],
+    };
+    const other = { ...layout, instances: layout.instances.map((instance) => ({ ...instance })) };
+    await writeConfigJson(dataDir, createSavedConfig({ layout, layouts: [{ name: "Two screens", layout }, { name: "Other", layout: other }], activeLayoutIndex: 0 }));
+    const loaded = await loadConfig(dataDir);
+    await saveConfig(loaded);
+    const reopened = await loadConfig(dataDir);
+    expect(reopened.layout.windows).toEqual(windows);
+    expect(reopened.layouts.map((entry) => entry.layout.windows)).toEqual([windows, windows]);
+    expect(reopened.layout.instances.map((instance) => instance.instanceId)).toEqual(["main", "w2-a", "w2-b", "w2-float"]);
+  });
+
   test("preserves an intentionally blank layout", () => {
     expect(sanitizeLayout({
       dockRoot: null,

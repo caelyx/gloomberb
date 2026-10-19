@@ -644,17 +644,27 @@ function withLocalSessionLayoutState(
  */
 function arrangedLayout(layout: unknown): unknown {
   if (!isRecord(layout)) return layout;
-  const windows = [
+  const instanceId = (entry: unknown) => (isRecord(entry) ? String(entry.instanceId) : "");
+  const arrangedFloating = (entries: unknown[]) => entries
+    .map((entry) => {
+      if (!isRecord(entry)) return entry;
+      const { zIndex: _zIndex, ...rest } = entry;
+      return rest;
+    })
+    .sort((left, right) => instanceId(left).localeCompare(instanceId(right)));
+  const floating = arrangedFloating([
     ...(Array.isArray(layout.floating) ? layout.floating : []),
     ...(Array.isArray(layout.detached) ? layout.detached : []),
-  ].map((entry) => {
-    if (!isRecord(entry)) return entry;
-    const { zIndex: _zIndex, ...rest } = entry;
-    return rest;
-  });
-  const instanceId = (entry: unknown) => (isRecord(entry) ? String(entry.instanceId) : "");
-  windows.sort((left, right) => instanceId(left).localeCompare(instanceId(right)));
-  return { ...layout, floating: windows, detached: [] };
+  ]);
+  // Secondary windows are kept as they are by renderers without them, so they
+  // compare as they stand, stacking order aside; no windows and none are equal.
+  const { windows: rawWindows, ...rest } = layout;
+  const windows = Array.isArray(rawWindows)
+    ? rawWindows.map((window) => (
+      isRecord(window) && Array.isArray(window.floating) ? { ...window, floating: arrangedFloating(window.floating) } : window
+    ))
+    : [];
+  return { ...rest, floating, detached: [], ...(windows.length > 0 ? { windows } : {}) };
 }
 
 // Pulled and last synced payloads are compared on every sync and never change.
