@@ -1,0 +1,20 @@
+{
+  "main": {
+    "frame": {
+      "x": 40,
+      "y": 71,
+      "width": 1100,
+      "height": 750
+    },
+    "fullscreen": false
+  },
+  "w2": {
+    "frame": {
+      "x": 3492,
+      "y": 96,
+      "width": 1100,
+      "height": 750
+    },
+    "fullscreen": false
+  }
+}

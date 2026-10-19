@@ -43,62 +43,62 @@ For each step, record what happened in the Result column. The Expected column is
 
 ### A. Displays and placement (Q1)
 
-| # | Do this | Expected (hoped) | Result |
-|---|---|---|---|
-| A1 | Launch. | Both windows open. Window 2 is on the second display. The Displays table lists both, with sensible bounds and scale. | |
-| A2 | In window 2, click **Move this window to display …** for each display in turn. | The window moves. The Windows table shows the new display id. | |
-| A3 | Drag window 2 by its top strip (to the right of the traffic lights) to the other display. | The window drags. `frames-saved` appears in the log. | |
+| #  | Do this                                                                                   | Expected (hoped)                                                                                                     | Result |
+|----|-------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|--------|
+| A1 | Launch.                                                                                   | Both windows open. Window 2 is on the second display. The Displays table lists both, with sensible bounds and scale. | Yes.   |
+| A2 | In window 2, click **Move this window to display …** for each display in turn.            | The window moves. The Windows table shows the new display id.                                                        | Yes    |
+| A3 | Drag window 2 by its top strip (to the right of the traffic lights) to the other display. | The window drags. `frames-saved` appears in the log.                                                                 | yes    |
 
 ### B. Full screen per display (Q1)
 
-| # | Do this | Expected (hoped) | Result |
-|---|---|---|---|
-| B1 | Put main on display 1 and window 2 on display 2. Focus main and press the green button (or **Window → Enter Full Screen**). | Main goes full screen on display 1 only. Window 2 stays usable on display 2. The full-screen badge lights in main. | |
-| B2 | Focus window 2 and make it full screen too. | Both windows are full screen at once, each on its own display. | |
-| B3 | Check the `resize-settled` / `fullscreen-check` lines. | `isFullScreen: true` for both windows within 1 second. | |
-| B4 | Exit full screen in window 2 using the **Exit full screen (API)** button. Re-enter with **Enter full screen (API)**. | The API calls behave the same as the green button. | |
-| B5 | With both windows full screen, quit with **Cmd-Q**. Relaunch with `bun run dev`. | Both windows reopen full screen, each on its original display. In the log, `restore-fullscreen-immediate` is followed by `fullscreen-check` with `isFullScreen: true` at 1 s and/or 3 s. | |
-| B6 | If B5 failed: record **which** part failed (wrong display, not full screen, full screen on the wrong display, flicker). | — | |
-| B7 | Quit with both windows **not** full screen, but each on a different display. Relaunch. | Each reopens on the same display, at the same size. | |
+| #  | Do this                                                                                                                     | Expected (hoped)                                                                                                                                                                                  | Result |
+|----|-----------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------|
+| B1 | Put main on display 1 and window 2 on display 2. Focus main and press the green button (or **Window → Enter Full Screen**). | Main goes full screen on display 1 only. Window 2 stays usable on display 2. The full-screen badge lights in main.                                                                                | Yes    |
+| B2 | Focus window 2 and make it full screen too.                                                                                 | Both windows are full screen at once, each on its own display.                                                                                                                                    | Yes    |
+| B3 | Check the `resize-settled` / `fullscreen-check` lines.                                                                      | `isFullScreen: true` for both windows within 1 second.                                                                                                                                                                                                                                                |        |
+| B4 | Exit full screen in window 2 using the **Exit full screen (API)** button. Re-enter with **Enter full screen (API)**.        | The API calls behave the same as the green button.                                                                                                                                                                                                                                                                                                                                                               | Yes    |
+| B5 | With both windows full screen, quit with **Cmd-Q**. Relaunch with `bun run dev`.                                            | Both windows reopen full screen, each on its original display. In the log, `restore-fullscreen-immediate` is followed by `fullscreen-check` with `isFullScreen: true` at 1 s and/or 3 s.                                                                                                                                                                                                                | Yes    |
+| B6 | If B5 failed: record **which** part failed (wrong display, not full screen, full screen on the wrong display, flicker).     | —                                                                                                                                                                                                 |        |
+| B7 | Quit with both windows **not** full screen, but each on a different display. Relaunch.                                      | Each reopens on the same display, at the same size.                                                                                                                                               |        |
 
 ### C. Focus tracking (Q2)
 
-| # | Do this | Expected (hoped) | Result |
-|---|---|---|---|
-| C1 | Click back and forth between the two windows about 5 times. | Both green badges ("native: key window" and "DOM: focused") move together to the clicked window every time. Each click logs one `native-blur`, one `native-focus` and the matching `dom-*` events. | |
-| C2 | Press **Cmd-`** (the macOS "next window" shortcut) a few times. | Focus cycles between the windows. Badges and log follow. No command bar opens. | |
-| C3 | Switch to another app (Cmd-Tab), then back. | When you leave, both badges go off. When you come back, the window that was last focused gets them. | |
-| C4 | With both windows full screen, move between them by clicking on each display, and by switching Spaces (Ctrl-←/→ or a swipe). | The badges follow the visible window you interact with. | |
-| C5 | Look at the order of `native-focus` and `dom-focus` lines in C1–C4. | Record whether the native event always arrives, and whether it comes before or after the page's. | |
+| #  | Do this                                                                                                                      | Expected (hoped)                                                                                                                                                                                          | Result |
+|----|------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------|
+| C1 | Click back and forth between the two windows about 5 times.                                                                  | Both green badges ("native: key window" and "DOM: focused") move together to the clicked window every time. Each click logs one `native-blur`, one `native-focus` and the matching `dom-*` events. | Yes    |
+| C2 | Press **Cmd-`** (the macOS "next window" shortcut) a few times.                                                              | Focus cycles between the windows. Badges and log follow. No command bar opens.                                                                                                                            | Yes    |
+| C3 | Switch to another app (Cmd-Tab), then back.                                                                                  | When you leave, both badges go off. When you come back, the window that was last focused gets them.                                                                                                                                                                                         | Yes    |
+| C4 | With both windows full screen, move between them by clicking on each display, and by switching Spaces (Ctrl-←/→ or a swipe). | The badges follow the visible window you interact with.                                                                                                                                                                                                                                     |        |
+| C5 | Look at the order of `native-focus` and `dom-focus` lines in C1–C4.                                                          | Record whether the native event always arrives, and whether it comes before or after the page's.                                                                                                          |        |
 
 ### D. Cmd-K routing (Q3)
 
-| # | Do this | Expected (hoped) | Result |
-|---|---|---|---|
-| D1 | Focus **window 2** (click the page body, not the text field). Press **Cmd-K** once. | The fake command bar opens **in window 2**. Main is **not** brought forward. `menu-routed` shows `target: "w2"` via `native-focus`. | |
-| D2 | Read window 2's counters after D1. | Either "via menu" = 1 and "via DOM keydown" = 0, or the reverse. **If both are 1**, the shortcut fires twice and the bar opens then closes immediately. Record which happened. | |
-| D3 | Repeat D1 and D2 in **main**. | Same as window 2. | |
-| D4 | Click into the **typing** field in window 2, then press Cmd-K. | Record whether the menu route still fires while a text field has focus. | |
-| D5 | Hold Cmd-K for about a second in window 2. | Count the `menu-clicked` lines. Gloomberb already suppresses repeats while the key is held; this checks the spike sees the same repeats. | |
-| D6 | Click into main, then **immediately** press Cmd-K. Repeat a few times. | The bar always opens in main. There's no race where it opens in the window that was focused before. | |
-| D7 | Use the mouse: **View → Open Command Bar** while window 2 is focused. | It opens in window 2. A menu click does not change which window is focused. | |
+| #  | Do this                                                                             | Expected (hoped)                                                                                                                                                                 | Result                                                                                                  |
+|----|-------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
+| D1 | Focus **window 2** (click the page body, not the text field). Press **Cmd-K** once. | The fake command bar opens **in window 2**. Main is **not** brought forward. `menu-routed` shows `target: "w2"` via `native-focus`.                                              | Yes                                                                                                     |
+| D2 | Read window 2's counters after D1.                                                  | Either "via menu" = 1 and "via DOM keydown" = 0, or the reverse. **If both are 1**, the shortcut fires twice and the bar opens then closes immediately. Record which happened. | The first time, it opened quickly and then closed; the second time I did it, it opened and stayed open. |
+| D3 | Repeat D1 and D2 in **main**.                                                       | Same as window 2.                                                                                                                                                                | It just opened once and stayed open, as intended.                                                       |
+| D4 | Click into the **typing** field in window 2, then press Cmd-K.                      | Record whether the menu route still fires while a text field has focus.                                                                                                          | Yes                                                                                                     |
+| D5 | Hold Cmd-K for about a second in window 2.                                          | Count the `menu-clicked` lines. Gloomberb already suppresses repeats while the key is held; this checks the spike sees the same repeats.                                         |                                                                                                         |
+| D6 | Click into main, then **immediately** press Cmd-K. Repeat a few times.              | The bar always opens in main. There's no race where it opens in the window that was focused before.                                                                                                        |                                                                                                         |
+| D7 | Use the mouse: **View → Open Command Bar** while window 2 is focused.               | It opens in window 2. A menu click does not change which window is focused.                                                                                                                                                                                              | No reaction; no command bar opened. Checked and it doesn't work in window 1 either.                     |
 
 ### E. Backtick (Q4)
 
-| # | Do this | Expected (hoped) | Result |
-|---|---|---|---|
-| E1 | In each window, click the page body and press **`** (backtick). | The bar opens in that window. "Backtick via DOM" goes up. | |
-| E2 | Click into the **typing** field and press backtick. | The character is typed. The bar does not open. | |
-| E3 | Mouse: **File → Search Ticker…** while window 2 is focused. | It opens in window 2. "Search Ticker via menu" goes up. | |
+| #  | Do this                                                         | Expected (hoped)                                          | Result |
+|----|-----------------------------------------------------------------|-----------------------------------------------------------|--------|
+| E1 | In each window, click the page body and press **`** (backtick). | The bar opens in that window. "Backtick via DOM" goes up. | Yes    |
+| E2 | Click into the **typing** field and press backtick.             | The character is typed. The bar does not open.            | Yes    |
+| E3 | Mouse: **File → Search Ticker…** while window 2 is focused.     | It opens in window 2. "Search Ticker via menu" goes up.   | Yes    |
 
 ### F. Window lifecycle (Q5)
 
-| # | Do this | Expected (hoped) | Result |
-|---|---|---|---|
-| F1 | Close window 2 with its red button. | The app keeps running. `window-closed` for w2 appears in the log. | |
-| F2 | **File → Open Window 2** (Cmd-Shift-N). | Window 2 reopens at its remembered frame and display. Record whether it is full screen if it was full screen when you closed it. (The spike only restores full screen at launch, so "not full screen" here is expected; record it anyway.) | |
-| F3 | Make window 2 full screen, then close it with Cmd-W. | Record what macOS does: the Space closes, and focus goes to …? | |
-| F4 | Close **main** with its red button while window 2 is open. | Record whether the app keeps running with only window 2 open. (In Gloomberb, I found no handler that quits when main's native red button is used; only its own close control does. So this shows Electrobun's baseline.) | |
+| #  | Do this                                                    | Expected (hoped)                                                                                                                                                                                                                           | Result                                                                                             |
+|----|------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
+| F1 | Close window 2 with its red button.                        | The app keeps running. `window-closed` for w2 appears in the log.                                                                                                                                                                          | Yes                                                                                                |
+| F2 | **File → Open Window 2** (Cmd-Shift-N).                    | Window 2 reopens at its remembered frame and display. Record whether it is full screen if it was full screen when you closed it. (The spike only restores full screen at launch, so "not full screen" here is expected; record it anyway.) | Yes -- not full screen                                                                             |
+| F3 | Make window 2 full screen, then close it with Cmd-W.       | Record what macOS does: the Space closes, and focus goes to …?                                                                                                                                                                             | Nothing happens; CMD-W just causes the system to give the "boop" error sound, and nothing changes. |
+| F4 | Close **main** with its red button while window 2 is open. | Record whether the app keeps running with only window 2 open. (In Gloomberb, I found no handler that quits when main's native red button is used; only its own close control does. So this shows Electrobun's baseline.)                | Main window closes, window two remains open and fullscreen.                                        |
 
 ### G. Optional: "Displays have separate Spaces" off
 
