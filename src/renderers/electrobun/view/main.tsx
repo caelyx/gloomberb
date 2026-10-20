@@ -36,7 +36,7 @@ import {
 } from "../../../api-client/research-activity";
 import { createDesktopWindowBridge } from "./desktop/window/bridge";
 import type { DesktopApplicationMenuBridge } from "../../../types/desktop-menu";
-import { prepareDetachedSnapshot } from "./desktop/window/snapshot";
+import { prepareDetachedSnapshot, prepareSecondaryWindowSnapshot } from "./desktop/window/snapshot";
 import { createElectrobunAppServices } from "./app-services";
 import { getRendererPlugins } from "../../../plugins/catalog-ui";
 import { loadDesktopExternalPlugin, loadDesktopExternalPlugins } from "./external-plugins";
@@ -153,10 +153,12 @@ async function boot() {
   installScreenshotWatermark();
   const desktopSnapshot = init.windowKind === "detached" && init.paneId && init.desktopSnapshot
     ? prepareDetachedSnapshot(init.desktopSnapshot, init.paneId)
-    : init.desktopSnapshot;
+    : init.windowKind === "window" && init.windowId && init.desktopSnapshot
+      ? prepareSecondaryWindowSnapshot(init.desktopSnapshot, init.windowId)
+      : init.desktopSnapshot;
   const config = desktopSnapshot?.config ?? init.config;
   applyLanguageFromConfig(config);
-  const desktopWindowBridge = createDesktopWindowBridge(init.windowKind, init.paneId);
+  const desktopWindowBridge = createDesktopWindowBridge(init.windowKind, init.paneId, init.windowId);
   const desktopApplicationMenuBridge: DesktopApplicationMenuBridge = {
     subscribe: (listener) => onBackendMessage("application-menu.select", ({ command }) => listener(command)),
   };

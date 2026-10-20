@@ -30,7 +30,7 @@ function sendUpdateProgress(rpc: DesktopRpc, progress: UpdateProgress): void {
 
 /** Every window loses its popped-out panes, workspace and services before the data they read is replaced. */
 function closeDesktopSession(backend: DesktopBackend): void {
-  backend.detachedWindows.closeAll();
+  backend.closeAllWindows();
   backend.workspace = null;
   backend.teardownServices();
 }

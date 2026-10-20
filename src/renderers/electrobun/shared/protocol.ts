@@ -25,8 +25,11 @@ export interface ElectrobunBackendInit {
   desktopPlatform: string;
   /** The machine name, which a remote assistant sees this desktop app under. */
   hostName?: string;
-  windowKind: "main" | "detached";
+  windowKind: "main" | "detached" | "window";
+  /** A popped-out window's pane. */
   paneId?: string;
+  /** A secondary window's layout window id. */
+  windowId?: string;
   /** What the view needs to send crash reports and usage counts the same way the Bun process would. */
   telemetry: ElectrobunTelemetryInit;
 }
@@ -156,7 +159,7 @@ export type DesktopPluginActivationResult =
 
 interface DesktopBackendRequestMap {
   init: {
-    request: { kind?: "main" | "detached"; paneId?: string };
+    request: { kind?: "main" | "detached" | "window"; paneId?: string; windowId?: string };
     response: ElectrobunBackendInit;
   };
   "http.fetch": { request: HttpProxyRequestEnvelope; response: HttpProxyResponseEnvelope };
@@ -182,6 +185,8 @@ interface DesktopBackendRequestMap {
   };
   "desktop.closeDetachedPane": { request: { paneId: string }; response: null };
   "desktop.focusDetachedPane": { request: { paneId: string }; response: null };
+  "desktop.movePaneToNewWindow": { request: { paneId: string }; response: null };
+  "desktop.movePaneToMainWindow": { request: { paneId: string }; response: null };
   "pluginState.setMany": { request: { entries: DesktopPluginStateSetEntry[] }; response: null };
   "pluginState.delete": { request: { pluginId: string; key: string }; response: null };
   "plugins.listExternal": { request: null; response: DesktopExternalPluginBundle[] };

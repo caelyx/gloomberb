@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { ContextMenu, Utils, type BrowserWindow } from "electrobun/bun";
+import { ContextMenu, Utils } from "electrobun/bun";
 import { buildSoundCommand } from "../../../../notifications/app-notifier";
 import type {
   DesktopBackendRequestResponse,
@@ -33,12 +33,6 @@ function playNotificationSound(sound: string | undefined): void {
   }
 }
 
-function windowForRpcKey(backend: DesktopBackend, windowKey: string | undefined): BrowserWindow | null {
-  return windowKey === MAIN_WINDOW_RPC_KEY
-    ? backend.mainWindow
-    : backend.detachedWindows.getWindowForRpcKey(windowKey);
-}
-
 /**
  * Electrobun has no fullscreen event, so the view asks after every resize.
  * A runtime whose native library cannot answer reports windowed, which is the
@@ -46,7 +40,7 @@ function windowForRpcKey(backend: DesktopBackend, windowKey: string | undefined)
  */
 function isWindowFullscreen(backend: DesktopBackend, windowKey: string | undefined): boolean {
   try {
-    return windowForRpcKey(backend, windowKey)?.isFullScreen?.() === true;
+    return backend.windowForRpcKey(windowKey)?.isFullScreen?.() === true;
   } catch {
     return false;
   }
@@ -57,26 +51,13 @@ function controlWindow(
   windowKey: string | undefined,
   action: DesktopWindowControlAction,
 ): boolean {
-  const targetWindow = windowForRpcKey(backend, windowKey);
+  const targetWindow = backend.windowForRpcKey(windowKey);
   if (!targetWindow) return false;
   if (action !== "close") {
     backend.detachedWindows.suppressAutoDockForRpcKey(windowKey);
   }
   applyDesktopWindowControl(targetWindow, action);
   return true;
-}
-
-/** Exiting closes the popped-out windows, services and main window; with no main window it quits directly. */
-function exitDesktopApp(backend: DesktopBackend): void {
-  backend.detachedWindows.closeAll();
-  backend.teardownServices();
-  const mainWindow = backend.mainWindow;
-  if (mainWindow) {
-    mainWindow.close();
-    backend.mainWindow = null;
-    return;
-  }
-  Utils.quit();
 }
 
 function normalizeWindowControlAction(action: unknown): DesktopWindowControlAction {
@@ -93,13 +74,13 @@ export async function handleDesktopHostRequest(
 ): Promise<DesktopBackendRequestResponse<DesktopHostRequest["method"]>> {
   switch (request.method) {
     case "host.exit":
-      exitDesktopApp(backend);
+      backend.exitApp();
       return null;
     case "host.windowControl": {
       const action = normalizeWindowControlAction(request.payload.action);
       const windowKey = backend.rpcs.getRpcWindowKey(rpc);
       if (action === "close" && windowKey === MAIN_WINDOW_RPC_KEY) {
-        exitDesktopApp(backend);
+        backend.exitApp();
         return null;
       }
       if (!controlWindow(backend, windowKey, action)) {
@@ -122,7 +103,7 @@ export async function handleDesktopHostRequest(
       return null;
     case "host.focusWindow": {
       const windowKey = backend.rpcs.getRpcWindowKey(rpc);
-      if (windowKey) backend.detachedWindows.focusWindowForRpcKey(windowKey);
+      if (windowKey) backend.focusWindowForRpcKey(windowKey);
       return null;
     }
     case "host.copyPngImage": {

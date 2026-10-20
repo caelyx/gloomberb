@@ -1,13 +1,13 @@
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  createRememberedWindowStore,
   fitWindowFrameToDisplays,
   parseRememberedDesktopWindow,
-  readRememberedDesktopWindow,
+  readRememberedDesktopWindows,
   rememberedDesktopWindowPath,
-  writeRememberedDesktopWindow,
 } from "./remembered-frame";
 
 const directories: string[] = [];
@@ -31,10 +31,32 @@ describe("remembered desktop window", () => {
     const directory = mkdtempSync(join(tmpdir(), "gloomberb-window-"));
     directories.push(directory);
     const path = join(directory, "desktop-window.json");
-    expect(readRememberedDesktopWindow(path)).toBeNull();
-    writeRememberedDesktopWindow(path, saved);
-    expect(readRememberedDesktopWindow(path)).toEqual(saved);
+    expect(readRememberedDesktopWindows(path)).toEqual({ main: null, windows: {} });
     expect(rememberedDesktopWindowPath({ GLOOMBERB_HOME: directory, HOME: directory })).toBe(path);
+  });
+
+  test("keeps the main window's file format and adds secondary windows beside it", () => {
+    const directory = mkdtempSync(join(tmpdir(), "gloomberb-window-"));
+    directories.push(directory);
+    const path = join(directory, "desktop-window.json");
+    const main = { frame: { x: 0, y: 25, width: 1400, height: 860 }, maximized: false, fullscreen: true };
+    // A file written before secondary windows existed reads as the main window alone.
+    writeFileSync(path, JSON.stringify(main));
+    expect(readRememberedDesktopWindows(path)).toEqual({ main, windows: {} });
+
+    const store = createRememberedWindowStore(path);
+    const second = { frame: { x: 3200, y: 204, width: 1100, height: 750 }, maximized: false, fullscreen: true };
+    store.saveWindow("w2", second);
+    expect(store.window("w2")).toEqual(second);
+    expect(store.window("w3")).toBeNull();
+    // The main window's fields stay at the top level, where older builds read them.
+    expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject(main);
+    expect(createRememberedWindowStore(path).window("w2")).toEqual(second);
+    expect(createRememberedWindowStore(path).main()).toEqual(main);
+
+    // A broken window entry is dropped without losing the rest.
+    writeFileSync(path, JSON.stringify({ ...main, windows: { w2: second, w3: { frame: { x: 1 } }, "": second } }));
+    expect(readRememberedDesktopWindows(path)).toEqual({ main, windows: { w2: second } });
   });
 
   test("keeps a frame that still sits on a display", () => {

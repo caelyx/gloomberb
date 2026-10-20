@@ -17,6 +17,7 @@ import { useLinkedLayoutSync } from "./layout-marketplace/linked-sync";
 import { useTeamCollectionsSync } from "./team/collections-sync";
 import { Shell } from "./components/layout/shell";
 import { DetachedPaneShell } from "./components/layout/detached-pane-shell";
+import { SecondaryWindowHeader } from "./components/layout/secondary-window-header";
 import { TransientLayoutProvider } from "./components/layout/transient-layout";
 import { CommandBar } from "./components/command-bar/surface";
 import { OnboardingWizard } from "./components/onboarding/onboarding-wizard";
@@ -185,8 +186,11 @@ function AppInner({
   const rendererHost = useRendererHost();
   const dialog = useDialog();
   const toast = useToastHost();
-  const isDetachedWindow = desktopWindowBridge?.kind === "detached";
-  const detachedPaneId = isDetachedWindow ? desktopWindowBridge.paneId ?? null : null;
+  const isMainWindow = !desktopWindowBridge || desktopWindowBridge.kind === "main";
+  // Any window but the main one: a popped-out pane or a secondary window. Only
+  // the main window opens panes, runs the bar and syncs; the others show state.
+  const isDetachedWindow = !isMainWindow;
+  const detachedPaneId = desktopWindowBridge?.kind === "detached" ? desktopWindowBridge.paneId ?? null : null;
   const focusDetachedPane = useMemo(() => {
     const focus = desktopWindowBridge?.kind === "main" ? desktopWindowBridge.focusDetachedPane : undefined;
     return focus ? (paneId: string) => { void focus(paneId).catch(() => {}); } : undefined;
@@ -349,7 +353,7 @@ function AppInner({
     // Keep a first-run workspace stable while the local guide is active. Once
     // onboarding finishes, the normal pull-before-push sync starts immediately.
     initialized: state.initialized
-      && desktopWindowBridge?.kind !== "detached"
+      && isMainWindow
       && !onboardingActive
       && !signInGateActive,
   });
@@ -441,6 +445,37 @@ function AppInner({
               <DetachedPaneShell
                 pluginRegistry={pluginRegistry}
                 desktopWindowBridge={{ ...desktopWindowBridge, kind: "detached", paneId: desktopWindowBridge.paneId }}
+              />
+              <ToastViewport position="bottom-right" />
+            </ThemedAppRoot>
+          </RemoteControlHost>
+        </ContextMenuProvider>
+      </KeybindingsProvider>
+    );
+  }
+
+  if (desktopWindowBridge?.kind === "window") {
+    // A secondary window: its own grid under a bare title bar. The header's
+    // prompt, the status bar and the command bar stay with the main window.
+    return (
+      <KeybindingsProvider value={keybindings}>
+        <AppDialogBridge />
+        <ContextMenuProvider pluginRegistry={pluginRegistry}>
+          <RemoteControlHost
+            adapter={remoteControlAdapter}
+            dispatch={dispatch}
+            getState={getRemoteState}
+            pluginRegistry={pluginRegistry}
+            desktopWindowBridge={desktopWindowBridge}
+          >
+            <ThemedAppRoot>
+              {chrome.header && <SecondaryWindowHeader />}
+              <Shell
+                pluginRegistry={pluginRegistry}
+                dataProvider={dataProvider}
+                tickerRepository={tickerRepository}
+                desktopWindowBridge={desktopWindowBridge}
+                commandBarNativeOccluder={commandBarNativeOccluder}
               />
               <ToastViewport position="bottom-right" />
             </ThemedAppRoot>
@@ -589,7 +624,7 @@ export function App({
   const signInGateActive = requireSignIn && !signedIn;
   const shareHandoff = isPaneShareHandoff();
   const [showOnboarding, setShowOnboarding] = useState(() => (
-    desktopWindowBridge?.kind !== "detached"
+    (!desktopWindowBridge || desktopWindowBridge.kind === "main")
     && !shareHandoff
     && (!effectiveInitialConfig.onboardingComplete || !!effectiveInitialConfig.onboardingProgress)
   ));
@@ -629,7 +664,7 @@ export function App({
     <RemoteUiRegistryProvider>
       <AppProvider
         config={config}
-        sessionStore={desktopWindowBridge?.kind === "detached" ? undefined : services.persistence.sessions}
+        sessionStore={desktopWindowBridge && desktopWindowBridge.kind !== "main" ? undefined : services.persistence.sessions}
         sessionSnapshot={sessionSnapshot}
         desktopBridge={desktopWindowBridge}
         desktopSnapshot={desktopSnapshot}

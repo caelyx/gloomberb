@@ -6,6 +6,7 @@ import {
   type WindowFrame,
   type WindowMinimumSize,
 } from "./frame";
+import { setWindowFrame } from "./native-frame";
 
 export type WindowMoveEvent = { data?: { x?: number; y?: number } };
 export type WindowResizeEvent = { data?: Partial<WindowFrame> };
@@ -43,7 +44,7 @@ export function applyWindowResizeEvent(
   const rawFrame = normalizeWindowFrame(event.data ?? {}, previousFrame);
   const nextFrame = updateWindowFrameCache(window, rawFrame, minimumSize);
   if (nextFrame && (nextFrame.width !== rawFrame.width || nextFrame.height !== rawFrame.height)) {
-    window.setFrame(nextFrame.x, nextFrame.y, nextFrame.width, nextFrame.height);
+    setWindowFrame(window, nextFrame);
   }
   return nextFrame;
 }

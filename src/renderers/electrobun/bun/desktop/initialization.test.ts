@@ -1,6 +1,14 @@
 import { expect, test } from "bun:test";
 import { CapabilityRegistry } from "../../../../capabilities";
-import { desktopRendererCapabilityManifests } from "./initialization";
+import { desktopRendererCapabilityManifests, normalizeInitWindowTarget } from "./initialization";
+
+test("a view opened on a secondary window's channel is that window, whatever it claims", () => {
+  expect(normalizeInitWindowTarget("window:w2", { kind: "main" })).toEqual({ kind: "window", windowId: "w2" });
+  expect(normalizeInitWindowTarget("main", { kind: "detached", paneId: "chat" })).toEqual({ kind: "main" });
+  expect(normalizeInitWindowTarget("detached:chat", {})).toEqual({ kind: "detached", paneId: "chat" });
+  // An empty id is no window; with no channel to go on, a view is the main window unless it says it is popped out.
+  expect(normalizeInitWindowTarget("window:", {})).toEqual({ kind: "main", paneId: undefined });
+});
 
 test("desktop init includes disabled renderer-safe manifests while invocation stays disabled", async () => {
   let enabled = false;

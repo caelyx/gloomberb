@@ -6,9 +6,13 @@ import type {
   DesktopWindowBridge,
 } from "../../../../../types/desktop-window";
 import { backendRequest, getElectrobunBackendInitSnapshot, onBackendMessage } from "../../backend-rpc";
-import { detachedSnapshotKey, prepareDetachedSnapshot } from "./snapshot";
+import { detachedSnapshotKey, prepareDetachedSnapshot, prepareSecondaryWindowSnapshot } from "./snapshot";
 
-export function createDesktopWindowBridge(kind: "main" | "detached", paneId?: string): DesktopWindowBridge {
+export function createDesktopWindowBridge(
+  kind: DesktopWindowBridge["kind"],
+  paneId?: string,
+  windowId?: string,
+): DesktopWindowBridge {
   const initialDesktopSnapshot = getElectrobunBackendInitSnapshot()?.desktopSnapshot ?? null;
   let lastDetachedSnapshotKey = kind === "detached" && paneId && initialDesktopSnapshot
     ? detachedSnapshotKey(initialDesktopSnapshot, paneId)
@@ -17,6 +21,7 @@ export function createDesktopWindowBridge(kind: "main" | "detached", paneId?: st
   return {
     kind,
     paneId,
+    windowId,
     syncMainState: kind === "main"
       ? async (snapshot: DesktopSharedStateSnapshot) => {
         await backendRequest("desktop.syncMainState", { snapshot });
@@ -44,6 +49,16 @@ export function createDesktopWindowBridge(kind: "main" | "detached", paneId?: st
     focusDetachedPane: async (targetPaneId: string) => {
       await backendRequest("desktop.focusDetachedPane", { paneId: targetPaneId });
     },
+    movePaneToNewWindow: kind === "main"
+      ? async (targetPaneId: string) => {
+        await backendRequest("desktop.movePaneToNewWindow", { paneId: targetPaneId });
+      }
+      : undefined,
+    movePaneToMainWindow: kind === "window"
+      ? async (targetPaneId: string) => {
+        await backendRequest("desktop.movePaneToMainWindow", { paneId: targetPaneId });
+      }
+      : undefined,
     subscribeState(listener: (snapshot: DesktopSharedStateSnapshot) => void) {
       return onBackendMessage("desktop.state", (message) => {
         if (kind === "detached" && paneId) {
@@ -53,7 +68,9 @@ export function createDesktopWindowBridge(kind: "main" | "detached", paneId?: st
           listener(prepareDetachedSnapshot(message.snapshot, paneId));
           return;
         }
-        listener(message.snapshot);
+        // A secondary window takes every change: any pane in its grid, or the
+        // grid itself, can move with one.
+        listener(kind === "window" && windowId ? prepareSecondaryWindowSnapshot(message.snapshot, windowId) : message.snapshot);
       });
     },
     subscribeDockPreview(listener: (preview: DesktopDockPreviewState) => void) {

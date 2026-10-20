@@ -1,4 +1,6 @@
+import { findPaneLocation } from "../../../../../layout/pane-manager";
 import type { DesktopWorkspaceRequest } from "../../../shared/protocol";
+import { MAIN_WINDOW_RPC_KEY } from "../../window/focus";
 import type { DesktopBackend } from "../backend";
 
 type DockEdge = "left" | "right" | "top" | "bottom";
@@ -26,7 +28,7 @@ export async function handleDesktopWorkspaceRequest(
     case "desktop.syncMainState": {
       const snapshot = workspace.syncMainState(request.payload.snapshot);
       backend.setConfig(snapshot.config);
-      detachedWindows.reconcile();
+      backend.reconcileWindows();
       stateBroadcaster.sendDesktopState(snapshot);
       return null;
     }
@@ -60,6 +62,19 @@ export async function handleDesktopWorkspaceRequest(
     case "desktop.focusDetachedPane": {
       const paneId = requirePaneId(request.payload, request.method);
       detachedWindows.focusDetachedPane(paneId);
+      return null;
+    }
+    case "desktop.movePaneToNewWindow": {
+      const paneId = requirePaneId(request.payload, request.method);
+      const snapshot = await backend.commitDesktopSnapshot(workspace.movePaneToNewWindow(paneId));
+      const location = findPaneLocation(snapshot.config.layout, paneId);
+      if (location && location.window !== "main") backend.secondaryWindows.focus(location.window);
+      return null;
+    }
+    case "desktop.movePaneToMainWindow": {
+      const paneId = requirePaneId(request.payload, request.method);
+      await backend.commitDesktopSnapshot(workspace.movePaneToMainWindow(paneId));
+      backend.focusWindowForRpcKey(MAIN_WINDOW_RPC_KEY);
       return null;
     }
     default: {

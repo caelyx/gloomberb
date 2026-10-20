@@ -17,6 +17,7 @@ import { createDesktopWorkspace } from "./workspace";
 import {
   MAIN_WINDOW_RPC_KEY,
   paneIdFromDetachedRpcKey,
+  windowIdFromSecondaryRpcKey,
 } from "../window/focus";
 import type { DesktopBackendRequestPayload, ElectrobunBackendInit } from "../../shared/protocol";
 import type { CapabilityRegistry } from "../../../../capabilities";
@@ -25,15 +26,20 @@ import { describeNodeOs, readOrCreateInstallId } from "../../../../telemetry/cra
 import type { DesktopBackend, DesktopRpc } from "./backend";
 
 interface DesktopWindowTarget {
-  kind: "main" | "detached";
+  kind: "main" | "detached" | "window";
   paneId?: string;
+  windowId?: string;
 }
 
-function normalizeInitWindowTarget(
+/** Which window a view is: the channel it was opened on decides, and a view's own claim only when that is unknown. */
+export function normalizeInitWindowTarget(
   rpcKey: string | undefined,
   payload: DesktopBackendRequestPayload<"init">,
 ): DesktopWindowTarget {
   if (rpcKey === MAIN_WINDOW_RPC_KEY) return { kind: "main" };
+
+  const windowId = windowIdFromSecondaryRpcKey(rpcKey);
+  if (windowId) return { kind: "window", windowId };
 
   const detachedPaneId = paneIdFromDetachedRpcKey(rpcKey);
   if (detachedPaneId) {
@@ -84,6 +90,7 @@ function buildInitializationPayload(
     hostName: hostname(),
     windowKind: windowTarget.kind,
     paneId: windowTarget.paneId,
+    windowId: windowTarget.windowId,
     telemetry: {
       installId: readOrCreateInstallId(config.dataDir),
       os: describeNodeOs(),
@@ -114,7 +121,7 @@ export async function initializeDesktopBackend(
   if (currentConfig && currentServices) {
     if (!backend.workspace) {
       backend.workspace = createDesktopWorkspace(currentConfig, backend.getSessionSnapshot());
-      backend.detachedWindows.reconcile();
+      backend.reconcileWindows();
     }
     return buildInitializationPayload(backend, currentConfig, currentServices, windowTarget);
   }

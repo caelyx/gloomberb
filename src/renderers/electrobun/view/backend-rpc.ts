@@ -144,7 +144,7 @@ export async function backendRequest(
   return decodeRpcResponse(result);
 }
 
-export async function initElectrobunBackend(payload?: { kind?: "main" | "detached"; paneId?: string }): Promise<ElectrobunBackendInit> {
+export async function initElectrobunBackend(payload?: { kind?: "main" | "detached" | "window"; paneId?: string; windowId?: string }): Promise<ElectrobunBackendInit> {
   initSnapshot = await backendRequest("init", payload ?? {});
   return initSnapshot;
 }
