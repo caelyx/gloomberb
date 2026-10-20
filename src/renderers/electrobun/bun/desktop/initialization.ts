@@ -91,6 +91,7 @@ function buildInitializationPayload(
     windowKind: windowTarget.kind,
     paneId: windowTarget.paneId,
     windowId: windowTarget.windowId,
+    activeWindowKey: backend.lastActiveWindowKey,
     telemetry: {
       installId: readOrCreateInstallId(config.dataDir),
       os: describeNodeOs(),

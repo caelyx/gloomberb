@@ -113,38 +113,13 @@ export function menuForPane(
   /** Report a Bug: the pane's picture and a line to #bugs; absent where it cannot be posted or pictured. */
   reportBug?: () => void,
 ): ContextMenuItem[] {
-  // A secondary window's grid is read-only for now, so its settings and layout
-  // edits would not be saved: it offers the pane's own actions, copying out,
-  // and the way back to the main window.
+  // A secondary window's panes stay out of the main window's layout tabs, and
+  // it cannot open the panes Share and Ask Gloom open.
   if (desktopWindowBridge?.kind === "window") {
-    const items: ContextMenuItem[] = [...paneItems];
-    if (items.length > 0) items.push(contextMenuDivider("pane:own-actions-divider"));
-    if (copyPaneScreenshot) {
-      items.push({
-        id: "copy-screenshot",
-        label: "Copy Screenshot",
-        accelerator: accelerators.copyScreenshot,
-        onSelect: () => copyPaneScreenshot(pane.instance.instanceId),
-      });
-    }
-    if (exportPaneCsv) {
-      items.push({
-        id: "export-csv",
-        label: "Export CSV",
-        accelerator: accelerators.exportCsv,
-        onSelect: () => exportPaneCsv(pane.instance.instanceId),
-      });
-    }
-    if (desktopWindowBridge.movePaneToMainWindow) {
-      items.push({
-        id: "move-to-main-window",
-        label: "Move to Main Window",
-        onSelect: () => {
-          fireAndForget(desktopWindowBridge.movePaneToMainWindow?.(pane.instance.instanceId), "desktop.movePaneToMainWindow");
-        },
-      });
-    }
-    return items;
+    fullscreen = undefined;
+    layoutMove = {};
+    sharePane = undefined;
+    askGloom = undefined;
   }
   const baseActions: ContextMenuItem[] = [...paneItems];
   if (baseActions.length > 0) baseActions.push(contextMenuDivider("pane:own-actions-divider"));
@@ -266,6 +241,15 @@ export function menuForPane(
       label: "Move to New Window",
       onSelect: () => {
         fireAndForget(desktopWindowBridge.movePaneToNewWindow?.(pane.instance.instanceId), "desktop.movePaneToNewWindow");
+      },
+    });
+  }
+  if (desktopWindowBridge?.kind === "window" && desktopWindowBridge.movePaneToMainWindow) {
+    baseActions.push({
+      id: "move-to-main-window",
+      label: "Move to Main Window",
+      onSelect: () => {
+        fireAndForget(desktopWindowBridge.movePaneToMainWindow?.(pane.instance.instanceId), "desktop.movePaneToMainWindow");
       },
     });
   }

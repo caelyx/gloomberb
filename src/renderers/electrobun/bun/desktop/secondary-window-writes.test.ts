@@ -9,8 +9,8 @@ describe("requests from a secondary window", () => {
     }
   });
 
-  test("can still read, fetch, and ask the host to move its panes", () => {
-    for (const method of ["init", "http.fetch", "capability.invoke", "ticker.save", "host.windowControl", "desktop.moveToMainWindow", "pluginState.setMany"]) {
+  test("can still read, fetch, ask the host to move its panes, and send its changes to the main window", () => {
+    for (const method of ["init", "http.fetch", "capability.invoke", "ticker.save", "host.windowControl", "desktop.movePaneToMainWindow", "window.intent", "pluginState.setMany"]) {
       expect(secondaryWindowMayRequest(method)).toBe(true);
     }
   });

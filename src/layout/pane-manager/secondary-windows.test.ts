@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import { createPaneInstance, type LayoutConfig } from "../../types/config";
 import { getDockedPaneIds } from "./dock-tree";
+import { removePane } from "./layout-state";
 import { findPaneLocation } from "./queries";
 import {
+  applySecondaryWindowLayoutEdit,
   closeSecondaryWindow,
   movePaneToMainWindow,
   movePaneToNewWindow,
+  secondaryWindowPaneIds,
   viewLayoutFromWindow,
+  windowLayoutEditFromView,
 } from "./secondary-windows";
 
 /** A main grid of two panes and a floating one, with window w2 holding a grid of two and a floating pane. */
@@ -104,5 +108,53 @@ describe("secondary window layout operations", () => {
     expect(gone.dockRoot).toBeNull();
     expect(gone.floating).toEqual([]);
     expect(findPaneLocation(gone, "list")).not.toBeNull();
+  });
+
+  test("an edit made in a window's view applies to that window's grid and its own panes only", () => {
+    const layout = twoWindowLayout();
+    const view = viewLayoutFromWindow(layout, "w2");
+    const base = secondaryWindowPaneIds(layout, "w2");
+    expect(base).toEqual(["news", "econ", "alerts"]);
+
+    // Rearranged and retitled, with a main-window pane retitled behind its back.
+    const edited: LayoutConfig = {
+      ...view,
+      dockRoot: { kind: "split", axis: "horizontal", ratio: 0.3, first: view.dockRoot!, second: { kind: "pane", instanceId: "alerts" } },
+      floating: [],
+      instances: view.instances.map((instance) => (
+        instance.instanceId === "news" ? { ...instance, title: "Headlines", paneId: "chat" }
+          : instance.instanceId === "list" ? { ...instance, title: "Not yours" }
+            : instance
+      )),
+    };
+    const applied = applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(edited, "w2", base));
+    expect(applied).not.toBeNull();
+    expect(secondaryWindowPaneIds(applied!, "w2")).toEqual(["news", "econ", "alerts"]);
+    expect(applied!.windows![0]!.floating).toEqual([]);
+    expect(applied!.dockRoot).toEqual(layout.dockRoot);
+    const news = applied!.instances.find((instance) => instance.instanceId === "news")!;
+    expect(news.title).toBe("Headlines");
+    // A window cannot change a pane's type, nor touch a pane outside it.
+    expect(news.paneId).toBe("news");
+    expect(applied!.instances.find((instance) => instance.instanceId === "list")!.title).toBeUndefined();
+  });
+
+  test("closing a pane in a window removes it from the layout, and edits from a stale or foreign view are dropped", () => {
+    const layout = twoWindowLayout();
+    const base = secondaryWindowPaneIds(layout, "w2");
+    const view = viewLayoutFromWindow(layout, "w2");
+
+    const closed = applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(removePane(view, "econ"), "w2", base));
+    expect(secondaryWindowPaneIds(closed!, "w2")).toEqual(["news", "alerts"]);
+    expect(closed!.instances.some((instance) => instance.instanceId === "econ")).toBe(false);
+    expect(closed!.instances).toHaveLength(5);
+
+    // A main-window pane brought in from the view's other windows is not this window's to take.
+    const foreign = { ...view, floating: [...view.floating, { instanceId: "list", x: 0, y: 0, width: 20, height: 8 }] };
+    expect(applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(foreign, "w2", base))).toBeNull();
+
+    // The window's panes changed since the view was made: the edit is from an older state.
+    expect(applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(view, "w2", ["news", "econ"]))).toBeNull();
+    expect(applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(view, "w9", base))).toBeNull();
   });
 });

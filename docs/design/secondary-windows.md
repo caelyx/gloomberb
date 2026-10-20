@@ -211,6 +211,18 @@ Status: agreed design (decisions in §8), not yet built. Written from a reading 
 
 Phases 1–4 deliver something usable (panes moved by command). Phase 5 is the "open where I am" behaviour. If needed, Phase 5 could ship before 3; a read-only window plus commands is already useful.
 
+**Delivered so far:** phase 1 (#15) and phase 2 (#16). The order from here is 3, 5, 4.
+
+**Phase 3 as built:**
+- **Intents to main.** A secondary window edits its own view at once and sends `window.intent` requests. The host names the sending window and passes them to the main window, which applies them (`applyWindowIntent`):
+  - `editLayout`: the window's grid and its own pane instances (titles, settings, links). It is refused if the window's panes changed since the edit was made, or if it places a pane that isn't the window's. A pane the edit no longer places was closed and leaves the layout.
+  - `replacePaneState`: the window's own panes only.
+  - `setPluginConfig`: plugin settings a pane changed, by plugin.
+- **Undo.** A grid edit joins the main window's undo history, so Cmd-Z in the main window can undo it. There is no undo in a secondary window (D8).
+- **Unanswered changes.** `SecondaryWindowSync` keeps them over snapshots sent before the main window applied them. A refused change brings the main window's state back.
+- **Focus.** Each window keeps its own focused pane. Only the window with native focus, or the last one to have it, draws its focused pane as focused.
+- **Moves stay with the host.** Phase 2's moves (to a new window, back to main, closing a window) are still host workspace operations, with the same race Pop Out has.
+
 **Effort (opinion, not measured):** the biggest pieces are Phase 1 (many small edits across about 25 files, plus tests) and Phase 3 (state plumbing). Phases 2 and 5 are moderate. Phase 4 is small once 1 and 3 exist. I would not trust a number in days without first prototyping Phase 2. The likely surprises are in Shell assumptions not covered above, and in Electrobun's multi-window behaviour on macOS (fullscreen Spaces, key-window events).
 
 ## 6. Tests (per CONTRIBUTING's selective policy)
@@ -237,7 +249,11 @@ Full write-up: `spikes/multi-window/results/RESULTS.md` on the `spike/multi-wind
 - **Focus:** Electrobun's native `focus`/`blur` events are reliable and arrive first. Page focus events were missed many times. → §4.3 uses native events only.
 - **Cmd-K:** routing to the focused window works, and main is not raised. It **fires twice**, through the menu and as a page key press. → Ignore a menu Cmd-K that arrives within about 150 ms of a page Cmd-K.
 - **Prerequisite (bug, fixed in #13):** Electrobun 1.18.1 deletes a menu item's `data` after its first click, so each Gloomberb menu command worked only once per launch. Commands now ride in the menu `action` string.
-- **New risk:** a window on the second display moves upwards on each save and restore. Two of the three observed offsets equal the height difference between the displays (108 pt). → Confirm with a follow-up run, then correct after window creation.
+- **Window creep on the second display (cause found, fixed in #16).** Electrobun 1.18.1 on macOS flips y against two different heights:
+  - window creation, and the move and resize events, use the primary display's height;
+  - `setFrame`, `setPosition` and `getFrame` use the height of the display the window is on (`[window screen]`).
+
+  On a display 108 pt shorter than the primary, `getFrame` reads 108 too high and `setFrame` lands 108 too low. Gloomberb saves frames from the events, which are correct, and moves windows through `window/native-frame.ts`, which compensates.
 - **New decision D10:** closing main while secondary windows are open. Recommendation: quit the app.
 
 ## 7. Risks and unknowns

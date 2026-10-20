@@ -4,9 +4,23 @@ import type {
   DesktopSharedStateSnapshot,
   DesktopThemePreviewState,
   DesktopWindowBridge,
+  DesktopWindowIntent,
+  DesktopWindowIntentResult,
 } from "../../../../../types/desktop-window";
-import { backendRequest, getElectrobunBackendInitSnapshot, onBackendMessage } from "../../backend-rpc";
+import {
+  backendRequest,
+  getElectrobunBackendInitSnapshot,
+  onBackendMessage,
+  setElectrobunWindowIntentHandler,
+} from "../../backend-rpc";
+import { detachedRpcKey, MAIN_WINDOW_RPC_KEY, secondaryWindowRpcKey } from "../../../shared/window-keys";
 import { detachedSnapshotKey, prepareDetachedSnapshot, prepareSecondaryWindowSnapshot } from "./snapshot";
+
+function windowKeyFor(kind: DesktopWindowBridge["kind"], paneId?: string, windowId?: string): string | undefined {
+  if (kind === "main") return MAIN_WINDOW_RPC_KEY;
+  if (kind === "window") return windowId ? secondaryWindowRpcKey(windowId) : undefined;
+  return paneId ? detachedRpcKey(paneId) : undefined;
+}
 
 export function createDesktopWindowBridge(
   kind: DesktopWindowBridge["kind"],
@@ -22,6 +36,19 @@ export function createDesktopWindowBridge(
     kind,
     paneId,
     windowId,
+    windowKey: windowKeyFor(kind, paneId, windowId),
+    initialActiveWindowKey: getElectrobunBackendInitSnapshot()?.activeWindowKey ?? null,
+    subscribeActiveWindow(listener: (windowKey: string | null) => void) {
+      return onBackendMessage("desktop.activeWindow", (message) => {
+        listener(message.windowKey);
+      });
+    },
+    sendWindowIntent: kind === "window"
+      ? (intent: DesktopWindowIntent) => backendRequest("window.intent", { intent })
+      : undefined,
+    handleWindowIntents: kind === "main"
+      ? (handler: (windowId: string, intent: DesktopWindowIntent) => DesktopWindowIntentResult) => setElectrobunWindowIntentHandler(handler)
+      : undefined,
     syncMainState: kind === "main"
       ? async (snapshot: DesktopSharedStateSnapshot) => {
         await backendRequest("desktop.syncMainState", { snapshot });

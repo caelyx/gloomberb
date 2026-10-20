@@ -103,6 +103,13 @@ interface TransientFocusLayoutState {
   active: boolean;
 }
 
+const NO_LAYOUT_MOVES: ReturnType<typeof useShellPaneLayoutMoves> = {
+  movePaneBack: () => false,
+  movePaneToNewLayout: () => false,
+  paneLayoutMoveMenu: () => ({}),
+  togglePaneNewLayout: () => false,
+};
+
 export function Shell({
   pluginRegistry,
   dataProvider,
@@ -126,8 +133,9 @@ export function Shell({
   const uiKind = useUiHost().kind;
   const shortcutDisplayMode = getShortcutDisplayMode(uiKind);
   const keybindings = useKeybindings();
-  // A secondary window shows its grid read-only for now: its layout is a view
-  // of the main window's state, and edits to it would not reach the saved layout.
+  // A secondary window's layout is its view of the main window's: an edit here
+  // changes the view at once and reaches the saved layout through the main
+  // window (see SecondaryWindowSync), whose undo history it joins.
   const secondaryWindow = desktopWindowBridge?.kind === "window";
   const openCommandBar = useCallback(() => {
     dispatch({ type: "SET_COMMAND_BAR", open: true, query: "" });
@@ -208,20 +216,21 @@ export function Shell({
   // Every edit here starts from the visible layout, so the panes it hides go
   // back in before the layout is saved, rather than being deleted with it.
   const persistLayout = useCallback((editedLayout: LayoutConfig, options?: { pushHistory?: boolean; focusedPaneId?: string | null }) => {
-    if (secondaryWindow) return;
     const nextLayout = restoreShellHiddenPanes(
       stateRef.current.config.layout,
       editedLayout,
       disabledPaneIds,
       pluginRegistry.panes,
     );
-    if (options?.pushHistory !== false) {
+    if (options?.pushHistory !== false && !secondaryWindow) {
       dispatch({ type: "PUSH_LAYOUT_HISTORY" });
     }
     const hasFocusTarget = !!options && Object.prototype.hasOwnProperty.call(options, "focusedPaneId");
     dispatch(hasFocusTarget
       ? { type: "UPDATE_LAYOUT", layout: nextLayout, focusedPaneId: options.focusedPaneId ?? null }
       : { type: "UPDATE_LAYOUT", layout: nextLayout });
+    // The main window saves a secondary window's edit when it applies it.
+    if (secondaryWindow) return;
     const currentState = stateRef.current;
     scheduleConfigSave(syncConfigActiveLayoutState(
       { ...currentState.config, layout: nextLayout },
@@ -354,6 +363,8 @@ export function Shell({
   }, [closePaneMenu, config.activeLayoutIndex, config.layouts, dispatch, focusPane, setTransientFocusLayout]);
   /** Fullscreen for a given pane: the focused one from the key, the menu's own from its item. */
   const togglePaneFullscreen = useCallback((paneId: string | null) => {
+    // Pane fullscreen is tied to the main window's layout tabs.
+    if (secondaryWindow) return false;
     const current = transientFocusLayoutStateRef.current;
     if (current?.active) {
       setTransientFocusLayout(null);
@@ -390,6 +401,7 @@ export function Shell({
     config.activeLayoutIndex,
     focusPane,
     pluginRegistry,
+    secondaryWindow,
     setTransientFocusLayout,
     visibleLayout,
   ]);
@@ -402,12 +414,7 @@ export function Shell({
   const leaveTransientFocusForPane = useCallback((paneId: string) => {
     if (transientFocusLayoutStateRef.current?.paneId === paneId) setTransientFocusLayout(null);
   }, [setTransientFocusLayout]);
-  const {
-    movePaneBack,
-    movePaneToNewLayout,
-    paneLayoutMoveMenu,
-    togglePaneNewLayout,
-  } = useShellPaneLayoutMoves({
+  const layoutMoves = useShellPaneLayoutMoves({
     closePaneMenu,
     dispatch,
     keybindings,
@@ -416,6 +423,10 @@ export function Shell({
     shortcutDisplayMode,
     stateRef,
   });
+  // Layout tabs belong to the main window, so a secondary window's panes do not move between them.
+  const { movePaneBack, movePaneToNewLayout, paneLayoutMoveMenu, togglePaneNewLayout } = secondaryWindow
+    ? NO_LAYOUT_MOVES
+    : layoutMoves;
   const toggleFocusedPaneNewLayout = useCallback(
     () => togglePaneNewLayout(focusedPaneId),
     [focusedPaneId, togglePaneNewLayout],

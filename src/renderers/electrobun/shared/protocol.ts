@@ -1,6 +1,12 @@
 import type { AppSessionSnapshot } from "../../../core/state/session-persistence";
 import type { PaneRuntimeState } from "../../../core/state/app/state";
-import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState } from "../../../types/desktop-window";
+import type {
+  DesktopDockPreviewState,
+  DesktopSharedStateSnapshot,
+  DesktopThemePreviewState,
+  DesktopWindowIntent,
+  DesktopWindowIntentResult,
+} from "../../../types/desktop-window";
 import type { DesktopApplicationMenuCommand } from "../../../types/desktop-menu";
 import type { AppConfig, UpdateChannel } from "../../../types/config";
 import type { CachedResourceRecord, ResourceCacheKey } from "../../../data/resource-store";
@@ -30,6 +36,8 @@ export interface ElectrobunBackendInit {
   paneId?: string;
   /** A secondary window's layout window id. */
   windowId?: string;
+  /** The window with native focus, or the last one to have it, by channel key. */
+  activeWindowKey?: string | null;
   /** What the view needs to send crash reports and usage counts the same way the Bun process would. */
   telemetry: ElectrobunTelemetryInit;
 }
@@ -187,6 +195,8 @@ interface DesktopBackendRequestMap {
   "desktop.focusDetachedPane": { request: { paneId: string }; response: null };
   "desktop.movePaneToNewWindow": { request: { paneId: string }; response: null };
   "desktop.movePaneToMainWindow": { request: { paneId: string }; response: null };
+  /** From a secondary window: a change the host passes to the main window, naming the window it came from. */
+  "window.intent": { request: { intent: DesktopWindowIntent }; response: DesktopWindowIntentResult };
   "pluginState.setMany": { request: { entries: DesktopPluginStateSetEntry[] }; response: null };
   "pluginState.delete": { request: { pluginId: string; key: string }; response: null };
   "plugins.listExternal": { request: null; response: DesktopExternalPluginBundle[] };
@@ -325,6 +335,15 @@ export interface RemoteControlRequestMessage {
   request: RemoteControlRequest;
 }
 
+export interface WindowIntentRequestMessage {
+  windowId: string;
+  intent: DesktopWindowIntent;
+}
+
+interface ActiveWindowMessage {
+  windowKey: string | null;
+}
+
 export interface ElectrobunDesktopRpcSchema {
   bun: {
     requests: {
@@ -343,8 +362,13 @@ export interface ElectrobunDesktopRpcSchema {
         params: RemoteControlRequestMessage;
         response: RemoteControlResponse;
       };
+      "window.intent": {
+        params: WindowIntentRequestMessage;
+        response: DesktopWindowIntentResult;
+      };
     };
     messages: {
+      "desktop.activeWindow": ActiveWindowMessage;
       "context-menu.select": ContextMenuSelectMessage;
       "application-menu.select": ApplicationMenuSelectMessage;
       "desktop.state": DesktopStateMessage;
