@@ -16,7 +16,11 @@ import type { RemoteControlRequest, RemoteControlResponse } from "../../../../re
 import { installCrashReporter } from "../../../../telemetry/crash-reports";
 import { createNodeCrashReporterHost } from "../../../../telemetry/crash-reports-node";
 import type { AppConfig } from "../../../../types/config";
-import type { DesktopSharedStateSnapshot } from "../../../../types/desktop-window";
+import type {
+  DesktopSharedStateSnapshot,
+  DesktopWindowIntent,
+  DesktopWindowIntentResult,
+} from "../../../../types/desktop-window";
 import type {
   ContextMenuSelectMessage,
   DesktopBackendRequest,
@@ -124,6 +128,8 @@ export class DesktopBackend {
   private readonly contextMenuRequestRpcs = new Map<string, DesktopRpc>();
   /** The window with native focus, by channel key; null while the app is in the background. */
   private activeWindowKey: string | null = null;
+  /** The last window to have native focus, kept while the app is in the background. */
+  lastActiveWindowKey: string | null = null;
   private readonly ignoredSecondaryRequests = new Set<string>();
 
   constructor(rememberedWindows: RememberedWindowStore) {
@@ -251,6 +257,13 @@ export class DesktopBackend {
   noteWindowFocus(windowKey: string, focused: boolean): void {
     if (focused) this.activeWindowKey = windowKey;
     else if (this.activeWindowKey === windowKey) this.activeWindowKey = null;
+    // The windows show their focused pane only in the last one to have
+    // focus, which stays the same while the app is in the background.
+    if (!focused || this.lastActiveWindowKey === windowKey) return;
+    this.lastActiveWindowKey = windowKey;
+    this.rpcs.forEachReadyWindowRpc((rpc) => {
+      rpc.send["desktop.activeWindow"]({ windowKey });
+    });
   }
 
   /**
@@ -470,6 +483,25 @@ export class DesktopBackend {
     }
   }
 
+  /**
+   * A secondary window's change goes to the main window, which writes all
+   * layout and config. The window is named by the channel the change came
+   * in on, so a window can only change its own panes.
+   */
+  private async forwardWindowIntent(
+    rpc: DesktopRpc,
+    intent: DesktopWindowIntent,
+  ): Promise<DesktopWindowIntentResult> {
+    const windowId = windowIdFromSecondaryRpcKey(this.rpcs.getRpcWindowKey(rpc));
+    const mainRpc = this.readyMainWindowRpc();
+    if (!windowId || !mainRpc) return { applied: false };
+    const response = await mainRpc.request["window.intent"]({
+      windowId,
+      intent: encodeRpcValue(intent) as DesktopWindowIntent,
+    });
+    return decodeRpcValue<DesktopWindowIntentResult>(response);
+  }
+
   private async ensureRemoteControlServer(): Promise<void> {
     if (this.remoteControlServer) return;
     const config = this.requireConfig();
@@ -540,6 +572,8 @@ export class DesktopBackend {
       case "desktop.movePaneToNewWindow":
       case "desktop.movePaneToMainWindow":
         return handleDesktopWorkspaceRequest(this, request);
+      case "window.intent":
+        return this.forwardWindowIntent(rpc, request.payload.intent);
       case "pluginState.setMany":
       case "pluginState.delete":
         return handleDesktopPluginStateRequest(this.requireServices().persistence.pluginState, request);

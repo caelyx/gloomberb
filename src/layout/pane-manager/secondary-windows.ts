@@ -1,5 +1,11 @@
-import type { LayoutConfig } from "../../types/config";
-import { getDockLeafLayouts, type LayoutBounds } from "./dock-tree";
+import {
+  removePaneInstances,
+  type DockLayoutNode,
+  type FloatingPaneEntry,
+  type LayoutConfig,
+  type PaneInstanceConfig,
+} from "../../types/config";
+import { getDockedInstanceIds, getDockLeafLayouts, type LayoutBounds } from "./dock-tree";
 import { dockPane, insertAtRootEdge } from "./docking";
 import { detachPane, finalizeLayout } from "./layout-state";
 import { findPaneLocation, isPaneInLayout } from "./queries";
@@ -103,4 +109,69 @@ export function viewLayoutFromWindow(layout: LayoutConfig, windowId: string): La
       ...windows.filter((candidate) => candidate.id !== windowId),
     ],
   };
+}
+
+/** The panes in secondary window `windowId`: its grid's, then its floating ones. */
+export function secondaryWindowPaneIds(layout: LayoutConfig, windowId: string): string[] {
+  const window = layout.windows?.find((candidate) => candidate.id === windowId);
+  return window ? [...getDockedInstanceIds(window.dockRoot), ...window.floating.map((entry) => entry.instanceId)] : [];
+}
+
+/**
+ * What a secondary window changed in its own grid, for the main window to
+ * apply: the main window is the only one that writes the layout.
+ */
+export interface SecondaryWindowLayoutEdit {
+  windowId: string;
+  /** The window's panes in the state the edit was made on; an edit made on an older state is dropped. */
+  basePaneIds: string[];
+  dockRoot: DockLayoutNode | null;
+  floating: FloatingPaneEntry[];
+  /** The window's own pane instances, with any title, settings or link changed there. */
+  instances: PaneInstanceConfig[];
+}
+
+/** The edit a window's view of the layout (see `viewLayoutFromWindow`) makes to that window. */
+export function windowLayoutEditFromView(view: LayoutConfig, windowId: string, basePaneIds: readonly string[]): SecondaryWindowLayoutEdit {
+  const paneIds = new Set([...getDockedInstanceIds(view.dockRoot), ...view.floating.map((entry) => entry.instanceId)]);
+  return {
+    windowId,
+    basePaneIds: [...basePaneIds],
+    dockRoot: view.dockRoot,
+    floating: view.floating,
+    instances: view.instances.filter((instance) => paneIds.has(instance.instanceId)),
+  };
+}
+
+/**
+ * The layout with a secondary window's edit applied, or null when it cannot
+ * be: the window is gone, its panes changed since the edit was made, or the
+ * edit places a pane that is not the window's. A pane the edit no longer
+ * places was closed there and leaves the layout. Only the window's own
+ * instances take the edit's changes, and none changes its pane type.
+ */
+export function applySecondaryWindowLayoutEdit(layout: LayoutConfig, edit: SecondaryWindowLayoutEdit): LayoutConfig | null {
+  const windows = layout.windows ?? [];
+  if (!windows.some((window) => window.id === edit.windowId)) return null;
+  const current = secondaryWindowPaneIds(layout, edit.windowId);
+  const currentIds = new Set(current);
+  if (current.length !== edit.basePaneIds.length || edit.basePaneIds.some((id) => !currentIds.has(id))) return null;
+  const incoming = [...getDockedInstanceIds(edit.dockRoot), ...edit.floating.map((entry) => entry.instanceId)];
+  if (incoming.some((id) => !currentIds.has(id))) return null;
+  const incomingIds = new Set(incoming);
+  const editedInstances = new Map(edit.instances
+    .filter((instance) => incomingIds.has(instance.instanceId))
+    .map((instance) => [instance.instanceId, instance] as const));
+  const spliced: LayoutConfig = {
+    ...layout,
+    instances: layout.instances.map((instance) => {
+      const edited = editedInstances.get(instance.instanceId);
+      return edited ? { ...edited, instanceId: instance.instanceId, paneId: instance.paneId } : instance;
+    }),
+    windows: windows.map((window) => (
+      window.id === edit.windowId ? { id: window.id, dockRoot: edit.dockRoot, floating: edit.floating } : window
+    )),
+  };
+  const closed = current.filter((id) => !incomingIds.has(id));
+  return finalizeLayout(closed.length > 0 ? removePaneInstances(spliced, closed) : spliced);
 }

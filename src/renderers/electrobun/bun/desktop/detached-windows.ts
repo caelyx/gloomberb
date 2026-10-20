@@ -154,6 +154,7 @@ export class DesktopDetachedWindowManager {
 
   private cleanupState(instanceId: string): void {
     this.backend.disposeWindowResources(detachedRpcKey(instanceId));
+    this.backend.noteWindowFocus(detachedRpcKey(instanceId), false);
     this.windows.delete(instanceId);
     this.clearTimer(this.frameTimers, instanceId);
     this.clearTimer(this.dockTimers, instanceId);
@@ -179,6 +180,9 @@ export class DesktopDetachedWindowManager {
     });
     this.windows.set(instanceId, window);
     this.suppressDockUntil.set(instanceId, Date.now() + INITIAL_DOCK_SUPPRESSION_MS);
+    const key = detachedRpcKey(instanceId);
+    (window as any).on?.("focus", () => this.backend.noteWindowFocus(key, true));
+    (window as any).on?.("blur", () => this.backend.noteWindowFocus(key, false));
 
     (window as any).on?.("close", () => {
       const shouldIgnore = this.closingPanes.delete(instanceId);

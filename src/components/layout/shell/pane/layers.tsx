@@ -8,6 +8,7 @@ import type {
   LayoutBounds,
   ResolvedPane,
 } from "../../../../layout/pane-manager";
+import { useDesktopWindowActive } from "../../../../state/app/context";
 import { useThemeColors } from "../../../../theme/theme-context";
 import { WEB_CELL_HEIGHT, WEB_CELL_WIDTH } from "../../../../theme/font-scale";
 import { LivePaneFrameContext, type CellSize, type LivePaneFrame } from "../../../../ui/live-stretch";
@@ -96,6 +97,8 @@ interface PaneLayerProps {
   rect: LayoutBounds;
   title: string;
   focused: boolean;
+  /** Drawn as the focused pane: focused, and in the window the user is working in. */
+  highlighted: boolean;
   windowModeSelected: boolean;
   showActions: boolean;
   /** Fully covered (terminal only): skip drawing, keep the tree mounted. */
@@ -152,6 +155,7 @@ const DockedPaneLayer = memo(function DockedPaneLayer({
   rect: layoutRect,
   title,
   focused,
+  highlighted,
   windowModeSelected,
   showActions,
   hidden,
@@ -210,7 +214,7 @@ const DockedPaneLayer = memo(function DockedPaneLayer({
             <PaneWrapper
               paneId={paneId}
               title={title}
-              focused={focused}
+              focused={highlighted}
               width={rect.width}
               height={rect.height}
               stretch={nativePaneChrome}
@@ -259,6 +263,7 @@ const FloatingPaneFrame = memo(function FloatingPaneFrame({
   rect,
   title,
   focused,
+  highlighted,
   windowModeSelected,
   showActions,
   hidden,
@@ -305,7 +310,7 @@ const FloatingPaneFrame = memo(function FloatingPaneFrame({
             height={rect.height}
             zIndex={zIndex}
             hidden={hidden}
-            focused={focused}
+            focused={highlighted}
             windowModeSelected={windowModeSelected}
             locked={pane.instance.locked === true}
             showActions={showActions}
@@ -618,6 +623,7 @@ export function ShellPaneLayers({
   windowModeDockResizePathKey,
   windowModePaneId,
 }: ShellPaneLayersProps) {
+  const windowActive = useDesktopWindowActive();
   // Panes whose every cell sits under floating windows. Their streams drop to
   // the off-screen cadence on every renderer; a transient focus unmounts the
   // other panes, so there is nothing to cover. The floating rects here are the
@@ -694,14 +700,17 @@ export function ShellPaneLayers({
   const layerProps = (pane: ResolvedPane, rect: LayoutBounds): PaneLayerProps => {
     const paneId = pane.instance.instanceId;
     const focused = focusedPaneId === paneId && (!overlayOpen || menuPaneId === paneId);
+    // Each desktop window keeps its own focused pane; only the one in use draws it.
+    const highlighted = focused && windowActive;
     const fullscreen = transientFocusActive && paneId === transientFocusPaneId;
     return {
       pane,
       rect,
       title: getPaneTitle(pane),
       focused,
+      highlighted,
       windowModeSelected: windowModePaneId === paneId,
-      showActions: focused || hoveredPaneId === paneId || menuPaneId === paneId,
+      showActions: highlighted || hoveredPaneId === paneId || menuPaneId === paneId,
       hidden: occludedPaneIds.has(paneId),
       inView: !coveredPaneIds.has(paneId),
       fullscreen,

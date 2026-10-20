@@ -1,9 +1,9 @@
 /**
  * What a secondary window may not ask for. Its view holds the layout with its
- * own grid swapped into the main window's place, and it never sends its state
- * back, so a config, session or pane-state write from it would overwrite the
- * main window's with a stale or swapped copy. Moving panes goes through the
- * host's own window requests instead.
+ * own grid swapped into the main window's place, so a config, session or
+ * pane-state write from it would overwrite the main window's with a stale or
+ * swapped copy. Its own changes reach the main window as `window.intent`
+ * requests instead, which the main window applies to that window's panes.
  */
 const SECONDARY_WINDOW_READ_ONLY_METHODS: ReadonlySet<string> = new Set([
   "config.save",
