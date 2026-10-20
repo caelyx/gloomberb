@@ -7,6 +7,10 @@ import type { DesktopWindowBridge } from "../../types/desktop-window";
 import { isDialogOpen } from "../../ui/dialog-stack";
 import type { RendererHost } from "../../ui/host";
 import { recordFunctionOpen } from "../../telemetry/usage-counts";
+import { shouldRunShortcut } from "../keybindings/menu-echo";
+
+/** The File menu's Search Ticker opens the bar on this query. */
+const TICKER_SEARCH_MENU_QUERY = "DES ";
 
 const OPENS_OVER_DIALOGS = new Set<string>(["open-command-bar", "open-plugin-workflow", "open-builtin-workflow"]);
 
@@ -28,17 +32,27 @@ export function useDesktopApplicationMenuRuntime({
   stateRef: { current: AppState };
 }) {
   useEffect(() => {
-    if (desktopWindowKind !== "main" || !desktopApplicationMenuBridge) return;
+    // A secondary window runs its own bar; the host sends it only that.
+    if ((desktopWindowKind !== "main" && desktopWindowKind !== "window") || !desktopApplicationMenuBridge) return;
+    const secondary = desktopWindowKind === "window";
     return desktopApplicationMenuBridge.subscribe((command) => {
+      if (secondary && command.type !== "open-command-bar") return;
       // The native menu stays reachable over a dialog, accelerators included.
       // A bar opened there would sit over the dialog without its keys, and Esc
       // would close the dialog under it; a form would stack over one the user
       // has not finished. Both wait for the dialog to close.
       if (OPENS_OVER_DIALOGS.has(command.type) && isDialogOpen()) return;
       switch (command.type) {
-        case "open-command-bar":
+        case "open-command-bar": {
+          // The accelerator's keydown may already have toggled the bar for this press.
+          // With the bar already open, opening it changes nothing, and the press's
+          // keydown, whenever it comes, is the one that closes it.
+          const channel = !command.query ? "command-bar" : command.query === TICKER_SEARCH_MENU_QUERY ? "ticker-search" : null;
+          if (channel === "command-bar" && stateRef.current.commandBarOpen) break;
+          if (channel && !shouldRunShortcut(channel, "menu")) break;
           dispatch({ type: "SET_COMMAND_BAR", open: true, query: command.query });
           break;
+        }
         case "open-plugin-workflow":
           pluginRegistry.openPluginCommandWorkflow(command.commandId);
           break;

@@ -74,6 +74,9 @@ const rpc = Electroview.defineRPC<ElectrobunDesktopRpcSchema>({
       "desktop.activeWindow": (message) => {
         emit("desktop.activeWindow", { windowKey: typeof message?.windowKey === "string" ? message.windowKey : null });
       },
+      "desktop.focusPane": (message) => {
+        if (typeof message?.paneId === "string") emit("desktop.focusPane", { paneId: message.paneId });
+      },
       "context-menu.select": (message) => {
         emit("context-menu.select", message, message.requestId);
       },

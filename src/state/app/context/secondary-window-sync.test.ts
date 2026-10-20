@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { appReducer, createInitialState, type AppState } from "../../../core/state/app/state";
-import { getDockedPaneIds, removePane } from "../../../layout/pane-manager";
+import { addPaneToLayout, getDockedPaneIds, removePane } from "../../../layout/pane-manager";
 import { secondaryWindowPaneIds, viewLayoutFromWindow } from "../../../layout/pane-manager/secondary-windows";
 import { createDefaultConfig, createPaneInstance, type AppConfig, type LayoutConfig } from "../../../types/config";
 import type { DesktopSharedStateSnapshot, DesktopWindowIntent } from "../../../types/desktop-window";
@@ -134,6 +134,36 @@ describe("SecondaryWindowSync", () => {
     local = hydrate(local, sync.receive(viewOf(applied.state), local));
     sync.noteSynced(local);
     expect(sync.collect(local)).toEqual([]);
+  });
+
+  test("a pane opened in the window reaches the main window with its state, and survives snapshots in between", () => {
+    const main = mainState();
+    const sync = new SecondaryWindowSync("w2");
+    let local = hydrate(createInitialState(mainConfig()), viewOf(main));
+    sync.start(viewOf(main), local);
+
+    const opened = createPaneInstance("calendar", { instanceId: "cal" });
+    local = appReducer(local, {
+      type: "UPDATE_LAYOUT",
+      layout: addPaneToLayout(local.config.layout, opened, { relativeTo: "econ", position: "right" }),
+    });
+    local = appReducer(local, { type: "REPLACE_PANE_STATE", paneId: "cal", state: { month: "2026-10" } });
+    const intents = sync.collect(local);
+    expect(intents.map((intent) => intent.type)).toEqual(["editLayout", "replacePaneState"]);
+
+    // A snapshot from before main took the edit still shows the new pane here.
+    const stale = sync.receive(viewOf(main), local);
+    expect(getDockedPaneIds(stale.config.layout)).toEqual(["news", "econ", "cal"]);
+    expect(stale.config.layout.instances.some((instance) => instance.instanceId === "cal")).toBe(true);
+
+    let next = main;
+    for (const intent of intents) {
+      const result = applyInMain(next, intent);
+      expect(result.applied).toBe(true);
+      next = result.state;
+    }
+    expect(secondaryWindowPaneIds(next.config.layout, "w2")).toEqual(["news", "econ", "cal"]);
+    expect(next.paneState.cal).toEqual({ month: "2026-10" });
   });
 
   test("a refused edit is dropped so main's state comes back", () => {

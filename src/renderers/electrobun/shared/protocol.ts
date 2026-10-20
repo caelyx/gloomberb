@@ -197,6 +197,8 @@ interface DesktopBackendRequestMap {
   "desktop.movePaneToMainWindow": { request: { paneId: string }; response: null };
   /** From a secondary window: a change the host passes to the main window, naming the window it came from. */
   "window.intent": { request: { intent: DesktopWindowIntent }; response: DesktopWindowIntentResult };
+  /** From any window: bring forward the window that shows a pane, and focus the pane there. */
+  "window.focusPane": { request: { paneId: string }; response: null };
   "pluginState.setMany": { request: { entries: DesktopPluginStateSetEntry[] }; response: null };
   "pluginState.delete": { request: { pluginId: string; key: string }; response: null };
   "plugins.listExternal": { request: null; response: DesktopExternalPluginBundle[] };
@@ -344,6 +346,10 @@ interface ActiveWindowMessage {
   windowKey: string | null;
 }
 
+interface FocusPaneMessage {
+  paneId: string;
+}
+
 export interface ElectrobunDesktopRpcSchema {
   bun: {
     requests: {
@@ -369,6 +375,7 @@ export interface ElectrobunDesktopRpcSchema {
     };
     messages: {
       "desktop.activeWindow": ActiveWindowMessage;
+      "desktop.focusPane": FocusPaneMessage;
       "context-menu.select": ContextMenuSelectMessage;
       "application-menu.select": ApplicationMenuSelectMessage;
       "desktop.state": DesktopStateMessage;

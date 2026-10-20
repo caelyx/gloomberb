@@ -12,6 +12,7 @@ import { PluginOffError } from "../../../plugins/plugin-off";
 import { formatTickerListInput } from "../../../tickers/list";
 import { PANE_LOCK_SETTING_KEY, setPaneLocked, updatePaneInstance, setPaneSettings } from "../../../pane-settings";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
+import { findPaneLocation } from "../../../layout/pane-manager";
 import { cleanPortfolioPaneSettings, resolvePortfolioPaneCollectionId } from "../../../plugins/builtin/portfolio-list/settings";
 import {
   DEFAULT_RELATIONSHIP_SECOND_SYMBOL,
@@ -252,7 +253,14 @@ export async function createPaneTemplateOrThrow(
     template,
     deps.pluginRegistry.paneTemplates,
     spec,
-    { focusedPaneId: deps.getState().focusedPaneId, paneDef: deps.pluginRegistry.panes.get(template.paneId) },
+    {
+      focusedPaneId: deps.getState().focusedPaneId,
+      paneDef: deps.pluginRegistry.panes.get(template.paneId),
+      // In a secondary window this layout is its view: "main" there is its own grid.
+      preferPaneIds: new Set(instances
+        .filter((entry) => findPaneLocation(deps.getState().config.layout, entry.instanceId)?.window === "main")
+        .map((entry) => entry.instanceId)),
+    },
   );
   if (existing) {
     const retargeted = retargetPaneInstance(existing, spec);

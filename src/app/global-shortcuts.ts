@@ -18,6 +18,7 @@ import { DOCS_PANE_TEMPLATE_ID } from "../docs/content";
 import { registerPaneDocsHandler } from "../docs/requests";
 import { isMoveDownShortcut, isMoveUpShortcut } from "../components/command-bar/keyboard-handlers";
 import { pressStarPromptKey } from "./star-prompt/runtime";
+import { shouldRunShortcut } from "./keybindings/menu-echo";
 import {
   copyActiveSelection,
   isCopyShortcut,
@@ -93,6 +94,7 @@ export function useAppGlobalShortcuts({
   dispatch,
   focusedTickerSymbol,
   isDetachedWindow,
+  opensPanes = !isDetachedWindow,
   keybindings = getDefaultKeybindings(),
   pluginRegistry,
   refreshTicker,
@@ -103,6 +105,8 @@ export function useAppGlobalShortcuts({
   dispatch: Dispatch<AppAction>;
   focusedTickerSymbol: string | null;
   isDetachedWindow: boolean;
+  /** The window runs the bar and opens panes: the main window or a secondary window, not a popped-out pane. */
+  opensPanes?: boolean;
   /** The resolved table; the app resolves it once and shares it with the shell. */
   keybindings?: ResolvedKeybindings;
   pluginRegistry: PluginRegistry;
@@ -131,14 +135,14 @@ export function useAppGlobalShortcuts({
   layoutRef.current = state.config.layout;
   // A pane's `?`: its entry in DOCS, or its help card where no pane can open.
   useEffect(() => registerPaneDocsHandler((paneId) => {
-    if (!isDetachedWindow) {
+    if (opensPanes) {
       pluginRegistry.createPaneFromTemplate(DOCS_PANE_TEMPLATE_ID, { values: { pane: paneId } });
       return;
     }
     const instance = findPaneInstance(layoutRef.current, paneId);
     const fn = instance ? helpFunctionForPane(buildRegistryHelpIndex(pluginRegistry), pluginRegistry, instance) : null;
     if (fn) requestFunctionHelp({ kind: "function", fn, inAppDocs: false });
-  }), [isDetachedWindow, pluginRegistry]);
+  }), [opensPanes, pluginRegistry]);
 
   useShortcut((event) => {
     if (isCopyShortcut(event) && copyActiveSelection(nativeRenderer)) {
@@ -224,20 +228,23 @@ export function useAppGlobalShortcuts({
 
     if (dialogOpen) return;
 
-    if (!isDetachedWindow && action === "command-bar") {
+    if (opensPanes && action === "command-bar") {
       // Ctrl+P and Ctrl+N move the open bar's selection, so a bar chord that
       // is one of them only opens it; Esc and the bar's other chords close it.
       if (state.commandBarOpen && (isMoveUpShortcut(event) || isMoveDownShortcut(event))) return;
       if (ranAlready(action)) return;
       event.preventDefault();
       event.stopPropagation();
+      // The same press may already have come through as the menu accelerator.
+      if (!shouldRunShortcut("command-bar", "key")) return;
       dispatch({ type: "TOGGLE_COMMAND_BAR" });
       return;
     }
-    if (!isDetachedWindow && action === "ticker-search" && !state.commandBarOpen) {
+    if (opensPanes && action === "ticker-search" && !state.commandBarOpen) {
       if (ranAlready(action)) return;
       event.preventDefault();
       event.stopPropagation();
+      if (!shouldRunShortcut("ticker-search", "key")) return;
       dispatch({
         type: "SET_COMMAND_BAR",
         open: true,
@@ -263,7 +270,7 @@ export function useAppGlobalShortcuts({
       return;
     }
 
-    if (match?.kind === "command" && !isDetachedWindow) {
+    if (match?.kind === "command" && opensPanes) {
       // Control chords belong to the editor while text is being typed; Alt,
       // Command and function keys are never text, so they still fire.
       const editing = state.inputCaptured || event.targetEditable === true;
@@ -288,14 +295,14 @@ export function useAppGlobalShortcuts({
       recordFunctionOpen({ shortcut: "HELP", externalPluginId: null });
       const instance = state.focusedPaneId ? findPaneInstance(state.config.layout, state.focusedPaneId) : undefined;
       const fn = instance ? helpFunctionForPane(buildRegistryHelpIndex(pluginRegistry), pluginRegistry, instance) : null;
-      if (fn && requestFunctionHelp({ kind: "function", fn, inAppDocs: !isDetachedWindow })) return;
-      if (!isDetachedWindow) pluginRegistry.showPane("help");
+      if (fn && requestFunctionHelp({ kind: "function", fn, inAppDocs: opensPanes })) return;
+      if (opensPanes) pluginRegistry.showPane("help");
       return;
     }
 
     if (state.inputCaptured) return;
 
-    if (!isDetachedWindow && action === "help") {
+    if (opensPanes && action === "help") {
       if (ranAlready(action)) return;
       event.preventDefault();
       event.stopPropagation();
