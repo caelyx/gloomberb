@@ -1,6 +1,6 @@
 import { useCallback, type Dispatch, type MutableRefObject } from "react";
 import type { PluginRegistry } from "../../../plugins/registry";
-import { useAppGetState, type AppAction, type AppState } from "../../../state/app/context";
+import { useAppGetState, useDesktopWindowCommands, type AppAction, type AppState } from "../../../state/app/context";
 import { t } from "../../../i18n";
 import type { TickerFinancials } from "../../../types/financials";
 import type { TickerRecord } from "../../../types/ticker";
@@ -67,6 +67,7 @@ export function useCommandBarRouteActions({
   stateRef,
 }: UseCommandBarRouteActionsOptions) {
   const getState = useAppGetState();
+  const windowCommands = useDesktopWindowCommands();
   const buildWindowModeItems = useCallback((arg: string): ResultItem[] => buildWindowModeResultItems({
     arg,
     closeAll,
@@ -90,6 +91,7 @@ export function useCommandBarRouteActions({
     pushRoute,
     query,
     state,
+    windowCommands,
   }), [
     closeAll,
     dispatch,
@@ -101,6 +103,7 @@ export function useCommandBarRouteActions({
     pluginRegistry,
     pushRoute,
     state,
+    windowCommands,
   ]);
 
   /**

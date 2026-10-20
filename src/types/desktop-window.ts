@@ -1,5 +1,5 @@
 import type { PaneRuntimeState } from "../core/state/app/state";
-import type { SecondaryWindowLayoutEdit } from "../layout/pane-manager/secondary-windows";
+import type { SecondaryWindowLayoutEdit, WindowMoveTarget, WindowSize } from "../layout/pane-manager/secondary-windows";
 import type { AppConfig } from "./config";
 
 export interface DesktopSharedStateSnapshot {
@@ -32,7 +32,24 @@ export type DesktopWindowIntent =
   | { type: "editLayout"; edit: SecondaryWindowLayoutEdit }
   | { type: "replacePaneState"; paneState: Record<string, PaneRuntimeState> }
   /** Plugin settings a pane changed, by plugin; null removes that plugin's settings. */
-  | { type: "setPluginConfig"; values: Record<string, Record<string, unknown> | null> };
+  | { type: "setPluginConfig"; values: Record<string, Record<string, unknown> | null> }
+  /** One of the window's own panes to another window: "main", a window id, or "new". */
+  | { type: "movePane"; paneId: string; target: WindowMoveTarget }
+  /** A new, empty secondary window. */
+  | { type: "addWindow" }
+  /** This window gone, its panes moved into the main window. */
+  | { type: "closeWindow" }
+  /**
+   * What the main window needs to place a pane moved here: the window's
+   * focused pane and its size. Not a change; it is kept, not saved.
+   */
+  | { type: "windowStatus"; status: SecondaryWindowStatus };
+
+/** A secondary window's focused pane and size, as it last told the main window. */
+export interface SecondaryWindowStatus {
+  focusedPaneId: string | null;
+  size: WindowSize | null;
+}
 
 export interface DesktopWindowIntentResult {
   /** False when the main window dropped the change, for instance an edit made on a state it has since moved past. */
@@ -53,6 +70,11 @@ export interface DesktopWindowBridge {
   subscribeActiveWindow?(listener: (windowKey: string | null) => void): () => void;
   /** A pane in another window: that window comes forward and focuses it. */
   focusPaneInItsWindow?(paneId: string): Promise<void>;
+  /**
+   * Window `windowId` ("main" or a layout window id) comes forward, focusing
+   * `paneId` there once the layout has it there.
+   */
+  focusWindow?(windowId: string, paneId?: string | null): Promise<void>;
   /** The host asking this window to focus one of its own panes. */
   subscribeFocusPane?(listener: (paneId: string) => void): () => void;
   /** From a secondary window: a change for the main window to apply. */
@@ -66,10 +88,6 @@ export interface DesktopWindowBridge {
   dockDetachedPane?(paneId: string): Promise<void>;
   closeDetachedPane?(paneId: string): Promise<void>;
   focusDetachedPane?(paneId: string): Promise<void>;
-  /** From the main window: the pane in a new secondary window. */
-  movePaneToNewWindow?(paneId: string): Promise<void>;
-  /** From a secondary window: the pane back in the main window. */
-  movePaneToMainWindow?(paneId: string): Promise<void>;
   subscribeState(listener: (snapshot: DesktopSharedStateSnapshot) => void): () => void;
   subscribeDockPreview?(listener: (preview: DesktopDockPreviewState) => void): () => void;
   subscribeThemePreview?(listener: (preview: DesktopThemePreviewState) => void): () => void;

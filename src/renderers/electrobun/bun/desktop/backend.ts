@@ -39,7 +39,7 @@ import {
   deactivateExternalPlugin,
   desktopPluginManager,
 } from "../external-plugins";
-import { MAIN_WINDOW_RPC_KEY, windowIdFromSecondaryRpcKey } from "../window/focus";
+import { MAIN_WINDOW_RPC_KEY, secondaryWindowRpcKey, windowIdFromSecondaryRpcKey } from "../window/focus";
 import { commandBarMenuTarget, paneWindowRpcKey } from "../../shared/window-keys";
 import { findPaneLocation } from "../../../../layout/pane-manager";
 import type { RememberedWindowStore } from "../window/remembered-frame";
@@ -65,6 +65,8 @@ export type DesktopRpc = ReturnType<typeof BrowserView.defineRPC<ElectrobunDeskt
 /** How long a quit waits for the view to flush and exit on its own. */
 const QUIT_FALLBACK_MS = 2_500;
 const MAX_PENDING_DEEP_LINKS = 20;
+/** How long a window asked to come forward waits for the main window's state to place what it shows. */
+const PENDING_WINDOW_FOCUS_MS = 3_000;
 
 function summarizeError(error: unknown): string {
   return error instanceof Error ? error.stack ?? error.message : String(error);
@@ -262,6 +264,38 @@ export class DesktopBackend {
     this.focusWindowForRpcKey(windowKey);
     const rpc = this.rpcs.getWindowRpc(windowKey);
     if (rpc && this.rpcs.isWindowRpcReady(windowKey)) rpc.send["desktop.focusPane"]({ paneId });
+  }
+
+  private pendingWindowFocus: { windowId: string; paneId: string | null; until: number } | null = null;
+
+  /**
+   * Brings window `windowId` forward with `paneId` focused there. The main
+   * window asks right after it moves a pane or makes a window, before its
+   * state reaches the host, so until the layout has the pane (or the window)
+   * there the request waits for the next state, for a few seconds at most.
+   */
+  focusWindowWhenPlaced(windowId: string, paneId: string | null): void {
+    this.pendingWindowFocus = { windowId, paneId, until: Date.now() + PENDING_WINDOW_FOCUS_MS };
+    this.flushPendingWindowFocus();
+  }
+
+  flushPendingWindowFocus(): void {
+    const pending = this.pendingWindowFocus;
+    if (!pending) return;
+    if (Date.now() > pending.until) {
+      this.pendingWindowFocus = null;
+      return;
+    }
+    const layout = this.config?.layout;
+    const windowKey = pending.windowId === "main" ? MAIN_WINDOW_RPC_KEY : secondaryWindowRpcKey(pending.windowId);
+    const windowThere = pending.windowId === "main" || !!layout?.windows?.some((window) => window.id === pending.windowId);
+    const paneThere = !pending.paneId || (!!layout && findPaneLocation(layout, pending.paneId)?.window === pending.windowId);
+    if (!windowThere || !paneThere || !this.windowForRpcKey(windowKey)) return;
+    this.pendingWindowFocus = null;
+    if (pending.windowId === "main") this.mainWindow?.activate();
+    else this.focusWindowForRpcKey(windowKey);
+    const rpc = this.rpcs.getWindowRpc(windowKey);
+    if (pending.paneId && rpc && this.rpcs.isWindowRpcReady(windowKey)) rpc.send["desktop.focusPane"]({ paneId: pending.paneId });
   }
 
   /**
@@ -518,13 +552,30 @@ export class DesktopBackend {
     intent: DesktopWindowIntent,
   ): Promise<DesktopWindowIntentResult> {
     const windowId = windowIdFromSecondaryRpcKey(this.rpcs.getRpcWindowKey(rpc));
+    return windowId ? this.sendWindowIntentToMain(windowId, intent) : { applied: false };
+  }
+
+  private async sendWindowIntentToMain(windowId: string, intent: DesktopWindowIntent): Promise<DesktopWindowIntentResult> {
     const mainRpc = this.readyMainWindowRpc();
-    if (!windowId || !mainRpc) return { applied: false };
+    if (!mainRpc) return { applied: false };
     const response = await mainRpc.request["window.intent"]({
       windowId,
       intent: encodeRpcValue(intent) as DesktopWindowIntent,
     });
     return decodeRpcValue<DesktopWindowIntentResult>(response);
+  }
+
+  /**
+   * A secondary window closed by its own button: the main window moves its
+   * panes into its own grid and drops the window, as it makes every layout
+   * change. Only when it cannot does the host change the layout itself.
+   */
+  async closeSecondaryWindowThroughMain(windowId: string): Promise<void> {
+    const result = await this.sendWindowIntentToMain(windowId, { type: "closeWindow" }).catch(() => ({ applied: false }));
+    if (result.applied) return;
+    const workspace = this.workspace;
+    if (!workspace || !this.config?.layout.windows?.some((entry) => entry.id === windowId)) return;
+    await this.commitDesktopSnapshot(workspace.closeSecondaryWindow(windowId));
   }
 
   private async ensureRemoteControlServer(): Promise<void> {
@@ -594,13 +645,16 @@ export class DesktopBackend {
       case "desktop.dockDetachedPane":
       case "desktop.closeDetachedPane":
       case "desktop.focusDetachedPane":
-      case "desktop.movePaneToNewWindow":
-      case "desktop.movePaneToMainWindow":
         return handleDesktopWorkspaceRequest(this, request);
       case "window.intent":
         return this.forwardWindowIntent(rpc, request.payload.intent);
       case "window.focusPane":
         if (typeof request.payload.paneId === "string") this.focusPaneWindow(request.payload.paneId);
+        return null;
+      case "window.focus":
+        if (typeof request.payload.windowId === "string") {
+          this.focusWindowWhenPlaced(request.payload.windowId, request.payload.paneId ?? null);
+        }
         return null;
       case "pluginState.setMany":
       case "pluginState.delete":
