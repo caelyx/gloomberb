@@ -7,6 +7,7 @@ import {
   normalizeWindowFrameWithMinimum,
   type WindowFrame,
 } from "../window/frame";
+import { setWindowFrame } from "../window/native-frame";
 import {
   detachedRpcKey,
   focusWindowForRpcKey,
@@ -106,7 +107,7 @@ export class DesktopDetachedWindowManager {
           || currentFrame.y !== nextFrame.y
           || currentFrame.width !== nextFrame.width
           || currentFrame.height !== nextFrame.height)) {
-        existingWindow.setFrame(nextFrame.x, nextFrame.y, nextFrame.width, nextFrame.height);
+        setWindowFrame(existingWindow, nextFrame);
       }
       (existingWindow as any).setTitle?.(this.resolveTitle(instanceId));
     }

@@ -9,7 +9,6 @@ import { secondaryWindowRpcKey, windowIdFromSecondaryRpcKey } from "../window/fo
 import { getWindowFrame } from "../window/events";
 import { createAppWindow } from "../window/create";
 import { readDisplayWorkAreas } from "../window/displays";
-import { correctOpenedFrameOnce } from "../window/frame-drift";
 import { fitWindowFrameToDisplays, type DisplayWorkArea, type RememberedWindowStore } from "../window/remembered-frame";
 import { createRememberedWindowTracker, restoreWindowState } from "../window/remembered-tracker";
 import type { DesktopBackend } from "./backend";
@@ -128,7 +127,6 @@ export class DesktopSecondaryWindowManager {
     this.windows.set(windowId, window);
     this.trackers.set(windowId, tracker);
     restoreWindowState(window, remembered);
-    if (!remembered?.fullscreen && !remembered?.maximized) correctOpenedFrameOnce(window, frame, MAIN_WINDOW_MIN_SIZE);
 
     const events = window as { on?: (event: string, listener: () => void) => void };
     events.on?.("focus", () => this.backend.noteWindowFocus(key, true));
