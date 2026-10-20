@@ -1,12 +1,19 @@
 import { syncConfigActiveLayoutState, type AppAction, type AppState, type PaneRuntimeState } from "../../../core/state/app/state";
 import { getDockedInstanceIds } from "../../../layout/pane-manager/dock-tree";
+import { findPaneLocation } from "../../../layout/pane-manager/queries";
 import {
+  addSecondaryWindow,
   applySecondaryWindowLayoutEdit,
+  closeSecondaryWindow,
+  movePaneToNewWindow,
+  movePaneToWindow,
   secondaryWindowPaneIds,
   windowLayoutEditFromView,
+  type WindowMoveTarget,
+  type WindowSize,
 } from "../../../layout/pane-manager/secondary-windows";
 import type { AppConfig, LayoutConfig } from "../../../types/config";
-import type { DesktopSharedStateSnapshot, DesktopWindowIntent } from "../../../types/desktop-window";
+import type { DesktopSharedStateSnapshot, DesktopWindowIntent, SecondaryWindowStatus } from "../../../types/desktop-window";
 
 export interface WindowIntentOutcome {
   applied: boolean;
@@ -14,10 +21,65 @@ export interface WindowIntentOutcome {
   actions: AppAction[];
   /** The config to save, when the change is one the main window saves itself. */
   save: AppConfig | null;
+  /** The window to bring forward afterwards ("main" or a layout window id), with the pane to focus there. */
+  focus?: { windowId: string; paneId: string | null };
+  /** A window's focused pane and size, for the main window to keep. */
+  windowStatus?: SecondaryWindowStatus;
+}
+
+/** What the main window knows of the windows, for placing a pane moved between them. */
+export interface WindowIntentContext {
+  /** What each secondary window last reported, by layout window id. */
+  windowStatus?: ReadonlyMap<string, SecondaryWindowStatus>;
+  /** The main window's own size. */
+  mainSize?: WindowSize | null;
 }
 
 const REFUSED: WindowIntentOutcome = { applied: false, actions: [], save: null };
 const UNCHANGED: WindowIntentOutcome = { applied: true, actions: [], save: null };
+
+/** A layout change the main window makes for a window: undone with its own undo, and saved. */
+function layoutChangeOutcome(state: AppState, layout: LayoutConfig, focus?: WindowIntentOutcome["focus"]): WindowIntentOutcome {
+  return {
+    applied: true,
+    actions: [{ type: "PUSH_LAYOUT_HISTORY" }, { type: "UPDATE_LAYOUT", layout }],
+    save: syncConfigActiveLayoutState({ ...state.config, layout }, state.paneState, state.focusedPaneId),
+    ...(focus ? { focus } : {}),
+  };
+}
+
+/**
+ * Moving a pane to window `target` ("main", a layout window id, or "new"),
+ * from wherever it is: beside the focused pane the target window last
+ * reported, a floating pane scaled between the windows' sizes. The main
+ * window's own focused pane and size are its state's and `mainSize`.
+ */
+export function windowMoveOutcome(
+  state: AppState,
+  paneId: string,
+  target: WindowMoveTarget,
+  context: WindowIntentContext = {},
+): WindowIntentOutcome {
+  const layout = state.config.layout;
+  if (target === "new") {
+    const moved = movePaneToNewWindow(layout, paneId);
+    return moved ? layoutChangeOutcome(state, moved.layout, { windowId: moved.windowId, paneId }) : REFUSED;
+  }
+  const statusOf = (windowId: string | undefined): SecondaryWindowStatus | undefined => {
+    if (!windowId) return undefined;
+    return windowId === "main"
+      ? { focusedPaneId: state.focusedPaneId, size: context.mainSize ?? null }
+      : context.windowStatus?.get(windowId);
+  };
+  const source = statusOf(findPaneLocation(layout, paneId)?.window);
+  const destination = statusOf(target);
+  const next = movePaneToWindow(layout, paneId, target, {
+    anchorId: destination?.focusedPaneId ?? null,
+    sourceSize: source?.size ?? undefined,
+    targetSize: destination?.size ?? undefined,
+  });
+  return next ? layoutChangeOutcome(state, next, { windowId: target, paneId }) : REFUSED;
+}
 
 /**
  * Where a window's panes sit, leaving out which floating pane is on top:
@@ -38,9 +100,30 @@ function windowArrangement(layout: LayoutConfig, windowId: string): string {
  * that window's panes take it. A grid edit is undone with the main window's
  * own undo, like any other layout edit; pane state and settings are not.
  */
-export function applyWindowIntent(state: AppState, windowId: string, intent: DesktopWindowIntent): WindowIntentOutcome {
+export function applyWindowIntent(
+  state: AppState,
+  windowId: string,
+  intent: DesktopWindowIntent,
+  context: WindowIntentContext = {},
+): WindowIntentOutcome {
   const layout = state.config.layout;
   switch (intent.type) {
+    case "movePane": {
+      // A window moves only its own panes, and never to itself.
+      if (intent.target === windowId || !secondaryWindowPaneIds(layout, windowId).includes(intent.paneId)) return REFUSED;
+      return windowMoveOutcome(state, intent.paneId, intent.target, context);
+    }
+    case "addWindow": {
+      const added = addSecondaryWindow(layout);
+      return layoutChangeOutcome(state, added.layout, { windowId: added.windowId, paneId: null });
+    }
+    case "closeWindow": {
+      // Gone already, by another route: nothing for the host to do instead.
+      if (!layout.windows?.some((window) => window.id === windowId)) return UNCHANGED;
+      return layoutChangeOutcome(state, closeSecondaryWindow(layout, windowId));
+    }
+    case "windowStatus":
+      return { ...UNCHANGED, windowStatus: intent.status };
     case "editLayout": {
       const next = applySecondaryWindowLayoutEdit(layout, { ...intent.edit, windowId });
       if (!next) return REFUSED;

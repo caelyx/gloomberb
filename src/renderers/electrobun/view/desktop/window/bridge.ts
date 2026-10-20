@@ -48,6 +48,11 @@ export function createDesktopWindowBridge(
       : async (targetPaneId: string) => {
         await backendRequest("window.focusPane", { paneId: targetPaneId });
       },
+    focusWindow: kind === "detached"
+      ? undefined
+      : async (targetWindowId: string, targetPaneId?: string | null) => {
+        await backendRequest("window.focus", { windowId: targetWindowId, paneId: targetPaneId ?? null });
+      },
     subscribeFocusPane: kind === "detached"
       ? undefined
       : (listener: (paneId: string) => void) => onBackendMessage("desktop.focusPane", (message) => {
@@ -86,16 +91,6 @@ export function createDesktopWindowBridge(
     focusDetachedPane: async (targetPaneId: string) => {
       await backendRequest("desktop.focusDetachedPane", { paneId: targetPaneId });
     },
-    movePaneToNewWindow: kind === "main"
-      ? async (targetPaneId: string) => {
-        await backendRequest("desktop.movePaneToNewWindow", { paneId: targetPaneId });
-      }
-      : undefined,
-    movePaneToMainWindow: kind === "window"
-      ? async (targetPaneId: string) => {
-        await backendRequest("desktop.movePaneToMainWindow", { paneId: targetPaneId });
-      }
-      : undefined,
     subscribeState(listener: (snapshot: DesktopSharedStateSnapshot) => void) {
       return onBackendMessage("desktop.state", (message) => {
         if (kind === "detached" && paneId) {

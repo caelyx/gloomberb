@@ -11,6 +11,7 @@ import { createAppWindow } from "../window/create";
 import { readDisplayWorkAreas } from "../window/displays";
 import { fitWindowFrameToDisplays, type DisplayWorkArea, type RememberedWindowStore } from "../window/remembered-frame";
 import { createRememberedWindowTracker, restoreWindowState } from "../window/remembered-tracker";
+import { secondaryWindowLabel } from "../../../../layout/pane-manager/secondary-windows";
 import type { DesktopBackend } from "./backend";
 
 /**
@@ -25,10 +26,9 @@ function defaultSecondaryWindowFrame(displays: readonly DisplayWorkArea[], mainF
   return { x: anchor.x + 72, y: anchor.y + 72, width: anchor.width, height: anchor.height };
 }
 
-/** "w2" reads as "Window 2" in the Window menu and the window switcher. */
+/** "w2" reads as "Window 2" in the Window menu and the window switcher, as in the app's own menus. */
 function secondaryWindowTitle(windowId: string): string {
-  const number = /^w(\d+)$/.exec(windowId)?.[1];
-  return number ? `Gloomberb – Window ${number}` : "Gloomberb";
+  return `Gloomberb – ${secondaryWindowLabel(windowId)}`;
 }
 
 /**
@@ -42,6 +42,8 @@ export class DesktopSecondaryWindowManager {
   private readonly trackers = new Map<string, ReturnType<typeof createRememberedWindowTracker>>();
   /** Windows this process is closing, whose close must not move their panes. */
   private readonly closing = new Set<string>();
+  /** Windows the user closed, still in the layout until the main window drops them. */
+  private readonly closedByUser = new Set<string>();
 
   constructor(
     private readonly backend: DesktopBackend,
@@ -64,7 +66,11 @@ export class DesktopSecondaryWindowManager {
     const config = this.backend.config;
     if (!config) return;
     const desired = new Set((config.layout.windows ?? []).map((window) => window.id));
+    for (const windowId of [...this.closedByUser]) {
+      if (!desired.has(windowId)) this.closedByUser.delete(windowId);
+    }
     for (const windowId of desired) {
+      if (this.closedByUser.has(windowId)) continue;
       const existing = this.windows.get(windowId);
       if (existing) {
         (existing as { setTitle?: (title: string) => void }).setTitle?.(secondaryWindowTitle(windowId));
@@ -135,11 +141,12 @@ export class DesktopSecondaryWindowManager {
       const ours = this.closing.delete(windowId);
       if (!ours) tracker.flush();
       if (this.windows.get(windowId) === window) this.cleanup(windowId);
-      // Closed by its own close button or Cmd-W: its panes move into the main window.
+      // Closed by its own close button or Cmd-W: the main window moves its panes into its own grid.
       if (ours || this.backend.exiting) return;
-      const workspace = this.backend.workspace;
-      if (!workspace || !this.backend.config?.layout.windows?.some((entry) => entry.id === windowId)) return;
-      void this.backend.commitDesktopSnapshot(workspace.closeSecondaryWindow(windowId));
+      if (!this.backend.config?.layout.windows?.some((entry) => entry.id === windowId)) return;
+      // Until the layout drops it, a state from before the close must not open it again.
+      this.closedByUser.add(windowId);
+      void this.backend.closeSecondaryWindowThroughMain(windowId);
     });
     return window;
   }

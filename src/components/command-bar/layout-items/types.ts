@@ -1,6 +1,6 @@
 import type { Dispatch } from "react";
 import type { PluginRegistry } from "../../../plugins/registry";
-import type { AppAction, AppState } from "../../../state/app/context";
+import type { AppAction, AppState, DesktopWindowCommands } from "../../../state/app/context";
 import type { LayoutConfig } from "../../../types/config";
 import type { OpenInlineConfirm } from "../routing/confirm";
 import type { CommandBarRoute } from "../workflow/types";
@@ -23,4 +23,6 @@ export interface LayoutItemsContext {
   pluginRegistry: PluginRegistry;
   pushRoute: (route: CommandBarRoute) => void;
   state: AppState;
+  /** Desktop window commands; null outside the desktop app's main and secondary windows. */
+  windowCommands?: DesktopWindowCommands | null;
 }

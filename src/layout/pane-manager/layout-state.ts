@@ -51,7 +51,7 @@ function normalizeDetachedEntries(layout: LayoutConfig) {
     .map((entry) => ({ ...entry }));
 }
 
-function captureDockedMemory(dockRoot: DockLayoutNode | null): Map<string, DockedPlacementMemory> {
+export function captureDockedMemory(dockRoot: DockLayoutNode | null): Map<string, DockedPlacementMemory> {
   const memory = new Map<string, DockedPlacementMemory>();
   const leaves = collectDockLeafRefs(dockRoot);
 
@@ -111,10 +111,11 @@ function capturePlacementMemory(layout: LayoutConfig): LayoutConfig {
 
       return {
         ...instance,
-        placementMemory: nextDocked || nextFloating || nextDetached ? {
+        placementMemory: nextDocked || nextFloating || nextDetached || previous.window ? {
           docked: nextDocked,
           floating: nextFloating,
           detached: nextDetached,
+          ...(previous.window ? { window: previous.window } : {}),
         } : undefined,
       };
     }),

@@ -27,12 +27,15 @@ import type {
   DesktopThemePreviewState,
   DesktopWindowBridge,
   DesktopWindowIntent,
+  SecondaryWindowStatus,
 } from "../../../types/desktop-window";
 import { setPaneSetting, setPaneSettings, updatePaneInstance } from "../../../pane-settings";
 import { useTickerFinancials } from "../../../market-data/hooks";
 import { hasAmbiguousTickerContracts, resolveInstrumentForPane, resolveListingForPane, tickerForInstrument } from "../../../core/state/app/instrument";
 import { materializeDetachedLayouts } from "../../../core/state/app/layout";
-import { applyWindowIntent, SecondaryWindowSync } from "./secondary-window-sync";
+import { applyWindowIntent, SecondaryWindowSync, windowMoveOutcome, type WindowIntentOutcome } from "./secondary-window-sync";
+import { DesktopWindowCommandsContext, type DesktopWindowCommands } from "./window-commands";
+import type { WindowSize } from "../../../layout/pane-manager/secondary-windows";
 import {
   APP_SESSION_ID,
   APP_SESSION_SCHEMA_VERSION,
@@ -63,6 +66,7 @@ export {
   syncConfigActiveLayoutState,
   resolveTickerForPane,
 } from "../../../core/state/app/state";
+export { useDesktopWindowCommands, type DesktopWindowCommands } from "./window-commands";
 export type {
   AppAction,
   AppState,
@@ -91,6 +95,9 @@ type AppContextValue = AppContextStoreValue | AppContextLegacyValue;
 
 export const AppContext = createContext<AppContextValue | null>(null);
 const PaneContext = createContext<string | null>(null);
+
+/** How long a secondary window waits for its focus and size to settle before telling the main window. */
+const WINDOW_STATUS_DEBOUNCE_MS = 250;
 
 /** Layout-tab actions a secondary window drops: its bar can offer them, but only the main window keeps tabs. */
 const MAIN_WINDOW_LAYOUT_ACTIONS = new Set<AppAction["type"]>([
@@ -635,15 +642,89 @@ export function AppProvider({
     sendWindowIntents();
   }, [desktopBridge, sendWindowIntents, state.config.layout, state.config.pluginConfig, state.paneState]);
 
+  // In the main window: each secondary window's focused pane and size as it
+  // last said, and the main window's own size, for placing moved panes.
+  const windowStatusRef = useRef(new Map<string, SecondaryWindowStatus>());
+  const windowSizeRef = useRef<WindowSize | null>(null);
+
+  /** A change the main window made for itself or a window: dispatched, saved, and the window it concerns brought forward. */
+  const applyMainWindowOutcome = useCallback((outcome: WindowIntentOutcome) => {
+    for (const action of outcome.actions) dispatch(action);
+    if (outcome.save) scheduleConfigSave(outcome.save);
+    const focus = outcome.focus;
+    if (focus && desktopBridge?.focusWindow) {
+      fireAndForget(desktopBridge.focusWindow(focus.windowId, focus.paneId), "window.focus");
+    }
+  }, [desktopBridge, dispatch]);
+
   useEffect(() => {
     if (desktopBridge?.kind !== "main" || !desktopBridge.handleWindowIntents) return;
     return desktopBridge.handleWindowIntents((windowId, intent) => {
-      const outcome = applyWindowIntent(stateRef.current, windowId, intent);
-      for (const action of outcome.actions) dispatch(action);
-      if (outcome.save) scheduleConfigSave(outcome.save);
+      const outcome = applyWindowIntent(stateRef.current, windowId, intent, {
+        windowStatus: windowStatusRef.current,
+        mainSize: windowSizeRef.current,
+      });
+      if (outcome.windowStatus) windowStatusRef.current.set(windowId, outcome.windowStatus);
+      applyMainWindowOutcome(outcome);
       return { applied: outcome.applied };
     });
-  }, [desktopBridge, dispatch]);
+  }, [applyMainWindowOutcome, desktopBridge]);
+
+  /** From a secondary window: a change for the main window to make, after this window's own edits so far. */
+  const sendWindowCommand = useCallback((intent: DesktopWindowIntent) => {
+    const send = desktopBridge?.sendWindowIntent;
+    if (!send) return;
+    sendWindowIntents();
+    send(intent).then(
+      (result) => {
+        if (result?.applied !== true && intent.type !== "windowStatus") rehydrateSecondaryWindow();
+      },
+      () => {},
+    );
+  }, [desktopBridge, rehydrateSecondaryWindow, sendWindowIntents]);
+
+  // A secondary window tells the main window its focused pane and size, so a pane moved here lands beside it.
+  const [windowSize, setWindowSize] = useState<WindowSize | null>(null);
+  useEffect(() => {
+    if (desktopBridge?.kind !== "window") return;
+    const timer = setTimeout(() => {
+      sendWindowCommand({ type: "windowStatus", status: { focusedPaneId: state.focusedPaneId, size: windowSize } });
+    }, WINDOW_STATUS_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [desktopBridge, sendWindowCommand, state.focusedPaneId, windowSize]);
+
+  const windowCommands = useMemo((): DesktopWindowCommands | null => {
+    const focusWindow = (windowId: string) => {
+      if (desktopBridge?.focusWindow) fireAndForget(desktopBridge.focusWindow(windowId), "window.focus");
+    };
+    const noteWindowSize = (size: WindowSize) => {
+      const previous = windowSizeRef.current;
+      if (previous?.width === size.width && previous.height === size.height) return;
+      windowSizeRef.current = size;
+      if (desktopBridge?.kind === "window") setWindowSize(size);
+    };
+    if (desktopBridge?.kind === "main") {
+      const context = () => ({ windowStatus: windowStatusRef.current, mainSize: windowSizeRef.current });
+      return {
+        windowId: null,
+        movePaneToWindow: (paneId, target) => applyMainWindowOutcome(windowMoveOutcome(stateRef.current, paneId, target, context())),
+        addWindow: () => applyMainWindowOutcome(applyWindowIntent(stateRef.current, "", { type: "addWindow" }, context())),
+        focusWindow,
+        noteWindowSize,
+      };
+    }
+    if (desktopBridge?.kind === "window" && desktopBridge.windowId) {
+      return {
+        windowId: desktopBridge.windowId,
+        movePaneToWindow: (paneId, target) => sendWindowCommand({ type: "movePane", paneId, target }),
+        addWindow: () => sendWindowCommand({ type: "addWindow" }),
+        closeWindow: () => sendWindowCommand({ type: "closeWindow" }),
+        focusWindow,
+        noteWindowSize,
+      };
+    }
+    return null;
+  }, [applyMainWindowOutcome, desktopBridge, sendWindowCommand]);
 
   useEffect(() => desktopBridge?.subscribeActiveWindow?.(setActiveWindowKey), [desktopBridge]);
   const windowActive = !desktopBridge?.windowKey || activeWindowKey === null || activeWindowKey === desktopBridge.windowKey;
@@ -758,7 +839,9 @@ export function AppProvider({
   return (
     <ThemeProvider themeId={effectiveThemeId}>
       <AppContext.Provider value={storeRef.current}>
-        <DesktopWindowActiveContext.Provider value={windowActive}>{children}</DesktopWindowActiveContext.Provider>
+        <DesktopWindowActiveContext.Provider value={windowActive}>
+          <DesktopWindowCommandsContext.Provider value={windowCommands}>{children}</DesktopWindowCommandsContext.Provider>
+        </DesktopWindowActiveContext.Provider>
       </AppContext.Provider>
     </ThemeProvider>
   );
