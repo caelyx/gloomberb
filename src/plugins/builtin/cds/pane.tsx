@@ -53,6 +53,7 @@ import {
   sortTrades,
   spreadChartPoints,
   spreadFigures,
+  spreadLevelNotice,
   summarizeIssuers,
   tradesForIssuer,
   withSpreadLevels,
@@ -315,12 +316,17 @@ export function CdsPane({
   // The band holds its rows while the first history loads, so the trades do not jump.
   const historyLoading = !!historyIssuer && history.loading && !history.data;
   const lineMaturity = spreadPoints.at(-1)?.maturity ?? null;
+  // Without it the last level charted reads as today's.
+  const lineStopped = historyIssuer && history.data
+    ? spreadLevelNotice(history.data.noLevelReason, history.data.points)
+    : null;
   // Without it a failed request reads as a name with no 5Y line.
   usePaneNoticeFooter({
     registrationId: `${paneId}:cds-history`,
     focused,
     notices: [
       ...(historyIssuer && history.error && !history.data ? ["5Y spread history unavailable."] : []),
+      ...(lineStopped ? [lineStopped] : []),
       ...(summaries.length && levels.error && !levels.data ? ["5Y spreads unavailable."] : []),
     ],
   });

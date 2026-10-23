@@ -621,6 +621,11 @@ export interface CloudCdsHistoryResponse {
   currency: string | null;
   asOf: string | null;
   points: CloudCdsHistoryPointPayload[];
+  /**
+   * Why the name has no current level, e.g. "upfront-side-unknown" when no
+   * trade reported a spread to tell which side of the coupon its upfront is on.
+   */
+  noLevelReason?: string | null;
 }
 
 /** An issuer's latest 5Y level: the last point of its history over the last month. */

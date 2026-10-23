@@ -64,6 +64,7 @@ function trade(
 // Oracle's on-the-run 5Y from the DTCC tape, rolling to the Dec 2031 contract on Sep 21.
 const HISTORY: CdsSpreadHistory = {
   issuer: "Oracle Corporation",
+  noLevelReason: null,
   points: [
     ["2026-07-24", 214.6, "2031-06-20"],
     ["2026-08-12", 198, "2031-06-20"],
@@ -189,7 +190,7 @@ describe("CdsPane", () => {
       symbol: "CHTR",
       height: 12,
       activity: { ...ACTIVITY, query: "CHTR", issuer: "CCO Holdings, LLC", trades: [] },
-      loadHistory: async () => ({ issuer: null, points: [] }),
+      loadHistory: async () => ({ issuer: null, points: [], noLevelReason: null }),
     });
     expect(tui.frame()).toContain("No CDS trades for CCO Holdings, LLC (CHTR) in the last 5 days.");
   });

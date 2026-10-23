@@ -110,6 +110,8 @@ const CDS_SPREAD_HISTORY_DAYS = 730;
 export interface CdsSpreadHistory {
   issuer: string | null;
   points: CloudCdsHistoryPointPayload[];
+  /** Why the name has no current level; the points then end before it stopped. */
+  noLevelReason: string | null;
 }
 
 export type CdsSpreadHistoryLoader = (issuer: string) => Promise<CdsSpreadHistory>;
@@ -127,7 +129,7 @@ export async function loadCdsSpreadHistory(
   const points = (response.points ?? [])
     .filter((point) => /^\d{4}-\d{2}-\d{2}$/.test(point.date) && Number.isFinite(point.spreadBp))
     .toSorted((left, right) => left.date.localeCompare(right.date));
-  return { issuer: response.issuer, points };
+  return { issuer: response.issuer, points, noLevelReason: response.noLevelReason ?? null };
 }
 
 export type CdsLevelsFetch = () => Promise<CloudCdsLevelsResponse>;
