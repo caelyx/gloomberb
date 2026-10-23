@@ -110,7 +110,7 @@ const CDS_SPREAD_HISTORY_DAYS = 730;
 export interface CdsSpreadHistory {
   issuer: string | null;
   points: CloudCdsHistoryPointPayload[];
-  /** Why the name has no current level; the points then end before it stopped. */
+  /** Why the name has no current level, when it has none; the points end at its last one. */
   noLevelReason: string | null;
 }
 

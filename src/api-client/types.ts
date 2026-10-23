@@ -623,7 +623,7 @@ export interface CloudCdsHistoryResponse {
   points: CloudCdsHistoryPointPayload[];
   /**
    * Why the name has no current level, e.g. "upfront-side-unknown" when no
-   * trade reported a spread to tell which side of the coupon its upfront is on.
+   * trade anchors which side of the coupon its unsigned upfronts are on.
    */
   noLevelReason?: string | null;
 }

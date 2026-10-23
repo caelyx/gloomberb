@@ -115,14 +115,21 @@ describe("CDS report", () => {
     expect(text).toMatch(/1M change\s+\+13bp/);
   });
 
-  test("says where the line stopped when the last level is no longer current", async () => {
-    // CoreWeave's tape since Nov 2025: no reported spread, so no upfront can be signed.
-    const { result } = await report("F", {
+  test("says since when a name has had no level, and why, in place of the generic note", async () => {
+    // As CoreWeave's line stopped in Nov 2025: no later trade anchors the upfronts' side.
+    const stopped = await report("F", {
       load: async () => FORD,
       loadHistory: async () => ({ ...FORD_LINE, noLevelReason: "upfront-side-unknown" }),
     });
-    expect(result.notes).toEqual([
-      "No 5Y level since 2026-10-09: no trade reported a spread to tell which side of the coupon the upfronts are on.",
+    expect(stopped.result.notes).toEqual([
+      "No 5Y level since 2026-10-09: later upfronts fit a spread either side of the coupon, and no trade shows which.",
+    ]);
+    const never = await report("F", {
+      load: async () => FORD,
+      loadHistory: async () => ({ ...FORD_LINE, points: [], noLevelReason: "upfront-side-unknown" }),
+    });
+    expect(never.result.notes).toEqual([
+      "No 5Y level in the last two years: the upfronts fit a spread either side of the coupon, and no trade shows which.",
     ]);
   });
 
