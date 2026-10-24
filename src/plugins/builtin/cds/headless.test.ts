@@ -44,6 +44,7 @@ function level(date: string, spreadBp: number, maturity = "2031-12-20"): CloudCd
 // Ford's 5Y line: its range over two years, and a month back on the Jun 2031 contract, before the roll.
 const FORD_LINE: CdsSpreadHistory = {
   issuer: "Ford Motor Company",
+  noLevelReason: null,
   points: [
     level("2024-10-11", 160, "2029-12-20"),
     level("2025-04-10", 276, "2030-06-20"),
@@ -112,6 +113,24 @@ describe("CDS report", () => {
     });
     expect(result.sections[0]!.entries!.find((entry) => entry.key === "change1mBp")?.value).toBe(12.7);
     expect(text).toMatch(/1M change\s+\+13bp/);
+  });
+
+  test("says since when a name has had no level, and why, in place of the generic note", async () => {
+    // As CoreWeave's line stopped in Nov 2025: no later trade anchors the upfronts' side.
+    const stopped = await report("F", {
+      load: async () => FORD,
+      loadHistory: async () => ({ ...FORD_LINE, noLevelReason: "upfront-side-unknown" }),
+    });
+    expect(stopped.result.notes).toEqual([
+      "No 5Y level since 2026-10-09: later upfronts fit a spread either side of the coupon, and no trade shows which.",
+    ]);
+    const never = await report("F", {
+      load: async () => FORD,
+      loadHistory: async () => ({ ...FORD_LINE, points: [], noLevelReason: "upfront-side-unknown" }),
+    });
+    expect(never.result.notes).toEqual([
+      "No 5Y level in the last two years: the upfronts fit a spread either side of the coupon, and no trade shows which.",
+    ]);
   });
 
   test("lists issuers with their 5Y level and its date from one request, however many are listed", async () => {

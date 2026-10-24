@@ -637,3 +637,20 @@ export function spreadFigures(points: readonly CloudCdsHistoryPointPayload[]): S
     }] : []),
   ];
 }
+
+/**
+ * Why the 5Y line stops, when Gloom Cloud has no current level for the name,
+ * so the last level charted does not pass for today's. Null while it has one,
+ * and for an unrecognised reason with no line, which says nothing new.
+ */
+export function spreadLevelNotice(
+  noLevelReason: string | null,
+  points: readonly Pick<CloudCdsHistoryPointPayload, "date">[],
+): string | null {
+  if (!noLevelReason) return null;
+  const since = points.at(-1)?.date;
+  if (noLevelReason !== "upfront-side-unknown") return since ? `No 5Y level since ${since}.` : null;
+  return since
+    ? `No 5Y level since ${since}: later upfronts fit a spread either side of the coupon, and no trade shows which.`
+    : "No 5Y level in the last two years: the upfronts fit a spread either side of the coupon, and no trade shows which.";
+}

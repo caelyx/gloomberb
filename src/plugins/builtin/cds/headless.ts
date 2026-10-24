@@ -32,6 +32,7 @@ import {
   noTradesMessage,
   sortIssuers,
   sortTrades,
+  spreadLevelNotice,
   spreadSummary,
   summarizeIssuers,
   withSpreadLevels,
@@ -117,7 +118,9 @@ function projectCdsHeadless({ activity, history, levels }: CdsReportInputs): Hea
     const entries = line ? spreadEntries(line) : [];
     // The name the tape was queried for heads the figures, as in the pane, so a ticker says what it became.
     const name = displayIssuerName(activity.issuer ?? line?.issuer ?? activity.query);
-    if (line && entries.length === 0) notes.push(`No 5Y spread level for ${name} in the last two years.`);
+    const stopped = line ? spreadLevelNotice(line.noLevelReason, line.points) : null;
+    if (stopped) notes.push(stopped);
+    else if (line && entries.length === 0) notes.push(`No 5Y spread level for ${name} in the last two years.`);
     const sections: HeadlessBundleSection[] = [
       ...(entries.length ? [{ title: name, entries }] : []),
       {
