@@ -40,6 +40,8 @@ import {
   desktopPluginManager,
 } from "../external-plugins";
 import { MAIN_WINDOW_RPC_KEY, windowIdFromSecondaryRpcKey } from "../window/focus";
+import { commandBarMenuTarget, paneWindowRpcKey } from "../../shared/window-keys";
+import { findPaneLocation } from "../../../../layout/pane-manager";
 import type { RememberedWindowStore } from "../window/remembered-frame";
 import { handleDesktopBackendRequest } from "./backend-requests";
 import { DesktopCapabilityBridge } from "./capability-bridge";
@@ -250,6 +252,19 @@ export class DesktopBackend {
   }
 
   /**
+   * Brings forward the window that shows a pane and has its view focus it:
+   * a pane reused from another window's bar, or a link to a pane elsewhere.
+   */
+  focusPaneWindow(paneId: string): void {
+    const layout = this.config?.layout;
+    const windowKey = layout ? paneWindowRpcKey(paneId, findPaneLocation(layout, paneId)) : null;
+    if (!windowKey) return;
+    this.focusWindowForRpcKey(windowKey);
+    const rpc = this.rpcs.getWindowRpc(windowKey);
+    if (rpc && this.rpcs.isWindowRpcReady(windowKey)) rpc.send["desktop.focusPane"]({ paneId });
+  }
+
+  /**
    * Native focus, which arrives for every switch between this app's windows,
    * unlike a view's own focus events. A blur only clears the window it is for,
    * so a blur arriving after the next window's focus changes nothing.
@@ -366,11 +381,21 @@ export class DesktopBackend {
       setTimeout(() => this.quit(), QUIT_FALLBACK_MS);
       return;
     }
+    if (command.type === "open-command-bar") {
+      // The bar opens in the secondary window last in front, which is where the
+      // user is; otherwise in the main window, brought forward.
+      const target = commandBarMenuTarget(this.lastActiveWindowKey, (key) => this.rpcs.isWindowRpcReady(key));
+      const targetRpc = this.rpcs.getWindowRpc(target);
+      if (!targetRpc) return;
+      if (target === MAIN_WINDOW_RPC_KEY) this.focusWindowForRpcKey(MAIN_WINDOW_RPC_KEY);
+      targetRpc.send["application-menu.select"]({ command });
+      return;
+    }
     if (!rpc) return;
-    // The bar and every form open in the main window; with a detached window
-    // key, the keys would go there instead.
-    if (command.type === "open-command-bar" || command.type === "open-builtin-workflow" || command.type === "open-plugin-workflow") {
-      this.detachedWindows.focusWindowForRpcKey(MAIN_WINDOW_RPC_KEY);
+    // Forms open in the main window, which their state submits through; with
+    // another window key, the keys would go there instead.
+    if (command.type === "open-builtin-workflow" || command.type === "open-plugin-workflow") {
+      this.focusWindowForRpcKey(MAIN_WINDOW_RPC_KEY);
     }
     rpc.send["application-menu.select"]({ command });
   }
@@ -574,6 +599,9 @@ export class DesktopBackend {
         return handleDesktopWorkspaceRequest(this, request);
       case "window.intent":
         return this.forwardWindowIntent(rpc, request.payload.intent);
+      case "window.focusPane":
+        if (typeof request.payload.paneId === "string") this.focusPaneWindow(request.payload.paneId);
+        return null;
       case "pluginState.setMany":
       case "pluginState.delete":
         return handleDesktopPluginStateRequest(this.requireServices().persistence.pluginState, request);

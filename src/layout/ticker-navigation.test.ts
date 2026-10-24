@@ -105,6 +105,20 @@ describe("findFixedTickerPaneForSymbol", () => {
     expect(findFixedTickerPaneForSymbol(layout, "ticker-detail", "NVDA")).toBeNull();
   });
 
+  test("prefers the pane in the window asking over the same ticker in another window", () => {
+    const elsewhere = createPaneInstance("ticker-detail", { instanceId: "aapl:w2", binding: { kind: "fixed", symbol: "AAPL" } });
+    const here = createPaneInstance("ticker-detail", { instanceId: "aapl:main", binding: { kind: "fixed", symbol: "AAPL" } });
+    const layout = {
+      ...createLayout([here]),
+      instances: [elsewhere, here],
+      windows: [{ id: "w2", dockRoot: { kind: "pane" as const, instanceId: "aapl:w2" }, floating: [] }],
+    };
+
+    expect(findFixedTickerPaneForSymbol(layout, "ticker-detail", "AAPL")?.instanceId).toBe("aapl:main");
+    expect(findFixedTickerPaneForSymbol({ ...layout, instances: [elsewhere], dockRoot: null }, "ticker-detail", "AAPL")?.instanceId)
+      .toBe("aapl:w2");
+  });
+
   test("does not let standalone shortcut panes collide with full Ticker Research", () => {
     const layout = createLayout([
       createPaneInstance("portfolio-list", {

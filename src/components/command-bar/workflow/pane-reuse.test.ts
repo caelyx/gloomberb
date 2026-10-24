@@ -36,6 +36,21 @@ describe("which open pane a template focuses", () => {
     expect(findReusablePaneInstance([other], qq, templatesOf(qq), spec)).toBeNull();
   });
 
+  test("a match in the window the bar opened in comes before one in another window", () => {
+    const qq = template("qq", "quote-monitor", { prefix: "QQ", argPlaceholder: "tickers" });
+    const spec: PaneTemplateInstanceConfig = { settings: { symbols: ["AAPL"] } };
+    const elsewhere = instance("quote:main", "quote-monitor", { settings: { symbols: ["AAPL"] } });
+    const here = instance("quote:w2", "quote-monitor", { settings: { symbols: ["AAPL"] } });
+
+    expect(findReusablePaneInstance([elsewhere, here], qq, templatesOf(qq), spec, {
+      preferPaneIds: new Set(["quote:w2"]),
+    })?.instanceId).toBe("quote:w2");
+    // With no match here, the one in the other window is still reused.
+    expect(findReusablePaneInstance([elsewhere], qq, templatesOf(qq), spec, {
+      preferPaneIds: new Set(["quote:w2"]),
+    })?.instanceId).toBe("quote:main");
+  });
+
   test("a stable id that was opened on another ticker does not hide a pane that shows this one", () => {
     const fa = template("fa", "financial-analysis", { prefix: "FA", argPlaceholder: "ticker" });
     const spec: PaneTemplateInstanceConfig = { instanceId: "financial-analysis:MSFT", binding: fixed("MSFT") };

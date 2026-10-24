@@ -92,6 +92,23 @@ type AppContextValue = AppContextStoreValue | AppContextLegacyValue;
 export const AppContext = createContext<AppContextValue | null>(null);
 const PaneContext = createContext<string | null>(null);
 
+/** Layout-tab actions a secondary window drops: its bar can offer them, but only the main window keeps tabs. */
+const MAIN_WINDOW_LAYOUT_ACTIONS = new Set<AppAction["type"]>([
+  "SWITCH_LAYOUT",
+  "NEW_LAYOUT",
+  "DELETE_LAYOUT",
+  "DUPLICATE_LAYOUT",
+  "RENAME_LAYOUT",
+  "REORDER_LAYOUT",
+  "INSTALL_LAYOUT_COPY",
+  "REPLACE_LAYOUT_CONTENT",
+  "SET_LAYOUT_ORIGIN",
+  "MOVE_PANE_TO_NEW_LAYOUT",
+  "MOVE_PANE_BACK",
+  "UNDO_LAYOUT",
+  "REDO_LAYOUT",
+]);
+
 /** False only for the deprecated `{ state, dispatch }` value, which the hooks below still read. */
 function isAppStoreContextValue(context: AppContextValue): context is AppContextStoreValue {
   return "getState" in context && "subscribe" in context;
@@ -515,6 +532,9 @@ export function AppProvider({
   }
 
   const dispatch = useCallback((action: AppAction) => {
+    // A secondary window's state is a view of the main window's open tab; the
+    // tabs, and the history of their layouts, are the main window's to change.
+    if (desktopBridge?.kind === "window" && MAIN_WINDOW_LAYOUT_ACTIONS.has(action.type)) return;
     const dispatchedAction = desktopBridge
       ? action
       : action.type === "SET_CONFIG"

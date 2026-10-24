@@ -51,6 +51,10 @@ export interface DesktopWindowBridge {
   initialActiveWindowKey?: string | null;
   /** Native focus moving between this app's windows; it keeps the last one while the app is in the background. */
   subscribeActiveWindow?(listener: (windowKey: string | null) => void): () => void;
+  /** A pane in another window: that window comes forward and focuses it. */
+  focusPaneInItsWindow?(paneId: string): Promise<void>;
+  /** The host asking this window to focus one of its own panes. */
+  subscribeFocusPane?(listener: (paneId: string) => void): () => void;
   /** From a secondary window: a change for the main window to apply. */
   sendWindowIntent?(intent: DesktopWindowIntent): Promise<DesktopWindowIntentResult>;
   /** In the main window: applies the changes secondary windows ask for. */
