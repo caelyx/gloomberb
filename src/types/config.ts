@@ -39,6 +39,14 @@ export interface DockedPlacementMemory {
   position?: "left" | "right" | "above" | "below";
 }
 
+/**
+ * Where a pane sat docked in the window it was last moved out of, so moving
+ * it back puts it there again. `windowId` is "main" for the main window.
+ */
+export interface WindowPlacementMemory extends DockedPlacementMemory {
+  windowId: string;
+}
+
 export interface FloatingPlacementMemory {
   x: number;
   y: number;
@@ -57,6 +65,7 @@ export interface PanePlacementMemory {
   docked?: DockedPlacementMemory;
   floating?: FloatingPlacementMemory;
   detached?: DetachedPlacementMemory;
+  window?: WindowPlacementMemory;
 }
 
 /**
@@ -727,6 +736,7 @@ export function clonePlacementMemory(memory: PanePlacementMemory | undefined): P
     } : undefined,
     floating: memory.floating ? { ...memory.floating } : undefined,
     detached: memory.detached ? { ...memory.detached } : undefined,
+    ...(memory.window ? { window: { ...memory.window, path: memory.window.path ? [...memory.window.path] : undefined } } : {}),
   };
 }
 
@@ -835,7 +845,7 @@ export function removePaneInstances(layout: LayoutConfig, instanceIds: Iterable<
         anchorInstanceId: undefined,
       };
       const nextDocked = docked.path || docked.position ? docked : undefined;
-      const placementMemory = nextDocked || memory.floating || memory.detached
+      const placementMemory = nextDocked || memory.floating || memory.detached || memory.window
         ? { ...memory, docked: nextDocked }
         : undefined;
       return { ...instance, placementMemory };

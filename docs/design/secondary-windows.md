@@ -211,7 +211,7 @@ Status: agreed design (decisions in §8), not yet built. Written from a reading 
 
 Phases 1–4 deliver something usable (panes moved by command). Phase 5 is the "open where I am" behaviour. If needed, Phase 5 could ship before 3; a read-only window plus commands is already useful.
 
-**Delivered so far:** phase 1 (#15), phase 2 (#16) and phase 3 (#17). The order from here is 5, then 4.
+**Delivered:** phase 1 (#15), phase 2 (#16), phase 3 (#17), then phase 5 and phase 4. Phase 6's link-menu labels came with phase 4; remote control and CLI window arguments are still to do.
 
 **Phase 3 as built:**
 - **Intents to main.** A secondary window edits its own view at once and sends `window.intent` requests. The host names the sending window and passes them to the main window, which applies them (`applyWindowIntent`):
@@ -230,6 +230,14 @@ Phases 1–4 deliver something usable (panes moved by command). Phase 5 is the "
 - **Opening panes locally, not by proxy.** A secondary window's state is a view with its own grid in the main window's place, so the existing placement code (`placePaneInstance`, ticker pinning, the ticker inspector) already places relative to that window's focused pane and sizes floating panes to that window. The new pane reaches main through phase 3's `editLayout`, which now accepts an instance the layout does not hold yet.
 - **Reuse (D6).** `findReusablePaneInstance` (`preferPaneIds`) and `findFixedTickerPaneForSymbol` prefer a match in the asking window. A match elsewhere is focused through `window.focusPane`: the host brings that window forward and tells it to focus the pane.
 - **Not moved:** deep links and remote control still go to main. A secondary window drops layout-tab actions (switching, new, delete, undo and so on) from its bar, and settings changed from its bar other than plugin settings don't persist.
+
+**Phase 4 as built:**
+- **Move to ▸.** Every pane's menu in the main and secondary windows has a **Move to** submenu: Main window (not in the main window), each other secondary window by number ("Window 2", the same name as its title), and New window. The keyboard-opened kit menu flattens it to "Move to Window 2" rows. The command bar's layout actions (`LMA`) add the same moves for the focused pane, plus **New Window**, **Close Window** (secondary windows only) and **Go to Window N**. No keyboard shortcut: the pane-management keys have no free slot that fits.
+- **The main window applies every move.** `movePaneToWindow` (pure) does the move. The main window runs it directly from its own menu; a secondary window sends `movePane`, `addWindow` or `closeWindow` intents, which the main window applies only to the sender's own panes. Each enters the main window's undo history and is saved. Phase 2's host workspace operations for moving panes are gone.
+- **Closing a window with its own button** sends a `closeWindow` intent on the window's behalf from the host. Only if the main window cannot answer does the host change the layout itself (`closeSecondaryWindow` in the workspace). Until the layout drops the window, the host does not reopen it from an older state.
+- **Placement.** A docked pane goes beside the target window's focused pane. Secondary windows report their focused pane and size to the main window (`windowStatus`, debounced, kept in memory only). A floating pane stays floating, its rect scaled from the source window's size to the target's. A docked pane moved out of a window remembers where it sat there (`placementMemory.window`, with the window id), and moving it back puts it there again.
+- **Bringing the target forward.** After a move the main window asks the host (`window.focus`) to bring the target window forward and focus the moved pane. The host waits for the main window's next state to place the pane there, for up to three seconds, so the request can arrive before the state does.
+- **Link menu labels.** A ticker source in another window says which one: "Portfolio · Window 2", or "· Main window" from a secondary window.
 
 **Effort (opinion, not measured):** the biggest pieces are Phase 1 (many small edits across about 25 files, plus tests) and Phase 3 (state plumbing). Phases 2 and 5 are moderate. Phase 4 is small once 1 and 3 exist. I would not trust a number in days without first prototyping Phase 2. The likely surprises are in Shell assumptions not covered above, and in Electrobun's multi-window behaviour on macOS (fullscreen Spaces, key-window events).
 

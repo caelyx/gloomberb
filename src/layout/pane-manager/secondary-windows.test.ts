@@ -1,14 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { createPaneInstance, type LayoutConfig } from "../../types/config";
-import { getDockedPaneIds } from "./dock-tree";
+import { createPaneInstance, getPlacedPaneInstanceIds, type LayoutConfig } from "../../types/config";
+import { getDockedInstanceIds, getDockedPaneIds } from "./dock-tree";
 import { removePane } from "./layout-state";
 import { findPaneLocation } from "./queries";
 import {
+  addSecondaryWindow,
   applySecondaryWindowLayoutEdit,
   closeSecondaryWindow,
-  movePaneToMainWindow,
   movePaneToNewWindow,
+  movePaneToWindow,
+  secondaryWindowLabel,
   secondaryWindowPaneIds,
+  windowLabelInView,
+  windowMoveTargets,
   viewLayoutFromWindow,
   windowLayoutEditFromView,
 } from "./secondary-windows";
@@ -62,17 +66,96 @@ describe("secondary window layout operations", () => {
     expect(movePaneToNewWindow(twoWindowLayout(), "missing")).toBeNull();
   });
 
-  test("moving a window pane to the main window docks it beside the anchor and leaves the window open", () => {
-    const layout = movePaneToMainWindow(twoWindowLayout(), "news", "list");
-    expect(findPaneLocation(layout, "news")).toEqual({ window: "main", kind: "docked" });
-    expect(getDockedPaneIds(layout)).toEqual(["list", "news", "chart"]);
-    expect(layout.windows?.[0]?.dockRoot).toEqual({ kind: "pane", instanceId: "econ" });
+  test("moving a pane between windows keeps every pane placed exactly once", () => {
+    const placedOnce = (layout: LayoutConfig) => {
+      expect(getPlacedPaneInstanceIds(layout).toSorted()).toEqual(layout.instances.map((instance) => instance.instanceId).toSorted());
+    };
 
-    // With no usable anchor it goes to the main grid's right edge; an emptied window stays.
-    const emptied = movePaneToMainWindow(movePaneToMainWindow(twoWindowLayout(), "econ", null), "news", "missing");
+    // Main to a window, beside that window's focused pane.
+    const toWindow = movePaneToWindow(twoWindowLayout(), "chart", "w2", { anchorId: "econ" })!;
+    expect(findPaneLocation(toWindow, "chart")).toEqual({ window: "w2", kind: "docked" });
+    expect(getDockedInstanceIds(toWindow.windows![0]!.dockRoot)).toEqual(["news", "econ", "chart"]);
+    expect(getDockedPaneIds(toWindow)).toEqual(["list"]);
+    placedOnce(toWindow);
+
+    // A window to the main window: beside the anchor, and the window stays open even when emptied.
+    const toMain = movePaneToWindow(twoWindowLayout(), "news", "main", { anchorId: "list" })!;
+    expect(getDockedPaneIds(toMain)).toEqual(["list", "news", "chart"]);
+    expect(toMain.windows?.[0]?.dockRoot).toEqual({ kind: "pane", instanceId: "econ" });
+    const emptied = movePaneToWindow(movePaneToWindow(twoWindowLayout(), "econ", "main")!, "news", "main", { anchorId: "missing" })!;
     expect(getDockedPaneIds(emptied)).toEqual(["list", "chart", "econ", "news"]);
     expect(emptied.windows?.map((window) => window.id)).toEqual(["w2"]);
     expect(emptied.windows?.[0]?.dockRoot).toBeNull();
+    placedOnce(emptied);
+
+    // One window to another, including an empty one.
+    const added = addSecondaryWindow(twoWindowLayout());
+    expect(added.windowId).toBe("w3");
+    const across = movePaneToWindow(added.layout, "news", "w3")!;
+    expect(across.windows?.find((window) => window.id === "w3")?.dockRoot).toEqual({ kind: "pane", instanceId: "news" });
+    placedOnce(across);
+
+    // Nowhere to go: the pane's own window, a window that does not exist, or a pane that is not placed.
+    expect(movePaneToWindow(twoWindowLayout(), "news", "w2")).toBeNull();
+    expect(movePaneToWindow(twoWindowLayout(), "list", "w9")).toBeNull();
+    expect(movePaneToWindow(twoWindowLayout(), "missing", "w2")).toBeNull();
+  });
+
+  test("a floating pane stays floating, its rect scaled to the window it moves to", () => {
+    const scaled = movePaneToWindow(twoWindowLayout(), "alerts", "main", {
+      sourceSize: { width: 60, height: 20 },
+      targetSize: { width: 120, height: 40 },
+    })!;
+    expect(findPaneLocation(scaled, "alerts")).toEqual({ window: "main", kind: "floating" });
+    expect(scaled.floating.find((entry) => entry.instanceId === "alerts")).toMatchObject({ x: 20, y: 4, width: 60, height: 20 });
+
+    // Into a smaller window it is kept inside it; with no sizes known it keeps its rect.
+    const shrunk = movePaneToWindow(twoWindowLayout(), "chat", "w2", {
+      sourceSize: { width: 40, height: 12 },
+      targetSize: { width: 30, height: 10 },
+    })!;
+    expect(shrunk.windows![0]!.floating.find((entry) => entry.instanceId === "chat")).toMatchObject({ x: 0, y: 0, width: 30, height: 10 });
+    const unscaled = movePaneToWindow(twoWindowLayout(), "chat", "w2")!;
+    expect(unscaled.windows![0]!.floating.find((entry) => entry.instanceId === "chat")).toMatchObject({ x: 4, y: 4, width: 40, height: 12 });
+  });
+
+  test("a pane moved back to the window it came from returns to where it sat there", () => {
+    const out = movePaneToWindow(twoWindowLayout(), "econ", "main", { anchorId: "list" })!;
+    expect(out.instances.find((instance) => instance.instanceId === "econ")?.placementMemory?.window).toMatchObject({
+      windowId: "w2",
+      anchorInstanceId: "news",
+      position: "below",
+    });
+    // Back with no anchor in the window: below news again, not at the grid's right edge.
+    const back = movePaneToWindow(out, "econ", "w2")!;
+    expect(back.windows![0]!.dockRoot).toEqual({
+      kind: "split",
+      axis: "vertical",
+      ratio: 0.5,
+      first: { kind: "pane", instanceId: "news" },
+      second: { kind: "pane", instanceId: "econ" },
+    });
+  });
+
+  test("windows are named for people and listed as places a pane can move to", () => {
+    expect(secondaryWindowLabel("w2")).toBe("Window 2");
+    expect(secondaryWindowLabel("w12")).toBe("Window 12");
+    expect(windowLabelInView("main")).toBe("Main window");
+
+    const layout = addSecondaryWindow(twoWindowLayout()).layout;
+    expect(windowMoveTargets(layout, null)).toEqual([
+      { target: "w2", label: "Window 2" },
+      { target: "w3", label: "Window 3" },
+      { target: "new", label: "New window" },
+    ]);
+    // In window 2's view the main window's grid sits among the windows under a view id; it reads as the main window.
+    const view = viewLayoutFromWindow(layout, "w2");
+    expect(windowLabelInView(view.windows![0]!.id)).toBe("Main window");
+    expect(windowMoveTargets(view, "w2")).toEqual([
+      { target: "main", label: "Main window" },
+      { target: "w3", label: "Window 3" },
+      { target: "new", label: "New window" },
+    ]);
   });
 
   test("closing a window moves its grid into the main window as one block and its floating panes with it", () => {

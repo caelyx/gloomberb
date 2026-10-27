@@ -9,6 +9,7 @@ import {
   type LayoutConfig,
 } from "../../../types/config";
 import type { PaneDef } from "../../../types/plugin";
+import { viewLayoutFromWindow } from "../../../layout/pane-manager/secondary-windows";
 import { getPaneDisplayTitle } from "../pane/title";
 import { tickerLinkMenuItems } from "./ticker-link-menu";
 
@@ -254,5 +255,42 @@ describe("tickerLinkMenuItems", () => {
       title: "OMON SPY",
       binding: { kind: "fixed", symbol: "SPY" },
     });
+  });
+
+  test("a source in another desktop window says which window, the main one included in a window's own view", () => {
+    const state = createInitialState(createDefaultConfig("/tmp/gloomberb-link-menu-test"));
+    const target = findPaneInstance(state.config.layout, "ticker-detail:main")!;
+    const otherList = createPaneInstance("portfolio-list", { instanceId: "portfolio-list:w2" });
+    const follower = createPaneInstance(TICKER_RESEARCH_PANE_ID, { instanceId: "ticker-detail:w2" });
+    const layout: LayoutConfig = {
+      ...state.config.layout,
+      instances: [...state.config.layout.instances, otherList, follower],
+      windows: [{
+        id: "w2",
+        dockRoot: {
+          kind: "split",
+          axis: "horizontal",
+          ratio: 0.5,
+          first: { kind: "pane", instanceId: otherList.instanceId },
+          second: { kind: "pane", instanceId: follower.instanceId },
+        },
+        floating: [],
+      }],
+    };
+    const labels = (instance: typeof target, view: LayoutConfig) => tickerLinkMenuItems({
+      instance,
+      layout: view,
+      panes,
+      state: { ...state, config: { ...state.config, layout: view } },
+      persistLayout: () => {},
+    }).map((item) => (item.type === "divider" ? "" : item.label ?? ""));
+
+    const fromMain = labels(target, layout);
+    expect(fromMain.find((label) => label.includes("· Window 2"))).toBeDefined();
+    expect(fromMain.some((label) => label.includes("· Main window"))).toBe(false);
+
+    const fromWindow = labels(follower, viewLayoutFromWindow(layout, "w2"));
+    expect(fromWindow.find((label) => label.includes("· Main window"))).toBeDefined();
+    expect(fromWindow.some((label) => label.includes("· Window"))).toBe(false);
   });
 });

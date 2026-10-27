@@ -151,8 +151,13 @@ function sanitizePlacementMemory(value: unknown): PanePlacementMemory | undefine
   const docked = sanitizeDockedPlacementMemory((value as PanePlacementMemory).docked);
   const floating = sanitizeFloatingPlacementMemory((value as PanePlacementMemory).floating);
   const detached = sanitizeDetachedPlacementMemory((value as PanePlacementMemory).detached);
-  if (!docked && !floating && !detached) return undefined;
-  return { docked, floating, detached };
+  const rawWindow = (value as PanePlacementMemory).window;
+  const windowDocked = rawWindow && typeof rawWindow.windowId === "string" && rawWindow.windowId
+    ? sanitizeDockedPlacementMemory(rawWindow)
+    : undefined;
+  const window = windowDocked ? { ...windowDocked, windowId: rawWindow!.windowId } : undefined;
+  if (!docked && !floating && !detached && !window) return undefined;
+  return { docked, floating, detached, ...(window ? { window } : {}) };
 }
 
 function sanitizePaneSettings(value: unknown): Record<string, unknown> | undefined {

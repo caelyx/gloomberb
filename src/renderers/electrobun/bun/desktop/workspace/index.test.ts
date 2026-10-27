@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { cloneLayout, createDefaultConfig, createPaneInstance, findPaneInstance } from "../../../../../types/config";
 import { addPaneFloating } from "../../../../../layout/pane-manager";
+import { movePaneToNewWindow } from "../../../../../layout/pane-manager/secondary-windows";
 import { updatePaneInstance } from "../../../../../pane-settings";
 import { createDesktopWorkspace } from "./index";
 
@@ -25,26 +26,17 @@ describe("desktop workspace", () => {
     expect(snapshot.config.layout.floating.some((entry) => entry.instanceId === "chat:main")).toBe(false);
   });
 
-  test("moves panes into a secondary window, back to the main window, and keeps them when the window closes", () => {
-    const workspace = createDesktopWorkspace(createDefaultConfig("/tmp/gloomberb-desktop"), null);
-    const docked = workspace.getSnapshot().config.layout.instances.find((instance) => instance.instanceId !== "chat:main")!;
+  test("closing a secondary window without the main window keeps its panes and their state", () => {
+    const config = createDefaultConfig("/tmp/gloomberb-desktop");
+    const moved = movePaneToNewWindow(config.layout, "chat:main")!;
+    const workspace = createDesktopWorkspace(config, null);
+    workspace.replaceConfig({ ...config, layout: moved.layout });
     workspace.replaceDetachedPaneState("chat:main", { cursor: 3 });
 
-    const moved = workspace.movePaneToNewWindow("chat:main");
-    expect(moved.config.layout.windows).toEqual([
-      { id: "w2", dockRoot: { kind: "pane", instanceId: "chat:main" }, floating: [] },
-    ]);
-    // The saved tab carries the window, so it outlives a relaunch and a tab switch.
-    expect(moved.config.layouts[moved.config.activeLayoutIndex]?.layout.windows).toEqual(moved.config.layout.windows);
-    expect(moved.paneState["chat:main"]).toEqual({ cursor: 3 });
-
-    const second = workspace.movePaneToNewWindow(docked.instanceId);
-    expect(second.config.layout.windows?.map((window) => window.id)).toEqual(["w2", "w3"]);
-    const back = workspace.movePaneToMainWindow(docked.instanceId);
-    expect(back.config.layout.windows?.find((window) => window.id === "w3")?.dockRoot).toBeNull();
-
     const closed = workspace.closeSecondaryWindow("w2");
-    expect(closed.config.layout.windows?.map((window) => window.id)).toEqual(["w3"]);
+    expect(closed.config.layout.windows ?? []).toEqual([]);
+    // The saved tab follows, so the closed window does not come back on a relaunch.
+    expect(closed.config.layouts[closed.config.activeLayoutIndex]?.layout.windows ?? []).toEqual([]);
     expect(closed.config.layout.instances.some((instance) => instance.instanceId === "chat:main")).toBe(true);
     expect(closed.paneState["chat:main"]).toEqual({ cursor: 3 });
   });

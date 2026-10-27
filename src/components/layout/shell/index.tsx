@@ -22,6 +22,7 @@ import {
   useAppDispatch,
   useAppSelector,
   useAppStateRef,
+  useDesktopWindowCommands,
 } from "../../../state/app/context";
 import { useThemeColors } from "../../../theme/theme-context";
 import { getPaneDisplayTitle } from "../pane/title";
@@ -153,6 +154,10 @@ export function Shell({
   const appHeaderHeight = chrome.header ? resolveAppHeaderHeightCells({ titleBarOverlay, cellHeightPx }) : 0;
   const contentHeight = Math.max(1, height - appHeaderHeight - (chrome.statusBar ? 1 : 0));
   pluginRegistry.bindHost({ getTermSize: () => ({ width, height: contentHeight }) });
+  const windowCommands = useDesktopWindowCommands();
+  useEffect(() => {
+    windowCommands?.noteWindowSize({ width, height: contentHeight });
+  }, [contentHeight, width, windowCommands]);
 
   const layout = useAppSelector((state) => state.config.layout);
   const dialogOpen = useDialogState((dialog) => dialog.isOpen);
@@ -687,6 +692,7 @@ export function Shell({
       canReportPaneBug(nativePaneChrome || !!nativeRenderer.capturePaneImage)
         ? () => { pluginRegistry.reportPaneBug(paneId); }
         : undefined,
+      windowCommands,
     );
     const showKitMenu = () => {
       const fallbackSourceItems = withPluginContextMenuItems(context, items, pluginRegistry);
@@ -729,7 +735,7 @@ export function Shell({
     void showContextMenu(context, items, event).then((shown) => {
       if (!shown) showKitMenu();
     });
-  }, [askAboutPane, canAsk, canExportPaneCsv, closePaneMenu, contentHeight, copyPaneScreenshot, desktopWindowBridge, exportPaneCsv, focusPane, getPaneTitle, handlePaneQuickSetting, nativePaneChrome, nativeRenderer, togglePaneFullscreen, openPaneDocs, openPaneSettings, paneAccelerators, paneLayoutMoveMenu, paneMap, persistLayout, pluginRegistry, rendererHost.copyPngImage, sharePane, shortcutDisplayMode, showContextMenu, titleState, visibleLayout, width]);
+  }, [askAboutPane, canAsk, canExportPaneCsv, closePaneMenu, contentHeight, copyPaneScreenshot, desktopWindowBridge, exportPaneCsv, focusPane, getPaneTitle, handlePaneQuickSetting, nativePaneChrome, nativeRenderer, togglePaneFullscreen, openPaneDocs, openPaneSettings, paneAccelerators, paneLayoutMoveMenu, paneMap, persistLayout, pluginRegistry, rendererHost.copyPngImage, sharePane, shortcutDisplayMode, showContextMenu, titleState, visibleLayout, width, windowCommands]);
   openPaneMenuRef.current = openPaneMenu;
 
 

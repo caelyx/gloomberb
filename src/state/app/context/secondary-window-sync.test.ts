@@ -110,6 +110,41 @@ describe("applyWindowIntent", () => {
 
     expect(applyWindowIntent(next, "w2", intent).applied).toBe(false);
   });
+
+  test("a window moves only its own panes, beside the focused pane its target window reported, and raises that window", () => {
+    const state = mainState();
+    // Main's own focus anchors a pane moved into the main window.
+    const toMain = applyWindowIntent({ ...state, focusedPaneId: "list" }, "w2", { type: "movePane", paneId: "econ", target: "main" });
+    expect(toMain.applied).toBe(true);
+    expect(toMain.focus).toEqual({ windowId: "main", paneId: "econ" });
+    expect(getDockedPaneIds(toMain.actions.reduce(appReducer, state).config.layout)).toEqual(["list", "econ", "chart"]);
+
+    // The window it goes to anchors it at the focused pane that window last reported.
+    const withW3 = applyWindowIntent(state, "w2", { type: "addWindow" }).actions.reduce(appReducer, state);
+    const status = applyWindowIntent(withW3, "w2", { type: "windowStatus", status: { focusedPaneId: "news", size: { width: 100, height: 30 } } });
+    expect(status).toMatchObject({ applied: true, actions: [], windowStatus: { focusedPaneId: "news" } });
+    const fromMain = applyWindowIntent(withW3, "w3", { type: "movePane", paneId: "news", target: "w2" });
+    expect(fromMain.applied).toBe(false);
+    const across = applyWindowIntent(withW3, "w2", { type: "movePane", paneId: "econ", target: "w3" });
+    expect(across.focus).toEqual({ windowId: "w3", paneId: "econ" });
+    expect(secondaryWindowPaneIds(across.actions.reduce(appReducer, withW3).config.layout, "w3")).toEqual(["econ"]);
+
+    // Not its pane, or to itself: refused.
+    expect(applyWindowIntent(state, "w2", { type: "movePane", paneId: "list", target: "main" }).applied).toBe(false);
+    expect(applyWindowIntent(state, "w2", { type: "movePane", paneId: "news", target: "w2" }).applied).toBe(false);
+  });
+
+  test("closing a window through the main window moves its panes into the main grid, once", () => {
+    const state = mainState();
+    const outcome = applyWindowIntent(state, "w2", { type: "closeWindow" });
+    expect(outcome.actions.map((action) => action.type)).toEqual(["PUSH_LAYOUT_HISTORY", "UPDATE_LAYOUT"]);
+    const next = outcome.actions.reduce(appReducer, state);
+    expect(next.config.layout.windows ?? []).toEqual([]);
+    expect(getDockedPaneIds(next.config.layout)).toEqual(["list", "chart", "news", "econ"]);
+    expect(outcome.save?.layouts[0]?.layout.windows ?? []).toEqual([]);
+    // Already gone: nothing to do, and nothing for the host to do instead.
+    expect(applyWindowIntent(next, "w2", { type: "closeWindow" })).toMatchObject({ applied: true, actions: [] });
+  });
 });
 
 describe("SecondaryWindowSync", () => {

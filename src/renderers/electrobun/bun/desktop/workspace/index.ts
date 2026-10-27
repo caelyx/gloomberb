@@ -3,11 +3,7 @@ import { clonePaneStateMap, syncConfigActiveLayoutState, type PaneRuntimeState }
 import { cloneLayout, findPaneInstance, type AppConfig, type LayoutConfig } from "../../../../../types/config";
 import type { DesktopSharedStateSnapshot } from "../../../../../types/desktop-window";
 import { detachPaneToFrame, dockPane, insertAtRootEdge, removePane } from "../../../../../layout/pane-manager";
-import {
-  closeSecondaryWindow,
-  movePaneToMainWindow,
-  movePaneToNewWindow,
-} from "../../../../../layout/pane-manager/secondary-windows";
+import { closeSecondaryWindow } from "../../../../../layout/pane-manager/secondary-windows";
 import type { WindowFrame } from "../../window/frame";
 
 function cloneSavedLayouts(config: AppConfig): AppConfig["layouts"] {
@@ -106,11 +102,10 @@ export interface DesktopWorkspace {
     edge?: "left" | "right" | "top" | "bottom",
   ): DesktopSharedStateSnapshot;
   closeDetachedPane(paneId: string): DesktopSharedStateSnapshot;
-  /** The pane in a new secondary window of its own; unchanged when the open tab has no such pane. */
-  movePaneToNewWindow(paneId: string): DesktopSharedStateSnapshot;
-  /** The pane docked in the main window beside its focused pane; the window it leaves stays open. */
-  movePaneToMainWindow(paneId: string): DesktopSharedStateSnapshot;
-  /** A secondary window gone, its panes moved into the main window. */
+  /**
+   * A secondary window gone, its panes moved into the main window: only when
+   * the main window cannot do it itself, since it writes the layout.
+   */
   closeSecondaryWindow(windowId: string): DesktopSharedStateSnapshot;
 }
 
@@ -259,17 +254,6 @@ export function createDesktopWorkspace(
       return updateConfig({
         ...sharedState.config,
         layout: nextLayout,
-      }, { layoutChanged: true });
-    },
-    movePaneToNewWindow(paneId) {
-      const moved = movePaneToNewWindow(sharedState.config.layout, paneId);
-      if (!moved) return getSnapshot();
-      return updateConfig({ ...sharedState.config, layout: moved.layout }, { layoutChanged: true });
-    },
-    movePaneToMainWindow(paneId) {
-      return updateConfig({
-        ...sharedState.config,
-        layout: movePaneToMainWindow(sharedState.config.layout, paneId, sharedState.focusedPaneId),
       }, { layoutChanged: true });
     },
     closeSecondaryWindow(windowId) {

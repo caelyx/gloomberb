@@ -193,12 +193,16 @@ interface DesktopBackendRequestMap {
   };
   "desktop.closeDetachedPane": { request: { paneId: string }; response: null };
   "desktop.focusDetachedPane": { request: { paneId: string }; response: null };
-  "desktop.movePaneToNewWindow": { request: { paneId: string }; response: null };
-  "desktop.movePaneToMainWindow": { request: { paneId: string }; response: null };
   /** From a secondary window: a change the host passes to the main window, naming the window it came from. */
   "window.intent": { request: { intent: DesktopWindowIntent }; response: DesktopWindowIntentResult };
   /** From any window: bring forward the window that shows a pane, and focus the pane there. */
   "window.focusPane": { request: { paneId: string }; response: null };
+  /**
+   * From any window: bring forward window `windowId` ("main" or a layout
+   * window id) and focus `paneId` there, once the layout has the pane there:
+   * a pane or window the main window has just moved or made.
+   */
+  "window.focus": { request: { windowId: string; paneId?: string | null }; response: null };
   "pluginState.setMany": { request: { entries: DesktopPluginStateSetEntry[] }; response: null };
   "pluginState.delete": { request: { pluginId: string; key: string }; response: null };
   "plugins.listExternal": { request: null; response: DesktopExternalPluginBundle[] };
