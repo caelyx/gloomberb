@@ -1,6 +1,6 @@
 import type { PaneRuntimeState } from "../core/state/app/state";
 import type { SecondaryWindowLayoutEdit, WindowMoveTarget, WindowSize } from "../layout/pane-manager/secondary-windows";
-import type { AppConfig } from "./config";
+import type { AppConfig, PaneInstanceConfig } from "./config";
 
 export interface DesktopSharedStateSnapshot {
   config: AppConfig;
@@ -33,6 +33,17 @@ export type DesktopWindowIntent =
   | { type: "replacePaneState"; paneState: Record<string, PaneRuntimeState> }
   /** Plugin settings a pane changed, by plugin; null removes that plugin's settings. */
   | { type: "setPluginConfig"; values: Record<string, Record<string, unknown> | null> }
+  /**
+   * App settings changed in the window, such as the theme or base currency:
+   * only the fields that changed there. The main window takes the ones a
+   * window may set and ignores the rest.
+   */
+  | { type: "setConfig"; fields: Partial<AppConfig> }
+  /**
+   * Panes in other windows that this window changed, as reusing one from its
+   * command bar retargets it. Their places stay as they are.
+   */
+  | { type: "updateInstances"; instances: PaneInstanceConfig[] }
   /** One of the window's own panes to another window: "main", a window id, or "new". */
   | { type: "movePane"; paneId: string; target: WindowMoveTarget }
   /** A new, empty secondary window. */
