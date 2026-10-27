@@ -211,7 +211,7 @@ Status: agreed design (decisions in §8), not yet built. Written from a reading 
 
 Phases 1–4 deliver something usable (panes moved by command). Phase 5 is the "open where I am" behaviour. If needed, Phase 5 could ship before 3; a read-only window plus commands is already useful.
 
-**Delivered so far:** phase 1 (#15) and phase 2 (#16). The order from here is 3, 5, 4.
+**Delivered so far:** phase 1 (#15), phase 2 (#16) and phase 3 (#17). The order from here is 5, then 4.
 
 **Phase 3 as built:**
 - **Intents to main.** A secondary window edits its own view at once and sends `window.intent` requests. The host names the sending window and passes them to the main window, which applies them (`applyWindowIntent`):
@@ -222,6 +222,14 @@ Phases 1–4 deliver something usable (panes moved by command). Phase 5 is the "
 - **Unanswered changes.** `SecondaryWindowSync` keeps them over snapshots sent before the main window applied them. A refused change brings the main window's state back.
 - **Focus.** Each window keeps its own focused pane. Only the window with native focus, or the last one to have it, draws its focused pane as focused.
 - **Moves stay with the host.** Phase 2's moves (to a new window, back to main, closing a window) are still host workspace operations, with the same race Pop Out has.
+
+**Phase 5 as built:**
+- **Bar in each window.** A secondary window mounts its own command bar. Cmd-K, backtick and command chords work there, as in the main window; a popped-out pane still has none.
+- **Menu routing.** The menu's Open Command Bar and Search Ticker go to the secondary window last in front (`commandBarMenuTarget`), and no longer raise main. Forms (`open-*-workflow`) still open in main, because they submit through its state.
+- **Cmd-K echo.** One press reaches the view as the menu accelerator and as a keydown. `createMenuEchoGate` drops whichever arrives second within 150 ms, and the menu's open is a no-op while the bar is already open, so the keydown alone closes it.
+- **Opening panes locally, not by proxy.** A secondary window's state is a view with its own grid in the main window's place, so the existing placement code (`placePaneInstance`, ticker pinning, the ticker inspector) already places relative to that window's focused pane and sizes floating panes to that window. The new pane reaches main through phase 3's `editLayout`, which now accepts an instance the layout does not hold yet.
+- **Reuse (D6).** `findReusablePaneInstance` (`preferPaneIds`) and `findFixedTickerPaneForSymbol` prefer a match in the asking window. A match elsewhere is focused through `window.focusPane`: the host brings that window forward and tells it to focus the pane.
+- **Not moved:** deep links and remote control still go to main. A secondary window drops layout-tab actions (switching, new, delete, undo and so on) from its bar, and settings changed from its bar other than plugin settings don't persist.
 
 **Effort (opinion, not measured):** the biggest pieces are Phase 1 (many small edits across about 25 files, plus tests) and Phase 3 (state plumbing). Phases 2 and 5 are moderate. Phase 4 is small once 1 and 3 exist. I would not trust a number in days without first prototyping Phase 2. The likely surprises are in Shell assumptions not covered above, and in Electrobun's multi-window behaviour on macOS (fullscreen Spaces, key-window events).
 

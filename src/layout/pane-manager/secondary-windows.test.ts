@@ -157,4 +157,28 @@ describe("secondary window layout operations", () => {
     expect(applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(view, "w2", ["news", "econ"]))).toBeNull();
     expect(applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(view, "w9", base))).toBeNull();
   });
+
+  test("a pane opened in a window joins the layout there, but never under an id the layout already holds", () => {
+    const layout = twoWindowLayout();
+    const base = secondaryWindowPaneIds(layout, "w2");
+    const view = viewLayoutFromWindow(layout, "w2");
+    const opened = {
+      ...view,
+      instances: [...view.instances, createPaneInstance("calendar", { instanceId: "cal" })],
+      floating: [...view.floating, { instanceId: "cal", x: 2, y: 2, width: 30, height: 10 }],
+    };
+
+    const applied = applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(opened, "w2", base));
+    expect(secondaryWindowPaneIds(applied!, "w2")).toEqual(["news", "econ", "alerts", "cal"]);
+    expect(applied!.instances.find((instance) => instance.instanceId === "cal")!.paneId).toBe("calendar");
+    expect(findPaneLocation(applied!, "cal")).toEqual({ window: "w2", kind: "floating" });
+
+    // An id the main window already holds is that pane's, whatever the view says it is.
+    const reused = {
+      ...view,
+      instances: [...view.instances.filter((instance) => instance.instanceId !== "list"), createPaneInstance("calendar", { instanceId: "list" })],
+      floating: [...view.floating, { instanceId: "list", x: 2, y: 2, width: 30, height: 10 }],
+    };
+    expect(applySecondaryWindowLayoutEdit(layout, windowLayoutEditFromView(reused, "w2", base))).toBeNull();
+  });
 });

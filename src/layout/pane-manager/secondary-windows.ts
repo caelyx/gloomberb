@@ -146,9 +146,10 @@ export function windowLayoutEditFromView(view: LayoutConfig, windowId: string, b
 /**
  * The layout with a secondary window's edit applied, or null when it cannot
  * be: the window is gone, its panes changed since the edit was made, or the
- * edit places a pane that is not the window's. A pane the edit no longer
- * places was closed there and leaves the layout. Only the window's own
- * instances take the edit's changes, and none changes its pane type.
+ * edit places a pane that is not the window's. A pane opened there joins the
+ * layout, under an id it did not hold. A pane the edit no longer places was
+ * closed there and leaves the layout. Only the window's own instances take
+ * the edit's changes, and none changes its pane type.
  */
 export function applySecondaryWindowLayoutEdit(layout: LayoutConfig, edit: SecondaryWindowLayoutEdit): LayoutConfig | null {
   const windows = layout.windows ?? [];
@@ -157,17 +158,28 @@ export function applySecondaryWindowLayoutEdit(layout: LayoutConfig, edit: Secon
   const currentIds = new Set(current);
   if (current.length !== edit.basePaneIds.length || edit.basePaneIds.some((id) => !currentIds.has(id))) return null;
   const incoming = [...getDockedInstanceIds(edit.dockRoot), ...edit.floating.map((entry) => entry.instanceId)];
-  if (incoming.some((id) => !currentIds.has(id))) return null;
   const incomingIds = new Set(incoming);
+  // A pane opened in the window brings its instance, under an id the layout does not hold yet.
+  const knownIds = new Set(layout.instances.map((instance) => instance.instanceId));
+  const opened = edit.instances.filter((instance) => (
+    incomingIds.has(instance.instanceId) && !knownIds.has(instance.instanceId) && typeof instance.paneId === "string"
+  ));
+  const openedIds = new Set(opened.map((instance) => instance.instanceId));
+  if (incoming.some((id) => !currentIds.has(id) && !openedIds.has(id))) return null;
   const editedInstances = new Map(edit.instances
     .filter((instance) => incomingIds.has(instance.instanceId))
     .map((instance) => [instance.instanceId, instance] as const));
   const spliced: LayoutConfig = {
     ...layout,
-    instances: layout.instances.map((instance) => {
-      const edited = editedInstances.get(instance.instanceId);
-      return edited ? { ...edited, instanceId: instance.instanceId, paneId: instance.paneId } : instance;
-    }),
+    instances: [
+      ...layout.instances.map((instance) => {
+        const edited = editedInstances.get(instance.instanceId);
+        return edited && currentIds.has(instance.instanceId)
+          ? { ...edited, instanceId: instance.instanceId, paneId: instance.paneId }
+          : instance;
+      }),
+      ...opened,
+    ],
     windows: windows.map((window) => (
       window.id === edit.windowId ? { id: window.id, dockRoot: edit.dockRoot, floating: edit.floating } : window
     )),

@@ -35,7 +35,7 @@ import type { CliLaunchRequest, GloomPlugin } from "./types/plugin";
 import type { DataProvider } from "./types/data-provider";
 import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindowBridge } from "./types/desktop-window";
 import type { DesktopApplicationMenuBridge } from "./types/desktop-menu";
-import type { LayoutBounds } from "./layout/pane-manager";
+import { findPaneLocation, type LayoutBounds } from "./layout/pane-manager";
 import type { AppSessionSnapshot } from "./core/state/session-persistence";
 import type { MarketDataCoordinator } from "./market-data/coordinator";
 import { createAppNotifier } from "./notifications/app-notifier";
@@ -195,6 +195,12 @@ function AppInner({
     const focus = desktopWindowBridge?.kind === "main" ? desktopWindowBridge.focusDetachedPane : undefined;
     return focus ? (paneId: string) => { void focus(paneId).catch(() => {}); } : undefined;
   }, [desktopWindowBridge]);
+  // The main window and a secondary window run the bar and open panes in their own grid.
+  const opensPanes = isMainWindow || desktopWindowBridge?.kind === "window";
+  const focusPaneInItsWindow = useMemo(() => {
+    const focus = opensPanes ? desktopWindowBridge?.focusPaneInItsWindow : undefined;
+    return focus ? (paneId: string) => { void focus(paneId).catch(() => {}); } : undefined;
+  }, [desktopWindowBridge, opensPanes]);
   const [desktopDockPreview, setDesktopDockPreview] = useState<DesktopDockPreviewState | null>(null);
   const [commandBarNativeOccluder, setCommandBarNativeOccluder] = useState<LayoutBounds | null>(null);
   appActiveRef.current = appActive;
@@ -243,6 +249,15 @@ function AppInner({
       setDesktopDockPreview(preview);
     });
   }, [desktopWindowBridge]);
+
+  // Another window reused or linked to a pane in this one, and the host brought this window forward.
+  useEffect(() => {
+    if (!opensPanes || !desktopWindowBridge?.subscribeFocusPane) return;
+    return desktopWindowBridge.subscribeFocusPane((paneId) => {
+      // Only a pane this window already shows: one it has not heard of yet would go back to the host.
+      if (findPaneLocation(stateRef.current.config.layout, paneId)?.window === "main") pluginRegistry.focusPane(paneId);
+    });
+  }, [desktopWindowBridge, opensPanes, pluginRegistry, stateRef]);
 
   useEffect(() => {
     const disposers = createCoreSyncContributors().map((contributor) => (
@@ -370,6 +385,7 @@ function AppInner({
     dispatch,
     externalPlugins,
     focusDetachedPane,
+    focusPaneInItsWindow,
     isDetachedWindow,
     notify,
     persistConfig,
@@ -421,6 +437,7 @@ function AppInner({
     dispatch,
     focusedTickerSymbol,
     isDetachedWindow,
+    opensPanes,
     keybindings,
     pluginRegistry,
     refreshTicker,
@@ -455,8 +472,9 @@ function AppInner({
   }
 
   if (desktopWindowBridge?.kind === "window") {
-    // A secondary window: its own grid under a bare title bar. The header's
-    // prompt, the status bar and the command bar stay with the main window.
+    // A secondary window: its own grid under a bare title bar, and a command
+    // bar of its own whose panes open there. The header's prompt and the
+    // status bar stay with the main window.
     return (
       <KeybindingsProvider value={keybindings}>
         <AppDialogBridge />
@@ -477,6 +495,15 @@ function AppInner({
                 desktopWindowBridge={desktopWindowBridge}
                 commandBarNativeOccluder={commandBarNativeOccluder}
               />
+              {state.commandBarOpen && (
+                <CommandBar
+                  dataProvider={dataProvider}
+                  tickerRepository={tickerRepository}
+                  pluginRegistry={pluginRegistry}
+                  quitApp={() => rendererHost.requestExit()}
+                  onNativeOccluderChange={setCommandBarNativeOccluder}
+                />
+              )}
               <ToastViewport position="bottom-right" />
             </ThemedAppRoot>
           </RemoteControlHost>

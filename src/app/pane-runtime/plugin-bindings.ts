@@ -7,7 +7,7 @@ import type { AppTickerRepositoryPort } from "../../core/app-service-ports";
 import { openFormModal } from "../../components/form-modal";
 import { t } from "../../i18n";
 import { openBrokerAddFlow } from "../../plugins/builtin/broker-manager/add-request";
-import { getPaneOrder, getPanelFocusTarget } from "../../core/state/app/layout";
+import { getPanelFocusTarget } from "../../core/state/app/layout";
 import { getVisiblePaneCycleOrder } from "../../components/layout/pane/cycle-order";
 import {
   collectDisabledPaneIds,
@@ -162,19 +162,22 @@ export function bindAppPanePluginRegistry({
   };
   const setPluginEnabled = (pluginId: string, enabled: boolean) => setPluginsEnabled({ [pluginId]: enabled });
 
+  // A popped-out pane's window shows one pane and opens none; a secondary
+  // window has a grid of its own and opens panes there, as the main window does.
+  const popOutWindow = isDetachedWindow && detachedPaneId !== null;
   pluginRegistry.bindHost({
     setPluginEnabled,
     setPluginsEnabled,
     selectTicker: (symbol, paneId) => selectTickerInPane(symbol, paneId),
     switchPanel: (panel) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       const paneId = getPanelFocusTarget(stateRef.current.config.layout, panel);
       if (paneId) dispatch({ type: "FOCUS_PANE", paneId });
     },
     switchTab: (tabId, paneId) => switchTickerResearchTab(tabId, paneId),
     // The bar would open over a dialog without its keys, so it waits for none to be open.
     openCommandBar: (query) => {
-      if (isDetachedWindow || isDialogOpen()) return;
+      if (popOutWindow || isDialogOpen()) return;
       dispatch({ type: "SET_COMMAND_BAR", open: true, query });
     },
     // Forms submit through the main window's state, so a detached window says where to go.
@@ -205,16 +208,16 @@ export function bindAppPanePluginRegistry({
     },
     getLayout: () => stateRef.current.config.layout,
     updateLayout: (layout) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       persistLayout(layout);
     },
     openPaneSettings: (paneId, options) => { void openPaneSettings(paneId, options); },
     showPane: (paneId) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       showPane(paneId);
     },
     createPaneFromTemplateAsync: async (templateId, options) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       await createPaneTemplateOrThrow(templateId, options, {
         dataProvider,
         tickerRepository,
@@ -244,7 +247,7 @@ export function bindAppPanePluginRegistry({
       placePaneInstance(instance, paneDef, { placement: "floating" });
     },
     createPaneFromTemplate: (templateId, options) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       void createPaneFromTemplate(templateId, options);
     },
     applyPaneSettingValue: async (paneId, field: PaneSettingField, value) => {
@@ -258,19 +261,15 @@ export function bindAppPanePluginRegistry({
       });
     },
     hidePane: (paneId) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       const instanceId = resolvePaneTarget(paneId);
       const layout = stateRef.current.config.layout;
       if (!instanceId || !isPaneInLayout(layout, instanceId)) return;
       persistLayout(removePane(layout, instanceId));
     },
     focusPane: (paneId, layout) => {
-      if (isDetachedWindow) {
-        // A popped-out window focuses its pane; a secondary window, the panes in its own grid.
-        const ownPane = detachedPaneId
-          ? paneId === detachedPaneId
-          : getPaneOrder(stateRef.current.config.layout).includes(paneId);
-        if (ownPane) dispatch({ type: "FOCUS_PANE", paneId });
+      if (popOutWindow) {
+        if (paneId === detachedPaneId) dispatch({ type: "FOCUS_PANE", paneId });
         return;
       }
       const instanceId = resolvePaneTarget(paneId);
@@ -293,12 +292,12 @@ export function bindAppPanePluginRegistry({
     // Ticker links in panes and menus, and DES from the command bar, open the
     // research pane (or the pane asked for) through these two.
     pinTicker: (symbol, options) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       recordFunctionOpen(usageFunctionForPane(pluginRegistry, options?.paneType ?? TICKER_RESEARCH_PANE_ID));
       void openPinnedTicker(symbol, options);
     },
     navigateTicker: (rawSymbol, options) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       // Navigation lands in a research pane, which stays hidden while its plugin is off.
       const researchOwner = pluginRegistry.getDisabledPaneOwner(TICKER_RESEARCH_PANE_ID, stateRef.current.config.disabledPlugins);
       if (researchOwner) {

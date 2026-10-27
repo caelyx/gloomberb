@@ -140,15 +140,20 @@ export class SecondaryWindowSync {
         .filter((instance) => own.has(instance.instanceId))
         .map((instance) => [instance.instanceId, instance] as const));
       const closedHere = new Set(this.mainPaneIds.filter((paneId) => !own.has(paneId)));
+      const known = new Set(config.layout.instances.map((instance) => instance.instanceId));
       config = {
         ...config,
         layout: {
           ...config.layout,
           dockRoot: local.config.layout.dockRoot,
           floating: local.config.layout.floating,
-          instances: config.layout.instances
-            .filter((instance) => !closedHere.has(instance.instanceId))
-            .map((instance) => localInstances.get(instance.instanceId) ?? instance),
+          instances: [
+            ...config.layout.instances
+              .filter((instance) => !closedHere.has(instance.instanceId))
+              .map((instance) => localInstances.get(instance.instanceId) ?? instance),
+            // Opened here and not yet in the main window's layout.
+            ...[...localInstances.values()].filter((instance) => !known.has(instance.instanceId)),
+          ],
         },
       };
     }

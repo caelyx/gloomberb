@@ -43,6 +43,16 @@ export function createDesktopWindowBridge(
         listener(message.windowKey);
       });
     },
+    focusPaneInItsWindow: kind === "detached"
+      ? undefined
+      : async (targetPaneId: string) => {
+        await backendRequest("window.focusPane", { paneId: targetPaneId });
+      },
+    subscribeFocusPane: kind === "detached"
+      ? undefined
+      : (listener: (paneId: string) => void) => onBackendMessage("desktop.focusPane", (message) => {
+        listener(message.paneId);
+      }),
     sendWindowIntent: kind === "window"
       ? (intent: DesktopWindowIntent) => backendRequest("window.intent", { intent })
       : undefined,
