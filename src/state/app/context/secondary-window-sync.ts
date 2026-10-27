@@ -1,5 +1,6 @@
 import { syncConfigActiveLayoutState, type AppAction, type AppState, type PaneRuntimeState } from "../../../core/state/app/state";
 import { getDockedInstanceIds } from "../../../layout/pane-manager/dock-tree";
+import { addPaneToLayout, insertAtRootEdge } from "../../../layout/pane-manager/docking";
 import { findPaneLocation } from "../../../layout/pane-manager/queries";
 import {
   addSecondaryWindow,
@@ -12,7 +13,7 @@ import {
   type WindowMoveTarget,
   type WindowSize,
 } from "../../../layout/pane-manager/secondary-windows";
-import type { AppConfig, LayoutConfig } from "../../../types/config";
+import type { AppConfig, FloatingPaneEntry, LayoutConfig, PaneInstanceConfig } from "../../../types/config";
 import type { DesktopSharedStateSnapshot, DesktopWindowIntent, SecondaryWindowStatus } from "../../../types/desktop-window";
 
 export interface WindowIntentOutcome {
@@ -25,6 +26,49 @@ export interface WindowIntentOutcome {
   focus?: { windowId: string; paneId: string | null };
   /** A window's focused pane and size, for the main window to keep. */
   windowStatus?: SecondaryWindowStatus;
+  /** App settings changed: the main window announces them as it does its own changes (`config:changed`). */
+  configChanged?: AppConfig;
+}
+
+/**
+ * The app settings a secondary window may change, as its command bar and
+ * settings forms do: theme, currency, portfolios and watchlists, brokers,
+ * plugins and sources on or off, chart and display preferences, language,
+ * keys, time zone, telemetry and the update channel. Layout and tabs go
+ * through grid edits, plugin settings through `setPluginConfig`; the rest
+ * (data directory, config version, onboarding and migration markers) are the
+ * main window's alone.
+ */
+const WINDOW_SETTABLE_CONFIG_FIELDS: ReadonlySet<string> = new Set<keyof AppConfig>([
+  "baseCurrency",
+  "refreshIntervalMinutes",
+  "portfolios",
+  "watchlists",
+  "brokerInstances",
+  "disabledPlugins",
+  "disabledSources",
+  "theme",
+  "chartPreferences",
+  "valueFlashingEnabled",
+  "fontSize",
+  "recentCommands",
+  "language",
+  "keybindings",
+  "telemetry",
+  "updates",
+  "timezone",
+  "presentationMode",
+]);
+
+/** Config a window never sends as a setting: layout and tabs are grid edits, plugin settings their own intent. */
+const CONFIG_FIELDS_NOT_SENT: ReadonlySet<string> = new Set<keyof AppConfig>(["layout", "layouts", "activeLayoutIndex", "pluginConfig"]);
+
+const ignoredConfigFields = new Set<string>();
+
+function noteIgnoredConfigField(field: string): void {
+  if (ignoredConfigFields.has(field)) return;
+  ignoredConfigFields.add(field);
+  console.warn("[desktop-window] ignored a secondary window's change to a setting it may not set", { field });
 }
 
 /** What the main window knows of the windows, for placing a pane moved between them. */
@@ -154,7 +198,47 @@ export function applyWindowIntent(
         else delete pluginConfig[pluginId];
       }
       const config = { ...state.config, pluginConfig };
-      return { applied: true, actions: [{ type: "SET_CONFIG", config }], save: config };
+      return { applied: true, actions: [{ type: "SET_CONFIG", config }], save: config, configChanged: config };
+    }
+    case "setConfig": {
+      const fields: Record<string, unknown> = {};
+      for (const [field, value] of Object.entries(intent.fields)) {
+        if (!WINDOW_SETTABLE_CONFIG_FIELDS.has(field)) {
+          noteIgnoredConfigField(field);
+          continue;
+        }
+        if (JSON.stringify(state.config[field as keyof AppConfig]) !== JSON.stringify(value)) fields[field] = value;
+      }
+      if (Object.keys(fields).length === 0) return UNCHANGED;
+      const config = { ...state.config, ...fields } as AppConfig;
+      return { applied: true, actions: [{ type: "SET_CONFIG", config }], save: config, configChanged: config };
+    }
+    case "updateInstances": {
+      // Any window's pane may take the change, but not a new type, a new pane or a new place.
+      const incoming = new Map(intent.instances.map((instance) => [instance.instanceId, instance] as const));
+      let changed = false;
+      const instances = layout.instances.map((instance) => {
+        const next = incoming.get(instance.instanceId);
+        if (!next) return instance;
+        const { placementMemory: _placementMemory, movedFrom: _movedFrom, ...content } = next;
+        const updated: PaneInstanceConfig = {
+          ...content,
+          instanceId: instance.instanceId,
+          paneId: instance.paneId,
+          ...(instance.placementMemory ? { placementMemory: instance.placementMemory } : {}),
+          ...(instance.movedFrom ? { movedFrom: instance.movedFrom } : {}),
+        };
+        if (JSON.stringify(updated) === JSON.stringify(instance)) return instance;
+        changed = true;
+        return updated;
+      });
+      if (!changed) return UNCHANGED;
+      const next = { ...layout, instances };
+      return {
+        applied: true,
+        actions: [{ type: "UPDATE_LAYOUT", layout: next }],
+        save: syncConfigActiveLayoutState({ ...state.config, layout: next }, state.paneState, state.focusedPaneId),
+      };
     }
   }
 }
@@ -183,6 +267,28 @@ function adjust(counts: Map<string, number>, key: string, delta: number): void {
   else counts.delete(key);
 }
 
+/** The config fields a window sends as settings, with their values' signatures. */
+function settingSignatures(config: AppConfig): Map<string, string> {
+  return new Map(Object.entries(config)
+    .filter(([field]) => !CONFIG_FIELDS_NOT_SENT.has(field))
+    .map(([field, value]) => [field, JSON.stringify(value ?? null)]));
+}
+
+/** Pane instances in the view that are not the window's own: the panes of other windows. */
+function foreignInstanceSignatures(layout: LayoutConfig): Map<string, string> {
+  const own = new Set(viewPaneIds(layout));
+  return new Map(layout.instances
+    .filter((instance) => !own.has(instance.instanceId))
+    .map((instance) => [instance.instanceId, JSON.stringify(instance)]));
+}
+
+/** A pane opened in the window whose edit the main window refused, to open again on its newer state. */
+interface PendingReplay {
+  instance: PaneInstanceConfig;
+  floating: FloatingPaneEntry | null;
+  paneState: PaneRuntimeState | undefined;
+}
+
 /**
  * A secondary window's side of keeping the main window the only writer. The
  * window edits its own view at once; this works out which of those edits to
@@ -196,26 +302,42 @@ export class SecondaryWindowSync {
   private syncedLayout = "";
   private syncedPaneState = new Map<string, string>();
   private syncedPluginConfig = new Map<string, string>();
+  private syncedSettings = new Map<string, string>();
+  private syncedForeignInstances = new Map<string, string>();
   /** The window's panes as the main window last reported them. */
   private mainPaneIds: string[] = [];
-  private sentLayout: { signature: string; paneIds: string[] } | null = null;
+  /** Every pane instance the main window's layout last had. */
+  private mainInstanceIds = new Set<string>();
+  private sentLayout: { signature: string; paneIds: string[]; openedIds: string[] } | null = null;
   private readonly sentPaneState = new Map<string, string>();
   private readonly sentPluginConfig = new Map<string, string>();
+  private readonly sentSettings = new Map<string, string>();
+  private readonly sentForeignInstances = new Map<string, string>();
   private layoutInFlight = 0;
   private readonly paneStateInFlight = new Map<string, number>();
   private readonly pluginConfigInFlight = new Map<string, number>();
+  private readonly settingsInFlight = new Map<string, number>();
+  private readonly foreignInstancesInFlight = new Map<string, number>();
+  /** Panes opened here whose edit was refused, to open again once; and those already opened again. */
+  private readonly pendingReplays = new Map<string, PendingReplay>();
+  private readonly replayedIds = new Set<string>();
 
   constructor(readonly windowId: string) {}
 
   /** The first snapshot, already in local state. */
   start(view: DesktopSharedStateSnapshot, local: AppState): void {
-    this.mainPaneIds = viewPaneIds(view.config.layout);
+    this.noteMain(view);
     this.noteSynced(local);
+  }
+
+  private noteMain(view: DesktopSharedStateSnapshot): void {
+    this.mainPaneIds = viewPaneIds(view.config.layout);
+    this.mainInstanceIds = new Set(view.config.layout.instances.map((instance) => instance.instanceId));
   }
 
   /** A snapshot from the main window, with what this window sent and has not heard back about laid over it. */
   receive(view: DesktopSharedStateSnapshot, local: AppState): DesktopSharedStateSnapshot {
-    this.mainPaneIds = viewPaneIds(view.config.layout);
+    this.noteMain(view);
     let config = view.config;
     if (this.layoutInFlight > 0) {
       const own = new Set(viewPaneIds(local.config.layout));
@@ -240,6 +362,18 @@ export class SecondaryWindowSync {
         },
       };
     }
+    if (this.foreignInstancesInFlight.size > 0) {
+      const localInstances = new Map(local.config.layout.instances.map((instance) => [instance.instanceId, instance] as const));
+      config = {
+        ...config,
+        layout: {
+          ...config.layout,
+          instances: config.layout.instances.map((instance) => (
+            this.foreignInstancesInFlight.has(instance.instanceId) ? localInstances.get(instance.instanceId) ?? instance : instance
+          )),
+        },
+      };
+    }
     if (this.pluginConfigInFlight.size > 0) {
       const pluginConfig = { ...config.pluginConfig };
       for (const pluginId of this.pluginConfigInFlight.keys()) {
@@ -248,6 +382,11 @@ export class SecondaryWindowSync {
         else delete pluginConfig[pluginId];
       }
       config = { ...config, pluginConfig };
+    }
+    if (this.settingsInFlight.size > 0) {
+      const settings: Record<string, unknown> = {};
+      for (const field of this.settingsInFlight.keys()) settings[field] = local.config[field as keyof AppConfig];
+      config = { ...config, ...settings } as AppConfig;
     }
     let paneState = view.paneState;
     if (this.paneStateInFlight.size > 0) {
@@ -267,6 +406,8 @@ export class SecondaryWindowSync {
     this.syncedPaneState = new Map(viewPaneIds(local.config.layout)
       .map((paneId) => [paneId, paneStateSignature(local.paneState[paneId])]));
     this.syncedPluginConfig = pluginConfigSignatures(local.config);
+    this.syncedSettings = settingSignatures(local.config);
+    this.syncedForeignInstances = foreignInstanceSignatures(local.config.layout);
   }
 
   /** The intents for what changed here since the last snapshot and has not been sent yet, each now counted as sent. */
@@ -280,7 +421,8 @@ export class SecondaryWindowSync {
       const base = this.layoutInFlight > 0 && this.sentLayout ? this.sentLayout.paneIds : this.mainPaneIds;
       const edit = windowLayoutEditFromView(layout, this.windowId, base);
       intents.push({ type: "editLayout", edit });
-      this.sentLayout = { signature, paneIds: viewPaneIds(layout) };
+      const paneIds = viewPaneIds(layout);
+      this.sentLayout = { signature, paneIds, openedIds: paneIds.filter((paneId) => !this.mainInstanceIds.has(paneId)) };
       this.layoutInFlight += 1;
     }
 
@@ -294,6 +436,19 @@ export class SecondaryWindowSync {
     }
     if (Object.keys(paneState).length > 0) intents.push({ type: "replacePaneState", paneState });
 
+    const instances: PaneInstanceConfig[] = [];
+    for (const [paneId, current] of foreignInstanceSignatures(layout)) {
+      const synced = this.syncedForeignInstances.get(paneId);
+      // Only a pane the main window has, changed here: never one it does not know, never one left alone.
+      if (synced === undefined || current === synced || current === this.sentForeignInstances.get(paneId)) continue;
+      const instance = layout.instances.find((candidate) => candidate.instanceId === paneId);
+      if (!instance) continue;
+      instances.push(instance);
+      this.sentForeignInstances.set(paneId, current);
+      adjust(this.foreignInstancesInFlight, paneId, 1);
+    }
+    if (instances.length > 0) intents.push({ type: "updateInstances", instances });
+
     const values: Record<string, Record<string, unknown> | null> = {};
     const current = pluginConfigSignatures(local.config);
     for (const pluginId of new Set([...current.keys(), ...this.syncedPluginConfig.keys()])) {
@@ -305,16 +460,31 @@ export class SecondaryWindowSync {
     }
     if (Object.keys(values).length > 0) intents.push({ type: "setPluginConfig", values });
 
+    // Only the settings changed here: one left alone is never sent, so it cannot undo main's.
+    const fields: Record<string, unknown> = {};
+    const settings = settingSignatures(local.config);
+    for (const field of new Set([...settings.keys(), ...this.syncedSettings.keys()])) {
+      const next = settings.get(field) ?? "null";
+      if (next === (this.syncedSettings.get(field) ?? "null") || next === this.sentSettings.get(field)) continue;
+      fields[field] = local.config[field as keyof AppConfig];
+      this.sentSettings.set(field, next);
+      adjust(this.settingsInFlight, field, 1);
+    }
+    if (Object.keys(fields).length > 0) intents.push({ type: "setConfig", fields: fields as Partial<AppConfig> });
+
     return intents;
   }
 
   /**
-   * The main window answered an intent from `collect`. True when it refused,
-   * and the window should take the main window's state back in.
+   * The main window answered an intent from `collect`, with local state as it
+   * is now. True when it refused, and the window should take the main
+   * window's state back in; a pane opened here in a refused edit is kept, for
+   * `replay` to open again on that state.
    */
-  settle(intent: DesktopWindowIntent, applied: boolean): boolean {
+  settle(intent: DesktopWindowIntent, applied: boolean, local: AppState): boolean {
     switch (intent.type) {
       case "editLayout":
+        if (!applied) this.keepOpenedPanes(intent, local);
         // An edit after a refused one built on it, so it is refused too.
         this.layoutInFlight = applied ? Math.max(0, this.layoutInFlight - 1) : 0;
         if (!applied) this.sentLayout = null;
@@ -325,13 +495,67 @@ export class SecondaryWindowSync {
           if (!applied) this.sentPaneState.delete(paneId);
         }
         break;
+      case "updateInstances":
+        for (const instance of intent.instances) {
+          adjust(this.foreignInstancesInFlight, instance.instanceId, -1);
+          if (!applied) this.sentForeignInstances.delete(instance.instanceId);
+        }
+        break;
       case "setPluginConfig":
         for (const pluginId of Object.keys(intent.values)) {
           adjust(this.pluginConfigInFlight, pluginId, -1);
           if (!applied) this.sentPluginConfig.delete(pluginId);
         }
         break;
+      case "setConfig":
+        for (const field of Object.keys(intent.fields)) {
+          adjust(this.settingsInFlight, field, -1);
+          if (!applied) this.sentSettings.delete(field);
+        }
+        break;
     }
     return !applied;
+  }
+
+  private keepOpenedPanes(intent: Extract<DesktopWindowIntent, { type: "editLayout" }>, local: AppState): void {
+    const opened = new Set(this.sentLayout?.openedIds ?? []);
+    for (const instance of intent.edit.instances) {
+      const paneId = instance.instanceId;
+      if (!opened.has(paneId) || this.mainInstanceIds.has(paneId) || this.replayedIds.has(paneId)) continue;
+      this.pendingReplays.set(paneId, {
+        instance,
+        floating: intent.edit.floating.find((entry) => entry.instanceId === paneId) ?? null,
+        paneState: local.paneState[paneId],
+      });
+    }
+  }
+
+  /**
+   * The window's view with the panes opened here in a refused edit opened
+   * again, after taking the main window's newer state in, and their state;
+   * null when there are none. Each is opened again once: if that edit is
+   * refused too, the pane is gone.
+   */
+  replay(local: AppState): { layout: LayoutConfig; paneState: Record<string, PaneRuntimeState> } | null {
+    if (this.pendingReplays.size === 0) return null;
+    let layout = local.config.layout;
+    const paneState: Record<string, PaneRuntimeState> = {};
+    for (const [paneId, pending] of this.pendingReplays) {
+      this.replayedIds.add(paneId);
+      if (layout.instances.some((instance) => instance.instanceId === paneId)) continue;
+      if (pending.floating) {
+        layout = { ...layout, instances: [...layout.instances, pending.instance], floating: [...layout.floating, { ...pending.floating }] };
+      } else {
+        const anchor = local.focusedPaneId;
+        layout = anchor && getDockedInstanceIds(layout.dockRoot).includes(anchor)
+          ? addPaneToLayout(layout, pending.instance, { relativeTo: anchor, position: "right" })
+          : insertAtRootEdge({ ...layout, instances: [...layout.instances, pending.instance] }, paneId, "right");
+      }
+      if (pending.paneState) paneState[paneId] = pending.paneState;
+      // Sent once already, with the edit that was refused: it is a change again.
+      this.sentPaneState.delete(paneId);
+    }
+    this.pendingReplays.clear();
+    return { layout, paneState };
   }
 }

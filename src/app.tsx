@@ -696,6 +696,7 @@ export function App({
         desktopBridge={desktopWindowBridge}
         desktopSnapshot={desktopSnapshot}
         initialThemePreview={desktopThemePreview}
+        onWindowConfigChange={(changed) => services.pluginRegistry.events.emit("config:changed", { config: changed })}
       >
         <AppLanguageConfigObserver />
         <AppInner

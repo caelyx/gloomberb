@@ -478,6 +478,7 @@ export function AppProvider({
   desktopBridge,
   desktopSnapshot = null,
   initialThemePreview = null,
+  onWindowConfigChange,
 }: {
   config: AppConfig;
   children: ReactNode;
@@ -486,6 +487,8 @@ export function AppProvider({
   desktopBridge?: DesktopWindowBridge;
   desktopSnapshot?: DesktopSharedStateSnapshot | null;
   initialThemePreview?: DesktopThemePreviewState | null;
+  /** In the main window: settings a secondary window changed, applied here, to announce as a local change is. */
+  onWindowConfigChange?: (config: AppConfig) => void;
 }) {
   const [state, rawDispatch] = useReducer(
     appReducer,
@@ -626,8 +629,16 @@ export function AppProvider({
     const send = desktopBridge?.sendWindowIntent;
     if (!windowSync || !send) return;
     const settle = (intent: DesktopWindowIntent, applied: boolean) => {
-      // Refused: the main window moved on, so its state comes back here.
-      if (windowSync.settle(intent, applied)) rehydrateSecondaryWindow();
+      // Refused: the main window moved on, so its state comes back here, with
+      // any pane opened in the refused edit opened again on it.
+      if (!windowSync.settle(intent, applied, stateRef.current)) return;
+      rehydrateSecondaryWindow();
+      const replay = windowSync.replay(stateRef.current);
+      if (!replay) return;
+      dispatch({ type: "UPDATE_LAYOUT", layout: replay.layout });
+      for (const [paneId, paneState] of Object.entries(replay.paneState)) {
+        dispatch({ type: "REPLACE_PANE_STATE", paneId, state: paneState });
+      }
     };
     for (const intent of windowSync.collect(stateRef.current)) {
       send(intent).then(
@@ -635,22 +646,25 @@ export function AppProvider({
         () => settle(intent, false),
       );
     }
-  }, [desktopBridge, rehydrateSecondaryWindow]);
+  }, [desktopBridge, dispatch, rehydrateSecondaryWindow]);
 
   useEffect(() => {
     if (desktopBridge?.kind !== "window") return;
     sendWindowIntents();
-  }, [desktopBridge, sendWindowIntents, state.config.layout, state.config.pluginConfig, state.paneState]);
+  }, [desktopBridge, sendWindowIntents, state.config, state.paneState]);
 
   // In the main window: each secondary window's focused pane and size as it
   // last said, and the main window's own size, for placing moved panes.
   const windowStatusRef = useRef(new Map<string, SecondaryWindowStatus>());
   const windowSizeRef = useRef<WindowSize | null>(null);
 
-  /** A change the main window made for itself or a window: dispatched, saved, and the window it concerns brought forward. */
+  const onWindowConfigChangeRef = useRef(onWindowConfigChange);
+  onWindowConfigChangeRef.current = onWindowConfigChange;
+  /** A change the main window made for itself or a window: dispatched, saved, announced, and the window it concerns brought forward. */
   const applyMainWindowOutcome = useCallback((outcome: WindowIntentOutcome) => {
     for (const action of outcome.actions) dispatch(action);
     if (outcome.save) scheduleConfigSave(outcome.save);
+    if (outcome.configChanged) onWindowConfigChangeRef.current?.(outcome.configChanged);
     const focus = outcome.focus;
     if (focus && desktopBridge?.focusWindow) {
       fireAndForget(desktopBridge.focusWindow(focus.windowId, focus.paneId), "window.focus");
