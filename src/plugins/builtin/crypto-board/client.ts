@@ -1,6 +1,12 @@
 import { apiClient } from "../../../api-client";
 import { ApiRequestError } from "../../../api-client/errors";
-import type { CryptoMarketAsset, CryptoMarketsPayload } from "../../../api-client/crypto-markets";
+import type {
+  CryptoMarketAsset,
+  CryptoMarketsPayload,
+  DefiTvlPayload,
+  StablecoinSupplyHistoryPayload,
+  StablecoinSupplyPayload,
+} from "../../../api-client/crypto-markets";
 import { createPluginCache } from "../../../data/plugin-cache";
 import { cachedCloudResource, loadCloudResource, unavailableOnServer } from "../shared/cloud-resource";
 import { isFiniteNumber } from "../../../utils/guards";
@@ -58,7 +64,55 @@ function validAsset(asset: CryptoMarketAsset): boolean {
   );
 }
 
-export function validateCryptoMarkets(data: CryptoMarketsPayload): CryptoMarketsPayload {
+const validPeg = (peg: CryptoMarketAsset["peg"]) =>
+  !!peg
+  && typeof peg.currency === "string"
+  && /^[A-Z]{3}$/.test(peg.currency)
+  && typeof peg.accrues === "boolean"
+  && (peg.price === null || (isFiniteNumber(peg.price) && peg.price > 0))
+  && nullableInstant(peg.asOf);
+
+const validRange = (range: CryptoMarketAsset["range24h"]) =>
+  !!range
+  && [range.low, range.high].every((value) => isFiniteNumber(value) && value > 0)
+  && [range.lowAt, range.highAt, range.start, range.end].every(instant);
+
+/** A malformed peg or 24h range is dropped from its coin alone; the coin and the rest of the board stay. */
+function withValidStablecoinFields(asset: CryptoMarketAsset): CryptoMarketAsset {
+  const peg = asset.peg != null && !validPeg(asset.peg);
+  const range = asset.range24h != null && !validRange(asset.range24h);
+  if (!peg && !range) return asset;
+  return { ...asset, ...(peg ? { peg: null } : {}), ...(range ? { range24h: null } : {}) };
+}
+
+const DAY_MS = 86_400_000;
+/** How many UTC days old a coin's latest daily close may be for its previous close to stand, as Gloom Cloud judges a coin quote's. */
+const PREVIOUS_CLOSE_MAX_AGE_DAYS = 2;
+
+/**
+ * A coin of a board from before Gloom Cloud measured its moves since 00:00
+ * UTC (a server not yet updated, a copy cached from one), whose change runs
+ * over the screener's 24 hours: moved from its previous close instead, the
+ * close of its last UTC day while its daily closes reach the last two days.
+ * Otherwise that close may be weeks old (Toncoin on 18 Oct 2026), and the
+ * coin has no move.
+ */
+function onUtcDayBasis(asset: CryptoMarketAsset, now: number): CryptoMarketAsset {
+  const history = asset.history;
+  const last = history?.closes.findLastIndex((close) => close != null) ?? -1;
+  const lastDay = history && last >= 0 ? Date.parse(`${history.start}T00:00:00Z`) / DAY_MS + last : null;
+  const holds = lastDay != null && asset.previousClose != null && asset.previousClose > 0
+    && Math.floor(now / DAY_MS) - lastDay <= PREVIOUS_CLOSE_MAX_AGE_DAYS;
+  const change = holds ? asset.price - asset.previousClose! : null;
+  return {
+    ...asset,
+    previousClose: holds ? asset.previousClose : null,
+    change,
+    changePercent: change != null ? (change / asset.previousClose!) * 100 : null,
+  };
+}
+
+export function validateCryptoMarkets(data: CryptoMarketsPayload, now = Date.now()): CryptoMarketsPayload {
   if (
     !data
     || data.version !== 1
@@ -77,7 +131,12 @@ export function validateCryptoMarkets(data: CryptoMarketsPayload): CryptoMarkets
   ) {
     throw new Error("The server returned an invalid crypto board");
   }
-  return data;
+  const legacy = data.dayChangeBasis !== "utc-day";
+  const assets = data.assets.map((asset) => {
+    const valid = withValidStablecoinFields(asset);
+    return legacy ? onUtcDayBasis(valid, now) : valid;
+  });
+  return assets.every((asset, index) => asset === data.assets[index]) ? data : { ...data, assets };
 }
 
 export async function fetchCryptoMarkets(
@@ -99,4 +158,212 @@ export function cachedCryptoMarkets() {
 
 export function loadCryptoMarkets(force = false) {
   return loadCloudResource(cryptoMarketsCache, "usd", () => fetchCryptoMarkets(), { force, validate: validateCryptoMarkets });
+}
+
+// Stablecoin supply ------------------------------------------------------------
+
+const stablecoinSupplyCache = createPluginCache<StablecoinSupplyPayload>({
+  kind: "stablecoin-supply",
+  source: "gloom-cloud",
+  schemaVersion: 1,
+  // The server reads the source once a UTC day; a month-old copy still dates itself.
+  policy: { staleMs: 30 * 60_000, expireMs: 30 * 86_400_000 },
+});
+
+const stablecoinSupplyHistoryCache = createPluginCache<StablecoinSupplyHistoryPayload>({
+  kind: "stablecoin-supply-history",
+  source: "gloom-cloud",
+  schemaVersion: 1,
+  policy: { staleMs: 30 * 60_000, expireMs: 30 * 86_400_000 },
+});
+
+export const STABLECOIN_SUPPLY_CACHES = [stablecoinSupplyCache, stablecoinSupplyHistoryCache] as const;
+
+const MAX_SUPPLY_DAYS = 20_000;
+const supplyValues = (values: unknown) =>
+  Array.isArray(values) && values.length <= MAX_SUPPLY_DAYS && values.every((value) => value === null || (isFiniteNumber(value) && value >= 0));
+const nullableString = (value: unknown) => value === null || typeof value === "string";
+const supplyStatus = (value: unknown) => value === "available" || value === "stale" || value === "unavailable";
+
+export function validateStablecoinSupply(data: StablecoinSupplyPayload): StablecoinSupplyPayload {
+  const history = data?.history;
+  if (
+    !data
+    || data.version !== 1
+    || !instant(data.generatedAt)
+    || !nullableInstant(data.fetchedAt)
+    || !(data.asOf === null || date(data.asOf))
+    || !supplyStatus(data.status)
+    || (data.total !== null && (
+      !data.total
+      || !isFiniteNumber(data.total.supply)
+      || ![data.total.change7d, data.total.change7dPercent, data.total.change30d, data.total.change30dPercent].every(nullableNumber)
+    ))
+    || !Array.isArray(data.coins)
+    || data.coins.length > 500
+    || !data.coins.every((coin) => !!coin
+      && typeof coin.symbol === "string"
+      && coin.symbol.length > 0
+      && typeof coin.name === "string"
+      && typeof coin.pegType === "string"
+      && nullableString(coin.pegMechanism)
+      && isFiniteNumber(coin.supply)
+      && coin.supply >= 0
+      && [coin.price, coin.change7d, coin.change7dPercent, coin.change30d, coin.change30dPercent, coin.share].every(nullableNumber))
+    || (history !== null && (
+      !history
+      || !date(history.start)
+      || !supplyValues(history.total)
+      || !Array.isArray(history.coins)
+      || history.coins.length > 20
+      || !history.coins.every((coin) => !!coin
+        && typeof coin.symbol === "string"
+        && typeof coin.name === "string"
+        && supplyValues(coin.values)
+        && coin.values.length === history.total.length)
+    ))
+    || !Array.isArray(data.warnings)
+    || data.warnings.some((warning) => typeof warning !== "string")
+  ) {
+    throw new Error("The server returned invalid stablecoin supply");
+  }
+  return data;
+}
+
+function validateStablecoinSupplyHistory(data: StablecoinSupplyHistoryPayload): StablecoinSupplyHistoryPayload {
+  if (
+    !data
+    || data.version !== 1
+    || !instant(data.generatedAt)
+    || !(data.asOf === null || date(data.asOf))
+    || !supplyStatus(data.status)
+    || typeof data.symbol !== "string"
+    || typeof data.name !== "string"
+    || (data.history !== null && (!data.history || !date(data.history.start) || !supplyValues(data.history.values)))
+    || !Array.isArray(data.warnings)
+  ) {
+    throw new Error("The server returned invalid stablecoin supply history");
+  }
+  return data;
+}
+
+function supplyError(error: unknown, what: string): unknown {
+  if (error instanceof ApiRequestError && error.status === 503) return new Error(`${what} is temporarily unavailable`);
+  return unavailableOnServer(error, `${what} is not available yet.`);
+}
+
+export async function fetchStablecoinSupply(
+  client: Pick<typeof apiClient, "getCloudStablecoinSupply"> = apiClient,
+): Promise<StablecoinSupplyPayload> {
+  try {
+    return validateStablecoinSupply(await client.getCloudStablecoinSupply());
+  } catch (error) {
+    throw supplyError(error, "Stablecoin supply");
+  }
+}
+
+export function cachedStablecoinSupply() {
+  return cachedCloudResource(stablecoinSupplyCache, "all", validateStablecoinSupply);
+}
+
+export function loadStablecoinSupply(force = false) {
+  return loadCloudResource(stablecoinSupplyCache, "all", () => fetchStablecoinSupply(), { force, validate: validateStablecoinSupply });
+}
+
+/** One listed stablecoin's daily supply, by its symbol (USDT). */
+export function loadStablecoinSupplyHistory(symbol: string) {
+  const key = symbol.trim().toUpperCase();
+  return loadCloudResource(stablecoinSupplyHistoryCache, key, async () => {
+    try {
+      return validateStablecoinSupplyHistory(await apiClient.getCloudStablecoinSupplyHistory(key));
+    } catch (error) {
+      if (error instanceof ApiRequestError && error.status === 404) throw new Error(`No stablecoin supply series for ${key}: it is not among the stablecoins CRYP lists.`);
+      throw supplyError(error, `${key} supply history`);
+    }
+  }, { validate: validateStablecoinSupplyHistory });
+}
+
+// DeFi TVL ---------------------------------------------------------------------
+
+const defiTvlCache = createPluginCache<DefiTvlPayload>({
+  kind: "defi-tvl",
+  source: "gloom-cloud",
+  schemaVersion: 1,
+  // The server reads the source once a UTC day; a month-old copy still dates itself.
+  policy: { staleMs: 30 * 60_000, expireMs: 30 * 86_400_000 },
+});
+
+export const DEFI_TVL_CACHES = [defiTvlCache] as const;
+
+const MAX_TVL_DAYS = 20_000;
+const tvlValue = (value: unknown) => value === null || (isFiniteNumber(value) && value >= 0);
+const changes = (entry: { change7d: unknown; change7dPercent: unknown; change30d: unknown; change30dPercent: unknown }) =>
+  [entry.change7d, entry.change7dPercent, entry.change30d, entry.change30dPercent].every(nullableNumber);
+
+export function validateDefiTvl(data: DefiTvlPayload): DefiTvlPayload {
+  const history = data?.history;
+  if (
+    !data
+    || data.version !== 1
+    || !instant(data.generatedAt)
+    || !nullableInstant(data.fetchedAt)
+    || !(data.asOf === null || date(data.asOf))
+    || !supplyStatus(data.status)
+    || !data.source
+    || typeof data.source.name !== "string"
+    || typeof data.source.url !== "string"
+    || (data.total !== null && (!data.total || !isFiniteNumber(data.total.tvl) || !changes(data.total)))
+    || !Array.isArray(data.protocols)
+    || data.protocols.length > 500
+    || !data.protocols.every((protocol) => !!protocol
+      && typeof protocol.name === "string"
+      && protocol.name.length > 0
+      && nullableString(protocol.category)
+      && Number.isInteger(protocol.chains)
+      && isFiniteNumber(protocol.tvl)
+      && protocol.tvl >= 0
+      && nullableNumber(protocol.change1dPercent)
+      && changes(protocol))
+    || !nullableInstant(data.protocolsAsOf)
+    || !Array.isArray(data.chains)
+    || data.chains.length > 500
+    || !data.chains.every((chain) => !!chain
+      && typeof chain.name === "string"
+      && chain.name.length > 0
+      && nullableString(chain.tokenSymbol)
+      && isFiniteNumber(chain.tvl)
+      && chain.tvl >= 0
+      && nullableNumber(chain.share)
+      && changes(chain))
+    || (history !== null && (
+      !history
+      || !date(history.start)
+      || !Array.isArray(history.total)
+      || history.total.length > MAX_TVL_DAYS
+      || !history.total.every(tvlValue)
+    ))
+    || !Array.isArray(data.warnings)
+    || data.warnings.some((warning) => typeof warning !== "string")
+  ) {
+    throw new Error("The server returned invalid DeFi TVL");
+  }
+  return data;
+}
+
+export async function fetchDefiTvl(
+  client: Pick<typeof apiClient, "getCloudDefiTvl"> = apiClient,
+): Promise<DefiTvlPayload> {
+  try {
+    return validateDefiTvl(await client.getCloudDefiTvl());
+  } catch (error) {
+    throw supplyError(error, "DeFi TVL");
+  }
+}
+
+export function cachedDefiTvl() {
+  return cachedCloudResource(defiTvlCache, "all", validateDefiTvl);
+}
+
+export function loadDefiTvl(force = false) {
+  return loadCloudResource(defiTvlCache, "all", () => fetchDefiTvl(), { force, validate: validateDefiTvl });
 }

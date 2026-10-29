@@ -169,8 +169,17 @@ describe("options --leaps", () => {
     const { dataProvider } = leapsProvider({ AAA: calls, BBB: calls });
     dataProvider.getTickerFinancials = async (symbol: string) => {
       if (symbol === "BBB") throw new Error("no financials");
-      return { fundamentals: { dividendYield: 0.01, exDividendDate: "2026-11-02" }, nextEarnings: { date: "2026-10-29" } } as never;
+      // The financials' own next report is not what the column reads: the calendar resolved as `earnings` resolves it is.
+      return { fundamentals: { dividendYield: 0.01, exDividendDate: "2026-11-02" }, nextEarnings: { date: "2026-10-20" } } as never;
     };
+    const event = (symbol: string, date: string) => ({ symbol, name: symbol, earningsDate: new Date(date), isDateEstimate: false,
+      epsEstimate: 1, epsActual: null, revenueEstimate: null, revenueActual: null, surprise: null, timing: "BMO" as const });
+    // BBB's calendar still names the report it made last week, which its record has out: it has no upcoming date.
+    Object.assign(dataProvider, {
+      getEarningsCalendar: async () => [event("AAA", "2026-10-29T12:30:00Z"), event("BBB", "2026-10-01T12:30:00Z")],
+      getCorporateActions: async (symbol: string) => ({ symbol, dividends: [], splits: [], earnings: symbol === "BBB"
+        ? [{ date: "2026-10-01", epsEstimate: 1, epsActual: 1.1, dateStatus: "reported" }] : [] }),
+    });
 
     const plain = createTestCliContext({ dataProvider });
     await options.execute(["AAA", "--leaps", "--delta", "0.5-0.9"], plain.context);
@@ -192,7 +201,7 @@ describe("options --leaps", () => {
     // BBB counts no dividends: on the same quotes its carry-net is AAA's less the 1% yield AAA's call forgoes.
     expect(bbb.carryNetPerYearPercent! - aaa.carryNetPerYearPercent!).toBeCloseTo(-1, 2);
     expect(result.warnings).toEqual([
-      "BBB: no earnings or dividend data, so carry-net counts no dividends",
+      "BBB: no upcoming earnings date; no dividend data, so carry-net counts no dividends",
       "IV rank unavailable (Gloom Cloud did not answer)",
     ]);
   });
@@ -219,6 +228,7 @@ test("the expiry window: a lower bound replaces the one-year floor, and one no e
   expect(window({ "--max-days": "730" })).toEqual([365, 730, null, null]);
   expect(window({ "--min-days": "180" })).toEqual([180, null, null, null]);
   expect(window({ "--expiry-from": "2027-04-01", "--max-days": "400" })).toEqual([null, 400, "2027-04-01", null]);
+  expect(window({ "--expiry-from": "1.4.2027", "--expiry-to": "Jan 21 2028" })).toEqual([null, null, "2027-04-01", "2028-01-21"]);
   expect(window({ "--expiration": "1832025600" })).toEqual([null, null, "2028-01-21", "2028-01-21"]);
   expect(window({ "--min-days": "730", "--max-days": "365" })).toContain("--min-days 730 is more than --max-days 365");
   expect(window({ "--expiry-from": "2028-06-01", "--expiry-to": "2027-06-01" })).toContain("such as --expiry-from 2027-06-01 --expiry-to 2028-06-01");
@@ -227,7 +237,8 @@ test("the expiry window: a lower bound replaces the one-year floor, and one no e
   expect(window({ "--min-days": "100", "--expiry-to": "2026-12-01" })).toContain("under --min-days 100");
   expect(window({ "--expiry-from": "2029-06-01", "--max-days": "730" })).toContain("past --max-days 730");
   expect(window({ "--expiry-to": "2026-10-09" })).toContain("has passed");
-  expect(window({ "--expiry-from": "2027-02-30" })).toContain('Invalid --expiry-from "2027-02-30"');
+  expect(window({ "--expiry-from": "2027-02-30" })).toBe('Invalid --expiry-from "2027-02-30". '
+    + "Use an expiry date as YYYY-MM-DD, DD.MM.YYYY, Oct 14 2026 or 14 October 2026, such as --expiry-from 2027-06-18.");
   expect(window({ "--expiration": "2028-01-21", "--expiry-to": "2028-06-30" })).toContain("--expiration reads one expiry");
 });
 

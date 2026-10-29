@@ -51,7 +51,7 @@ function normalizeDetachedEntries(layout: LayoutConfig) {
     .map((entry) => ({ ...entry }));
 }
 
-function captureDockedMemory(dockRoot: DockLayoutNode | null): Map<string, DockedPlacementMemory> {
+export function captureDockedMemory(dockRoot: DockLayoutNode | null): Map<string, DockedPlacementMemory> {
   const memory = new Map<string, DockedPlacementMemory>();
   const leaves = collectDockLeafRefs(dockRoot);
 
@@ -111,10 +111,11 @@ function capturePlacementMemory(layout: LayoutConfig): LayoutConfig {
 
       return {
         ...instance,
-        placementMemory: nextDocked || nextFloating || nextDetached ? {
+        placementMemory: nextDocked || nextFloating || nextDetached || previous.window ? {
           docked: nextDocked,
           floating: nextFloating,
           detached: nextDetached,
+          ...(previous.window ? { window: previous.window } : {}),
         } : undefined,
       };
     }),
@@ -131,11 +132,26 @@ export function finalizeLayout(layout: LayoutConfig): LayoutConfig {
 }
 
 function removeDockedLeaf(layout: LayoutConfig, instanceId: string): LayoutConfig {
-  const leaf = collectDockLeafRefs(layout.dockRoot).find((entry) => entry.instanceId === instanceId);
-  if (!leaf) return layout;
+  const dockRoot = removeFromDockTree(layout.dockRoot, instanceId);
+  return dockRoot === layout.dockRoot ? layout : { ...layout, dockRoot };
+}
+
+function removeFromDockTree(root: DockLayoutNode | null, instanceId: string): DockLayoutNode | null {
+  const leaf = collectDockLeafRefs(root).find((entry) => entry.instanceId === instanceId);
+  return leaf ? removeNodeAtPath(root, leaf.path) : root;
+}
+
+/** Takes the pane out of every secondary window, keeping windows it is not in as they are. */
+function removeFromWindows(layout: LayoutConfig, instanceId: string): Pick<LayoutConfig, "windows"> {
+  if (!layout.windows) return {};
   return {
-    ...layout,
-    dockRoot: removeNodeAtPath(layout.dockRoot, leaf.path),
+    windows: layout.windows.map((window) => {
+      const dockRoot = removeFromDockTree(window.dockRoot, instanceId);
+      const floating = window.floating.filter((entry) => entry.instanceId !== instanceId);
+      return dockRoot === window.dockRoot && floating.length === window.floating.length
+        ? window
+        : { ...window, dockRoot, floating };
+    }),
   };
 }
 
@@ -144,6 +160,7 @@ export function detachPane(layout: LayoutConfig, instanceId: string): LayoutConf
     ...removeDockedLeaf(layout, instanceId),
     floating: layout.floating.filter((entry) => entry.instanceId !== instanceId),
     detached: (layout.detached ?? []).filter((entry) => entry.instanceId !== instanceId),
+    ...removeFromWindows(layout, instanceId),
   };
 }
 

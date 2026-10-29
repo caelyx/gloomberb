@@ -35,6 +35,10 @@ const SERIES_MAP: Record<string, FredMapping> = {
   "building permits": { seriesId: "PERMIT", displayMode: "level", relatedTickers: ["XHB", "ITB"] },
   "existing home sales": { seriesId: "EXHOSLUSM495S", displayMode: "level", relatedTickers: ["XHB"] },
   "new home sales": { seriesId: "HSN1F", displayMode: "level", relatedTickers: ["XHB", "ITB"] },
+  // Freddie Mac's PMMS, not the MBA's contract rate ("mba 30-year mortgage rate"), which is another survey.
+  "30-year mortgage rate": { seriesId: "MORTGAGE30US", displayMode: "level", relatedTickers: ["XHB", "ITB"] },
+  "15-year mortgage rate": { seriesId: "MORTGAGE15US", displayMode: "level", relatedTickers: ["XHB", "ITB"] },
+  "nahb housing market index": { seriesId: "NAHBHMI", displayMode: "level", relatedTickers: ["XHB", "ITB"] },
   "durable goods orders m/m": { seriesId: "DGORDER", displayMode: "mom", relatedTickers: ["XLI", "SPY"] },
   "core durable goods orders m/m": { seriesId: "ADXTNO", displayMode: "mom", relatedTickers: ["XLI"] },
   "factory orders m/m": { seriesId: "AMTMNO", displayMode: "mom", relatedTickers: ["XLI"] },
@@ -51,12 +55,23 @@ const SERIES_MAP: Record<string, FredMapping> = {
   "unit labor costs q/q": { seriesId: "ULCNFB", displayMode: "qoq-annualized", relatedTickers: ["SPY", "^TNX"] },
 };
 
+/** Other countries' releases Gloom Cloud serves a series for, by country and normalized title. */
+const COUNTRY_SERIES_MAP: Record<string, Record<string, FredMapping>> = {
+  // TurkStat's CPI, published as percent changes; the related ticker is the US-listed MSCI Turkey ETF.
+  TR: {
+    "cpi y/y": { seriesId: "TURCPIYOY", displayMode: "level", relatedTickers: ["TUR"] },
+    "cpi m/m": { seriesId: "TURCPIMOM", displayMode: "level", relatedTickers: ["TUR"] },
+  },
+};
+
 function normalizeEventTitle(title: string): string {
   return title.toLowerCase().trim();
 }
 
 export function resolveFredMapping(eventTitle: string, country: string): FredMapping | null {
-  // Only US events have FRED data
+  const elsewhere = COUNTRY_SERIES_MAP[country];
+  if (elsewhere) return elsewhere[normalizeEventTitle(eventTitle)] ?? null;
+  // Otherwise only US events have FRED data
   if (country !== "US" && country !== "USD") return null;
 
   const normalized = normalizeEventTitle(eventTitle);

@@ -5,6 +5,8 @@ import {
   removePane,
   type ResolvedPane,
 } from "../../../layout/pane-manager";
+import { windowMoveTargets } from "../../../layout/pane-manager/secondary-windows";
+import type { DesktopWindowCommands } from "../../../state/app/context/window-commands";
 import type { PluginRegistry } from "../../../plugins/registry";
 import type { LayoutConfig } from "../../../types/config";
 import { isPaneLocked, setPaneLocked } from "../../../pane-settings";
@@ -112,7 +114,17 @@ export function menuForPane(
   askGloom?: () => void,
   /** Report a Bug: the pane's picture and a line to #bugs; absent where it cannot be posted or pictured. */
   reportBug?: () => void,
+  /** Move to another desktop window; absent outside the desktop app's main and secondary windows. */
+  windowCommands?: DesktopWindowCommands | null,
 ): ContextMenuItem[] {
+  // A secondary window's panes stay out of the main window's layout tabs, and
+  // it cannot open the panes Share and Ask Gloom open.
+  if (desktopWindowBridge?.kind === "window") {
+    fullscreen = undefined;
+    layoutMove = {};
+    sharePane = undefined;
+    askGloom = undefined;
+  }
   const baseActions: ContextMenuItem[] = [...paneItems];
   if (baseActions.length > 0) baseActions.push(contextMenuDivider("pane:own-actions-divider"));
   for (const setting of quickSettings) {
@@ -227,6 +239,17 @@ export function menuForPane(
       },
     });
   }
+  if (windowCommands) {
+    baseActions.push({
+      id: "move-to-window",
+      label: "Move to",
+      submenu: windowMoveTargets(layout, windowCommands.windowId).map(({ target, label }) => ({
+        id: `move-to-window:${target}`,
+        label,
+        onSelect: () => windowCommands.movePaneToWindow(pane.instance.instanceId, target),
+      })),
+    });
+  }
 
   const locked = isPaneLocked(pane.instance);
   baseActions.push({
@@ -273,6 +296,12 @@ export function menuItemsForFallback(
   return items.flatMap((item, index): PaneMenuEntry[] => {
     if (item.type === "divider") return [{ id: item.id ?? `divider:${index}`, label: "", divider: true, action: () => {} }];
     if (item.type === "role" || item.enabled === false || item.hidden === true) return [];
+    // The kit menu has one level: a submenu's items take its label in front ("Move to Window 2").
+    if (!item.onSelect && item.submenu?.length) {
+      return menuItemsForFallback(item.submenu, shortcutDisplayMode)
+        .filter((entry) => !entry.divider)
+        .map((entry) => ({ ...entry, label: `${item.label} ${entry.label}` }));
+    }
     if (!item.onSelect) return [];
     return [{
       id: item.id,

@@ -31,9 +31,12 @@
  * to the invented bars' last close),
  * `layout` (one pane that sets text or scrolls content, docked or floating,
  * for the layout checks; see layout-fixture.tsx), `des` (DES's overview
- * over an invented company, see DesPane), or `header` (the app's top bar in
+ * over an invented company, see DesPane), `header` (the app's top bar in
  * each update state, see header-fixture.tsx; `&host=browser` draws it as the
- * web app does).
+ * web app does), `tab-sweep` (what the layout sweep's tab visits are checked
+ * against, tab-sweep-fixture.tsx), or `kit` (the kit page: every design-system family in every
+ * state, see kit-fixture.tsx; `&family=<id>` shows one, `&theme=paper` and
+ * `&font=` as everywhere).
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ThemePicker, type ThemePickerHandle } from "../../src/components/command-bar/theme-picker";
@@ -53,6 +56,7 @@ import { StaticChartSurface } from "../../src/components/chart/static/chart-surf
 import { DataTableView } from "../../src/components/data-table/view";
 import { ChartTableHeader } from "../../src/components/chart-table/header";
 import { QueryBar } from "../../src/components/ui/query-bar";
+import { ColumnGrid } from "../../src/components/ui/column-grid";
 // A namespace import: the frame budget builds this file against the base
 // branch's sources too, which may not have useHeatTreemapScene.
 import * as heatSurface from "../../src/components/metric-treemap/heat-surface";
@@ -60,6 +64,8 @@ import type { MetricTreemapItem } from "../../src/components/metric-treemap/layo
 import { PaneSidebar } from "../../src/components/layout/pane/sidebar";
 import { DetachedPaneShell } from "../../src/components/layout/detached-pane-shell";
 import { usePaneTabs } from "../../src/components/layout/pane/pane-tabs";
+import { usePaneFooter } from "../../src/components/layout/pane/footer/registration";
+import { delayedFooterSegment } from "../../src/components/layout/pane/footer/model";
 import { Shell } from "../../src/components/layout/shell";
 import { Header } from "../../src/components/layout/header";
 import { StatusBar } from "../../src/components/layout/status-bar";
@@ -85,9 +91,12 @@ import { PANE_HEADER_ASK_MIN_WIDTH } from "../../src/components/layout/pane/head
 import { ChatFixturePane, chatLayout } from "./chat-fixture";
 import { AxisFixturePane } from "./axis-fixture";
 import { chatLatencyLayouts, ChatLatencySync } from "./chat-latency-fixture";
+import { useAppGlobalShortcuts } from "../../src/app/global-shortcuts";
 import { HeaderFixture, installHeaderClock, installHeaderMarketData, installHeaderPlatform, type HeaderFixtureHandle } from "./header-fixture";
 import { browserUiHost } from "../../src/renderers/browser/ui-host";
 import { LAYOUT_PANES, installLayoutFetches, layoutLayout } from "./layout-fixture";
+import { KitPage } from "./kit-fixture";
+import { TabSweepFixture } from "./tab-sweep-fixture";
 // A namespace import: the frame budget builds this file against the base branch's
 // sources too, which may not have every capture yet.
 import * as domScreenshot from "../../src/utils/dom-screenshot";
@@ -251,7 +260,8 @@ const PEN_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><p
  * A canvas chart (the composite chart's bitmap) over an SVG one (a sparkline),
  * on invented data, with a toolbar laid over the canvas by z-index, then the
  * CSS image layers charts draw: a dashed legend cue (a repeating gradient), a
- * colour scale (a gradient) and a toolbar icon (a colour box cut by an SVG mask).
+ * colour scale (a gradient) and a toolbar icon (a colour box cut by an SVG mask),
+ * and a ColumnGrid, whose rows are `display: contents` (DES Fundamentals, a quote book).
  */
 function ChartsPane({ width }: PaneProps) {
   const points = inventedSeries(120, 100, 18);
@@ -299,6 +309,14 @@ function ChartsPane({ width }: PaneProps) {
             maskRepeat: "no-repeat",
             maskPosition: "center",
           }}
+        />
+      </Box>
+      <Box data-shot-region="column-grid" marginTop={1} style={{ width: 360 }}>
+        <ColumnGrid
+          columns={[{ width: 10, growFrom: 10 }, { width: 12, growFrom: 8, align: "right" }]}
+          rows={[["Volume", "1.20M"], ["Market Cap", "5.00B USD"], ["P/E (TTM)", "21.5"]].map(([label, value]) => [
+            { text: label!, color: "#9aa3b2" }, { text: value!, color: "#e5e7eb" },
+          ])}
         />
       </Box>
     </Box>
@@ -422,6 +440,8 @@ function ChartRowsPane({ focused, width, height }: PaneProps) {
 
 const BOARD_TABS = [{ value: "one", label: "Stocks" }, { value: "two", label: "Rates" }];
 const BOARD_ROWS = TABLE_ROWS.slice(0, 12);
+/** The band's cursor rests on the latest close, as the inventories board's rests on the latest week. */
+const BOARD_CURSOR = CHART_SERIES[0]!.points.at(-1)!.date;
 
 /**
  * A board as the chart-table kit lays it out (inventories, money markets):
@@ -446,7 +466,7 @@ function ChartBoardPane({ paneId, focused, width, height }: PaneProps) {
             tableRows={BOARD_ROWS.length}
             tableColumns={TABLE_COLUMNS}
             query={<QueryBar width={width} meta="Invented closes" />}
-            chart={{ series: CHART_SERIES, minRows: 8 }}
+            chart={{ series: CHART_SERIES, minRows: 8, cursorDate: BOARD_CURSOR }}
           />
         )}
         selection={{ kind: "id", selectedId, getId: String, onChange: setSelectedId }}
@@ -701,6 +721,9 @@ function OverviewPane({ width, height, focused }: PaneProps) {
  * repeats the description, `long=1` gives it long account names, long
  * classification and site names, dated figures with their muted detail and a
  * book with large sizes, and `float=1` floats the pane over a plain one.
+ * `footer=1` gives it the status and hint of a delayed quote,
+ * `ratio=<0 to 1>` is how much of the width the docked pane starts with, and
+ * `fw=<cells>` how wide the floating one is.
  */
 const DES_LONG = params.get("long") === "1";
 /** Account names from 4 to 44 characters, several near the length a column at rest holds, so a name ends close to its track whatever the width. */
@@ -712,7 +735,8 @@ const DES_ACCOUNTS = DES_LONG
 const desDay = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
 const desPositions = Number(params.get("positions") ?? 3);
 const DES_DESCRIPTION = Array.from({ length: Number(params.get("scale") ?? 1) }, () => "Example Industries builds small instruments for imaginary observatories. The team assembles each device in a bright studio beside the river, checks the lenses twice, and sends a hand written guide with every order. Longer runs use the same tools, but the instruments travel to classrooms, research stations and libraries across several regions.").join(" ");
-const DES_TICKER = createTestTicker("EXMPL", "Example Industries", {
+const DES_NAME = DES_LONG ? "Example Industries of the Invented Archipelago and Associated Holdings Limited" : "Example Industries";
+const DES_TICKER = createTestTicker("EXMPL", DES_NAME, {
   exchange: "NASDAQ",
   assetCategory: "STK",
   portfolios: DES_ACCOUNTS.slice(0, desPositions),
@@ -723,7 +747,8 @@ const DES_TICKER = createTestTicker("EXMPL", "Example Industries", {
 const DES_FINANCIALS = createTestFinancials({
   financialCurrency: "USD",
   quote: createTestQuote({
-    symbol: "EXMPL", name: "Example Industries", price: 105.25, change: 1.25, changePercent: 1.2, previousClose: 104, lastUpdated: Date.UTC(2026, 0, 2),
+    symbol: "EXMPL", name: DES_NAME, price: 105.25, change: 1.25, changePercent: 1.2, previousClose: 104, lastUpdated: Date.UTC(2026, 0, 2),
+    ...(DES_LONG ? { exchangeName: "NASDAQ" } : {}),
     bid: 105.2, ask: 105.3, bidSize: DES_LONG ? 12_345_678 : 300, askSize: DES_LONG ? 98_765_432 : 500, high: 106, low: 103, high52w: 140, low52w: 80, volume: 1_200_000, marketCap: 5e9, marketState: "CLOSED",
   }),
   priceHistory: inventedSeries(120, 100, 18),
@@ -749,7 +774,16 @@ const DES_FINANCIALS = createTestFinancials({
     }
     : { description: DES_DESCRIPTION, sector: "Industrials", industry: "Instruments", employees: 12_345, website: "https://example.invalid", fiscalYearEnd: "12-31" },
 });
+const DES_FOOTER = params.get("footer") === "1";
 function DesPane({ width, height, focused }: PaneProps) {
+  // The status and the one hint the pane's real footer carries for a delayed quote.
+  usePaneFooter("des-fixture", () => DES_FOOTER ? {
+    info: [
+      { id: "quote", parts: [{ text: "Stale quote 2026-01-02", tone: "muted" }] },
+      delayedFooterSegment({ id: "access", detail: "15m delayed", delay: "15m", onPress: () => {} }),
+    ],
+    hints: [{ id: "upgrade", key: "$", label: "upgrade", onPress: () => {} }],
+  } : null, []);
   return <OverviewTab ticker={DES_TICKER} financials={DES_FINANCIALS} width={width} height={height} focused={focused} />;
 }
 
@@ -759,12 +793,12 @@ function desLayout(): LayoutConfig {
     return {
       dockRoot: leaf("plain:a"),
       instances: [instance("des:a"), instance("plain:a")],
-      floating: [{ instanceId: "des:a", x: 10, y: 2, width: 112, height: 44, zIndex: 50 }],
+      floating: [{ instanceId: "des:a", x: 10, y: 2, width: Number(params.get("fw") ?? 112), height: 44, zIndex: 50 }],
       detached: [],
     };
   }
   return {
-    dockRoot: { kind: "split", axis: "horizontal", ratio: 0.66, first: leaf("des:a"), second: leaf("plain:a") },
+    dockRoot: { kind: "split", axis: "horizontal", ratio: Number(params.get("ratio") ?? 0.66), first: leaf("des:a"), second: leaf("plain:a") },
     instances: [instance("des:a"), instance("plain:a")],
     floating: [],
     detached: [],
@@ -778,17 +812,28 @@ function desLayout(): LayoutConfig {
  */
 function PaintPane(props: PaneProps) {
   const [active, setActive] = useState("empty");
+  // Like the research pane: a tab opened once stays mounted, hidden while
+  // another one shows, so going back to it reveals the chart it drew.
+  const [mounted, setMounted] = useState<readonly string[]>(["empty"]);
+  const select = useCallback((tab: string) => {
+    setActive(tab);
+    setMounted((current) => (current.includes(tab) ? current : [...current, tab]));
+  }, []);
   const { strip, rows } = usePaneTabs({
     tabs: ["empty", "chart", "overview", "composer"].map((value) => ({ value, label: value })),
-    activeValue: active, onSelect: setActive,
+    activeValue: active, onSelect: select,
   });
   const body = { ...props, height: Math.max(4, props.height - rows) };
   return <Box flexDirection="column" flexGrow={1}>
     {strip}
-    {active === "chart" ? <ChartPane {...props} />
-      : active === "overview" ? <OverviewPane {...props} />
-      : active === "composer" ? <ChartComposerFixturePane {...body} />
-      : null}
+    {mounted.map((tab) => (
+      <Box key={tab} visible={tab === active} flexDirection="column" flexGrow={1} flexBasis={0} overflow="hidden">
+        {tab === "chart" ? <ChartPane {...body} />
+          : tab === "overview" ? <OverviewPane {...body} />
+          : tab === "composer" ? <ChartComposerFixturePane {...body} />
+          : null}
+      </Box>
+    ))}
   </Box>;
 }
 
@@ -1375,6 +1420,14 @@ function config() {
 }
 
 const paneRegistry = registry();
+
+function ChatNavigationShortcuts() {
+  const state = useAppSelector((value) => value);
+  const dispatch = useAppDispatch();
+  useAppGlobalShortcuts({ state, dispatch, pluginRegistry: paneRegistry, isDetachedWindow: false,
+    focusedTickerSymbol: null, refreshTicker() {}, restartToApplyUpdate() {}, startUpdate() {} });
+  return null;
+}
 const detachedBridge: DesktopWindowBridge & { kind: "detached"; paneId: string } = {
   kind: "detached",
   paneId: scenario === "theme-detached" ? "chart:theme" : scenario === "chat" ? "chat:a" : "tabs:a",
@@ -1429,7 +1482,7 @@ registerAskGloomPaneHandler(({ paneId, visibleText, args }) => {
 // The pane reads its data from the cache on mount, so it renders with the invented data at once.
 if (scenario === "screenshot" || params.get("float") === "fear") await loadFearGreed(true, async () => INVENTED_FEAR_GREED);
 if (scenario === "cmp" && params.get("linked") === "mixed") await loadFearGreed(true, async () => recentFearGreed());
-if (scenario === "layout") installLayoutFetches();
+if (scenario === "layout") installLayoutFetches(params);
 if (scenario === "header") {
   installHeaderPlatform(platform);
   installHeaderClock();
@@ -1452,14 +1505,17 @@ createRoot(root).render(
       {detached
         ? <DetachedPaneShell pluginRegistry={paneRegistry} desktopWindowBridge={detachedBridge} />
         : scenario === "header" ? <HeaderFixture handle={window.__paneChrome.header} />
-        : scenario === "theme" ? <Box flexDirection="column" width="100%" height="100%">
-          <Box data-theme-chrome="header"><Header /></Box>
+        : scenario === "kit" ? <KitPage family={params.get("family")} />
+        : scenario === "tab-sweep" ? <TabSweepFixture />
+        : scenario === "theme" || params.get("layoutReturn") === "1" ? <Box flexDirection="column" width="100%" height="100%">
+          {scenario === "theme" && <Box data-theme-chrome="header"><Header /></Box>}
           <Shell pluginRegistry={paneRegistry} />
           <Box data-theme-chrome="status"><StatusBar /></Box>
         </Box> : <Shell pluginRegistry={paneRegistry} />}
       {(scenario.startsWith("theme") || scenario === "paint") && <ThemeControls />}
       {scenario === "paint" && <PaneAdder />}
       {scenario === "chat" && params.get("latencyCheck") === "1" && <ChatLatencySync />}
+      {scenario === "chat" && params.get("layoutReturn") === "1" && <ChatNavigationShortcuts />}
       <Ready />
     </AppProvider>
   </DomHostProviders>,

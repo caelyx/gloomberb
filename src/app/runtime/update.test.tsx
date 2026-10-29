@@ -8,11 +8,13 @@ import { resolveUpdateChannel, withUpdateChannel } from "../../updater/channel";
 import { VERSION } from "../../version";
 import { debugLog, type LogEntry } from "../../utils/debug-log";
 import { useAppUpdateRuntime } from "./update";
+import { setConfigStoreHost, type ConfigStoreHost } from "../../data/config/store";
 
 const tui = createOpenTuiTestHarness();
 
 afterEach(() => {
   setUpdateHost(null);
+  setConfigStoreHost(null);
 });
 
 const release: ReleaseInfo = {
@@ -92,6 +94,28 @@ async function mountRuntime(options: { detached?: boolean; initial?: Partial<App
   return { runtime: () => runtime, state: () => current.state, dispatch: (action: AppAction) => current.dispatch(action), settle };
 }
 
+test("a failed launch-version save is logged while the runtime keeps its config update", async () => {
+  installFakeHost();
+  const saved: unknown[] = [];
+  setConfigStoreHost({
+    saveConfig: async (config) => {
+      saved.push(config);
+      throw new Error("Injected config write failure");
+    },
+  } as ConfigStoreHost);
+  const logged: LogEntry[] = [];
+  const unsubscribe = debugLog.subscribe((entry) => { if (entry.source === "update") logged.push(entry); });
+  try {
+    const app = await mountRuntime({ initial: { config: createDefaultConfig("unused") } });
+    expect(app.state().config.lastLaunchedVersion).toBe(VERSION);
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({ lastLaunchedVersion: VERSION });
+    expect(logged.map((entry) => entry.source)).toEqual(["update"]);
+  } finally {
+    unsubscribe();
+  }
+});
+
 test("downloads in the background, stops at ready, and restarts only when asked", async () => {
   const host = installFakeHost();
   const app = await mountRuntime();
@@ -116,9 +140,9 @@ test("downloads in the background, stops at ready, and restarts only when asked"
   expect(app.state().updateProgress).toEqual({ phase: "replacing" });
 });
 
-test("a failed apply shows the error and can be tried again", async () => {
+test("a failed apply shows the error and can be tried again from the command bar", async () => {
   const host = installFakeHost();
-  host.onApply = (report) => report({ phase: "error", error: "Failed to replace app" });
+  host.onApply = (report) => report({ phase: "error", error: "Failed to replace app", failure: { phase: "apply", code: "permission_denied" } });
   const app = await mountRuntime();
   const logged: LogEntry[] = [];
   const unsubscribe = debugLog.subscribe((entry) => { if (entry.source === "update") logged.push(entry); });
@@ -126,12 +150,17 @@ test("a failed apply shows the error and can be tried again", async () => {
   act(() => { app.runtime().restartToApplyUpdate(); });
   await app.settle();
   unsubscribe();
-  expect(app.state().updateProgress).toEqual({ phase: "error", error: "Failed to replace app" });
-  // The header cuts the message to its room; the log keeps all of it.
-  expect(logged).toMatchObject([{ level: "error", message: "update failed", data: { error: "Failed to replace app" } }]);
+  expect(app.state().updateProgress).toMatchObject({ phase: "error", error: "Failed to replace app" });
+  // The header says the reason in a few words; the log keeps all of it.
+  expect(logged).toMatchObject([{
+    level: "error",
+    message: "update failed",
+    data: { error: "Failed to replace app", phase: "apply", code: "permission_denied" },
+  }]);
 
-  // Retry downloads again and lands on ready, then Restart works once more.
-  act(() => { app.runtime().startUpdate(release); });
+  // Check for Updates retries, as the key does: it downloads again and lands
+  // on ready, then Restart works once more.
+  act(() => { app.runtime().runUpdateCommand(); });
   await app.settle();
   expect(app.state().updateProgress).toEqual({ phase: "ready", canRestart: true });
   act(() => { app.runtime().restartToApplyUpdate(); });
@@ -173,6 +202,20 @@ test("a download that finds nothing to take passes as a notice and is not offere
   await app.settle();
   expect(host).toEqual({ checks: 3, downloads: 2 });
   expect(app.state()).toMatchObject({ updateProgress: null, updateAvailable: null, updateNotice: "Already on the latest version" });
+});
+
+test("a check asked for by hand that fails says why in a few words", async () => {
+  setUpdateHost({
+    async checkForUpdateDetailed() {
+      return { kind: "error", error: "GitHub returned 403", failure: { phase: "check", code: "rate_limited" } };
+    },
+    async performUpdate() {},
+  });
+  const app = await mountRuntime();
+
+  await act(async () => { await app.runtime().runUpdateCheck(true); });
+  await app.settle();
+  expect(app.state().updateNotice).toBe("Update check failed: GitHub rate limit");
 });
 
 test("a popped-out window neither checks nor restarts", async () => {

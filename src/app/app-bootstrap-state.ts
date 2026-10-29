@@ -109,7 +109,8 @@ export function resolveAppSessionSnapshot<TLaunchState = unknown>({
   desktopWindowKind,
   sessionStore,
 }: ResolveAppSessionSnapshotOptions<TLaunchState>): AppSessionSnapshot | null {
-  if (desktopWindowKind === "detached") {
+  // A popped-out pane or a secondary window starts from the shared state, not a saved session.
+  if (desktopWindowKind === "detached" || desktopWindowKind === "window") {
     return resolveDetachedAppSessionSnapshot(config, sessionStore, desktopSnapshot);
   }
 

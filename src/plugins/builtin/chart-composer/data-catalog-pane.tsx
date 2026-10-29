@@ -1,3 +1,4 @@
+import { logFailure } from "../../../utils/log-failure";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Box } from "../../../ui";
 import {
@@ -10,6 +11,7 @@ import {
   type DataTableKeyEvent,
   type DataTableRootKeyContext,
 } from "../../../components";
+import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import type { PaneProps } from "../../../types/plugin";
 import { colors } from "../../../theme/colors";
 import { nextHeaderSort, type SortDirection } from "../../../utils/sort-values";
@@ -25,6 +27,7 @@ import {
   catalogEmptyCopy,
   catalogExpressionForRow,
   catalogInstrumentMatchesQuery,
+  catalogPlacedSeriesForRow,
   catalogRowsForListedCrypto,
   catalogRowsForResolvedInstruments,
   catalogRowsFromEntries,
@@ -40,6 +43,8 @@ import {
   type CatalogSeriesRow,
 } from "./catalog-inventory";
 import { useCatalogUniverse, useRegisteredSeries } from "./use-series-catalog";
+import { buildRegisteredSeriesChart } from "./presets";
+import { currencyCodeLabel } from "../../../utils/currency-units";
 
 type CatalogColumnId = "series" | "group" | "unit" | "frequency" | "publisher" | "expression";
 type CatalogColumn = DataTableColumn & { id: CatalogColumnId };
@@ -105,7 +110,7 @@ function buildColumns(width: number, showGroup: boolean): CatalogColumn[] {
 }
 
 export function DataCatalogPane({ focused, width, height }: PaneProps) {
-  const { createPaneFromTemplate } = usePluginAppActions();
+  const { createPaneFromTemplate, notify } = usePluginAppActions();
   const dialog = useDialog();
   const [seedQuery] = usePaneSettingValue("query", "");
   const [searchQuery, setSearchQuery] = useState(seedQuery);
@@ -114,14 +119,15 @@ export function DataCatalogPane({ focused, width, height }: PaneProps) {
   const [sortPreference, setSortPreference] = useState<CatalogSortPreference>(DEFAULT_SORT);
   const { active: searchFocused, focus: focusSearch, searchProps } = useQueryBarSearch();
 
-  const entries = useRegisteredSeries();
+  const { entries, loading: catalogLoading, error: catalogError, retry } = useRegisteredSeries();
+  usePaneRefreshKey(() => { void retry(); }, { focused, enabled: !searchFocused });
   const catalogRows = useMemo(() => catalogRowsFromEntries(entries), [entries]);
   const filter = normalizeCatalogFilter(savedFilter, catalogRows);
   const tickerQuery = looksLikeCatalogTickerQuery(searchQuery);
   const { instruments, loading: universeLoading } = useCatalogUniverse(
     tickerQuery ? searchQuery : "",
   );
-  const loading = tickerQuery && universeLoading;
+  const loading = catalogLoading || (tickerQuery && universeLoading);
   const emptyCopy = catalogEmptyCopy(loading, searchQuery);
 
   const listedCrypto = useMemo(
@@ -152,6 +158,22 @@ export function DataCatalogPane({ focused, width, height }: PaneProps) {
 
   const columns = useMemo(() => buildColumns(width, filter === "all"), [filter, width]);
 
+  // A series that says where it is drawn, or draws several lines, opens as the chart it builds.
+  const chartPlacedSeries = useCallback((row: CatalogSeriesRow, ticker?: string): boolean => {
+    if (!row.seriesName) return false;
+    const series = catalogPlacedSeriesForRow(row, ticker);
+    if (!series) return true;
+    let chartSpec: ReturnType<typeof buildRegisteredSeriesChart>;
+    try {
+      chartSpec = buildRegisteredSeriesChart(series, series.symbol);
+    } catch (error) {
+      notify({ body: error instanceof Error ? error.message : `${series.name} cannot be charted.`, type: "error" });
+      return true;
+    }
+    createPaneFromTemplate(CHART_COMPOSER_TEMPLATE_ID, { shareData: { chartSpec } });
+    return true;
+  }, [createPaneFromTemplate, notify]);
+
   const chartSelected = useCallback(async (row: CatalogSeriesRow | null) => {
     if (!row) return;
     if (row.input) {
@@ -175,14 +197,16 @@ export function DataCatalogPane({ focused, width, height }: PaneProps) {
             }}
           />
         ),
-      }).catch(() => undefined);
+      }).catch(logFailure("chart-composer.data-catalog-pane", "Open chart ticker prompt failed"));
+      if (chartPlacedSeries(row, ticker)) return;
       const expression = catalogExpressionForRow(row, ticker);
       if (!expression) return;
       createPaneFromTemplate(CHART_COMPOSER_TEMPLATE_ID, { arg: expression });
       return;
     }
+    if (chartPlacedSeries(row)) return;
     createPaneFromTemplate(CHART_COMPOSER_TEMPLATE_ID, { arg: row.template });
-  }, [createPaneFromTemplate, dialog]);
+  }, [chartPlacedSeries, createPaneFromTemplate, dialog]);
 
   // `/` and `g` are footer hints, which bind their own keys; the table only
   // hands the cursor up into the search from its first row.
@@ -208,7 +232,7 @@ export function DataCatalogPane({ focused, width, height }: PaneProps) {
       case "group":
         return { text: row.group, color: colors.textDim };
       case "unit":
-        return { text: row.unit, color: colors.textDim };
+        return { text: currencyCodeLabel(row.unit), color: colors.textDim };
       case "frequency":
         return { text: FREQUENCY_LABELS[row.frequency], color: colors.textDim };
       case "publisher":
@@ -225,6 +249,7 @@ export function DataCatalogPane({ focused, width, height }: PaneProps) {
     source: selectedUrl ? selectedRow?.publisher : null,
     label: "source",
     loading,
+    error: catalogError,
     hints: [
       { id: "graph", key: "g", label: "raph", onPress: () => chartSelected(selectedRow), disabled: !selectedRow },
       { id: "search", key: "/", label: "search", onPress: focusSearch },

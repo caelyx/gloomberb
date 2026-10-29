@@ -18,6 +18,12 @@ export interface BrokerInstanceConfig {
   config: Record<string, unknown>;
   enabled?: boolean;
   lastSyncedAt?: number;
+  /**
+   * The user keeps this connection's data on this device: Cloud sync leaves out the profile, its
+   * accounts' portfolios and account values, and the positions in them. Daily roundups, the weekly
+   * brief, position alerts, the mobile app and Ask Gloom's portfolio context then go without it.
+   */
+  localOnly?: boolean;
 }
 
 export interface ColumnConfig {
@@ -39,6 +45,14 @@ export interface DockedPlacementMemory {
   position?: "left" | "right" | "above" | "below";
 }
 
+/**
+ * Where a pane sat docked in the window it was last moved out of, so moving
+ * it back puts it there again. `windowId` is "main" for the main window.
+ */
+export interface WindowPlacementMemory extends DockedPlacementMemory {
+  windowId: string;
+}
+
 export interface FloatingPlacementMemory {
   x: number;
   y: number;
@@ -57,6 +71,7 @@ export interface PanePlacementMemory {
   docked?: DockedPlacementMemory;
   floating?: FloatingPlacementMemory;
   detached?: DetachedPlacementMemory;
+  window?: WindowPlacementMemory;
 }
 
 /**
@@ -129,11 +144,24 @@ interface DetachedPaneEntry {
   height: number;
 }
 
+/**
+ * A desktop window beside the main one with a grid of its own. Its panes are
+ * instances of the same layout; the window only says where they sit. Its frame
+ * is kept per machine, not here.
+ */
+export interface SecondaryWindowLayout {
+  id: string;
+  dockRoot: DockLayoutNode | null;
+  floating: FloatingPaneEntry[];
+}
+
 export interface LayoutConfig {
   dockRoot: DockLayoutNode | null;
   instances: PaneInstanceConfig[];
   floating: FloatingPaneEntry[];
   detached: DetachedPaneEntry[];
+  /** Secondary desktop windows; missing means none. Renderers without desktop windows keep them untouched. */
+  windows?: SecondaryWindowLayout[];
 }
 
 /**
@@ -266,6 +294,13 @@ export interface RecentCommand {
   arg?: string;
 }
 
+/** What a launch's plugin seed could not install. */
+export interface PluginSeedFailure {
+  /** Extracted plugin ids, sorted. */
+  plugins: string[];
+  gitMissing: boolean;
+}
+
 export interface AppConfig {
   dataDir: string;
   configVersion: number;
@@ -286,6 +321,13 @@ export interface AppConfig {
    */
   seededPlugins?: string[];
   /**
+   * The extracted plugins the last launch's seed could not install, and
+   * whether git was missing then. Absent until a seed fails, and again once
+   * one installs everything. `doctor` fails on it, and the launch notice that
+   * Gloom tries again is said once per failure.
+   */
+  pluginSeedFailure?: PluginSeedFailure;
+  /**
    * Manual portfolios have taken the one currency their positions share. Runs
    * once per install, so later holdings never move a portfolio's currency.
    */
@@ -299,6 +341,12 @@ export interface AppConfig {
   recentTickers: string[];
   /** Pane templates recently run from the command bar, newest first. */
   recentCommands: RecentCommand[];
+  /**
+   * How many times the empty command bar has opened, counted to one past its
+   * introduction (see `command-bar-intro.ts`). A new config starts at 0; one
+   * from an earlier build has none and reads as past it. Kept on this machine only.
+   */
+  commandBarOpens?: number;
   language?: LanguagePreference;
   onboardingComplete?: boolean;
   /** App version at the last launch, used to show release notes after an update. */
@@ -633,7 +681,65 @@ export function getPlacedPaneInstanceIds(layout: LayoutConfig): string[] {
     ...getDockedPaneIdsFromNode(layout.dockRoot),
     ...layout.floating.map((entry) => entry.instanceId),
     ...(layout.detached ?? []).map((entry) => entry.instanceId),
+    ...(layout.windows ?? []).flatMap((window) => [
+      ...getDockedPaneIdsFromNode(window.dockRoot),
+      ...window.floating.map((entry) => entry.instanceId),
+    ]),
   ])];
+}
+
+function cloneSecondaryWindow(window: SecondaryWindowLayout): SecondaryWindowLayout {
+  return {
+    id: window.id,
+    dockRoot: window.dockRoot ? cloneDockNode(window.dockRoot) : null,
+    floating: window.floating.map((entry) => ({ ...entry })),
+  };
+}
+
+/** `{ windows }` when there are any, so a layout without windows keeps its shape. */
+function windowsField(windows: SecondaryWindowLayout[]): Pick<LayoutConfig, "windows"> {
+  return windows.length > 0 ? { windows } : {};
+}
+
+/**
+ * Window docks normalised after the main dock, sharing its seen set so a pane
+ * docked in two places keeps the first. A repeated window id keeps the first.
+ */
+function normalizeWindowDocks(
+  windows: SecondaryWindowLayout[] | undefined,
+  validInstanceIds: Set<string>,
+  seenPaneIds: Set<string>,
+): SecondaryWindowLayout[] {
+  const seenWindowIds = new Set<string>();
+  const result: SecondaryWindowLayout[] = [];
+  for (const window of windows ?? []) {
+    if (!window || typeof window.id !== "string" || window.id.length === 0 || seenWindowIds.has(window.id)) continue;
+    seenWindowIds.add(window.id);
+    result.push({
+      id: window.id,
+      dockRoot: normalizeDockNode(window.dockRoot, validInstanceIds, seenPaneIds),
+      floating: Array.isArray(window.floating) ? window.floating : [],
+    });
+  }
+  return result;
+}
+
+/** Keeps each window's floating panes that are valid and not already placed, first place wins. */
+function filterWindowFloating(
+  windows: SecondaryWindowLayout[],
+  validInstanceIds: Set<string>,
+  placedPaneIds: Set<string>,
+): SecondaryWindowLayout[] {
+  return windows.map((window) => ({
+    ...window,
+    floating: window.floating
+      .filter((entry) => {
+        if (!validInstanceIds.has(entry.instanceId) || placedPaneIds.has(entry.instanceId)) return false;
+        placedPaneIds.add(entry.instanceId);
+        return true;
+      })
+      .map((entry) => ({ ...entry })),
+  }));
 }
 
 export function createPaneInstanceId(paneId: string): string {
@@ -656,6 +762,7 @@ export function clonePlacementMemory(memory: PanePlacementMemory | undefined): P
     } : undefined,
     floating: memory.floating ? { ...memory.floating } : undefined,
     detached: memory.detached ? { ...memory.detached } : undefined,
+    ...(memory.window ? { window: { ...memory.window, path: memory.window.path ? [...memory.window.path] : undefined } } : {}),
   };
 }
 
@@ -764,20 +871,28 @@ export function removePaneInstances(layout: LayoutConfig, instanceIds: Iterable<
         anchorInstanceId: undefined,
       };
       const nextDocked = docked.path || docked.position ? docked : undefined;
-      const placementMemory = nextDocked || memory.floating || memory.detached
+      const placementMemory = nextDocked || memory.floating || memory.detached || memory.window
         ? { ...memory, docked: nextDocked }
         : undefined;
       return { ...instance, placementMemory };
     });
-  const dockRoot = normalizeDockNode(layout.dockRoot, validInstanceIds, new Set<string>());
-  const dockedPaneIds = new Set(getDockedPaneIdsFromNode(dockRoot));
+  const dockedPaneIds = new Set<string>();
+  const dockRoot = normalizeDockNode(layout.dockRoot, validInstanceIds, dockedPaneIds);
+  const windowDocks = normalizeWindowDocks(layout.windows, validInstanceIds, dockedPaneIds);
   const detached = layout.detached ?? [];
+  const floating = layout.floating.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId));
+  const windows = windowDocks.map((window) => ({
+    ...window,
+    floating: window.floating.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId)),
+  }));
+  const { windows: _previousWindows, ...rest } = layout;
   return {
-    ...layout,
+    ...rest,
     instances,
     dockRoot,
-    floating: layout.floating.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId)),
+    floating,
     detached: detached.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId)),
+    ...windowsField(windows),
   };
 }
 
@@ -883,8 +998,10 @@ export function normalizePaneLayout(
   }
 
   const validInstanceIds = new Set(nextLayout.instances.map((instance) => instance.instanceId));
-  const dockRoot = normalizeDockNode(nextLayout.dockRoot, validInstanceIds, new Set<string>());
-  const dockedPaneIds = new Set(getDockedPaneIdsFromNode(dockRoot));
+  // One place per pane: main dock, window docks, detached, main floating, then window floating.
+  const dockedPaneIds = new Set<string>();
+  const dockRoot = normalizeDockNode(nextLayout.dockRoot, validInstanceIds, dockedPaneIds);
+  const windowDocks = normalizeWindowDocks(nextLayout.windows, validInstanceIds, dockedPaneIds);
   const detached = (nextLayout.detached ?? [])
     .filter((entry) => validInstanceIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId))
     .filter((entry, index, entries) => entries.findIndex((candidate) => candidate.instanceId === entry.instanceId) === index)
@@ -895,7 +1012,12 @@ export function normalizePaneLayout(
       width: entry.width,
       height: entry.height,
     }));
-  const detachedPaneIds = new Set(detached.map((entry) => entry.instanceId));
+  const placedPaneIds = new Set([...dockedPaneIds, ...detached.map((entry) => entry.instanceId)]);
+  const floating = nextLayout.floating
+    .filter((entry) => validInstanceIds.has(entry.instanceId) && !placedPaneIds.has(entry.instanceId))
+    .map((entry) => ({ ...entry }));
+  for (const entry of floating) placedPaneIds.add(entry.instanceId);
+  const windows = filterWindowFloating(windowDocks, validInstanceIds, placedPaneIds);
 
   return {
     dockRoot,
@@ -907,14 +1029,9 @@ export function normalizePaneLayout(
       placementMemory: clonePlacementMemory(instance.placementMemory),
       ...(instance.movedFrom ? { movedFrom: clonePaneMovedFrom(instance.movedFrom) } : {}),
     })),
-    floating: nextLayout.floating
-      .filter((entry) => (
-        validInstanceIds.has(entry.instanceId)
-        && !dockedPaneIds.has(entry.instanceId)
-        && !detachedPaneIds.has(entry.instanceId)
-      ))
-      .map((entry) => ({ ...entry })),
+    floating,
     detached,
+    ...windowsField(windows),
   };
 }
 
@@ -932,6 +1049,7 @@ export function cloneLayout(layout: LayoutConfig): LayoutConfig {
     })),
     floating: layout.floating.map((entry) => ({ ...entry })),
     detached: detached.map((entry) => ({ ...entry })),
+    ...windowsField((layout.windows ?? []).map(cloneSecondaryWindow)),
   };
 }
 
@@ -995,6 +1113,7 @@ export function createDefaultConfig(dataDir: string): AppConfig {
     fontSize: 12,
     recentTickers: [],
     recentCommands: [],
+    commandBarOpens: 0,
   };
 }
 

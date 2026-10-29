@@ -1,3 +1,4 @@
+import { logFailure } from "../utils/log-failure";
 import {
   apiClient,
   type FunctionUsageCount,
@@ -96,7 +97,6 @@ let officialIds: ReadonlySet<string> | null = null;
 let officialLookup: Promise<void> | null = null;
 let automationDepth = 0;
 const builtinPlugins = new WeakSet<object>();
-const openListeners = new Set<() => void>();
 
 /** Reads the config switch and the environment. Absent means on. */
 export function usageCountsEnabled(
@@ -118,6 +118,7 @@ export function usageTelemetryAllowed(config: { telemetry?: TelemetryConfig } | 
     if (!usageCountsEnabled(config, typeof process !== "undefined" ? process.env : undefined)) return false;
     return !host || host.isEnabled();
   } catch {
+    // Intentional ignore: An unreadable consent setting disables usage reporting.
     return false;
   }
 }
@@ -172,7 +173,8 @@ export function usageFunctionForPane(
       return describeUsageFunction(registry, registry.getPaneTemplatePluginId(template.id), template.shortcut.prefix);
     }
     return describeUsageFunction(registry, registry.getPanePluginId(paneId), null);
-  } catch {
+  } catch (error) {
+    logFailure("telemetry-usage-counts", "Could not identify function usage")(error);
     return { shortcut: null, externalPluginId: null };
   }
 }
@@ -194,30 +196,15 @@ export function automationActive(): boolean {
   return automationDepth > 0;
 }
 
-/**
- * Calls `listener` each time the user opens a function, with nothing about
- * which one. The web terminal's first-screen measure uses it; automation never
- * reaches it.
- */
-export function subscribeFunctionOpens(listener: () => void): () => void {
-  openListeners.add(listener);
-  return () => {
-    openListeners.delete(listener);
-  };
-}
-
 /** Counts one open of a function by the user. Never throws. */
 export function recordFunctionOpen(fn: UsageFunction): void {
   try {
     if (automationDepth > 0) return;
-    for (const listener of openListeners) {
-      try { listener(); } catch { /* A listener never stops the open. */ }
-    }
     if (host && !host.isEnabled()) return;
     count(fn, "opened");
     scheduleFlush();
-  } catch {
-    /* Counting must never get in the way of opening a function. */
+  } catch (error) {
+    logFailure("telemetry-usage-counts", "Could not record function usage")(error);
   }
 }
 
@@ -233,8 +220,8 @@ export function recordRestoredFunctions(fns: readonly UsageFunction[]): void {
     if (host && !host.isEnabled()) return;
     for (const fn of fns) count(fn, "restored");
     scheduleFlush();
-  } catch {
-    /* Best effort. */
+  } catch (error) {
+    logFailure("telemetry-usage-counts", "Could not record restored function usage")(error);
   }
 }
 
@@ -271,8 +258,8 @@ export async function flushUsageCounts(options: { timeoutMs?: number } = {}): Pr
   });
   try {
     await Promise.race([flushNow({ exiting: true }), deadline]);
-  } catch {
-    /* The caller is on its way out. */
+  } catch (error) {
+    logFailure("telemetry-usage-counts", "Could not flush usage counts")(error);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -312,7 +299,7 @@ function lookUpOfficialPlugins(): Promise<void> {
       // An empty answer means the registry could not be read; ask again later.
       if (ids.size > 0) officialIds = ids;
     })
-    .catch(() => {})
+    .catch(logFailure("telemetry-usage-counts", "Could not load official plugin identifiers"))
     .finally(() => {
       officialLookup = null;
     });
@@ -364,9 +351,8 @@ async function sendPending({ exiting }: { exiting: boolean }): Promise<void> {
       ...(current.os ? { os: current.os } : {}),
       counts,
     });
-  } catch {
-    // A batch that could not be sent is dropped, not retried: an offline
-    // app, a rate limit, or a server without this endpoint yet (404).
+  } catch (error) {
+    logFailure("telemetry-usage-counts", "Could not send usage counts")(error);
   }
 }
 

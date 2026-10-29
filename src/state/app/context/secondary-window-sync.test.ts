@@ -1,0 +1,373 @@
+import { describe, expect, test } from "bun:test";
+import { appReducer, createInitialState, type AppState } from "../../../core/state/app/state";
+import { addPaneToLayout, getDockedPaneIds, removePane } from "../../../layout/pane-manager";
+import { updatePaneInstance } from "../../../pane-settings";
+import { secondaryWindowPaneIds, viewLayoutFromWindow } from "../../../layout/pane-manager/secondary-windows";
+import { createDefaultConfig, createPaneInstance, type AppConfig, type LayoutConfig } from "../../../types/config";
+import type { DesktopSharedStateSnapshot, DesktopWindowIntent } from "../../../types/desktop-window";
+import { applyWindowIntent, SecondaryWindowSync, windowMoveOutcome } from "./secondary-window-sync";
+
+/** Main has a list and a chart; window w2 has news and econ side by side. */
+function twoWindowLayout(): LayoutConfig {
+  return {
+    dockRoot: {
+      kind: "split",
+      axis: "horizontal",
+      ratio: 0.5,
+      first: { kind: "pane", instanceId: "list" },
+      second: { kind: "pane", instanceId: "chart" },
+    },
+    instances: [
+      createPaneInstance("portfolio-list", { instanceId: "list" }),
+      createPaneInstance("ticker-detail", { instanceId: "chart" }),
+      createPaneInstance("news", { instanceId: "news" }),
+      createPaneInstance("econ", { instanceId: "econ" }),
+    ],
+    floating: [],
+    detached: [],
+    windows: [{
+      id: "w2",
+      dockRoot: {
+        kind: "split",
+        axis: "horizontal",
+        ratio: 0.5,
+        first: { kind: "pane", instanceId: "news" },
+        second: { kind: "pane", instanceId: "econ" },
+      },
+      floating: [],
+    }],
+  };
+}
+
+function mainConfig(layout = twoWindowLayout()): AppConfig {
+  const config = createDefaultConfig("/tmp/gloomberb-test");
+  return { ...config, layout, layouts: [{ name: "Main", layout }], activeLayoutIndex: 0 };
+}
+
+function mainState(layout = twoWindowLayout()): AppState {
+  return createInitialState(mainConfig(layout));
+}
+
+/** The snapshot window w2 receives for the main window's state. */
+function viewOf(state: AppState): DesktopSharedStateSnapshot {
+  return {
+    config: { ...state.config, layout: viewLayoutFromWindow(state.config.layout, "w2") },
+    paneState: state.paneState,
+    focusedPaneId: "news",
+    statusBarVisible: false,
+  };
+}
+
+function hydrate(local: AppState, snapshot: DesktopSharedStateSnapshot): AppState {
+  return appReducer(local, { type: "HYDRATE_DESKTOP_SNAPSHOT", snapshot });
+}
+
+/** Applies an intent the way the main window does and returns its next state. */
+function applyInMain(state: AppState, intent: DesktopWindowIntent): { state: AppState; applied: boolean } {
+  const outcome = applyWindowIntent(state, "w2", intent);
+  return { applied: outcome.applied, state: outcome.actions.reduce(appReducer, state) };
+}
+
+describe("applyWindowIntent", () => {
+  test("takes pane state and plugin settings for the window's own panes only", () => {
+    const state = mainState();
+    const paneState = applyInMain(state, {
+      type: "replacePaneState",
+      paneState: { news: { cursorSymbol: "AAPL" }, list: { cursorSymbol: "MSFT" } },
+    });
+    expect(paneState.applied).toBe(true);
+    expect(paneState.state.paneState.news).toEqual({ cursorSymbol: "AAPL" });
+    expect(paneState.state.paneState.list).toEqual(state.paneState.list);
+
+    const withPlugin = { ...state, config: { ...state.config, pluginConfig: { keep: { a: 1 }, drop: { b: 2 } } } };
+    const plugin = applyWindowIntent(withPlugin, "w2", {
+      type: "setPluginConfig",
+      values: { drop: null, added: { c: 3 } },
+    });
+    expect(plugin.save?.pluginConfig).toEqual({ keep: { a: 1 }, added: { c: 3 } });
+  });
+
+  test("a grid edit enters the main window's undo history and is saved; a stale one is refused", () => {
+    const state = mainState();
+    const view = viewLayoutFromWindow(state.config.layout, "w2");
+    const edited = removePane(view, "econ");
+    const intent: DesktopWindowIntent = {
+      type: "editLayout",
+      edit: {
+        windowId: "w9",
+        basePaneIds: ["news", "econ"],
+        dockRoot: edited.dockRoot,
+        floating: edited.floating,
+        instances: edited.instances.filter((instance) => instance.instanceId === "news"),
+      },
+    };
+    // The host names the window; the edit's own claim is ignored.
+    const outcome = applyWindowIntent(state, "w2", intent);
+    expect(outcome.applied).toBe(true);
+    expect(outcome.actions.map((action) => action.type)).toEqual(["PUSH_LAYOUT_HISTORY", "UPDATE_LAYOUT"]);
+    const next = outcome.actions.reduce(appReducer, state);
+    expect(secondaryWindowPaneIds(next.config.layout, "w2")).toEqual(["news"]);
+    expect(outcome.save?.layout.instances.some((instance) => instance.instanceId === "econ")).toBe(false);
+
+    expect(applyWindowIntent(next, "w2", intent).applied).toBe(false);
+  });
+
+  test("a window moves only its own panes, beside the focused pane its target window reported, and raises that window", () => {
+    const state = mainState();
+    // Main's own focus anchors a pane moved into the main window.
+    const toMain = applyWindowIntent({ ...state, focusedPaneId: "list" }, "w2", { type: "movePane", paneId: "econ", target: "main" });
+    expect(toMain.applied).toBe(true);
+    expect(toMain.focus).toEqual({ windowId: "main", paneId: "econ" });
+    expect(getDockedPaneIds(toMain.actions.reduce(appReducer, state).config.layout)).toEqual(["list", "econ", "chart"]);
+
+    // The window it goes to anchors it at the focused pane that window last reported.
+    const withW3 = applyWindowIntent(state, "w2", { type: "addWindow" }).actions.reduce(appReducer, state);
+    const status = applyWindowIntent(withW3, "w2", { type: "windowStatus", status: { focusedPaneId: "news", size: { width: 100, height: 30 } } });
+    expect(status).toMatchObject({ applied: true, actions: [], windowStatus: { focusedPaneId: "news" } });
+    const fromMain = applyWindowIntent(withW3, "w3", { type: "movePane", paneId: "news", target: "w2" });
+    expect(fromMain.applied).toBe(false);
+    const across = applyWindowIntent(withW3, "w2", { type: "movePane", paneId: "econ", target: "w3" });
+    expect(across.focus).toEqual({ windowId: "w3", paneId: "econ" });
+    expect(secondaryWindowPaneIds(across.actions.reduce(appReducer, withW3).config.layout, "w3")).toEqual(["econ"]);
+
+    // Not its pane, or to itself: refused.
+    expect(applyWindowIntent(state, "w2", { type: "movePane", paneId: "list", target: "main" }).applied).toBe(false);
+    expect(applyWindowIntent(state, "w2", { type: "movePane", paneId: "news", target: "w2" }).applied).toBe(false);
+  });
+
+  test("closing a window through the main window moves its panes into the main grid, once", () => {
+    const state = mainState();
+    const outcome = applyWindowIntent(state, "w2", { type: "closeWindow" });
+    expect(outcome.actions.map((action) => action.type)).toEqual(["PUSH_LAYOUT_HISTORY", "UPDATE_LAYOUT"]);
+    const next = outcome.actions.reduce(appReducer, state);
+    expect(next.config.layout.windows ?? []).toEqual([]);
+    expect(getDockedPaneIds(next.config.layout)).toEqual(["list", "chart", "news", "econ"]);
+    expect(outcome.save?.layouts[0]?.layout.windows ?? []).toEqual([]);
+    // Already gone: nothing to do, and nothing for the host to do instead.
+    expect(applyWindowIntent(next, "w2", { type: "closeWindow" })).toMatchObject({ applied: true, actions: [] });
+  });
+
+  test("takes the settings a window changed, only from the allowed fields, and reports the config changed", () => {
+    const state = mainState();
+    const outcome = applyWindowIntent(state, "w2", {
+      type: "setConfig",
+      fields: { theme: "solarized", baseCurrency: "AUD", commandBarOpens: 2, dataDir: "/elsewhere", activeLayoutIndex: 3, onboardingComplete: false },
+    });
+    expect(outcome.applied).toBe(true);
+    const next = outcome.actions.reduce(appReducer, state);
+    expect(next.config.theme).toBe("solarized");
+    expect(next.config.baseCurrency).toBe("AUD");
+    expect(next.config.commandBarOpens).toBe(2);
+    expect(next.config.dataDir).toBe(state.config.dataDir);
+    expect(next.config.activeLayoutIndex).toBe(state.config.activeLayoutIndex);
+    expect(next.config.onboardingComplete).toBe(state.config.onboardingComplete);
+    expect(outcome.save?.theme).toBe("solarized");
+    expect(outcome.configChanged?.theme).toBe("solarized");
+
+    const plugin = applyWindowIntent(state, "w2", { type: "setPluginConfig", values: { added: { c: 3 } } });
+    expect(plugin.configChanged?.pluginConfig.added).toEqual({ c: 3 });
+    // Nothing allowed changed: nothing to save or announce.
+    expect(applyWindowIntent(state, "w2", { type: "setConfig", fields: { dataDir: "/elsewhere" } }).configChanged).toBeUndefined();
+  });
+
+  test("takes a change to a pane in another window, but never its type or a pane it does not have", () => {
+    const state = mainState();
+    const list = state.config.layout.instances.find((instance) => instance.instanceId === "list")!;
+    const outcome = applyWindowIntent(state, "w2", {
+      type: "updateInstances",
+      instances: [
+        { ...list, title: "Retargeted", paneId: "news", params: { symbol: "AAPL" } },
+        createPaneInstance("calendar", { instanceId: "ghost" }),
+      ],
+    });
+    expect(outcome.applied).toBe(true);
+    const next = outcome.actions.reduce(appReducer, state);
+    const updated = next.config.layout.instances.find((instance) => instance.instanceId === "list")!;
+    expect(updated.title).toBe("Retargeted");
+    expect(updated.params).toEqual({ symbol: "AAPL" });
+    expect(updated.paneId).toBe("portfolio-list");
+    expect(next.config.layout.instances.some((instance) => instance.instanceId === "ghost")).toBe(false);
+    expect(getDockedPaneIds(next.config.layout)).toEqual(getDockedPaneIds(state.config.layout));
+  });
+});
+
+describe("SecondaryWindowSync", () => {
+  test("sends a grid edit once, keeps it over snapshots that predate it, and lets main's state win after", () => {
+    const main = mainState();
+    const sync = new SecondaryWindowSync("w2");
+    let local = hydrate(createInitialState(mainConfig()), viewOf(main));
+    sync.start(viewOf(main), local);
+    expect(sync.collect(local)).toEqual([]);
+
+    local = appReducer(local, { type: "UPDATE_LAYOUT", layout: removePane(local.config.layout, "econ") });
+    const intents = sync.collect(local);
+    expect(intents.map((intent) => intent.type)).toEqual(["editLayout"]);
+    expect(sync.collect(local)).toEqual([]);
+
+    // Main's next snapshot was sent before it applied the edit: the window keeps its grid.
+    const stale = sync.receive(viewOf(main), local);
+    expect(getDockedPaneIds(stale.config.layout)).toEqual(["news"]);
+
+    const applied = applyInMain(main, intents[0]!);
+    expect(sync.settle(intents[0]!, applied.applied, local)).toBe(false);
+    local = hydrate(local, sync.receive(viewOf(applied.state), local));
+    sync.noteSynced(local);
+    expect(sync.collect(local)).toEqual([]);
+  });
+
+  test("a pane opened in the window reaches the main window with its state, and survives snapshots in between", () => {
+    const main = mainState();
+    const sync = new SecondaryWindowSync("w2");
+    let local = hydrate(createInitialState(mainConfig()), viewOf(main));
+    sync.start(viewOf(main), local);
+
+    const opened = createPaneInstance("calendar", { instanceId: "cal" });
+    local = appReducer(local, {
+      type: "UPDATE_LAYOUT",
+      layout: addPaneToLayout(local.config.layout, opened, { relativeTo: "econ", position: "right" }),
+    });
+    local = appReducer(local, { type: "REPLACE_PANE_STATE", paneId: "cal", state: { month: "2026-10" } });
+    const intents = sync.collect(local);
+    expect(intents.map((intent) => intent.type)).toEqual(["editLayout", "replacePaneState"]);
+
+    // A snapshot from before main took the edit still shows the new pane here.
+    const stale = sync.receive(viewOf(main), local);
+    expect(getDockedPaneIds(stale.config.layout)).toEqual(["news", "econ", "cal"]);
+    expect(stale.config.layout.instances.some((instance) => instance.instanceId === "cal")).toBe(true);
+
+    let next = main;
+    for (const intent of intents) {
+      const result = applyInMain(next, intent);
+      expect(result.applied).toBe(true);
+      next = result.state;
+    }
+    expect(secondaryWindowPaneIds(next.config.layout, "w2")).toEqual(["news", "econ", "cal"]);
+    expect(next.paneState.cal).toEqual({ month: "2026-10" });
+  });
+
+  test("a refused edit is dropped so main's state comes back", () => {
+    const main = mainState();
+    const sync = new SecondaryWindowSync("w2");
+    let local = hydrate(createInitialState(mainConfig()), viewOf(main));
+    sync.start(viewOf(main), local);
+    local = appReducer(local, { type: "UPDATE_LAYOUT", layout: removePane(local.config.layout, "econ") });
+    const [intent] = sync.collect(local);
+    expect(sync.settle(intent!, false, local)).toBe(true);
+    const restored = sync.receive(viewOf(main), local);
+    expect(restored.config.layout.dockRoot).toEqual(viewOf(main).config.layout.dockRoot);
+  });
+
+  test("a window's focus stays among its own panes", () => {
+    const main = mainState();
+    // The main window's focused pane is in its own grid, not this window's.
+    const local = hydrate(createInitialState(mainConfig()), { ...viewOf(main), focusedPaneId: "list" });
+    expect(["news", "econ"]).toContain(local.focusedPaneId!);
+    const next = appReducer(local, { type: "FOCUS_NEXT", paneOrder: getDockedPaneIds(local.config.layout) });
+    expect(["news", "econ"]).toContain(next.focusedPaneId!);
+    expect(next.focusedPaneId).not.toBe(local.focusedPaneId);
+  });
+
+  test("sends the state of its own panes that changed, and keeps its own focus", () => {
+    const main = mainState();
+    const sync = new SecondaryWindowSync("w2");
+    let local = hydrate(createInitialState(mainConfig()), viewOf(main));
+    sync.start(viewOf(main), local);
+    local = appReducer(local, { type: "UPDATE_PANE_STATE", paneId: "econ", patch: { cursorSymbol: "SPY" } });
+    local = appReducer(local, { type: "UPDATE_PANE_STATE", paneId: "list", patch: { cursorSymbol: "QQQ" } });
+    local = appReducer(local, { type: "FOCUS_PANE", paneId: "econ" });
+    expect(sync.collect(local)).toEqual([{ type: "replacePaneState", paneState: { econ: { cursorSymbol: "SPY" } } }]);
+
+    const stale = sync.receive(viewOf(main), local);
+    expect(stale.paneState.econ).toEqual({ cursorSymbol: "SPY" });
+    expect(stale.focusedPaneId).toBe("econ");
+  });
+  test("sends only the settings changed here, and keeps them over snapshots sent before main took them", () => {
+    const main = mainState();
+    const sync = new SecondaryWindowSync("w2");
+    let local = hydrate(createInitialState(mainConfig()), viewOf(main));
+    sync.start(viewOf(main), local);
+
+    local = appReducer(local, { type: "SET_CONFIG", config: { ...local.config, theme: "solarized" } });
+    const intents = sync.collect(local);
+    expect(intents).toEqual([{ type: "setConfig", fields: { theme: "solarized" } }]);
+    expect(sync.collect(local)).toEqual([]);
+
+    // Main changed another setting meanwhile: the window's snapshot keeps its own theme and takes main's currency.
+    const mainMoved = { ...main, config: { ...main.config, baseCurrency: "EUR" } };
+    const stale = sync.receive(viewOf(mainMoved), local);
+    expect(stale.config.theme).toBe("solarized");
+    expect(stale.config.baseCurrency).toBe("EUR");
+
+    const applied = applyInMain(mainMoved, intents[0]!);
+    expect(applied.state.config.theme).toBe("solarized");
+    expect(applied.state.config.baseCurrency).toBe("EUR");
+    expect(sync.settle(intents[0]!, true, local)).toBe(false);
+    local = hydrate(local, sync.receive(viewOf(applied.state), local));
+    sync.noteSynced(local);
+    expect(sync.collect(local)).toEqual([]);
+  });
+
+  test("a pane opened here survives main changing the window first: the refused edit is replayed on main's state", () => {
+    const main = mainState();
+    const sync = new SecondaryWindowSync("w2");
+    let local = hydrate(createInitialState(mainConfig()), viewOf(main));
+    sync.start(viewOf(main), local);
+
+    const opened = createPaneInstance("calendar", { instanceId: "cal" });
+    local = appReducer(local, {
+      type: "UPDATE_LAYOUT",
+      layout: addPaneToLayout(local.config.layout, opened, { relativeTo: "econ", position: "right" }),
+    });
+    local = appReducer(local, { type: "REPLACE_PANE_STATE", paneId: "cal", state: { month: "2026-10" } });
+    const first = sync.collect(local);
+
+    // Main moved a pane into the window before the edit reached it, so the edit is stale.
+    const moved = windowMoveOutcome(main, "list", "w2");
+    let mainNext = moved.actions.reduce(appReducer, main);
+    for (const intent of first) {
+      const result = applyInMain(mainNext, intent);
+      mainNext = result.state;
+      if (sync.settle(intent, result.applied, local)) {
+        local = hydrate(local, sync.receive(viewOf(mainNext), local));
+        sync.noteSynced(local);
+      }
+    }
+    expect(secondaryWindowPaneIds(mainNext.config.layout, "w2")).not.toContain("cal");
+
+    const replay = sync.replay(local);
+    expect(replay).not.toBeNull();
+    local = appReducer(local, { type: "UPDATE_LAYOUT", layout: replay!.layout });
+    for (const [paneId, state] of Object.entries(replay!.paneState)) {
+      local = appReducer(local, { type: "REPLACE_PANE_STATE", paneId, state });
+    }
+    for (const intent of sync.collect(local)) {
+      const result = applyInMain(mainNext, intent);
+      expect(result.applied).toBe(true);
+      mainNext = result.state;
+    }
+    expect(secondaryWindowPaneIds(mainNext.config.layout, "w2").sort()).toEqual(["cal", "econ", "list", "news"]);
+    expect(mainNext.paneState.cal).toEqual({ month: "2026-10" });
+    // Replayed once: nothing left to replay.
+    expect(sync.replay(local)).toBeNull();
+  });
+
+  test("a change to a pane in another window goes to main as that pane's change, not as a grid edit", () => {
+    const main = mainState();
+    const sync = new SecondaryWindowSync("w2");
+    let local = hydrate(createInitialState(mainConfig()), viewOf(main));
+    sync.start(viewOf(main), local);
+
+    local = appReducer(local, {
+      type: "UPDATE_LAYOUT",
+      layout: updatePaneInstance(local.config.layout, "list", (instance) => ({ ...instance, title: "Retargeted" })),
+    });
+    const intents = sync.collect(local);
+    expect(intents.map((intent) => intent.type)).toEqual(["updateInstances"]);
+    // A snapshot from before main took it keeps the change here.
+    const stale = sync.receive(viewOf(main), local);
+    expect(stale.config.layout.instances.find((instance) => instance.instanceId === "list")?.title).toBe("Retargeted");
+
+    const applied = applyInMain(main, intents[0]!);
+    expect(applied.state.config.layout.instances.find((instance) => instance.instanceId === "list")?.title).toBe("Retargeted");
+  });
+});

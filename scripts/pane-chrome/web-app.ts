@@ -12,10 +12,15 @@ import { evaluate, sleep, type Cdp } from "./browser";
  * under a replay folder for the next run, and every page runs on the first
  * run's clock so the next run asks for the same dates; every write, the live
  * socket and telemetry are refused.
+ *
+ * An offline replay never reaches upstream: a read it did not keep is
+ * answered 503, so a run on a kept snapshot draws the same views every time
+ * (the CI checks), and one with no snapshot draws every pane's offline state.
  */
 
 const UPSTREAM = "https://api.gloom.sh";
-const READ_POSTS = /^\/api\/market\/[a-z-]+\/batch$/;
+/** POSTs that only read: the market batches, and a live scan (its watchlist would not fit a URL). */
+const READ_POSTS = /^\/api\/market\/(?:[a-z-]+\/batch|scanner\/live)$/;
 const REFUSED = /telemetry|crash|usage|analytics|research-activity|\/events|collect|beacon|track|posthog|sentry/i;
 
 export interface CatalogEntry { token: string; paneId: string; argKind?: string | null; defaultSettings?: Record<string, unknown> }
@@ -41,7 +46,13 @@ interface Replay {
   clock(): Promise<number>;
 }
 
-export function createReplay(dir: string): Replay {
+/** The clock of an offline run with no snapshot: a fixed weekday morning, so dated panes ask for the same dates. */
+const OFFLINE_CLOCK_MS = Date.UTC(2026, 0, 6, 14, 30);
+
+/** Answered for a read an offline replay did not keep, as the worker answers when Gloom Cloud is down. */
+const NOT_KEPT: Answer = { status: 503, type: "text/plain", bytes: new TextEncoder().encode("Not in the replay") };
+
+export function createReplay(dir: string, { offline = false }: { offline?: boolean } = {}): Replay {
   /** The text of every answer served this run: a cut string found here arrived cut, the page did not cut it. */
   const served = new Set<string>();
   const remember = (answer: Answer): Answer => {
@@ -55,6 +66,7 @@ export function createReplay(dir: string): Replay {
         const meta = await Bun.file(`${file}.json`).json();
         return remember({ status: meta.status, type: meta.type, bytes: new Uint8Array(await Bun.file(`${file}.body`).arrayBuffer()) });
       }
+      if (offline) return NOT_KEPT;
       const fresh = remember(await load().catch((error) => ({ status: 502, type: "text/plain", bytes: new TextEncoder().encode(String(error)) })));
       if (fresh.status < 500 && fresh.status !== 429) {
         await mkdir(dir, { recursive: true });
@@ -75,6 +87,8 @@ export function createReplay(dir: string): Replay {
     async clock() {
       const file = Bun.file(join(dir, "clock.json"));
       if (await file.exists()) return (await file.json()).ms;
+      // With nothing kept, an offline run still needs one clock for every page: a fixed one.
+      if (offline) return OFFLINE_CLOCK_MS;
       const ms = Date.now();
       await mkdir(dir, { recursive: true });
       await Bun.write(file, JSON.stringify({ ms, iso: new Date(ms).toISOString() }));

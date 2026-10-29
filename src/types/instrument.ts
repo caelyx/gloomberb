@@ -1,3 +1,5 @@
+import type { ListingDelisting } from "./financials";
+
 /**
  * What a ticker is, at the grain that decides which research has data for it:
  * filings, executives and analyst coverage exist for a company's stock,
@@ -71,4 +73,18 @@ export interface InstrumentSearchResult {
    * Albemarle, which the lithium funds hold), sent by newer cloud servers on a
    * row a theme query added. Matched like the name, ranked after name matches. */
   searchKeywords?: string[];
+  /** The company that merged into this one whose old name the query is
+   * (Golden Ocean Group Ltd, GOGL until 2025-08-20, on CMB.Tech's CMBT), sent
+   * by newer cloud servers on a row such a query added. `searchAliases` then
+   * carries that name. A leftover listing of the merged company (GOGLC on
+   * BYMA) is linked to it by search, naming the `successor`. */
+  formerIssuer?: { symbol: string; name: string; until: string; successor?: { symbol: string; name: string | null } };
+  /** The name a renamed company had (Cassava Sciences Inc, now Filana Therapeutics' FLNA), sent by newer cloud
+   * servers on the row a search by that name found. `searchAliases` then carries it as EDGAR files it. */
+  formerName?: string;
+  /** A US listing that no longer trades, found by its exact symbol (TWTR). Untrusted until parsed. */
+  delisting?: ListingDelisting;
+  /** The company's home line, its common stock on its home exchange (7203 on JPX for Toyota), sent by newer
+   * cloud servers. Search lists it before the company's depositary receipts and other lines. Only `true` counts. */
+  homeListing?: boolean;
 }

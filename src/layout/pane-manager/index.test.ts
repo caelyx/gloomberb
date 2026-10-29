@@ -4,6 +4,7 @@ import {
   addPaneFloating,
   analyzeFloatingPaneVisibility,
   applyDrop,
+  findPaneLocation,
   floatAtRect,
   getDockResizeTargets,
   gridlockAllPanes,
@@ -13,6 +14,7 @@ import {
   getDockedPaneIds,
   getLeafRect,
   moveFloatingPane,
+  removePane,
   resizeFloatingPaneFromCorner,
   simulateDrop,
 } from "./index";
@@ -305,5 +307,41 @@ describe("pane-manager split-tree drops", () => {
       { path: [1], axis: "vertical", leafBranch: 1 },
       { path: [], axis: "horizontal", leafBranch: 1 },
     ]);
+  });
+});
+
+describe("pane-manager with secondary windows", () => {
+  const leaf = (instanceId: string) => ({ kind: "pane" as const, instanceId });
+  function layout(): LayoutConfig {
+    return {
+      dockRoot: leaf("main"),
+      instances: ["main", "w2-a", "w2-b", "w2-float"].map((instanceId) => createPaneInstance("portfolio-list", { instanceId })),
+      floating: [],
+      detached: [],
+      windows: [{
+        id: "w2",
+        dockRoot: { kind: "split", axis: "horizontal", ratio: 0.5, first: leaf("w2-a"), second: leaf("w2-b") },
+        floating: [{ instanceId: "w2-float", x: 4, y: 4, width: 40, height: 12 }],
+      }],
+    };
+  }
+
+  test("finds a pane in its window", () => {
+    expect(findPaneLocation(layout(), "main")).toEqual({ window: "main", kind: "docked" });
+    expect(findPaneLocation(layout(), "w2-b")).toEqual({ window: "w2", kind: "docked" });
+    expect(findPaneLocation(layout(), "w2-float")).toEqual({ window: "w2", kind: "floating" });
+    expect(findPaneLocation(layout(), "missing")).toBeNull();
+  });
+
+  // Every move starts by taking the pane out of where it was; a pane left behind
+  // in its window would be placed twice and normalisation would keep the window copy.
+  test("moving a window pane into the main window takes it out of the window", () => {
+    const floated = floatAtRect(layout(), "w2-a", { x: 2, y: 2, width: 30, height: 10 });
+    expect(findPaneLocation(floated, "w2-a")).toEqual({ window: "main", kind: "floating" });
+    expect(floated.windows).toEqual([{ id: "w2", dockRoot: leaf("w2-b"), floating: [{ instanceId: "w2-float", x: 4, y: 4, width: 40, height: 12 }] }]);
+
+    const removed = removePane(layout(), "w2-float");
+    expect(removed.instances.some((instance) => instance.instanceId === "w2-float")).toBe(false);
+    expect(removed.windows?.[0]?.floating).toEqual([]);
   });
 });

@@ -1,5 +1,5 @@
 /**
- * `gloomberb fn MAP`: the venue list, or with a layer (`MAP ships`,
+ * `gloom fn MAP`: the venue list, or with a layer (`MAP ships`,
  * `--layer vessels`) that layer's entity table with plain values and the
  * linked tickers, for JSON and CSV.
  */
@@ -8,6 +8,7 @@ import type { HeadlessPaneColumn, HeadlessPaneContext, HeadlessPaneDefinition, H
 import { REFERENCE_DATA } from "../shared/report-freshness";
 import { columnValue, layerCoverageNote, parseLayerTokens, plainGeoValue, resolveActiveLayers, tickerLinkKey } from "./layers";
 import { filterWorldVenues, formatVenueLocalTime } from "./model";
+import { REPORT_FILTER, REPORT_ROWS } from "../shared/headless-options";
 
 /**
  * A layer's status from its own cadence, as the pane's footer shows it. The
@@ -17,9 +18,11 @@ import { filterWorldVenues, formatVenueLocalTime } from "./model";
  */
 function layerFreshness(layer: GeoLayerInfo): HeadlessPaneFreshness | undefined {
   if (layer.status === "unavailable") return undefined;
-  if (layer.cadence === "live") return { status: "live" };
-  if (layer.cadence === "daily") return { status: "not-a-feed", basis: "daily data" };
-  return REFERENCE_DATA;
+  // Cited as the server names who published it (the ports' and chokepoints' publisher), else Gloom Cloud.
+  const cited = layer.publisher?.trim() ? { source: layer.publisher.trim(), publisher: layer.publisher.trim() } : {};
+  if (layer.cadence === "live") return { status: "live", ...cited };
+  if (layer.cadence === "daily") return { status: "not-a-feed", basis: "daily data", ...cited };
+  return { ...REFERENCE_DATA, ...cited };
 }
 
 function contextRequest(context: HeadlessPaneContext): GeoRequest {
@@ -104,8 +107,8 @@ export const mapHeadless = {
   },
   options: [
     { key: "layer", aliases: ["layers"], settingKey: "layers", description: "Layer id or group to list, such as vessels or energy.", type: "string" },
-    { key: "query", aliases: ["q", "search"], description: "Filter by name or any field.", type: "string" },
-    { key: "limit", description: "Rows to return.", type: "integer", defaultValue: 100, minimum: 1, maximum: 500 },
+    { key: "query", shot: REPORT_FILTER, aliases: ["q", "search"], description: "Filter by name or any field.", type: "string" },
+    { key: "limit", shot: REPORT_ROWS, description: "Rows to return.", type: "integer", defaultValue: 100, minimum: 1, maximum: 500 },
   ],
   discovery: {
     id: "world-map",

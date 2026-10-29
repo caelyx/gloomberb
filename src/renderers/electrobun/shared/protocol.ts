@@ -1,6 +1,12 @@
 import type { AppSessionSnapshot } from "../../../core/state/session-persistence";
 import type { PaneRuntimeState } from "../../../core/state/app/state";
-import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState } from "../../../types/desktop-window";
+import type {
+  DesktopDockPreviewState,
+  DesktopSharedStateSnapshot,
+  DesktopThemePreviewState,
+  DesktopWindowIntent,
+  DesktopWindowIntentResult,
+} from "../../../types/desktop-window";
 import type { DesktopApplicationMenuCommand } from "../../../types/desktop-menu";
 import type { AppConfig, UpdateChannel } from "../../../types/config";
 import type { CachedResourceRecord, ResourceCacheKey } from "../../../data/resource-store";
@@ -10,6 +16,7 @@ import type { CapabilityManifest } from "../../../capabilities";
 import type { PluginOperationResult, PluginPin } from "../../../plugins/marketplace/store";
 import type { RemoteControlRequest, RemoteControlResponse } from "../../../remote/types";
 import type { HttpProxyRequestEnvelope, HttpProxyResponseEnvelope } from "../../../utils/http-proxy-response";
+import type { BootFrame } from "../../dom/boot-frame-page";
 
 export const ELECTROBUN_CONTEXT_MENU_ACTION = "gloom.context-menu.select";
 
@@ -25,8 +32,15 @@ export interface ElectrobunBackendInit {
   desktopPlatform: string;
   /** The machine name, which a remote assistant sees this desktop app under. */
   hostName?: string;
-  windowKind: "main" | "detached";
+  windowKind: "main" | "detached" | "window";
+  /** A popped-out window's pane. */
   paneId?: string;
+  /** A secondary window's layout window id. */
+  windowId?: string;
+  /** The window with native focus, or the last one to have it, by channel key. */
+  activeWindowKey?: string | null;
+  /** What the launch's plugin seed could not install, for the main window to say once. */
+  pluginSeedNotice?: { body: string; type: "error" | "info" };
   /** What the view needs to send crash reports and usage counts the same way the Bun process would. */
   telemetry: ElectrobunTelemetryInit;
 }
@@ -130,6 +144,8 @@ export interface DesktopExternalPluginBundle {
   /** `owner/repo` of the checkout's GitHub origin. */
   repo?: string;
   linked?: boolean;
+  /** The plugin's logo as a `data:` URL, read from the checkout by the Bun process. */
+  icon?: string;
   /** ES module source, absent when `error` or `unsupportedTarget` is set. */
   code?: string;
   targets?: readonly ("cli" | "tui" | "desktop" | "web")[];
@@ -156,7 +172,7 @@ export type DesktopPluginActivationResult =
 
 interface DesktopBackendRequestMap {
   init: {
-    request: { kind?: "main" | "detached"; paneId?: string };
+    request: { kind?: "main" | "detached" | "window"; paneId?: string; windowId?: string };
     response: ElectrobunBackendInit;
   };
   "http.fetch": { request: HttpProxyRequestEnvelope; response: HttpProxyResponseEnvelope };
@@ -182,6 +198,16 @@ interface DesktopBackendRequestMap {
   };
   "desktop.closeDetachedPane": { request: { paneId: string }; response: null };
   "desktop.focusDetachedPane": { request: { paneId: string }; response: null };
+  /** From a secondary window: a change the host passes to the main window, naming the window it came from. */
+  "window.intent": { request: { intent: DesktopWindowIntent }; response: DesktopWindowIntentResult };
+  /** From any window: bring forward the window that shows a pane, and focus the pane there. */
+  "window.focusPane": { request: { paneId: string }; response: null };
+  /**
+   * From any window: bring forward window `windowId` ("main" or a layout
+   * window id) and focus `paneId` there, once the layout has the pane there:
+   * a pane or window the main window has just moved or made.
+   */
+  "window.focus": { request: { windowId: string; paneId?: string | null }; response: null };
   "pluginState.setMany": { request: { entries: DesktopPluginStateSetEntry[] }; response: null };
   "pluginState.delete": { request: { pluginId: string; key: string }; response: null };
   "plugins.listExternal": { request: null; response: DesktopExternalPluginBundle[] };
@@ -201,7 +227,7 @@ interface DesktopBackendRequestMap {
   "host.exit": { request: null; response: null };
   "host.windowControl": { request: { action: DesktopWindowControlAction }; response: null };
   "host.windowFullscreen": { request: null; response: boolean };
-  "host.openExternal": { request: { url: string }; response: null };
+  "host.openExternal": { request: { url: string }; response: boolean };
   "host.copyText": { request: { text: string }; response: null };
   "host.focusWindow": { request: null; response: null };
   "host.copyPngImage": { request: { pngBase64: string }; response: null };
@@ -215,6 +241,8 @@ interface DesktopBackendRequestMap {
     response: null;
   };
   "host.showContextMenu": { request: { menu: DesktopContextMenuItem[] }; response: boolean };
+  /** The layout the main window draws at the next launch before its script loads (dom/boot-frame.ts). Only the main window's is kept. */
+  "host.saveBootFrame": { request: { frame: BootFrame }; response: null };
   /** The unread count for the Dock icon badge: `""` (none), `"1"` to `"99"` or `"99+"`. Only the main window's is applied. */
   "host.setAppBadge": { request: { label: string }; response: null };
   /** `channel` absent (an older view) means stable. */
@@ -320,6 +348,19 @@ export interface RemoteControlRequestMessage {
   request: RemoteControlRequest;
 }
 
+export interface WindowIntentRequestMessage {
+  windowId: string;
+  intent: DesktopWindowIntent;
+}
+
+interface ActiveWindowMessage {
+  windowKey: string | null;
+}
+
+interface FocusPaneMessage {
+  paneId: string;
+}
+
 export interface ElectrobunDesktopRpcSchema {
   bun: {
     requests: {
@@ -338,8 +379,14 @@ export interface ElectrobunDesktopRpcSchema {
         params: RemoteControlRequestMessage;
         response: RemoteControlResponse;
       };
+      "window.intent": {
+        params: WindowIntentRequestMessage;
+        response: DesktopWindowIntentResult;
+      };
     };
     messages: {
+      "desktop.activeWindow": ActiveWindowMessage;
+      "desktop.focusPane": FocusPaneMessage;
       "context-menu.select": ContextMenuSelectMessage;
       "application-menu.select": ApplicationMenuSelectMessage;
       "desktop.state": DesktopStateMessage;

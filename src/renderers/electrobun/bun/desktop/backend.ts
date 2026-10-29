@@ -1,4 +1,5 @@
 import { ApplicationMenu, BrowserView, Utils, type BrowserWindow } from "electrobun/bun";
+import { homedir } from "os";
 import { createAppServices, type AppServices } from "../../../../core/app-services";
 import { syncConfigActiveLayoutState, type PaneRuntimeState } from "../../../../core/state/app/state";
 import {
@@ -15,8 +16,16 @@ import { startRemoteControlServer, type RemoteControlServer } from "../../../../
 import type { RemoteControlRequest, RemoteControlResponse } from "../../../../remote/types";
 import { installCrashReporter } from "../../../../telemetry/crash-reports";
 import { createNodeCrashReporterHost } from "../../../../telemetry/crash-reports-node";
+import { installUpdateFailureReporter, reviewLastUpdateAttempt } from "../../../../telemetry/update-failures";
+import { createNodeUpdateFailureHost } from "../../../../telemetry/update-failures-node";
 import type { AppConfig } from "../../../../types/config";
-import type { DesktopSharedStateSnapshot } from "../../../../types/desktop-window";
+import { linkDesktopCommands } from "../../../../updater/command-names";
+import { debugLog } from "../../../../utils/debug-log";
+import type {
+  DesktopSharedStateSnapshot,
+  DesktopWindowIntent,
+  DesktopWindowIntentResult,
+} from "../../../../types/desktop-window";
 import type {
   ContextMenuSelectMessage,
   DesktopBackendRequest,
@@ -31,18 +40,26 @@ import { registerElectrobunCoreCapabilities } from "../core-capabilities";
 import {
   activateExternalPlugin,
   bundleExternalPluginDirectory,
-  collectExternalPluginBundles,
   deactivateExternalPlugin,
   desktopPluginManager,
+  prefetchExternalPluginBundles,
+  takeExternalPluginBundles,
 } from "../external-plugins";
-import { MAIN_WINDOW_RPC_KEY } from "../window/focus";
+import { MAIN_WINDOW_RPC_KEY, secondaryWindowRpcKey, windowIdFromSecondaryRpcKey } from "../window/focus";
+import { commandBarMenuTarget, paneWindowRpcKey } from "../../shared/window-keys";
+import { findPaneLocation } from "../../../../layout/pane-manager";
+import type { RememberedWindowStore } from "../window/remembered-frame";
 import { handleDesktopBackendRequest } from "./backend-requests";
+import { detectDesktopInstallKind, removeUpdateAsides } from "./update";
+import { removeLegacyMacApp } from "./app-name";
 import { DesktopCapabilityBridge } from "./capability-bridge";
 import { DesktopDetachedWindowManager } from "./detached-windows";
+import { DesktopSecondaryWindowManager } from "./secondary-windows";
+import { secondaryWindowMayRequest } from "./secondary-window-writes";
 import { handleDesktopHostRequest } from "./host-requests";
 import { handleHttpFetch } from "./http-fetch";
 import { DesktopHttpStreamBridge } from "./http-stream";
-import { initializeDesktopBackend } from "./initialization";
+import { initializeDesktopBackend, joinDesktopBackendLaunch } from "./initialization";
 import { applyMacosDockIcon } from "./macos-dock-icon";
 import { handleDesktopPluginStateRequest } from "./plugin-state";
 import { scheduleDesktopRelaunch } from "./relaunch";
@@ -55,7 +72,11 @@ export type DesktopRpc = ReturnType<typeof BrowserView.defineRPC<ElectrobunDeskt
 
 /** How long a quit waits for the view to flush and exit on its own. */
 const QUIT_FALLBACK_MS = 2_500;
+/** How long after the main window is up the app looks for its `gloomberb` command to add `gloom` beside it. */
+const COMMAND_LINK_DELAY_MS = 10_000;
 const MAX_PENDING_DEEP_LINKS = 20;
+/** How long a window asked to come forward waits for the main window's state to place what it shows. */
+const PENDING_WINDOW_FOCUS_MS = 3_000;
 
 function summarizeError(error: unknown): string {
   return error instanceof Error ? error.stack ?? error.message : String(error);
@@ -105,15 +126,30 @@ export class DesktopBackend {
     getWindowKey: this.rpcs.getRpcWindowKey,
   });
   readonly detachedWindows = new DesktopDetachedWindowManager(this);
+  readonly secondaryWindows: DesktopSecondaryWindowManager;
+  /** Saves the main window's frame; set once it is open, so an exit can save it first. */
+  mainWindowTracker: { flush(): void } | null = null;
+  /** Set when the app starts to exit, so the windows closing on the way out do not move their panes. */
+  exiting = false;
   /** Each pane type's plugin, for hiding popped-out windows with their plugin. */
   paneOwners: ReadonlyMap<string, string> = new Map();
 
   private crashReporterInstalled = false;
   private restartInProgress = false;
   private pluginAutoUpdatesStarted = false;
+  private commandLinksScheduled = false;
   private remoteControlServer: RemoteControlServer | null = null;
   private readonly pendingDeepLinks: string[] = [];
   private readonly contextMenuRequestRpcs = new Map<string, DesktopRpc>();
+  /** The window with native focus, by channel key; null while the app is in the background. */
+  private activeWindowKey: string | null = null;
+  /** The last window to have native focus, kept while the app is in the background. */
+  lastActiveWindowKey: string | null = null;
+  private readonly ignoredSecondaryRequests = new Set<string>();
+
+  constructor(rememberedWindows: RememberedWindowStore) {
+    this.secondaryWindows = new DesktopSecondaryWindowManager(this, rememberedWindows);
+  }
 
   requireConfig(): AppConfig {
     if (!this.config) throw new Error("Backend config has not been initialized.");
@@ -138,6 +174,13 @@ export class DesktopBackend {
     if (!this.crashReporterInstalled) {
       this.crashReporterInstalled = true;
       installCrashReporter(createNodeCrashReporterHost({ surface: "desktop", getConfig: () => this.config }));
+      // This process runs the desktop update, so it reports how the last one ended and any that fail.
+      installUpdateFailureReporter(createNodeUpdateFailureHost({
+        installKind: detectDesktopInstallKind(),
+        getDataDir: () => this.config?.dataDir ?? null,
+      }));
+      reviewLastUpdateAttempt();
+      void removeUpdateAsides();
     }
     // The native menu shows the same accelerators the keys use, so a rebind
     // rebuilds it.
@@ -178,8 +221,13 @@ export class DesktopBackend {
       getServices: () => this.requireServices(),
     });
     this.workspace = createDesktopWorkspace(config, this.getSessionSnapshot());
-    this.detachedWindows.reconcile();
+    this.reconcileWindows();
     return { config, services };
+  }
+
+  /** Compiles the view's plugins ahead of its first `plugins.listExternal`. */
+  prefetchExternalPluginBundles(): void {
+    prefetchExternalPluginBundles();
   }
 
   teardownServices(): void {
@@ -201,10 +249,110 @@ export class DesktopBackend {
       await saveConfig(nextConfig);
     }
     if (options.reconcileWindows !== false) {
-      this.detachedWindows.reconcile();
+      this.reconcileWindows();
     }
     this.stateBroadcaster.sendDesktopState(this.requireWorkspace().getSnapshot());
     return this.requireWorkspace().getSnapshot();
+  }
+
+  /** Opens and closes popped-out and secondary windows to match the open layout tab. */
+  reconcileWindows(): void {
+    this.detachedWindows.reconcile();
+    this.secondaryWindows.reconcile();
+  }
+
+  closeAllWindows(): void {
+    this.detachedWindows.closeAll();
+    this.secondaryWindows.closeAll();
+  }
+
+  windowForRpcKey(windowKey: string | undefined): BrowserWindow | null {
+    if (windowKey === MAIN_WINDOW_RPC_KEY) return this.mainWindow;
+    return this.secondaryWindows.getWindowForRpcKey(windowKey) ?? this.detachedWindows.getWindowForRpcKey(windowKey);
+  }
+
+  focusWindowForRpcKey(windowKey: string | undefined): boolean {
+    const windowId = windowIdFromSecondaryRpcKey(windowKey);
+    return windowId ? this.secondaryWindows.focus(windowId) : this.detachedWindows.focusWindowForRpcKey(windowKey);
+  }
+
+  /**
+   * Brings forward the window that shows a pane and has its view focus it:
+   * a pane reused from another window's bar, or a link to a pane elsewhere.
+   */
+  focusPaneWindow(paneId: string): void {
+    const layout = this.config?.layout;
+    const windowKey = layout ? paneWindowRpcKey(paneId, findPaneLocation(layout, paneId)) : null;
+    if (!windowKey) return;
+    this.focusWindowForRpcKey(windowKey);
+    const rpc = this.rpcs.getWindowRpc(windowKey);
+    if (rpc && this.rpcs.isWindowRpcReady(windowKey)) rpc.send["desktop.focusPane"]({ paneId });
+  }
+
+  private pendingWindowFocus: { windowId: string; paneId: string | null; until: number } | null = null;
+
+  /**
+   * Brings window `windowId` forward with `paneId` focused there. The main
+   * window asks right after it moves a pane or makes a window, before its
+   * state reaches the host, so until the layout has the pane (or the window)
+   * there the request waits for the next state, for a few seconds at most.
+   */
+  focusWindowWhenPlaced(windowId: string, paneId: string | null): void {
+    this.pendingWindowFocus = { windowId, paneId, until: Date.now() + PENDING_WINDOW_FOCUS_MS };
+    this.flushPendingWindowFocus();
+  }
+
+  flushPendingWindowFocus(): void {
+    const pending = this.pendingWindowFocus;
+    if (!pending) return;
+    if (Date.now() > pending.until) {
+      this.pendingWindowFocus = null;
+      return;
+    }
+    const layout = this.config?.layout;
+    const windowKey = pending.windowId === "main" ? MAIN_WINDOW_RPC_KEY : secondaryWindowRpcKey(pending.windowId);
+    const windowThere = pending.windowId === "main" || !!layout?.windows?.some((window) => window.id === pending.windowId);
+    const paneThere = !pending.paneId || (!!layout && findPaneLocation(layout, pending.paneId)?.window === pending.windowId);
+    if (!windowThere || !paneThere || !this.windowForRpcKey(windowKey)) return;
+    this.pendingWindowFocus = null;
+    if (pending.windowId === "main") this.mainWindow?.activate();
+    else this.focusWindowForRpcKey(windowKey);
+    const rpc = this.rpcs.getWindowRpc(windowKey);
+    if (pending.paneId && rpc && this.rpcs.isWindowRpcReady(windowKey)) rpc.send["desktop.focusPane"]({ paneId: pending.paneId });
+  }
+
+  /**
+   * Native focus, which arrives for every switch between this app's windows,
+   * unlike a view's own focus events. A blur only clears the window it is for,
+   * so a blur arriving after the next window's focus changes nothing.
+   */
+  noteWindowFocus(windowKey: string, focused: boolean): void {
+    if (focused) this.activeWindowKey = windowKey;
+    else if (this.activeWindowKey === windowKey) this.activeWindowKey = null;
+    // The windows show their focused pane only in the last one to have
+    // focus, which stays the same while the app is in the background.
+    if (!focused || this.lastActiveWindowKey === windowKey) return;
+    this.lastActiveWindowKey = windowKey;
+    this.rpcs.forEachReadyWindowRpc((rpc) => {
+      rpc.send["desktop.activeWindow"]({ windowKey });
+    });
+  }
+
+  /**
+   * Quits the app, once: the main window's frame is saved, every window
+   * closes and services stop. Closing the main window by any route ends here,
+   * since it holds the state the other windows show.
+   */
+  exitApp(): void {
+    if (this.exiting) return;
+    this.exiting = true;
+    this.mainWindowTracker?.flush();
+    this.closeAllWindows();
+    this.teardownServices();
+    const window = this.mainWindow;
+    this.mainWindow = null;
+    window?.close();
+    Utils.quit();
   }
 
   /** Stops what a closed window was streaming or subscribed to. */
@@ -275,7 +423,7 @@ export class DesktopBackend {
 
   runApplicationMenuCommand(command: ElectrobunApplicationMenuCommand): void {
     if (command.type === "open-devtools") {
-      this.mainWindow?.webview.openDevTools();
+      (this.windowForRpcKey(this.activeWindowKey ?? MAIN_WINDOW_RPC_KEY) ?? this.mainWindow)?.webview.openDevTools();
       return;
     }
     const rpc = this.readyMainWindowRpc();
@@ -290,22 +438,27 @@ export class DesktopBackend {
       setTimeout(() => this.quit(), QUIT_FALLBACK_MS);
       return;
     }
+    if (command.type === "open-command-bar") {
+      // The bar opens in the secondary window last in front, which is where the
+      // user is; otherwise in the main window, brought forward.
+      const target = commandBarMenuTarget(this.lastActiveWindowKey, (key) => this.rpcs.isWindowRpcReady(key));
+      const targetRpc = this.rpcs.getWindowRpc(target);
+      if (!targetRpc) return;
+      if (target === MAIN_WINDOW_RPC_KEY) this.focusWindowForRpcKey(MAIN_WINDOW_RPC_KEY);
+      targetRpc.send["application-menu.select"]({ command });
+      return;
+    }
     if (!rpc) return;
-    // The bar and every form open in the main window; with a detached window
-    // key, the keys would go there instead.
-    if (command.type === "open-command-bar" || command.type === "open-builtin-workflow" || command.type === "open-plugin-workflow") {
-      this.detachedWindows.focusWindowForRpcKey(MAIN_WINDOW_RPC_KEY);
+    // Forms open in the main window, which their state submits through; with
+    // another window key, the keys would go there instead.
+    if (command.type === "open-builtin-workflow" || command.type === "open-plugin-workflow") {
+      this.focusWindowForRpcKey(MAIN_WINDOW_RPC_KEY);
     }
     rpc.send["application-menu.select"]({ command });
   }
 
   private quit(): void {
-    this.detachedWindows.closeAll();
-    this.teardownServices();
-    const window = this.mainWindow;
-    this.mainWindow = null;
-    window?.close();
-    Utils.quit();
+    this.exitApp();
   }
 
   private restart(message: DesktopRestartMessage = {}): void {
@@ -325,7 +478,9 @@ export class DesktopBackend {
       console.error("[desktop-recovery] failed to schedule restart", summarizeError(error));
       throw error;
     }
-    this.detachedWindows.closeAll();
+    this.exiting = true;
+    this.mainWindowTracker?.flush();
+    this.closeAllWindows();
     this.teardownServices();
     Utils.quit();
   }
@@ -382,8 +537,43 @@ export class DesktopBackend {
         console.error("[remote] desktop control endpoint failed", summarizeError(error));
       });
       this.ensurePluginAutoUpdates();
+      this.scheduleCommandLinks();
     }
     return init;
+  }
+
+  /**
+   * An install from before the rename updates its bundle in place and keeps
+   * only the `gloomberb` command its installer linked, so the app adds `gloom`
+   * beside it. First, a Mac `Gloomberb.app` left beside this `Gloom.app` goes,
+   * its links moved here. That looks through PATH, which can hold a slow
+   * network folder, so it runs a while after the main window is up and never
+   * in its way.
+   */
+  private scheduleCommandLinks(): void {
+    if (this.commandLinksScheduled) return;
+    this.commandLinksScheduled = true;
+    const log = debugLog.createLogger("desktop-command");
+    const where = {
+      platform: process.platform,
+      homeDir: homedir(),
+      pathEnv: process.env.PATH ?? "",
+    };
+    const timer = setTimeout(() => {
+      void removeLegacyMacApp({ ...where, execPath: process.execPath }).then((removed) => {
+        if (removed) log.info("Removed the app's copy under its old name");
+      }, (error: unknown) => {
+        log.warn("Could not remove the app's copy under its old name", summarizeError(error));
+      }).then(() => linkDesktopCommands({
+        ...where,
+        localAppData: process.env.LOCALAPPDATA,
+      })).then((added) => {
+        if (added.length > 0) log.info(`Added the gloom command in ${added.length} folder(s)`);
+      }, (error: unknown) => {
+        log.warn("Could not add the gloom command", summarizeError(error));
+      });
+    }, COMMAND_LINK_DELAY_MS);
+    timer.unref?.();
   }
 
   private flushPendingDeepLinks(): void {
@@ -408,6 +598,42 @@ export class DesktopBackend {
         error instanceof Error ? error.message : String(error),
       );
     }
+  }
+
+  /**
+   * A secondary window's change goes to the main window, which writes all
+   * layout and config. The window is named by the channel the change came
+   * in on, so a window can only change its own panes.
+   */
+  private async forwardWindowIntent(
+    rpc: DesktopRpc,
+    intent: DesktopWindowIntent,
+  ): Promise<DesktopWindowIntentResult> {
+    const windowId = windowIdFromSecondaryRpcKey(this.rpcs.getRpcWindowKey(rpc));
+    return windowId ? this.sendWindowIntentToMain(windowId, intent) : { applied: false };
+  }
+
+  private async sendWindowIntentToMain(windowId: string, intent: DesktopWindowIntent): Promise<DesktopWindowIntentResult> {
+    const mainRpc = this.readyMainWindowRpc();
+    if (!mainRpc) return { applied: false };
+    const response = await mainRpc.request["window.intent"]({
+      windowId,
+      intent: encodeRpcValue(intent) as DesktopWindowIntent,
+    });
+    return decodeRpcValue<DesktopWindowIntentResult>(response);
+  }
+
+  /**
+   * A secondary window closed by its own button: the main window moves its
+   * panes into its own grid and drops the window, as it makes every layout
+   * change. Only when it cannot does the host change the layout itself.
+   */
+  async closeSecondaryWindowThroughMain(windowId: string): Promise<void> {
+    const result = await this.sendWindowIntentToMain(windowId, { type: "closeWindow" }).catch(() => ({ applied: false }));
+    if (result.applied) return;
+    const workspace = this.workspace;
+    if (!workspace || !this.config?.layout.windows?.some((entry) => entry.id === windowId)) return;
+    await this.commitDesktopSnapshot(workspace.closeSecondaryWindow(windowId));
   }
 
   private async ensureRemoteControlServer(): Promise<void> {
@@ -450,6 +676,13 @@ export class DesktopBackend {
   }
 
   private async handleRequest(rpc: DesktopRpc, request: DesktopBackendRequest) {
+    if (windowIdFromSecondaryRpcKey(this.rpcs.getRpcWindowKey(rpc)) && !secondaryWindowMayRequest(request.method)) {
+      if (!this.ignoredSecondaryRequests.has(request.method)) {
+        this.ignoredSecondaryRequests.add(request.method);
+        console.error("[desktop-window] ignored a secondary window's request; its state is a view", { method: request.method });
+      }
+      return null;
+    }
     switch (request.method) {
       case "init":
         return this.initialize(rpc, request.payload);
@@ -470,12 +703,26 @@ export class DesktopBackend {
       case "desktop.dockDetachedPane":
       case "desktop.closeDetachedPane":
       case "desktop.focusDetachedPane":
-        return handleDesktopWorkspaceRequest(this, request);
+        return handleDesktopWorkspaceRequest(this, rpc, request);
+      case "window.intent":
+        return this.forwardWindowIntent(rpc, request.payload.intent);
+      case "window.focusPane":
+        if (typeof request.payload.paneId === "string") this.focusPaneWindow(request.payload.paneId);
+        return null;
+      case "window.focus":
+        if (typeof request.payload.windowId === "string") {
+          this.focusWindowWhenPlaced(request.payload.windowId, request.payload.paneId ?? null);
+        }
+        return null;
       case "pluginState.setMany":
       case "pluginState.delete":
         return handleDesktopPluginStateRequest(this.requireServices().persistence.pluginState, request);
       case "plugins.listExternal":
-        return collectExternalPluginBundles();
+        // The view asks beside `init`. Waiting for a launch in flight takes
+        // the bundles it compiles, and keeps a second load of the plugins
+        // from running beside the one the services do. It never starts a
+        // launch of its own: that is `init`'s.
+        return joinDesktopBackendLaunch(this).then(takeExternalPluginBundles);
       case "plugins.install":
         return desktopPluginManager.install(request.payload.ref, request.payload.pin);
       case "plugins.update":
@@ -501,6 +748,7 @@ export class DesktopBackend {
       case "host.saveTextFile":
       case "host.notify":
       case "host.showContextMenu":
+      case "host.saveBootFrame":
       case "host.setAppBadge":
         return handleDesktopHostRequest(this, rpc, request);
       case "update.check":

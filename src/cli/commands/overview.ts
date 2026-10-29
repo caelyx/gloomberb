@@ -1,10 +1,14 @@
+import { logFailure } from "../../utils/log-failure";
 import { apiClient } from "../../api-client";
 import { ApiRequestError } from "../../api-client/errors";
 import type { CliCommandDef } from "../../types/plugin";
-import { withCliServices } from "../context";
+import { withCliServices, withMarketData } from "../context";
+import { CLI_ERROR_CODE, failWithFields } from "../errors";
+import type { CliResultColumn } from "../result";
 import { formatCompact } from "../../utils/format";
+import { DATE_OPTION_EXAMPLES, DATE_OPTION_FORMATS, dateOptionError, readCalendarDate } from "../../utils/calendar-date";
 import {
-  fetchScreenerResult,
+  fetchPreferredMarketMovers,
   fetchTrending,
   MARKET_SUMMARY_SYMBOLS,
   type ScreenerCategory,
@@ -19,17 +23,26 @@ import {
   type MoverRankBasis,
 } from "../../plugins/builtin/market-movers/model";
 import { MOVER_CANDIDATES } from "../../plugins/builtin/market-movers/client";
+import { fetchEconCalendarFrom } from "../../plugins/builtin/econ/calendar-source";
+import { computedFredSeriesNote, seriesNotOnFred } from "../../sources/gloomberb-cloud/fred-series";
 import { EXTENDED_SESSION_LABELS, getQuoteSessionFields, type ExtendedSession } from "../../market-data/market/status";
 import {
   COUNTRY_CYCLE,
+  COUNTRY_FILTER_HINT,
+  countriesWithoutEvents,
   FILTER_CYCLE,
   loadCalendar,
+  eventCountry,
   matchesCountry,
   matchesImpact,
+  noScheduledReleasesMessage,
+  parseCountryFilter,
   shortCalendarEnd,
   type CountryFilter,
   type ImpactFilter,
 } from "../../plugins/builtin/econ/calendar-model";
+import { hasNoReleaseTime, hasNoStatedTime } from "../../plugins/builtin/econ/types";
+import { econRowFigures } from "../../plugins/builtin/econ/figures";
 import { isoDate, rejectExtraArgs, requireArg, requireOneArg, takeFlag, takeOption } from "./command-utils";
 import { buildCorrelationSeries } from "../../plugins/builtin/correlation/matrix/model";
 import { alignDailyCloses, correlateDailyCloses } from "../../plugins/builtin/correlation/compute";
@@ -41,7 +54,7 @@ import { formatChangePercentCell, formatCompactCell } from "../helpers";
 import { WORLD_INDICES } from "../../plugins/builtin/world-indices/indices";
 import { getSectorCollection, SECTOR_COLLECTIONS } from "../../plugins/builtin/sectors/sector-data";
 import { DAILY_CLOSES } from "../../plugins/builtin/shared/report-freshness";
-import { localTimeSuffix, newestReportTime, oldestReportTime } from "../../utils/utc-time";
+import { canonicalTimeZone, localTimeSuffix, newestReportTime, oldestReportTime, timeZoneCity, zonedClock } from "../../utils/utc-time";
 import { quotesFreshness, rowsFreshness } from "../freshness";
 import { periodicityOf } from "../pane-functions/freshness";
 import { formatBasisPoints, toBasisPoints } from "../../utils/basis-points";
@@ -49,18 +62,27 @@ import {
   basisPointsCell,
   DEFAULT_FRED_START,
   filterFredSeries,
+  fredChangeCell,
+  fredChangeFetchStart,
+  fredChangeHeader,
+  fredChangeMismatch,
+  fredChanges,
+  fredDecimals,
   fredEmptyAdvice,
   fredEmptyMessage,
   fredExportValue,
   fredHistoryNotes,
   fredInterval,
+  fredObservesDays,
   fredObservationsFromStart,
   fredProvenance,
   fredPublicationTime,
   fredUnit,
+  fredValueCell,
   fredValueHeader,
   isSpreadSeries,
   laggingSeriesNote,
+  parseFredChange,
 } from "./fred-series";
 
 // Batch quotes often omit names for indices and ETFs; these baskets are fixed, so name them here.
@@ -108,8 +130,8 @@ const MOVER_COLUMNS = [
   { ...MARKET_CAP_CELL, format: formatCompactCell },
 ];
 const START_OPTION = {
-  flags: "--start <yyyy-mm-dd>",
-  description: `First observation date; yyyy or yyyy-mm start at the first of that year or month (default ${DEFAULT_FRED_START})`,
+  flags: "--start <date>",
+  description: `First observation date, as ${DATE_OPTION_EXAMPLES}; yyyy or yyyy-mm start at the first of that year or month (default ${DEFAULT_FRED_START})`,
 };
 
 const MOVER_LISTS: Record<string, ScreenerCategory | "trending"> = {
@@ -122,6 +144,8 @@ const MOVER_LISTS: Record<string, ScreenerCategory | "trending"> = {
 const MOVERS_USAGE = "movers [gainers|losers|active|trending] [--session regular|extended]";
 /** The most rows the movers list serves in one request. */
 const MOVER_REQUEST_CAP = 100;
+/** A one-shot list waits this long for its rows' average volumes and sizes, as `fn MOST` does. */
+const MOVER_METADATA_WAIT_MS = 10_000;
 
 function moverRankBasis(value: string | undefined, ctx: Parameters<CliCommandDef["execute"]>[1]): MoverRankBasis {
   if (value == null) return "regular";
@@ -198,12 +222,14 @@ async function runMoverCommand(rawArgs: string[], ctx: Parameters<CliCommandDef[
   // After the close a price list keeps only the rows moving its way on the basis
   // asked for, so it reads more candidates than it shows.
   const count = category === "most_actives" ? limit : Math.min(MOVER_REQUEST_CAP, Math.max(limit, MOVER_CANDIDATES));
-  const screener = await fetchScreenerResult(category, count, undefined, { forceRefresh: ctx.cliOptions.refresh, session: basis });
+  // With the saved session, as MOST reads it: a Pro account gets the real-time lists, anyone else the delayed ones.
+  const movers = await withMarketData(ctx, () =>
+    fetchPreferredMarketMovers(category, count, { forceRefresh: ctx.cliOptions.refresh, session: basis, metadataWaitMs: MOVER_METADATA_WAIT_MS }));
   // Last and Chg% are the regular session, as `ticker` reads it, and a
   // pre-market or after-hours print is its own column. The list is ranked by
   // the regular session's move (its close's after the close), or with
   // --session extended by the extended print's move from that close.
-  const { quotes, rankedBy } = rankMoverQuotes(category, screener.data.map(moverRegularSession), basis);
+  const { quotes, rankedBy } = rankMoverQuotes(category, movers.quotes.map(moverRegularSession), basis);
   const rows = quotes.slice(0, limit).map((quote) => {
     const { extended, ...row } = quote;
     return {
@@ -215,12 +241,12 @@ async function runMoverCommand(rawArgs: string[], ctx: Parameters<CliCommandDef[
     };
   });
   const fellBack = basis === "extended" && rankedBy === "regular";
-  // A screener snapshot, as the MOST report reads it: delayed, each row dated by its own last price.
+  // As the MOST report reads it: real-time for a Pro account, delayed otherwise, each row dated by its own last price.
   ctx.printResult({
     data: rows,
     metadata: { category, rankedBy },
     ...(fellBack ? { warnings: ["No pre-market or after-hours prints now, so the list is ranked by the regular-session move."] } : {}),
-    freshness: rowsFreshness(rows, { status: "delayed" }, { stale: screener.stale === true }),
+    freshness: rowsFreshness(rows, { status: movers.source === "cloud" ? "live" : "delayed" }, { stale: movers.stale }),
   }, {
     heading: `Ranked by ${MOVER_RANKING_LABELS[rankedBy]}`,
     columns: [
@@ -251,16 +277,79 @@ async function runQuoteBasket(symbols: string[], ctx: Parameters<CliCommandDef["
   });
 }
 
-/** The UTC date, or the UTC time with its zone named (and the reader's own beside it), of an event's timestamp. */
-function utcDateTimePart(value: unknown, part: "date" | "time"): string {
+/**
+ * The UTC date, or the UTC time with its zone named, of an event's timestamp;
+ * with `readerClock`, the reader's configured clock beside it.
+ */
+function utcDateTimePart(value: unknown, part: "date" | "time", readerClock = true): string {
   const date = new Date(String(value));
   if (Number.isNaN(date.getTime())) return "";
   const iso = date.toISOString();
-  return part === "date" ? iso.slice(0, 10) : `${iso.slice(11, 16)} UTC${localTimeSuffix(date.getTime())}`;
+  return part === "date" ? iso.slice(0, 10) : `${iso.slice(11, 16)} UTC${readerClock ? localTimeSuffix(date.getTime()) : ""}`;
 }
 
-const ECON_USAGE = "econ [--country <region>] [--impact <level>] [--from <yyyy-mm-dd>]";
+const ECON_USAGE = "econ [--country <regions or countries>] [--impact <level>] [--from <date>] [--tz <zone>]";
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+/** "Sat" for 2026-10-31. */
+const weekdayOf = (date: string) => WEEKDAYS[new Date(`${date}T00:00:00Z`).getUTCDay()]!;
+
+/** Mon to Sun, so a release on a weekend (China's PMI on a Saturday) reads as one. */
+const ECON_DAY_COLUMN = { key: "day", header: "Day", shrink: false };
+
+/** A publisher's clock for a row it times itself: `13:00 Mexico City` from 13:00 in America/Mexico_City. */
+function publisherClock(localTime: unknown, timeZone: unknown): string {
+  if (typeof localTime !== "string" || !localTime || typeof timeZone !== "string" || !timeZone) return "";
+  return `${localTime} ${timeZoneCity(timeZone)}`;
+}
 const DAY_MS = 86_400_000;
+
+/** The calendar's columns up to the event: shared by the text table and the exports, which keep the raw values under them. */
+function econHeadColumns(viewerZone: string | null): CliResultColumn[] {
+  return [
+    // Text shows both halves of the event timestamp in UTC, never the host's zone; exports keep the source values.
+    { key: "date", header: "Date", format: (value) => utcDateTimePart(value, "date") },
+    // The weekday sits before the clock it is on: the UTC time's, or with --tz the viewer's.
+    ...viewerZone ? [] : [ECON_DAY_COLUMN],
+    // With --tz the viewer's clock has its own column, so the UTC time does not repeat it.
+    { key: "time", header: "Time", format: (value, row) => value === "All Day" ? "All day" : value === ""
+      ? "" : utcDateTimePart(row.date, "time", !viewerZone) },
+    ...viewerZone ? [ECON_DAY_COLUMN] : [],
+    // Only --tz fills it: the viewer's clock, its weekday in Day before it.
+    { key: "viewerTime", header: viewerZone ? timeZoneCity(viewerZone) : "Viewer", shrink: false,
+      format: (value) => typeof value === "string" && viewerZone ? value : "" },
+    // Only rows a publisher times itself fill it, so the feeds' calendar prints as before.
+    { key: "localTime", header: "Local", optional: true, dropPriority: 1, format: (value, row) => publisherClock(value, row.timeZone) },
+    { key: "country", header: "Country" },
+    { key: "impact", header: "Impact" },
+    { key: "event", header: "Event" },
+  ];
+}
+
+/**
+ * Actual, Forecast and Prior: as the text draws them (`30.3K`, `-4.1M bbl`) in the table, as
+ * numbers in the exports (30300, -4100000), where Unit and Scale say what they count and how they were drawn.
+ */
+function econFigureColumns(text: boolean): CliResultColumn[] {
+  return text
+    ? [{ key: "actualText", header: "Actual" }, { key: "forecastText", header: "Forecast" }, { key: "priorText", header: "Prior" }]
+    : [{ key: "actual", header: "Actual" }, { key: "forecast", header: "Forecast" }, { key: "prior", header: "Prior" }];
+}
+
+const ECON_PUBLISHER_COLUMN: CliResultColumn = {
+  key: "publisher", header: "Publisher", format: (value) => typeof value === "string" ? value : "",
+};
+
+/** What only the exports say about a row: how to read its figures, who publishes it and where, and the figures as drawn. */
+const econExportColumns: CliResultColumn[] = [
+  { key: "unit", header: "Unit" },
+  { key: "scale", header: "Scale" },
+  { key: "publisher", header: "Publisher" },
+  { key: "sourceUrl", header: "Link" },
+  // The figures as the calendar draws them, so a bound (`<1.25%`) that is no number keeps its text.
+  { key: "actualText", header: "actual_text" },
+  { key: "forecastText", header: "forecast_text" },
+  { key: "priorText", header: "prior_text" },
+];
 
 /**
  * What an empty calendar says. A window that starts after the last day listed
@@ -276,7 +365,7 @@ function econEmptyMessage(from: string | null, listedThrough: string | null, sto
 }
 
 /**
- * A `yyyy-mm-dd` option, checked here; null when it was not given. `expand`
+ * A date option, read as an ISO date; null when it was not given. `expand`
  * reads a shorthand as a full date first, and `form` is how the message names
  * what the option takes.
  */
@@ -284,14 +373,11 @@ function parseDateOption(
   value: string | undefined,
   flag: string,
   ctx: Parameters<CliCommandDef["execute"]>[1],
-  { expand = (text: string) => text, form = "yyyy-mm-dd" }: { expand?: (text: string) => string; form?: string } = {},
+  { expand = (text: string) => text, form = DATE_OPTION_FORMATS }: { expand?: (text: string) => string; form?: string } = {},
 ): string | null {
   if (value == null) return null;
-  const date = expand(value.trim());
-  const time = /^\d{4}-\d{2}-\d{2}$/.test(date) ? Date.parse(`${date}T00:00:00Z`) : Number.NaN;
-  if (!Number.isFinite(time) || new Date(time).toISOString().slice(0, 10) !== date) {
-    ctx.fail(`${flag} takes a date as ${form}, got "${value}".`);
-  }
+  const date = readCalendarDate(expand(value.trim()));
+  if (!date) ctx.fail(dateOptionError(value, flag, { formats: form }));
   return date;
 }
 
@@ -303,15 +389,63 @@ function parseFilter<T extends string>(value: string | undefined, values: readon
   return match;
 }
 
+/** The pane's regions and ISO country codes, comma separated (`MX,BR,ZA`, `G7,MX`); upper-cased. */
+function parseCountry(value: string | undefined, ctx: Parameters<CliCommandDef["execute"]>[1]): CountryFilter {
+  if (value == null) return COUNTRY_CYCLE[0]!;
+  const parsed = parseCountryFilter(value);
+  return "error" in parsed ? ctx.fail(parsed.error, COUNTRY_FILTER_HINT) : parsed.filter;
+}
+
+/** Blank times, each with why: a bank whose calendar gives the day and not the time. */
+function blankTimeNotes(rows: ReadonlyArray<{ event: string; country: string; timeNote: string | null }>): string[] {
+  const byNote = new Map<string, string[]>();
+  for (const row of rows) {
+    if (!row.timeNote) continue;
+    const named = `${row.event} (${row.country})`;
+    const events = byNote.get(row.timeNote) ?? [];
+    if (!events.includes(named)) events.push(named);
+    byNote.set(row.timeNote, events);
+  }
+  return [...byNote].map(([note, events]) => `No time for ${events.join(", ")}: ${note.charAt(0).toLowerCase()}${note.slice(1)}.`);
+}
+
+/**
+ * A `--from` the stored calendar does not reach back to, which Gloom Cloud refuses
+ * with "The calendar reaches back 400 days": an input error naming the earliest
+ * day it takes, and `--json` carries it as `earliest`. Any other failure goes on as it was.
+ */
+function failBeforeCalendar(error: unknown, from: string, todayStart: number): never {
+  const days = error instanceof ApiRequestError && error.status === 422 ? /reaches back (\d+) days?/i.exec(error.message)?.[1] : undefined;
+  if (!days) throw error;
+  const earliest = isoDate(new Date(todayStart - Number(days) * DAY_MS)).slice(0, 10);
+  return failWithFields(
+    `--from ${from} is before the earliest day the calendar reaches back to, ${earliest}. Use --from ${earliest} or later.`,
+    CLI_ERROR_CODE,
+    { earliest, days: Number(days) },
+  );
+}
+
 async function runEcon(args: string[], ctx: Parameters<CliCommandDef["execute"]>[1]) {
   const rawArgs = [...args];
-  const country: CountryFilter = parseFilter(takeOption(rawArgs, "--country"), COUNTRY_CYCLE, "country", ctx);
+  const country = parseCountry(takeOption(rawArgs, "--country"), ctx);
   const impact: ImpactFilter = parseFilter(takeOption(rawArgs, "--impact"), FILTER_CYCLE, "impact", ctx);
   const fromOption = parseDateOption(takeOption(rawArgs, "--from"), "--from", ctx);
+  const tzOption = takeOption(rawArgs, "--tz");
+  const viewerZone = tzOption == null ? null : canonicalTimeZone(tzOption);
+  if (tzOption != null && !viewerZone) {
+    ctx.fail(`Unknown time zone "${tzOption}".`, "Use an IANA zone name, such as America/New_York, Europe/London or Asia/Tokyo.");
+  }
   rejectArgs(rawArgs, ECON_USAGE, ctx, "Filter with --country and --impact.");
   await withCliServices(ctx, async () => {
-    const { data: events, fetchedAt, stale } = await loadCalendar(ctx.cliOptions.refresh);
     const todayStart = Math.floor(Date.now() / DAY_MS) * DAY_MS;
+    // An earlier day reads the stored calendar, which keeps past events after the week's listing drops them.
+    // A server without it, a server error or no network lists the current calendar (cached when offline) instead.
+    const stored = fromOption != null && fromOption < isoDate(new Date(todayStart))
+      ? await fetchEconCalendarFrom(fromOption).catch((error: unknown) => failBeforeCalendar(error, fromOption, todayStart))
+      : null;
+    const past = stored?.events ? stored : null;
+    const unread = stored && !stored.events && stored.failure ? `The stored calendar could not be read (${stored.failure}); listing the current calendar` : null;
+    const { data: events, fetchedAt, stale } = past ? { data: past.events, fetchedAt: Date.now(), stale: false } : await loadCalendar(ctx.cliOptions.refresh);
     // The calendar lists from today (UTC). --from moves the first day; --tail
     // alone keeps the newest events of the whole calendar, the past week's too.
     const from = fromOption ?? (ctx.cliOptions.tail != null ? null : new Date(todayStart).toISOString().slice(0, 10));
@@ -320,45 +454,93 @@ async function runEcon(args: string[], ctx: Parameters<CliCommandDef["execute"]>
     const listedThrough = lastEvent ? lastEvent.toISOString().slice(0, 10) : null;
     // A calendar that stops short of a week ahead says so under the table.
     const listedAfter = shortCalendarEnd(events, Math.max(todayStart, fromTime)) ? `No events listed after ${listedThrough}` : null;
-    const rows = events
-      .filter((event) => event.date.getTime() >= fromTime && matchesCountry(event, country) && matchesImpact(event, impact))
+    // A day before anything the calendar holds says where its listing starts.
+    const firstEvent = events.reduce<Date | null>((first, event) => (!first || event.date < first ? event.date : first), null);
+    const listedFrom = firstEvent ? firstEvent.toISOString().slice(0, 10) : null;
+    const startsLater = fromOption != null && (past ? past.storedFrom == null || past.storedFrom > fromOption : listedFrom != null && listedFrom > fromOption);
+    const listedBefore = !startsLater ? null
+      : past?.storedFrom ? `The stored calendar starts ${past.storedFrom}; nothing earlier is listed`
+      : `No events are stored before ${listedFrom ?? isoDate(new Date(todayStart))}`;
+    // Countries asked for that nothing in the window is for: a quiet week there, not an unknown country.
+    const inWindow = events.filter((event) => event.date.getTime() >= fromTime);
+    const unscheduled = countriesWithoutEvents(country, inWindow);
+    const rows = inWindow
+      .filter((event) => matchesCountry(event, country) && matchesImpact(event, impact))
       .sort((left, right) => left.date.getTime() - right.date.getTime())
-      .map((event) => ({
-        date: isoDate(event.date),
-        time: event.time,
-        country: event.country,
-        impact: event.impact,
-        event: event.event,
-        actual: event.actual ?? "",
-        forecast: event.forecast ?? "",
-        prior: event.prior ?? "",
-      }));
+      .map((event) => {
+        // The viewer's clock (--tz) for a row with a time: its date and time there.
+        const clock = viewerZone && !hasNoReleaseTime(event) ? zonedClock(event.date.getTime(), viewerZone) : null;
+        // The figures as numbers, scale multiplied out, with their unit and the scale they are drawn in; the text stays as drawn.
+        const figures = econRowFigures(event);
+        return {
+          date: isoDate(event.date),
+          // The weekday on the viewer's clock (--tz), else the UTC day's; a row with no time is its day's.
+          day: weekdayOf(clock?.date ?? isoDate(event.date).slice(0, 10)),
+          time: hasNoStatedTime(event) ? "" : event.time,
+          ...(viewerZone ? { viewerDate: clock?.date ?? null, viewerTime: clock?.time ?? null } : {}),
+          country: eventCountry(event),
+          impact: event.impact,
+          event: event.event,
+          actual: figures.actual,
+          forecast: figures.forecast,
+          prior: figures.prior,
+          unit: figures.unit,
+          scale: figures.scale,
+          actualText: event.actual ?? null,
+          forecastText: event.forecast ?? null,
+          priorText: event.prior ?? null,
+          // The publisher's own clock, for rows Gloom Cloud adds from a bank's or a statistics office's calendar.
+          localTime: event.localTime ?? null,
+          timeZone: event.timeZone ?? null,
+          timeNote: event.timeNote ?? null,
+          priorAsOf: event.priorAsOf ?? null,
+          // Who publishes the figure (Freddie Mac for the 30-year mortgage rate), the period it covers and its page.
+          publisher: event.source?.name ?? null,
+          referencePeriod: event.referencePeriod ?? null,
+          // When the figure came out: the row's time once it has an actual (its day alone when it states no time), null before.
+          released: event.actual?.trim() ? (hasNoReleaseTime(event) ? isoDate(event.date).slice(0, 10) : isoDate(event.date)) : null,
+          sourceUrl: event.source?.url ?? null,
+          // The same indicator from one release to the next; empty until Gloom Cloud names it.
+          indicatorId: event.indicatorId ?? null,
+        };
+      });
+    // A filter of countries only, none of which has anything in the window, says so as its empty list.
+    const allUnscheduled = unscheduled.length > 0 && unscheduled.length === country.split(",").length;
+    const notes = [listedBefore, listedAfter, ...(rows.length > 0 ? blankTimeNotes(rows) : []),
+      rows.length > 0 && unscheduled.length > 0 ? noScheduledReleasesMessage(unscheduled) : null]
+      .filter((note): note is string => !!note);
+    const footnote = notes.join("\n");
     ctx.printResult({
       data: rows,
-      metadata: { country, impact, from, listedThrough },
+      ...(unread ? { warnings: [unread] } : {}),
+      metadata: { country, impact, from, listedThrough, storedFrom: past?.storedFrom ?? null, ...(viewerZone ? { timeZone: viewerZone } : {}) },
       // The calendar as read, not its rows: those are scheduled, mostly ahead.
       freshness: rowsFreshness([], { status: "not-a-feed", basis: "calendar", asOf: fetchedAt }, { stale }),
     }, {
       dateKey: "date",
       defaultLimit: 50,
-      empty: econEmptyMessage(from, listedThrough, listedAfter != null),
-      ...(listedAfter ? { footnote: listedAfter } : {}),
-      columns: [
-        // Text shows both halves of the event timestamp in UTC, never the host's zone; exports keep the source values.
-        { key: "date", header: "Date", format: (value) => utcDateTimePart(value, "date") },
-        { key: "time", header: "Time", format: (value, row) => value === "All Day" ? "All day" : utcDateTimePart(row.date, "time") },
-        { key: "country", header: "Country" },
-        { key: "impact", header: "Impact" },
-        { key: "event", header: "Event" },
-        { key: "actual", header: "Actual" },
-        { key: "forecast", header: "Forecast" },
-        { key: "prior", header: "Prior" },
-      ],
+      empty: allUnscheduled ? noScheduledReleasesMessage(unscheduled) : econEmptyMessage(from, listedThrough, listedAfter != null),
+      ...(footnote ? { footnote } : {}),
+      // What the text says under the table, a script reads in the CSV's closing lines.
+      exportNotes: notes,
+      // `as_of` is the release: when a row's figure came out, blank for one that has none yet.
+      exportDated: true,
+      exportIdentity: (row) => ({
+        symbolOrSeries: typeof row.indicatorId === "string" ? row.indicatorId : null,
+        // A percent is `pct` here as in `fred` and `yield-curve`; `unit` keeps the `%` the calendar draws.
+        currencyOrUnit: row.unit === "%" ? "pct" : typeof row.unit === "string" ? row.unit : null,
+        asOf: typeof row.released === "string" ? row.released : null,
+        released: typeof row.released === "string" ? row.released : null,
+        period: typeof row.referencePeriod === "string" ? row.referencePeriod : null,
+      }),
+      // The exports add what a script needs to read a row; the text table keeps the columns it had.
+      columns: [...econHeadColumns(viewerZone), ...econFigureColumns(false), ...econExportColumns],
+      textColumns: [...econHeadColumns(viewerZone), ...econFigureColumns(true), ECON_PUBLISHER_COLUMN],
     });
   });
 }
 
-const FRED_USAGE = "fred <series-id> [--start <yyyy-mm-dd>] [--sort desc|asc]";
+const FRED_USAGE = "fred <series-id> [--start <date>] [--sort desc|asc] [--change 1D|1W]";
 const FRED_LIST_USAGE = "fred --list [filter]";
 
 /** A year or a month stands for the first day of it. */
@@ -369,7 +551,7 @@ function startOfPeriod(text: string): string {
 
 /** `--start`, checked here: Gloom Cloud cannot read anything but yyyy-mm-dd, so yyyy and yyyy-mm are spelled out. */
 function parseStartDate(value: string | undefined, ctx: Parameters<CliCommandDef["execute"]>[1]): string {
-  return parseDateOption(value, "--start", ctx, { expand: startOfPeriod, form: "yyyy-mm-dd, yyyy-mm or yyyy" }) ?? DEFAULT_FRED_START;
+  return parseDateOption(value, "--start", ctx, { expand: startOfPeriod, form: `${DATE_OPTION_FORMATS.replace(" or ", ", ")}, YYYY-MM or YYYY` }) ?? DEFAULT_FRED_START;
 }
 
 /** Gloom Cloud serves a curated set of FRED series and answers 400 for any other id. */
@@ -398,7 +580,7 @@ async function runFredList(filter: string, ctx: Parameters<CliCommandDef["execut
       { key: "title", header: "Title", minWidth: 30, stackPriority: 1 },
       { key: "group", header: "Group", shrink: false },
     ],
-    empty: filter ? `No supported FRED series match "${filter}". Run gloomberb fred --list to see them all.` : "No FRED series are listed.",
+    empty: filter ? `No supported FRED series match "${filter}". Run gloom fred --list to see them all.` : "No FRED series are listed.",
   });
 }
 
@@ -407,59 +589,87 @@ async function runFred(rawArgs: string[], ctx: Parameters<CliCommandDef["execute
   const list = takeFlag(args, "--list");
   const start = takeOption(args, "--start");
   const sort = takeOption(args, "--sort");
-  if (list) {
-    if (start != null || sort != null) ctx.fail("--list takes a filter, not --start or --sort.", `Usage: gloomberb ${FRED_LIST_USAGE}`);
+  const changeGiven = args.some((arg) => arg === "--change" || arg.startsWith("--change="));
+  const change = changeGiven ? takeOption(args, "--change") : undefined;
+  // Bare `fred` lists the series it can fetch, grouped by topic, as `fred --list` does.
+  if (list || rawArgs.length === 0) {
+    if (start != null || sort != null || changeGiven) {
+      ctx.fail("--list takes a filter, not --start, --sort or --change.", `Usage: gloom ${FRED_LIST_USAGE}`);
+    }
     return runFredList(args.join(" ").trim(), ctx);
   }
   const startDate = parseStartDate(start, ctx);
   const sortOrder = (sort ?? "desc").trim().toLowerCase();
   if (sortOrder !== "asc" && sortOrder !== "desc") ctx.fail(`Unknown sort order "${sort}".`, "Use desc (newest first) or asc.");
+  const horizon = changeGiven ? parseFredChange(change) : null;
+  if (changeGiven && !horizon) {
+    ctx.fail(change ? `Unknown change "${change}".` : "--change needs 1D or 1W.", "Use 1D (from the previous observation) or 1W (from a week before).");
+  }
   const seriesId = requireOneArg(args, FRED_USAGE, "series", ctx).toUpperCase();
-  const data = await apiClient.getCloudFredSeries(seriesId, { startDate, sortOrder }).catch((error: unknown) => {
-    if (isUnsupportedSeries(error)) ctx.fail(`Unsupported FRED series ${seriesId}. List supported series with: gloomberb fred --list`);
+  // A change needs the observation it is measured from: the fetch reaches back before the first row shown.
+  const fetchStart = horizon ? fredChangeFetchStart(startDate) : startDate;
+  const data = await apiClient.getCloudFredSeries(seriesId, { startDate: fetchStart, sortOrder }).catch((error: unknown) => {
+    if (isUnsupportedSeries(error)) ctx.fail(`Unsupported FRED series ${seriesId}. List supported series with: gloom fred --list`);
     throw error;
   });
   // Every observation exports as `value`, a spread in basis points; its unit goes in the `currency_or_unit` column.
   const unit = fredUnit(seriesId, data.info);
   const interval = fredInterval(data.info?.frequency);
+  const mismatch = horizon ? fredChangeMismatch(seriesId, interval, horizon) : null;
+  if (mismatch) ctx.fail(mismatch);
+  // Each row's change in the unit its value exports in, and the date it is from; a holiday's stays blank.
+  const changes = horizon ? fredChanges(seriesId, data.observations, horizon) : null;
+  const releasedOf = (observation: { publisher?: string; publishedAt?: string; releasedOn?: string }) =>
+    observation.releasedOn ?? (observation.publisher?.trim() ? observation.publishedAt : undefined);
   // A value FRED does not list yet carries its publisher and when it published, in every export.
-  const exportRow = (observation: { date: string; value: number | null; publisher?: string; publishedAt?: string }) => ({
+  const exportRow = (observation: { date: string; value: number | null; publisher?: string; publishedAt?: string; releasedOn?: string }) => ({
     date: observation.date,
     value: fredExportValue(seriesId, observation.value),
+    ...(changes ? { change: changes.get(observation.date)?.change ?? null, changeFrom: changes.get(observation.date)?.changeFrom ?? null } : {}),
     ...(observation.publisher?.trim() ? { publisher: observation.publisher.trim(), ...(observation.publishedAt ? { publishedAt: observation.publishedAt } : {}) } : {}),
+    // When the figure came out, where the data says: only a series' newest observation does. `date` is the period it covers.
+    ...releasedOf(observation) ? { released: releasedOf(observation) } : {},
   });
   // A --start before the series begins comes back padded with blank days: the rows start at its first observation.
-  const rows = fredObservationsFromStart(data.observations, data.info?.observationStart).map(exportRow);
+  const rows = fredObservationsFromStart(data.observations, data.info?.observationStart)
+    .filter((observation) => !horizon || observation.date >= startDate)
+    .map(exportRow);
   // The default start hides older history and a start before the series begins is moved up silently: say where it really starts.
   const notes = [
     ...fredHistoryNotes({ startDate, startGiven: start != null, seriesStart: data.info?.observationStart }),
     laggingSeriesNote(seriesId),
+    computedFredSeriesNote(seriesId),
   ].filter((note): note is string => note != null);
   // Nothing on or after the start: name where the series ends, so an empty answer is not a dead end.
   const latest = rows.length > 0 ? null : await apiClient.getCloudFredSeries(seriesId, { limit: 1, sortOrder: "desc" })
-    .then((payload) => payload.observations[0] ?? null).catch(() => null);
+    .then((payload) => payload.observations[0] ?? null).catch(logFailure("cli.commands-overview", "Read latest economic series observation failed", null));
   // CSV and NDJSON are rows alone: an empty one would read as a series with no data, so it fails and says where the series ends.
   if (rows.length === 0 && (ctx.cliOptions.format === "csv" || ctx.cliOptions.format === "ndjson")) {
     ctx.fail(`No ${seriesId} observations on or after ${startDate}.`, fredEmptyAdvice(seriesId, latest));
   }
   const periodicity = periodicityOf(data.info?.frequency);
+  const observesDays = fredObservesDays(data.info?.frequency);
   const newestDate = rows.reduce<string | null>((newest, row) => (!newest || row.date > newest ? row.date : newest), null);
   // A newest value FRED does not list yet names its publisher, Treasury for a yield; FRED's own stay "FRED".
-  const ahead = fredProvenance(data.observations.filter((observation) => observation.date === newestDate));
+  const ahead = fredProvenance(data.observations.filter((observation) => observation.date === newestDate), seriesId);
   // FRED names the series' publisher when Gloom Cloud passes it on, and when it last updated the series.
   const publisher = ahead?.publisher ?? data.info?.source?.trim();
   const publishedAt = ahead ? ahead.publishedAt : fredPublicationTime(data.info, newestDate);
+  // When the newest figure was released: the report is as of then, `Sep 2026, released Tue 20 Oct`.
+  const releasedOn = ahead ? undefined : data.observations.find((observation) => observation.date === newestDate)?.releasedOn;
   ctx.printResult({
     data: rows,
     metadata: {
       info: data.info, seriesId, startDate, sortOrder, unit, interval,
+      ...(horizon ? { change: horizon } : {}),
       ...(notes.length ? { notes } : {}),
       ...(latest ? { latestObservation: exportRow(latest) } : {}),
     },
     freshness: rowsFreshness(rows, {
-      source: ahead?.source ?? "FRED", status: "not-a-feed", basis: "published statistics", observedKey: "date", oldest: null,
+      source: ahead?.source ?? notOnFredSource(seriesId) ?? "FRED", status: "not-a-feed", basis: "published statistics", observedKey: "date", oldest: null,
       // A monthly or quarterly observation is dated the first of its period, not a day it was seen.
       ...(periodicity ? { periodicity } : {}),
+      ...(releasedOn ? { releasedOn } : {}),
       ...(publisher ? { publisher } : {}),
       ...(publishedAt ? { publishedAt } : {}),
     }),
@@ -467,14 +677,33 @@ async function runFred(rawArgs: string[], ctx: Parameters<CliCommandDef["execute
     dateKey: "date",
     empty: fredEmptyMessage(startDate, latest == null ? null : exportRow(latest)),
     ...(notes.length ? { footnote: notes.join("\n"), exportNotes: notes } : {}),
-    exportIdentity: { symbolOrSeries: seriesId, currencyOrUnit: unit, interval },
+    // `as_of` is the release. A figure with none stated is as of its own day when the series is known to observe
+    // days (a daily or weekly rate), and of nothing otherwise, never the first day of the period it covers.
+    exportDated: true,
+    exportIdentity: (row) => {
+      const released = typeof row.released === "string" ? row.released : null;
+      const date = typeof row.date === "string" ? row.date : null;
+      return { symbolOrSeries: seriesId, currencyOrUnit: unit, interval, asOf: released ?? (observesDays ? date : null), period: date, released };
+    },
+    // The release closes the row with the other dating columns, so it is not one of the observation's own.
+    columns: [...new Set(rows.flatMap((row) => Object.keys(row)))].filter((key) => key !== "released").map((key) => ({ key, header: key })),
     textColumns: [
       { key: "date", header: "Date" },
       isSpreadSeries(seriesId)
         ? { key: "value", header: "Value (bp)", align: "right", format: basisPointsCell }
-        : { key: "value", header: fredValueHeader(data.info), align: "right" },
+        : { key: "value", header: fredValueHeader(data.info), align: "right", format: fredValueCell(fredDecimals(rows.map((row) => row.value))) },
+      ...(horizon ? [{
+        key: "change", header: fredChangeHeader(seriesId, horizon, data.info), align: "right" as const,
+        format: fredChangeCell(isSpreadSeries(seriesId), fredDecimals(rows.map((row) => row.value))),
+      }] : []),
     ],
   });
+}
+
+/** Who a series FRED does not carry comes from, for a source line whose rows do not name it: `TurkStat via the CBRT`. */
+function notOnFredSource(seriesId: string): string | null {
+  const elsewhere = seriesNotOnFred(seriesId);
+  return elsewhere ? `${elsewhere.publisher} via ${elsewhere.via}` : null;
 }
 
 const YIELD_TENORS: Record<string, string> = { DGS3MO: "3M", DGS2: "2Y", DGS10: "10Y", DGS30: "30Y" };
@@ -482,7 +711,7 @@ const YIELD_TENORS: Record<string, string> = { DGS3MO: "3M", DGS2: "2Y", DGS10: 
 async function runYieldCurve(rawArgs: string[], ctx: Parameters<CliCommandDef["execute"]>[1]) {
   const args = [...rawArgs];
   const startDate = parseStartDate(takeOption(args, "--start"), ctx);
-  rejectArgs(args, "yield-curve [--start <yyyy-mm-dd>]", ctx);
+  rejectArgs(args, "yield-curve [--start <date>]", ctx);
   const series = Object.keys(YIELD_TENORS);
   const results = await Promise.all(series.map(async (seriesId) => {
     const data = await apiClient.getCloudFredSeries(seriesId, { startDate, sortOrder: "desc" });
@@ -535,8 +764,8 @@ async function runCorrelation(rawArgs: string[], ctx: Parameters<CliCommandDef["
   const args = [...rawArgs];
   const exchange = takeOption(args, "--exchange");
   const usage = "correlation <symbol-a> <symbol-b>";
-  requireArg(args[0], `Usage: gloomberb ${usage}`, ctx);
-  requireArg(args[1], `Usage: gloomberb ${usage}`, ctx);
+  requireArg(args[0], `Usage: gloom ${usage}`, ctx);
+  requireArg(args[1], `Usage: gloom ${usage}`, ctx);
   rejectExtraArgs(args, 2, { usage, takes: "two symbols", advice: "Run it once per pair." }, ctx);
   await withCliServices(ctx, async (services) => {
     // --exchange is for a symbol that names no exchange of its own.
@@ -627,11 +856,13 @@ export const overviewCliCommands: CliCommandDef[] = [
       group: CLI_COMMAND_GROUPS.markets,
       usage: [ECON_USAGE],
       options: [
-        { flags: "--country <region>", description: "US, G7, EU, or all (default all)" },
+        { flags: "--country <regions or countries>", description: "US, G7, EU, all (default), or countries by their two-letter codes, comma separated, such as MX or MX,BR,ZA" },
         { flags: "--impact <level>", description: "high, medium, low, or all (default all)" },
-        { flags: "--from <yyyy-mm-dd>", description: "First day listed (default today, UTC); an earlier day reaches past events" },
+        { flags: "--from <date>", description: `First day listed, as ${DATE_OPTION_EXAMPLES} (default today, UTC); an earlier day lists past events from the stored calendar and says where it starts` },
+        { flags: "--tz <zone>", description: "Add a column with each release's time on that clock, an IANA zone such as America/New_York; with the weekday when it falls on another day than the UTC date" },
       ],
-      examples: ["econ", "econ --country US --impact high", "econ --tail 20"],
+      examples: ["econ", "econ --country US --impact high", "econ --country MX,BR,ZA,IN,KR", "econ --from 2026-10-12 --country US",
+        "econ --country BR --tz America/New_York", "econ --tail 20"],
     },
     execute: runEcon,
   },
@@ -640,19 +871,23 @@ export const overviewCliCommands: CliCommandDef[] = [
     description: "Fetch a FRED economic series, or list the ones served",
     help: {
       group: CLI_COMMAND_GROUPS.markets,
-      usage: [FRED_USAGE, FRED_LIST_USAGE],
+      usage: [FRED_USAGE, "fred", FRED_LIST_USAGE],
       options: [
         START_OPTION,
         { flags: "--sort <order>", description: "desc for newest first (default) or asc" },
-        { flags: "--list", description: "List the series Gloom Cloud serves (ID, title, group); words after it filter the list" },
+        { flags: "--list", description: "List the series Gloom Cloud serves (ID, title, group), as fred alone does; words after it filter the list" },
+        {
+          flags: "--change <1D|1W>",
+          description: "Add each observation's change in the series' unit (bp for a spread, pp for a percent): 1D from the previous observation, 1W from the last one a week before; holidays stay blank",
+        },
       ],
       sections: [{
         title: "Series",
         lines: [
-          "Gloom Cloud serves a curated set of FRED series and needs no sign-in for them. gloomberb fred --list prints them; any other ID fails with that pointer.",
+          "Gloom Cloud serves a curated set of FRED series and needs no sign-in for them. gloom fred (or fred --list) prints them by topic; any other ID fails with that pointer.",
         ],
       }],
-      examples: ["fred CPIAUCSL", "fred DGS10 --tail 5", "fred UNRATE --start 2020-01-01 --csv", "fred --list", "fred --list fx"],
+      examples: ["fred CPIAUCSL", "fred DGS10 --tail 5", "fred DGS10 --change 1D --tail 5", "fred UNRATE --start 2020-01-01 --csv", "fred", "fred --list credit", "fred --list fx"],
     },
     execute: runFred,
   },
@@ -661,7 +896,7 @@ export const overviewCliCommands: CliCommandDef[] = [
     description: "Show the latest 3M, 2Y, 10Y, and 30Y Treasury yields",
     help: {
       group: CLI_COMMAND_GROUPS.markets,
-      usage: ["yield-curve [--start <yyyy-mm-dd>]"],
+      usage: ["yield-curve [--start <date>]"],
       options: [START_OPTION],
     },
     execute: runYieldCurve,

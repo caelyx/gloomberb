@@ -1,11 +1,13 @@
 import { Box, Text } from "../../ui";
 import { useEffect, useId, type ReactNode } from "react";
-import type { PaneSettingField } from "../../types/plugin";
-import { blendHex, colors } from "../../theme/colors";
+import type { PaneSettingField, PaneSettingRowNote } from "../../types/plugin";
+import { colors } from "../../theme/colors";
 import { SelectField, type SelectFieldHandle } from "../ui/select-field";
 import { Checkbox } from "../ui/checkbox";
+import { Button } from "../ui/button";
+import { Badge } from "../ui/display";
 import { DialogFrame } from "../ui/frame";
-import { isPaneSettingDisabled, summarizePaneSettingValue } from "./value";
+import { isPaneSettingDisabled, noteColor, summarizePaneSettingValue } from "./value";
 
 const DESKTOP_TEXT_STYLE = {
   letterSpacing: 0,
@@ -16,13 +18,6 @@ export function desktopText(weight?: number) {
   return weight ? { ...DESKTOP_TEXT_STYLE, fontWeight: weight } : DESKTOP_TEXT_STYLE;
 }
 
-function desktopSubtleSurface(): string {
-  return blendHex(colors.panel, colors.bg, 0.22);
-}
-
-function desktopHoverSurface(): string {
-  return blendHex(colors.bg, colors.borderFocused, 0.08);
-}
 
 /** Pane settings dialogs: the kit DialogFrame at the settings width. */
 export function DesktopDialogSurface({
@@ -41,40 +36,6 @@ export function DesktopDialogSurface({
       <DialogFrame title={title} subtitle={subtitle} onClose={dismiss}>
         {children}
       </DialogFrame>
-    </Box>
-  );
-}
-
-function DesktopValuePill({ value }: { value: string }) {
-  return (
-    <Box
-      flexDirection="row"
-      alignItems="center"
-      backgroundColor={desktopSubtleSurface()}
-      style={{
-        border: `1px solid ${colors.border}`,
-        borderRadius: 6,
-        padding: "1px 7px",
-      }}
-    >
-      <Text fg={colors.textDim} style={desktopText(600)}>{value}</Text>
-    </Box>
-  );
-}
-
-function DesktopActionPill({ disabled, label }: { disabled: boolean; label: string }) {
-  return (
-    <Box
-      flexDirection="row"
-      alignItems="center"
-      backgroundColor={disabled ? "transparent" : desktopSubtleSurface()}
-      style={{
-        border: `1px solid ${colors.border}`,
-        borderRadius: 6,
-        padding: "1px 7px",
-      }}
-    >
-      <Text fg={disabled ? colors.textMuted : colors.text} style={desktopText(650)}>{label}</Text>
     </Box>
   );
 }
@@ -113,6 +74,7 @@ function DesktopSettingsRow({
   field,
   selected,
   currentValue,
+  note,
   onHover,
   onEdit,
   onSelectRef,
@@ -121,6 +83,8 @@ function DesktopSettingsRow({
   field: PaneSettingField;
   selected: boolean;
   currentValue: unknown;
+  /** What its action said on it: the state beside its button, the reason in place of its description. */
+  note: PaneSettingRowNote | null;
   onHover: () => void;
   onEdit: () => void;
   onSelectRef: (fieldKey: string, element: SelectFieldHandle | null) => void;
@@ -130,6 +94,7 @@ function DesktopSettingsRow({
   const disabled = isPaneSettingDisabled(field);
   const rowId = useFollowHighlight(selected);
   const summary = summarizePaneSettingValue(field, currentValue);
+  const description = note?.text ?? field.description;
   const control = field.type === "toggle" ? (
     <Checkbox label={field.label} displayLabel="" checked={currentValue === true} onChange={(checked) => onApply(field, checked)} />
   ) : field.type === "select" ? (
@@ -142,11 +107,15 @@ function DesktopSettingsRow({
       onChange={(value) => onApply(field, value)}
     />
   ) : field.type === "action" ? (
-    <DesktopActionPill disabled={disabled} label={summary} />
+    // The button says what pressing the row does, and presses it: the row's own press is not repeated.
+    <Box flexDirection="row" alignItems="center" gap={1}>
+      {note ? <Text fg={noteColor(note)} style={desktopText()}>{note.status}</Text> : null}
+      <Button label={summary} variant="secondary" disabled={disabled} onPress={onEdit} stopPropagation />
+    </Box>
   ) : (
     <Box flexDirection="row" alignItems="center" gap={1}>
-      <DesktopValuePill value={summary} />
-      <Text fg={colors.textMuted} style={desktopText(600)}>Edit</Text>
+      <Badge label={summary} />
+      <Text fg={colors.textMuted} style={desktopText()}>Edit</Text>
     </Box>
   );
 
@@ -154,10 +123,10 @@ function DesktopSettingsRow({
     <Box
       id={rowId}
       flexDirection="column"
-      minHeight={field.description ? undefined : 2}
+      minHeight={description ? undefined : 2}
       data-gloom-role="pane-setting-row"
       data-selected={selected ? "true" : "false"}
-      backgroundColor={selected ? desktopHoverSurface() : "transparent"}
+      backgroundColor={selected ? "var(--gloom-hover-fill)" : "transparent"}
       onMouseOver={disabled ? undefined : onHover}
       onMouseDown={field.type === "select" ? undefined : (event: any) => {
         event.stopPropagation?.();
@@ -168,22 +137,22 @@ function DesktopSettingsRow({
       }}
       data-gloom-interactive={field.type === "select" || disabled ? undefined : "true"}
       style={{
-        borderRadius: 6,
+        borderRadius: "var(--gloom-radius-md)",
         cursor: field.type === "select" || disabled ? "default" : "pointer",
         opacity: disabled ? 0.6 : 1,
-        padding: "7px 4px 8px",
+        padding: "var(--gloom-space-sm)",
         transition: "background-color 100ms ease",
       }}
     >
       <Box flexDirection="row" alignItems="center" width="100%">
-        <Box flexDirection="row" flexGrow={1} minWidth={0} style={{ paddingRight: 12 }}>
-          <Text fg={colors.text} style={desktopText(650)}>{field.label}</Text>
+        <Box flexDirection="row" flexGrow={1} minWidth={0} style={{ paddingRight: "var(--gloom-space-md)" }}>
+          <Text fg={colors.text} style={desktopText()}>{field.label}</Text>
         </Box>
         {control}
       </Box>
-      {field.description && (
-        <Text fg={colors.textMuted} wrapText style={desktopText()}>
-          {field.description}
+      {description && (
+        <Text fg={note?.text ? noteColor(note) : colors.textMuted} wrapText style={desktopText()}>
+          {description}
         </Text>
       )}
     </Box>
@@ -194,6 +163,7 @@ function DesktopSettingsList({
   fields,
   selectedIndex,
   settings,
+  noteFor,
   onHover,
   onEdit,
   onSelectRef,
@@ -202,6 +172,7 @@ function DesktopSettingsList({
   fields: PaneSettingField[];
   selectedIndex: number;
   settings: Record<string, unknown>;
+  noteFor?: (field: PaneSettingField) => PaneSettingRowNote | null;
   onHover: (field: PaneSettingField, index: number) => void;
   onEdit: (field: PaneSettingField, index: number) => void;
   onSelectRef: (fieldKey: string, element: SelectFieldHandle | null) => void;
@@ -220,6 +191,7 @@ function DesktopSettingsList({
           field={field}
           selected={index === selectedIndex}
           currentValue={settings[field.key]}
+          note={noteFor?.(field) ?? null}
           onHover={() => onHover(field, index)}
           onEdit={() => onEdit(field, index)}
           onSelectRef={onSelectRef}
@@ -246,6 +218,7 @@ export function DesktopPaneSettingsDialogBody({
   fields,
   selectedIndex,
   settings,
+  noteFor,
   onHover,
   onEdit,
   onSelectRef,
@@ -256,6 +229,7 @@ export function DesktopPaneSettingsDialogBody({
   fields: PaneSettingField[];
   selectedIndex: number;
   settings: Record<string, unknown>;
+  noteFor?: (field: PaneSettingField) => PaneSettingRowNote | null;
   onHover: (field: PaneSettingField, index: number) => void;
   onEdit: (field: PaneSettingField, index: number) => void;
   onSelectRef: (fieldKey: string, element: SelectFieldHandle | null) => void;
@@ -275,6 +249,7 @@ export function DesktopPaneSettingsDialogBody({
           fields={fields}
           selectedIndex={selectedIndex}
           settings={settings}
+          noteFor={noteFor}
           onHover={onHover}
           onEdit={onEdit}
           onSelectRef={onSelectRef}

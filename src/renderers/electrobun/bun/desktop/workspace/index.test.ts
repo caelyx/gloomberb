@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { cloneLayout, createDefaultConfig, createPaneInstance, findPaneInstance } from "../../../../../types/config";
 import { addPaneFloating } from "../../../../../layout/pane-manager";
+import { movePaneToNewWindow } from "../../../../../layout/pane-manager/secondary-windows";
 import { updatePaneInstance } from "../../../../../pane-settings";
 import { createDesktopWorkspace } from "./index";
 
@@ -23,6 +24,21 @@ describe("desktop workspace", () => {
       { instanceId: "chat:main", x: 100, y: 120, width: 800, height: 540 },
     ]);
     expect(snapshot.config.layout.floating.some((entry) => entry.instanceId === "chat:main")).toBe(false);
+  });
+
+  test("closing a secondary window without the main window keeps its panes and their state", () => {
+    const config = createDefaultConfig("/tmp/gloomberb-desktop");
+    const moved = movePaneToNewWindow(config.layout, "chat:main")!;
+    const workspace = createDesktopWorkspace(config, null);
+    workspace.replaceConfig({ ...config, layout: moved.layout });
+    workspace.replaceDetachedPaneState("chat:main", { cursor: 3 });
+
+    const closed = workspace.closeSecondaryWindow("w2");
+    expect(closed.config.layout.windows ?? []).toEqual([]);
+    // The saved tab follows, so the closed window does not come back on a relaunch.
+    expect(closed.config.layouts[closed.config.activeLayoutIndex]?.layout.windows ?? []).toEqual([]);
+    expect(closed.config.layout.instances.some((instance) => instance.instanceId === "chat:main")).toBe(true);
+    expect(closed.paneState["chat:main"]).toEqual({ cursor: 3 });
   });
 
   test("docking a detached pane onto a frame edge clears detached placement", () => {

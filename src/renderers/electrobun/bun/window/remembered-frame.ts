@@ -4,9 +4,10 @@ import { getGloomberbDirs } from "../../../../data/config/home";
 import type { WindowFrame } from "./frame";
 
 /**
- * The main window's last frame lives beside the config, not in it. Launch
- * reads it before config is loaded, and a frame is this machine's screen,
- * so it stays out of the synced config.
+ * The windows' last frames live beside the config, not in it. Launch reads
+ * them before config is loaded, and a frame is this machine's screen, so it
+ * stays out of the synced config. The main window's fields sit at the top
+ * level, as they did before secondary windows, which go under `windows` by id.
  */
 const FILE_NAME = "desktop-window.json";
 
@@ -43,20 +44,56 @@ export function parseRememberedDesktopWindow(raw: unknown): RememberedDesktopWin
   };
 }
 
-export function readRememberedDesktopWindow(path: string): RememberedDesktopWindow | null {
-  try {
-    return parseRememberedDesktopWindow(JSON.parse(readFileSync(path, "utf8")));
-  } catch {
-    return null;
-  }
+interface RememberedDesktopWindows {
+  main: RememberedDesktopWindow | null;
+  /** Secondary windows by layout window id. */
+  windows: Record<string, RememberedDesktopWindow>;
 }
 
-export function writeRememberedDesktopWindow(path: string, value: RememberedDesktopWindow): void {
+export function readRememberedDesktopWindows(path: string): RememberedDesktopWindows {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return { main: null, windows: {} };
+  }
+  const windows: Record<string, RememberedDesktopWindow> = {};
+  const rawWindows = raw && typeof raw === "object" ? (raw as Record<string, unknown>).windows : null;
+  if (rawWindows && typeof rawWindows === "object") {
+    for (const [id, entry] of Object.entries(rawWindows)) {
+      const parsed = id ? parseRememberedDesktopWindow(entry) : null;
+      if (parsed) windows[id] = parsed;
+    }
+  }
+  return { main: parseRememberedDesktopWindow(raw), windows };
+}
+
+function writeRememberedDesktopWindows(path: string, value: RememberedDesktopWindows): void {
   mkdirSync(dirname(path), { recursive: true });
   const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify(value));
+  writeFileSync(temporary, JSON.stringify({ ...value.main, windows: value.windows }));
   renameSync(temporary, path);
 }
+
+/** One copy of the file for the process, so a save for one window never drops another's. */
+export function createRememberedWindowStore(path: string) {
+  const current = readRememberedDesktopWindows(path);
+  const write = () => writeRememberedDesktopWindows(path, current);
+  return {
+    main: (): RememberedDesktopWindow | null => current.main,
+    window: (id: string): RememberedDesktopWindow | null => current.windows[id] ?? null,
+    saveMain(value: RememberedDesktopWindow): void {
+      current.main = value;
+      write();
+    },
+    saveWindow(id: string, value: RememberedDesktopWindow): void {
+      current.windows[id] = value;
+      write();
+    },
+  };
+}
+
+export type RememberedWindowStore = ReturnType<typeof createRememberedWindowStore>;
 
 function overlapArea(frame: WindowFrame, display: DisplayWorkArea): number {
   const width = Math.min(frame.x + frame.width, display.x + display.width) - Math.max(frame.x, display.x);

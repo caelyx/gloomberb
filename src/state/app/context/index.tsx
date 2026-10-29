@@ -7,6 +7,7 @@ import {
   useMemo,
   useReducer,
   useRef,
+  useState,
   useSyncExternalStore,
   type Dispatch,
   type SetStateAction,
@@ -21,11 +22,20 @@ import {
   type AppConfig,
   type PaneInstanceConfig,
 } from "../../../types/config";
-import type { DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindowBridge } from "../../../types/desktop-window";
+import type {
+  DesktopSharedStateSnapshot,
+  DesktopThemePreviewState,
+  DesktopWindowBridge,
+  DesktopWindowIntent,
+  SecondaryWindowStatus,
+} from "../../../types/desktop-window";
 import { setPaneSetting, setPaneSettings, updatePaneInstance } from "../../../pane-settings";
 import { useTickerFinancials } from "../../../market-data/hooks";
 import { hasAmbiguousTickerContracts, resolveInstrumentForPane, resolveListingForPane, tickerForInstrument } from "../../../core/state/app/instrument";
 import { materializeDetachedLayouts } from "../../../core/state/app/layout";
+import { applyWindowIntent, SecondaryWindowSync, windowMoveOutcome, type WindowIntentOutcome } from "./secondary-window-sync";
+import { DesktopWindowCommandsContext, type DesktopWindowCommands } from "./window-commands";
+import type { WindowSize } from "../../../layout/pane-manager/secondary-windows";
 import {
   APP_SESSION_ID,
   APP_SESSION_SCHEMA_VERSION,
@@ -56,6 +66,7 @@ export {
   syncConfigActiveLayoutState,
   resolveTickerForPane,
 } from "../../../core/state/app/state";
+export { useDesktopWindowCommands, type DesktopWindowCommands } from "./window-commands";
 export type {
   AppAction,
   AppState,
@@ -84,6 +95,26 @@ type AppContextValue = AppContextStoreValue | AppContextLegacyValue;
 
 export const AppContext = createContext<AppContextValue | null>(null);
 const PaneContext = createContext<string | null>(null);
+
+/** How long a secondary window waits for its focus and size to settle before telling the main window. */
+const WINDOW_STATUS_DEBOUNCE_MS = 250;
+
+/** Layout-tab actions a secondary window drops: its bar can offer them, but only the main window keeps tabs. */
+const MAIN_WINDOW_LAYOUT_ACTIONS = new Set<AppAction["type"]>([
+  "SWITCH_LAYOUT",
+  "NEW_LAYOUT",
+  "DELETE_LAYOUT",
+  "DUPLICATE_LAYOUT",
+  "RENAME_LAYOUT",
+  "REORDER_LAYOUT",
+  "INSTALL_LAYOUT_COPY",
+  "REPLACE_LAYOUT_CONTENT",
+  "SET_LAYOUT_ORIGIN",
+  "MOVE_PANE_TO_NEW_LAYOUT",
+  "MOVE_PANE_BACK",
+  "UNDO_LAYOUT",
+  "REDO_LAYOUT",
+]);
 
 /** False only for the deprecated `{ state, dispatch }` value, which the hooks below still read. */
 function isAppStoreContextValue(context: AppContextValue): context is AppContextStoreValue {
@@ -398,19 +429,6 @@ function useUpdatePaneLayout(options: { saveDelayMs?: number } = {}) {
   }, [dispatch, saveDelayMs, stateRef]);
 }
 
-/**
- * Rewrites this pane's own instance (binding, title, settings) in one saved
- * layout update, for a pane that changes what it shows in place, as INS does
- * when its ranking opens a company.
- */
-export function useUpdatePaneInstance(paneId?: string): (update: (instance: PaneInstanceConfig) => PaneInstanceConfig) => void {
-  const id = useScopedPaneId(paneId);
-  const updateLayout = useUpdatePaneLayout();
-  return useCallback((update: (instance: PaneInstanceConfig) => PaneInstanceConfig) => {
-    updateLayout((layout) => findPaneInstance(layout, id) ? updatePaneInstance(layout, id, update) : layout);
-  }, [id, updateLayout]);
-}
-
 /** Keep a content-derived pane title in its saved layout, without exposing config writes. Null leaves the title alone. */
 export function usePaneTitle(title: string | null, paneId?: string): void {
   const id = useScopedPaneId(paneId);
@@ -427,6 +445,18 @@ export function usePaneTitle(title: string | null, paneId?: string): void {
   }, [id, title, updateLayout]);
 }
 
+const DesktopWindowActiveContext = createContext(true);
+
+/**
+ * Whether this is the desktop window the user is working in: the one with
+ * native focus, or the last to have it while the app is in the background.
+ * Only that window shows its focused pane as focused. Always true outside the
+ * desktop app.
+ */
+export function useDesktopWindowActive(): boolean {
+  return useContext(DesktopWindowActiveContext);
+}
+
 export function AppProvider({
   config,
   children,
@@ -435,6 +465,7 @@ export function AppProvider({
   desktopBridge,
   desktopSnapshot = null,
   initialThemePreview = null,
+  onWindowConfigChange,
 }: {
   config: AppConfig;
   children: ReactNode;
@@ -443,6 +474,8 @@ export function AppProvider({
   desktopBridge?: DesktopWindowBridge;
   desktopSnapshot?: DesktopSharedStateSnapshot | null;
   initialThemePreview?: DesktopThemePreviewState | null;
+  /** In the main window: settings a secondary window changed, applied here, to announce as a local change is. */
+  onWindowConfigChange?: (config: AppConfig) => void;
 }) {
   const [state, rawDispatch] = useReducer(
     appReducer,
@@ -471,6 +504,7 @@ export function AppProvider({
   const effectiveThemeId = getEffectiveThemeId(state);
   const previousRecentTickers = useRef(state.recentTickers);
   const previousRecentCommands = useRef(state.config.recentCommands);
+  const previousCommandBarOpens = useRef(state.config.commandBarOpens);
   const stateRef = useRef(state);
   const listenersRef = useRef(new Set<() => void>());
   const storeRef = useRef<AppContextStoreValue | null>(null);
@@ -478,10 +512,27 @@ export function AppProvider({
   const latestMainStateRevisionRef = useRef(desktopSnapshot?.mainStateRevision ?? 0);
   const lastDetachedPaneSyncRef = useRef<string | null>(null);
   const lastThemePreviewSyncRef = useRef<string | null | undefined>(undefined);
+  // A secondary window's changes go to the main window as intents; this keeps
+  // track of them, and of the last snapshot the main window sent.
+  const windowSyncRef = useRef<SecondaryWindowSync | null>(null);
+  const lastWindowViewRef = useRef<DesktopSharedStateSnapshot | null>(desktopSnapshot);
+  const [activeWindowKey, setActiveWindowKey] = useState<string | null>(desktopBridge?.initialActiveWindowKey ?? null);
 
   stateRef.current = state;
+  if (!windowSyncRef.current && desktopBridge?.kind === "window" && desktopBridge.windowId && desktopBridge.sendWindowIntent) {
+    windowSyncRef.current = new SecondaryWindowSync(desktopBridge.windowId);
+    windowSyncRef.current.start(desktopSnapshot ?? {
+      config: state.config,
+      paneState: state.paneState,
+      focusedPaneId: state.focusedPaneId,
+      statusBarVisible: state.statusBarVisible,
+    }, state);
+  }
 
   const dispatch = useCallback((action: AppAction) => {
+    // A secondary window's state is a view of the main window's open tab; the
+    // tabs, and the history of their layouts, are the main window's to change.
+    if (desktopBridge?.kind === "window" && MAIN_WINDOW_LAYOUT_ACTIONS.has(action.type)) return;
     const dispatchedAction = desktopBridge
       ? action
       : action.type === "SET_CONFIG"
@@ -507,6 +558,7 @@ export function AppProvider({
     paneState: currentState.paneState,
     focusedPaneId: currentState.focusedPaneId,
     statusBarVisible: currentState.statusBarVisible,
+    brokerSyncErrors: currentState.brokerSyncErrors,
   }), []);
 
   const serializeDesktopSnapshot = useCallback((snapshot: DesktopSharedStateSnapshot): string => JSON.stringify({
@@ -514,6 +566,7 @@ export function AppProvider({
     paneState: snapshot.paneState,
     focusedPaneId: snapshot.focusedPaneId,
     statusBarVisible: snapshot.statusBarVisible,
+    brokerSyncErrors: snapshot.brokerSyncErrors ?? {},
   }), []);
 
   const serializePaneState = useCallback((paneState: PaneRuntimeState | undefined): string => JSON.stringify(paneState ?? {}), []);
@@ -551,9 +604,155 @@ export function AppProvider({
     scheduleConfigSave(() => ({ ...stateRef.current.config, recentTickers: stateRef.current.recentTickers }));
   }, [state.config.recentCommands]);
 
+  // Opening the empty bar changes only config.commandBarOpens, until it stops
+  // counting; nothing else saves it.
+  useEffect(() => {
+    if (previousCommandBarOpens.current === state.config.commandBarOpens) return;
+    previousCommandBarOpens.current = state.config.commandBarOpens;
+    scheduleConfigSave(() => ({ ...stateRef.current.config, recentTickers: stateRef.current.recentTickers }));
+  }, [state.config.commandBarOpens]);
+
+  /** Takes the main window's last snapshot back in, with this window's unanswered changes laid over it. */
+  const rehydrateSecondaryWindow = useCallback(() => {
+    const windowSync = windowSyncRef.current;
+    const view = lastWindowViewRef.current;
+    if (!windowSync || !view) return;
+    dispatch({ type: "HYDRATE_DESKTOP_SNAPSHOT", snapshot: windowSync.receive(view, stateRef.current) });
+    windowSync.noteSynced(stateRef.current);
+  }, [dispatch]);
+
+  /** Sends what changed in this secondary window to the main window, which saves it. */
+  const sendWindowIntents = useCallback(() => {
+    const windowSync = windowSyncRef.current;
+    const send = desktopBridge?.sendWindowIntent;
+    if (!windowSync || !send) return;
+    const settle = (intent: DesktopWindowIntent, applied: boolean) => {
+      // Refused: the main window moved on, so its state comes back here, with
+      // any pane opened in the refused edit opened again on it.
+      if (!windowSync.settle(intent, applied, stateRef.current)) return;
+      rehydrateSecondaryWindow();
+      const replay = windowSync.replay(stateRef.current);
+      if (!replay) return;
+      dispatch({ type: "UPDATE_LAYOUT", layout: replay.layout });
+      for (const [paneId, paneState] of Object.entries(replay.paneState)) {
+        dispatch({ type: "REPLACE_PANE_STATE", paneId, state: paneState });
+      }
+    };
+    for (const intent of windowSync.collect(stateRef.current)) {
+      send(intent).then(
+        (result) => settle(intent, result?.applied === true),
+        () => settle(intent, false),
+      );
+    }
+  }, [desktopBridge, dispatch, rehydrateSecondaryWindow]);
+
+  useEffect(() => {
+    if (desktopBridge?.kind !== "window") return;
+    sendWindowIntents();
+  }, [desktopBridge, sendWindowIntents, state.config, state.paneState]);
+
+  // In the main window: each secondary window's focused pane and size as it
+  // last said, and the main window's own size, for placing moved panes.
+  const windowStatusRef = useRef(new Map<string, SecondaryWindowStatus>());
+  const windowSizeRef = useRef<WindowSize | null>(null);
+
+  const onWindowConfigChangeRef = useRef(onWindowConfigChange);
+  onWindowConfigChangeRef.current = onWindowConfigChange;
+  /** A change the main window made for itself or a window: dispatched, saved, announced, and the window it concerns brought forward. */
+  const applyMainWindowOutcome = useCallback((outcome: WindowIntentOutcome) => {
+    for (const action of outcome.actions) dispatch(action);
+    if (outcome.save) scheduleConfigSave(outcome.save);
+    if (outcome.configChanged) onWindowConfigChangeRef.current?.(outcome.configChanged);
+    const focus = outcome.focus;
+    if (focus && desktopBridge?.focusWindow) {
+      fireAndForget(desktopBridge.focusWindow(focus.windowId, focus.paneId), "window.focus");
+    }
+  }, [desktopBridge, dispatch]);
+
+  useEffect(() => {
+    if (desktopBridge?.kind !== "main" || !desktopBridge.handleWindowIntents) return;
+    return desktopBridge.handleWindowIntents((windowId, intent) => {
+      const outcome = applyWindowIntent(stateRef.current, windowId, intent, {
+        windowStatus: windowStatusRef.current,
+        mainSize: windowSizeRef.current,
+      });
+      if (outcome.windowStatus) windowStatusRef.current.set(windowId, outcome.windowStatus);
+      applyMainWindowOutcome(outcome);
+      return { applied: outcome.applied };
+    });
+  }, [applyMainWindowOutcome, desktopBridge]);
+
+  /** From a secondary window: a change for the main window to make, after this window's own edits so far. */
+  const sendWindowCommand = useCallback((intent: DesktopWindowIntent) => {
+    const send = desktopBridge?.sendWindowIntent;
+    if (!send) return;
+    sendWindowIntents();
+    // Refused or never delivered: the main window did not make the change, so its state comes back here.
+    const settle = (applied: boolean) => {
+      if (!applied && intent.type !== "windowStatus") rehydrateSecondaryWindow();
+    };
+    send(intent).then(
+      (result) => settle(result?.applied === true),
+      () => settle(false),
+    );
+  }, [desktopBridge, rehydrateSecondaryWindow, sendWindowIntents]);
+
+  // A secondary window tells the main window its focused pane and size, so a pane moved here lands beside it.
+  const [windowSize, setWindowSize] = useState<WindowSize | null>(null);
+  useEffect(() => {
+    if (desktopBridge?.kind !== "window") return;
+    const timer = setTimeout(() => {
+      sendWindowCommand({ type: "windowStatus", status: { focusedPaneId: state.focusedPaneId, size: windowSize } });
+    }, WINDOW_STATUS_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [desktopBridge, sendWindowCommand, state.focusedPaneId, windowSize]);
+
+  const windowCommands = useMemo((): DesktopWindowCommands | null => {
+    const focusWindow = (windowId: string) => {
+      if (desktopBridge?.focusWindow) fireAndForget(desktopBridge.focusWindow(windowId), "window.focus");
+    };
+    const noteWindowSize = (size: WindowSize) => {
+      const previous = windowSizeRef.current;
+      if (previous?.width === size.width && previous.height === size.height) return;
+      windowSizeRef.current = size;
+      if (desktopBridge?.kind === "window") setWindowSize(size);
+    };
+    if (desktopBridge?.kind === "main") {
+      const context = () => ({ windowStatus: windowStatusRef.current, mainSize: windowSizeRef.current });
+      return {
+        windowId: null,
+        movePaneToWindow: (paneId, target) => applyMainWindowOutcome(windowMoveOutcome(stateRef.current, paneId, target, context())),
+        addWindow: () => applyMainWindowOutcome(applyWindowIntent(stateRef.current, "", { type: "addWindow" }, context())),
+        focusWindow,
+        noteWindowSize,
+      };
+    }
+    if (desktopBridge?.kind === "window" && desktopBridge.windowId) {
+      return {
+        windowId: desktopBridge.windowId,
+        movePaneToWindow: (paneId, target) => sendWindowCommand({ type: "movePane", paneId, target }),
+        addWindow: () => sendWindowCommand({ type: "addWindow" }),
+        closeWindow: () => sendWindowCommand({ type: "closeWindow" }),
+        focusWindow,
+        noteWindowSize,
+      };
+    }
+    return null;
+  }, [applyMainWindowOutcome, desktopBridge, sendWindowCommand]);
+
+  useEffect(() => desktopBridge?.subscribeActiveWindow?.(setActiveWindowKey), [desktopBridge]);
+  const windowActive = !desktopBridge?.windowKey || activeWindowKey === null || activeWindowKey === desktopBridge.windowKey;
+
   useEffect(() => {
     if (!desktopBridge) return;
-    return desktopBridge.subscribeState((snapshot) => {
+    return desktopBridge.subscribeState((incoming) => {
+      const windowSync = windowSyncRef.current;
+      if (windowSync) {
+        lastWindowViewRef.current = incoming;
+        // Changes made here and not sent yet go first, so this snapshot cannot undo them.
+        sendWindowIntents();
+      }
+      const snapshot = windowSync ? windowSync.receive(incoming, stateRef.current) : incoming;
       if (desktopBridge.kind === "main" && typeof snapshot.mainStateRevision === "number") {
         if (snapshot.mainStateRevision < latestMainStateRevisionRef.current) return;
         latestMainStateRevisionRef.current = Math.max(
@@ -563,15 +762,17 @@ export function AppProvider({
       }
       const currentSignature = serializeDesktopSnapshot(buildDesktopSnapshot(stateRef.current));
       const nextSignature = serializeDesktopSnapshot(snapshot);
-      if (currentSignature === nextSignature) return;
-      if (desktopBridge.kind === "main") {
-        lastMainSyncRef.current = nextSignature;
-      } else if (desktopBridge.paneId) {
-        lastDetachedPaneSyncRef.current = serializePaneState(snapshot.paneState[desktopBridge.paneId] as PaneRuntimeState | undefined);
+      if (currentSignature !== nextSignature) {
+        if (desktopBridge.kind === "main") {
+          lastMainSyncRef.current = nextSignature;
+        } else if (desktopBridge.paneId) {
+          lastDetachedPaneSyncRef.current = serializePaneState(snapshot.paneState[desktopBridge.paneId] as PaneRuntimeState | undefined);
+        }
+        dispatch({ type: "HYDRATE_DESKTOP_SNAPSHOT", snapshot });
       }
-      dispatch({ type: "HYDRATE_DESKTOP_SNAPSHOT", snapshot });
+      windowSync?.noteSynced(stateRef.current);
     });
-  }, [buildDesktopSnapshot, desktopBridge, serializeDesktopSnapshot, serializePaneState]);
+  }, [buildDesktopSnapshot, desktopBridge, sendWindowIntents, serializeDesktopSnapshot, serializePaneState]);
 
   useEffect(() => {
     if (desktopBridge?.kind !== "main" || !desktopBridge.syncMainState) return;
@@ -598,6 +799,7 @@ export function AppProvider({
     state.focusedPaneId,
     state.paneState,
     state.statusBarVisible,
+    state.brokerSyncErrors,
   ]);
 
   useEffect(() => {
@@ -611,7 +813,7 @@ export function AppProvider({
   }, [desktopBridge, state.themePreview]);
 
   useEffect(() => {
-    if (desktopBridge?.kind !== "detached" || !desktopBridge.subscribeThemePreview) return;
+    if (!desktopBridge || desktopBridge.kind === "main" || !desktopBridge.subscribeThemePreview) return;
     return desktopBridge.subscribeThemePreview((preview) => {
       dispatch({ type: "PREVIEW_THEME", theme: preview.theme });
     });
@@ -651,7 +853,11 @@ export function AppProvider({
 
   return (
     <ThemeProvider themeId={effectiveThemeId}>
-      <AppContext.Provider value={storeRef.current}>{children}</AppContext.Provider>
+      <AppContext.Provider value={storeRef.current}>
+        <DesktopWindowActiveContext.Provider value={windowActive}>
+          <DesktopWindowCommandsContext.Provider value={windowCommands}>{children}</DesktopWindowCommandsContext.Provider>
+        </DesktopWindowActiveContext.Provider>
+      </AppContext.Provider>
     </ThemeProvider>
   );
 }

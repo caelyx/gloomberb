@@ -103,6 +103,38 @@ describe("scenario market loader", () => {
       .toThrow("No expiry 2026-12-19 for AAPL; available: 2026-12-18");
   });
 
+  test("after Friday's close the default is the nearest live expiry, a lapsed date is named, and an unusable chain names the next one", async () => {
+    const saturday = Date.parse("2026-10-24T05:24:00Z");
+    const day = (date: string) => Date.parse(`${date}T00:00:00Z`) / 1000;
+    const friday = day("2026-10-23"), next = day("2026-10-30"), later = day("2026-11-06");
+    // One-sided quotes: no strike solves an IV, as on a chain whose session has ended.
+    const contract = (expiry: number) => ({ contractSymbol: `COPX${expiry}`, strike: 100, bid: 0, ask: 0.25, currency: "USD", expiration: expiry,
+      impliedVolatility: 0, lastPrice: 1, change: 0, percentChange: 0, inTheMoney: false, lastTradeDate: 0 });
+    const requested: (number | undefined)[] = [];
+    const fresh = <T>(data: T) => ({ ...ready(data), fetchedAt: saturday, staleAt: saturday + 60_000 });
+    const deps = dependencies({ now: () => saturday, loadQuote: async () => fresh({ ...quote, symbol: "COPX", lastUpdated: saturday }),
+      loadOptions: async (request) => {
+        requested.push(request.expirationDate);
+        const expiry = request.expirationDate ?? friday;
+        return fresh({ ...chain, underlyingSymbol: "COPX", expirationDates: [friday, next, later], puts: [contract(expiry)] });
+      } });
+    const instrument = { symbol: "COPX", exchange: "ARCA" };
+    const market = await loadScenarioMarket({ instrument }, deps);
+    expect(requested).toEqual([undefined, next]);
+    expect(market.expirationDates).toEqual([next, later]);
+    expect(market.chain?.puts[0]?.expiration).toBe(next);
+    expect(() => scenarioPositionFromSettings({ symbol: "COPX", strategy: "put" }, market))
+      .toThrow("The 30 Oct chain has no complete quoted strategy with usable IV; try the next expiry, 6 Nov (--expiration 2026-11-06)");
+
+    requested.length = 0;
+    const lapsed = await loadScenarioMarket({ instrument, expiration: friday }, deps);
+    // The lapsed date is not asked for: the default chain lists the live ones.
+    expect(requested).toEqual([undefined]);
+    expect(lapsed.chain).toBeNull();
+    expect(() => scenarioPositionFromSettings({ symbol: "COPX", strategy: "put" }, lapsed))
+      .toThrow("Expiry 2026-10-23 for COPX expired on 23 Oct; nearest live: 30 Oct (--expiration 2026-10-30)");
+  });
+
   test("consumer cancellation does not wait for or cancel the shared chain request", async () => {
     const controller = new AbortController();
     let resolve!: (value: QueryEntry<OptionsChain>) => void;
@@ -170,6 +202,30 @@ describe("scenario headless inputs", () => {
           splits: [], earnings: [] }) }, signal: new AbortController().signal,
         apiClient: { getCloudYieldCurve: dependencies().loadYieldCurve } } as unknown as HeadlessPaneContext);
       expect(fund.metadata).toMatchObject({ position: { dividendYield: 0 }, market: { dividendYieldBasis: "none-paid" } });
+    } finally { setSystemTime(); }
+  });
+
+  test("a dividend that stopped is valued at 0% and the Inputs line says so; a current payer keeps its yield", async () => {
+    // 2026-10-16: WHR paid quarterly until 2026-02-27 and Gloom Cloud has withdrawn its forward yield; KO paid on 2026-09-15.
+    const at = Date.UTC(2026, 9, 16, 14);
+    const actions = (symbol: string, exDates: string[]) => ({ symbol, coverage: { dividends: "available" as const },
+      dividends: exDates.map((exDate) => ({ exDate, amount: 1 })), splits: [], earnings: [] });
+    const run = (symbol: string, fundamentals: TickerFinancials["fundamentals"], exDates: string[]) => optionsScenarioHeadless.load({
+      symbols: [symbol], rawArgument: symbol, argument: symbol, options: { legs: "put,30,2027-01-15,1,2,40" } }, {
+      marketData: { id: "scenario-test", getQuote: async () => ({ ...quote, symbol, lastUpdated: at }),
+        getTickerFinancials: async () => ({ ...financials, quote: { ...quote, symbol }, fundamentals }),
+        getOptionsChain: async () => ({ ...chain, underlyingSymbol: symbol }), getCorporateActions: async () => actions(symbol, exDates) } as unknown as DataProvider,
+      signal: new AbortController().signal, apiClient: { getCloudYieldCurve: dependencies().loadYieldCurve } } as unknown as HeadlessPaneContext);
+    const dividendLine = (result: Awaited<ReturnType<typeof run>>) =>
+      result.sections.find((section) => section.title === "Inputs")?.entries?.find((item) => item.key === "dividendYield")?.formatted;
+    setSystemTime(at);
+    try {
+      const whr = await run("WHR", { exDividendDate: "2026-02-27" }, ["2025-05-23", "2025-08-15", "2025-11-21", "2026-02-27"]);
+      expect(whr.metadata).toMatchObject({ position: { dividendYield: 0 }, market: { dividendYieldBasis: "stopped", dividendLastPaid: "2026-02-27" } });
+      expect(dividendLine(whr)).toBe("0.00% (no current dividend, last paid 2026-02-27)");
+      const ko = await run("KO", { dividendYield: 0.0226, dividendYieldBasis: "forward", exDividendDate: "2026-09-15" }, ["2026-03-13", "2026-06-15", "2026-09-15"]);
+      expect(ko.metadata).toMatchObject({ position: { dividendYield: 0.0226 }, market: { dividendYieldBasis: "stated" } });
+      expect(dividendLine(ko)).toBe("2.26%");
     } finally { setSystemTime(); }
   });
 

@@ -1,3 +1,4 @@
+import { logFailure } from "../../utils/log-failure";
 import { selectCachedResource } from "./cache";
 import { financialHistoryVariants, hasReusableExtendedHistory } from "./statement-history";
 import type { MarketDataRequestContext } from "../../types/data-provider";
@@ -57,8 +58,8 @@ export class ProviderRouterPrimaryRoutes {
           this.options.resolveBrokerPolicy("financials", candidate.broker),
         );
         return { sourceKey: this.options.brokerSourceKey(candidate), value: result };
-      } catch {
-        // continue
+      } catch (error) {
+        logFailure("sources.provider-router.primary", "Loading broker financials failed")(error);
       }
     }
     return null;
@@ -162,7 +163,7 @@ export class ProviderRouterPrimaryRoutes {
     const entityKey = this.options.getEntityKey(ticker, context?.instrument);
     const variantKey = this.options.getTickerVariantCandidates(exchange)[0] ?? "";
     for (const candidate of this.options.getBrokerCandidatesForContext(context, false)) {
-      if (!candidate.broker.getQuote) continue;
+      if (!candidate.broker.getQuote || candidate.broker.ticketQuotesOnly) continue;
       try {
         const result = await candidate.broker.getQuote(
           ticker,
@@ -179,8 +180,8 @@ export class ProviderRouterPrimaryRoutes {
           this.options.resolveBrokerPolicy("brokerQuote", candidate.broker),
         );
         return { sourceKey: this.options.brokerSourceKey(candidate), value: result };
-      } catch {
-        // continue
+      } catch (error) {
+        logFailure("sources.provider-router.primary", "Loading a broker quote failed")(error);
       }
     }
     return null;

@@ -3,6 +3,7 @@ import { clonePaneStateMap, syncConfigActiveLayoutState, type PaneRuntimeState }
 import { cloneLayout, findPaneInstance, type AppConfig, type LayoutConfig } from "../../../../../types/config";
 import type { DesktopSharedStateSnapshot } from "../../../../../types/desktop-window";
 import { detachPaneToFrame, dockPane, insertAtRootEdge, removePane } from "../../../../../layout/pane-manager";
+import { closeSecondaryWindow } from "../../../../../layout/pane-manager/secondary-windows";
 import type { WindowFrame } from "../../window/frame";
 
 function cloneSavedLayouts(config: AppConfig): AppConfig["layouts"] {
@@ -101,6 +102,11 @@ export interface DesktopWorkspace {
     edge?: "left" | "right" | "top" | "bottom",
   ): DesktopSharedStateSnapshot;
   closeDetachedPane(paneId: string): DesktopSharedStateSnapshot;
+  /**
+   * A secondary window gone, its panes moved into the main window: only when
+   * the main window cannot do it itself, since it writes the layout.
+   */
+  closeSecondaryWindow(windowId: string): DesktopSharedStateSnapshot;
 }
 
 export function createDesktopWorkspace(
@@ -151,6 +157,7 @@ export function createDesktopWorkspace(
     paneState: clonePaneStateMap(sharedState.paneState),
     focusedPaneId: sharedState.focusedPaneId,
     statusBarVisible: sharedState.statusBarVisible,
+    brokerSyncErrors: { ...sharedState.brokerSyncErrors },
     mainStateRevision: sharedState.mainStateRevision,
     layoutChanged: sharedState.layoutChanged,
   });
@@ -179,6 +186,7 @@ export function createDesktopWorkspace(
         paneState: filterPaneState(syncedConfig.layout, clonePaneStateMap(snapshot.paneState)),
         focusedPaneId: snapshot.focusedPaneId,
         statusBarVisible: snapshot.statusBarVisible,
+        brokerSyncErrors: { ...snapshot.brokerSyncErrors },
         mainStateRevision: snapshot.mainStateRevision ?? currentRevision,
         layoutChanged: snapshot.layoutChanged,
       };
@@ -248,6 +256,12 @@ export function createDesktopWorkspace(
       return updateConfig({
         ...sharedState.config,
         layout: nextLayout,
+      }, { layoutChanged: true });
+    },
+    closeSecondaryWindow(windowId) {
+      return updateConfig({
+        ...sharedState.config,
+        layout: closeSecondaryWindow(sharedState.config.layout, windowId),
       }, { layoutChanged: true });
     },
   };

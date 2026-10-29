@@ -6,7 +6,7 @@ import {
 } from "../../../time-series/types";
 import type { ChartResolution, TimeRange } from "../../../components/chart/core/types";
 import { MAX_CHART_COMPOSER_SERIES } from "./chart-spec";
-import { appendChartSeries, buildCustomSeries, buildSeriesSpec, panelsForSeries } from "./chart-spec-edit";
+import { appendChartSeries, appendPlacedSeries, buildCustomSeries, buildSeriesSpec, nextGeneratedPanelId, panelsForSeries } from "./chart-spec-edit";
 import { currencyPairSpelling } from "../../../utils/currency-pair";
 import { dashedCoinPair } from "../../../utils/crypto-pair";
 import {
@@ -21,6 +21,8 @@ import {
 import { setBuiltinStudies, setPairStudies, type PairStudySelection } from "./studies";
 import { looksLikeFormula, parseFormulaExpression, type ParsedFormula } from "./formula";
 import type { SeriesCatalogSuggestion } from "./series-catalog";
+import { getSharedRegistry } from "../../registry";
+import { seriesCatalogEntry } from "../../../series/registry";
 
 function chartSpec(
   series: ChartSeriesSpec[],
@@ -43,7 +45,8 @@ export function buildEmptyChartPreset(): ChartSpec {
 /**
  * `GAA/VOO`, `GAA / VOO`, and `CL=F - ES=F` are a ratio or a spread of two series.
  * A slash that is the symbol stays one series (`EUR/USD`, `BTC/USD`), and so does
- * a field written with a slash (`AAPL:EV/EBITDA`). A comma-separated list stays a list.
+ * a field written with a slash (`AAPL:EV/EBITDA`) and the symbol a catalog series
+ * takes after one (`CAP:short-volume:ratio/AAPL`). A comma-separated list stays a list.
  */
 function derivedPair(expression: string): { series: ParsedSeriesExpression[]; formula: PairStudySelection } | null {
   const trimmed = expression.trim();
@@ -58,6 +61,7 @@ function derivedPair(expression: string): { series: ParsedSeriesExpression[]; fo
   const tight = /^([^/\s]+)\/([^/\s]+)$/.exec(trimmed);
   if (!tight) return null;
   const [leftToken, rightToken] = [tight[1]!, tight[2]!];
+  if (/^CAP:/i.test(leftToken) && !/^CAP:/i.test(rightToken)) return null;
   const quote = rightToken.split(":")[0]!;
   if (currencyPairSpelling(`${leftToken}/${quote}`) || dashedCoinPair(`${leftToken}/${quote}`)) return null;
   const left = parseSeriesExpression(leftToken);
@@ -78,21 +82,51 @@ function placeFormulaLeg(formula: ParsedFormula, index: number, series: ChartSer
   return mixed && series.panelId === "main" && !formula.legs[index]!.perBarrel ? { ...series, axis: "right" } : series;
 }
 
-/** The study that weighs a formula's legs, charted as the given series, in the Formula panel. */
+/**
+ * A series the formula is divided or multiplied by (an FX rate) counts
+ * something else again: it is drawn in a panel of its own, not on the legs' axes.
+ */
+function placeFormulaFactor(spec: Pick<ChartSpec, "panels" | "series" | "studies">, series: ChartSeriesSpec): ChartSeriesSpec {
+  return { ...series, panelId: nextGeneratedPanelId(spec), axis: "auto" };
+}
+
+/** A factor's panel is shorter than a series panel, so the legs and the formula keep their room. */
+const FACTOR_PANEL_HEIGHT = 0.2;
+
+/** The panels with each new factor's last and short: the formula reads right under its legs. */
+function withFactorPanels(panels: ChartSpec["panels"], factors: readonly ChartSeriesSpec[]): ChartSpec["panels"] {
+  const ids = new Set(factors.map((series) => series.panelId));
+  return [
+    ...panels.filter((panel) => !ids.has(panel.id)),
+    ...panels.filter((panel) => ids.has(panel.id)).map((panel) => ({ ...panel, height: FACTOR_PANEL_HEIGHT })),
+  ];
+}
+
+/** The study that weighs a formula's legs and scales the sum, charted as the given series, in the Formula panel. */
 function formulaStudy(formula: ParsedFormula, inputSeriesIds: string[]): ChartStudySpec {
   const parameters: ChartStudySpec["parameters"] = { divisor: formula.divisor };
   formula.legs.forEach((leg, index) => {
     parameters[`weight${index + 1}`] = leg.weight;
     if (leg.perBarrel) parameters[`perBarrel${index + 1}`] = 1;
+    if (leg.perTonne) parameters[`perTonne${index + 1}`] = leg.perTonne;
+  });
+  formula.factors.forEach((factor, index) => {
+    parameters[`power${formula.legs.length + index + 1}`] = factor.power;
   });
   return { id: FORMULA_STUDY_ID, kind: "formula", inputSeriesIds, parameters, panelId: "formula", axis: "auto" };
 }
 
-/** A formula's legs as series, with the study that sums them in the Formula panel. */
+/** A formula's legs and factors as series, with the study that sums them in the Formula panel. */
 function formulaChartPreset(formula: ParsedFormula): ChartSpec {
-  const series = buildCustomSeries(formula.legs.map((leg) => leg.series))
-    .map((entry, index) => placeFormulaLeg(formula, index, entry));
-  return chartSpec(series, { studies: [formulaStudy(formula, series.map((entry) => entry.id))] });
+  const legs = buildCustomSeries([...formula.legs, ...formula.factors].map((entry) => entry.series));
+  const series: ChartSeriesSpec[] = [];
+  legs.forEach((entry, index) => {
+    series.push(index < formula.legs.length
+      ? placeFormulaLeg(formula, index, entry)
+      : placeFormulaFactor({ panels: [], series, studies: [] }, entry));
+  });
+  const spec = chartSpec(series, { studies: [formulaStudy(formula, series.map((entry) => entry.id))] });
+  return { ...spec, panels: withFactorPanels(spec.panels, series.slice(formula.legs.length)) };
 }
 
 /**
@@ -103,17 +137,22 @@ function appendChartFormula(spec: ChartSpec, expression: string): { spec: ChartS
   const formula = parseFormulaExpression(expression);
   if (!formula) throw new Error(`"${expression}" is not a formula.`);
   const key = (series: ChartSeriesSpec) => formatSeriesExpression(series).toLowerCase();
-  const legs = formula.legs.map((leg) => key(buildSeriesSpec(leg.series, 0)));
+  const terms = [...formula.legs, ...formula.factors];
+  const legs = terms.map((leg) => key(buildSeriesSpec(leg.series, 0)));
   const missing = legs.filter((leg) => !spec.series.some((series) => key(series) === leg)).length;
   if (spec.series.length + missing > MAX_CHART_COMPOSER_SERIES) {
     throw new Error(`Charts support up to ${MAX_CHART_COMPOSER_SERIES} base series.`);
   }
   let next: ChartSpec = { ...spec, studies: spec.studies.filter((study) => study.id !== FORMULA_STUDY_ID) };
-  const inputs = formula.legs.map((leg, index) => {
+  const placedFactors: ChartSeriesSpec[] = [];
+  const inputs = terms.map((leg, index) => {
     const charted = next.series.find((series) => key(series) === legs[index]);
     if (charted) return charted;
     const appended = appendChartSeries(next, leg.series);
-    const placed = placeFormulaLeg(formula, index, appended.series);
+    const placed = index < formula.legs.length
+      ? placeFormulaLeg(formula, index, appended.series)
+      : placeFormulaFactor(next, appended.series);
+    if (index >= formula.legs.length) placedFactors.push(placed);
     next = { ...appended.spec, series: appended.spec.series.map((series) => series.id === placed.id ? placed : series) };
     return placed;
   });
@@ -123,20 +162,63 @@ function appendChartFormula(spec: ChartSpec, expression: string): { spec: ChartS
     spec: {
       ...next,
       studies,
-      panels: [...next.panels, ...panelsForSeries(next.series, studies).filter((panel) => !known.has(panel.id))],
+      panels: withFactorPanels(
+        [...next.panels, ...panelsForSeries(next.series, studies).filter((panel) => !known.has(panel.id))],
+        placedFactors,
+      ),
     },
     series: inputs.at(-1)!,
   };
 }
 
-/** The chart with a catalog suggestion added: one series, or a formula's legs and its study. */
+/**
+ * The chart with a catalog suggestion added: one series, a registered
+ * series' lines where it asks for them, or a formula's legs and its study.
+ */
 export function appendCatalogSuggestion(
   spec: ChartSpec,
   suggestion: SeriesCatalogSuggestion,
 ): { spec: ChartSpec; series: ChartSeriesSpec } {
-  return suggestion.formula !== undefined
-    ? appendChartFormula(spec, suggestion.formula)
-    : appendChartSeries(spec, suggestion.expression);
+  if (suggestion.formula !== undefined) return appendChartFormula(spec, suggestion.formula);
+  if (suggestion.lines || suggestion.placement) {
+    return appendPlacedSeries(spec, suggestion.lines ?? [suggestion.expression!], {
+      name: suggestion.seriesName ?? suggestion.label,
+      ...(suggestion.placement ? { placement: suggestion.placement } : {}),
+      ...(suggestion.symbol ? { symbol: suggestion.symbol } : {}),
+    });
+  }
+  return appendChartSeries(spec, suggestion.expression);
+}
+
+/**
+ * The chart CAT opens for a registered series that asks where it is drawn or
+ * draws several lines: the ticker's price with the series placed as it asks,
+ * or the lines on their own.
+ */
+export function buildRegisteredSeriesChart(
+  series: { name: string; template: string; placement?: SeriesCatalogSuggestion["placement"]; lines?: ReadonlyArray<{ name: string; expression: string; style?: ChartSeriesSpec["style"] }> },
+  symbol?: string,
+): ChartSpec {
+  const fill = (template: string) => symbol
+    ? template.replaceAll("{ticker}", template.startsWith("CAP:") ? encodeURIComponent(symbol) : symbol)
+    : template;
+  const prefix = symbol ? `${symbol} · ` : "";
+  const lines = series.lines?.length
+    ? series.lines.map((line) => {
+      const parsed = parseSeriesExpression(fill(line.expression));
+      if (!parsed) throw new Error(`"${line.expression}" is not a chart series.`);
+      return { ...parsed, label: `${prefix}${series.name} · ${line.name}`, ...(line.style ? { style: line.style } : {}) };
+    })
+    : [(() => {
+      const parsed = parseSeriesExpression(fill(series.template));
+      if (!parsed) throw new Error(`"${series.template}" is not a chart series.`);
+      return { ...parsed, label: `${prefix}${series.name}` };
+    })()];
+  const base = series.placement && symbol ? buildPriceChartPreset(symbol) : buildEmptyChartPreset();
+  return appendPlacedSeries(base, lines, {
+    name: series.name,
+    ...(series.placement && symbol ? { placement: series.placement, symbol } : {}),
+  }).spec;
 }
 
 /**
@@ -157,14 +239,32 @@ export function buildCustomChartPreset(expression: string, fallbackSymbol?: stri
     return formulaChartPreset(formula);
   }
   if (parsed.length === 0) return fallbackSymbol ? buildPriceChartPreset(fallbackSymbol) : buildEmptyChartPreset();
+  const registered = parsed.length === 1 ? placedRegisteredSeries(parsed[0]!) : null;
+  if (registered) return buildRegisteredSeriesChart(registered.series, registered.ticker);
   return chartSpec(buildCustomSeries(parsed));
 }
 
-export function buildPriceChartPreset(symbol: string): ChartSpec {
+/**
+ * A registered series typed alone (`CAP:studies:rsi/AAPL`) that says where it is
+ * drawn or draws several lines charts as CAT opens it. Naming one line
+ * (`rsi~signal/AAPL`) charts that line alone.
+ */
+function placedRegisteredSeries(expression: ParsedSeriesExpression) {
+  if (expression.kind !== "capability" || expression.seriesId.split("/")[0]!.includes("~")) return null;
+  const found = getSharedRegistry()?.series?.findLoaded(expression.capabilityId, expression.seriesId);
+  if (!found || (!found.series.definition.placement && !found.series.definition.lines?.length)) return null;
+  const entry = seriesCatalogEntry(found.series);
+  return {
+    series: { name: entry.name, template: entry.expression, placement: entry.placement, lines: entry.lines },
+    ...(found.ticker ? { ticker: found.ticker } : {}),
+  };
+}
+
+export function buildPriceChartPreset(symbol: string, range?: TimeRange): ChartSpec {
   const normalized = normalizeInstrument(symbol, true);
   if (!normalized) return buildEmptyChartPreset();
   return setBuiltinStudies(
-    chartSpec([buildSeriesSpec({ kind: "security", ...normalized, fieldId: CHART_FIELD_IDS.price }, 0)]),
+    chartSpec([buildSeriesSpec({ kind: "security", ...normalized, fieldId: CHART_FIELD_IDS.price }, 0)], { range }),
     ["volume"],
   );
 }
@@ -209,9 +309,12 @@ export function buildValuationChartPreset(
 ): ChartSpec {
   const resolvedField = resolveChartFieldAlias(fieldId);
   const normalized = symbols.map((symbol) => normalizeInstrument(symbol, true)).filter((entry): entry is NonNullable<typeof entry> => entry !== null).slice(0, MAX_CHART_COMPOSER_SERIES);
-  return chartSpec(normalized.map((instrument, index) => buildSeriesSpec(
-    { kind: "security", ...instrument, fieldId: resolvedField },
-    index,
-    { style: normalized.length === 1 ? "line" : "columns", axis: "left" },
-  )));
+  return chartSpec(normalized.map((instrument, index) => {
+    const series = buildSeriesSpec(
+      { kind: "security", ...instrument, fieldId: resolvedField },
+      index,
+      { style: "line", axis: "left" },
+    );
+    return series.source.kind === "security" ? { ...series, source: { ...series.source, period: "daily" } } : series;
+  }));
 }

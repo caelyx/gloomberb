@@ -1,9 +1,10 @@
+import { logFailure } from "../../utils/log-failure";
 import type { Dispatch } from "react";
 import {
   clearPersistedBrokerAccounts,
   getBrokerAccountCacheSourceKey,
 } from "../../brokers/account-cache";
-import { clearLeftoverBrokerHoldings, findPortfolioHeir, knownBrokerHoldings } from "../../brokers/broker-portfolio-sync";
+import { accountsShownFor, clearLeftoverBrokerHoldings, findPortfolioHeir, knownBrokerHoldings } from "../../brokers/broker-portfolio-sync";
 import type { AppTickerRepositoryPort } from "../../core/app-service-ports";
 import type { MarketDataCoordinator } from "../../market-data/coordinator";
 import { instrumentFromTicker } from "../../market-data/request-types";
@@ -104,7 +105,7 @@ export function bindPluginRegistryRuntimeAccess({
       pluginRegistry.events.emit("config:changed", { config: nextConfig });
     },
 
-    createBrokerInstance: async (brokerType, label, values) => {
+    createBrokerInstance: async (brokerType, label, values, options = {}) => {
       const instanceId = createBrokerInstanceId(
         brokerType,
         label,
@@ -117,6 +118,7 @@ export function bindPluginRegistryRuntimeAccess({
         connectionMode: typeof values.connectionMode === "string" ? values.connectionMode : undefined,
         config: values,
         enabled: true,
+        ...(options.localOnly ? { localOnly: true } : {}),
       };
       const nextConfig = {
         ...stateRef.current.config,
@@ -136,12 +138,12 @@ export function bindPluginRegistryRuntimeAccess({
       const broker = pluginRegistry.brokers.get(instance.brokerType);
       if (!broker) throw new Error(`Broker "${instance.brokerType}" is not available.`);
 
-      const valid = await broker.validate(instance).catch(() => false);
+      const valid = await broker.validate(instance).catch(logFailure("app.runtime.plugin-bindings", "Broker setup validation failed", false));
       if (!valid) throw new Error(`${broker.name} setup is incomplete.`);
 
       await broker.connect?.(instance);
       if (broker.listAccounts) {
-        const accounts = await broker.listAccounts(instance);
+        const accounts = accountsShownFor(stateRef.current.config, instance, await broker.listAccounts(instance));
         dispatch({ type: "SET_BROKER_ACCOUNTS", instanceId, accounts });
       }
     },
@@ -152,12 +154,15 @@ export function bindPluginRegistryRuntimeAccess({
         instance.id === instanceId
           ? (() => {
             const nextValues = options.replaceConfig ? values : { ...instance.config, ...values };
+            const { localOnly: wasLocalOnly, ...rest } = instance;
+            const localOnly = options.localOnly ?? wasLocalOnly === true;
             return {
-              ...instance,
+              ...rest,
               label: options.label ?? instance.label,
               enabled: options.enabled ?? instance.enabled,
               connectionMode: typeof nextValues.connectionMode === "string" ? nextValues.connectionMode : instance.connectionMode,
               config: nextValues,
+              ...(localOnly ? { localOnly: true } : {}),
             };
           })()
           : instance,
@@ -272,7 +277,7 @@ export function bindPluginRegistryRuntimeAccess({
       pluginRegistry.events.emit("config:changed", { config: nextConfig });
       // The profile that kept a portfolio fills in what the removed one held there.
       for (const heirId of new Set(heirs.values())) {
-        void importBrokerPositions(heirId).catch(() => {});
+        void importBrokerPositions(heirId).catch(logFailure("app.runtime.plugin-bindings", "Replacement broker positions import failed"));
       }
     },
   });

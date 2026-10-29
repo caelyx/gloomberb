@@ -4,7 +4,8 @@ import { cloudNewsFreshness, quoteObservation } from "../../plugins/builtin/shar
 import { createTestQuote } from "../../test-support/data-provider";
 import { quotesFreshness } from "../freshness";
 import { formatUtcTime, setDisplayTimeZone } from "../../utils/utc-time";
-import { captureStatusLine, delayLength, deriveHeadlessFreshness, formatFreshnessLine, formatStatusLine, paneStatusLine, periodicityOf, statusLineVariants } from "./freshness";
+import { captureStatusLine, delayLength, deriveCaptureReport, deriveHeadlessFreshness, deriveRenderedFreshness, formatFreshnessLine, formatStatusLine, paneStatusLine, periodicityOf, statusLineVariants } from "./freshness";
+import { renderedReportFreshness, renderedReportObservations } from "./report-notices";
 
 const NOW = Date.parse("2026-10-09T05:00:00Z"); // Friday, before the US open
 const rows = (freshness?: HeadlessPaneDefinition["freshness"]) => ({ shape: "rows" as const, ...(freshness ? { freshness } : {}) });
@@ -32,14 +33,59 @@ describe("report freshness", () => {
       .toEqual(["monthly", "quarterly", "annual", null, null, null]);
   });
 
+  test("a figure dated by its period is as of its release, and says both: `Sep 2026, released Tue 20 Oct`", () => {
+    const now = Date.parse("2026-10-23T15:00:00Z");
+    const fred = { source: "FRED", status: "not-a-feed" as const, basis: "published statistics", observedKey: "date", oldest: null };
+    const permits = { rows: [{ date: "2026-09-01" }, { date: "2026-08-01" }] };
+    // Declared by the loader (`fred PERMIT`, a chart of FRED series).
+    const declared = deriveHeadlessFreshness(rows({ ...fred, periodicity: "monthly", releasedOn: "2026-10-20" }), permits, now);
+    expect(declared).toMatchObject({ asOf: "2026-10-20", referencePeriod: "2026-09-01", periodicity: "monthly" });
+    expect(formatFreshnessLine(declared)).toBe("Source: FRED · Sep 2026, released Tue 20 Oct · not a live feed (published statistics)");
+    // A weekly figure is its day; a release in another year names it; a release at a time names the time.
+    expect(formatFreshnessLine(deriveHeadlessFreshness(rows({ ...fred, releasedOn: "2026-10-22" }), { rows: [{ date: "2026-10-17" }] }, now)))
+      .toBe("Source: FRED · Sat 17 Oct 2026, released Thu 22 Oct · not a live feed (published statistics)");
+    expect(formatFreshnessLine(deriveHeadlessFreshness(rows({ ...fred, periodicity: "monthly", releasedOn: "2027-01-15" }), { rows: [{ date: "2026-12-01" }] }, Date.parse("2027-01-20T00:00:00Z"))))
+      .toBe("Source: FRED · Dec 2026, released Fri 15 Jan 2027 · not a live feed (published statistics)");
+    expect(formatFreshnessLine(deriveHeadlessFreshness(rows({ ...fred, periodicity: "monthly", releasedOn: "2026-10-14T12:30:00Z" }), { rows: [{ date: "2026-09-01" }] }, now)))
+      .toBe("Source: FRED · Sep 2026, released Wed 14 Oct 12:30 UTC · not a live feed (published statistics)");
+    // A release before the period, after now, or on the day the figure is dated by says nothing new.
+    for (const releasedOn of ["2026-08-20", "2026-10-30", "2026-09-01", "not a date"]) {
+      const freshness = deriveHeadlessFreshness(rows({ ...fred, periodicity: "monthly", releasedOn }), permits, now);
+      expect(freshness).toMatchObject({ asOf: "2026-09-01" });
+      expect(freshness.referencePeriod).toBeUndefined();
+    }
+
+    // Rows that say their own release and period (ECST): the newest row's.
+    const board = rows({ source: "FRED", status: "not-a-feed", basis: "published statistics" });
+    const stats = deriveHeadlessFreshness(board, { rows: [
+      { asOf: "2026-09-01", releasedOn: "2026-10-20", periodicity: "monthly" },
+      { asOf: "2026-04-01", releasedOn: "2026-09-25", periodicity: "quarterly" },
+    ] }, now);
+    expect(stats).toMatchObject({ asOf: "2026-10-20", referencePeriod: "2026-09-01", periodicity: "monthly", oldest: "2026-04-01", oldestPeriodicity: "quarterly" });
+    expect(formatFreshnessLine(stats)).toBe("Source: FRED · Sep 2026, released Tue 20 Oct (oldest Q2 2026) · not a live feed (published statistics)");
+    // A period without a release names the period; a daily row newest keeps its day.
+    expect(formatFreshnessLine(deriveHeadlessFreshness(board, { rows: [{ asOf: "2026-10-01", periodicity: "monthly" }] }, now)))
+      .toBe("Source: FRED · Oct 2026 (monthly) · not a live feed (published statistics)");
+    expect(formatFreshnessLine(deriveHeadlessFreshness(board, { rows: [{ asOf: "2026-10-22" }, { asOf: "2026-09-01", releasedOn: "2026-10-20", periodicity: "monthly" }] }, now)))
+      .toBe("Source: FRED · Thu 22 Oct 2026 (oldest Sep 2026) · not a live feed (published statistics)");
+    // Two figures dated the same day that disagree on their release name neither.
+    const split = deriveHeadlessFreshness(board, { rows: [
+      { asOf: "2026-09-01", releasedOn: "2026-10-20", periodicity: "monthly" },
+      { asOf: "2026-09-01", releasedOn: "2026-10-02", periodicity: "monthly" },
+    ] }, now);
+    expect(split).toMatchObject({ asOf: "2026-09-01" });
+    expect(split.referencePeriod).toBeUndefined();
+  });
+
   test("says how long a delay is in minutes or hours, as a range when rows differ", () => {
     expect([15, 20, 60, 90, 720, 3 * 24 * 60].map(delayLength)).toEqual(["15 min", "20 min", "1 h", "90 min", "12 h", "3 days"]);
     const delayed = (delayMinutes: number) => ({ dataSource: "delayed", delayMinutes, lastUpdated: NOW - 20 * 60_000 });
     expect(line(rows(), { rows: [delayed(15), delayed(20)] })).toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:40 UTC · 15-20 min delayed");
-    // News held back for an account without real-time access says how far; with it, the wire is live.
+    // News held back for an account without real-time access says how far; with it, the wire is live. The time is the
+    // newest story's and says so, so it is not read as the time now.
     const stories = { rows: [{ publishedAt: "2026-10-08T16:30:00Z" }, { publishedAt: "2026-10-08T15:00:00Z" }] };
-    expect(line(rows(cloudNewsFreshness(false)), stories)).toBe("Source: Gloom Cloud · Thu 8 Oct 2026 16:30 UTC · 12 h delayed");
-    expect(line(rows(cloudNewsFreshness(true)), stories)).toBe("Source: Gloom Cloud · Thu 8 Oct 2026 16:30 UTC · live");
+    expect(line(rows(cloudNewsFreshness(false)), stories)).toBe("Source: Gloom Cloud · newest story Thu 8 Oct 2026 16:30 UTC · 12 h delayed");
+    expect(line(rows(cloudNewsFreshness(true)), stories)).toBe("Source: Gloom Cloud · newest story Thu 8 Oct 2026 16:30 UTC · live");
     expect(line(rows(), { rows: [{ dataSource: "delayed", lastUpdated: NOW - 60_000 }] }))
       .toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:59 UTC · delayed");
   });
@@ -97,9 +143,34 @@ describe("report freshness", () => {
     const lagging = deriveHeadlessFreshness(rows({ status: "delayed", sources: [{ source: "Binance", asOf: "2026-10-10T23:58:00Z" }, { source: "Bybit", asOf: "2026-10-11T00:04:00Z" }] }),
       { rows: [{ observedAt: "2026-10-10T23:58:00Z", stale: true }, { observedAt: "2026-10-11T00:04:00Z", stale: true }] }, Date.parse("2026-10-11T01:30:00Z"));
     expect(paneStatusLine(lagging)).toBe("Binance Sat 10 Oct 23:58 · Bybit 00:04 UTC · oldest 92 min · stale");
+    // Dated by age alone, a venue whose newest row streams is as old as its oldest row: Binance's other market is 9
+    // minutes old, though its newest price is from 02:24.
+    const streaming = { rows: [{ observedAt: "2026-10-11T02:24:30Z" }, { observedAt: "2026-10-11T02:15:10Z" }, { observedAt: "2026-10-11T02:24:05Z" }] };
+    const sources = [{ source: "Binance", asOf: "2026-10-11T02:24:30Z" }, { source: "Bybit", asOf: "2026-10-11T02:24:05Z" }];
+    expect(paneStatusLine(deriveHeadlessFreshness(rows({ ageOnly: true, sources }), streaming, now))).toBe("Binance 02:24 · Bybit 02:24 UTC · oldest 9 min");
+    expect(paneStatusLine(deriveHeadlessFreshness(rows({ status: "live", ageOnly: true, sources }), streaming, now))).toBe("Binance 02:24 · Bybit 02:24 UTC · oldest 9 min · live");
     // One source says how old its oldest row is the same way.
     expect(line(rows({ status: "delayed", oldestAge: true }), { rows: [{ quoteTime: "2026-10-09T04:59:00Z" }, { quoteTime: "2026-10-09T04:56:00Z" }] }))
       .toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:59 UTC · oldest 4 min · delayed");
+    // Rows dated apart from a snapshot that states no feed say their time and age and nothing about a feed...
+    const board = { rows: [{ quoteTime: "2026-10-09T04:59:00Z" }, { quoteTime: "2026-10-09T04:56:00Z" }] };
+    const ageOnly = deriveHeadlessFreshness(rows({ ageOnly: true }), board, NOW);
+    expect(formatFreshnessLine(ageOnly)).toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:59 UTC · oldest 4 min");
+    expect(paneStatusLine(ageOnly)).toBe("04:59 UTC · oldest 4 min");
+    expect(ageOnly).toMatchObject({ status: "unreported", ageOnly: true, oldestAgeMinutes: 4 });
+    // ...unless a row states its feed, or the newest price has gone past what the data allows.
+    expect(line(rows({ ageOnly: true }), { rows: [{ quoteTime: "2026-10-09T04:59:00Z", dataSource: "live" }] }))
+      .toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:59 UTC · oldest 1 min · live");
+    expect(line(rows({ ageOnly: true, maxAgeMinutes: 60 }), { rows: [{ quoteTime: "2026-10-09T02:00:00Z" }] }))
+      .toBe("Source: Gloom Cloud · Fri 9 Oct 2026 02:00 UTC · oldest 3 hours · stale");
+    // A pane publishes the same declaration to a capture, whose line reads the same.
+    const semanticUi = [{ id: "ui:1", role: "report-freshness", actions: [], metadata: { ageOnly: true, maxAgeMinutes: 60, observations: board.rows } }];
+    const published = renderedReportFreshness(semanticUi);
+    expect(published).toEqual({ ageOnly: true, maxAgeMinutes: 60 });
+    expect(statusLineVariants(deriveRenderedFreshness(published, { footerText: "", cellTimes: [], observed: renderedReportObservations(semanticUi) }, NOW))[0])
+      .toBe("Fri 9 Oct 2026 04:59 UTC · oldest 4 min");
+    // Other reports keep their date without a feed-status placeholder.
+    expect(line(rows(), board)).toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:59 UTC");
   });
 
   test("a dataset cites its source, observation date and lag; quote rows on its pane keep the market line", () => {
@@ -143,6 +214,27 @@ describe("report freshness", () => {
     expect(formatFreshnessLine(deriveHeadlessFreshness(rows(), airlines, WED))).toContain("· US trading day Tue 13 Oct 2026 close ·");
     expect(deriveHeadlessFreshness(rows({ datesEachVenue: true }), { rows: [quote("NYSE", "2026-10-13T23:45:00Z")] }, WED).venueSessions)
       .toBeUndefined();
+  });
+
+  test("a capture of a pane whose quotes trade on several markets dates each, and says its note's shorter forms before leaving it out", () => {
+    const WED = Date.parse("2026-10-14T03:00:00Z");
+    const quote = (sessionExchange: string, quoteAsOf: string) => ({
+      dataSource: "delayed", delayMinutes: 15, sessionExchange, marketState: "CLOSED", quoteAsOf: Date.parse(quoteAsOf),
+    });
+    // RV's pane: euro and dollar caps under MCAP USD, so the line names the rate as `fn RV --currency USD` does.
+    const note = "MCAP USD at EUR/USD 1.1612 (2026-10-13 21:00 UTC) · fundamentals through 2026-06-30, Q REV% for that quarter";
+    const noteVariants = ["MCAP USD at EUR/USD 1.1612 · fundamentals through 2026-06-30, Q REV% for that quarter"];
+    const semanticUi = [{ id: "ui:1", role: "report-freshness", actions: [], metadata: {
+      datesEachVenue: true, note, noteVariants, observations: [quote("NYSE", "2026-10-13T20:00:00Z"), quote("XETRA", "2026-10-13T15:35:00Z")],
+    } }];
+    const published = renderedReportFreshness(semanticUi);
+    expect(published).toEqual({ datesEachVenue: true, note, noteVariants });
+    const freshness = deriveRenderedFreshness(published, { footerText: "", cellTimes: [], observed: renderedReportObservations(semanticUi) }, WED);
+    expect(statusLineVariants(freshness).slice(-3)).toEqual([
+      `US and XETRA Tue 13 Oct 2026 close · 15 min delayed · ${note}`,
+      `US and XETRA Tue 13 Oct 2026 close · 15 min delayed · ${noteVariants[0]}`,
+      "US and XETRA Tue 13 Oct 2026 close · 15 min delayed",
+    ]);
   });
 
   test("an index quote's own sessions date its last close and name the open its pre-market waits for", () => {
@@ -240,38 +332,57 @@ describe("report freshness", () => {
     const quoted = deriveHeadlessFreshness(rows(), { rows: [
       { dataSource: "delayed", delayMinutes: 15, sessionExchange: "NYSE", marketState: "CLOSED", lastUpdated: Date.parse("2026-10-09T20:00:00Z") },
     ] }, SUN);
-    expect(captureStatusLine({ report: freshness, quoted, selfDated: false, rendered: () => quoted }).variants[0]).toBe(one);
+    expect(captureStatusLine({ report: { freshness, declaresData: true }, quoted, selfDated: false, rendered: () => quoted }).variants[0]).toBe(one);
     // Without a name the dataset keeps its own line, and a delayed feed that is no dataset has no lag.
     expect(formatStatusLine(deriveHeadlessFreshness(rows({ ...tape, observation: undefined }), { rows: [] }, SUN)))
       .toBe("Source: DTCC \u00b7 observed Fri 9 Oct \u00b7 lag 2d");
     expect(deriveHeadlessFreshness(rows({ ...tape, dataset: undefined }), { rows: [] }, SUN).lagDays).toBeUndefined();
   });
 
-  test("a capture states its report's freshness as fn ends, unless the pane or its quotes date the view", () => {
+  test("a capture ends as its report's fn line when the report says what its data is; quotes date only quotes and prices", () => {
     const SUN = Date.parse("2026-10-11T06:17:00Z");
-    const cot = deriveHeadlessFreshness(rows({ source: "CFTC", status: "not-a-feed", basis: "weekly report", maxAgeMinutes: 14 * 24 * 60 }),
+    const cot = deriveCaptureReport(rows({ source: "CFTC", status: "not-a-feed", basis: "weekly report", maxAgeMinutes: 14 * 24 * 60 }),
       { rows: [{ asOf: "2026-10-06" }, { asOf: "2026-09-29" }] }, SUN);
     const rendered = deriveHeadlessFreshness(rows(), { rows: [] }, SUN);
-    const quoted = deriveHeadlessFreshness(rows(), { rows: [
-      { dataSource: "delayed", delayMinutes: 15, sessionExchange: "NASDAQ", marketState: "CLOSED", lastUpdated: Date.parse("2026-10-09T23:59:00Z") },
-    ] }, SUN);
+    const delayedClose = { dataSource: "delayed", delayMinutes: 15, sessionExchange: "NASDAQ", marketState: "CLOSED", lastUpdated: Date.parse("2026-10-09T23:59:00Z") };
+    const quoted = deriveHeadlessFreshness(rows(), { rows: [delayedClose] }, SUN);
+    const marketLine = "US trading day Fri 9 Oct 2026 close \u00b7 15 min delayed \u00b7 markets closed until Mon";
     const pick = (inputs: Partial<Parameters<typeof captureStatusLine>[0]>) => captureStatusLine({ selfDated: false, rendered: () => rendered, ...inputs });
     // The footer ends as `fn` does, then gives up the oldest observation, then its source.
     // It dates the pane's own data, so the pane's own `as of` goes.
-    expect(pick({ report: cot })).toEqual({ freshness: cot, dates: "data", variants: [
+    expect(cot.declaresData).toBe(true);
+    expect(pick({ report: cot })).toEqual({ freshness: cot.freshness, dates: "data", variants: [
       "Source: CFTC \u00b7 Tue 6 Oct 2026 (oldest Tue 29 Sep 2026) \u00b7 not a live feed (weekly report)",
       "Source: CFTC \u00b7 Tue 6 Oct 2026 \u00b7 not a live feed (weekly report)",
       "Tue 6 Oct 2026 \u00b7 not a live feed (weekly report)",
     ] });
-    expect(pick({ report: cot }).variants[0]).toBe(formatFreshnessLine(cot));
-    // Quotes on screen keep the market line; a pane that dates its own view keeps its word.
-    expect(pick({ report: cot, quoted }).variants[0]).toBe("US trading day Fri 9 Oct 2026 close \u00b7 15 min delayed \u00b7 markets closed until Mon");
-    expect(pick({ report: cot, quoted }).dates).toBe("quotes");
+    expect(pick({ report: cot }).variants[0]).toBe(formatFreshnessLine(cot.freshness));
+    // The quotes the page loaded beside it (EE's, MDAY's ticker) do not date it, undated or not.
+    expect(pick({ report: cot, quoted }).variants[0]).toBe(formatFreshnessLine(cot.freshness));
+    const estimates = deriveCaptureReport(rows({ status: "not-a-feed", basis: "estimates and reported earnings", oldest: null }),
+      { rows: [{ date: "2026-11-09" }, { date: "2026-08-11" }] }, SUN);
+    expect(pick({ report: estimates, quoted }).variants[0])
+      .toBe("Source: Gloom Cloud \u00b7 retrieved Sun 11 Oct 2026 06:17 UTC \u00b7 not a live feed (estimates and reported earnings)");
+    // A pane that dates its own view keeps its word.
     expect(pick({ report: cot, quoted, selfDated: true }).freshness).toBe(rendered);
+    // Quotes keep the market line: a report whose rows are quotes, a price chart's bars, a report that declares nothing.
+    const board = deriveCaptureReport(rows({ status: "delayed" }), { rows: [delayedClose] }, SUN);
+    const bars = deriveCaptureReport(rows({ status: "not-a-feed", basis: "daily closes", cadence: "daily", prices: true }), { rows: [{ asOf: "2026-10-09" }] }, SUN);
+    const silent = deriveCaptureReport(rows(), { rows: [] }, SUN);
+    for (const report of [board, bars, silent]) {
+      expect(report.declaresData).toBe(false);
+      expect(pick({ report, quoted })).toMatchObject({ dates: "quotes", freshness: quoted });
+      expect(pick({ report, quoted }).variants[0]).toBe(marketLine);
+    }
+    expect(pick({ report: bars }).variants[0]).toBe(formatFreshnessLine(bars.freshness));
+    // A board whose figures are a session's close names no feed but still dates the capture by that close.
+    const closedBoard = deriveCaptureReport(rows(), { rows: [], metadata: { asOf: "2026-10-09T20:00:00Z", sessionExchange: "NYSE" } }, SUN);
+    expect(closedBoard.freshness.status).toBe("unreported");
+    expect(pick({ report: closedBoard }).variants[0]).toBe("Source: Gloom Cloud \u00b7 US trading day Fri 9 Oct 2026 close \u00b7 markets closed until Mon");
     // A report that cannot tell falls back to the rendered view.
-    expect(pick({ report: rendered, quoted: undefined })).toEqual({ freshness: rendered, dates: null, variants: ["Retrieved Sun 11 Oct 2026 06:17 UTC \u00b7 status not reported"] });
+    expect(pick({ report: silent, quoted: undefined })).toEqual({ freshness: rendered, dates: null, variants: ["Retrieved Sun 11 Oct 2026 06:17 UTC"] });
     // A dataset's report dates it whatever else the capture shows.
-    const dataset = deriveHeadlessFreshness(rows({ status: "not-a-feed", dataset: true }), { rows: [{ asOf: "2026-10-04" }] }, SUN);
+    const dataset = deriveCaptureReport(rows({ status: "not-a-feed", dataset: true }), { rows: [{ asOf: "2026-10-04" }] }, SUN);
     expect(pick({ report: dataset, quoted, selfDated: true }).variants[0]).toBe("Source: Gloom Cloud \u00b7 observed Sun 4 Oct \u00b7 lag 7d");
   });
 
@@ -299,7 +410,7 @@ describe("report freshness", () => {
       .toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:59 UTC · 15 min delayed");
     // A dated row with no feed signal is not called live.
     expect(line(rows(), { rows: [{ price: 1, lastUpdated: NOW - 60_000 }] }))
-      .toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:59 UTC · status not reported");
+      .toBe("Source: Gloom Cloud · Fri 9 Oct 2026 04:59 UTC");
   });
 
   test("a partly stale board names the share; a wholly stale one says how old it is", () => {
@@ -333,6 +444,33 @@ describe("report freshness", () => {
       .toBe("Source: Gloom Cloud · FX trading day Tue 13 Oct 2026 close · 15 min delayed · markets closed");
     expect(at("2026-10-14T14:00:00Z", pair("2026-10-14T13:59:00Z", "REGULAR")))
       .toBe("Source: Gloom Cloud · Wed 14 Oct 2026 13:59 UTC · 15 min delayed · markets open");
+  });
+
+  test("futures are closed from the Friday close to the Sunday open, whatever state a quote stamped before it", () => {
+    // The FUT board's rows as Gloom Cloud serves them: each venue by its full name, the last tick Friday at the 21:00 UTC close.
+    const status = (time: string, marketState: "REGULAR" | "CLOSED", lastUpdated: string, stale: boolean) => {
+      const now = Date.parse(time);
+      const observations = [["CME", "ES=F"], ["NY MERCANTILE", "CL=F"], ["COMEX", "GC=F"], ["CBOT", "ZC=F"], ["ICE FUTURES", "KC=F"]]
+        .map(([venue, symbol]) => quoteObservation(createTestQuote({
+          symbol, instrumentType: "FUTURE", listingExchangeName: venue, exchangeName: venue, marketState, stale,
+          dataSource: "delayed", providerId: "gloomberb-cloud", lastUpdated: Date.parse(lastUpdated),
+        }), now));
+      return paneStatusLine(deriveHeadlessFreshness(rows(), { rows: observations }, now));
+    };
+    const friday = "2026-10-23T21:00:00Z";
+    // Sunday 05:35 UTC, the Futures pane's capture: stale rows still reading REGULAR were "markets open".
+    expect(status("2026-10-25T05:35:00Z", "REGULAR", friday, true))
+      .toBe("Fri 23 Oct 2026 close · stale (32 hours old) · markets closed · reopens 22:00 UTC");
+    expect(status("2026-10-25T05:35:00Z", "CLOSED", friday, true))
+      .toBe("Fri 23 Oct 2026 close · stale (32 hours old) · markets closed · reopens 22:00 UTC");
+    // Saturday: the weekday of the open, as every other market names its Monday.
+    expect(status("2026-10-24T12:00:00Z", "REGULAR", friday, true))
+      .toBe("Fri 23 Oct 2026 close · stale (15 hours old) · markets closed until Sun");
+    // Just after the Sunday open, a board whose source says open is open; so is Monday's.
+    expect(status("2026-10-25T22:05:00Z", "REGULAR", "2026-10-25T22:00:00Z", false))
+      .toBe("22:00 UTC · 15 min delayed · markets open");
+    expect(status("2026-10-26T09:00:00Z", "REGULAR", "2026-10-26T08:59:00Z", false))
+      .toBe("08:59 UTC · 15 min delayed · markets open");
   });
 
   test("filed data is never stale for its age, only for a release it missed", () => {

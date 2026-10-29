@@ -4,19 +4,66 @@ import type {
   DesktopSharedStateSnapshot,
   DesktopThemePreviewState,
   DesktopWindowBridge,
+  DesktopWindowIntent,
+  DesktopWindowIntentResult,
 } from "../../../../../types/desktop-window";
-import { backendRequest, getElectrobunBackendInitSnapshot, onBackendMessage } from "../../backend-rpc";
-import { detachedSnapshotKey, prepareDetachedSnapshot } from "./snapshot";
+import {
+  backendRequest,
+  getElectrobunBackendInitSnapshot,
+  onBackendMessage,
+  setElectrobunWindowIntentHandler,
+} from "../../backend-rpc";
+import { detachedRpcKey, MAIN_WINDOW_RPC_KEY, secondaryWindowRpcKey } from "../../../shared/window-keys";
+import { createDetachedSnapshotFilter, prepareSecondaryWindowSnapshot } from "./snapshot";
 
-export function createDesktopWindowBridge(kind: "main" | "detached", paneId?: string): DesktopWindowBridge {
+function windowKeyFor(kind: DesktopWindowBridge["kind"], paneId?: string, windowId?: string): string | undefined {
+  if (kind === "main") return MAIN_WINDOW_RPC_KEY;
+  if (kind === "window") return windowId ? secondaryWindowRpcKey(windowId) : undefined;
+  return paneId ? detachedRpcKey(paneId) : undefined;
+}
+
+export function createDesktopWindowBridge(
+  kind: DesktopWindowBridge["kind"],
+  paneId?: string,
+  windowId?: string,
+): DesktopWindowBridge {
   const initialDesktopSnapshot = getElectrobunBackendInitSnapshot()?.desktopSnapshot ?? null;
-  let lastDetachedSnapshotKey = kind === "detached" && paneId && initialDesktopSnapshot
-    ? detachedSnapshotKey(initialDesktopSnapshot, paneId)
+  const takeDetachedSnapshot = kind === "detached" && paneId
+    ? createDetachedSnapshotFilter(paneId, initialDesktopSnapshot)
     : null;
 
   return {
     kind,
     paneId,
+    windowId,
+    windowKey: windowKeyFor(kind, paneId, windowId),
+    initialActiveWindowKey: getElectrobunBackendInitSnapshot()?.activeWindowKey ?? null,
+    subscribeActiveWindow(listener: (windowKey: string | null) => void) {
+      return onBackendMessage("desktop.activeWindow", (message) => {
+        listener(message.windowKey);
+      });
+    },
+    focusPaneInItsWindow: kind === "detached"
+      ? undefined
+      : async (targetPaneId: string) => {
+        await backendRequest("window.focusPane", { paneId: targetPaneId });
+      },
+    focusWindow: kind === "detached"
+      ? undefined
+      : async (targetWindowId: string, targetPaneId?: string | null) => {
+        await backendRequest("window.focus", { windowId: targetWindowId, paneId: targetPaneId ?? null });
+      },
+    subscribeFocusPane: kind === "detached"
+      ? undefined
+      : (listener: (paneId: string) => void) => onBackendMessage("desktop.focusPane", (message) => {
+        listener(message.paneId);
+      }),
+    sendWindowIntent: kind === "window"
+      ? (intent: DesktopWindowIntent) => backendRequest("window.intent", { intent })
+      : undefined,
+    handleWindowIntents: kind === "main"
+      ? (handler: (windowId: string, intent: DesktopWindowIntent) => DesktopWindowIntentResult) => setElectrobunWindowIntentHandler(handler)
+      : undefined,
     syncMainState: kind === "main"
       ? async (snapshot: DesktopSharedStateSnapshot) => {
         await backendRequest("desktop.syncMainState", { snapshot });
@@ -46,14 +93,14 @@ export function createDesktopWindowBridge(kind: "main" | "detached", paneId?: st
     },
     subscribeState(listener: (snapshot: DesktopSharedStateSnapshot) => void) {
       return onBackendMessage("desktop.state", (message) => {
-        if (kind === "detached" && paneId) {
-          const nextKey = detachedSnapshotKey(message.snapshot, paneId);
-          if (nextKey === lastDetachedSnapshotKey) return;
-          lastDetachedSnapshotKey = nextKey;
-          listener(prepareDetachedSnapshot(message.snapshot, paneId));
+        if (takeDetachedSnapshot) {
+          const snapshot = takeDetachedSnapshot(message.snapshot);
+          if (snapshot) listener(snapshot);
           return;
         }
-        listener(message.snapshot);
+        // A secondary window takes every change: any pane in its grid, or the
+        // grid itself, can move with one.
+        listener(kind === "window" && windowId ? prepareSecondaryWindowSnapshot(message.snapshot, windowId) : message.snapshot);
       });
     },
     subscribeDockPreview(listener: (preview: DesktopDockPreviewState) => void) {

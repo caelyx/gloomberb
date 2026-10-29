@@ -20,14 +20,16 @@ import {
   type CliHelpEntry,
 } from "./help";
 import { parsePaneFunctionArgs, SHOT_SIZE_LIMITS } from "./pane-functions/options";
-import { checkCliCommandOptions } from "./command-options";
+import { checkCliCommandOptions, foldCommandArgs } from "./command-options";
+import { foldTypedText } from "../utils/typed-text";
 import { CLI_EXIT_CODES } from "./exit-codes";
 import { asUsageError, fail, inferCliErrorOptions, printCliError } from "./errors";
-import { cliStyles, setCliColorEnabledOverride, setCliWidthOverride } from "../utils/cli-output";
+import { cliStyles, setCliColorEnabledOverride, setCliPlainOverride, setCliWidthOverride } from "../utils/cli-output";
 import { setDisplayTimeZone } from "../utils/utc-time";
+import { collectSavedCopies } from "../data/saved-copies";
 import { search, searchCandidatesForCli, buildSearchReport } from "./commands/search";
 import { ticker } from "./commands/ticker";
-import { requireOneArg, takeOption } from "./commands/command-utils";
+import { requireOneArg, takeFlag, takeOption } from "./commands/command-utils";
 import { EXCHANGE_OPTION } from "./listing-arg";
 import { apiCliCommand } from "./commands/api";
 import { marketDataCliCommands } from "./commands/market";
@@ -37,13 +39,24 @@ import { createSystemCliCommands } from "./commands/system";
 import { brokerCliCommand, ibkrCliCommand } from "./commands/broker";
 import { listPlugins, updatePlugins } from "./commands/plugins";
 import { installListedPlugin, removePlugin } from "../plugins/installer";
-import { catalogCommandHits, functionCodeCommand, nearFunctionCodeCommand, runPaneCatalog, runPaneFunction, runPaneScreenshot } from "./pane-functions";
+import {
+  catalogCommandHits,
+  functionCodeCommand,
+  nearFunctionCodeCommand,
+  runPaneCatalog,
+  runPaneFunction,
+  runPaneFunctionHelp,
+  runPaneScreenshot,
+} from "./pane-functions";
 import { catalogPointer, tickerPointer, type CatalogCommandHit } from "./unknown-command";
+import { exportCommandPointer } from "./known-gaps";
 import { catalogFredSeriesIds } from "./series-search";
+import { primeBoardCoins } from "./board-coins";
 
 const { width: SHOT_WIDTH, height: SHOT_HEIGHT } = SHOT_SIZE_LIMITS;
 
-function createCoreCliCommands(
+/** The commands the CLI itself defines (help, ticker, search, ...), which plugins' commands join. */
+export function createCoreCliCommands(
   helpEntries: () => CliHelpEntry[],
   lookupCommand: (token: string) => CliCommandDef | null,
   allCommands: () => CliCommandDef[],
@@ -58,14 +71,16 @@ function createCoreCliCommands(
       description: "Show every command, or the usage, options, and examples for one",
       help: {
         group: CLI_COMMAND_GROUPS.app,
-        usage: ["help [command]", "<command> --help"],
-        examples: ["help", "help quote", "quote --help"],
+        usage: ["help [command]", "<command> --help", "help fn <function>", "fn <function> --help"],
+        examples: ["help", "help quote", "quote --help", "fn BT --help"],
       },
       execute: async (args, ctx) => {
         const topic = args[0];
         if (topic) {
           const command = lookupCommand(topic);
           if (!command) failUnknownCommand(topic, allCommands(), await unknownCommandPointers(ctx, topic, [], allCommands()));
+          // A command that runs a function is helped by that function's own options when one is named.
+          if (FUNCTION_COMMANDS.has(command.name) && args.length > 1 && await runPaneFunctionHelp(command.name, args.slice(1), ctx)) return;
           printCommandHelp(command, ctx);
           return;
         }
@@ -79,7 +94,7 @@ function createCoreCliCommands(
     {
       name: "launch-ui",
       aliases: ["ui"],
-      description: "Open the terminal UI, like plain gloomberb",
+      description: "Open the terminal UI, like plain gloom",
       help: {
         group: CLI_COMMAND_GROUPS.app,
         usage: ["launch-ui"],
@@ -110,15 +125,20 @@ function createCoreCliCommands(
       help: {
         group: CLI_COMMAND_GROUPS.research,
         usage: ["ticker <symbol>"],
-        options: [EXCHANGE_OPTION],
+        options: [
+          EXCHANGE_OPTION,
+          { flags: "--all", description: "List a bank's pricing supplements (424B2, FWP, its notes' 424B3) and the 13D/13G it filed about other companies among the recent SEC filings" },
+        ],
         examples: ["ticker AAPL", "ticker SAN:EPA", "ticker 7203.T", "ticker AAPL --json"],
       },
       execute: async (rawArgs, ctx) => {
         const args = [...rawArgs];
         const exchange = takeOption(args, "--exchange");
+        const allFilings = takeFlag(args, "--all");
         const symbol = requireOneArg(args, "ticker <symbol>", "symbol", ctx);
         await ticker(symbol, {
           exchange,
+          allFilings,
           initMarketData: ctx.initMarketData,
           fail: ctx.fail,
           ...(ctx.cliOptions.format === "text" ? {} : { printResult: ctx.printResult }),
@@ -156,7 +176,7 @@ function createCoreCliCommands(
         group: CLI_COMMAND_GROUPS.functions,
         usage: ["fn <function> [argument] [options]"],
         options: [
-          { flags: "--<option> <value>", description: "A function setting; gloomberb catalog <function> lists them" },
+          { flags: "--<option> <value>", description: "A function setting; gloom catalog <function> lists them" },
           { flags: "--require-bot-safe", description: "Fail unless the function has a verified, complete report" },
           { flags: "--explain", description: "Follow the report with what its terms mean (text and JSON; CSV keeps the rows)" },
           {
@@ -172,8 +192,16 @@ function createCoreCliCommands(
           "fn WEI --csv --section europe > europe.csv",
           "fn 13F AAPL --view=ticker-holdings",
           "fn OVME --spot 100 --strike 100 --days 30 --volatility 25",
+          "fn HIVG SPY --event fomc --offset -6 --lookback ALL --csv",
           "fn AUCT --explain",
         ],
+        sections: [{
+          title: "Exit status",
+          lines: [
+            "0 when the report has data for what was asked, partial data with warnings about the rest included; 1 when it has none (an empty report, or rows with no value for a listing that has nothing) or the input is bad. --json ok is false exactly when the exit status is 1.",
+            "CSV headers are the same for every symbol: a reason a figure is missing goes to the status column, never into a number cell.",
+          ],
+        }],
       },
       execute: async (args, ctx) => {
         requirePaneFunctionTarget(args, "fn", ctx);
@@ -191,12 +219,12 @@ function createCoreCliCommands(
           { flags: "--output <path>", description: "PNG to write; defaults to gloomberb-<function>-<argument>.png in this folder" },
           { flags: "--width <px>", description: `Layout width, ${SHOT_WIDTH.min} to ${SHOT_WIDTH.max} (default 1280). The PNG is drawn at twice the size: ${SHOT_WIDTH.min * 2} to ${SHOT_WIDTH.max * 2} px wide` },
           { flags: "--height <px>", description: `Layout height, ${SHOT_HEIGHT.min} to ${SHOT_HEIGHT.max} (default 720), so ${SHOT_HEIGHT.min * 2} to ${SHOT_HEIGHT.max * 2} px tall` },
-          { flags: "--theme <id>", description: "Render with another theme, such as amber or colorblind; gloomberb config themes lists them" },
+          { flags: "--theme <id>", description: "Render with another theme, such as amber or colorblind; gloom config themes lists them" },
           { flags: "--scale <n>", description: "Text scale from 0.5 to 4 (default 1)" },
           { flags: "--watermark <label>", description: "Label drawn in the pane title bar" },
           { flags: "--no-status", description: "Leave out the dated status line (as-of, delay, market hours) drawn in the pane footer" },
           { flags: "--strict", description: `Exit ${CLI_EXIT_CODES.unusableShot} when the pane is empty, shows an error, is still loading or is access-gated; the PNG and the Reason line are still written` },
-          { flags: "--<option> <value>", description: "A function setting; gloomberb catalog <function> lists them" },
+          { flags: "--<option> <value>", description: "A function setting; gloom catalog <function> lists them" },
           EXCHANGE_OPTION,
         ],
         examples: [
@@ -239,7 +267,7 @@ function createCoreCliCommands(
       execute: async (args) => {
         const ref = args[0];
         if (!ref) {
-          fail("Usage: gloomberb install <user/repo>");
+          fail("Usage: gloom install <user/repo>");
         }
         console.error(cliStyles.warning("Runs with your full permissions. Read the source first."));
         await installListedPlugin(ref);
@@ -252,9 +280,9 @@ function createCoreCliCommands(
         group: CLI_COMMAND_GROUPS.plugins,
         usage: ["update [name]"],
         sections: [{
-          title: "Updating Gloomberb itself",
+          title: "Updating Gloom itself",
           lines: [
-            "The app updates itself from stable releases. config set updates.channel nightly adds the nightly build of main; see gloomberb help config.",
+            "The app updates itself from stable releases. config set updates.channel nightly adds the nightly build of main; see gloom help config.",
           ],
         }],
         examples: ["update", "update gloom-tv"],
@@ -275,7 +303,7 @@ function createCoreCliCommands(
       execute: async (args) => {
         const name = args[0];
         if (!name) {
-          fail("Usage: gloomberb remove <name>");
+          fail("Usage: gloom remove <name>");
         }
         await removePlugin(name);
       },
@@ -290,15 +318,18 @@ function createCoreCliCommands(
   ];
 }
 
+/** Commands whose first argument is a function, so `<command> <function> --help` is that function's help. */
+const FUNCTION_COMMANDS: ReadonlySet<string> = new Set(["fn", "shot"]);
+
 function requirePaneFunctionTarget(args: string[], commandName: string, ctx: CliCommandContext): void {
   let target: string;
   try {
     target = parsePaneFunctionArgs(args).target;
   } catch {
-    // Invalid options are reported by the runner, with its error code.
+    // Intentional ignore: The pane function runner reports invalid options with its error code.
     return;
   }
-  if (!target) ctx.fail(`Usage: gloomberb ${commandName} <function> [argument] [options]`);
+  if (!target) ctx.fail(`Usage: gloom ${commandName} <function> [argument] [options]`);
 }
 
 function printHelpText(text: string, ctx: CliCommandContext): void {
@@ -362,10 +393,12 @@ function failUnknownCommand(token: string, commands: CliCommandDef[], pointers: 
       [`Run: ${pointers.nearFn.command}`, ticker].filter(Boolean).join("\n"),
     );
   }
-  const catalog = suggestion ? null : catalogPointer(token, pointers.hits, pointers.args);
+  // Exporting is a flag, not a command: `export LMT` says how, rather than listing functions that mention exports.
+  const exported = suggestion ? null : exportCommandPointer(token, pointers.args);
+  const catalog = suggestion ? null : exported ?? catalogPointer(token, pointers.hits, pointers.args);
   const help = suggestion
-    ? `Did you mean ${suggestion}? Run gloomberb help to see every command.`
-    : catalog ? `${catalog}\nRun gloomberb help to see every command.` : "Run gloomberb help to see every command.";
+    ? `Did you mean ${suggestion}? Run gloom help to see every command.`
+    : catalog ? `${catalog}\nRun gloom help to see every command.` : "Run gloom help to see every command.";
   fail(`Unknown command "${token}".`, ticker ? `${ticker}\n${help}` : help);
 }
 
@@ -413,13 +446,15 @@ export async function dispatchCli(args: string[], options: DispatchCliOptions = 
   }
   setCliColorEnabledOverride(parsed.options.color);
   setCliWidthOverride(parsed.options.width ?? null);
+  // The CLI entry sets plain output for a pipe or NO_COLOR (entry.ts); `--plain` and `--no-plain` decide it either way.
+  if (parsed.options.plain != null) setCliPlainOverride(parsed.options.plain);
   const command = parsed.args[0] ?? (parsed.help ? "help" : undefined);
   if (!command) {
     return { kind: "unhandled" };
   }
 
   const registry = await createRegistry(options);
-  const resolved = registry.lookup.get(normalizeCliCommandToken(command));
+  const resolved = registry.lookup.get(normalizeCliCommandToken(foldTypedText(command)));
   if (!resolved) {
     return { kind: "unhandled" };
   }
@@ -428,15 +463,22 @@ export async function dispatchCli(args: string[], options: DispatchCliOptions = 
   // plugin name, or a note to write.
   const helpOnly = parsed.help && resolved.command.name !== "help";
   const target = helpOnly ? registry.lookup.get("help")! : resolved;
-  const commandArgs = helpOnly ? [resolved.command.name] : parsed.args.slice(1);
+  // The words after a command that runs a function name the function whose help it is (`fn BT --help`).
+  // Full-width letters and digits (ＧＭＥ, １０) are read as the ASCII they stand for, once, here.
+  const commandArgs = helpOnly
+    ? [resolved.command.name, ...FUNCTION_COMMANDS.has(resolved.command.name) ? foldCommandArgs(resolved.command, parsed.args.slice(1)) : []]
+    : foldCommandArgs(resolved.command, parsed.args.slice(1), parsed.literalStart - 1);
   try {
     if (!helpOnly && resolved.builtin) checkCliCommandOptions(resolved.command, commandArgs, parsed.literalStart - 1);
-    const result = await target.command.execute(
+    // What it answers from a saved copy, its refresh having failed, its closing line says.
+    const result = await collectSavedCopies(() => Promise.resolve(target.command.execute(
       commandArgs,
       createCliCommandContext(target.ownerId, registry, parsed.options, commandArgs),
-    );
+    )));
     return normalizeCliDispatchResult(result);
   } catch (error) {
+    // A coin typed without its quote currency (USDT) is named by its one symbol (USDT-USD) in the hint.
+    if (parsed.options.format !== "json") await primeBoardCoins([error instanceof Error ? error.message : String(error)]);
     printCliError(error, parsed.options, { command: resolved.command.name, args: commandArgs,
       isFredSeries: (id) => catalogFredSeriesIds(registry.plugins).has(id) });
     process.exitCode = 1;
@@ -453,7 +495,7 @@ export async function failUnknownCliCommand(args: string[], options: DispatchCli
     parsed = parseCliGlobalArgs(args);
     token = parsed.args[0] ?? token;
   } catch {
-    // dispatchCli already reported flags that do not parse.
+    // Intentional ignore: dispatchCli already reports invalid flags.
   }
   const registry = await createRegistry(options);
   const commands = listedCommands(registry).map((entry) => entry.command);

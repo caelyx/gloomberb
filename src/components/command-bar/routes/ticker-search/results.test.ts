@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { ResultItem } from "../../list/model";
-import { formatInstrumentBadge, mergePlainRootTickerResults, mergeTickerSearchResultItems, venueDropdownResults } from "./results";
+import { DID_YOU_MEAN_CATEGORY, formatInstrumentBadge, mergePlainRootTickerResults, mergeTickerSearchResultItems, readRootTickerQuery, venueDropdownResults } from "./results";
 
 function resultItem(id: string, label: string, right: string, kind: ResultItem["kind"] = "ticker"): ResultItem {
   return {
@@ -80,6 +80,20 @@ test("an index typed by its code is the exact match; the fund named for it and a
     ["pane:news", "Panes"],
     ["fund", "Instruments"],
   ]);
+});
+
+test("a commodity typed by its name is the exact match with its benchmark future first; a name search is not", () => {
+  const rows = (query: string) => mergeTickerSearchResultItems(query, [
+    { ...resultItem("future", "GC=F", "CMX", "search"), detail: "Gold", category: "Funds & Derivatives", instrumentType: "FUTURE", searchAliases: ["GC=F", "Gold"] },
+    { ...resultItem("company", "GOLD", "NYSE", "search"), detail: "Gold.com, Inc.", category: "Primary Listing", instrumentType: "Common Stock", searchAliases: ["GOLD"] },
+  ], []);
+  for (const query of ["gold", "Gold", "GOLD"]) {
+    expect(rows(query).map((item) => [item.id, item.category]), query).toEqual([["future", "Exact Match"], ["company", "Exact Match"]]);
+  }
+  expect(rows("gold futures").map((item) => [item.id, item.category])).toEqual([["future", "Exact Match"], ["company", "Primary Listing"]]);
+  expect(rows("gold miners").map((item) => item.category)).toEqual(["Funds & Derivatives", "Primary Listing"]);
+  const pane: ResultItem = { id: "pane:news", label: "News", detail: "", category: "Panes", kind: "action", action: () => {} };
+  expect(mergePlainRootTickerResults("gold", rows("gold"), [pane]).map((item) => item.id)).toEqual(["future", "company", "pane:news"]);
 });
 
 test("folds a plain query's symbol hits into one capped Instruments section behind the local rows", () => {
@@ -215,4 +229,25 @@ test("one exchange is one exact row however the listing is spelled", () => {
   ];
   expect(mergePlainRootTickerResults("BRK.B", berkshire, []).map((item) => item.id))
     .toEqual(["dot:NYSE", "dot:IEX", "compact:BMV"]);
+});
+
+test("a Bloomberg code's listing is the exact match; an unknown market code or a near miss offers the row it was read from above Ask AI", () => {
+  const search = (id: string, label: string, right: string): ResultItem => ({ ...resultItem(id, label, right, "search"), category: "Other Listings" });
+  const ask: ResultItem = { id: "ask", label: "Ask AI", detail: "", category: "Ask AI", kind: "action", action: () => {} };
+  const merged = (query: string, rows: ResultItem[]) => mergePlainRootTickerResults(readRootTickerQuery(query)!.search, rows, [ask], readRootTickerQuery(query))
+    .map((item) => [item.id, item.category]);
+  const vod = [search("adr", "VOD", "NASDAQ"), search("lse", "VOD", "LSE"), search("xetra", "VODI", "XETRA")];
+  expect(merged("VOD LN", vod)).toEqual([["lse", "Exact Match"], ["ask", "Ask AI"], ["adr", "Instruments"], ["xetra", "Instruments"]]);
+  expect(merged("VOD US Equity", vod)[0]).toEqual(["adr", "Exact Match"]);
+  // Search lists Volvo's B shares as VOLV.B, the code glues the class on.
+  expect(merged("VOLVB SS", [search("prague", "VOLVB", "PSE"), search("sto", "VOLV.B", "SFB")])[0]).toEqual(["sto", "Exact Match"]);
+  const apple = [search("aapl", "AAPL", "NASDAQ"), search("other", "AAPLUSTRAD", "BSE")];
+  for (const query of ["AAPL GY", "AAPL GP"]) {
+    expect(merged(query, apple), query).toEqual([["aapl", DID_YOU_MEAN_CATEGORY], ["ask", "Ask AI"], ["other", "Instruments"]]);
+  }
+  expect(merged("700.HK", [search("tencent", "0700", "HKEX")])[0]).toEqual(["tencent", DID_YOU_MEAN_CATEGORY]);
+  expect(merged("6758.JP", [search("sony", "6758", "JPX")])[0]).toEqual(["sony", DID_YOU_MEAN_CATEGORY]);
+  expect(merged("BRK/B", [search("brk", "BRK.B", "NYSE")])[0]).toEqual(["brk", DID_YOU_MEAN_CATEGORY]);
+  // A name before a legal form is searched as typed, so search finds the company: SE is also SIX Swiss's code.
+  for (const query of ["AAPL", "apple", "VOD.L", "AAPL MSFT", "vod ln", "SAP SE", "SIEMENS AG", "P/E"]) expect(readRootTickerQuery(query), query).toBeNull();
 });

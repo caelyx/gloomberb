@@ -6,7 +6,7 @@ import {
   type PaneInstanceConfig,
 } from "../types/config";
 import type { PaneDef } from "../types/plugin";
-import { isPaneInLayout } from "./pane-manager";
+import { findPaneLocation, isPaneInLayout } from "./pane-manager";
 import type { BrokerContractRef } from "../types/instrument";
 import { scopedBrokerContractIdentityKey } from "../utils/instrument-identity";
 
@@ -104,14 +104,16 @@ export function findFixedTickerPaneForSymbol(
   symbol: string,
   instrument?: BrokerContractRef | null,
 ): PaneInstanceConfig | null {
-  return layout.instances.find((instance) =>
+  const matches = layout.instances.filter((instance) =>
     instance.paneId === normalizePaneId(paneId)
     && instance.binding?.kind === "fixed"
     && instance.binding.symbol === symbol
     && (instance.binding.instrument === undefined ? "unspecified" : instance.binding.instrument === null ? "public" : scopedBrokerContractIdentityKey(instance.binding.instrument))
       === (instrument === undefined ? "unspecified" : instrument === null ? "public" : scopedBrokerContractIdentityKey(instrument))
     && isPaneInLayout(layout, instance.instanceId)
-  ) ?? null;
+  );
+  // One in this window's grid or floating over the same ticker in another window.
+  return matches.find((instance) => findPaneLocation(layout, instance.instanceId)?.window === "main") ?? matches[0] ?? null;
 }
 
 export function shouldFocusTickerNavigationTarget({

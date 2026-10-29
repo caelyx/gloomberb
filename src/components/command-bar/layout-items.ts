@@ -8,6 +8,7 @@ import type { ResultItem } from "./list/model";
 import type { CommandBarRoute } from "./workflow/types";
 import { buildCurrentLayoutItems } from "./layout-items/current-layout";
 import { buildFocusedPaneLayoutItems } from "./layout-items/focused-pane";
+import { buildWindowLayoutItems } from "./layout-items/windows";
 import type { CloseAll, LayoutItemsContext, OpenInlineConfirm } from "./layout-items/types";
 import {
   buildWindowModeResultItems,
@@ -32,6 +33,7 @@ export function buildLayoutResultItems({
   pushRoute,
   query,
   state,
+  windowCommands,
 }: {
   closeAll: CloseAll;
   confirmDangerousActions?: boolean;
@@ -45,6 +47,7 @@ export function buildLayoutResultItems({
   pushRoute: (route: CommandBarRoute) => void;
   query: string;
   state: AppState;
+  windowCommands?: LayoutItemsContext["windowCommands"];
 }): ResultItem[] {
   const context: LayoutItemsContext = {
     closeAll,
@@ -59,10 +62,12 @@ export function buildLayoutResultItems({
     pluginRegistry,
     pushRoute,
     state,
+    windowCommands,
     ...(confirmDangerousActions === undefined ? {} : { confirmDangerousActions }),
   };
   const layoutItems = [
     ...buildFocusedPaneLayoutItems(context),
+    ...buildWindowLayoutItems(context),
     ...buildCurrentLayoutItems(context),
     ...buildSavedLayoutItems(context),
   ];

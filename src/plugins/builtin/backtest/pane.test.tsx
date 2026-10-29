@@ -14,6 +14,7 @@ const PANE_ID = "backtest:layout-test";
 const SYMBOL = "BTTEST";
 const tui = createOpenTuiTestHarness();
 let previousCoordinator: ReturnType<typeof getSharedMarketDataCoordinator>;
+let coordinator: MarketDataCoordinator | undefined;
 
 /** Three years of sessions that trend up with a dip, so both rules fire. */
 function history(): PricePoint[] {
@@ -31,12 +32,14 @@ function installCoordinator() {
     phase: "ready", data: points, lastGoodData: points, source: "test", fetchedAt: Date.now(),
     staleAt: null, error: null, attempts: [],
   };
-  const coordinator = new MarketDataCoordinator(createTestDataProvider({ id: "backtest-pane-fixture" }));
+  coordinator = new MarketDataCoordinator(createTestDataProvider({ id: "backtest-pane-fixture" }));
   coordinator.loadChart = async () => entry;
   setSharedMarketDataCoordinator(coordinator);
 }
 
 afterEach(() => {
+  coordinator?.destroy();
+  coordinator = undefined;
   setSharedMarketDataCoordinator(previousCoordinator ?? null);
 });
 
@@ -94,7 +97,7 @@ test("a short stacked pane sizes the chart with the kit: the legend names the li
   expect(lines.slice(0, row).join("\n")).toContain("• Buy & hold");
   expect(lines.slice(0, row).join("\n")).toContain("+ Strategy");
   // The table keeps its header and four metrics under the chart.
-  for (const label of ["Total return", "CAGR", "Volatility (ann.)", "Sharpe (0% cash)"]) {
+  for (const label of ["Price return", "CAGR", "Volatility (ann.)", "Sharpe (0% cash)"]) {
     expect(lines.slice(row).join("\n")).toContain(label);
   }
 });

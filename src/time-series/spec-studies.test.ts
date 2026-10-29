@@ -319,9 +319,10 @@ describe("study resolution", () => {
       study("sma", "sma", ["a"], { period: 100 }),
     ]);
 
-    expect(result.series.find(({ id }) => id === "volume")?.points).toEqual([]);
+    // No bar reports volume, so there is no panel to draw and no unit to warn about.
+    expect(result.series.find(({ id }) => id === "volume")).toBeUndefined();
     expect(result.warnings).toEqual([
-      "sma: not enough valid history to calculate sma.",
+      "SMA: not enough valid history to calculate sma.",
     ]);
   });
 
@@ -329,6 +330,13 @@ describe("study resolution", () => {
     const input = resolved("a");
     input.points = input.points.map((point, index) => ({ ...point, volume: index === input.points.length - 1 ? undefined : 0 }));
     expect(resolveStudies([input], [study("volume", "volume", ["a"])]).series).toEqual([]);
+    // A coin's feed leaves hours without volume, read as missing rather than 0: a window missing every bar's adds no
+    // panel, and one missing some plots only the bars that have it.
+    const coin = resolved("b");
+    coin.points = coin.points.map(({ volume: _volume, ...point }) => point);
+    expect(resolveStudies([coin], [study("volume", "volume", ["b"])]).series).toEqual([]);
+    coin.points[3] = { ...coin.points[3]!, volume: 5_000 };
+    expect(resolveStudies([coin], [study("volume", "volume", ["b"])]).series[0]?.points.map((point) => point.value)).toEqual([5_000]);
   });
 
   test("aligns pair formulas to the latest available value even when display interpolation is off", () => {
@@ -390,7 +398,7 @@ describe("study resolution", () => {
     expect(result.series.find(({ id }) => id === "spread")?.points).toHaveLength(5);
     const correlation = result.series.find(({ id }) => id === "correlation")?.points ?? [];
     expect(correlation).toHaveLength(0);
-    expect(result.warnings).toContain("correlation: not enough valid history to calculate correlation.");
+    expect(result.warnings).toContain("Correlation: not enough valid history to calculate correlation.");
     expect(result.series.find(({ id }) => id === "correlation")).toMatchObject({
       style: "line",
       interpolation: "none",
@@ -457,9 +465,10 @@ describe("study resolution", () => {
   });
 
   test("returns actionable errors for missing inputs instead of throwing", () => {
-    const result = resolveStudies([resolved("a")], [study("ratio", "ratio", ["a", "missing"])]);
+    const result = resolveStudies([resolved("a")], [study("pair:ratio", "ratio", ["a", "missing"])]);
     expect(result.series).toEqual([]);
-    expect(result.errors[0]).toContain("requires 2 valid input series");
+    // Named for what it is, never for the id the chart gave it.
+    expect(result.errors).toEqual(["Ratio: ratio requires 2 valid input series."]);
   });
 
   test("preserves the derived unit when a raw ratio mixes dimensions in one currency", () => {
@@ -486,9 +495,9 @@ describe("study resolution", () => {
     ]);
 
     expect(result.warnings).toEqual([
-      "ratio: ratio inputs use different currencies (USD and JPY); raw values are not FX-converted.",
+      "Ratio: ratio inputs use different currencies (USD and JPY); raw values are not FX-converted.",
     ]);
-    expect(result.errors).toEqual(["spread: USD is USD/share and JPY is JPY/share: a spread does not convert currencies."]);
+    expect(result.errors).toEqual(["Spread: USD is USD/share and JPY is JPY/share: a spread does not convert currencies."]);
     expect(result.series.find(({ id }) => id === "spread")).toBeUndefined();
     expect(result.series.find(({ id }) => id === "ratio")).toMatchObject({
       unit: "USD/JPY",
@@ -504,7 +513,7 @@ describe("study resolution", () => {
     ]);
 
     expect(result.warnings).toEqual([]);
-    expect(result.errors).toEqual(["spread: PRICE is USD/share and REVENUE is in USD: a spread needs both in one unit."]);
+    expect(result.errors).toEqual(["Spread: PRICE is USD/share and REVENUE is in USD: a spread needs both in one unit."]);
     expect(result.series).toEqual([]);
   });
 
@@ -565,7 +574,7 @@ describe("study resolution", () => {
       const result = resolveStudies(inputs, [study("spread", "spread", ["left", "right"])]);
       expect(result.series).toEqual([]);
       expect(result.errors).toHaveLength(1);
-      expect(result.errors[0]).toBe("spread: LEFT is USD/share and RIGHT is EUR/share: a spread does not convert currencies.");
+      expect(result.errors[0]).toBe("Spread: LEFT is USD/share and RIGHT is EUR/share: a spread does not convert currencies.");
     }
   });
 

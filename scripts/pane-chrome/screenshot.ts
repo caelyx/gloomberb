@@ -13,16 +13,16 @@ import {
 /**
  * Copy Screenshot paints a pane into a canvas itself (src/utils/dom-screenshot.ts),
  * so anything it does not know how to paint is missing from the image while
- * the screen shows it: the speedometer gauge and SVG charts were (GLO-493).
+ * the screen shows it: the speedometer gauge and SVG charts were.
  * This renders chart panes on invented data in headless Chrome (fixture.tsx,
  * `screenshot`), takes the pane's Copy Screenshot image and Chrome's own
  * screenshot of the same pane, and checks that each chart region has about as
  * much ink in the copy as on screen: an SVG gauge, canvas charts, an SVG chart,
- * a toolbar laid over a canvas by z-index (GLO-500), and the gradients and
+ * a toolbar laid over a canvas by z-index, and the gradients and
  * masked icons charts draw with CSS. Both device pixel
  * ratios are checked, the 2x one being a Retina Mac.
  *
- * The image an assistant gets through pane.screenshot (GLO-500) is the same
+ * The image an assistant gets through pane.screenshot is the same
  * paint at its own size; the check also holds it to its bounds: twice the
  * on-screen size within the long edge, and shrunk under a byte cap that the
  * first paint overshoots, or refused when even the narrowest image would not fit.
@@ -46,7 +46,13 @@ const MAX_DIFFERING = 0.3;
 const MIN_SCREEN_INK = 150;
 
 interface Rect { x: number; y: number; width: number; height: number }
-interface Region { pane: string; name: string; selector: string }
+interface Region {
+  pane: string;
+  name: string;
+  selector: string;
+  /** Text: the copy sets glyphs a pixel or two off the screen's baseline, so only its ink counts. */
+  text?: true;
+}
 
 const REGIONS: Region[] = [
   { pane: "fear-greed:a", name: "speedometer gauge (SVG)", selector: "svg[role=img]" },
@@ -57,6 +63,7 @@ const REGIONS: Region[] = [
   { pane: "charts:a", name: "dashed legend cue (repeating gradient)", selector: "[data-shot-region=dashed-cue]" },
   { pane: "charts:a", name: "colour scale (gradient)", selector: "[data-shot-region=colour-scale]" },
   { pane: "charts:a", name: "toolbar icon (SVG mask)", selector: "[data-shot-region=masked-icon]" },
+  { pane: "charts:a", name: "grid rows (display: contents)", selector: "[data-shot-region=column-grid]", text: true },
 ];
 
 /** Page side: ink in each region of the screen and of the copy, measured against the region's commonest colour. */
@@ -152,7 +159,7 @@ async function checkPanes(cdp: Cdp, scale: number, out: string | undefined): Pro
       const ok = ink.screen >= MIN_SCREEN_INK * scale * scale
         && ink.copy >= ink.screen * MIN_INK_RATIO
         && ink.copy <= ink.screen * MAX_INK_RATIO
-        && ink.differing <= MAX_DIFFERING;
+        && (region.text || ink.differing <= MAX_DIFFERING);
       failed ||= !ok;
       results.push({ pane, name: region.name, scale, ...ink, ok });
     });

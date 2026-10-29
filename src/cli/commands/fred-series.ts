@@ -1,3 +1,5 @@
+import { seriesMoves, type MoveHorizon } from "../../plugins/builtin/shared/move-rank";
+import { seriesNotOnFred } from "../../sources/gloomberb-cloud/fred-series";
 import { ICE_SPREAD_SERIES } from "../../time-series/ice-credit";
 import { toBasisPoints } from "../../utils/basis-points";
 import { parseReportTime } from "../../utils/utc-time";
@@ -11,6 +13,8 @@ export const DEFAULT_FRED_START = "2021-01-01";
  */
 const SPREAD_SERIES: ReadonlySet<string> = new Set([
   "T10Y2Y", "T10Y3M",
+  // The 30-year mortgage rate less the 10-year Treasury, which Gloom Cloud computes on each PMMS date.
+  "MORTGAGE30US10Y",
   ...ICE_SPREAD_SERIES.map((series) => series.seriesId),
 ]);
 
@@ -38,6 +42,11 @@ export function fredUnit(seriesId: string, info: { units?: string | null; season
 export function fredInterval(frequency: string | null | undefined): string | null {
   const word = frequency?.split(",")[0]?.trim().toLowerCase();
   return word || null;
+}
+
+/** Whether a series' dates are days it was observed on (FRED's `Daily`, `Weekly, Ending Friday`), not the start of a period; false when it does not say. */
+export function fredObservesDays(frequency: string | null | undefined): boolean {
+  return /^(?:daily|weekly)\b/i.test(frequency?.trim() ?? "");
 }
 
 /**
@@ -75,6 +84,28 @@ export function fredValueHeader(info: { units?: string | null; seasonalAdjustmen
 export function fredExportValue(seriesId: string, value: number | null): number | null {
   if (value == null || !Number.isFinite(value)) return null;
   return isSpreadSeries(seriesId) ? toBasisPoints(value, 4) : value;
+}
+
+/** Decimals past which a value's digits are float noise, not the series' precision. */
+const MAX_FRED_DECIMALS = 6;
+
+/**
+ * The decimals a series is published to: the most any of its observations
+ * carries, float noise aside (DGS10 to the hundredth, DEXSFUS to the
+ * ten-thousandth). FRED drops trailing zeros, so 5.10 and 5.00 arrive as 5.1
+ * and 5, which printed bare read as rounder figures than 5.09 beside them.
+ */
+export function fredDecimals(values: ReadonlyArray<number | null>): number {
+  return values.reduce<number>((most, value) => {
+    if (value == null || !Number.isFinite(value)) return most;
+    const text = String(Number(value.toPrecision(10)));
+    return Math.max(most, text.includes("e") ? MAX_FRED_DECIMALS : Math.min(MAX_FRED_DECIMALS, text.split(".")[1]?.length ?? 0));
+  }, 0);
+}
+
+/** An observation as a `fred` table prints it, at the series' decimals (`fredDecimals`); exports keep the value as FRED gives it. */
+export function fredValueCell(decimals: number): (value: unknown) => string {
+  return (value) => typeof value === "number" && Number.isFinite(value) ? value.toFixed(decimals) : "";
 }
 
 /** Basis points as a text table prints them, to a tenth: 44 is `44`, -12.5 is `-12.5`. */
@@ -115,7 +146,10 @@ export interface FredProvenance {
  * looking for the figure in FRED's own data knows it is not there yet:
  * `U.S. Treasury via FRED, published 2026-10-09`. Null for FRED's own.
  */
-export function fredProvenance(observations: ReadonlyArray<{ date: string; publisher?: string; publishedAt?: string }>): FredProvenance | null {
+export function fredProvenance(
+  observations: ReadonlyArray<{ date: string; publisher?: string; publishedAt?: string }>,
+  seriesId?: string,
+): FredProvenance | null {
   const ahead = observations.filter((observation) => observation.publisher?.trim());
   if (ahead.length === 0) return null;
   const publishers = [...new Set(ahead.map((observation) => observation.publisher!.trim()))];
@@ -126,7 +160,8 @@ export function fredProvenance(observations: ReadonlyArray<{ date: string; publi
   const publishedAt = times.at(-1);
   const publisher = publishers.join(" and ");
   return {
-    source: `${publisher} via FRED${publishedAt ? `, published ${publishedAt.slice(0, 10)}` : ""}`,
+    // A series FRED does not carry names whose publication it is read from instead (TurkStat via the CBRT).
+    source: `${publisher} via ${(seriesId ? seriesNotOnFred(seriesId)?.via : null) ?? "FRED"}${publishedAt ? `, published ${publishedAt.slice(0, 10)}` : ""}`,
     publisher,
     ...(publishedAt ? { publishedAt } : {}),
   };
@@ -164,6 +199,73 @@ export function fredHistoryNotes(input: {
     : [`Showing from ${input.startDate}; earlier: --start YYYY-MM-DD (series begins ${seriesStart}).`];
 }
 
+/**
+ * `--change 1D|1W`, in any case: the horizon each row's change is over, or
+ * null for anything else. 1D is from the previous observation, 1W from the
+ * last one on or before the same day a week earlier, each within ten days, so
+ * a holiday is skipped (shared/move-rank.ts).
+ */
+export function parseFredChange(value: string | undefined): MoveHorizon | null {
+  const horizon = value?.trim().toUpperCase();
+  return horizon === "1D" || horizon === "1W" ? horizon : null;
+}
+
+/**
+ * Where a `--change` fetch starts: a week and the ten-day window before
+ * `--start`, so the first row shown has the observation it is measured from.
+ */
+export function fredChangeFetchStart(startDate: string): string {
+  return new Date(Date.parse(`${startDate}T00:00:00Z`) - 17 * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** Why a series has no changes over a horizon: a 1D change of a weekly series is a week's, and longer intervals have neither. Null when it has them. */
+export function fredChangeMismatch(seriesId: string, interval: string | null, horizon: MoveHorizon): string | null {
+  if (interval == null || interval === "daily" || (interval === "weekly" && horizon === "1W")) return null;
+  return interval === "weekly"
+    ? `${seriesId} is weekly, so its changes are 1W.`
+    : `${seriesId} is ${interval}: --change works on daily and weekly series.`;
+}
+
+/**
+ * The change column's header, in the series' own unit: basis points for a
+ * spread (its values print in bp), percentage points for a percent, else
+ * FRED's units.
+ */
+export function fredChangeHeader(seriesId: string, horizon: MoveHorizon, info: { units?: string | null } | null | undefined): string {
+  if (isSpreadSeries(seriesId)) return `${horizon} chg (bp)`;
+  const units = info?.units?.trim();
+  if (!units) return `${horizon} chg`;
+  return `${horizon} chg (${/^percent\b/i.test(units) ? "pp" : units})`;
+}
+
+/**
+ * A change as its column prints it: signed, a spread's basis points to a
+ * tenth, anything else at the series' decimals (`fredDecimals`), as its values.
+ */
+export function fredChangeCell(spread: boolean, decimals: number): (value: unknown) => string {
+  const format = spread ? basisPointsCell : fredValueCell(decimals);
+  return (value) => {
+    const text = format(value);
+    return typeof value === "number" && Number(text) > 0 ? `+${text}` : text.replace(/^-(?=0(\.0+)?$)/, "");
+  };
+}
+
+/**
+ * Each observation's change over the horizon, in the unit it exports in, and
+ * the date it is measured from, by observation date. A holiday's blank and an
+ * observation with nothing within ten days before have none.
+ */
+export function fredChanges(
+  seriesId: string,
+  observations: ReadonlyArray<{ date: string; value: number | null }>,
+  horizon: MoveHorizon,
+): Map<string, { change: number | null; changeFrom: string }> {
+  const ascending = [...observations].sort((a, b) => a.date.localeCompare(b.date));
+  return new Map(seriesMoves(ascending, horizon).map((move) => [
+    move.date, { change: fredExportValue(seriesId, move.change), changeFrom: move.from },
+  ]));
+}
+
 /** What `fred` says when nothing falls on or after `--start`: where the series actually ends. */
 export function fredEmptyMessage(startDate: string, latest: { date: string; value: number | null } | null): string {
   return latest
@@ -174,8 +276,8 @@ export function fredEmptyMessage(startDate: string, latest: { date: string; valu
 /** What an export of nothing on or after `--start` says to try instead: a start that reaches the latest observation. */
 export function fredEmptyAdvice(seriesId: string, latest: { date: string } | null): string {
   return latest
-    ? `Latest observation: ${latest.date}. Try: gloomberb fred ${seriesId} --start ${latest.date.slice(0, 4)}`
-    : `No observations came back for ${seriesId}. Try an earlier --start, or gloomberb fred --list for the series served.`;
+    ? `Latest observation: ${latest.date}. Try: gloom fred ${seriesId} --start ${latest.date.slice(0, 4)}`
+    : `No observations came back for ${seriesId}. Try an earlier --start, or gloom fred --list for the series served.`;
 }
 
 /** A series as `fred --list` shows it. */
@@ -183,6 +285,11 @@ export interface FredListRow {
   id: string;
   title: string;
   group: string;
+}
+
+/** Lower case without accents, so `turk` and `turkiye` find Türkiye. */
+function foldAccents(text: string): string {
+  return text.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
 }
 
 /** How well a word of the filter matches a series, best first: its id or group name, a word of its group or title, the start of its id, then any text. */
@@ -200,11 +307,11 @@ function matchTier(term: string, row: FredListRow, words: readonly string[]): nu
  * Catalog order breaks ties; an empty filter keeps the catalog as it is.
  */
 export function filterFredSeries(rows: readonly FredListRow[], filter: string): FredListRow[] {
-  const terms = filter.toLowerCase().split(/\s+/).filter(Boolean);
+  const terms = foldAccents(filter).split(/\s+/).filter(Boolean);
   const ranked = rows.flatMap((row, index) => {
-    const text = `${row.id} ${row.title} ${row.group}`.toLowerCase();
+    const text = foldAccents(`${row.id} ${row.title} ${row.group}`);
     if (!terms.every((term) => text.includes(term))) return [];
-    const words = `${row.title} ${row.group}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    const words = foldAccents(`${row.title} ${row.group}`).split(/[^a-z0-9]+/).filter(Boolean);
     const tiers = terms.map((term) => matchTier(term, row, words));
     return [{ row, index, worst: Math.max(0, ...tiers), total: tiers.reduce((sum, tier) => sum + tier, 0) }];
   });

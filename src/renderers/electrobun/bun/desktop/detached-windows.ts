@@ -7,6 +7,7 @@ import {
   normalizeWindowFrameWithMinimum,
   type WindowFrame,
 } from "../window/frame";
+import { setWindowFrame } from "../window/native-frame";
 import {
   detachedRpcKey,
   focusWindowForRpcKey,
@@ -106,7 +107,7 @@ export class DesktopDetachedWindowManager {
           || currentFrame.y !== nextFrame.y
           || currentFrame.width !== nextFrame.width
           || currentFrame.height !== nextFrame.height)) {
-        existingWindow.setFrame(nextFrame.x, nextFrame.y, nextFrame.width, nextFrame.height);
+        setWindowFrame(existingWindow, nextFrame);
       }
       (existingWindow as any).setTitle?.(this.resolveTitle(instanceId));
     }
@@ -131,7 +132,7 @@ export class DesktopDetachedWindowManager {
   private resolveTitle(instanceId: string): string {
     const config = this.backend.config;
     const instance = config ? findPaneInstance(config.layout, instanceId) : null;
-    if (!instance) return "Gloomberb";
+    if (!instance) return "Gloom";
     return instance.title?.trim() || instance.paneId;
   }
 
@@ -153,6 +154,7 @@ export class DesktopDetachedWindowManager {
 
   private cleanupState(instanceId: string): void {
     this.backend.disposeWindowResources(detachedRpcKey(instanceId));
+    this.backend.noteWindowFocus(detachedRpcKey(instanceId), false);
     this.windows.delete(instanceId);
     this.clearTimer(this.frameTimers, instanceId);
     this.clearTimer(this.dockTimers, instanceId);
@@ -178,6 +180,9 @@ export class DesktopDetachedWindowManager {
     });
     this.windows.set(instanceId, window);
     this.suppressDockUntil.set(instanceId, Date.now() + INITIAL_DOCK_SUPPRESSION_MS);
+    const key = detachedRpcKey(instanceId);
+    (window as any).on?.("focus", () => this.backend.noteWindowFocus(key, true));
+    (window as any).on?.("blur", () => this.backend.noteWindowFocus(key, false));
 
     (window as any).on?.("close", () => {
       const shouldIgnore = this.closingPanes.delete(instanceId);

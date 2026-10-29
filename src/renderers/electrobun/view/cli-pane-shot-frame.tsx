@@ -2,7 +2,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { FloatingPaneWrapper } from "../../../components/layout/floating-pane";
 import { CaptureDatesDataContext } from "../../../components/layout/pane/capture-status";
-import { PaneFooterProvider, hasPaneFooterContent, type PaneFooterSegment } from "../../../components/layout/pane/footer";
+import { PaneFooterProvider, datesPaneData, hasPaneFooterContent, type PaneFooterSegment } from "../../../components/layout/pane/footer";
 import { resolvePaneBodyFrame } from "../../../components/layout/pane/sizing";
 
 /** What a capture's status line dates (`CaptureStatusLine`): the pane's own data, the quotes on screen, or neither. */
@@ -125,8 +125,8 @@ function useShotStatusLine(enabled: boolean, hasAsOf: () => boolean): ShotStatus
 }
 
 /**
- * Static captures retain warnings and optional source status without action
- * shortcuts. With `statusLine` the footer also carries the capture's dated
+ * Static captures retain warnings, what a filter leaves out (`capture`) and
+ * optional source status without action shortcuts. With `statusLine` the footer also carries the capture's dated
  * status line (`Fri 9 Oct close · 15 min delayed · markets closed until Mon`),
  * inside the requested size: the body gives up the footer row for it. The
  * pane's own text that says the same goes, so the date is said once: its `as
@@ -149,10 +149,10 @@ export function PaneShotFrame({ paneId, title, width, height, preserveStatus = f
   const datesData = statusLine && dates === "data";
   return <PaneFooterProvider>{(registeredFooter) => {
     const status: PaneFooterSegment[] = statusLine ? [{ id: "shot-status", parts: [{ text: statusText, tone: "label" }] }] : [];
-    const info = registeredFooter.info.filter((segment) => (preserveStatus || segment.icon === "warning")
-      && !(segment.asOf && (datesData || crowded))
+    const info = registeredFooter.info.filter((segment) => (preserveStatus || segment.icon === "warning" || segment.capture)
+      && !(datesPaneData(segment) && (datesData || crowded))
       && !(segment.quoteStatus && statusLine && dates !== null));
-    shownAsOf.current = info.some((segment) => segment.asOf);
+    shownAsOf.current = info.some(datesPaneData);
     const footer = { info: [...info, ...status], hints: [], menu: [], keys: [] };
     const bodyFrame = resolvePaneBodyFrame({
       width,

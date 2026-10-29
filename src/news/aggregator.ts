@@ -1,3 +1,4 @@
+import { logFailure } from "../utils/log-failure";
 import type { NewsCapability } from "../capabilities";
 import type { ConnectionHealthRegistry } from "../core/connection-health";
 import type { NewsArticle, NewsQuery, NewsQueryState } from "./types";
@@ -153,7 +154,7 @@ export class NewsService {
       this.pollTimer = null;
       this.pollInFlight = true;
       this.lastPollAt = this.now();
-      void this.pollActiveQueries().catch(() => {}).then(() => {
+      void this.pollActiveQueries().catch(logFailure("news.aggregator", "Polling active news queries failed")).then(() => {
         this.pollInFlight = false;
         this.scheduleNextPoll();
       });
@@ -285,7 +286,8 @@ export class NewsService {
           continue;
         }
         return commitDetail(article);
-      } catch {
+      } catch (error) {
+        logFailure("news.aggregator", "Loading story detail failed")(error);
         failed = true;
         // Continue to lower-priority sources.
       }
@@ -336,7 +338,11 @@ export class NewsService {
         }
         if (entry.loadMoreInFlight) return entry.state;
         const incoming = filterNewsArticlesForQuery(dedupeNewsArticles(result.articles), query);
-        const existing = entry.state.articles;
+        // The stories a coin's fallback found are not the pair's own: once stories are filed under it, they replace them.
+        const existing = incoming.length > 0 && entry.state.articles.length > 0
+          && (incoming[0]!.searchedFor ?? null) !== (entry.state.articles[0]!.searchedFor ?? null)
+          ? []
+          : entry.state.articles;
         const incomingIds = new Set(incoming.map((article) => article.id));
         const hasOlderPages = existing.some((article) => !incomingIds.has(article.id));
         const articles = existing.length > 0

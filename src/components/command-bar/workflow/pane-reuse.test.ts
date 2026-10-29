@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { setCloudApiFetchTransport } from "../../../api-client";
+import { resetGeoCatalogCache } from "../../../api-client/geo";
 import { createPaneCatalog } from "../../../cli/pane-functions/discovery";
 import { JsonTickerRepository } from "../../../data/json-ticker-repository";
 import { getLoadablePlugins } from "../../../plugins/catalog";
@@ -34,6 +36,21 @@ describe("which open pane a template focuses", () => {
 
     expect(findReusablePaneInstance([other, open], qq, templatesOf(qq), spec)?.instanceId).toBe("quote:1");
     expect(findReusablePaneInstance([other], qq, templatesOf(qq), spec)).toBeNull();
+  });
+
+  test("a match in the window the bar opened in comes before one in another window", () => {
+    const qq = template("qq", "quote-monitor", { prefix: "QQ", argPlaceholder: "tickers" });
+    const spec: PaneTemplateInstanceConfig = { settings: { symbols: ["AAPL"] } };
+    const elsewhere = instance("quote:main", "quote-monitor", { settings: { symbols: ["AAPL"] } });
+    const here = instance("quote:w2", "quote-monitor", { settings: { symbols: ["AAPL"] } });
+
+    expect(findReusablePaneInstance([elsewhere, here], qq, templatesOf(qq), spec, {
+      preferPaneIds: new Set(["quote:w2"]),
+    })?.instanceId).toBe("quote:w2");
+    // With no match here, the one in the other window is still reused.
+    expect(findReusablePaneInstance([elsewhere], qq, templatesOf(qq), spec, {
+      preferPaneIds: new Set(["quote:w2"]),
+    })?.instanceId).toBe("quote:main");
   });
 
   test("a stable id that was opened on another ticker does not hide a pane that shows this one", () => {
@@ -201,6 +218,8 @@ async function openFunctions(
 
 describe("every function opens once", () => {
   test("opening it again focuses its window, even after the pane picked up a setting of its own", async () => {
+    // CHOKE reads the geo catalog while opening: answer the Cloud API here, and leave nothing cached for the next file.
+    setCloudApiFetchTransport(async () => Response.json({ error: "NOT_FOUND", message: "Not found" }, { status: 404 }));
     const config = createDefaultConfig("/tmp/gloomberb-pane-reuse-catalog");
     const catalog = await createPaneCatalog({ config } as never, getLoadablePlugins());
     const dupes: string[] = [];
@@ -228,6 +247,8 @@ describe("every function opens once", () => {
       }
     } finally {
       catalog.destroy();
+      setCloudApiFetchTransport(null);
+      resetGeoCatalogCache();
     }
 
     expect([...new Set(dupes)].sort()).toEqual(Object.keys(OPENS_ANOTHER_WINDOW).sort());

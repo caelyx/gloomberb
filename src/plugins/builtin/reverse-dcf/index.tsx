@@ -6,13 +6,13 @@ import { DISCOUNT_OPTIONS, MARGIN_OPTIONS, ReverseDcfPane } from "./pane";
 export const reverseDcfModule: PluginModule = {
   panes: [{
     id: "reverse-dcf", name: "Reverse DCF", icon: "R", component: ReverseDcfPane,
-    defaultPosition: "right", tickerFollower: true, defaultMode: "floating", defaultFloatingSize: { width: 80, height: 20 },
+    defaultPosition: "right", tickerFollower: true, instruments: ["equity"], defaultMode: "floating", defaultFloatingSize: { width: 80, height: 20 },
     tableExport: true,
     // Dated as `fn RDCF` dates it, by the regular close the enterprise value is measured at, not by the quote's latest print.
     reportFreshness: reverseDcfHeadless.freshness,
     settings: { title: "Reverse DCF Settings", fields: [
       { key: "discountRate", label: "Discount rate", type: "select", options: DISCOUNT_OPTIONS },
-      { key: "margin", label: "FCF margin", description: "The free cash flow margin the implied year-10 revenue assumes.", type: "select", options: MARGIN_OPTIONS },
+      { key: "margin", label: "FCF margin", description: "The free cash flow margin the implied year-10 revenue assumes; the company's own trailing margin unless you pick one.", type: "select", options: MARGIN_OPTIONS },
     ] },
   }],
   paneTemplates: [{ ...createTickerSurfacePaneTemplate({
