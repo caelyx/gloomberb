@@ -3,7 +3,7 @@ import { foldPaneLayout } from "../data/config/store/fold-panes";
 import { swapDefaultPortfolioAgeColumn } from "../data/config/store/portfolio-as-of-column";
 import { publicTickerBindingSymbol } from "../tickers/selection";
 import { pinFollowingPane } from "../layout/pane-follow";
-import { flattenSecondaryWindows } from "../layout/pane-manager/secondary-windows";
+import { flattenSecondaryWindows } from "../layout/pane-manager/flatten-windows";
 import {
   CURRENT_CONFIG_VERSION,
   removePaneInstances,
