@@ -1,12 +1,18 @@
 import type { CliCommandContext } from "../../../../types/plugin";
 import type { TickerRecord } from "../../../../types/ticker";
-import { loadSavedListing, parseListingArg } from "../../../../cli/listing-arg";
+import type { MarketContext } from "../../../../cli/types";
+import { listingFields, loadSavedListingOf, savedListingCandidates, savedListingName } from "../../../../cli/listing-arg";
+import { withSuggestion } from "../../../../cli/listing-suggestion";
 import { StagedTickerRepository } from "../../../../cli/staged-tickers";
-import { splitSymbolArgs, symbolInputKey } from "../../../../cli/symbol-args";
+import { splitSymbolArgs, splitSymbolWords, symbolInputKey } from "../../../../cli/symbol-args";
+import { notASymbolError } from "../../../../cli/symbol-cells";
 import { readSymbolList, SymbolListError } from "../../../../cli/symbol-list";
 import { cliStyles } from "../../../../utils/cli-output";
+import { dryRunNote } from "../../../../cli/helpers";
 import {
+  addSymbol,
   addSymbols,
+  failedReason,
   failedRow,
   listingRow,
   NO_MATCH,
@@ -18,6 +24,7 @@ import {
   type SymbolStatus,
   type Verb,
 } from "../../../../cli/symbol-rows";
+import { failPortfolioCommand } from "./shared";
 
 export { addSymbols };
 
@@ -31,15 +38,37 @@ export const FILE_OPTION = {
 export const SYMBOL_LIST_HELP = {
   title: "Several symbols",
   lines: [
-    "add and remove take any number of symbols split by spaces, commas or newlines, a --file, or piped input (or -). A CSV is read from its Symbol, Ticker or Code column, else its first. Quote a list name with spaces.",
-    "Each symbol gets a line, then a summary. Exit status 0 when at least one symbol was added (or removed) or already was, 1 when none resolved or the usage is wrong.",
+    "add and remove take any number of symbols split by spaces, commas or newlines, a --file, or piped input (or -). An entry of a list with commas, semicolons or newlines that has spaces in it is a company's name when search finds one (philip morris intl is PM), read as its US listing first with a line under it saying which, else the symbols it holds when each is written as a symbol or has a quote (AAPL MSFT), and otherwise a name not found. A file or piped list reads each line as such an entry. A CSV is read from its Symbol, Ticker or Code column, else its Name or Company column as names. Without that header every cell is a symbol, unless names, prices or weights sit beside them: then the first column is read and the cells left out are named. Each line is split by its own tab, semicolon, comma or spaces, and a price is never a symbol, written either way (2.582,52 or 1,899.21). A comma between plain digits (0700,25) splits them unless the line also has a tab, a semicolon or spaces between cells. Quote a list name with spaces.",
+    "Each symbol gets a line, then a summary. An entry that cannot be a symbol (N/A, $$$, --, a price alone) is named as not a symbol without a lookup. Symbols Gloom Cloud did not answer for are listed together with one command that adds them again. Exit status 0 when at least one symbol was added (or removed) or already was, 1 when none resolved or the usage is wrong.",
+    "A bare US-style symbol is not added when the listing it matched stopped trading, is abroad while the symbol also names a US listing (DFS as DFS:LSE, Discover's old symbol) or was taken by another company in the last two years (BRKL), or when nothing lists under it now and its company trades as another. Those are listed under Needs a choice, with the add for what their company trades as now and the listing that matched, which naming keeps; one symbol alone fails with the same. A symbol another company took longer ago says so under its line, and one listed only abroad (GARAN) is added with a line naming its venue and currency.",
+    "A vendor's suffix is the venue it names: GARAN.IS is stored as GARAN:BIST, the same row GARAN:BIST and GARAN add to.",
+    "add --dry-run looks every symbol up and prints the same lines without saving.",
   ],
 };
 
-/** A row's line, and under it the coin hint when a bare coin ticker was read as something else. */
+/**
+ * One word of a command line as a shell reads it back: as written when it
+ * holds nothing a shell treats specially (`NVDA`, `SAN:EPA`, `BRK.B`), else
+ * in single quotes (`'Altria Group'`, `'$nvda'`, `'AT&T'`).
+ */
+export function shellWord(word: string): string {
+  return /^[\p{L}\p{N}._:@%+,/][\p{L}\p{N}._:@%+,/=-]*$/u.test(word) ? word : `'${word.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * A row's line, and under it the listing a company's name was read as, the
+ * company that had the symbol before the listing added, the venue and
+ * currency of a bare symbol added on its only listing, abroad, and the coin
+ * hint when a bare coin ticker was read as something else.
+ */
 function rowLines(row: SymbolRow, verb: Verb): string {
-  const line = rowLine(row, verb);
-  return row.hint ? `${line}\n  ${cliStyles.warning(row.hint)}` : line;
+  return [
+    rowLine(row, verb),
+    ...row.readAs ? [`  ${cliStyles.muted(row.readAs)}`] : [],
+    ...row.changeNote ? [`  ${cliStyles.warning(row.changeNote)}`] : [],
+    ...row.abroad ? [`  ${cliStyles.warning(row.abroad)}`] : [],
+    ...row.hint ? [`  ${cliStyles.warning(row.hint)}`] : [],
+  ].join("\n");
 }
 
 function rowLine(row: SymbolRow, verb: Verb): string {
@@ -53,8 +82,61 @@ function rowLine(row: SymbolRow, verb: Verb): string {
     case "removed": return cliStyles.success(`Removed ${label}`);
     case "not_listed": return cliStyles.warning(`Not in the list: ${label}`);
     case "not_found": return cliStyles.danger(`Not found: ${typed}${row.message && !NO_MATCH.test(row.message) ? ` (${reason(row.message, typed)})` : ""}${row.suggestion ? `; did you mean ${row.suggestion}?` : ""}`);
-    case "failed": return cliStyles.danger(`Not ${verb === "add" ? "added" : "removed"}: ${typed} (${reason(row.message ?? "", typed)})`);
+    case "needs_choice": return cliStyles.warning(`  ${row.message ?? typed}`);
+    case "failed": return cliStyles.danger(`Not ${verb === "add" ? "added" : "removed"}: ${typed} (${failedReason(row, typed)})`);
+    // Named as written (`$$$`), and a figure says it is one.
+    case "not_a_symbol": return cliStyles.warning(`Not a symbol: ${row.input.trim()}${row.message?.includes("a number") ? " (a number)" : ""}`);
+    case "not_looked_up": return cliStyles.danger(`Not looked up: ${typed}`);
   }
+}
+
+/**
+ * The symbols of an add Gloom Cloud did not answer for, after the other
+ * lines: one line naming them as they were written, and one command that adds
+ * them all again, each entry one shell word (`'philip morris intl'`).
+ */
+function unansweredLines(rows: readonly SymbolRow[], retry: ((keys: string) => string) | undefined): string[] {
+  const unanswered = rows.filter((row) => row.status === "not_looked_up").map((row) => row.input.trim());
+  if (unanswered.length === 0) return [];
+  const count = unanswered.length === 1 ? "1 symbol" : `${unanswered.length} symbols`;
+  return [
+    "",
+    cliStyles.danger(`Gloom Cloud did not answer for ${count}, so ${unanswered.length === 1 ? "it was" : "they were"} not looked up: ${unanswered.join(", ")}`),
+    ...retry ? [`Try again in a minute: ${retry(unanswered.map(shellWord).join(" "))}`] : [],
+  ];
+}
+
+/**
+ * What symbols that need a choice offer: the add that takes the companies
+ * they trade as now, and the add that keeps each match as it is by naming its
+ * listing. Null for an offer the symbols do not have.
+ */
+function choiceOffers(choices: readonly SymbolRow[], retry: ((keys: string) => string) | undefined): { successors: string | null; matches: string | null } {
+  const successors = [...new Set(choices.flatMap((row) => row.tradesAs ? [row.tradesAs] : []))];
+  const matches = [...new Set(choices.flatMap((row) => row.listing ? [row.listing] : []))];
+  const command = (keys: string[]) => retry ? retry(keys.map(shellWord).join(" ")) : keys.join(" ");
+  const one = choices.length === 1;
+  return {
+    successors: successors.length > 0 ? `Add what ${one ? "it trades" : "they trade"} as now: ${command(successors)}` : null,
+    matches: matches.length > 0 ? `To keep ${one ? "the" : "a"} match instead, name its listing: ${command(matches)}` : null,
+  };
+}
+
+/**
+ * The symbols of an add that need a choice, under their own heading after the
+ * other lines: why each was not added, then what they offer (`choiceOffers`).
+ */
+function choiceLines(rows: readonly SymbolRow[], retry: ((keys: string) => string) | undefined): string[] {
+  const choices = rows.filter((row) => row.status === "needs_choice");
+  if (choices.length === 0) return [];
+  const { successors, matches } = choiceOffers(choices, retry);
+  return [
+    ...rows.length > choices.length ? [""] : [],
+    cliStyles.warning(`Needs a choice, not added (${choices.length}):`),
+    ...choices.map((row) => rowLines(row, "add")),
+    ...successors ? [successors] : [],
+    ...matches ? [cliStyles.muted(matches)] : [],
+  ];
 }
 
 interface CollectionRef {
@@ -65,29 +147,92 @@ interface CollectionRef {
 /**
  * One line per symbol and the summary under them; `--json` and `--csv` give
  * the rows, with the summary in the JSON metadata and on standard error beside
- * CSV. A separator dropped from a symbol of the list is named as a warning. The
- * command exits non-zero when no symbol ended up as asked.
+ * CSV. A separator dropped from a symbol of the list, and the cells a table
+ * read by one column left out, are named as warnings. The command exits
+ * non-zero when no symbol ended up as asked.
  */
 export function printSymbolRows(
   ctx: CliCommandContext,
   rows: SymbolRow[],
-  { verb, collection, repeated, strays }: { verb: Verb; collection: CollectionRef; repeated: number; strays: readonly string[] },
+  { verb, collection, repeated, notes, retry, dryRun = false }: {
+    verb: Verb; collection: CollectionRef; repeated: number; notes: readonly string[];
+    /** The add of some listings, for the line that adds what the symbols needing a choice trade as now. */
+    retry?: (keys: string) => string;
+    dryRun?: boolean;
+  },
 ): void {
   const summary = `${collection.kind === "watchlist" ? "Watchlist" : "Portfolio"} "${collection.name}": ${summarizeSymbolRows(rows, verb, repeated)}`;
   const count = (status: SymbolStatus) => rows.filter((row) => row.status === status).length;
+  const extra = (key: string, status: SymbolStatus) => count(status) > 0 ? { [key]: count(status) } : {};
   const counts = verb === "add"
-    ? { added: count("added"), alreadyListed: count("already_listed"), notFound: count("not_found"), notAdded: count("failed") }
-    : { removed: count("removed"), notListed: count("not_listed"), notFound: count("not_found"), notRemoved: count("failed") };
+    ? { added: count("added"), alreadyListed: count("already_listed"), notFound: count("not_found"), notAdded: count("failed"),
+      ...extra("needsChoice", "needs_choice"), ...extra("notLookedUp", "not_looked_up"), ...extra("notASymbol", "not_a_symbol") }
+    : { removed: count("removed"), notListed: count("not_listed"), notFound: count("not_found"), notRemoved: count("failed"),
+      ...extra("notASymbol", "not_a_symbol") };
   ctx.printResult({
     data: rows,
-    metadata: { [collection.kind]: collection.name, ...counts, repeated, summary },
-    ...strays.length > 0 ? { warnings: [...strays] } : {},
+    metadata: { [collection.kind]: collection.name, ...counts, repeated, summary, ...dryRun ? { dryRun } : {} },
+    ...notes.length > 0 ? { warnings: [...notes] } : {},
   }, {
-    text: () => [...rows.map((row) => rowLines(row, verb)), "", summary].join("\n"),
+    text: () => [
+      ...rows.filter((row) => row.status !== "needs_choice" && row.status !== "not_looked_up").map((row) => rowLines(row, verb)),
+      ...choiceLines(rows, retry),
+      ...unansweredLines(rows, retry),
+      "",
+      `${summary}${dryRunNote(dryRun)}`,
+    ].join("\n"),
   });
   const { format, quiet } = ctx.cliOptions;
   if ((format === "csv" || format === "ndjson") && !quiet) console.error(summary);
   if (!rows.some((row) => settled(row, verb))) process.exitCode = 1;
+}
+
+/**
+ * `watchlist add` and `portfolio add` given one symbol: added as a symbol of a
+ * list is (`addSymbol`), and said as one listing, added or already there with
+ * its notes as warnings, after `notes` on what was left out of the input (the
+ * price of `ED 2.582,52`). A symbol a list would leave for a choice fails the
+ * command, saying why, with what a list offers under the error; any other
+ * failure fails it as the lookup's error, a busy service's to retry.
+ */
+export async function addOneSymbol(
+  ctx: CliCommandContext,
+  market: MarketContext,
+  { symbol, exchange, collection, notes: inputNotes = [], retry, reject, add }: {
+    symbol: string;
+    exchange: string | undefined;
+    notes?: readonly string[];
+    collection: CollectionRef;
+    /** The add of one listing, for the choices a failure names. */
+    retry: (key: string) => string;
+    reject?: (input: string) => Error | null;
+    add: (ticker: TickerRecord) => { changed: boolean; ticker: TickerRecord };
+  },
+): Promise<void> {
+  const { dataProvider, store } = market;
+  const dryRun = ctx.cliOptions.dryRun;
+  const { row, error, lookup } = await addSymbol(symbol, { exchange, store, dataProvider, reject, retry, dryRun, add });
+  if (row.status === "needs_choice") {
+    const message = row.message ?? symbol;
+    const { successors, matches } = choiceOffers([row], retry);
+    ctx.fail(/[.!?]$/.test(message) ? message : `${message}.`, [successors, matches].filter(Boolean).join("\n"));
+  }
+  if (error || !lookup) {
+    return failPortfolioCommand(ctx, await withSuggestion(error, symbol, { store, dataProvider }), `Failed to add ${symbol} to "${collection.name}".`);
+  }
+  // Name the listing that was stored: SAN:EPA is not the SAN that a bare SAN means.
+  const saved = savedListingName(lookup.ticker);
+  const changed = row.status === "added";
+  const { change, formerIssuer, notes } = lookup;
+  const data = { changed, ...listingFields(saved), [collection.kind]: collection.name,
+    ...change ? { tickerChange: change } : {}, ...formerIssuer ? { formerIssuer } : {}, ...dryRun ? { dryRun } : {} };
+  const said = [...inputNotes, ...notes, ...row.abroad ? [row.abroad] : []];
+  const warnings = said.length > 0 ? said : undefined;
+  ctx.printResult({ data, warnings }, {
+    text: () => changed
+      ? `${cliStyles.success(`Added ${saved.label} to "${collection.name}".`)}${dryRunNote(dryRun)}`
+      : cliStyles.warning(`${saved.label} is already in "${collection.name}".`),
+  });
 }
 
 /** A line on standard error while a long add waits to look symbols up again, so it never looks stuck. */
@@ -98,21 +243,38 @@ export function retryNotice(ctx: CliCommandContext): (count: number, waitMs: num
   };
 }
 
-/** The symbols an add or remove was given, failing the command when there are none or the file cannot be read. */
+/**
+ * The symbols an add or remove was given, failing the command when there are
+ * none or the file cannot be read. An add reads a typed company's name with
+ * `readNameEntries`; without it (a remove) every entry is its words. `single`
+ * is the one symbol typed alone, and `notes` what the single command says
+ * beside it: none when it goes as typed, else what was left out of it.
+ */
 export async function requireSymbolList(
   ctx: CliCommandContext,
   args: readonly string[],
   file: string | undefined,
   usage: string,
-): Promise<{ symbols: string[]; repeated: number; strays: string[]; single: string | null }> {
+  readEntries?: (entries: string[]) => Promise<string[]>,
+): Promise<{ symbols: string[]; repeated: number; notes: string[]; single: string | null }> {
   try {
-    const list = await readSymbolList({ args, file });
-    if (list.symbols.length === 0) ctx.fail(usage);
+    // The first entries read are what was typed; a file's and standard input's come after.
+    let typed: string[] | null = null;
+    const list = await readSymbolList({ args, file, readEntries: async (entries) => {
+      const read = readEntries ? await readEntries(entries) : splitSymbolWords(entries);
+      typed ??= read;
+      return read;
+    } });
+    // Only numbers or strays says what it left out, not only how to call the command.
+    if (list.symbols.length === 0) ctx.fail(list.notes.length > 0 ? ["No symbols.", ...list.notes].join(" ") : usage, list.notes.length > 0 ? usage : undefined);
     // One symbol typed alone keeps the single-symbol output and errors. It goes as typed, so a separator
-    // left on it (`UPST;`) is named by the listing it resolves to.
-    const typed = splitSymbolArgs(args);
-    const single = file == null && !args.includes("-") && typed.length === 1 ? (args.length === 1 ? args[0]!.trim() : typed[0]!) : null;
-    return { ...list, single };
+    // left on it (`UPST;`) is named by the listing it resolves to; without the figure typed beside it
+    // (`ED 2.582,52`), which the notes name.
+    const entries: string[] = typed ?? [];
+    const split = splitSymbolArgs(args);
+    const asTyped = args.length === 1 && split.length === 1 && split[0] === entries[0];
+    const single = file == null && !args.includes("-") && entries.length === 1 ? (asTyped ? args[0]!.trim() : entries[0]!) : null;
+    return { ...list, single, notes: single && asTyped ? [] : list.notes };
   } catch (error) {
     if (error instanceof SymbolListError) ctx.fail(error.message, usage);
     throw error;
@@ -130,29 +292,33 @@ export async function removeSymbols({
   exchange,
   store,
   reject,
+  holds,
   remove,
 }: BulkSymbolsOptions & {
   reject?: (input: string) => Error | null;
+  /** Whether the list being changed holds the row: of two a symbol may be saved as (GARAN:BIST and GARAN.IS), the one it holds. */
+  holds?: (ticker: TickerRecord) => boolean;
   remove: (ticker: TickerRecord) => { changed: boolean; ticker: TickerRecord; extra?: Record<string, unknown> };
 }): Promise<SymbolRow[]> {
   const staged = new StagedTickerRepository(store);
   const rows: SymbolRow[] = [];
   for (const input of symbols) {
-    const refusal = reject?.(input);
+    const refusal = notASymbolError(input) ?? reject?.(input);
     if (refusal) {
       rows.push(failedRow(input, refusal));
       continue;
     }
-    let listing;
+    let listings;
     try {
-      listing = parseListingArg(input, exchange, { ownExchangeWins: true });
+      // GARAN.IS is the row of GARAN:BIST, else a row still saved under that key (a broker's).
+      listings = savedListingCandidates(input, exchange, { ownExchangeWins: true });
     } catch (error) {
       rows.push(failedRow(input, error instanceof Error ? error : new Error(String(error))));
       continue;
     }
-    const ticker = listing.symbol ? await loadSavedListing(staged, listing) : null;
+    const ticker = listings[0]!.symbol ? (await loadSavedListingOf(staged, listings, holds))?.ticker : null;
     if (!ticker) {
-      rows.push(failedRow(input, new Error(`Ticker "${listing.key}" was not found in your local data.`), "not_found"));
+      rows.push(failedRow(input, new Error(`Ticker "${listings[0]!.key}" was not found in your local data.`), "not_found"));
       continue;
     }
     const result = remove(ticker);

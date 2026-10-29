@@ -74,6 +74,8 @@ export type CloudEarningsCallsParams = IssuerListingParams & {
   offset?: number;
   /** Include calls still working through the transcription pipeline. */
   includePending?: boolean;
+  /** Every company's calls on these New York days (YYYY-MM-DD), earliest first, in place of a company or the shelf. */
+  upcoming?: { from: string; to: string };
 };
 
 export type CloudNewsParams = {
@@ -246,6 +248,8 @@ export type CloudSecFilingsParams = {
   name?: string;
   limit?: number;
   offset?: number;
+  /** Only these forms, each with its amendment (`8-K` is also `8-K/A`). A server that predates the filter sends every form. */
+  forms?: readonly string[];
 };
 
 export type CloudSecFilingParams = {
@@ -308,6 +312,14 @@ export function cloudJobsPostingsPath(ticker: string, params: CloudJobsPostingsP
   return appendQuery(`/cloud/jobs/${encodeURIComponent(normalizeIssuerResearchTicker(ticker))}/postings`, search);
 }
 
+/** One posting of a company, by the database id the jobs list carries or the careers system's own id HIRE's evidence carries. */
+export function cloudJobsPostingPath(ticker: string, posting: { id: number } | { externalId: string }): string {
+  const search = new URLSearchParams();
+  if ("id" in posting) search.set("id", String(posting.id));
+  else search.set("externalId", posting.externalId);
+  return appendQuery(`/cloud/jobs/${encodeURIComponent(normalizeIssuerResearchTicker(ticker))}/posting`, search);
+}
+
 export function cloudJobsMoversPath(limit?: number, offset?: number): string {
   const search = new URLSearchParams();
   if (limit != null) search.set("limit", String(limit));
@@ -354,11 +366,20 @@ export function cloudEarningsCallsPath(
   if (params.limit != null) search.set("limit", String(params.limit));
   if (params.offset != null) search.set("offset", String(params.offset));
   if (params.includePending) search.set("includePending", "true");
+  if (params.upcoming) {
+    search.set("upcoming", "true");
+    search.set("from", params.upcoming.from);
+    search.set("to", params.upcoming.to);
+  }
   return appendQuery("/cloud/transcripts", search);
 }
 
 export function cloudEarningsTranscriptPath(id: string): string {
   return `/cloud/transcripts/${encodeURIComponent(id)}`;
+}
+
+export function cloudEarningsCallAudioPath(id: string): string {
+  return `${cloudEarningsTranscriptPath(id)}/audio`;
 }
 
 /**
@@ -429,8 +450,14 @@ export function cloudSecFilingsPath(params: CloudSecFilingsParams): string {
   });
   if (params.limit != null) search.set("limit", String(params.limit));
   if (params.offset != null) search.set("offset", String(params.offset));
+  if (params.forms?.length) search.set("form", params.forms.join(","));
   setListingAbroad(search, abroad);
   return appendQuery("/cloud/sec/filings", search);
+}
+
+/** A US-listed company's bank figures: SEC deposits and its lead bank's FDIC call report. */
+export function cloudBankFiguresPath(symbol: string): string {
+  return appendQuery("/cloud/bank-figures", new URLSearchParams({ symbol }));
 }
 
 /** Schedule 13D and 13G reports about the issuer behind `ticker`. */
@@ -445,11 +472,18 @@ export function cloudSecBeneficialOwnersPath(params: CloudBeneficialOwnersParams
   return appendQuery("/cloud/sec/beneficial-owners", search);
 }
 
-/** Companies ranked by recent open-market insider buying. */
+/** Companies ranked by recent open-market insider buying or selling. Defaults are left out of the query. */
 export function cloudSecInsiderSignalsPath(params: CloudInsiderSignalsParams = {}): string {
   const search = new URLSearchParams();
+  if (params.side === "sell") search.set("side", "sell");
   if (params.window != null) search.set("window", String(params.window));
   if (params.limit != null) search.set("limit", String(params.limit));
+  if (params.role && params.role !== "all") search.set("role", params.role);
+  if (params.minValue) search.set("minValue", String(params.minValue));
+  if (params.cluster) search.set("cluster", "true");
+  if (params.position) search.set("position", params.position);
+  if (params.cap) search.set("cap", params.cap);
+  if (params.ticker) search.set("ticker", params.ticker);
   return appendQuery("/cloud/sec/insider-signals", search);
 }
 
@@ -586,9 +620,11 @@ export function cloudNewsPath(params: CloudNewsParams = {}): string {
 }
 
 /** Stories whose headline, summary or publisher matches the text, best match first; the service takes at most 100. */
-export function cloudNewsSearchPath(query: string, limit?: number): string {
+/** `topics` are NI codes the stories must carry: `query=gold&topics=metals` is gold's market news. */
+export function cloudNewsSearchPath(query: string, limit?: number, topics?: readonly string[]): string {
   const search = new URLSearchParams({ query });
   if (limit != null) search.set("limit", String(limit));
+  if (topics?.length) search.set("topics", topics.join(","));
   return appendQuery("/news/search", search);
 }
 

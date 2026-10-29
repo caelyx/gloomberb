@@ -1,10 +1,11 @@
 import type { AwardFilter, AwardRow, AwardType } from "../../../api-client/awards";
 import { notATickerSymbol } from "../../../sources/provider-errors";
 import type { HeadlessBundleSection, HeadlessPaneColumn, HeadlessPaneContext, HeadlessPaneDefinition, HeadlessPaneRow } from "../../../types/headless";
-import { isoDateOption } from "../../../utils/calendar-date";
+import { DATE_OPTION_EXAMPLES, isoDateOption } from "../../../utils/calendar-date";
 import { resolveHeadlessInstrument } from "../shared/headless-market-data";
 import { fetchAward, fetchAwards } from "./client";
-import { AWARD_TABS, awardScope, awardsPreviewNote, awardTypeLabel, futureAwardDatesNote, money } from "./model";
+import { AWARD_TABS, awardScope, awardsCoverageNotes, awardsEmptyReason, awardsPreviewNote, awardTypeLabel, futureAwardDatesNote, money } from "./model";
+import { REPORT_PAGE, REPORT_ROWS } from "../shared/headless-options";
 
 /**
  * "Not a ticker: ZZZZQ." when no listing has the symbol, so a preview that
@@ -87,14 +88,14 @@ export const awardsHeadless: HeadlessPaneDefinition<"bundle"> = {
     { key: "tab", type: "enum", settingKey: "tab", defaultValue: "feed", values: [...AWARD_TABS.map(({ value }) => ({ value })), { value: "all" }], description: "Feed, company history, agencies, sectors, events, or all sections." },
     { key: "view", type: "enum", settingKey: "leaderView", defaultValue: "companies", values: [{ value: "companies" }, { value: "sectors" }], description: "Sectors tab: company leaders or sector totals." },
     ...FILTER_KEYS.map((key) => key === "from" || key === "to"
-      ? { key, type: "string" as const, settingKey: key, placeholder: "YYYY-MM-DD", description: `${key === "from" ? "Start" : "End"} of the date range. Dates use YYYY-MM-DD.`,
+      ? { key, type: "string" as const, settingKey: key, placeholder: "date", description: `${key === "from" ? "Start" : "End"} of the date range, as ${DATE_OPTION_EXAMPLES}.`,
         normalize: (value: string) => isoDateOption(value, key) }
       : { key, type: "string" as const, settingKey: key, description: `Filter by ${key}.` }),
     { key: "type", type: "enum", settingKey: "awardType", defaultValue: "prime", values: [{ value: "prime" }, { value: "subaward" }, { value: "notice" }, { value: "modification" }], description: "Keep record types separate." },
-    { key: "cursor", type: "string", description: "Continue after the previous response's nextCursor." },
-    { key: "limit", type: "integer", minimum: 1, maximum: 200, defaultValue: 100, description: "Maximum feed rows in this response." },
+    { key: "cursor", shot: REPORT_PAGE, type: "string", description: "Continue after the previous response's nextCursor." },
+    { key: "limit", shot: REPORT_ROWS, type: "integer", minimum: 1, maximum: 200, defaultValue: 100, description: "Maximum feed rows in this response." },
     { key: "award", type: "string", settingKey: "award", description: "Open one award's evidence, revisions, subawards and modifications by stable id." },
-    { key: "revisionsCursor", type: "string", description: "Continue a detail response's revisions using nextRevisionsCursor." },
+    { key: "revisionsCursor", shot: REPORT_PAGE, type: "string", description: "Continue a detail response's revisions using nextRevisionsCursor." },
   ],
   describe: "Government awards, agency concentration and company exposure (Pro)",
   async load(args, ctx) {
@@ -112,6 +113,8 @@ export const awardsHeadless: HeadlessPaneDefinition<"bundle"> = {
     const missing = filter.ticker && (data.locked || !data.rows.length) ? await notATicker(filter.ticker, ctx) : null;
     const lock = awardsPreviewNote(data, filter);
     const futureDates = futureAwardDatesNote(data.rows, data.generatedAt);
+    const notes = [...awardsCoverageNotes(data), ...(futureDates ? [futureDates] : [])];
+    const empty = awardsEmptyReason(data);
     const sections: HeadlessBundleSection[] = [];
     const tab = String(args.options.tab ?? "feed");
     if (tab === "feed" || tab === "company" || tab === "all") sections.push({ title: "Awards", columns: FEED_COLUMNS, rows: data.rows.map(awardRecord) });
@@ -121,8 +124,10 @@ export const awardsHeadless: HeadlessPaneDefinition<"bundle"> = {
       { title: "Sector totals", columns: aggregateColumns("Sector"), rows: data.sectors.map((row) => ({ ...row })) });
     if (tab === "events" || tab === "all") sections.push({ title: "Awards relative to annual revenue", columns: EVENT_COLUMNS, rows: data.alerts.map(awardRecord) });
     return { complete: !data.locked && !data.nextCursor && data.status === "available" && !Object.values(data.truncated ?? {}).some(Boolean), sections,
-      ...(futureDates ? { notes: [futureDates] } : {}),
-      errors: [...(missing ? [missing] : []), ...data.gaps, ...(lock ? [lock] : [])],
+      // Collection health is what the awards may be missing, a coverage note; only a failure is an error.
+      ...(notes.length ? { notes } : {}),
+      ...(empty ? { empty } : {}),
+      errors: [...(missing ? [missing] : []), ...(lock ? [lock] : [])],
       // A preview is the same latest awards whatever was asked, so the filters were requested, not applied.
       metadata: { generatedAt: data.generatedAt, asOf: data.asOf, access: data.access, nextCursor: data.nextCursor, truncated: data.truncated, coverage: data.coverage, sources: data.sources,
         filters: filter, filtersApplied: !data.locked } };

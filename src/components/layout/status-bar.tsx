@@ -9,7 +9,7 @@ import {
 } from "../../ui";
 import { useDialog } from "../../ui/dialog";
 import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
-import { blendHex, hoverBg } from "../../theme/colors";
+import { hoverBg } from "../../theme/colors";
 import { t, tf } from "../../i18n";
 import { useThemeColors } from "../../theme/theme-context";
 import { useAppDispatch, useAppSelector } from "../../state/app/context";
@@ -457,11 +457,8 @@ function NativeStatusBar({
       onContextMenu={(event: any) => {
         void openLayoutContextMenu(activeLayoutIdx, event);
       }}
-      style={{
-        borderTop: `1px solid ${colors.border}`,
-        boxShadow: `inset 0 1px 0 ${blendHex(colors.panel, colors.textBright, 0.03)}`,
-        paddingInline: 8,
-      }}
+      // The hairline above it and the type are styles.css's, as the pane footer's are.
+      style={{ paddingInline: "var(--gloom-inset)" }}
     >
       <StatusBarLayoutControl nativePaneChrome {...props} />
       <NativeNewLayout />
@@ -469,7 +466,7 @@ function NativeStatusBar({
       <Box flexGrow={1} minWidth={0} />
       <StatusBarSummary nativePaneChrome {...props} />
       {/* Widgets keep their width; the layout tabs give way instead. */}
-      <Box flexShrink={0} flexDirection="row" alignItems="center">
+      <Box flexShrink={0} flexDirection="row" alignItems="center" data-gloom-role="status-widgets">
         <PluginSlot name="status:widget" />
       </Box>
       <StatusBarFeedback nativePaneChrome {...props} />
@@ -595,7 +592,7 @@ function StatusBarSummary({
           onPress={() => { void rendererHost.openExternal(DESKTOP_DOWNLOAD_URL); }}
           role="link"
           setHoveredControl={setHoveredControl}
-          title={t("Get Gloomberb for Mac or Windows")}
+          title={t("Get Gloom for Mac or Windows")}
         />
       )}
     </>

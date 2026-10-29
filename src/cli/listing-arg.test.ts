@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { AppPersistence } from "../data/app-persistence";
 import { TickerRepository } from "../data/ticker-repository";
-import { createTestDataProvider } from "../test-support/data-provider";
+import { createTestDataProvider, createTestQuote } from "../test-support/data-provider";
 import {
   ListingArgError, listingChoiceNote, listingVenues, loadForListing, notTradedMessage, parseListingArg, resolveCliListing,
 } from "./listing-arg";
@@ -73,12 +73,13 @@ test("an exchange code the app does not know is refused unless the symbol trades
   // A venue only search knows is still the symbol's own listing; data requests go by its key.
   expect((await resolveCliListing("SAN", "BVL", deps)).request).toEqual({ symbol: "SAN:BVL", exchange: "BVL" });
 
-  // A bare symbol keeps the listing it was saved with, as the ticker report always did.
+  // Sanofi in Paris saved under the bare key: the bare symbol is still its US listing, read as with nothing saved.
   await store.createTicker({
     ticker: "SAN", exchange: "EPA", currency: "EUR", name: "Sanofi", portfolios: [], watchlists: [], positions: [], custom: {}, tags: [],
   });
-  const saved = await resolveCliListing("SAN", undefined, deps);
-  expect(saved.request).toEqual({ symbol: "SAN", exchange: "EPA" });
+  const bare = await resolveCliListing("SAN", undefined, deps);
+  expect(bare.saved).toBeNull();
+  expect(bare.request).toEqual({ symbol: "SAN", exchange: "" });
   expect((await resolveCliListing("SAN:XPAR", undefined, deps)).saved?.metadata.name).toBe("Sanofi");
   expect((await resolveCliListing("SAN:NYSE", undefined, deps)).saved).toBeNull();
 });
@@ -97,6 +98,37 @@ test("an index typed with the venue search files it under resolves as the bare s
   // Another code is still a typo, and says where the index is listed.
   const refused = await resolveCliListing("^VIX:ZZZ", undefined, deps).catch((error: unknown) => error);
   expect((refused as Error).message).toBe("Unknown exchange ZZZ for ^VIX. ^VIX trades on: CXI.");
+});
+
+test("a broker's index code is the index, and a cashtag stays the stock it names", async () => {
+  const persistence = new AppPersistence(":memory:");
+  persistences.push(persistence);
+  const store = new TickerRepository(persistence.tickers);
+  const quoted: string[] = [];
+  // No source lists VIX; MOVE is Corvex, AAPL Apple, and a quote for MID times out.
+  const dataProvider = createTestDataProvider({
+    getQuote: async (symbol) => {
+      quoted.push(symbol);
+      if (symbol === "VIX") throw new Error("No provider available for VIX");
+      if (symbol === "MID") throw new Error("Request timed out after 10000ms");
+      return createTestQuote({ symbol, instrumentType: "EQUITY" });
+    },
+  });
+  const deps = { store, dataProvider };
+  // thinkorswim's VIX.X and $VIX.X are only ever the index, so they are read without a request.
+  for (const typed of ["VIX.X", "$vix.x", "SPX.X"]) expect(parseListingArg(typed).key).toBe(typed.toUpperCase().includes("SPX") ? "^SPX" : "^VIX");
+  expect(parseListingArg("VIX.X").readAs).toBe("Read VIX.X as ^VIX (Cboe Volatility Index).");
+  expect(quoted).toEqual([]);
+  // Schwab's $VIX is the index because VIX quotes nothing; $MOVE and $AAPL are the securities that trade as MOVE and AAPL.
+  expect(await resolveCliListing("$VIX", undefined, deps)).toMatchObject({ key: "^VIX", request: { symbol: "^VIX" } });
+  expect((await resolveCliListing("$MOVE", undefined, deps)).key).toBe("MOVE");
+  expect(await resolveCliListing("$AAPL", undefined, deps)).toMatchObject({ key: "AAPL", request: { symbol: "AAPL" } });
+  expect((await resolveCliListing("$AAPL", undefined, deps)).readAs).toBeUndefined();
+  // A timeout says nothing about what trades as MID, so $MID stays the symbol typed rather than the index.
+  expect((await resolveCliListing("$MID", undefined, deps)).key).toBe("MID");
+  // A root no index is known by is never looked up as one, and a named exchange keeps the symbol as typed.
+  expect(quoted).toEqual(["VIX", "MOVE", "MID"]);
+  expect(parseListingArg("VIX.X", "NYSE").key).toBe("VIX.X:NYSE");
 });
 
 test("a perpetual is a listing on its venue, typed by PERP's market id or Hyperliquid's dex name", async () => {
@@ -176,8 +208,8 @@ test("a bare code several companies list asks which, whichever way the router wo
     // Every venue is a choice, the first included.
     expect(failure.details).toBe([
       "Listings:",
-      "  2222:JPX Kotobuki Spirits Co., Ltd. (try: gloomberb history 2222:JPX)",
-      "  2222:TADAWUL Saudi Arabian Oil Co. (try: gloomberb history 2222:TADAWUL)",
+      "  2222:JPX Kotobuki Spirits Co., Ltd. (try: gloom history 2222:JPX)",
+      "  2222:TADAWUL Saudi Arabian Oil Co. (try: gloom history 2222:TADAWUL)",
     ].join("\n"));
   }
   // A timeout is not a missing listing: it surfaces as it was thrown.
@@ -191,7 +223,7 @@ test("a bare code several companies list asks which, whichever way the router wo
   const saved = await loadForListing(await resolveCliListing("2222", undefined, deps), deps, ctx, async () => { throw new Error("Not a ticker: 2222."); }, undefined, request)
     .catch((error) => error);
   expect(saved.message).toBe("2222 resolved to Saudi Arabian Oil Co. (TADAWUL), which has no history.");
-  expect(saved.details).toBe("Other listings: 2222:JPX Kotobuki Spirits Co., Ltd. (try: gloomberb history 2222:JPX)");
+  expect(saved.details).toBe("Other listings: 2222:JPX Kotobuki Spirits Co., Ltd. (try: gloom history 2222:JPX)");
 });
 
 test("listings of one company, however each venue spells its name, still go to the first venue with the others as retries", async () => {
@@ -214,8 +246,8 @@ test("listings of one company, however each venue spells its name, still go to t
     undefined, { command: "history --range 5Y", noun: "history" },
   ).catch((error) => error);
   expect(failure.message).toBe("SAN resolved to Banco Santander, S.A. (NYSE), which has no history.");
-  expect(failure.details).toContain("SAN:BVL BANCO SANTANDER SA Sponsored ADR (try: gloomberb history SAN:BVL --range 5Y)");
-  expect(failure.details).toContain("SAN:XETRA (try: gloomberb history SAN:XETRA --range 5Y)");
+  expect(failure.details).toContain("SAN:BVL BANCO SANTANDER SA Sponsored ADR (try: gloom history SAN:BVL --range 5Y)");
+  expect(failure.details).toContain("SAN:XETRA (try: gloom history SAN:XETRA --range 5Y)");
 });
 
 // CAR as search listed it on 2026-10-11 in its first rows: Avis and Carrefour, but not CAR Group's ASX line.

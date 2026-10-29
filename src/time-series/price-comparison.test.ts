@@ -1,9 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import { createTestDataProvider } from "../test-support/data-provider";
 import type { PricePoint, Quote } from "../types/financials";
 import { chartQuoteOverrideKeyForSource } from "./live-quotes";
 import { resolvePriceComparison } from "./price-comparison";
-import { ChartResolveCache, resolveChartSpecData, seedChartResolutionResult } from "./resolve";
+import { resolveChartSpecData } from "./resolve";
+import { ChartResolveCache } from "./resolve-context";
+import { seedChartResolutionResult } from "./chart-seed";
 import { summarizeResolvedSeries } from "./reporting";
 import { CHART_SPEC_VERSION, type ChartSpec } from "./types";
 
@@ -56,6 +58,41 @@ describe("normalized market price comparison", () => {
       expect(seeded?.priceComparison?.start).toBe(result.priceComparison?.start);
     });
   }
+
+  test("a panned comparison keeps loaded bars past both edges of the view to pan into, and only shared dates inside it", async () => {
+    const days = (from: string, count: number, skip: string[] = []) => Array.from({ length: count }, (_, index) => (
+      new Date(Date.parse(from) + index * 86_400_000).toISOString().slice(0, 10)
+    )).filter((day) => !skip.includes(day));
+    // The second listing has no bar on the view's last day.
+    const data = {
+      OLDER: rows(days("2026-07-01", 70).map((day, index) => [day, 100 + index])),
+      NEWER: rows(days("2026-07-01", 70, ["2026-08-28"]).map((day, index) => [day, 50 + index])),
+    };
+    const view = { start: date("2026-08-17"), end: date("2026-08-28T23:59:59.999Z") };
+    const result = await resolveChartSpecData(spec(), sources(data), new ChartResolveCache(), { requestViewport: view });
+    const span = (points: { date: Date }[]) => [points[0]?.date.toISOString().slice(0, 10), points.at(-1)?.date.toISOString().slice(0, 10)];
+    expect(result.series.map((entry) => span(entry.points))).toEqual([["2026-08-17", "2026-08-27"], ["2026-08-17", "2026-08-27"]]);
+    for (const [index, buffered] of result.bufferedSeries!.entries()) {
+      expect(buffered.points[0]!.date.getTime()).toBeLessThan(view.start.getTime());
+      expect(buffered.points.at(-1)!.date.getTime()).toBeGreaterThan(view.end.getTime());
+      const inView = buffered.points.filter((point) => point.date >= view.start && point.date <= view.end);
+      expect(inView).toEqual(result.series[index]!.points);
+    }
+  });
+
+  test("a weekly comparison's notice dates its shared bars by their last sessions, a daily one by their dates", async () => {
+    // Thu 10 Sep 2026 18:00 UTC, as the sources read it: New York is trading, so the week of Mon 7 Sep runs through today.
+    setSystemTime(date("2026-09-10T18:00:00Z"));
+    try {
+      expect((await resolveChartSpecData(spec("1d"), sources())).priceComparison?.notice)
+        .toContain("From Mon 2 May 2022 close to Mon 7 Sep close;");
+      // The week of Mon 2 May 2022 closed on Fri 6 May; this week runs through today's session.
+      expect((await resolveChartSpecData(spec("1wk"), sources())).priceComparison?.notice)
+        .toContain("From Fri 6 May 2022 close to Thu 10 Sep, latest, intraday;");
+    } finally {
+      setSystemTime();
+    }
+  });
 
   test("missing holiday dates use an exact overlap without carrying or rounding observations", async () => {
     const result = await resolveChartSpecData(spec(), sources({
@@ -172,8 +209,49 @@ describe("normalized market price comparison", () => {
     expect(result.series.map((s) => s.points.at(-1)?.rawValue)).toEqual([180, 60]);
   });
 
-  test("missing, disjoint and single-overlap history leave comparison unavailable, then recover from the source", async () => {
-    for (const newer of [[], rows([["2026-09-10", 60]]), rows([["2025-01-02", 60], ["2025-01-03", 65]])]) {
+  test("a preset range measures each leg from its close on or before the same date a range before, and to its own newest close", async () => {
+    const weekdays = (to: string) => {
+      const out: [string, number][] = [];
+      for (let time = Date.parse("2026-07-01"); time <= Date.parse(to); time += 86_400_000) {
+        if (![0, 6].includes(new Date(time).getUTCDay())) out.push([new Date(time).toISOString().slice(0, 10), 100 + out.length]);
+      }
+      return out;
+    };
+    // NEWER's saved copy stops on Fri 16 Oct; OLDER trades on Tue 20 Oct, whose session is open.
+    const data = { OLDER: weekdays("2026-10-20"), NEWER: weekdays("2026-10-16") };
+    const chart: ChartSpec = { ...spec(), viewport: { range: "1M", resolution: "1d" } };
+    const result = await resolveChartSpecData(chart, { ...sources({ OLDER: rows(data.OLDER), NEWER: rows(data.NEWER) }), now: date("2026-10-20T18:00:00Z") });
+    // A month before Tue 20 Oct is Sun 20 Sep: both legs run from Fri 18 Sep's close, and NEWER does not cut OLDER short.
+    expect(result.priceComparison?.legs).toEqual({
+      OLDER: { baseDay: "2026-09-18", endDay: "2026-10-20", intraday: true },
+      NEWER: { baseDay: "2026-09-18", endDay: "2026-10-16", intraday: false },
+    });
+    expect(result.priceComparison?.notice).toContain("From Fri 18 Sep close to Tue 20 Oct, latest, intraday (NEWER Fri 16 Oct close);");
+    const close = (leg: [string, number][], day: string) => leg.find(([key]) => key === day)![1];
+    expect(result.series[0]!.points.at(-1)!.value!).toBeCloseTo((close(data.OLDER, "2026-10-20") / close(data.OLDER, "2026-09-18") - 1) * 100, 10);
+    expect(result.series[1]!.points.at(-1)!.value!).toBeCloseTo((close(data.NEWER, "2026-10-16") / close(data.NEWER, "2026-09-18") - 1) * 100, 10);
+  });
+
+  test("a leg that is not a ticker is left out, named as asked and pointed at its index, not by its id", async () => {
+    const chart = spec();
+    chart.series[1] = { ...chart.series[1]!, id: "vix-market-close-3", source: { kind: "security", instrument: { symbol: "VIX" }, fieldId: "market.close" } };
+    const inputs = sources();
+    const fail = async (symbol: string) => {
+      if (symbol === "VIX") throw new Error("Not a ticker: VIX.");
+      return histories.OLDER;
+    };
+    Object.assign(inputs.dataProvider, { getPriceHistory: fail, getPriceHistoryForResolution: fail, getDetailedPriceHistory: fail,
+      getTickerFinancials: async (symbol: string) => ({ annualStatements: [], quarterlyStatements: [], priceHistory: await fail(symbol) }) });
+    const result = await resolveChartSpecData(chart, inputs);
+    expect(result.errors).toEqual(["VIX: Not a ticker: VIX. Did you mean ^VIX (Cboe Volatility Index)?"]);
+    expect(result.priceComparison?.dropped?.map((entry) => entry.label)).toEqual(["VIX"]);
+    expect(result.priceComparison?.notice).toEndWith("Left out: VIX.");
+    // OLDER compares on its own, from its first close in the window (100 to 200).
+    expect(result.series[0]?.points.at(-1)?.value).toBe(100);
+  });
+
+  test("disjoint and single-overlap history leave comparison unavailable, then recover from the source", async () => {
+    for (const newer of [rows([["2026-09-10", 60]]), rows([["2025-01-02", 60], ["2025-01-03", 65]])]) {
       const result = await resolveChartSpecData(spec(), sources({ ...histories, NEWER: newer }));
       expect(result.priceComparison).toMatchObject({ start: null, end: null });
       expect(result.series.every((s) => s.points.length === 0)).toBe(true);

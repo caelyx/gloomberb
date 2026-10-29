@@ -32,20 +32,43 @@ export interface FuturesContractTermsPayload {
   settlement: { price: number; date: string } | null
   /**
    * For a continuous symbol (CL=F) or a front generic: the nearest contract
-   * still trading when the symbol has rolled past it to the most active one,
-   * with its last trade; null when it prices the nearest itself. Absent from
+   * still trading once the symbol has rolled past it on its roll date, with
+   * its last trade; null when it prices the nearest itself. Absent from
    * servers that do not send it.
    */
   nearest?: FuturesNearestContract | null
+  /**
+   * For a continuous symbol or a generic: how it rolls ("1 day before last
+   * trade") and the first session it is on the next contract; the date is
+   * null under the open interest switch. Absent from older servers.
+   */
+  roll?: { label: string; date: string | null } | null
+  /**
+   * The root's front contract (what its continuous symbol and first generic
+   * price) when the symbol prices another one (NGF27, NG2); null on the front.
+   */
+  front?: FuturesNearestContract | null
+  /** The contract that traded the most on the root's newest session with volumes: the day's volume alone. */
+  mostActive?: FuturesMostActiveContract | null
 }
 
-/** The nearest contract still trading, which a continuous symbol has rolled past (CLX26 under CL=F on Dec). */
+/** A listed contract by its code, as the quote endpoints take it (CLX26.NYM), and its last trade. */
 interface FuturesNearestContract {
   contract: string
   contractSymbol: string
   /** YYYY-MM */
   deliveryMonth: string
   lastTrade: string | null
+}
+
+/** The most active contract: its volume on that session (`date`). */
+interface FuturesMostActiveContract {
+  contract: string
+  contractSymbol: string
+  /** YYYY-MM */
+  deliveryMonth: string
+  volume: number
+  date: string
 }
 
 /** Gloom Cloud futures prices retain provider denomination and explicit quote units. */
@@ -110,7 +133,15 @@ export interface FuturesCurvePayload {
     historyStart: string | null
     historyEnd: string | null
     asOf: string | null
-    state: "contango" | "backwardation" | "flat" | "unavailable"
+    /**
+     * What the spread subtracts: two last trades made at the same time
+     * ("last"), or both contracts' settlements for the session in `asOf`
+     * ("settle"). Absent from a server that does not say.
+     */
+    basis?: "last" | "settle" | null
+    /** The leg that makes the spread thin (state "thin"): too few lots this session, or no trade in it. */
+    thinSymbol?: string | null
+    state: "contango" | "backwardation" | "flat" | "thin" | "unavailable"
   }
   gaps: string[]
   /** The session the contracts' settlements are for; null when none is confirmed. */

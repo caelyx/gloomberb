@@ -1,15 +1,16 @@
 import type { HeadlessPaneOptionValues } from "../../../types/headless";
 import {
-  CHART_RESOLUTIONS,
   TIME_RANGES,
   type ChartResolution,
   type TimeRange,
 } from "../../../time-series/range";
+import { parseChartResolution } from "../../../time-series/resolution";
 import {
   coerceSeriesTransformForStyle,
   normalizeChartSpec,
 } from "../../../time-series/spec";
 import type { ChartSeriesSpec, ChartSpec, SeriesPeriod } from "../../../time-series/types";
+import { yearToDateBaseDay } from "../../../market-data/market/year-to-date";
 
 const PRICE_CAPABILITIES = new Set(["price-chart", "intraday-price-chart", "price-comparison"]);
 
@@ -20,15 +21,26 @@ function chartRange(options: HeadlessPaneOptionValues): TimeRange | null {
     : null;
 }
 
-function chartResolution(options: HeadlessPaneOptionValues): ChartResolution | null {
-  const value = options.chartResolution ?? options.resolution;
-  return typeof value === "string" && (CHART_RESOLUTIONS as readonly string[]).includes(value)
-    ? value as ChartResolution
-    : null;
+/**
+ * YTD as a window: from the prior year's last session to today, so a return
+ * comparison starts at the close year-to-date returns are measured from (31
+ * Dec 2025 for 2026), never at the year's first session. The earliest of the
+ * charted listings' last December sessions, a venue's own calendar where it
+ * is known.
+ */
+export function yearToDateWindow(spec: ChartSpec, now = Date.now()): { start: string; end: string } {
+  const today = new Date(now).toISOString().slice(0, 10);
+  const venues = [...new Set(spec.series.flatMap((entry) => entry.source.kind === "security" ? [entry.source.instrument.exchange || undefined] : []))];
+  const starts = (venues.length ? venues : [undefined]).flatMap((venue) => yearToDateBaseDay(today, venue, now) ?? []);
+  return { start: starts.sort()[0] ?? `${Number(today.slice(0, 4)) - 1}-12-31`, end: today };
 }
 
-function financialPeriod(value: unknown): SeriesPeriod | null {
-  return value === "annual" || value === "quarterly" || value === "ttm" ? value : null;
+function chartResolution(options: HeadlessPaneOptionValues): ChartResolution | null {
+  return parseChartResolution(options.chartResolution ?? options.resolution);
+}
+
+function financialPeriod(value: unknown, valuation: boolean): SeriesPeriod | null {
+  return value === "annual" || value === "quarterly" || value === "ttm" || (valuation && value === "daily") ? value : null;
 }
 
 function mapSecuritySeries(
@@ -45,6 +57,10 @@ export function applyChartComposerCapabilityOptions(
   options: HeadlessPaneOptionValues,
 ): ChartSpec {
   let next = spec;
+  if ((options.rangePreset ?? options.range) === "YTD") {
+    // A year of daily bars, shown from the prior year's last close.
+    next = { ...next, viewport: { ...next.viewport, range: "1Y", dateWindow: yearToDateWindow(next) } };
+  }
   const selectedRange = chartRange(options);
   const range = capabilityId === "intraday-price-chart" && typeof options.session === "string"
     ? "1D"
@@ -79,15 +95,15 @@ export function applyChartComposerCapabilityOptions(
   const graphKind = capabilityId === "fundamental-series"
     ? "fundamental"
     : capabilityId === "valuation-series" ? "valuation" : null;
-  if (graphKind && typeof options.metric === "string") {
-    const period = financialPeriod(options.period);
+  if (graphKind) {
+    const period = financialPeriod(options.period, graphKind === "valuation");
     next = {
       ...next,
       series: mapSecuritySeries(next.series, (entry) => ({
         ...entry,
         source: entry.source.kind === "security" ? {
           ...entry.source,
-          fieldId: `${graphKind}.${options.metric}`,
+          ...(typeof options.metric === "string" ? { fieldId: `${graphKind}.${options.metric}` } : {}),
           ...(period ? { period } : {}),
         } : entry.source,
       })),

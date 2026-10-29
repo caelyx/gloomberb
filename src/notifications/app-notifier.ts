@@ -6,7 +6,7 @@ import type {
 import { debugLog } from "../utils/debug-log";
 import { appendNotificationLog, markNotificationLogRead } from "./notification-log";
 
-const DEFAULT_NOTIFICATION_TITLE = "Gloomberb";
+const DEFAULT_NOTIFICATION_TITLE = "Gloom";
 const notificationLog = debugLog.createLogger("notifications");
 
 function getRuntimePlatform(): NodeJS.Platform {
@@ -245,8 +245,8 @@ export function createAppNotifier({
 }: CreateAppNotifierOptions): AppNotifier {
   return {
     notify(request) {
-      // A missed price, catalyst or team notice waits in the Unread list; using
-      // its toast action means it was seen.
+      // A missed price, catalyst, economic release or team notice waits in the
+      // Unread list; using its toast action means it was seen.
       const logged = appendNotificationLog(request);
       const notification: AppNotificationRequest = logged && request.action
         ? {

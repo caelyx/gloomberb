@@ -49,10 +49,29 @@ export function detachedSnapshotKey(snapshot: DesktopSharedStateSnapshot, paneId
     portfolios: snapshot.config.portfolios,
     watchlists: snapshot.config.watchlists,
     brokerInstances: snapshot.config.brokerInstances,
+    brokerSyncErrors: snapshot.brokerSyncErrors ?? {},
     pluginConfig: snapshot.config.pluginConfig,
     disabledPlugins: snapshot.config.disabledPlugins,
     chartPreferences: snapshot.config.chartPreferences,
     instances: paneStateIds.map((id) => findPaneInstance(snapshot.config.layout, id) ?? null),
     paneState: Object.fromEntries(paneStateIds.map((id) => [id, snapshot.paneState[id] ?? {}])),
   });
+}
+
+/**
+ * What a popped-out window takes of each state it is sent: nothing unless the
+ * part for its pane and the panes it follows changed, and then all of it,
+ * config included.
+ */
+export function createDetachedSnapshotFilter(
+  paneId: string,
+  initialSnapshot: DesktopSharedStateSnapshot | null,
+): (snapshot: DesktopSharedStateSnapshot) => DesktopSharedStateSnapshot | null {
+  let lastKey = initialSnapshot ? detachedSnapshotKey(initialSnapshot, paneId) : null;
+  return (snapshot) => {
+    const nextKey = detachedSnapshotKey(snapshot, paneId);
+    if (nextKey === lastKey) return null;
+    lastKey = nextKey;
+    return prepareDetachedSnapshot(snapshot, paneId);
+  };
 }

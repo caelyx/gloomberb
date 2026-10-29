@@ -1,4 +1,5 @@
 import type { FinancialStatement, TickerFinancials } from "../../../../types/financials";
+import { fiscalPeriodLabel, ttmPeriodLabel } from "../../../../utils/fiscal-period";
 import { formatPerShareNumber } from "../../../../utils/reported-money";
 import { hasNonIncomeStatementGap } from "../../../../utils/statement-gaps";
 import {
@@ -122,12 +123,18 @@ export function canCompareFinancialRow(
 ): boolean {
   if (!previous) return false;
   const key = row.kind === "group" ? row.summaryKey : row.key;
+  // A line filled from the exchange is not compared with the statements source's: the two define revenue differently.
+  if (key && filledLine(current, key) !== filledLine(previous, key)) return false;
   const sameShareBasis = current.shareBasis === previous.shareBasis;
   if (key && SHARE_COUNT_FIELDS.has(key)) return sameShareBasis;
   if (key && PER_SHARE_EARNINGS_FIELDS.has(key) && !sameShareBasis) return false;
   const currentCurrency = (current.currency ?? financialCurrency)?.trim();
   const previousCurrency = (previous.currency ?? financialCurrency)?.trim();
   return !!currentCurrency && currentCurrency === previousCurrency;
+}
+
+function filledLine(statement: FinancialStatement, key: keyof FinancialStatement): boolean {
+  return statement.filledFrom?.fields.some((field) => field === key) === true;
 }
 
 export function semanticGrowthValue(
@@ -190,47 +197,6 @@ export function formatFinancialHeader(date: string, currency?: string, dateSourc
   return `${label} ${dateSource === "sec" ? "(SEC date)" : "(provider date)"}`;
 }
 
-/**
- * The month a period end closes. A 52/53-week period that ends in a month's
- * first week (Jan 3, 2026) closes the month before, as its filer counts it.
- */
-function closingMonth(date: string): { year: number; month: number } | null {
-  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(date);
-  if (!match) return null;
-  let year = Number(match[1]);
-  let month = Number(match[2]);
-  if (Number(match[3]) <= 7) {
-    month -= 1;
-    if (month === 0) {
-      month = 12;
-      year -= 1;
-    }
-  }
-  return month >= 1 && month <= 12 ? { year, month } : null;
-}
-
-/** The month the issuer's fiscal year ends, from its latest annual statement. */
-export function fiscalYearEndMonth(annualStatements: readonly Pick<FinancialStatement, "date">[]): number | null {
-  const latest = annualStatements.reduce<string | null>((max, { date }) => (!max || date > max ? date : max), null);
-  return latest ? closingMonth(latest)?.month ?? null : null;
-}
-
-/**
- * A fiscal period as issuers and Bloomberg name it: `FY2026` for a year,
- * `Q4 FY26` for a quarter. A fiscal year is named by the calendar year it
- * ends in. Without a fiscal calendar, or for a period off it (a transition
- * period, an off-cycle observation), the period end date is shown instead.
- */
-export function fiscalPeriodLabel(date: string, kind: FinancialPeriod, yearEndMonth: number | null): string {
-  const closing = closingMonth(date);
-  if (!closing || yearEndMonth == null) return date.slice(0, 10);
-  const offset = (closing.month - yearEndMonth + 12) % 12;
-  if (kind === "annual") return offset === 0 ? `FY${closing.year}` : date.slice(0, 10);
-  if (offset % 3 !== 0) return date.slice(0, 10);
-  const fiscalYear = closing.month <= yearEndMonth ? closing.year : closing.year + 1;
-  return `Q${offset === 0 ? 4 : offset / 3} FY${String(fiscalYear).slice(-2)}`;
-}
-
 /** A table column's label: the fiscal period, and `TTM` with the quarter it runs to. */
 export function financialColumnLabel(
   statement: FinancialTableStatement,
@@ -239,7 +205,7 @@ export function financialColumnLabel(
 ): string {
   if (statement.date !== "TTM") return fiscalPeriodLabel(statement.date, kind, yearEndMonth);
   const periodEnd = statement.aggregation?.periodEnd;
-  return periodEnd ? `TTM ${fiscalPeriodLabel(periodEnd, "quarterly", yearEndMonth)}` : "TTM";
+  return ttmPeriodLabel(periodEnd, yearEndMonth);
 }
 
 /** The end of the latest period on screen, which the query bar shows as of. */
@@ -553,7 +519,7 @@ export function selectFinancialStatements(
     .filter((candidate) => !tabRows || tabRows.some((row) => hasFinancialRowValue(row, [candidate])))
     .slice(-limit)
     .reverse();
-  const trailing = period === "annual" && statement !== "balance" ? computeTTM(quarterlyStatements) : null;
+  const trailing = period === "annual" && statement !== "balance" ? computeTTM(quarterlyStatements, annualStatements) : null;
   // Right after a fiscal year closes, the last four quarters are that year:
   // the reported year is shown, not a second column of the same period.
   const ttm = trailing && !coversLatestYear(trailing, rawStatements[0]) ? trailing : null;
@@ -645,4 +611,33 @@ export function buildFinancialTableModel(
   });
 
   return { period, subTab, statements, rows, unit };
+}
+
+/**
+ * A statement table's columns for stalePeriodNote, each with whether the
+ * statement's lead line (its first: revenue, total assets, free cash flow)
+ * has a figure in it, so a newer column with only some figures (an EPS
+ * alone) is not read as the latest period.
+ */
+export function financialStatementPeriods(
+  statements: readonly FinancialTableStatement[],
+  subTab: Pick<FinancialSubTab, "rows">,
+): Array<{ date: string; lead: boolean }> {
+  const lead = subTab.rows[0];
+  return statements.map((statement) => ({ date: statement.date, lead: !!lead && hasFinancialRowValue(lead, [statement]) }));
+}
+
+/** The statement lines a table has a row for (filledPeriodsNote), group totals included. */
+export function financialSubTabFields(subTab: Pick<FinancialSubTab, "rows">): Set<string> {
+  const fields = new Set<string>();
+  const visit = (rows: readonly FinancialRowDef[]) => {
+    for (const row of rows) {
+      if (isFinancialGroup(row)) {
+        if (row.summaryKey) fields.add(row.summaryKey);
+        visit(row.children);
+      } else if (row.key) fields.add(row.key);
+    }
+  };
+  visit(subTab.rows);
+  return fields;
 }

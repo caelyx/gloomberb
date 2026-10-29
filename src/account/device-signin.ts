@@ -4,6 +4,7 @@
  * adopted through the same persistence and API-client path boot restoration
  * uses, so the rest of the app sees a normal signed-in session.
  */
+import { logFailure } from "../utils/log-failure";
 import {
   apiClient,
   type AuthUser,
@@ -53,7 +54,7 @@ const POLL_BACKOFF_FACTOR = 2;
 
 function defaultClientName(): string {
   const name = typeof process !== "undefined" ? process.env.HOSTNAME?.trim() : "";
-  return name && name !== "localhost" ? name : "Gloomberb";
+  return name && name !== "localhost" ? name : "Gloom";
 }
 
 function defaultClientPlatform(): string | undefined {
@@ -62,7 +63,7 @@ function defaultClientPlatform(): string | undefined {
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim()) return error.message.trim();
-  return "Could not reach Gloomberb Cloud.";
+  return "Could not reach Gloom Cloud.";
 }
 
 export function parseDeviceCodeExpiryMs(expiresAt: unknown, now: number): number {
@@ -83,7 +84,7 @@ const defaultIo: DeviceSignInIo = {
     chatController.adoptSession(sessionToken, user);
     // Validate and pick up realtime wiring; the session is already persisted,
     // so a transient failure here must not surface as a sign-in failure.
-    await chatController.refreshSession().catch(() => {});
+    await chatController.refreshSession().catch(logFailure("account-device-signin", "Session refresh after device authentication failed"));
   },
   now: () => Date.now(),
   delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),

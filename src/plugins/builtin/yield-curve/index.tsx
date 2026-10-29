@@ -27,16 +27,19 @@ import {
   type YieldTenorRow,
 } from "./chart";
 import {
-  compareDate, curveIdOf, CURVE_OPTIONS, curveSpreadFigures, loadComparePoints, loadCurveData, parseCompareInput,
-  parseCurveArgument, type CurveId,
+  compareDate, curveCutoff, curveIdOf, CURVE_OPTIONS, curveSpreadFigures, curveTenorMove, loadComparePoints, loadCurveData,
+  parseCompareInput, parseCurveArgument, type CurveId,
 } from "./curves";
+import { formatMoveRank, MOVE_HORIZONS } from "../shared/move-rank";
 import { forwardCurve, type CurveBasis } from "./forward";
 import { loadYieldCurveLookbacks, yieldCurveDate } from "./history";
 import { curveAsOf, isYieldObservationDate, type YieldPoint, yieldCurveErrors } from "./treasury-data";
 import { loadWorldRows, type WorldRow } from "./world";
+import { SwapsTab } from "./swaps";
+import { swapCurveCache } from "./client";
 
-type GcTab = "curve" | "world";
-const TABS = [{ label: "Curve", value: "curve" }, { label: "World", value: "world" }];
+type GcTab = "curve" | "world" | "swaps";
+const TABS = [{ label: "Curve", value: "curve" }, { label: "World", value: "world" }, { label: "Swaps", value: "swaps" }];
 const EMPTY_POINTS: YieldPoint[] = [];
 /** Axis word for the loaded curve's basis. */
 const BASIS_LABEL: Record<CurveBasis, string> = {
@@ -72,6 +75,12 @@ const formatBp = (value: number) => {
 /** "1D", "1D and 1W", "1D, 1W and 1M". */
 function andList(items: readonly string[]): string {
   return items.length > 1 ? `${items.slice(0, -1).join(", ")} and ${items.at(-1)}` : items[0] ?? "";
+}
+
+/** `as of 2026-10-16 15:30 ET`; the date is left to the Date field when it already shows it. */
+function curveAsOfLabel(asOf: string | null, requestedDate: string, cutoff: string | null): string | undefined {
+  const parts = [asOf && asOf !== requestedDate ? asOf : null, asOf ? cutoff : null].filter(Boolean);
+  return parts.length ? `as of ${parts.join(" ")}` : undefined;
 }
 
 /** The session a curve shows: its one date, else the latest tenor's. */
@@ -122,13 +131,15 @@ export function YieldCurvePane({ focused, width, height }: PaneProps) {
   return (
     <Box flexDirection="column" width={width} height={height}>
       {strip}
-      {(["curve", "world"] as const).map((id) => mounted.has(id) ? (
+      {(["curve", "world", "swaps"] as const).map((id) => mounted.has(id) ? (
         <Box key={id} visible={tab === id} flexDirection="column" width={width} height={bodyHeight} flexGrow={1} flexBasis={0}
           overflow="hidden">
           <PaneFooterScope active={tab === id}>
             {id === "curve"
               ? <CurveTab curve={curve} onCurveChange={setCurve} focused={focused && tab === "curve"} width={width} height={bodyHeight} />
-              : <WorldTab onOpen={openCurve} focused={focused && tab === "world"} width={width} height={bodyHeight} />}
+              : id === "world"
+                ? <WorldTab onOpen={openCurve} focused={focused && tab === "world"} width={width} height={bodyHeight} />
+                : <SwapsTab focused={focused && tab === "swaps"} width={width} height={bodyHeight} />}
           </PaneFooterScope>
         </Box>
       ) : null)}
@@ -258,15 +269,24 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
 
   const rows = useMemo(() => yieldTenorRows(points, lookbackCurves, { compare: comparePoints, forward }),
     [comparePoints, forward, lookbackCurves, points]);
-  // The spreads the desk quotes with their day move and where they sit in the
-  // last year; an inverted one is the warning the curve's shape gives.
-  const figures = useMemo<StatItem[]>(() => curveSpreadFigures(current, lookbackCurves).map(({ id, value, change1d, percentile1y }) => ({
-    id, label: id, value: value == null ? "--" : formatYieldChange(value),
-    detail: [`${change1d == null ? "--" : formatYieldChange(change1d)} 1D`,
-      ...(percentile1y == null ? [] : [formatPercentileRank(percentile1y, "1Y")])].join(" · "),
-    tone: value != null && Math.round(value * 100) < 0 ? "warning" : undefined,
-  })), [current, lookbackCurves]);
   const selectedId = rows.some((row) => row.id === selectedTenor) ? selectedTenor! : rows[0]?.id ?? null;
+  // The spreads the desk quotes with their day move and where they sit in the
+  // last year; an inverted one is the warning the curve's shape gives. Then the
+  // selected tenor's 1D and 1W moves, ranked by size against its whole history.
+  const figures = useMemo<StatItem[]>(() => [
+    ...curveSpreadFigures(current, lookbackCurves).map(({ id, value, change1d, percentile1y }): StatItem => ({
+      id, label: id, value: value == null ? "--" : formatYieldChange(value),
+      detail: [`${change1d == null ? "--" : formatYieldChange(change1d)} 1D`,
+        ...(percentile1y == null ? [] : [formatPercentileRank(percentile1y, "1Y")])].join(" · "),
+      tone: value != null && Math.round(value * 100) < 0 ? "warning" : undefined,
+    })),
+    ...(selectedId ? MOVE_HORIZONS : []).flatMap((horizon): StatItem[] => {
+      const move = curveTenorMove(current, selectedId!, horizon);
+      const rank = formatMoveRank(move);
+      return move?.change == null ? []
+        : [{ id: `move-${horizon}`, label: `${selectedId} ${horizon}`, value: formatYieldChange(move.change), ...(rank ? { detail: rank } : {}) }];
+    }),
+  ], [current, lookbackCurves, selectedId]);
   useChartTableSelection({ rows, getId: tenorKey, getDate: tenorPosition, selectedId, onSelect: setSelectedTenor,
     focused: focused && !editing });
   const compareName = curveLookbackLabel(compareLabel);
@@ -332,8 +352,9 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
         ...(forwardNodes.length && !comparing ? [{ id: "forward", kind: "toggle" as const, label: "1Y fwd", value: showForward,
           onChange: setShowForward }] : []),
       ]}
-      // The session actually shown; a requested date the field already shows is not repeated.
-      asOf={asOf && asOf !== requestedDate ? `as of ${asOf}` : undefined}
+      // The session actually shown; a requested date the field already shows is not repeated. A Treasury
+      // curve adds when in the day it was taken, so its 10Y is not read against ^TNX's earlier close.
+      asOf={curveAsOfLabel(asOf, requestedDate, curveCutoff(curve))}
     />
   );
   // The query bar stays above the status body so the curve or date can change
@@ -444,6 +465,8 @@ function WorldTab({ onOpen, focused, width, height }: {
 }
 
 export const yieldCurveModule: PluginModule = {
+  setup(ctx) { swapCurveCache.attach(ctx.persistence); },
+  dispose() { swapCurveCache.reset(); },
   series: [...TREASURY_SERIES, ...GOVERNMENT_BOND_SERIES],
   panes: [{
     id: "yield-curve",
@@ -458,10 +481,10 @@ export const yieldCurveModule: PluginModule = {
     id: "yield-curve-pane",
     paneId: "yield-curve",
     label: "Yield Curve",
-    description: "Government bond curves: US Treasury, TIPS real, breakevens, euro AAA, Bund, Gilt, JGB and Canada, with a world grid.",
+    description: "Government bond curves, a world grid, and USD SOFR swap rates, swap spreads and tenor history.",
     keywords: ["yield", "curve", "treasury", "bonds", "rates", "gc", "interest", "tips", "breakeven", "bund", "gilt", "jgb",
-      "sovereign", "world", "forward"],
-    shortcut: { prefix: "GC", argPlaceholder: "[curve] [YYYY-MM-DD]", argKind: "text", argOptional: true },
+      "sovereign", "world", "forward", "swaps", "sofr", "ois", "swap spread"],
+    shortcut: { prefix: "GC", argPlaceholder: "[curve] [date]", argKind: "text", argOptional: true },
     headless: yieldCurveHeadless,
     createInstance: (_context, options) => {
       const { curve, date } = parseCurveArgument(options?.arg);

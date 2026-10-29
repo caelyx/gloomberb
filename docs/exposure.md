@@ -7,7 +7,7 @@
 - `EXPO PORT:portfolio-id` selects local positions. Press **S** to enter the account NAV in the portfolio's configured currency. Positions use available quotes, or independent broker market values when quotes are missing, converted using available FX. An unavailable valuation blocks calculation rather than dropping or reweighting a holding. Derivatives need explicit underlying exposure weights; their notional is not inferred from the contract price.
 - `EXPO WATCH:watchlist-id` creates an equal-weight basket from that local watchlist. This is a hypothetical basket, not the account's actual weights.
 
-**S** opens the scenario and holdings form. The library covers Taiwan disruption, China/Europe demand, a China semiconductor export restriction, China tariffs, oil, rates, USD, TSMC supply and Microsoft capex. Choose a preset in the query bar; the form edits its kind, target, shock size, product restriction and depth. Rate shocks use basis points; other shocks use percent. Positive and negative shocks are supported. Enter submits; Escape cancels. Advanced JSON supports multiple shocks and explicit transmission assumptions.
+**S** opens the scenario and holdings form. The library covers Taiwan disruption, China/Europe demand, a China semiconductor export restriction, China tariffs, oil, rates, USD, TSMC supply and Microsoft capex. Choose a preset in the query bar; the form edits its kind, target, shock size, product restriction and depth. Rate shocks use basis points; other shocks use percent. Positive and negative shocks are supported. Enter submits; Escape cancels. Advanced JSON supports multiple shocks and explicit transmission assumptions. If a saved custom scenario or captured snapshot cannot be read, the pane keeps the original input and blocks analysis. Edit the custom scenario to repair its JSON, or use the error state’s reset action to clear the failed setting before analyzing again.
 
 **Table** shows each holding's estimated operating exposure range and scenario stress, with the denominator, reporting period and disclosed (`dsc`), estimated (`est`) or unknown status. Multiple reporting periods, denominator bases and shocks remain separate rows. An asterisk marks an incomplete bound. Select a row and press **E** or Enter for its source evidence and missing information. **Paths** traces matching relationships and preserves each hop's percentage denominator, quote, source tier, confidence, as-of and reporting period. **Portfolio** shows signed holding-weighted operating stress and gross concentration by country, supplier or customer. Its percentages are NAV-weighted operating percentage points, not a stock-return or portfolio-P&L forecast. Concentrations may overlap and must not be summed. The chart compares only the selected row's denominator and reporting period.
 
@@ -28,16 +28,18 @@ Country and counterparty scenarios apply a proportional change to supported oper
 ## Custom scenarios and headless output
 
 ```sh
-gloomberb fn EXPO 'AAPL=60% NVDA=50% TSM=-10%' --scenario taiwan-disruption --depth 2 --json
-gloomberb fn EXPO 'PORT:portfolio-id' --nav 250000 --cash 0.1 --scenario oil-up --json
-gloomberb fn EXPO 'WATCH:watchlist-id' --scenario china-demand --json
-gloomberb shot EXPO 'AAPL NVDA' --tab paths --width 1280 --height 540 --output exposure-paths.png
+gloom fn EXPO 'AAPL=60% NVDA=50% TSM=-10%' --scenario taiwan-disruption --depth 2 --json
+gloom fn EXPO 'PORT:portfolio-id' --nav 250000 --cash 0.1 --scenario oil-up --json
+gloom fn EXPO 'WATCH:watchlist-id' --scenario china-demand --json
+gloom shot EXPO 'AAPL NVDA' --tab paths --width 1280 --height 540 --output exposure-paths.png
 ```
+
+`--scenario` takes a library id: `taiwan-disruption` (the default), `china-demand`, `europe-demand`, `china-semiconductor-ban`, `china-tariff`, `oil-up`, `rates-up`, `usd-up`, `tsmc-outage` or `microsoft-capex`; `gloom catalog EXPO` lists them. A report run without `--scenario` says in its notes that it used the default and names the others. An id the library does not have fails with the ids it has (`Unknown scenario: rates. Did you mean rates-up?`).
 
 An explicit transmission assumption is user evidence, never a filing disclosure. For example, this assumes 20–40% of the interest-expense denominator is rate-sensitive, with a factor between 0.5 and 1 per percentage-point rate change:
 
 ```sh
-gloomberb fn EXPO AAPL --custom '{"label":"Rate stress","shocks":[{"id":"rates","kind":"rate","target":"interest rates","changeBps":100,"transmission":{"basis":"interest_expense","exposurePct":{"low":20,"high":40},"factor":{"low":0.5,"high":1},"direction":1}}]}' --json
+gloom fn EXPO AAPL --custom '{"label":"Rate stress","shocks":[{"id":"rates","kind":"rate","target":"interest rates","changeBps":100,"transmission":{"basis":"interest_expense","exposurePct":{"low":20,"high":40},"factor":{"low":0.5,"high":1},"direction":1}}]}' --json
 ```
 
 The text report prints each section as its pane tab shows it, within 100 columns or a narrower terminal: the title names the scenario, ranges and weights read as percents, and a driver's value carries its unit (201.18B USD), its fiscal period as KPIS prints it (FY2024, with the date it ended when the table has room) and its scope in words. Names and scopes take the room the figures leave and are cut after a whole word only when they cannot fit. A stress line's unknown holding weight and a driver's conditions print under the row. JSON returns all holding measures, per-hop evidence and quotes, portfolio measures, concentration evidence, coverage and unknowns, and CSV keeps the same records. `complete: false` means the requested analysis is a preview or has unresolved coverage, even when useful rows are present. The same request contract is available through `POST /cloud/exposure/analyze`; the scenario library is `GET /cloud/exposure/scenarios` and dataset status is `GET /cloud/exposure/status`. Ask Gloom and the Cloud MCP exposure tools use these same sourced results.

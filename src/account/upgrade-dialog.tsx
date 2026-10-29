@@ -4,6 +4,7 @@
  * says what Pro adds, what today costs and when the first charge lands, and
  * only then opens checkout.
  */
+import { logFailure } from "../utils/log-failure";
 import { useCallback, useEffect, useState } from "react";
 import { apiClient, type CloudAccountPlan, type CloudPricing } from "../api-client";
 import { Button } from "../components/ui/button";
@@ -73,7 +74,7 @@ export function upgradeDialogCopy(
     const firstCharge = formatTrialEnd(new Date(now.getTime() + days * MS_PER_DAY));
     return {
       title: tf("Try Pro free for {days} days", { days }),
-      subtitle: tf("$0 today, then {price} from {date}. Cancel before and you pay nothing.", {
+      subtitle: tf("$0 today, then {price} from {date}. Card required. Cancel before and you pay nothing.", {
         price,
         date: firstCharge ?? "",
       }),
@@ -179,7 +180,10 @@ function UpgradeDialog({
   useEffect(() => {
     let live = true;
     void loadOffer()
-      .catch((): UpgradeOffer => ({ pricing: null, trialAvailable: null, paymentFailed: false }))
+      .catch((error): UpgradeOffer => {
+        logFailure("account-upgrade", "Upgrade offer request failed")(error);
+        return { pricing: null, trialAvailable: null, paymentFailed: false };
+      })
       .then((loaded) => {
         if (live) setOffer(loaded);
       });
@@ -277,6 +281,6 @@ export async function promptCloudUpgrade(
         />
       ),
     })
-    .catch(() => null);
+    .catch(logFailure("account-upgrade", "Upgrade prompt failed", null));
   return interval ?? null;
 }

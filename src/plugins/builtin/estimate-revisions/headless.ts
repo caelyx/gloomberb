@@ -1,5 +1,6 @@
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
 import { explainRefusal } from "../shared/cloud-denied";
+import { DATE_OPTION_EXAMPLES } from "../../../utils/calendar-date";
 import { fetchEstimates } from "./client";
 import { estimateRevisionsLockNote } from "./lock-note";
 import { estimateCurrent, periodLabel, pinnedEstimatePeriods } from "./model";
@@ -15,7 +16,7 @@ export const estimateRevisionsHeadless: HeadlessPaneDefinition<"bundle"> = {
     {
       key: "period",
       type: "string",
-      description: "Optional fiscal end date, YYYY-MM-DD.",
+      description: `Optional fiscal end date, as ${DATE_OPTION_EXAMPLES}.`,
       settingKey: "period",
     },
     {
@@ -44,16 +45,19 @@ export const estimateRevisionsHeadless: HeadlessPaneDefinition<"bundle"> = {
       symbol,
       instrument?.exchange ?? "",
       ctx.apiClient,
-    ).catch((error: unknown) => {
-      throw explainRefusal(error, estimateRevisionsLockNote, {
+      ctx.marketData,
+    ).catch(async (error: unknown) => {
+      throw await explainRefusal(error, estimateRevisionsLockNote, {
         symbol: args.symbols[0] ?? null,
         token: ctx.settings?.tab === "guidance" ? "GUID" : "EM",
+        context: ctx,
       });
     });
     const periods = pinnedEstimatePeriods(
       data.periods,
       args.options.period,
       args.options.frequency,
+      "--period",
     );
     return {
       sections: [

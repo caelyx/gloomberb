@@ -18,6 +18,12 @@ export interface BrokerInstanceConfig {
   config: Record<string, unknown>;
   enabled?: boolean;
   lastSyncedAt?: number;
+  /**
+   * The user keeps this connection's data on this device: Cloud sync leaves out the profile, its
+   * accounts' portfolios and account values, and the positions in them. Daily roundups, the weekly
+   * brief, position alerts, the mobile app and Ask Gloom's portfolio context then go without it.
+   */
+  localOnly?: boolean;
 }
 
 export interface ColumnConfig {
@@ -288,6 +294,13 @@ export interface RecentCommand {
   arg?: string;
 }
 
+/** What a launch's plugin seed could not install. */
+export interface PluginSeedFailure {
+  /** Extracted plugin ids, sorted. */
+  plugins: string[];
+  gitMissing: boolean;
+}
+
 export interface AppConfig {
   dataDir: string;
   configVersion: number;
@@ -308,6 +321,13 @@ export interface AppConfig {
    */
   seededPlugins?: string[];
   /**
+   * The extracted plugins the last launch's seed could not install, and
+   * whether git was missing then. Absent until a seed fails, and again once
+   * one installs everything. `doctor` fails on it, and the launch notice that
+   * Gloom tries again is said once per failure.
+   */
+  pluginSeedFailure?: PluginSeedFailure;
+  /**
    * Manual portfolios have taken the one currency their positions share. Runs
    * once per install, so later holdings never move a portfolio's currency.
    */
@@ -321,6 +341,12 @@ export interface AppConfig {
   recentTickers: string[];
   /** Pane templates recently run from the command bar, newest first. */
   recentCommands: RecentCommand[];
+  /**
+   * How many times the empty command bar has opened, counted to one past its
+   * introduction (see `command-bar-intro.ts`). A new config starts at 0; one
+   * from an earlier build has none and reads as past it. Kept on this machine only.
+   */
+  commandBarOpens?: number;
   language?: LanguagePreference;
   onboardingComplete?: boolean;
   /** App version at the last launch, used to show release notes after an update. */
@@ -1087,6 +1113,7 @@ export function createDefaultConfig(dataDir: string): AppConfig {
     fontSize: 12,
     recentTickers: [],
     recentCommands: [],
+    commandBarOpens: 0,
   };
 }
 
