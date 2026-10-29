@@ -151,12 +151,13 @@ describe("applyWindowIntent", () => {
     const state = mainState();
     const outcome = applyWindowIntent(state, "w2", {
       type: "setConfig",
-      fields: { theme: "solarized", baseCurrency: "AUD", dataDir: "/elsewhere", activeLayoutIndex: 3, onboardingComplete: false },
+      fields: { theme: "solarized", baseCurrency: "AUD", commandBarOpens: 2, dataDir: "/elsewhere", activeLayoutIndex: 3, onboardingComplete: false },
     });
     expect(outcome.applied).toBe(true);
     const next = outcome.actions.reduce(appReducer, state);
     expect(next.config.theme).toBe("solarized");
     expect(next.config.baseCurrency).toBe("AUD");
+    expect(next.config.commandBarOpens).toBe(2);
     expect(next.config.dataDir).toBe(state.config.dataDir);
     expect(next.config.activeLayoutIndex).toBe(state.config.activeLayoutIndex);
     expect(next.config.onboardingComplete).toBe(state.config.onboardingComplete);

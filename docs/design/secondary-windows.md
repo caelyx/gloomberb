@@ -177,7 +177,7 @@ Status: agreed design (decisions in §8), not yet built. Written from a reading 
 - `src/remote/controller-utils.ts:72-99`: `panePlacement` reports `window:<id>`; mutation summaries list window panes.
 - Add an optional `window` argument to `pane.show`, `pane.createFromTemplate`, `ticker.pin` and `layout.placePane`.
 - `layout.setGrid`, `layout.focusRegion` and `layout.closeFloating` stay main-only. Document that.
-- `gloomberb layout` (`src/cli/commands/system.ts:604`) prints a count of panes per window.
+- `gloom layout` (`src/cli/commands/system.ts:651`) prints how many secondary windows each layout has.
 
 ### 4.8 Sharing, marketplace and terminal
 

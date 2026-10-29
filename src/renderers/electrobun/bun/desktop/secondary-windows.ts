@@ -12,6 +12,7 @@ import { readDisplayWorkAreas } from "../window/displays";
 import { fitWindowFrameToDisplays, type DisplayWorkArea, type RememberedWindowStore } from "../window/remembered-frame";
 import { createRememberedWindowTracker, restoreWindowState } from "../window/remembered-tracker";
 import { secondaryWindowLabel } from "../../../../layout/pane-manager/secondary-windows";
+import { DESKTOP_APP_NAME } from "../../shared/app-name";
 import type { DesktopBackend } from "./backend";
 
 /**
@@ -28,7 +29,7 @@ function defaultSecondaryWindowFrame(displays: readonly DisplayWorkArea[], mainF
 
 /** "w2" reads as "Window 2" in the Window menu and the window switcher, as in the app's own menus. */
 function secondaryWindowTitle(windowId: string): string {
-  return `Gloomberb – ${secondaryWindowLabel(windowId)}`;
+  return `${DESKTOP_APP_NAME} – ${secondaryWindowLabel(windowId)}`;
 }
 
 /**

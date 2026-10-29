@@ -52,6 +52,8 @@ const WINDOW_SETTABLE_CONFIG_FIELDS: ReadonlySet<string> = new Set<keyof AppConf
   "valueFlashingEnabled",
   "fontSize",
   "recentCommands",
+  // Opening the empty bar in any window counts toward its introduction.
+  "commandBarOpens",
   "language",
   "keybindings",
   "telemetry",
