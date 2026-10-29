@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { AppTickerRepositoryPort } from "../core/app-service-ports";
-import type { HeadlessPaneDefinition, HeadlessPaneFreshness, HeadlessPaneOptionDef } from "./headless";
+import type { HeadlessPaneArgumentDef, HeadlessPaneContext, HeadlessPaneDefinition, HeadlessPaneFreshness, HeadlessPaneOptionDef } from "./headless";
 
 export type {
   HeadlessArgumentExpansion,
@@ -28,6 +28,7 @@ export type {
   HeadlessSeries,
   HeadlessSeriesPoint,
   HeadlessSeriesResult,
+  HeadlessShotState,
   HeadlessSnapshotResult,
 } from "./headless";
 import type { ConnectionHealthRegistry } from "../core/connection-health";
@@ -100,11 +101,16 @@ export interface PanePortableShareDef {
     state?: PaneSharePrivateFields;
   };
   /**
-   * Rewrites the instance before it leaves the device. The receiver has none
-   * of the sender's local ticker records, so anything resolved through them
-   * (a listing's venue, for example) must be pinned into the instance here.
+   * Rewrites the instance before it leaves the device, on every publish. The
+   * receiver has none of the sender's local ticker records, so anything
+   * resolved through them (a listing's venue, for example) must be pinned into
+   * the instance here; a layout published to the gallery passes none.
    */
-  prepare?(pane: PaneInstanceConfig, context: { tickers: ReadonlyMap<string, TickerRecord> }): PaneInstanceConfig;
+  prepare?(pane: PaneInstanceConfig, context: {
+    tickers: ReadonlyMap<string, TickerRecord>;
+    /** The moment the pane's layout tab has its crosshair pinned at, so a link opens there. */
+    pinnedTime?: number;
+  }): PaneInstanceConfig;
 }
 
 /** What covers a pane when a report of it is refused: see `PaneDef.reportLockNote`. */
@@ -117,6 +123,12 @@ export interface PaneLock {
   token?: string;
   /** The session is signed in and its email is not verified yet. */
   verifyEmail?: boolean;
+  /**
+   * Reads data as the report does, so a note can check that a free route it
+   * would name has data for the symbol before naming it. Absent where nothing
+   * can be read.
+   */
+  context?: HeadlessPaneContext;
 }
 
 export interface PaneDef {
@@ -138,6 +150,13 @@ export interface PaneDef {
    * win over the binding.
    */
   tickerFollower?: boolean | ((pane: PaneInstanceConfig) => boolean);
+  /**
+   * Instrument kinds this pane has data for, such as `["equity"]` for company
+   * data, as a research tab declares them. Bound to a ticker of another known
+   * kind (an index, an ETF), the pane says so in place of its data, and `fn`
+   * and `shot` answer before loading. Omit when every ticker has it.
+   */
+  instruments?: readonly TickerInstrumentKind[];
   /**
    * For a pane type that two or more functions open (ERN and EVTS): the settings that say
    * what a window shows, as against how (a range, a toggle, a column choice). Opening a
@@ -167,9 +186,23 @@ export interface PaneDef {
   /**
    * Options a rendered-view report takes (`fn OMON AAPL --strikes 10`):
    * each sets the pane setting of its key, is checked by its `normalize`, and
-   * is listed with its example by `gloomberb catalog`.
+   * is listed with its example by `gloom catalog`.
    */
   reportOptions?: readonly PaneReportOptionDef[];
+  /**
+   * A rendered-view report that takes its `reportOptions` and nothing else:
+   * any other option is refused with the ones it takes (`fn FUT --bogus 1`),
+   * as a `headless` report refuses one, instead of being set as a pane
+   * setting of that name.
+   */
+  reportOptionsOnly?: boolean;
+  /**
+   * What a rendered-view report takes after the function, for a pane whose
+   * template reads it with no shortcut to say so (X Feed's query): the
+   * catalog lists it, and `fn` refuses an argument from a function that
+   * declares none here, in its shortcut or in a `headless` model.
+   */
+  reportArgument?: Pick<HeadlessPaneArgumentDef, "kind" | "placeholder" | "description" | "optional">;
   /**
    * Lines a rendered-view report prints above its table, from the settings it
    * ran with: what the default view leaves out and how to see more. `--json`
@@ -182,21 +215,23 @@ export interface PaneDef {
    * read without it and where, and how to unlock it. A `headless` pane's report
    * prints it when the server refuses the read (401, 402 or 403). Without it
    * the report prints the wall's own words, or the refusal. Either way it cites
-   * no source, since nothing was read.
+   * no source, since nothing was read. A free route it names must have data
+   * for the symbol (`lock.context` reads it), so the note may resolve later.
    */
-  reportLockNote?(lock: PaneLock): string;
+  reportLockNote?(lock: PaneLock): string | Promise<string>;
   /**
    * What a rendered-view report needs before it shows anything, such as a
-   * sign-in: `gloomberb catalog` lists it under Requires, as it does a
+   * sign-in: `gloom catalog` lists it under Requires, as it does a
    * `headless` model's `discovery.dataRequirements`.
    */
   reportRequirements?: readonly string[];
   /**
    * A `shot` without `--height` grows to the pane's natural height, up to the
    * height limit, so a fixed board (FUT) shows every row instead of cutting
-   * the last ones. Leave it off for long or paged lists.
+   * the last ones. Leave it off for long or paged lists; a pane with tabs
+   * answers for the instance shown, so only its fixed board's tab grows.
    */
-  shotFitsRows?: true;
+  shotFitsRows?: true | ((pane: PaneInstanceConfig) => boolean);
   /**
    * A report of the pane grows to the whole text of the page its reader has
    * open (a docs page), so it is not cut at the first screen. A list the reader
@@ -239,9 +274,11 @@ export type PanePersonalData = "holdings" | "account" | "messages" | "personal";
 /**
  * An option of a rendered-view report, which sets the pane setting of its key,
  * or of `settingKey` when the flag reads better than the setting's name
- * (`--columns` for `optionColumnIds`).
+ * (`--columns` for `optionColumnIds`); with `pluginState`, the pane state the
+ * view reads it from (a workspace's tab), and the setting too when it also
+ * names a `settingKey`.
  */
-export interface PaneReportOptionDef extends Omit<HeadlessPaneOptionDef, "pluginState"> {
+export interface PaneReportOptionDef extends HeadlessPaneOptionDef {
   /** The value's name in the catalog's flag, `--currencies <codes>`; the type when absent. */
   placeholder?: string;
   /** The option in use as typed after the function, such as `--currencies USD,ZAR,NGN`; the catalog shows it as an example. */
@@ -328,11 +365,29 @@ interface PaneSettingOrderedMultiSelectField extends PaneSettingFieldBase {
   searchable?: boolean;
 }
 
+/** What an action row says of its own action (docs/pane-conventions.md, "Row messages"). */
+export interface PaneSettingRowNote {
+  /** A short state, where the row's action label is: `Connecting…`, `Sign-in failed`. */
+  status: string;
+  /** The full reason or the next step, in place of the row's description. */
+  text?: string;
+  tone: "warning" | "negative";
+}
+
 export interface PaneSettingActionContext extends PaneSettingsContext {
   surface: "pane-dialog" | "command-bar";
   close(): void;
   openCommandBar(query?: string): void;
   notify(notification: AppNotificationRequest): void;
+  /**
+   * Says on the row the action runs from what it is doing or what stopped it,
+   * or clears that with null. A success the row's own description and label
+   * show once they change needs no note. False once the row is off screen
+   * (the dialog closed, or the action removed its own field): say it with
+   * `notify` then, as a row that has left a list is a toast. Older hosts do
+   * not pass it.
+   */
+  setRowNote?(note: PaneSettingRowNote | null): boolean;
 }
 
 export type PaneSettingActionHandler = (
@@ -383,12 +438,22 @@ export interface ShortcutArgOption {
   label: string;
 }
 
+/** Why a typed argument opens nothing: the row's text, and the line under it saying what to type instead. */
+export interface ShortcutArgError {
+  message: string;
+  detail?: string;
+}
+
 interface PaneTemplateShortcut {
   prefix: string;
   /** Other mnemonics for the same view (FFIP for WIRP). They open it when typed but are not listed as separate rows. */
   aliases?: readonly string[];
   /** Keep this shortcut executable when typed, but omit its pane from command-bar browse rows. Defaults to true. */
   showInBrowse?: boolean;
+  /**
+   * What the shortcut takes after the prefix. Left out, it takes the argument
+   * the template's `headless` definition declares, as `gloom catalog` lists it.
+   */
   argPlaceholder?: string;
   argKind?: "text" | "ticker" | "ticker-list";
   /**
@@ -409,6 +474,12 @@ interface PaneTemplateShortcut {
    * from it instead of guessing the text; the command may accept others too.
    */
   argOptions?: () => readonly ShortcutArgOption[];
+  /**
+   * Why a typed argument opens nothing, or null when it opens the view:
+   * `PF Nope` names no portfolio or watchlist. The command bar shows it in
+   * place of the function's row, and the pane does not open for it.
+   */
+  argError?: (arg: string, context: PaneTemplateContext) => ShortcutArgError | null;
 }
 
 export interface PaneTemplateCreateOptions {
@@ -460,6 +531,14 @@ export interface PaneTemplateDef {
   shortcut?: PaneTemplateShortcut;
   /** Template-specific headless model. Takes precedence over the pane-level model. */
   headless?: HeadlessPaneDefinition;
+  /**
+   * Source and status of the view this template opens, for a template that
+   * opens one view of a pane hosting several (Fixed Income's Issuer Debt).
+   * Captures and rendered-view reports merge it over the pane's own
+   * `reportFreshness`: each field set here wins, the rest are the pane's. So
+   * they date the filings on screen, not the issuer's stock quote.
+   */
+  reportFreshness?: Pick<HeadlessPaneFreshness, "source" | "status" | "basis">;
   wizard?: WizardStep[];
   canCreate?: (context: PaneTemplateContext, options?: PaneTemplateCreateOptions) => boolean;
   createInstance?: (
@@ -478,7 +557,8 @@ export interface WizardStep {
   required?: boolean;
   type?: "text" | "password" | "info" | "select" | "number" | "textarea";
   options?: Array<{ label: string; value: string }>;
-  dependsOn?: { key: string; value: string };
+  /** Shown only while the earlier answer holds the value; with several, while every one does. */
+  dependsOn?: { key: string; value: string } | ReadonlyArray<{ key: string; value: string }>;
   /** Later wizard values to clear when this selection changes from its default. */
   clearOnChange?: string[];
   body?: string[];
@@ -555,6 +635,12 @@ export interface CommandBarSearchProvider {
   /** Default 300. Ignored by `match`. */
   debounceMs?: number;
   /**
+   * How long `provide` may take once it starts, in ms. Default 8000. Past it
+   * the bar aborts `signal`, drops a late answer and stops showing Searching.
+   * Ignored by `match`.
+   */
+  timeoutMs?: number;
+  /**
    * Codes (`CHAT`) after which the provider is still asked, typed alone or
    * with text after them, with the whole query. Every other provider stays
    * quiet once a code claims the text.
@@ -595,14 +681,14 @@ interface CliCommandHelpOption {
 }
 
 interface CliCommandHelp {
-  /** Heading `gloomberb help` lists the command under. Plugin commands without one share a plugin heading. */
+  /** Heading `gloom help` lists the command under. Plugin commands without one share a plugin heading. */
   group?: string;
   /** Invocations without the leading `gloomberb`, e.g. `quote <symbol...>`. */
   usage?: string[];
   options?: CliCommandHelpOption[];
   /** Complete invocations without the leading `gloomberb`. */
   examples?: string[];
-  /** Extra blocks shown only in the command's own help (`gloomberb help <command>`). */
+  /** Extra blocks shown only in the command's own help (`gloom help <command>`). */
   sections?: CliCommandHelpSection[];
 }
 
@@ -858,8 +944,8 @@ export interface AppNotificationRequest {
   };
   /**
    * What a built-in notice is about, so the Unread list can keep it after the
-   * toast is gone and open it again: `price:<alertId>`, `catalyst:<eventId>`
-   * or `team:<cardId>`. Other values are not kept.
+   * toast is gone and open it again: `price:<alertId>`, `catalyst:<eventId>`,
+   * `econ:<eventId>`, `team:<cardId>` or `scan:<paneId>`. Other values are not kept.
    */
   refId?: string;
   /** Rendered next to `action`. Use for a dismissing counterpart such as snooze. */
@@ -873,6 +959,13 @@ export interface BrokerInstanceUpdateOptions {
   label?: string;
   enabled?: boolean;
   replaceConfig?: boolean;
+  /** Keep this connection's data on this device, out of Gloom Cloud sync (`BrokerInstanceConfig.localOnly`). */
+  localOnly?: boolean;
+}
+
+export interface BrokerInstanceCreateOptions {
+  /** Keep the new connection's data on this device from the start, before its first import. */
+  localOnly?: boolean;
 }
 
 export interface PinTickerOptions {
@@ -884,6 +977,8 @@ export interface PinTickerOptions {
   listing?: TickerListingRef;
   /** Select this research tab once the requested ticker has resolved. */
   tabId?: string;
+  /** Merge this state into the resolved research pane when selecting `tabId`. */
+  tabState?: Record<string, unknown>;
 }
 
 export interface GloomPluginContext {
@@ -915,6 +1010,8 @@ export interface GloomPluginContext {
   getData(ticker: string): TickerFinancials | null;
   getTicker(ticker: string): TickerRecord | null;
   getConfig(): import("./config").AppConfig;
+  /** Resolve a broker registered by another plugin, without connecting it. */
+  getBrokerAdapter?(brokerType: string): BrokerAdapter | null;
   getPaneDef(paneId: string): PaneDef | undefined;
 
   readonly marketData: DataProvider;
@@ -927,7 +1024,7 @@ export interface GloomPluginContext {
   readonly paneSettings: PluginPaneSettingsState;
   readonly teamState: PluginTeamState;
 
-  createBrokerInstance(brokerType: string, label: string, values: Record<string, unknown>): Promise<BrokerInstanceConfig>;
+  createBrokerInstance(brokerType: string, label: string, values: Record<string, unknown>, options?: BrokerInstanceCreateOptions): Promise<BrokerInstanceConfig>;
   updateBrokerInstance(instanceId: string, values: Record<string, unknown>, options?: BrokerInstanceUpdateOptions): Promise<void>;
   syncBrokerInstance(instanceId: string): Promise<void>;
   removeBrokerInstance(instanceId: string): Promise<void>;

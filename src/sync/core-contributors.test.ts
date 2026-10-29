@@ -5,7 +5,8 @@ import { createTestDataProvider } from "../test-support/data-provider";
 import { createDefaultConfig, createPaneInstance } from "../types/config";
 import { removePane, removeUnavailablePaneTypes, restoreHiddenPanes } from "../layout/pane-manager";
 import type { PricePoint } from "../types/financials";
-import type { TickerRecord } from "../types/ticker";
+import type { TickerPosition, TickerRecord } from "../types/ticker";
+import { mergeSuffixedListings } from "../portfolio/suffixed-listings";
 import {
   __syncContributorInternalsForTests,
   coreCollectionsSyncContributor,
@@ -17,7 +18,7 @@ import { createTestTicker } from "../test-support/ticker";
 import { createTestFinancials } from "../test-support/data-provider";
 
 describe("core sync contributors", () => {
-  captureConfigSaves();
+  const configSaves = captureConfigSaves();
 
   function priceHistoryFromReturns(returns: number[]): PricePoint[] {
     let close = 100;
@@ -792,6 +793,130 @@ describe("core sync contributors", () => {
     });
   });
 
+  // Aries runs with Cloud on. Its accounts sync like any broker's, so roundups, alerts, mobile and
+  // Ask Gloom see them, but the quotes and bars it supplies never leave the device (its terms). A
+  // user can still keep one connection's data on the device.
+  function ariesState(keepOnDevice?: boolean) {
+    const config = createDefaultConfig("/tmp/gloomberb-sync-local-only-test");
+    const aries = { id: "aries-sim", brokerType: "aries", label: "Aries", config: { clientSecret: "secret" }, enabled: true, lastSyncedAt: 1, ...(keepOnDevice ? { localOnly: true } : {}) };
+    config.brokerInstances = [aries, { id: "ibkr-main", brokerType: "ibkr", label: "IBKR", connectionMode: "gateway", config: {}, enabled: true, lastSyncedAt: 1 }];
+    const ariesAccount = { id: "broker:aries-sim:SIM1", name: "SIM1", currency: "USD", brokerId: "aries", brokerInstanceId: "aries-sim", brokerAccountId: "SIM1" };
+    const ibkrAccount = { id: "broker:ibkr-main:U1", name: "U1", currency: "USD", brokerId: "ibkr", brokerInstanceId: "ibkr-main", brokerAccountId: "U1" };
+    config.portfolios = [config.portfolios[0]!, ariesAccount, ibkrAccount];
+    config.watchlists = [{ id: "tech", name: "Tech" }];
+    const ariesHeld = (shares: number) => ({ portfolio: ariesAccount.id, shares, broker: "aries", brokerInstanceId: "aries-sim", brokerAccountId: "SIM1" });
+    const state = createInitialState(config);
+    state.tickers = new Map([
+      ["NVDA", createTestTicker("NVDA", "NVIDIA", { portfolios: [ariesAccount.id], watchlists: ["tech"], positions: [ariesHeld(2)] })],
+      ["SPY", createTestTicker("SPY", "SPDR S&P 500", { portfolios: [ariesAccount.id], positions: [ariesHeld(21)] })],
+      ["AAPL", createTestTicker("AAPL", "Apple", {
+        portfolios: [ariesAccount.id, ibkrAccount.id],
+        positions: [ariesHeld(5), { portfolio: ibkrAccount.id, shares: 7, broker: "ibkr", brokerInstanceId: "ibkr-main" }],
+      })],
+    ]);
+    const bars = [{ date: new Date("2026-10-13T20:00:00Z"), close: 700 }, { date: new Date("2026-10-19T20:00:00Z"), close: 760 }];
+    const quoted = (symbol: string, price: number, providerId: string, priceHistorySourceKey?: string) => createTestFinancials({
+      quote: { symbol, price, currency: "USD", change: 1, changePercent: 1, lastUpdated: Date.parse("2026-10-20T15:00:00Z"), providerId },
+      priceHistory: bars, ...(priceHistorySourceKey ? { priceHistorySourceKey } : {}),
+    });
+    state.financials = new Map([
+      ["NVDA", quoted("NVDA", 217.74, "aries")],
+      // Cloud's quote over Aries's bars: the price goes up, the week's move from those bars does not.
+      ["SPY", quoted("SPY", 771.45, "gloomberb-cloud", "broker:aries:aries-sim")],
+      ["AAPL", quoted("AAPL", 342.97, "gloomberb-cloud", "provider:gloomberb-cloud")],
+    ]);
+    state.brokerAccounts = {
+      "aries-sim": [{ accountId: "SIM1", name: "SIM1", currency: "USD", netLiquidation: 100_000 }],
+      "ibkr-main": [{ accountId: "U1", name: "U1", currency: "USD", netLiquidation: 2_000 }],
+    } as typeof state.brokerAccounts;
+    return { config, state, ariesAccount };
+  }
+  const isLocalMarketData = (providerId: string) => providerId === "aries";
+  const tickersOf = (collections: any) => new Map<string, any>(collections.tickers.map((ticker: { ticker: string }) => [ticker.ticker, ticker]));
+
+  test("a broker's accounts sync like any other's, while the quotes and bars of one that keeps its market data local never do", async () => {
+    const { state } = ariesState();
+    const config = await coreConfigSyncContributor.collect({ state }) as any;
+    const collections = await coreCollectionsSyncContributor.collect({ state, isLocalMarketData }) as any;
+
+    expect(config.brokerInstances.map((instance: { id: string }) => instance.id)).toEqual(["aries-sim", "ibkr-main"]);
+    expect(JSON.stringify(config)).not.toContain("secret");
+    expect(collections.portfolios.map((portfolio: { id: string }) => portfolio.id)).toEqual(["main", "broker:aries-sim:SIM1", "broker:ibkr-main:U1"]);
+    expect(Object.keys(collections.accountsByPortfolio)).toEqual(["broker:aries-sim:SIM1", "broker:ibkr-main:U1"]);
+    const tickers = tickersOf(collections);
+    expect(tickers.get("SPY")).toMatchObject({ positions: [{ shares: 21, broker: "aries" }] });
+    expect(tickers.get("NVDA").quote).toBeUndefined();
+    expect(JSON.stringify(collections)).not.toContain("217.74");
+    expect(tickers.get("SPY").quote).toMatchObject({ price: 771.45 });
+    expect(tickers.get("SPY").quote.weekReferencePrice).toBeUndefined();
+    expect(tickers.get("AAPL").quote).toMatchObject({ price: 342.97, weekReferencePrice: 700 });
+  });
+
+  test("a connection the user keeps on this device stays off the push: its profile, accounts and positions", async () => {
+    const { state } = ariesState(true);
+    const config = await coreConfigSyncContributor.collect({ state }) as any;
+    const collections = await coreCollectionsSyncContributor.collect({ state, isLocalMarketData }) as any;
+
+    expect(config.brokerInstances.map((instance: { id: string }) => instance.id)).toEqual(["ibkr-main"]);
+    expect(config.portfolios.map((portfolio: { id: string }) => portfolio.id)).toEqual(["main", "broker:ibkr-main:U1"]);
+    expect(JSON.stringify([config, collections])).not.toMatch(/aries|SIM1|217\.74/);
+    expect(collections.portfolios.map((portfolio: { id: string }) => portfolio.id)).toEqual(["main", "broker:ibkr-main:U1"]);
+    expect(Object.keys(collections.accountsByPortfolio)).toEqual(["broker:ibkr-main:U1"]);
+    // SPY was only ever held there; NVDA stays for its watchlist.
+    const tickers = tickersOf(collections);
+    expect([...tickers.keys()].sort()).toEqual(["AAPL", "NVDA"]);
+    expect(tickers.get("NVDA")).toMatchObject({ portfolios: [], positions: [], watchlists: ["tech"] });
+    expect(tickers.get("AAPL")).toMatchObject({ portfolios: ["broker:ibkr-main:U1"], positions: [{ shares: 7, broker: "ibkr" }], quote: { price: 342.97 } });
+  });
+
+  test("a pull from another device keeps a connection kept on this device, and its portfolio and positions, in place", async () => {
+    const { config, state, ariesAccount } = ariesState(true);
+    // As the wire and the baseline store hand them back.
+    const pushedConfig = JSON.parse(JSON.stringify(await coreConfigSyncContributor.collect({ state })));
+    const pushedCollections = await coreCollectionsSyncContributor.collect({ state, isLocalMarketData }) as any;
+    let current = state;
+    const saved: TickerRecord[] = [];
+    const context = (baselinePayload: unknown) => ({
+      snapshot: { contributors: {} },
+      baselinePayload,
+      baselineState: state,
+      state,
+      getState: () => current,
+      isCurrent: () => true,
+      dispatch: (action: { type: string; config?: typeof config; tickers?: typeof state.tickers }) => {
+        if (action.type === "SET_CONFIG") current = { ...current, config: action.config! };
+        if (action.type === "SET_TICKERS") current = { ...current, tickers: action.tickers! };
+      },
+      tickerRepository: { saveTicker: async (record: TickerRecord) => { saved.push(record); }, deleteTicker: async () => {} },
+    }) as unknown as Parameters<NonNullable<typeof coreConfigSyncContributor.apply>>[1];
+
+    // This device's own copy comes back: nothing changes.
+    await coreConfigSyncContributor.apply?.(pushedConfig, context(pushedConfig));
+    expect(current.config).toBe(state.config);
+
+    // Another device renamed the IBKR account and holds 9 AAPL there; an older build there pushed an Aries portfolio too.
+    const renamed = { ...pushedConfig, portfolios: pushedConfig.portfolios.map((portfolio: { id: string }) => (
+      portfolio.id === "broker:ibkr-main:U1" ? { ...portfolio, name: "IBKR main" } : portfolio)).concat([{ id: "broker:aries-sim:OTHER", name: "Old", currency: "USD", brokerId: "aries" }]) };
+    await coreConfigSyncContributor.apply?.(renamed, context(pushedConfig));
+    expect(current.config.brokerInstances.map((instance) => instance.id)).toEqual(["aries-sim", "ibkr-main"]);
+    expect(current.config.portfolios.map((portfolio) => [portfolio.id, portfolio.name])).toEqual([
+      ["main", config.portfolios[0]!.name], [ariesAccount.id, "SIM1"], ["broker:ibkr-main:U1", "IBKR main"],
+    ]);
+
+    const pulledTickers = pushedCollections.tickers.map((ticker: { ticker: string; positions: unknown[] }) => (
+      ticker.ticker === "AAPL" ? { ...ticker, positions: [{ portfolio: "broker:ibkr-main:U1", shares: 9, broker: "ibkr" }] } : ticker));
+    await coreCollectionsSyncContributor.apply?.(JSON.parse(JSON.stringify({ ...pushedCollections, tickers: pulledTickers })), context(pushedCollections));
+    const aapl = saved.find((record) => record.metadata.ticker === "AAPL")!.metadata;
+    expect(aapl.portfolios).toEqual([ariesAccount.id, "broker:ibkr-main:U1"]);
+    expect(aapl.positions.map((position) => [position.portfolio, position.shares])).toEqual([[ariesAccount.id, 5], ["broker:ibkr-main:U1", 9]]);
+    // NVDA is held only there: the pull leaves it as it is.
+    expect(current.tickers.get("NVDA")!.metadata.positions).toMatchObject([{ portfolio: ariesAccount.id, shares: 2 }]);
+    // A first pull, with nothing synced before to compare with, keeps them too.
+    current = state;
+    await coreCollectionsSyncContributor.apply?.(JSON.parse(JSON.stringify({ ...pushedCollections, tickers: pulledTickers })), context(undefined));
+    expect(current.tickers.get("AAPL")!.metadata.positions.map((position) => [position.portfolio, position.shares])).toEqual([[ariesAccount.id, 5], ["broker:ibkr-main:U1", 9]]);
+  });
+
   test("a watchlist removed elsewhere leaves no id on tickers, pulled or local", async () => {
     const config = createDefaultConfig("/tmp/gloomberb-sync-watchlist-removal-test");
     config.watchlists = [{ id: "watchlist", name: "Watchlist" }, { id: "tech", name: "Tech" }];
@@ -992,7 +1117,7 @@ describe("core sync contributors", () => {
     syncedState.tickers = new Map([["NVDA", withoutPosition]]);
     const syncedPayload = await coreCollectionsSyncContributor.collect({ state: syncedState });
 
-    // `gloomberb portfolio position set` wrote this straight to the database.
+    // `gloom portfolio position set` wrote this straight to the database.
     const state = createInitialState(config);
     state.tickers = new Map([["NVDA", {
       metadata: {
@@ -1135,6 +1260,37 @@ describe("core sync contributors", () => {
     expect(short.analyticsByPortfolio.main.spyBeta).toBeNull();
   });
 
+  // Each sync reuses a holding's returns while its bars are the same array;
+  // a bar revised or added in place must still reach the next one.
+  test("a holding's bars revised or extended in place reach the next sync's beta", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-sync-test");
+    config.portfolios = [{ id: "main", name: "Main", currency: "USD" }];
+    const state = createInitialState(config);
+    state.tickers = new Map([["AAPL", createTestTicker("AAPL", "Apple", {
+      portfolios: ["main"],
+      positions: [{ portfolio: "main", shares: 10, avgCost: 100, broker: "manual", currency: "USD" }],
+    })]]);
+    const holding = priceHistoryFromReturns([0.03, -0.009, 0.036, 0.018, -0.012, 0.024, 0.009, -0.006, 0.021, 0.012, -0.003]);
+    const benchmark = priceHistoryFromReturns([0.01, -0.003, 0.012, 0.006, -0.004, 0.008, 0.003, -0.002, 0.007, 0.004, -0.001, 0.005]);
+    const quote = { symbol: "AAPL", price: 100, currency: "USD", change: 0, changePercent: 0, lastUpdated: 1 };
+    state.financials = new Map([
+      ["AAPL", createTestFinancials({ quote, priceHistory: holding })],
+      ["SPY", createTestFinancials({ priceHistory: benchmark })],
+    ]);
+    const beta = async () => ((await coreCollectionsSyncContributor.collect({ state })) as any).analyticsByPortfolio.main.spyBeta as number;
+
+    // The holding moves three times the benchmark each day.
+    expect(await beta()).toBeCloseTo(3, 5);
+    const close = holding.at(-1)!.close;
+    holding.at(-1)!.close = close * 1.05;
+    expect(await beta()).not.toBeCloseTo(3, 2);
+    holding.at(-1)!.close = close;
+    expect(await beta()).toBeCloseTo(3, 5);
+    // A day it moves five times the benchmark.
+    holding.push({ date: new Date(Date.UTC(2026, 5, 13, 20)), close: close * 1.025 });
+    expect(await beta()).not.toBeCloseTo(3, 2);
+  });
+
   test("values holdings in a non-USD base currency with the loaded exchange rates", async () => {
     const config = createDefaultConfig("/tmp/gloomberb-sync-test");
     config.baseCurrency = "EUR";
@@ -1230,5 +1386,60 @@ describe("core sync contributors", () => {
       spyBeta: 1.1,
       basis: "holdings",
     });
+  });
+  test("lots an older build pushes under a suffixed key again merge into the listing's row on the pull, each once, with the target that names them", async () => {
+    const lot = (shares: number, avgCost: number, extra: Partial<TickerPosition> = {}): TickerPosition => ({
+      portfolio: "savings", shares, avgCost, currency: "TRY", broker: "manual", ...extra,
+    });
+    // A bond-like lot: sync keeps no price basis, so the copy that comes back lacks it.
+    const merged = lot(50, 98.5, { dateAcquired: "2025-03-01", priceBasis: "percent-of-par" });
+    const bist = { exchange: "BIST", currency: "TRY", portfolios: ["savings"] };
+    const config = createDefaultConfig(":memory:");
+    config.portfolios = [{ id: "savings", name: "Savings", currency: "TRY", targetWeights: { "GARAN.IS:BIST": 10 } }];
+    // This device merged GARAN.IS:BIST into GARAN at launch, and pushed GARAN.
+    const launch = mergeSuffixedListings([
+      createTestTicker("GARAN.IS:BIST", "Garanti", { ...bist, positions: [merged] }),
+      createTestTicker("GARAN", "Garanti", { ...bist, positions: [lot(100, 120)] }),
+    ])!;
+    const state = createInitialState(config);
+    state.tickers = new Map(launch.saves.map((row) => [row.metadata.ticker, row]));
+    const pushed = await coreCollectionsSyncContributor.collect({ state });
+    expect((pushed.tickers as Array<{ ticker: string; mergedLots?: unknown }>).map((row) => [row.ticker, !!row.mergedLots])).toEqual([["GARAN", true]]);
+
+    // The older build there still holds the lot under GARAN.IS:BIST, took GARAN's copy of it, and bought another.
+    const elsewhere = createInitialState(config);
+    const { priceBasis: _basis, ...synced } = merged;
+    elsewhere.tickers = new Map([
+      ["GARAN", createTestTicker("GARAN", "Garanti", { ...bist, positions: [lot(100, 120), synced] })],
+      ["GARAN.IS:BIST", createTestTicker("GARAN.IS:BIST", "Garanti", { ...bist, positions: [synced, lot(10, 130)] })],
+    ]);
+    const pulled = JSON.parse(JSON.stringify(await coreCollectionsSyncContributor.collect({ state: elsewhere })));
+
+    let current = state;
+    const saved: string[] = [];
+    let configSavedFirst = false;
+    await coreCollectionsSyncContributor.apply?.(pulled, {
+      baselinePayload: JSON.parse(JSON.stringify(pushed)),
+      baselineState: state,
+      state,
+      getState: () => current,
+      isCurrent: () => true,
+      dispatch: (action: { type: string; config?: typeof config; tickers?: typeof state.tickers }) => {
+        if (action.type === "SET_CONFIG") current = { ...current, config: action.config! };
+        if (action.type === "SET_TICKERS") current = { ...current, tickers: action.tickers! };
+      },
+      tickerRepository: {
+        saveTicker: async (record: TickerRecord) => {
+          if (saved.length === 0) configSavedFirst = configSaves.length > 0;
+          saved.push(record.metadata.ticker);
+        },
+      },
+    } as unknown as Parameters<NonNullable<typeof coreCollectionsSyncContributor.apply>>[1]);
+
+    expect(current.tickers.get("GARAN")!.metadata.positions.map((position) => position.shares)).toEqual([100, 50, 10]);
+    expect(current.tickers.get("GARAN.IS:BIST")!.metadata).toMatchObject({ portfolios: [], positions: [] });
+    expect(saved.sort()).toEqual(["GARAN", "GARAN.IS:BIST"]);
+    expect(current.config.portfolios[0]!.targetWeights).toEqual({ GARAN: 10 });
+    expect(configSavedFirst).toBe(true);
   });
 });

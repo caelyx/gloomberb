@@ -429,19 +429,6 @@ function useUpdatePaneLayout(options: { saveDelayMs?: number } = {}) {
   }, [dispatch, saveDelayMs, stateRef]);
 }
 
-/**
- * Rewrites this pane's own instance (binding, title, settings) in one saved
- * layout update, for a pane that changes what it shows in place, as INS does
- * when its ranking opens a company.
- */
-export function useUpdatePaneInstance(paneId?: string): (update: (instance: PaneInstanceConfig) => PaneInstanceConfig) => void {
-  const id = useScopedPaneId(paneId);
-  const updateLayout = useUpdatePaneLayout();
-  return useCallback((update: (instance: PaneInstanceConfig) => PaneInstanceConfig) => {
-    updateLayout((layout) => findPaneInstance(layout, id) ? updatePaneInstance(layout, id, update) : layout);
-  }, [id, updateLayout]);
-}
-
 /** Keep a content-derived pane title in its saved layout, without exposing config writes. Null leaves the title alone. */
 export function usePaneTitle(title: string | null, paneId?: string): void {
   const id = useScopedPaneId(paneId);
@@ -517,6 +504,7 @@ export function AppProvider({
   const effectiveThemeId = getEffectiveThemeId(state);
   const previousRecentTickers = useRef(state.recentTickers);
   const previousRecentCommands = useRef(state.config.recentCommands);
+  const previousCommandBarOpens = useRef(state.config.commandBarOpens);
   const stateRef = useRef(state);
   const listenersRef = useRef(new Set<() => void>());
   const storeRef = useRef<AppContextStoreValue | null>(null);
@@ -570,6 +558,7 @@ export function AppProvider({
     paneState: currentState.paneState,
     focusedPaneId: currentState.focusedPaneId,
     statusBarVisible: currentState.statusBarVisible,
+    brokerSyncErrors: currentState.brokerSyncErrors,
   }), []);
 
   const serializeDesktopSnapshot = useCallback((snapshot: DesktopSharedStateSnapshot): string => JSON.stringify({
@@ -577,6 +566,7 @@ export function AppProvider({
     paneState: snapshot.paneState,
     focusedPaneId: snapshot.focusedPaneId,
     statusBarVisible: snapshot.statusBarVisible,
+    brokerSyncErrors: snapshot.brokerSyncErrors ?? {},
   }), []);
 
   const serializePaneState = useCallback((paneState: PaneRuntimeState | undefined): string => JSON.stringify(paneState ?? {}), []);
@@ -613,6 +603,14 @@ export function AppProvider({
     previousRecentCommands.current = state.config.recentCommands;
     scheduleConfigSave(() => ({ ...stateRef.current.config, recentTickers: stateRef.current.recentTickers }));
   }, [state.config.recentCommands]);
+
+  // Opening the empty bar changes only config.commandBarOpens, until it stops
+  // counting; nothing else saves it.
+  useEffect(() => {
+    if (previousCommandBarOpens.current === state.config.commandBarOpens) return;
+    previousCommandBarOpens.current = state.config.commandBarOpens;
+    scheduleConfigSave(() => ({ ...stateRef.current.config, recentTickers: stateRef.current.recentTickers }));
+  }, [state.config.commandBarOpens]);
 
   /** Takes the main window's last snapshot back in, with this window's unanswered changes laid over it. */
   const rehydrateSecondaryWindow = useCallback(() => {
@@ -689,11 +687,13 @@ export function AppProvider({
     const send = desktopBridge?.sendWindowIntent;
     if (!send) return;
     sendWindowIntents();
+    // Refused or never delivered: the main window did not make the change, so its state comes back here.
+    const settle = (applied: boolean) => {
+      if (!applied && intent.type !== "windowStatus") rehydrateSecondaryWindow();
+    };
     send(intent).then(
-      (result) => {
-        if (result?.applied !== true && intent.type !== "windowStatus") rehydrateSecondaryWindow();
-      },
-      () => {},
+      (result) => settle(result?.applied === true),
+      () => settle(false),
     );
   }, [desktopBridge, rehydrateSecondaryWindow, sendWindowIntents]);
 
@@ -799,6 +799,7 @@ export function AppProvider({
     state.focusedPaneId,
     state.paneState,
     state.statusBarVisible,
+    state.brokerSyncErrors,
   ]);
 
   useEffect(() => {

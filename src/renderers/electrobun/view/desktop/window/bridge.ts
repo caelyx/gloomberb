@@ -14,7 +14,7 @@ import {
   setElectrobunWindowIntentHandler,
 } from "../../backend-rpc";
 import { detachedRpcKey, MAIN_WINDOW_RPC_KEY, secondaryWindowRpcKey } from "../../../shared/window-keys";
-import { detachedSnapshotKey, prepareDetachedSnapshot, prepareSecondaryWindowSnapshot } from "./snapshot";
+import { createDetachedSnapshotFilter, prepareSecondaryWindowSnapshot } from "./snapshot";
 
 function windowKeyFor(kind: DesktopWindowBridge["kind"], paneId?: string, windowId?: string): string | undefined {
   if (kind === "main") return MAIN_WINDOW_RPC_KEY;
@@ -28,8 +28,8 @@ export function createDesktopWindowBridge(
   windowId?: string,
 ): DesktopWindowBridge {
   const initialDesktopSnapshot = getElectrobunBackendInitSnapshot()?.desktopSnapshot ?? null;
-  let lastDetachedSnapshotKey = kind === "detached" && paneId && initialDesktopSnapshot
-    ? detachedSnapshotKey(initialDesktopSnapshot, paneId)
+  const takeDetachedSnapshot = kind === "detached" && paneId
+    ? createDetachedSnapshotFilter(paneId, initialDesktopSnapshot)
     : null;
 
   return {
@@ -93,11 +93,9 @@ export function createDesktopWindowBridge(
     },
     subscribeState(listener: (snapshot: DesktopSharedStateSnapshot) => void) {
       return onBackendMessage("desktop.state", (message) => {
-        if (kind === "detached" && paneId) {
-          const nextKey = detachedSnapshotKey(message.snapshot, paneId);
-          if (nextKey === lastDetachedSnapshotKey) return;
-          lastDetachedSnapshotKey = nextKey;
-          listener(prepareDetachedSnapshot(message.snapshot, paneId));
+        if (takeDetachedSnapshot) {
+          const snapshot = takeDetachedSnapshot(message.snapshot);
+          if (snapshot) listener(snapshot);
           return;
         }
         // A secondary window takes every change: any pane in its grid, or the

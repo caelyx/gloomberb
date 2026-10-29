@@ -1,3 +1,4 @@
+import { logFailure } from "../../utils/log-failure";
 import type { CachedAssetArgs, CachedAssetMethod, CachedAssetValue, DataProvider, SecFilingDocument, SecFilingItem } from "../../types/data-provider";
 import type { CorporateActionsData, OptionsChain, PricePoint, Quote, TickerFinancials } from "../../types/financials";
 import { fetchHistoryResult, type HistoryResultRequest } from "../../sources/history-result";
@@ -81,6 +82,7 @@ import {
   type QuoteSubscriptionHandle,
   type QuoteSubscriptionRequest,
 } from "./quotes";
+import { withSavedCopyMarkOf } from "../../data/saved-copies";
 
 /** How long a streamed tick may reuse the quote fields read from the cache. */
 const STREAM_QUOTE_BASELINE_TTL_MS = 60_000;
@@ -314,7 +316,7 @@ export class MarketDataCoordinator {
   async loadListingFate(instrument: InstrumentRef): Promise<ListingFate> {
     const listing = fateListing(instrument);
     if (!listing) return NO_FATE;
-    const quote = this.loadQuote(instrument).then(resolveEntryData, () => null);
+    const quote = this.loadQuote(instrument).then(resolveEntryData, logFailure("market-data.coordinator.index", "Loading a listing fate quote failed", null));
     return loadListingFate(listing, this.dataProvider, { quote, changes: this.lookupTickerChanges(instrument) });
   }
 
@@ -335,8 +337,8 @@ export class MarketDataCoordinator {
 
   prefetchTicker(instrument: InstrumentRef | null | undefined): void {
     if (!instrument) return;
-    void this.loadSnapshot(instrument).catch(() => {});
-    void this.loadChart(createBaselineChartRequest(instrument)).catch(() => {});
+    void this.loadSnapshot(instrument).catch(logFailure("market-data.coordinator.index", "Loading a financial snapshot failed"));
+    void this.loadChart(createBaselineChartRequest(instrument)).catch(logFailure("market-data.coordinator.index", "Loading chart data failed"));
   }
 
   /**
@@ -348,11 +350,11 @@ export class MarketDataCoordinator {
   warmTickerGaps(instrument: InstrumentRef | null | undefined): void {
     if (!instrument) return;
     if (resolveEntryData(this.getSnapshotEntry(instrument)) == null) {
-      void this.loadSnapshot(instrument).catch(() => {});
+      void this.loadSnapshot(instrument).catch(logFailure("market-data.coordinator.index", "Loading a financial snapshot failed"));
     }
     const chartRequest = createBaselineChartRequest(instrument);
     if (resolveEntryData(this.getChartEntry(chartRequest)) == null) {
-      void this.loadChart(chartRequest).catch(() => {});
+      void this.loadChart(chartRequest).catch(logFailure("market-data.coordinator.index", "Loading chart data failed"));
     }
   }
 
@@ -746,7 +748,8 @@ export class MarketDataCoordinator {
     const resolvedQuote = quote.stale === true ? quote : this.resolveIncomingQuote(instrument, quote);
     const startedAt = Date.now();
     const receivedAt = resolvedQuote.stale === true ? resolvedQuote.receivedAt : startedAt;
-    const storedQuote = receivedAt == null ? resolvedQuote : { ...resolvedQuote, receivedAt };
+    // A tick merged onto a saved copy is the stream's answer, not the saved copy.
+    const storedQuote = withSavedCopyMarkOf(receivedAt == null ? resolvedQuote : { ...resolvedQuote, receivedAt }, quote);
     const currentQuote = current.data ?? current.lastGoodData;
     if (areStreamQuotesEquivalent(currentQuote, storedQuote)) {
       const previousReceipt = currentQuote?.receivedAt;

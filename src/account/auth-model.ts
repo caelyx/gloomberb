@@ -4,6 +4,7 @@
  * (validation, retry classification, username derivation) can be exercised
  * without rendering.
  */
+import { logFailure } from "../utils/log-failure";
 import { apiClient, type AuthUser } from "../api-client";
 import { identifyResearchUser } from "../api-client/research-activity";
 import { t } from "../i18n";
@@ -124,15 +125,19 @@ export async function performEmailAuth(mode: AccountMode, email: string, passwor
   } else {
     user = await apiClient.signIn(email, password);
   }
-  if (!user.emailVerified) {
-    await apiClient.sendVerification().catch(() => {});
-  }
+  if (apiClient.getCurrentUser()?.id !== user.id) throw new Error("Another sign-in replaced this request.");
   const sessionToken = apiClient.getSessionToken();
   if (sessionToken) {
     chatController.adoptSession(sessionToken, user);
   }
+  if (!user.emailVerified) {
+    await apiClient.sendVerification().catch(logFailure("account-auth", "Verification email request failed"));
+  }
+  if (apiClient.getSessionToken() !== sessionToken || apiClient.getCurrentUser()?.id !== user.id) {
+    throw new Error("Another sign-in replaced this request.");
+  }
   identifyResearchUser();
-  await chatController.refreshSession().catch(() => {});
+  await chatController.refreshSession().catch(logFailure("account-auth", "Session refresh after email authentication failed"));
   return user;
 }
 

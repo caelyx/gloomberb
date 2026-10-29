@@ -35,6 +35,8 @@ interface ShellPaneLayersProps {
   dockDividerLayouts: DockDividerLayout[];
   dockLeafLayouts: DockLeafLayout[];
   focusedPaneId: string | null;
+  /** Saved insertion order, independent of which floating window is in front. */
+  floatingOrder: readonly { instanceId: string }[];
   getPaneTitle: (pane: ResolvedPane) => string;
   getPaneQuickSettings: (paneId: string) => PaneHeaderQuickSetting[];
   handleFloatingClose: (paneId: string) => void;
@@ -593,6 +595,7 @@ export function ShellPaneLayers({
   dockDividerLayouts,
   dockLeafLayouts,
   focusedPaneId,
+  floatingOrder,
   getPaneTitle,
   getPaneQuickSettings,
   handleFloatingClose,
@@ -697,6 +700,21 @@ export function ShellPaneLayers({
     dividerDragStart: (divider, event) => handlersRef.current.startNativeDividerDrag(divider, event),
   }), []);
 
+  // DOM z-index already stacks the windows. Reordering their React children
+  // as focus changes detaches/reinserts the existing DOM nodes, resetting every
+  // nested scrollport to zero without a scroll event. A windowed list then
+  // paints its old tail into an empty viewport. Keep insertion order on the
+  // desktop/web, including the saved order for equal z-indices. The terminal
+  // still draws back to front.
+  const floatingLayers = useMemo(() => {
+    if (!nativePaneChrome) return visibleFloatingPanes;
+    const byId = new Map(visibleFloatingPanes.map((entry) => [entry.pane.instance.instanceId, entry]));
+    return floatingOrder.flatMap(({ instanceId }) => {
+      const entry = byId.get(instanceId);
+      return entry ? [entry] : [];
+    });
+  }, [floatingOrder, nativePaneChrome, visibleFloatingPanes]);
+
   const layerProps = (pane: ResolvedPane, rect: LayoutBounds): PaneLayerProps => {
     const paneId = pane.instance.instanceId;
     const focused = focusedPaneId === paneId && (!overlayOpen || menuPaneId === paneId);
@@ -738,7 +756,7 @@ export function ShellPaneLayers({
         );
       })}
 
-      {visibleFloatingPanes.map(({ pane, rect }) => {
+      {floatingLayers.map(({ pane, rect }) => {
         if (transientFocusActive && pane.instance.instanceId !== transientFocusPaneId) return null;
         return (
           <FloatingPaneLayer

@@ -1,5 +1,9 @@
 import { act, useReducer, type Dispatch } from "react";
 import { afterEach, expect, test } from "bun:test";
+import { MarketDataCoordinator, setSharedMarketDataCoordinator } from "../../../market-data/coordinator";
+import { AssetDataRouter } from "../../../sources/provider-router";
+import { createTestDataProvider } from "../../../test-support/data-provider";
+import type { QuoteSubscriptionTarget } from "../../../types/data-provider";
 import { setCloudApiFetchTransport } from "../../../api-client";
 import type { PerpBoardPayload, PerpRankingsPayload } from "../../../api-client/perps";
 import { PaneFooterBar, PaneFooterKeys, PaneFooterProvider } from "../../../components/layout/pane/footer";
@@ -14,7 +18,11 @@ import { perpsInstance } from "./index";
 import { PerpsPane } from "./pane";
 import { equityBoard, longShort, perpBoard, perpHistory, perpRankings, perpRow, venueRow } from "./test-fixture";
 const tui = createOpenTuiTestHarness();
-const reset = () => { setCloudApiFetchTransport(null); perpsCache.reset(); perpsHistoryCache.reset(); perpsMarketCache.reset(); perpsRankingsCache.reset(); };
+let coordinator: MarketDataCoordinator | null = null;
+const reset = () => {
+  setCloudApiFetchTransport(null); perpsCache.reset(); perpsHistoryCache.reset(); perpsMarketCache.reset(); perpsRankingsCache.reset();
+  setSharedMarketDataCoordinator(null); coordinator?.destroy(); coordinator = null;
+};
 afterEach(reset);
 /** A second pane in the same test starts from empty caches. */
 async function remount() { await tui.destroy(); reset(); }
@@ -56,10 +64,12 @@ test("no market opens the board in its preview; a named market still opens its h
   expect(board).toContain("Hyperliquid");
   expect(board).not.toContain("NaN");
   await remount();
-  serve({ board: perpBoard({ access: "preview", locked: 5 }) });
+  serve({ board: perpBoard({ access: "preview", locked: 5, sources: ["hyperliquid", "binance"].map((source) => ({ source })) }) });
   await mount({ market: "BTC" });
   const history = await tui.waitForFrameToContain("Full history requires Gloom Pro.");
   expect(history).toContain("Funding / 8h");
+  // The lock says what Pro adds, with the venues Gloom Cloud collects.
+  expect(history).toContain("Gloom Pro adds Hyperliquid BTC history and every market on 2 venues.");
   expect(history).toContain("Upgrade for full history");
 });
 
@@ -180,8 +190,58 @@ test("evidence distinguishes source time, raw interval, reference price and reta
   setCloudApiFetchTransport(async (url) => Response.json(String(url).includes("/market?") ? { ...board, evidence: [{ kind: "funding", period_at: board.asOf, received_at: board.asOf, superseded_at: null, fingerprint: "revision-one", payload: {} }], methodologyUrl: "https://gloom.sh/docs/perpetuals" } : board));
   await mount({ tab: "evidence" });
   const frame = await tui.waitForFrameToContain("Funding 8h / APR");
-  expect(frame).toContain("APR = current 8h rate × 3 × 365");
+  // The market funds hourly, so its APR is the 1h rate × 24 × 365, as the server computes it (+0.00083% × 24 × 365).
+  expect(frame).toContain("+0.0066% / +7.27%  APR = current 1h rate × 24 × 365");
   // A crypto perp has no listed underlying, so the reference-price rows are left out rather than shown as unavailable.
   expect(frame).not.toContain("Underlying last");
   expect(frame).toContain("Source as of");
+});
+
+test("the board's footer says live only while every row on screen streams, and otherwise dates them by the oldest price", async () => {
+  const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+  // Three markets read by the last pass, the oldest (Binance's ETH) 3 minutes before.
+  const rows = [venueRow("binance", { observedAt: at(1) }), venueRow("bybit", { observedAt: at(2) }), venueRow("binance", { symbol: "ETHUSDT", observedAt: at(3) })];
+  serve({ board: perpBoard({ access: "preview", locked: 2555, rows }) });
+  let subscribed: QuoteSubscriptionTarget[] = [];
+  let deliver!: (target: QuoteSubscriptionTarget, quote: Record<string, unknown>) => void;
+  coordinator = new MarketDataCoordinator(new AssetDataRouter(createTestDataProvider({
+    subscribeQuotes: (targets, onQuote) => { subscribed = targets; deliver = (target, quote) => onQuote(target, quote as never); return () => {}; },
+  })));
+  setSharedMarketDataCoordinator(coordinator);
+  await mount({ market: "", tab: "board" }, {}, createTestPluginRuntime(), 180);
+  await tui.waitForFrameToContain("Upgrade for 2,555 more markets");
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+  expect(subscribed.map((target) => target.symbol).sort()).toEqual(["BTCUSDT:BINANCE", "BTCUSDT:BYBIT", "ETHUSDT:BINANCE"]);
+  // Nothing streams yet: the minute's read is neither live nor delayed; the line says how old its oldest price is.
+  const read = tui.frame();
+  expect(read).toContain("UTC · oldest 3 min");
+  expect(read).not.toMatch(/delayed|· live/);
+  const stream = async (index: number) => {
+    const row = { ...rows[index]!, markPrice: 81_000 + index, observedAt: new Date().toISOString() };
+    await act(async () => {
+      const target = subscribed.find((candidate) => candidate.symbol === `${row.symbol}:${row.venue.toUpperCase()}`)!;
+      deliver(target, { symbol: target.symbol, price: row.markPrice, currency: row.quoteCurrency,
+        change: 0, changePercent: 0, lastUpdated: Date.now(), dataSource: "live", delivery: "stream", stale: false, instrumentType: "PERP", perpetual: row });
+      await new Promise((resolve) => setTimeout(resolve, 520));
+    });
+  };
+  // Two of three stream, as a signed-out board streams 16 of its 21 rows: not live, and as old as the row left, though
+  // its venue's newest price streams.
+  await stream(0);
+  await stream(1);
+  const some = await tui.waitForFrameToContain("81,001.00");
+  expect(some).toContain("UTC · oldest 3 min");
+  expect(some).not.toMatch(/delayed|· live/);
+  await stream(2);
+  expect(await tui.waitForFrameToContain("oldest 0 min · live")).not.toContain("delayed");
+});
+
+test("the board's footer dates the rows on screen, not markets scrolled out of view", async () => {
+  const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+  // Thirty markets: the last, below the fold, was read 50 minutes ago (a venue read hourly).
+  const rows = Array.from({ length: 30 }, (_, index) => venueRow("binance", { symbol: `C${index}USDT`, observedAt: at(index === 29 ? 50 : 1) }));
+  serve({ board: perpBoard({ rows }) });
+  await mount({ market: "", tab: "board" }, {}, createTestPluginRuntime(), 180);
+  // The pane shows about twenty rows; the footer is as old as they are.
+  expect(await tui.waitForFrameToContain("UTC · oldest")).toContain("UTC · oldest 1 min ·");
 });

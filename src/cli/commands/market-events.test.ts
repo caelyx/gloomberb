@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createTestCliContext } from "../../test-support/cli-context";
 import { serializeCliResult } from "../result";
 import { DEFAULT_CLI_OPTIONS } from "../options";
+import { formatFreshnessLine } from "../pane-functions/freshness";
 import { marketDataCliCommands } from "./market";
 
 const events = marketDataCliCommands.find((command) => command.name === "events")!;
@@ -29,18 +30,14 @@ const PLTR = [
   { date: "2025-05-05", dateType: "announcement", currency: "USD", epsEstimate: 0.08, epsActual: 0.04, difference: -0.04, epsBasis: null },
 ];
 
-test("events names every earnings row's basis and quarter as EE does, and rounds a pending estimate to the cent", async () => {
-  const { rows } = await eventRows(PLTR);
+test("events preserve earnings inputs in NDJSON while formatting known bases, periods and rounded estimates", async () => {
+  const { rows, result, options } = await eventRows(PLTR);
   expect(rows.map((row) => row.detail)).toEqual([
     "est $0.41, confirmed, 24 analysts (Sep 2026)",
     "eps $0.31, adj, +0.03 vs est (Jun 2026)",
     "eps $0.24, GAAP, +0.07 vs est (Dec 2025)",
-    "eps $0.04, basis unknown, -0.04 vs est",
+    "eps $0.04, -0.04 vs est",
   ]);
-});
-
-test("events rows only gain fields, so NDJSON consumers keep type, date and detail", async () => {
-  const { rows, result, options } = await eventRows(PLTR);
   expect(rows[0]).toMatchObject({ type: "earnings", date: "2026-11-02", epsEstimate: 0.41222, epsAnalysts: 24, dateStatus: "confirmed", fiscalPeriod: "2026-09" });
   // An upcoming estimate no basis was served for carries none.
   const lines = serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, format: "ndjson" }, options).split("\n").map((line) => JSON.parse(line));
@@ -53,4 +50,10 @@ test("events rows only gain fields, so NDJSON consumers keep type, date and deta
   const csv = serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, options);
   expect(csv.split("\n")[0]).toStartWith("Date,Type,Detail,");
   expect(csv.split("\n")[0]).not.toContain("eps");
+});
+
+test("events is dated by when it was read: a row's date is when its event happens, so the newest past one is no as-of", async () => {
+  const { result } = await eventRows(PLTR);
+  expect(result.freshness).toMatchObject({ asOf: null, status: "not-a-feed", basis: "corporate actions" });
+  expect(formatFreshnessLine(result.freshness!)).toMatch(/^Source: Gloom Cloud · retrieved \w{3} \d+ \w{3} \d{4} \d{2}:\d{2} UTC · not a live feed \(corporate actions\)$/);
 });

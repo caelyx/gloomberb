@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -30,6 +30,7 @@ import {
 } from "../../types/config";
 import type { DataProvider } from "../../types/data-provider";
 import { OnboardingWizard } from "./onboarding-wizard";
+import { loadFuturesContractTermsCached } from "../../market-data/futures-contract";
 
 const tui = createOpenTuiTestHarness();
 let tempDataDir: string | null = null;
@@ -43,6 +44,8 @@ const KNOWN_LISTINGS: Record<string, { symbol: string; name: string; exchange: s
   "TTALO.HE": { symbol: "TTALO", name: "Terveystalo Oyj", exchange: "HEL", currency: "EUR" },
   // Neither search nor quote knows this listing's currency.
   BARE: { symbol: "BARE", name: "Bare Listing", exchange: "XETRA", currency: "" },
+  // Oats quote in US cents a bushel.
+  "ZO=F": { symbol: "ZO=F", name: "Oats Dec 26", exchange: "CBT", currency: "USX" },
 };
 
 /** Exact-symbol search plus a flat 100 quote in the listing's currency, enough to resolve and value a position. */
@@ -79,10 +82,6 @@ function createPluginRegistry(options: {
 }
 
 const startedPlugins: GloomPlugin[] = [];
-afterAll(() => {
-  for (const plugin of startedPlugins.splice(0).reverse()) plugin.dispose?.();
-});
-
 let builtInFunctions: Promise<Pick<PluginRegistry, "panes" | "paneTemplates">> | null = null;
 
 /** A registry that also has the app's own functions, so desks build from the real ones. */
@@ -294,17 +293,28 @@ async function skipDesks(): Promise<void> {
 const originalRecordResearchActivity = apiClient.recordResearchActivity;
 const originalGetCloudPricing = apiClient.getCloudPricing;
 const originalGetCloudAccountPlan = apiClient.getCloudAccountPlan;
+const originalGetChannels = apiClient.getChannels;
+const originalGetSession = apiClient.getSession;
 beforeEach(() => {
   expectedPositionCount = 0;
   apiClient.recordResearchActivity = (async () => {}) as typeof apiClient.recordResearchActivity;
   apiClient.getCloudPricing = (async () => { throw new Error("offline"); }) as typeof apiClient.getCloudPricing;
   apiClient.getCloudAccountPlan = (async () => ({ trialAvailable: true })) as typeof apiClient.getCloudAccountPlan;
+  apiClient.getChannels = async () => [];
+  apiClient.getSession = async () => apiClient.getCurrentUser();
 });
 
 afterEach(async () => {
+  // The desk registry starts cloud listeners; later sign-in tests must not inherit them.
+  for (const plugin of startedPlugins.splice(0).reverse()) plugin.dispose?.();
+  builtInFunctions = null;
+  // Checkout refreshes chat directly, even without a registry, and can start verification polling.
+  chatController.dispose();
   apiClient.recordResearchActivity = originalRecordResearchActivity;
   apiClient.getCloudPricing = originalGetCloudPricing;
   apiClient.getCloudAccountPlan = originalGetCloudAccountPlan;
+  apiClient.getChannels = originalGetChannels;
+  apiClient.getSession = originalGetSession;
   apiClient.setSessionToken(null);
   apiClient.restoreCachedUser(null);
   resetCloudUpgradeGuardForTests();
@@ -404,6 +414,31 @@ describe("OnboardingWizard", () => {
     expect(capturedConfig?.portfolios.find((portfolio) => portfolio.id === "main")?.currency).toBe("EUR");
     expect(await positionOf("BARE")).toBe("EUR");
     expect((await tickerRepository.loadTicker("BARE"))?.metadata.currency).toBe("");
+  });
+
+  test("a future is entered in contracts of its size at the cents it quotes in, and leaves the portfolio's currency alone", async () => {
+    // The wizard reads a future's terms where the portfolio does: oats are 5,000 bushels, quoted in US cents.
+    await loadFuturesContractTermsCached("ZO=F", async (symbol) => ({
+      symbol, root: "ZO", name: "Oats", contract: "ZOZ26", contractSymbol: "ZOZ26", deliveryMonth: "2026-12",
+      spec: { unit: "US cents / bushel", size: "5,000 bushels", pointValue: 50, tick: 0.25, tickValue: 12.5, settlement: "physical" },
+      lastTrade: null, firstNotice: null, inDelivery: false, settlement: null,
+    }));
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-future-"));
+    const tickerRepository = new JsonTickerRepository();
+    const pluginRegistry = createPluginRegistry({ tickerRepository });
+    await tui.render(
+      <WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={pluginRegistry} />,
+      { width: 100, height: 32 },
+    );
+    await tui.setup().renderOnce();
+
+    // Short two contracts; a blank cost is the quote's 100 cents.
+    await addManualPosition("ZO=F", "-2");
+    expect((await tickerRepository.loadTicker("ZO=F"))?.metadata.positions).toEqual([
+      { portfolio: "main", shares: -2, avgCost: 100, currency: "USX", broker: "manual", multiplier: 5000 },
+    ]);
+    // US cents never become a portfolio's currency, as pence never do.
+    expect(capturedConfig?.portfolios.find((portfolio) => portfolio.id === "main")?.currency ?? "USD").toBe("USD");
   });
 
   test("a blank share count follows the company and prices a missing cost from the quote", async () => {
@@ -839,6 +874,7 @@ describe("OnboardingWizard", () => {
     apiClient.signUp = (async (email: string) => {
       signUps.push(email);
       const user = { id: "new-user", email, emailVerified: false, plan: "free" as const };
+      apiClient.setSessionToken("onboarding-signup-session");
       apiClient.restoreCachedUser(user);
       return user;
     }) as typeof apiClient.signUp;
@@ -891,6 +927,7 @@ describe("OnboardingWizard", () => {
     apiClient.signIn = (async (email: string) => {
       calls.push("login");
       const user = { id: "returning-user", email, emailVerified: true, plan: "free" as const };
+      apiClient.setSessionToken("onboarding-login-session");
       apiClient.restoreCachedUser(user);
       return user;
     }) as typeof apiClient.signIn;

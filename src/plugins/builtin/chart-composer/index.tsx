@@ -22,6 +22,8 @@ import {
 } from "./catalog-inventory";
 import {
   CHART_INTERACTION_VIEWPORT_SETTING_KEY,
+  CHART_LEVERAGE_PENDING_SETTING_KEY,
+  CHART_PINNED_MOMENT_SETTING_KEY,
   CHART_SPEC_SETTING_KEY,
   parseChartInteractionViewport,
   parseChartSpec,
@@ -100,16 +102,65 @@ function bindSelectedContract(spec: ChartSpec, context: PaneTemplateContext, opt
   )) };
 }
 
+/**
+ * What a registered series reads as in a chart's title: without its ticker
+ * when the chart shows that ticker's price, and once for all of its lines
+ * (`Z-score`, not `AAPL · Z-score · Z · AAPL · Z-score · Upper`).
+ */
+function capabilityTitlePart(
+  source: { capabilityId: string; seriesId: string },
+  label: string,
+  pricedTickers: ReadonlySet<string>,
+): { text: string; group: string | null } {
+  const slash = source.seriesId.indexOf("/");
+  const named = slash < 0 ? source.seriesId : source.seriesId.slice(0, slash);
+  let ticker: string | null = null;
+  if (slash >= 0) {
+    try {
+      ticker = decodeURIComponent(source.seriesId.slice(slash + 1));
+    } catch {
+      ticker = source.seriesId.slice(slash + 1);
+    }
+  }
+  let text = label;
+  if (ticker && pricedTickers.has(ticker.toUpperCase())) {
+    for (const lead of [`${ticker} · `, `${ticker} `]) {
+      if (text.startsWith(lead) && text.length > lead.length) {
+        text = text.slice(lead.length);
+        break;
+      }
+    }
+  }
+  const tilde = named.indexOf("~");
+  if (tilde < 0) return { text, group: null };
+  const lineAt = text.lastIndexOf(" · ");
+  return {
+    text: lineAt > 0 ? text.slice(0, lineAt) : text,
+    group: `${source.capabilityId}:${named.slice(0, tilde)}/${ticker ?? ""}`,
+  };
+}
+
 function chartTitle(spec: ChartSpec, prefix = "G"): string {
-  const labels = spec.series.slice(0, 3).map((series) => (
-    series.source.kind === "security"
-      ? tickerInstrumentLabel(publicTickerKey(series.source.instrument.symbol, series.source.instrument.exchange), series.source.instrument.instrument)
-      : series.source.kind === "economic"
-        ? `FRED:${series.source.seriesId}`
-        : series.label?.trim() || registeredSeriesName(series.source) || series.source.seriesId
-  ));
+  const pricedTickers = new Set(spec.series.flatMap((series) => series.source.kind === "security"
+    ? [publicTickerKey(series.source.instrument.symbol, series.source.instrument.exchange).toUpperCase(), series.source.instrument.symbol.toUpperCase()]
+    : []));
+  const groups = new Set<string>();
+  const parts = spec.series.flatMap((series) => {
+    if (series.source.kind === "security") {
+      return [tickerInstrumentLabel(publicTickerKey(series.source.instrument.symbol, series.source.instrument.exchange), series.source.instrument.instrument)];
+    }
+    if (series.source.kind === "economic") return [`FRED:${series.source.seriesId}`];
+    const label = series.label?.trim() || registeredSeriesName(series.source) || series.source.seriesId;
+    const { text, group } = capabilityTitlePart(series.source, label, pricedTickers);
+    if (group) {
+      if (groups.has(group)) return [];
+      groups.add(group);
+    }
+    return [text];
+  });
+  const labels = parts.slice(0, 3);
   if (labels.length === 0) return "Custom Chart";
-  const remaining = spec.series.length - labels.length;
+  const remaining = parts.length - labels.length;
   return `${prefix} ${labels.join(" · ")}${remaining > 0 ? ` +${remaining}` : ""}`;
 }
 
@@ -140,14 +191,21 @@ function pinChartSpecListings(spec: ChartSpec, tickers: ReadonlyMap<string, Tick
 
 function prepareChartPaneForShare(
   pane: PaneInstanceConfig,
-  { tickers }: { tickers: ReadonlyMap<string, TickerRecord> },
+  { tickers, pinnedTime }: { tickers: ReadonlyMap<string, TickerRecord>; pinnedTime?: number },
 ): PaneInstanceConfig {
+  // A crosshair pinned in the sender's tab travels with the link, so it opens
+  // on that moment. A moment the pane still holds from a link it was opened
+  // from is never passed on, whatever else the pane holds.
+  const { [CHART_PINNED_MOMENT_SETTING_KEY]: held, ...settings } = pane.settings ?? {};
   const spec = parseChartSpec(pane.settings?.[CHART_SPEC_SETTING_KEY]);
-  if (!spec) return pane;
+  if (!spec) return held === undefined ? pane : { ...pane, settings };
   const pinned = pinChartSpecListings(spec, tickers);
-  return pinned === spec
-    ? pane
-    : { ...pane, settings: { ...pane.settings, [CHART_SPEC_SETTING_KEY]: pinned } };
+  if (pinned === spec && pinnedTime === undefined && held === undefined) return pane;
+  return { ...pane, settings: {
+    ...settings,
+    [CHART_SPEC_SETTING_KEY]: pinned,
+    ...(pinnedTime !== undefined ? { [CHART_PINNED_MOMENT_SETTING_KEY]: pinnedTime } : {}),
+  } };
 }
 
 interface SharedChartState {
@@ -202,6 +260,7 @@ function securityTemplate({
   minimumSymbols,
   build,
   keywords = [],
+  settings,
 }: {
   id: Parameters<typeof chartHeadless>[0];
   prefix: "GP" | "GIP" | "CMP" | "GF" | "GE";
@@ -215,6 +274,8 @@ function securityTemplate({
   argKind: "ticker" | "ticker-list";
   minimumSymbols: number;
   build: (symbols: string[]) => ChartSpec;
+  /** Pane settings the template opens with besides the chart. */
+  settings?: Record<string, unknown>;
 }): PaneTemplateDef {
   return {
     id,
@@ -239,7 +300,9 @@ function securityTemplate({
     canCreate: (context, options) => templateSymbols(context, options).length >= minimumSymbols,
     createInstance: (context, options) => {
       const symbols = templateSymbols(context, options);
-      return symbols.length >= minimumSymbols ? selectedInstanceFor(build(symbols), prefix, context, options) : null;
+      if (symbols.length < minimumSymbols) return null;
+      const instance = selectedInstanceFor(build(symbols), prefix, context, options);
+      return settings ? { ...instance, settings: { ...instance.settings, ...settings } } : instance;
     },
   };
 }
@@ -342,6 +405,7 @@ const chartComposerTemplates: PaneTemplateDef[] = [
       "positioning",
     ],
     shortcut: { prefix: "CAT", argPlaceholder: "query", argKind: "text", argOptional: true },
+    reportFreshness: { status: "not-a-feed", basis: "series catalog" },
     canCreate: () => true,
     createInstance: (_context, options) => {
       const query = options?.arg?.trim() ?? options?.values?.query?.trim() ?? "";
@@ -389,10 +453,13 @@ const chartComposerTemplates: PaneTemplateDef[] = [
     prefix: "CMP",
     aliases: ["COMP", "TRA"],
     label: "Comparison Chart",
-    description: "Compare price returns over shared observation dates for two or more tickers.",
+    description: "Compare price returns over shared observation dates for two or more tickers. A leveraged or inverse fund gets its daily objective drawn from its index fund (3× daily QQQ beside TQQQ) and its decay against it.",
+    // Leveraged and inverse funds: the daily line and the decay come with the comparison.
+    keywords: ["leveraged", "inverse", "decay", "daily-reset", "daily reset", "volatility decay"],
     argKind: "ticker-list",
     minimumSymbols: 2,
     build: buildComparisonChartPreset,
+    settings: { [CHART_LEVERAGE_PENDING_SETTING_KEY]: true },
   }),
   securityTemplate({
     id: "fundamental-graph-pane",

@@ -1,10 +1,30 @@
 import { THEME_PERIODS, type ThemeAggregate, type ThemeMember, type ThemePeriod, type ThemeSummary } from "../../../api-client/themes";
 import type { DataTableColumn } from "../../../components";
-import { getTableWidth } from "../../../components/ui/table-layout";
+import { dropColumnsToFit, getTableWidth } from "../../../components/ui/table-layout";
 import { extendedSessionStateLabel, type ExtendedSession } from "../../../market-data/market/status";
+import { yearToDateBaseLabel } from "../../../market-data/market/year-to-date";
 import { compareSortValues, type SortDirection } from "../../../utils/sort-values";
 
-export const PERIOD_LABELS: Record<ThemePeriod, string> = { changePercent: "1D", return1WPercent: "1W", return1MPercent: "1M", return3MPercent: "3M", returnYtdPercent: "YTD" };
+const PERIOD_LABELS: Record<ThemePeriod, string> = { changePercent: "1D", return1WPercent: "1W", return1MPercent: "1M", return3MPercent: "3M", returnYtdPercent: "YTD" };
+
+/**
+ * The close a board's YTD is measured from, `31 Dec`: NYSE's last session of
+ * the year before the session the board describes, as the server measures it.
+ */
+export function boardYtdBase(payload: { asOf?: unknown; regularSessionDate?: unknown; regularSessionClosedAt?: unknown }, now = Date.now()): string {
+  const day = boardClose(payload)?.date ?? (typeof payload.asOf === "string" && /^\d{4}-\d{2}-\d{2}/.test(payload.asOf) ? payload.asOf.slice(0, 10) : new Date(now).toISOString().slice(0, 10));
+  return yearToDateBaseLabel(day, "NYSE", now);
+}
+
+/**
+ * A period's header. YTD names its base close, as long as `room` allows:
+ * `YTD vs 31 Dec close`, `YTD vs 31 Dec`, then `YTD 31 Dec`.
+ */
+export function periodLabel(period: ThemePeriod, ytdBase: string | null, room = Infinity): string {
+  if (period !== "returnYtdPercent" || !ytdBase) return PERIOD_LABELS[period];
+  const labels = [`YTD vs ${ytdBase} close`, `YTD vs ${ytdBase}`, `YTD ${ytdBase}`];
+  return labels.find((label) => label.length <= room) ?? labels.at(-1)!;
+}
 export interface ThemeSort { columnId: string; direction: SortDirection }
 export const DEFAULT_SORT: ThemeSort = { columnId: "changePercent", direction: "desc" };
 export function percent(value: number | null): string {
@@ -53,7 +73,7 @@ export function boardClose(payload: { regularSessionDate?: unknown; regularSessi
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
 /** `Fri 9 Oct close` for the US session dated 2026-10-09, named by its own day, never the reader's. */
-function closeLabel(date: string): string {
+export function closeLabel(date: string): string {
   const day = new Date(`${date}T00:00:00Z`);
   return `${WEEKDAYS[day.getUTCDay()]} ${day.getUTCDate()} ${MONTHS[day.getUTCMonth()]} close`;
 }
@@ -62,13 +82,23 @@ function closeLabel(date: string): string {
  * How current the board is, for its footer. Outside the regular session the
  * close its figures describe and how old the snapshot is, `Fri 9 Oct close ·
  * snapshot 12m ago`; while a session trades, or from a server that does not
- * name the close, the delay and the snapshot's age. `age` is the relative age
- * (`12m ago`).
+ * name the close, whether its prices are live (a Pro account's) or delayed,
+ * and the snapshot's age, which the longer returns start from. `age` is the
+ * relative age (`12m ago`).
  */
-export function snapshotFooterText(payload: { regularSessionDate?: unknown; regularSessionClosedAt?: unknown }, age: string): string {
+export function snapshotFooterText(payload: { regularSessionDate?: unknown; regularSessionClosedAt?: unknown; access?: unknown }, age: string): string {
   const close = boardClose(payload);
-  return close ? `${closeLabel(close.date)} · snapshot ${age}` : `15m delayed · snapshot ${age}`;
+  if (close) return `${closeLabel(close.date)} · snapshot ${age}`;
+  return `${isLiveBoard(payload) ? "live" : "15m delayed"} · snapshot ${age}`;
 }
+
+/** Whether a board's prices are real-time: a Pro account's, priced from the server's live read. */
+export function isLiveBoard(payload: { access?: unknown } | null | undefined): boolean {
+  return payload?.access === "realtime";
+}
+
+/** How often a board is worth checking again: the server renews a live board's prices every 15 seconds. */
+export const LIVE_BOARD_REFRESH_MS = 15_000;
 
 /** A member's pre-market or after-hours print and its move from the close in Price, when it has a valid one. */
 export function memberExtended(row: ThemeMember): { session: ExtendedSession; price: number; change: number | null; changePercent: number | null } | null {
@@ -110,17 +140,27 @@ export function matchTheme(rows: readonly ThemeSummary[], input: string): ThemeS
 }
 
 const column = (id: string, label: string, width: number, align: "left" | "right" = "right"): DataTableColumn => ({ id, label, width, align });
-/** Drop leaders/laggards first, then longer windows; keep the day's move and breadth. */
-export function themeColumns(width: number, rows: readonly ThemeSummary[]): DataTableColumn[] {
+/** Room a header has in its column: the sort indicator takes two cells. */
+const HEADER_ROOM = 2;
+/**
+ * Drop leaders/laggards first, then longer windows; keep the day's move and
+ * breadth. YTD names `ytdBase`, the close it is measured from, as fully as
+ * its column allows.
+ */
+export function themeColumns(width: number, rows: readonly ThemeSummary[], ytdBase: string | null = null): DataTableColumn[] {
   const suffixWidth = (period: ThemePeriod) => coverageWidth(rows.map((row) => row.returns[period]));
   const metricWidth = (period: ThemePeriod) => Math.max(8, ...rows.map((row) => percent(row.returns[period].value).length)) + suffixWidth(period);
+  // The same trailing space is reserved in every cell and its header. A note
+  // occupies that space without moving the number away from its label.
+  const label = (period: ThemePeriod, room?: number) => periodLabel(period, ytdBase, room) + " ".repeat(suffixWidth(period));
   const columns = [column("name", "Theme", 26, "left"), column("memberCount", "N", 3),
-    // The same trailing space is reserved in every cell and its header. A note
-    // occupies that space without moving the number away from its label.
-    ...THEME_PERIODS.map((period) => column(period, PERIOD_LABELS[period] + " ".repeat(suffixWidth(period)), metricWidth(period))),
+    ...THEME_PERIODS.map((period) => column(period, label(period, 0), Math.max(metricWidth(period), label(period, 0).length + HEADER_ROOM))),
     column("breadth", "Breadth" + " ".repeat(coverageWidth(rows.map((row) => row.breadth))), 7 + coverageWidth(rows.map((row) => row.breadth))),
     column("best", "Best 1D", 15), column("worst", "Worst 1D", 15)];
-  return fitColumns(columns, width, ["worst", "best", "return3MPercent", "returnYtdPercent", "return1MPercent", "return1WPercent", "memberCount"]);
+  const fitted = fitColumns(columns, width, ["worst", "best", "return3MPercent", "returnYtdPercent", "return1MPercent", "return1WPercent", "memberCount"]);
+  const ytd = fitted.find((col) => col.id === "returnYtdPercent");
+  if (ytd) ytd.label = label("returnYtdPercent", ytd.width - HEADER_ROOM - suffixWidth("returnYtdPercent"));
+  return fitted;
 }
 /**
  * The member table at `width`. Price and 1D are the regular session's; a
@@ -128,19 +168,19 @@ export function themeColumns(width: number, rows: readonly ThemeSummary[]): Data
  * each session in `extendedSessions`. A narrow pane gives up the longer
  * windows first, then that column, then the name.
  */
-export function memberColumns(width: number, extendedSessions: readonly ExtendedSession[] = []): DataTableColumn[] {
+export function memberColumns(width: number, extendedSessions: readonly ExtendedSession[] = [], ytdBase: string | null = null): DataTableColumn[] {
   const extended = extendedSessions.map((session) => column(session === "PRE" ? "preMarket" : "afterHours", extendedSessionStateLabel(session), 9));
-  const [day, ...windows] = THEME_PERIODS.map((period) => column(period, PERIOD_LABELS[period], 9));
-  return fitColumns([column("symbol", "Ticker", 7, "left"), column("name", "Name", 24, "left"), column("price", "Price $", 10),
+  const [day, ...windows] = THEME_PERIODS.map((period) => column(period, periodLabel(period, ytdBase, 0), Math.max(9, periodLabel(period, ytdBase, 0).length + HEADER_ROOM)));
+  const fitted = fitColumns([column("symbol", "Ticker", 7, "left"), column("name", "Name", 24, "left"), column("price", "Price $", 10),
     day!, ...extended, ...windows], width,
   ["return3MPercent", "returnYtdPercent", "return1MPercent", "return1WPercent", "preMarket", "afterHours", "name", "price"]);
+  const ytd = fitted.find((col) => col.id === "returnYtdPercent");
+  if (ytd) ytd.label = periodLabel("returnYtdPercent", ytdBase, ytd.width - HEADER_ROOM);
+  return fitted;
 }
 function fitColumns(columns: DataTableColumn[], width: number, drop: string[]): DataTableColumn[] {
+  columns = dropColumnsToFit(columns, width, drop);
   const used = () => getTableWidth(columns);
-  for (const id of drop) {
-    if (used() <= width) break;
-    columns = columns.filter((col) => col.id !== id);
-  }
   const name = columns.find((col) => col.id === "name") ?? columns[0]!;
   const spare = width - used();
   name.width = Math.max(8, name.width + Math.min(spare, Math.max(0, 36 - name.width)));

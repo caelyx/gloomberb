@@ -1,8 +1,8 @@
 import { cliStyles, cliTerminalWidth, renderDefinitions, renderSection, wrapText } from "../utils/cli-output";
 
 /**
- * Plain-words meanings of the rates, auction, energy, perpetual-futures, portfolio,
- * fund, short interest, quote-board, futures (basis, contango, roll yield) and economic-calendar terms the functions
+ * Plain-words meanings of the rates, auction, credit and bond yield, energy, perpetual-futures, portfolio,
+ * fund, bond fund (SEC yield, tax-equivalent yield, muni/Treasury ratio), short interest, quote-board, futures (basis, contango, roll yield), VIX curve (term structure, 3M/30D, VVIX), CFTC positioning (COT trader classes, net % of open interest), depositary receipt (ADR ratio, premium, implied FX, the peso's CCL and MEP rates) and economic-calendar terms the functions
  * show in their rows, headers and footers.
  * `catalog glossary` lists them, `catalog explain <term>` prints one, and
  * `fn <function> --explain` and `portfolio show --explain` follow a report with
@@ -22,6 +22,12 @@ export interface GlossaryEntry {
    * A row type can stand for it: an AUCT Note row's rate is a high yield.
    */
   shown?: readonly string[];
+  /**
+   * The labels one function prints it under, in place of `shown` for that
+   * function: TRACE heads its yield to worst column `Yield`, a word DVD and ETF
+   * print in other yields.
+   */
+  shownBy?: Readonly<Record<string, readonly string[]>>;
   /** One or two plain sentences. */
   definition: string;
 }
@@ -29,8 +35,10 @@ export interface GlossaryEntry {
 export const GLOSSARY: readonly GlossaryEntry[] = [
   // Treasury auctions (AUCT).
   {
-    term: "Bid-to-cover", short: "B/C", aliases: ["btc", "cover ratio"], functions: ["AUCT"],
-    definition: "Dollars bid for every dollar of securities the Treasury sold. A higher ratio means more demand.",
+    term: "Bid-to-cover", short: "B/C", aliases: ["btc", "cover ratio", "auction cover"], functions: ["AUCT", "EPWR"],
+    shown: ["Bid-to-cover", "B/C", "Cover"],
+    definition: "What bidders asked for over what was sold: dollars bid for every dollar of securities the Treasury sold, or, as an EUA auction's Cover, "
+      + "allowances bid for over allowances on offer (2.09x is bids for about twice the volume). A higher ratio means more demand.",
   },
   {
     term: "Indirect", aliases: ["indirect bidders", "indirect bid", "indirect share"], functions: ["AUCT"],
@@ -167,6 +175,25 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     term: "JGB", aliases: ["jgbs", "japanese government bond"], functions: ["GC"],
     definition: "A Japanese government bond.",
   },
+  // When in the day a US 10-year yield is taken: GC and ECST name it beside their date, `quote ^TNX` in its source line.
+  {
+    term: "Treasury end of day", aliases: ["15:30 et", "treasury close", "treasury cut-off", "dgs10 cut-off", "par curve cut-off", "cut-off"],
+    functions: ["GC", "ECST"], shown: ["15:30 ET"],
+    definition: "When the Treasury's daily par yield curve is taken: bid-side quotes the New York Fed collects near 15:30 ET. "
+      + "GC's US curves and FRED's constant-maturity yields (DGS10, DGS2, DFII10, T10Y2Y) come from it, so they name that time beside their date.",
+  },
+  {
+    term: "^TNX", aliases: ["cboe 10-year yield index", "10-year yield index", "cboe close", "15:00 et close"], functions: ["GC", "ECST"],
+    definition: "The Cboe 10-year Treasury yield index, the yield in percent, which closes at 15:00 ET. The Treasury curve and DGS10 are taken "
+      + "near 15:30 ET, so a late move can leave the two 10-year yields for one day a basis point or two apart; neither is wrong.",
+  },
+  {
+    term: "Move pctl", aliases: ["move rank", "move percentile", "1d pctl", "1w pctl", "big day"], functions: ["GC", "ECST"],
+    shown: ["1D pctl", "1W pctl", "pctl since"],
+    definition: "How big a 1D or 1W move was against every move of the same horizon in the series' history, by size in either direction: "
+      + "the share of them that were smaller, ties counted half, so 95 is bigger than 95% of them. The year after since (GC: Since) is where that history starts. "
+      + "A 1W move is from the last observation on or before the same day a week earlier.",
+  },
   // Money markets (BTMM).
   {
     term: "SOFR", aliases: ["secured overnight financing rate", "repo rate"], functions: ["BTMM", "WIRP"],
@@ -215,7 +242,7 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     definition: "The first date the new rate level appears in the data, not necessarily the announcement or effective date.",
   },
   {
-    term: "Pctl 1Y", aliases: ["percentile", "1y percentile", "pctl"], functions: ["BTMM", "WIRP", "CBR"],
+    term: "Pctl 1Y", aliases: ["percentile", "1y percentile", "1-year percentile", "pctl"], functions: ["BTMM", "WIRP", "CBR", "CDX", "SOVR", "COT"],
     definition: "Where today's value ranks against the past year of the same series: 100 is the highest, 0 the lowest.",
   },
   {
@@ -287,11 +314,35 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     definition: "EU Allowance: the right to emit one tonne of CO2 under the EU Emissions Trading System, priced in euros per tonne.",
   },
   {
+    term: "1Y range", aliases: ["52-week range", "52w range", "52w low", "52w high", "in 1y range"], functions: ["EPWR"],
+    shown: ["In 1Y range", "52W low", "52W high"],
+    definition: "The lowest and highest daily price of the past 52 weeks. In 1Y range places the latest price between them: 0% at the low, 100% at the high.",
+  },
+  // European gas storage (EPWR GAS).
+  {
+    term: "Gas day", aliases: ["gas days", "eu gas day"], functions: ["EPWR"], shown: ["Gas day", "gas day"],
+    definition: "The day gas storage is counted by, 06:00 to 06:00 Central European time, named by the date it starts; a row's level is the gas in storage at its end. "
+      + "Each area is dated by its own latest gas day, so an area whose operators report early can be a day ahead of the EU total.",
+  },
+  {
+    term: "Estimated", short: "est", aliases: ["estimate", "confirmed", "gas storage status"], functions: ["EPWR"], shown: ["estimated", "est"],
+    definition: "A gas day the storage operators have not confirmed yet, so its figures may change. The current gas day is always an estimate, "
+      + "and the EU total stays estimated while any operator's day is. Confirmed days can still be revised later.",
+  },
+  {
+    term: "5Y range", aliases: ["five-year range", "5-year range", "5y low", "5y avg", "5y high", "5y years", "in 5y range"], functions: ["EPWR"],
+    shown: ["5Y low", "5Y avg", "5Y high", "5Y years", "In 5Y range"],
+    definition: "The lowest, average and highest % full on the same calendar day in the five years before the gas day's own; 5Y years counts those with a reading, "
+      + "fewer where history is short. In 5Y range places the day between that low (0%) and high (100%), and says below or above outside it.",
+  },
+  {
     term: "Front month", aliases: ["front-month", "front contract", "continuous contract", "front-month contract", "most active", "most active contract"],
     functions: ["FUT", "CTM"], shown: ["most active"],
-    definition: "The nearest contract still trading, which is the one about to expire. Rolls follow volume: a continuous symbol (CL=F), "
-      + "and FUT with it, moves to the next contract when that one becomes the most active (it holds more open interest, or trades more "
-      + "where none is reported), usually days before expiry, and until then FUT names the nearer contract and its expiry.",
+    definition: "The nearest contract still trading, which is the one about to expire. A continuous symbol (CL=F) and the first generic (CL1), "
+      + "and FUT with them, stay on it until a stated roll date: one business day before its last trade for most roots (before first "
+      + "notice where delivery notices come first), two for WTI crude and Henry Hub gas so their mini and micro contracts roll with them, "
+      + "six for equity index and currency futures, none for VX. `quote` prints the date. "
+      + "The most active contract is a separate reading: the one with the most volume on the latest session, which FUT names beside the front.",
   },
   // Perpetual futures (PERP).
   {
@@ -305,11 +356,12 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     shown: ["Funding %/int", "Funding 8h", "Paid %/int", "APR %"],
     definition: "A regular payment between the two sides of a perpetual contract, set to pull its price toward the asset's. "
       + "Positive means longs pay shorts, negative means shorts pay longs, so a basis trade (long spot, short the perpetual) collects it when positive. "
-      + "APR % is the current 8h rate × 3 × 365: a simple annualisation of the rate now, not funding actually paid.",
+      + "APR % is the current rate times the payments a year at the market's own interval (1h rate × 24 × 365, 8h rate × 3 × 365): "
+      + "a simple annualisation of the rate now, not funding actually paid.",
   },
   {
-    term: "Open interest", short: "OI", aliases: ["open interest usd"], functions: ["PERP"],
-    definition: "The total value of contracts that are open and not yet closed, counting each buyer and seller pair once, usually in dollars. "
+    term: "Open interest", short: "OI", aliases: ["open interest usd"], functions: ["PERP", "COT"],
+    definition: "The contracts that are open and not yet closed, counting each buyer and seller pair once: COT counts them, PERP gives their value, usually in dollars. "
       + "It rises as new positions open and falls as they close.",
   },
   {
@@ -320,7 +372,8 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   // Portfolio weights and rebalancing (PF, portfolio show).
   {
     term: "Weight", aliases: ["weights", "portfolio weight", "allocation weight"], functions: ["PF"],
-    definition: "A holding's share of the portfolio's total value, cash included, in percent. A holding without a price is left out of the total.",
+    definition: "A holding's share of the portfolio's total value, cash included, in percent. A holding without a price is left out of the total. "
+      + "In a book that holds a short, its signed value's share of gross exposure instead, longs plus shorts at their absolute value, so a short weighs negative and cash has no weight.",
   },
   {
     term: "Target", aliases: ["target weight", "target weights", "targets", "target allocation"], functions: ["PF"],
@@ -337,9 +390,11 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   },
   {
     // Drift prints it after each figure (+2.3pp), never as a word of its own.
-    term: "Percentage point", short: "pp", aliases: ["percentage points", "percent points", "ppt"], functions: ["PF"],
-    shown: ["Drift"],
-    definition: "The plain difference between two percentages. A 22% weight against a 20% target is 2pp over it, not 10%.",
+    term: "Percentage point", short: "pp", aliases: ["percentage points", "percent points", "ppt"], functions: ["PF", "EPWR"],
+    // EPWR heads its columns with it (1D pp, Vs 1Y pp).
+    shown: ["Drift", "pp"],
+    definition: "The plain difference between two percentages. A 22% weight against a 20% target is 2pp over it, not 10%, "
+      + "and gas storage going from 74.31% to 74.46% full is up 0.15pp.",
   },
   // Financial statements and ratios (FA).
   {
@@ -375,6 +430,139 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     definition: "How loosely a fund follows its index: how much the gap between the fund's return and the index's swings, usually over a year. "
       + "Fees, cash and holdings that differ from the index widen it.",
   },
+  // A depositary receipt beside its home listing (ADR, DES), and the peso's market dollar rates `fx USD/ARS` lists.
+  {
+    term: "ADR ratio", aliases: ["adr", "adrs", "depositary receipt", "american depositary receipt", "depositary ratio", "ads ratio"],
+    functions: ["ADR", "DES"], shown: ["Ratio", "ADR Ratio", "ADR ratio"],
+    definition: "How many ordinary shares one depositary receipt holds: 1 ADR = 10 ordinary shares means one GGAL in New York is ten GGAL.BA shares in Buenos Aires. "
+      + "A receipt's price compares with its home price only once the home price is multiplied by the ratio.",
+  },
+  {
+    term: "ADR premium", aliases: ["adr discount", "adr vs home", "receipt premium", "adr premium/discount"],
+    functions: ["ADR"], shown: ["ADR vs home", "premium", "discount"],
+    definition: "How far a receipt trades above (a premium) or below (a discount) the home shares it holds, at the spot rate: spot / implied rate - 1. "
+      + "Arbitrage keeps it small where money moves freely; where it cannot (Argentina's controls, Taiwan's limits on foreign buying) it runs to several percent.",
+  },
+  {
+    term: "Implied FX", aliases: ["implied exchange rate", "implied dollar rate", "implied fx rate", "adr implied rate"],
+    functions: ["ADR"], shown: ["Implied"],
+    definition: "The exchange rate at which a receipt and its home shares cost the same: home price × ratio / ADR price. "
+      + "GGAL.BA at ARS 6,260, 10 shares a receipt and GGAL at $37.91 imply 6,260 × 10 / 37.91 = 1,651 pesos a dollar.",
+  },
+  {
+    term: "Contado con liquidación", short: "CCL", aliases: ["contado con liquidacion", "contado con liqui", "dolar ccl", "ccl rate", "blue chip swap"],
+    functions: ["ADR"],
+    definition: "The peso's dollar rate for moving money abroad through securities: buy shares in pesos in Buenos Aires, sell them (or their ADR) for dollars abroad. "
+      + "Read from an ADR pair (home × ratio / ADR) or a BYMA C line (peso price / C-line dollar price); it runs above the official wholesale rate.",
+  },
+  {
+    term: "Mercado electrónico de pagos", short: "MEP", aliases: ["mercado electronico de pagos", "dolar mep", "dolar bolsa", "mep rate"],
+    functions: ["ADR"],
+    definition: "The peso's dollar rate inside Argentina through securities: buy shares in pesos and sell their BYMA D line for dollars paid in Argentina. "
+      + "Read as the peso price over the D line's dollar price; it sits near the CCL rate, usually a little under it.",
+  },
+  // Bond spreads and yields (CRD, the data catalog's ICE BofA yields, TRACE), a fund's SEC yield, which DVD's cash yield is not,
+  // and the bond fund figures and tax-equivalent maths DVD and fundamentals give with --tax-rate.
+  {
+    term: "Option-adjusted spread", short: "OAS", aliases: ["spread over treasuries", "corporate spread"], functions: ["CRD"],
+    definition: "How much more a corporate bond index yields than Treasuries of the same maturities, once the value of the issuers' right to call their bonds early is taken out. "
+      + "CRD shows the ICE BofA indexes' spreads in basis points; a wider spread means investors want more for the credit risk.",
+  },
+  {
+    term: "Effective yield", aliases: ["effective yields", "index effective yield", "ice effective yield"], functions: ["CAT"],
+    shown: ["effective yield", "Effective Yield"],
+    definition: "The yield of an ICE BofA bond index: its bonds' yields averaged by market value, allowing for the calls in callable bonds. "
+      + "fred serves the US corporate (investment grade) index's for all maturities, by maturity from 1-3 to 15+ years and by rating (fred --list credit), "
+      + "so a corporate bond can be read against the Treasury of its tenor.",
+  },
+  {
+    term: "SEC yield", aliases: ["30-day yield", "30-day sec yield", "30 day sec yield", "sec 30-day yield", "standardized yield", "sec yld"],
+    functions: ["DVD", "ETF"], shown: ["SEC yield", "30-day SEC yield", "30-Day SEC Yield", "SEC yld"],
+    definition: "A fund's yield in the formula the SEC sets so funds compare alike: the income its holdings earned over the latest 30 days, after expenses, annualized over the share price. "
+      + "Fund issuers publish it, dated; DVD's trailing yield is the past 12 months' distributions over the price instead, so the two differ, most for bond funds, "
+      + "and DVD, fundamentals and DES show a bond fund's SEC yield beside its distribution yield.",
+  },
+  {
+    term: "Yield to worst", short: "YTW", aliases: ["worst yield", "yield-to-worst"], functions: ["TRACE", "DVD", "ETF"],
+    shown: ["Yield to worst", "Yield to Worst", "Yld to Worst"], shownBy: { TRACE: ["Yield"] },
+    definition: "The lowest yield a bond can pay without its issuer defaulting: the lower of its yield to maturity and its yield to each date it can be called. "
+      + "The yield TRACE shows for a sale is this one, worked out from the sale price; a bond fund's is the average over its holdings, as its sponsor publishes it.",
+  },
+  {
+    term: "Distribution yield", aliases: ["dist yield", "dist yld", "fund distribution yield"], functions: ["DVD"],
+    shown: ["distribution yield", "Distribution Yield", "Fwd dist yld", "TTM dist yld"],
+    definition: "The cash a fund paid, annualized over its price: the latest distribution times its frequency (forward), or the last 12 months' (trailing). "
+      + "For a bond fund it is not the SEC yield, and DVD and fundamentals say so beside it: MUB's forward distribution yield read 3.27% on a 4.04% SEC yield in October 2026.",
+  },
+  {
+    term: "Duration", aliases: ["effective duration", "average duration", "option-adjusted duration", "eff duration", "avg duration"],
+    functions: ["DVD", "ETF"], shown: ["Effective duration", "Average duration", "Effective Duration", "Average Duration", "Eff Duration", "Avg Duration"],
+    definition: "How far a bond fund's price moves when rates move: 7 years of duration is about 7% for a 1 percentage point change. "
+      + "Effective (option-adjusted) duration allows for calls; Vanguard publishes an average duration as of the month end.",
+  },
+  {
+    term: "Tax-equivalent yield", short: "TEY", aliases: ["tax equivalent yield", "taxable equivalent yield", "taxable-equivalent yield", "tax equivalent"],
+    functions: ["DVD"], shown: ["Tax-equivalent yield", "Tax-Equivalent Yield"],
+    definition: "The yield a taxable bond needs to match a tax-exempt muni fund after tax: yield / (1 - (federal rate + state rate)), on the SEC yield, "
+      + "else the distribution yield. At 40.8% (37% plus the 3.8% net investment income tax), MUB's 4.04% is 6.83%. A state rate counts only for a "
+      + "single-state fund of that state (CMF, VTEC for California). gloom fn DVD and fundamentals take --tax-rate, --state-rate and --state.",
+  },
+  {
+    term: "Muni/Treasury ratio", aliases: ["muni treasury ratio", "muni-to-treasury ratio", "muni/ust ratio", "muni ratio", "municipal treasury ratio"],
+    functions: ["DVD"], shown: ["Muni/Treasury ratio"],
+    definition: "A muni yield over the Treasury yield of the same maturity, both before tax: under 100% munis yield less than Treasuries, as their tax "
+      + "exemption usually makes them. DVD and fundamentals divide a muni fund's SEC yield by the GC Treasury par yield at the tenor nearest its duration "
+      + "(MUB's 7.13 years: the 7Y). Market ratios read the AAA muni curve, MMD or BVAL, which are licensed and not in the terminal.",
+  },
+  // Index and sovereign CDS (CDX, SOVR), in the order CDX's columns run, then the trade terms behind them.
+  {
+    term: "5Y level", aliases: ["5y spread", "5y price", "cds level", "index level"], functions: ["CDX", "SOVR"], shown: ["5Y"],
+    definition: "The day's level of the 5-year contract on the run, from that day's public DTCC prints. CDX IG, iTraxx Main and Crossover and the sovereigns "
+      + "quote a spread in basis points; CDX HY and EM a price in points of par (see Points).",
+  },
+  {
+    term: "Complete day", aliases: ["so far", "partial day", "day so far", "today so far"], functions: ["CDX"], shown: ["1D", "Day"],
+    definition: "A day of index prints is complete once New York's trade date has turned. Until then today's level and prints are so far: Day says how many prints "
+      + "and the last one's time (UTC), and 1D, 1W and 1M compare complete days, 1D the last complete day against the one before, on one contract across a roll.",
+  },
+  {
+    term: "Spread equivalent", short: "Spread eq", aliases: ["spread-equivalent", "conventional spread", "quoted spread", "price to spread"], functions: ["CDX"],
+    definition: "CDX HY's and EM's price as the spread a 5-year contract would quote, in basis points, to read against a spread such as HY OAS. The ISDA standard model: "
+      + "a flat hazard rate, the index's coupon (HY 500bp, EM 100bp) and standard recovery (HY 30%, EM 25%), the contract's maturity and that day's flat USD rate. "
+      + "Price 100 is the coupon; each point above par takes about 20 to 25bp off it. A model figure, not a traded spread.",
+  },
+  {
+    term: "Prints", aliases: ["print count", "dtcc prints"], functions: ["CDX"],
+    definition: "How many public DTCC trades on the day's contract its level rests on, after prints far from the median are dropped. "
+      + "A day with fewer than three stands only beside a busier day within two weeks that agrees with it.",
+  },
+  {
+    term: "As of", aliases: ["as-of", "level date", "observation date"], functions: ["CDX", "SOVR"],
+    definition: "The New York trade date the row's level is from, which every exported row carries as its as_of. A thinly traded name's can be days old; "
+      + "past five days the board marks it stale.",
+  },
+  {
+    term: "Points", aliases: ["points upfront", "price points", "pts", "points of par"], functions: ["CDX"], shown: ["CDX HY", "CDX EM", "Price", "pts"],
+    definition: "CDX HY and EM trade on price in points of par: 100 less the upfront. At 106.00 the protection buyer receives 6% of the notional up front "
+      + "and pays the running coupon. Their moves are in points: -0.13 is 13 cents per 100 of notional, and a falling price is a widening spread.",
+  },
+  {
+    term: "Upfront", aliases: ["upfront fee", "upfront payment", "upfront amount", "abs upfront"], functions: ["CDX", "CDS"], shown: ["CDX HY", "CDX EM", "Spread eq", "Abs upfront"],
+    definition: "The cash that changes hands when a CDS trades, as a share of the notional, because the contract pays a standard coupon (100bp or 500bp) instead of its own spread: "
+      + "the protection buyer pays it when the spread is above the coupon and receives it below. The trade also settles the coupon accrued since the last quarterly date (Mar, Jun, Sep, Dec 20).",
+  },
+  {
+    term: "Index roll", aliases: ["series roll", "cdx roll", "itraxx roll", "roll day", "on the run", "on-the-run", "new series"], functions: ["CDX"], shown: ["Contract"],
+    definition: "Credit indexes start a new series every Mar 20 and Sep 20, its 5-year contract maturing five years and three months later (Dec 2031 from Sep 2026). "
+      + "The board follows the series on the run, the new one from the first day it prints at least half as often as the old; across a roll moves stay on one contract.",
+  },
+  // Backtests (BT).
+  {
+    term: "Price return", aliases: ["price returns", "distributions not included"], functions: ["BT"],
+    shown: ["Price return (distributions not included)", "price return (distributions not included)"],
+    definition: "The change in the close alone. BT's closes are not adjusted for dividends or fund distributions, so its returns, CAGR and growth-of-1 curves leave them out: "
+      + "an income fund such as HYG returns more in total than BT shows. Borrow and cash interest are not modelled either.",
+  },
   // Short interest (SI, SIW) and daily short volume (SIV).
   {
     term: "Short interest", short: "SI", aliases: ["shares short", "short position", "short positions", "short shares"],
@@ -404,8 +592,9 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     term: "Float", aliases: ["free float", "public float", "float shares", "floating stock", "% float", "percent of float"],
     functions: ["SI", "SIW"], shown: ["Float"],
     definition: "The shares open to public trading: those outstanding less shares held by insiders and strategic holders, never more than the shares outstanding. "
-      + "% Float is shares short over today's float, so a settlement is measured against the float as it is now, not as it was then; "
-      + "SI gives it for the latest settlement only.",
+      + "The float is the source's own, held within the 10-K or 10-Q cover count and undated; a float held at that count is the count, dated by it. "
+      + "SIW's % Float is the latest settlement's shares short over today's float; SI reads each earlier settlement over the float when FINRA published it: "
+      + "the cover count known that day, at the share of today's count that floats.",
   },
   {
     // SIW's Setup column prints these two words.
@@ -465,7 +654,7 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   {
     term: "Futures contract", aliases: ["futures", "future", "futures contracts", "contract", "contract month", "expiry", "expiration"],
     functions: ["FUT", "CTM"], shown: ["CONTRACT", "Contract"],
-    definition: "An agreement to buy or sell something, such as oil, gold or the S&P 500, at a set price on a set date. Each contract has a month (Dec 26) and expires, "
+    definition: "An agreement to buy or sell something, such as oil, gold or the S&P 500, at a set price on a set date. Each contract has a month (Dec 2026) and expires, "
       + "and most traders close out before then. A contract's own Settlement line says how it ends: in cash or by physical delivery.",
   },
   {
@@ -473,6 +662,59 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     functions: ["FUT", "CTM"], shown: ["Settle", "PREV"],
     definition: "A futures contract's official price for the day, set by its exchange from trading near the close. "
       + "The day's change and margin are measured from it, and it can differ from the last trade. FUT's PREV is the previous one.",
+  },
+  // CFTC positioning (COT): the legacy report's trader classes, then the disaggregated report's.
+  {
+    term: "Commitments of Traders", short: "COT", aliases: ["cot report", "commitment of traders", "cftc", "cftc report", "cftc positioning", "positioning"],
+    functions: ["COT"], shown: ["CFTC", "COT"],
+    definition: "The CFTC's weekly count of who holds each US futures market: open contracts split by type of trader, as of Tuesday and published that Friday. "
+      + "It shows whether speculators or hedgers are net long or short, and how that moved since the week before.",
+  },
+  {
+    term: "Noncommercial", aliases: ["non-commercial", "noncommercials", "large speculators", "speculators", "large specs"], functions: ["COT"],
+    definition: "Large traders who do not hedge a business with the contract, such as funds and other speculators. "
+      + "Their net position is the one most often read as the market's bet.",
+  },
+  {
+    term: "Commercial", aliases: ["commercials", "hedgers", "commercial hedgers"], functions: ["COT"],
+    definition: "Large traders who use the contract to hedge a business: producers, processors, merchants and dealers. "
+      + "In a commodity they are usually net short, selling ahead what they will grow, mine or deliver.",
+  },
+  {
+    term: "Nonreportable", aliases: ["non-reportable", "nonreportables", "small traders", "small speculators"], functions: ["COT"],
+    definition: "Traders too small to report their positions to the CFTC, counted as open interest less every reported position. Mostly smaller speculators.",
+  },
+  {
+    term: "Net position", short: "Net", aliases: ["net long", "net short", "net positioning", "net spec"], functions: ["COT"], shown: ["Net"],
+    definition: "A group's long contracts less its short ones: positive is net long, negative net short.",
+  },
+  {
+    term: "Net % of open interest", short: "Net % OI", aliases: ["% of open interest", "percent of open interest", "net percent of open interest"], functions: ["COT"],
+    definition: "A group's net position as a share of all open contracts, so markets of different sizes compare: +8.3% means its longs exceed its shorts by 8.3% of open interest.",
+  },
+  {
+    term: "Weekly change", short: "1W Δ", aliases: ["1w change", "week change", "weekly net change"], functions: ["COT"],
+    definition: "How far a group's net position moved since the previous weekly report, in contracts.",
+  },
+  {
+    term: "Pctl 3Y", aliases: ["3y percentile", "3-year percentile", "three-year percentile"], functions: ["COT"],
+    definition: "Where this week's net position ranks against the past three years of weekly reports: 100 is the most net long it has been, 0 the most net short.",
+  },
+  {
+    term: "Managed money", aliases: ["money managers", "managed money traders", "hedge funds", "ctas"], functions: ["COT"], shown: ["Managed Money"],
+    definition: "The disaggregated report's funds that trade futures for clients, such as hedge funds and CTAs: the speculators most often watched.",
+  },
+  {
+    term: "Producer/merchant", aliases: ["producers", "merchants", "producer merchant", "processors"], functions: ["COT"], shown: ["Producer/Merchant"],
+    definition: "The disaggregated report's growers, miners, processors and merchants that hedge the physical commodity they produce or handle.",
+  },
+  {
+    term: "Swap dealers", aliases: ["swap dealer", "swaps dealers"], functions: ["COT"], shown: ["Swap Dealers"],
+    definition: "The disaggregated report's banks and dealers that hedge the commodity swaps they sell to clients, often index investors.",
+  },
+  {
+    term: "Other reportables", aliases: ["other reportable", "other reportable traders"], functions: ["COT"], shown: ["Other Reportables"],
+    definition: "The disaggregated report's large traders that fit none of its other classes, such as proprietary traders and family offices.",
   },
   // Futures basis and curve shape (CTM, FUT, PERP).
   {
@@ -484,8 +726,16 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   {
     term: "Annualised basis", aliases: ["annualized basis", "ann basis", "ann. basis", "basis annualised"], functions: ["CTM", "PERP"], shown: ["Ann Basis", "ANN BASIS"],
     definition: "The basis restated as a yearly rate, so contracts of different length compare with each other and with a perpetual's funding APR: "
-      + "(Last / spot - 1) × 365 / days to expiry, simple rather than compounded, on the latest trade against the spot quote. "
-      + "Inside 30 days a few basis points of spot noise move it by whole points: 10 bp is about ±2 points at 18 days to expiry.",
+      + "(Last / spot - 1) × 365 / days to expiry, simple rather than compounded. CTM reads each last trade against spot in the same minute "
+      + "and counts days to final settlement to the hour. Inside a week a few basis points of spot noise move it by whole points "
+      + "(10 bp is about ±5 points at 7 days), so CTM greys it there and Vs Spot is the figure to read.",
+  },
+  {
+    term: "Crypto composite price", aliases: ["CCC", "crypto composite", "composite price", "composite crypto price"], functions: ["CTM"],
+    shown: ["crypto composite price"],
+    definition: "A coin's dollar price blended from trading on several crypto exchanges rather than taken from one, quoted around the clock; "
+      + "quotes list it under the code CCC. CTM reads CME crypto futures against it, while the futures settle to CME's own reference rate, "
+      + "so a small gap at expiry is expected.",
   },
   {
     term: "Contango", aliases: ["contango curve", "upward curve"], functions: ["CTM", "FUT"], shown: ["contango", "Contango"],
@@ -503,6 +753,67 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     definition: "What a long future earns or loses as it is rolled into the next contract. CTM's annualised roll yield is the front price over the next contract's "
       + "less 1, scaled to a year: (front / next - 1) × 365 / days between the two. It is positive in backwardation and negative in contango.",
   },
+  // The VIX curve and the volatility board (VIX, VOLS): spot indices, not futures.
+  {
+    term: "Term structure", aliases: ["volatility term structure", "VIX term structure", "VIX curve", "tenor curve", "tenors"],
+    functions: ["VIX", "VOLS"], shown: ["Tenor", "tenor curve"],
+    definition: "Implied volatility by time horizon. VIX 9D, VIX (30 days), VIX 3M, 6M and 1Y each measure the S&P 500 volatility its options price over that "
+      + "horizon; read from short to long they form a curve. Its shape says whether the market fears the coming weeks more than the months after them.",
+  },
+  {
+    term: "3M/30D ratio", aliases: ["3M/30D", "VIX 3M / VIX", "VIX 3M / VIX ratio", "VIX ratio", "VIX term ratio", "term ratio"],
+    functions: ["VIX", "VOLS", "G"], shown: ["3M / 30D", "3M/30D", "VIX 3M / VIX"],
+    definition: "VIX 3M divided by VIX: the volatility the market expects over three months against the next 30 days. Above 1 the curve is in contango, "
+      + "the usual calm state; below 1 it is in backwardation, a sign of near-term stress. The 3M spread is the same pair as a difference, in index points.",
+  },
+  {
+    term: "Contango/backwardation (VIX)", aliases: ["VIX contango", "VIX backwardation", "volatility contango", "volatility backwardation", "inverted VIX curve", "curve state"],
+    functions: ["VIX", "VOLS"], shown: ["Contango", "Backwardation", "Flat"],
+    definition: "The shape of the VIX curve. Contango: longer horizons sit above shorter ones (VIX 3M above VIX), the usual state in calm markets. "
+      + "Backwardation: VIX sits above VIX 3M, as fear of the coming weeks outruns the longer view, typically in a sell-off. Flat: the two are equal. "
+      + "These are spot indices, so unlike a futures curve nothing is rolled or paid.",
+  },
+  {
+    term: "VVIX", aliases: ["vol of vol", "volatility of volatility", "VIX of VIX", "VVIX index"], functions: ["VIX", "VOLS"],
+    definition: "Cboe's index of the 30-day volatility that VIX options price: the VIX of the VIX. A high reading means traders are paying up "
+      + "to protect against sudden jumps in VIX itself.",
+  },
+  // Options positioning (OPX, GEX) and the volatility surface (OVDV).
+  {
+    term: "Max pain", aliases: ["max-pain", "maximum pain", "max pain strike", "pain strike"], functions: ["OPX", "GEX"],
+    definition: "The settlement price at which one expiry's options would pay their holders the least, summed over every call's and put's open interest: "
+      + "the strike where Payout $ is lowest. It says where option holders collect least at expiry, not where the price will go. "
+      + "Deribit's BTC and ETH options settle at 08:00 UTC on the day named, against its index averaged over the 30 minutes before.",
+  },
+  {
+    term: "Payout $", aliases: ["payout", "expiry payout", "option payout", "payout at expiry"], functions: ["OPX", "GEX"], shown: ["Payout $"],
+    definition: "What an expiry's options would pay their holders, in dollars, if the underlying settled at that strike: each call's open interest times "
+      + "how far the strike is above the call's, plus each put's times how far it is below, times the contract size (100 shares for a US listing, "
+      + "1 BTC or 1 ETH on Deribit). Max pain is the strike where it is lowest.",
+  },
+  {
+    term: "Call wall", aliases: ["put wall", "walls", "gamma wall", "gamma walls"], functions: ["OPX", "GEX"], shown: ["Call wall", "Put wall"],
+    definition: "The strike with the most dealer gamma from calls (call wall) or from puts (put wall), across every expiry or within one. "
+      + "Hedging flows are largest there, so it is often read as resistance above spot and support below it.",
+  },
+  {
+    term: "Risk reversal", short: "RR", aliases: ["25d risk reversal", "25-delta risk reversal", "25 delta risk reversal", "rr25", "risk reversals"],
+    functions: ["OVDV"], shown: ["RR"],
+    definition: "The 25-delta call's implied volatility minus the 25-delta put's, in vol points, for one expiry. Negative means puts cost more than calls "
+      + "as far from the forward (downside protection is bid), positive that upside calls are. OVDV signs it call minus put.",
+  },
+  {
+    term: "Butterfly", short: "BF", aliases: ["25d butterfly", "25-delta butterfly", "25 delta butterfly", "bf25", "smile curvature", "fly"],
+    functions: ["OVDV"], shown: ["BF"],
+    definition: "The average of the 25-delta call and put implied volatilities minus the implied volatility at the forward, in vol points, for one expiry: "
+      + "how much the wings cost over the middle of the smile. A higher butterfly prices larger moves in either direction.",
+  },
+  {
+    term: "DVOL", aliases: ["deribit volatility index", "bitcoin volatility index", "ether volatility index", "btc dvol", "eth dvol", "crypto vix"],
+    functions: ["OVDV", "G"], shown: ["DVOL"],
+    definition: "Deribit's volatility index for BTC or ETH: the 30-day implied volatility its options price, in vol points, computed from the whole "
+      + "strip of strikes as VIX is. OVDV shows it beside the coin's surface; chart it as CAP:volatility:dvol-btc or CAP:volatility:dvol-eth.",
+  },
   // The economic calendar (ECO).
   {
     term: "Actual", aliases: ["actual release", "actual value"], functions: ["ECO"], shown: ["ACTUAL", "Actual"],
@@ -519,6 +830,19 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   {
     term: "Impact", short: "IMP", aliases: ["importance", "event impact", "high impact"], functions: ["ECO"],
     definition: "How much a release usually moves markets: HIGH for the big ones (CPI, jobs, rate decisions), MED and LOW for speeches and smaller data.",
+  },
+  {
+    term: "Purchasing managers' index", short: "PMI", aliases: ["pmis", "purchasing managers", "purchasing managers index", "ism", "ism pmi",
+      "flash pmi", "caixin pmi", "ratingdog pmi"], functions: ["ECO"],
+    definition: "A monthly survey of companies' purchasing managers on orders, output, jobs and prices: 50 is no change from the month before, "
+      + "above it growth, below it contraction. A flash PMI is the month's early read, the final a week or so later. ECO lists each as a release: "
+      + "ISM for the US, S&P Global's elsewhere, NBS and RatingDog (formerly Caixin) for China, most at medium or low impact.",
+  },
+  // Economic statistics (ECST).
+  {
+    term: "Nowcast", aliases: ["nowcasts", "nowcasting", "gdpnow", "gdp nowcast"], functions: ["ECST", "ECO"], shown: ["GDPNow"],
+    definition: "An estimate of this quarter's GDP growth from the data already out, revised as each release lands until the official figure. "
+      + "ECST shows the Atlanta Fed's GDPNow, annualized, against its own history; ECO lists each update as a release.",
   },
 ];
 
@@ -541,8 +865,8 @@ export interface GlossaryLookup {
   /** The entries the query names: by the term, its abbreviation or an alias. */
   exact: GlossaryEntry[];
   /**
-   * The others whose names start a word with each word of the query: `stop-out` finds stop-out vs average.
-   * Those that hold the words whole come first.
+   * The others whose names hold each word of the query: `stop-out` finds stop-out vs average. Beside a term the
+   * query names they hold the words whole; otherwise a word start is enough, and the whole ones come first.
    */
   partial: GlossaryEntry[];
 }
@@ -550,22 +874,26 @@ export interface GlossaryLookup {
 // Shorter words (the `b` and `c` of `B/C`) would find half the glossary.
 const MIN_PARTIAL_WORD = 3;
 
+/** A name's word holds a query word whole, or as its plural: `assets` holds `asset`, `floating` does not hold `float`. */
+const wholeWord = (have: string, word: string) => have === word || have === `${word}s` || have === `${word}es`;
+
 export function lookupGlossary(query: string): GlossaryLookup {
   const key = lookupKey(query);
   if (!key) return { exact: [], partial: [] };
   const exact = GLOSSARY.filter((entry) => names(entry).some((name) => lookupKey(name) === key));
   const wanted = words(query).filter((word) => word.length >= MIN_PARTIAL_WORD);
-  const partial = wanted.length === 0 ? [] : GLOSSARY.filter((entry) => {
-    if (exact.includes(entry)) return false;
+  if (wanted.length === 0) return { exact, partial: [] };
+  const others = GLOSSARY.filter((entry) => !exact.includes(entry));
+  const holding = (match: (have: string, word: string) => boolean) => others.filter((entry) => {
     const have = names(entry).flatMap(words);
-    return wanted.every((word) => have.some((name) => name.startsWith(word)));
+    return wanted.every((word) => have.some((name) => match(name, word)));
   });
-  // The entries that hold the words whole come before those that only start with them: `float` is the float, not the floating rate note.
-  const whole = (entry: GlossaryEntry) => {
-    const have = names(entry).flatMap(words);
-    return wanted.every((word) => have.includes(word));
-  };
-  return { exact, partial: partial.sort((left, right) => Number(whole(right)) - Number(whole(left))) };
+  // Related to a term the query names are only the terms that hold its words whole: `float` is the float of a
+  // stock, and the floating rate note only starts with the same letters. A query that names no term is a search,
+  // where a word start (`vol` for volume) still finds a term, after those that hold it whole.
+  const whole = holding(wholeWord);
+  if (exact.length > 0) return { exact, partial: whole };
+  return { exact, partial: [...whole, ...holding((name, word) => name.startsWith(word)).filter((entry) => !whole.includes(entry))] };
 }
 
 function escapeRegExp(text: string): string {
@@ -582,7 +910,7 @@ export function reportGlossary(token: string, reportText: string): GlossaryEntry
   const text = reportText.replace(ANSI, "");
   const upper = token.toUpperCase();
   return GLOSSARY.filter((entry) => entry.functions.includes(upper)
-    && (entry.shown ?? [entry.term, ...(entry.short ? [entry.short] : [])]).some((label) => showsLabel(text, label)));
+    && (entry.shownBy?.[upper] ?? entry.shown ?? [entry.term, ...(entry.short ? [entry.short] : [])]).some((label) => showsLabel(text, label)));
 }
 
 function textWidth(): number {
@@ -604,7 +932,7 @@ export function renderGlossaryEntries(entries: readonly GlossaryEntry[]): string
 /** What `--explain` adds under a report: the terms it shows, or a note that it shows none. */
 export function renderReportGlossary(token: string, entries: readonly GlossaryEntry[]): string {
   if (entries.length === 0) {
-    return wrapText(`${token} shows no glossary terms. gloomberb catalog glossary lists every term.`, textWidth())
+    return wrapText(`${token} shows no glossary terms. gloom catalog glossary lists every term.`, textWidth())
       .map((line) => cliStyles.muted(line)).join("\n");
   }
   return [renderSection("Terms"), ...renderGlossaryEntries(entries)].join("\n");
@@ -641,7 +969,7 @@ export function renderGlossaryIndex(): string {
       index === 0 ? `  ${cliStyles.command(owner)}${" ".repeat(labelWidth - 2 - owner.length)}${line}` : `${" ".repeat(labelWidth)}${line}`
     ))),
     "",
-    ...wrapText("gloomberb catalog glossary <term> explains one; fn <function> --explain and portfolio show --explain add the terms a report shows.", width)
+    ...wrapText("gloom catalog glossary <term> explains one; fn <function> --explain and portfolio show --explain add the terms a report shows.", width)
       .map((line) => cliStyles.muted(line)),
   ].join("\n");
 }

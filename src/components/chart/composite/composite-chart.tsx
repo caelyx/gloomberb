@@ -1,16 +1,29 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { useCompositeChartKeyboard } from "./use-composite-chart-keyboard";
 import { useCompositeViewport } from "./use-composite-viewport";
 import { CompositePanelSurface } from "./panel-surface";
 import { MINIMUM_AXIS_LABEL_WIDTH, compositeAxisLabelWidth } from "./panel-labels";
-import { isVerticalWheelDirection } from "./panel-gestures";
+import { AXIS_DOUBLE_PRESS_MS, isVerticalWheelDirection } from "./panel-gestures";
 import { type ChartToolSpan, CHART_DRAWING_COLORS, isDrawingTool, type ChartDrawing } from "./tools";
 import { ChartDrawingStore, NO_DRAWINGS } from "./drawing-store";
 import { CompositeLegend } from "./legend";
+import { compositeRangeStatisticsLevels } from "./range-statistics";
 import { ChartToolbar, CHART_TOOLBAR_WIDTH } from "./toolbar";
 import { AsciiText, Box, ChartSurface, Text, useUiCapabilities, type BoxRenderable } from "../../../ui";
+import { Button } from "../../ui/button";
 import { useLiveStretch } from "../../../ui/live-stretch";
-import { useOptionalPaneInstanceId } from "../../../state/app/context";
+import { useOptionalPaneInstanceId, usePaneSettingValue } from "../../../state/app/context";
+import {
+  CHART_LAYOUT_SETTING_KEY,
+  NO_CHART_LAYOUT,
+  draggedPanelWeights,
+  minimumPanelRows,
+  parseChartLayoutPrefs,
+  patchChartLayout,
+  stepTopPanel,
+  type ChartLayoutPrefs,
+} from "./chart-layout";
+import { usePaneFocused } from "../../../state/app/activity";
 import { useTabCursorLink } from "../../../state/app/tab-cursor";
 import { useThemeColors, useThemeId } from "../../../theme/theme-context";
 import { themedSeriesColor, themeSeriesColors } from "../../../theme/series-colors";
@@ -26,7 +39,14 @@ import { useChartViewResetListener } from "../core/view-reset";
 import { useShowChartTextFallback } from "../native/use-chart-text-fallback";
 import { StaticXAxisLabels, StaticXMarkerLabels, StaticXMarkerOverlay } from "./axis-overlays";
 import { formatCompositeCursorAxisDate } from "./format";
-import { resolveCompositeWheelPan, resolveCompositeWheelZoom } from "./interactions";
+import {
+  resolveCompositeWheelPan,
+  resolveCompositeWheelZoom,
+  type CompositeNavigationFrame,
+  type CompositeViewportRange,
+} from "./interactions";
+import { NO_VALUE_SCALES, resolveAxisDragSpanFactor } from "./value-scale";
+import { useCompositeValueScales } from "./use-composite-value-scales";
 import { COMPOSITE_RIGHT_OFFSET_RATIO } from "./time-scale";
 import {
   allocateCompositePanelHeights,
@@ -35,6 +55,7 @@ import {
   compositeCursorAsOf,
   compositeLinkedCursorTime,
   resizeCompositePanel,
+  resolveAdjacentCompositeCursorDate,
 } from "./scene";
 import { buildCompositeTimeAxisLayout, buildCompositeViewportTimeAxisLayout } from "./time-axis";
 import type {
@@ -48,6 +69,10 @@ import type {
 // Wordmark cell grid at scale 1 (27 columns of 8px, 4 rows of 12px).
 const WATERMARK_BASE_WIDTH_PX = 216;
 const WATERMARK_BASE_HEIGHT_PX = 48;
+
+/** The most lines a legend wraps to, and the plot rows each panel keeps when it does. */
+const MAX_LEGEND_ROWS = 3;
+const MIN_PANEL_ROWS_BESIDE_WRAPPED_LEGEND = 4;
 
 /**
  * Size the screenshot wordmark to roughly half the plot width, capped so it
@@ -76,6 +101,10 @@ const holdsNothing = () => false;
  */
 const DESKTOP_FULL_ROW = { width: "100%" } as const;
 const DESKTOP_PLOT_COLUMN = { flex: "1 1 0px", width: "auto", minWidth: 0 } as const;
+/** The button on a panel that has the whole plot. */
+const RESTORE_PANELS_LABEL = "All panels";
+/** The time axis row where a drag on it zooms time. */
+const TIME_AXIS_ROW = { ...DESKTOP_FULL_ROW, cursor: "ew-resize" } as const;
 
 /** Default-palette series in the theme's own palette, where it has one; the same list otherwise. */
 function useThemedSeriesList(list: ResolvedSeries[], themeId: string): ResolvedSeries[];
@@ -90,11 +119,53 @@ function useThemedSeriesList(list: ResolvedSeries[] | undefined, themeId: string
   }, [list, themeId]);
 }
 
+/** A line broken between its " · " parts to fit `width` cells, each part kept whole. */
+function centeredLines(text: string, width: number): string[] {
+  const lines: string[] = [];
+  for (const part of text.split(" · ")) {
+    const last = lines.at(-1);
+    if (last !== undefined && last.length + 3 + part.length <= width) lines[lines.length - 1] = `${last} · ${part}`;
+    else lines.push(part);
+  }
+  return lines;
+}
+
+type ChartLayoutUpdate = (update: (layout: ChartLayoutPrefs) => ChartLayoutPrefs) => void;
+type ChartLayoutChild = (layout: ChartLayoutPrefs, update: ChartLayoutUpdate) => ReactNode;
+
+/** A chart in a pane keeps its layout in the pane's settings, read as it renders so it never paints twice. */
+function PaneChartLayout({ paneInstanceId, children }: { paneInstanceId: string; children: ChartLayoutChild }) {
+  const [stored, setStored] = usePaneSettingValue<unknown>(CHART_LAYOUT_SETTING_KEY, undefined, paneInstanceId);
+  const layout = useMemo(() => parseChartLayoutPrefs(stored), [stored]);
+  const update = useCallback<ChartLayoutUpdate>((change) => {
+    setStored((current: unknown) => {
+      const previous = parseChartLayoutPrefs(current);
+      const next = change(previous);
+      if (next === previous) return current;
+      return next === NO_CHART_LAYOUT ? undefined : next;
+    });
+  }, [setStored]);
+  return <>{children(layout, update)}</>;
+}
+
+/** A chart outside a pane (a share page) keeps its layout while it is mounted. */
+function LocalChartLayout({ children }: { children: ChartLayoutChild }) {
+  const [layout, setLayout] = useState<ChartLayoutPrefs>(NO_CHART_LAYOUT);
+  const update = useCallback<ChartLayoutUpdate>((change) => setLayout(change), []);
+  return <>{children(layout, update)}</>;
+}
+
 export function CompositeChart(props: CompositeChartProps) {
   const themeId = useThemeId();
   const series = useThemedSeriesList(props.series, themeId);
   const legendSeries = useThemedSeriesList(props.legendSeries, themeId);
-  return <ThemedCompositeChart {...props} series={series} legendSeries={legendSeries} />;
+  const paneInstanceId = useOptionalPaneInstanceId();
+  const chart: ChartLayoutChild = (layout, update) => (
+    <ThemedCompositeChart {...props} series={series} legendSeries={legendSeries} chartLayout={layout} onChartLayoutChange={update} />
+  );
+  return paneInstanceId
+    ? <PaneChartLayout paneInstanceId={paneInstanceId}>{chart}</PaneChartLayout>
+    : <LocalChartLayout>{chart}</LocalChartLayout>;
 }
 
 function ThemedCompositeChart({
@@ -125,21 +196,29 @@ function ThemedCompositeChart({
   legendAccessoryWidth,
   showTimeAxis = true,
   emptyMessage = "No chart data",
+  emptyDetail,
   formatValue,
   onCursorDateChange,
   onViewportChange,
   onActivate,
+  onPress,
   onToggleSeries,
   isSeriesToggleable,
   timePick,
+  pricePick,
   levels,
-}: CompositeChartProps) {
+  rangeStatisticsSeriesId,
+  chartLayout,
+  onChartLayoutChange,
+}: CompositeChartProps & { chartLayout: ChartLayoutPrefs; onChartLayoutChange: ChartLayoutUpdate }) {
   const activeThemeColors = useThemeColors();
   const { cellWidthPx = 8, cellHeightPx = 18, pixelRatio = 1, fractionalViewport = false } = useUiCapabilities();
   const isDesktopWeb = useUiCapabilities().nativePaneChrome === true;
   const showTextFallback = useShowChartTextFallback();
   const [internalCursorDate, setInternalCursorDate] = useState<Date | null>(null);
   const [toolSpan, setToolSpan] = useState<ChartToolSpan | null>(null);
+  const [pointerDragging, setPointerDragging] = useState(false);
+  const paneFocused = usePaneFocused();
   const paneInstanceId = useOptionalPaneInstanceId();
   const [drawings, setDrawings] = useState<readonly ChartDrawing[]>(NO_DRAWINGS);
   const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
@@ -171,7 +250,13 @@ function ThemedCompositeChart({
       (drawing) => drawing.id === selectedDrawingId ? { ...drawing, color } : drawing,
     ));
   }, [selectedDrawingId]);
-  const resolvedCursorDate = cursorDate === undefined ? internalCursorDate : cursorDate;
+  // A cursor the owner rests on without following its moves (a seasonal
+  // chart's latest week) is where the chart's own cursor goes back to: the
+  // pointer moves it as on any chart, and the pointer leaving returns it.
+  const restingCursor = cursorDate !== undefined && !onCursorDateChange;
+  const ownsCursor = cursorDate === undefined || restingCursor;
+  const resolvedCursorDate = cursorDate === undefined ? internalCursorDate
+    : restingCursor ? internalCursorDate ?? cursorDate : cursorDate;
   const totalWidth = Math.max(1, Math.floor(width));
   const totalHeight = Math.max(1, Math.floor(height));
   const seriesIdentityRef = useRef<ResolvedSeries[]>([]);
@@ -210,21 +295,36 @@ function ThemedCompositeChart({
     return lineCuesEnabled ? assignSeriesLineCues(cueSourceRef.current) : NO_LINE_CUES;
   }, [cueKey, lineCuesEnabled]);
   const {
-    navigationFrame, activeUserViewport, effectiveViewport,
+    navigationFrame, activeUserViewport, effectiveViewport, authoredViewportChanged, authoredGeneration,
     panViewport, panViewportByRatio, zoomViewport, setViewportRange, resetViewport,
   } = useCompositeViewport({
     viewport, viewportResetKey, visibleSeries, marketTimelineSeries,
     allowHistoricalBackfill, onViewportChange,
   });
+  // Values scaled by hand belong to the view they were scaled in: a new
+  // authored view (another range, another listing) fits them again.
+  const { valueScales: heldValueScales, setValueScale, resetPanelValueScale, resetValueScales } = useCompositeValueScales(authoredGeneration);
+  const valueScales = authoredViewportChanged ? NO_VALUE_SCALES : heldValueScales;
+  const scaledByHand = valueScales !== NO_VALUE_SCALES && Object.keys(valueScales).length > 0;
+  // `0`, Reset Zoom and choosing the range again put both axes back.
+  const resetView = useCallback(() => {
+    resetViewport();
+    resetValueScales();
+  }, [resetValueScales, resetViewport]);
   // The pane's range control asks for this when its selected range is chosen again.
-  useChartViewResetListener(resetViewport, interactive && navigable);
-  const legendRows = showLegend && (visibleSeries.length > 0 || legendAccessory)
-    ? 1
-    : 0;
+  useChartViewResetListener(resetView, interactive);
   const timeAxisRows = showTimeAxis ? 1 : 0;
   const xMarkers = xAxis?.markers ?? NO_X_MARKERS;
   const xMarkerRows = xMarkers.some((marker) => marker.label) ? 1 : 0;
   const panelCount = new Set(panelSeries.map((entry) => entry.panelId)).size;
+  // One legend line, or up to a few when its entries cannot share one and each
+  // panel keeps a readable plot: the legend says how many it needs while no
+  // cursor moves its values.
+  const [legendWantedRows, setLegendWantedRows] = useState(1);
+  const legendRoom = totalHeight - timeAxisRows - xMarkerRows - MIN_PANEL_ROWS_BESIDE_WRAPPED_LEGEND * Math.max(1, panelCount);
+  const legendRows = showLegend && (visibleSeries.length > 0 || legendAccessory)
+    ? Math.max(1, Math.min(legendWantedRows, MAX_LEGEND_ROWS, legendRoom))
+    : 0;
   // A forming bar can change its extremes or volume without moving its close.
   const lastTickKey = visibleSeries.map((entry) => {
     const last = entry.points.at(-1);
@@ -241,6 +341,20 @@ function ThemedCompositeChart({
     textDim: colors?.textDim ?? activeThemeColors.textDim,
     negative: colors?.negative ?? activeThemeColors.negative,
   }), [activeThemeColors, colors, paneSurface]);
+  const rangeStatisticsLevels = useMemo(() => {
+    void lastTickKey;
+    return compositeRangeStatisticsLevels(
+      panelSeries.find((entry) => entry.id === rangeStatisticsSeriesId),
+      effectiveViewport,
+      resolvedColors.textDim,
+      formatValue,
+    );
+  }, [effectiveViewport, formatValue, lastTickKey, panelSeries, rangeStatisticsSeriesId, resolvedColors.textDim]);
+  const displayedLevels = useMemo(() => (
+    levels && rangeStatisticsLevels && levels.seriesId === rangeStatisticsLevels.seriesId
+      ? { ...levels, items: [...levels.items, ...rangeStatisticsLevels.items] }
+      : levels ?? rangeStatisticsLevels
+  ), [levels, rangeStatisticsLevels]);
   // A custom x axis means x is not time: a tenor, a fraction, a return. Its
   // last observation belongs at the right edge, under its own label.
   const rightOffsetRatio = xAxis ? 0 : COMPOSITE_RIGHT_OFFSET_RATIO;
@@ -254,6 +368,8 @@ function ThemedCompositeChart({
       clipToViewport,
       timelineSeries: marketTimelineSeries,
       rightOffsetRatio,
+      valueScales,
+      referenceLevels: rangeStatisticsLevels,
     });
   }, [
     clipToViewport,
@@ -264,6 +380,8 @@ function ThemedCompositeChart({
     panelSeries,
     panels,
     rightOffsetRatio,
+    rangeStatisticsLevels,
+    valueScales,
   ]);
   // Gutters follow the axes the scene actually built. Reading the series list
   // instead drops a gutter the moment its series has no observation in view,
@@ -284,22 +402,43 @@ function ThemedCompositeChart({
   const availableAxisWidth = axisCount > 0
     ? Math.max(0, Math.floor((totalWidth - minimumPlotWidth) / axisCount) - 1)
     : 0;
+  // Heights a drag is setting, shown before they are kept.
+  const [draftPanelWeights, setDraftPanelWeights] = useState<Readonly<Record<string, number>> | null>(null);
+  const panelWeights = draftPanelWeights ?? chartLayout.panelWeights;
+  useEffect(() => setDraftPanelWeights(null), [chartLayout.panelWeights]);
+  // A panel given the whole plot, while the chart still has it and another.
+  const maximizedPanelId = projectedScene && projectedScene.panels.length > 1
+    && projectedScene.panels.some((panel) => panel.id === chartLayout.maximizedPanelId)
+    ? chartLayout.maximizedPanelId ?? null
+    : null;
   const layoutPanels = useMemo<CompositePanelScene[] | null>(() => {
     if (!projectedScene) return null;
     const panelSpecById = new Map(panels.map((panel) => [panel.id, panel] as const));
+    const shown = maximizedPanelId
+      ? projectedScene.panels.filter((panel) => panel.id === maximizedPanelId)
+      : projectedScene.panels;
     const panelHeights = allocateCompositePanelHeights(
-      projectedScene.panels.map((panel) => ({
+      shown.map((panel) => ({
         id: panel.id,
-        height: panelSpecById.get(panel.id)?.height,
+        height: panelWeights?.[panel.id] ?? panelSpecById.get(panel.id)?.height,
       })),
       plotHeight,
     );
     // Terminal labels snap to rows; a fractional viewport places them exactly.
-    return projectedScene.panels.map((panel) => {
+    return shown.map((panel) => {
       const resized = resizeCompositePanel(panel, panelHeights.get(panel.id) ?? 1, !fractionalViewport);
       return lineCues.size > 0 ? { ...resized, lineCues } : resized;
     });
-  }, [fractionalViewport, lineCues, panels, plotHeight, projectedScene]);
+  }, [fractionalViewport, lineCues, maximizedPanelId, panelWeights, panels, plotHeight, projectedScene]);
+  // What a resize starts from: each shown panel's rows, and the weights they share.
+  const panelLayoutRef = useRef<{ rows: { id: string; rows: number; weight: number }[]; weightTotal: number }>({ rows: [], weightTotal: 0 });
+  {
+    const rows = (layoutPanels ?? []).map((panel) => {
+      const weight = panelWeights?.[panel.id] ?? panels.find((spec) => spec.id === panel.id)?.height;
+      return { id: panel.id, rows: panel.height, weight: typeof weight === "number" && Number.isFinite(weight) && weight > 0 ? weight : 1 };
+    });
+    panelLayoutRef.current = { rows, weightTotal: rows.reduce((sum, entry) => sum + entry.weight, 0) };
+  }
   // Static overview charts also pin the latest price with cursor precision.
   const includeCursorLabels = interactive || cursorDate !== undefined || !!scenePanels?.some((panel) => panel.lastPrice);
   const includeSeriesTags = isDesktopWeb && (interactive || cursorDate !== undefined);
@@ -307,6 +446,7 @@ function ThemedCompositeChart({
     availableAxisWidth,
     Math.max(
       Math.min(MINIMUM_AXIS_LABEL_WIDTH, maximumAxisWidth),
+      ...(displayedLevels?.items ?? []).map((level) => level.axisLabel?.length ?? 0),
       ...(layoutPanels ?? []).flatMap((panel) => (["left", "right"] as const).map((side) => {
         const width = compositeAxisLabelWidth(panel.axes[side], formatAxisValue, includeCursorLabels);
         if (!includeSeriesTags || !width) return includeCursorLabels ? width : Math.min(width, maximumAxisWidth);
@@ -317,7 +457,7 @@ function ThemedCompositeChart({
         return (width + 1) * lanes;
       })),
     ),
-  ), [availableAxisWidth, formatAxisValue, includeCursorLabels, includeSeriesTags, layoutPanels, maximumAxisWidth]);
+  ), [availableAxisWidth, displayedLevels?.items, formatAxisValue, includeCursorLabels, includeSeriesTags, layoutPanels, maximumAxisWidth]);
   const leftAxisWidth = hasLeftAxis ? resolvedAxisWidth : 0;
   const rightAxisWidth = hasRightAxis ? resolvedAxisWidth : 0;
   const axisGap = resolvedAxisWidth > 0 ? 1 : 0;
@@ -338,9 +478,11 @@ function ThemedCompositeChart({
       width: plotWidth,
       height: layoutPanels.reduce((sum, panel) => sum + panel.height, 0),
       panels: layoutPanels,
+      // A panel with the whole plot still leaves the legend every series' value.
+      ...(maximizedPanelId ? { cursorPanels: projectedScene.panels } : {}),
     };
     return downsampleCompositeChartScene(laidOut, downsampleWidth);
-  }, [downsampleWidth, layoutPanels, plotWidth, projectedScene]);
+  }, [downsampleWidth, layoutPanels, maximizedPanelId, plotWidth, projectedScene]);
   const resolvedCursorTimestamp = resolvedCursorDate?.getTime() ?? null;
   const normalizedCursorTimestamp = resolvedCursorTimestamp !== null && Number.isFinite(resolvedCursorTimestamp)
     ? resolvedCursorTimestamp
@@ -350,10 +492,12 @@ function ThemedCompositeChart({
   // pane's layout tab, its siblings in the pane included: each chart is its
   // own source, so they never take turns. A chart that stops taking the
   // pointer for a while (under a dialog) keeps its place, so a cursor it
-  // holds stays shared.
+  // holds stays shared. Only an interactive chart shows the tab's pin and
+  // lifts it, so only one counts toward keeping it.
   const chartId = useId();
   const tabLink = useTabCursorLink(
     cursorLink === undefined && !xAxis && paneInstanceId !== null ? `${paneInstanceId}${chartId}` : null,
+    { viewer: interactive },
   );
   const link = xAxis ? undefined
     : cursorLink === undefined ? interactive ? tabLink : undefined
@@ -371,6 +515,7 @@ function ThemedCompositeChart({
     return time === null || !baseScene ? null : compositeLinkedCursorTime(baseScene, time);
   }, [baseScene, sharedTime]));
   const holdsSharedCursor = useSyncExternalStore(subscribeToLink, link?.held ?? holdsNothing);
+  const pinnedCursor = useSyncExternalStore(subscribeToLink, link?.pinned ?? holdsNothing);
   const publishCursor = link?.publish;
   const scene = useMemo(() => {
     if (!baseScene) return null;
@@ -394,23 +539,152 @@ function ThemedCompositeChart({
     const nextTimestamp = timestamp !== null && Number.isFinite(timestamp) ? timestamp : null;
     if (lastCursorTimestampRef.current === nextTimestamp) return;
     lastCursorTimestampRef.current = nextTimestamp;
-    if (cursorDate === undefined) setInternalCursorDate(date);
+    if (ownsCursor) setInternalCursorDate(date);
     onCursorDateChange?.(date);
     publishCursor?.(date && baseScene && nextTimestamp !== null ? compositeCursorAsOf(baseScene, date) : null);
-  }, [baseScene, cursorDate, onCursorDateChange, publishCursor]);
+  }, [baseScene, onCursorDateChange, ownsCursor, publishCursor]);
   // Another chart taking the cursor, or clearing it, takes it from this one,
   // so it does not come back here later. Read live: a move since the render
   // makes this chart's cursor the shared one again.
   useEffect(() => {
     void holdsSharedCursor;
-    if (!link || cursorDate !== undefined || lastCursorTimestampRef.current === null || link.held()) return;
+    if (!link || !ownsCursor || lastCursorTimestampRef.current === null || link.held()) return;
     updateCursor(null);
-  }, [cursorDate, holdsSharedCursor, link, updateCursor]);
+  }, [holdsSharedCursor, link, ownsCursor, updateCursor]);
   // Esc on a chart showing another chart's cursor clears it, as on that chart.
+  // While the tab's cursor is pinned the arrows move the pin and Esc unpins it.
   const updateKeyboardCursor = useCallback((date: Date | null) => {
+    if (link?.pinned?.()) {
+      link.pin?.(date && baseScene ? compositeCursorAsOf(baseScene, date) : null);
+      return;
+    }
     if (date === null && showsSharedCursor) link?.clear();
     updateCursor(date);
-  }, [link, showsSharedCursor, updateCursor]);
+  }, [baseScene, link, showsSharedCursor, updateCursor]);
+  // `p` pins the crosshair where it is, this chart's own or another's, so
+  // every chart in the tab holds that moment after the pointer leaves.
+  // Another chart's is pinned at its own moment, not at the bar it lands on
+  // here, so a daily chart pins an intraday chart's minute. With no crosshair
+  // it pins the last one shown (the pointer leaves the plot on its way to the
+  // footer's pin), and before any, the latest bar, where the arrows start.
+  // The last time sits in a ref, so a moving crosshair costs no extra render,
+  // and the footer's pin is there from the start: a hint appearing mid-hover
+  // would move the plot under the pointer.
+  const cursorAt = scene?.cursorDate?.getTime() ?? null;
+  const lastCursorAtRef = useRef<{ time: number; shared: boolean } | null>(null);
+  if (cursorAt !== null) {
+    const shared = showsSharedCursor ? sharedTime?.() ?? null : null;
+    lastCursorAtRef.current = shared !== null ? { time: shared, shared: true } : { time: cursorAt, shared: false };
+  }
+  const pinnable = !!link?.pin;
+  const togglePin = useCallback(() => {
+    if (!link?.pin) return;
+    if (link.pinned?.()) {
+      link.pin(null);
+      return;
+    }
+    const live = link.time();
+    if (live !== null) {
+      link.pin(live);
+      return;
+    }
+    if (!baseScene) return;
+    const last = lastCursorAtRef.current;
+    if (last?.shared) {
+      link.pin(last.time);
+      return;
+    }
+    const date = last ? new Date(last.time) : resolveAdjacentCompositeCursorDate(baseScene, null, -1);
+    if (date) link.pin(compositeCursorAsOf(baseScene, date));
+  }, [baseScene, link]);
+
+  // The layout the user leaves the chart in: kept with the pane, through the
+  // latest values, so a handler bound once still acts on what is on screen.
+  const layoutStateRef = useRef({ chartLayout, maximizedPanelId, onChartLayoutChange });
+  layoutStateRef.current = { chartLayout, maximizedPanelId, onChartLayoutChange };
+  const patchLayout = useCallback((patch: ChartLayoutPrefs | ((layout: ChartLayoutPrefs) => ChartLayoutPrefs)) => {
+    layoutStateRef.current.onChartLayoutChange((layout) => patchChartLayout(layout, typeof patch === "function" ? patch(layout) : patch));
+  }, []);
+  // The tool in hand, read when the bar is toggled (the keyboard hook below holds it).
+  const toolInHandRef = useRef<{ armed: boolean; putDown: () => void }>({ armed: false, putDown: () => {} });
+  // Shift+T and the chevrons act on the bar as it shows: a bar open only for
+  // the tool in hand folds again, the tool put down, and stays hidden.
+  const toggleToolbar = useCallback(() => {
+    const tool = toolInHandRef.current;
+    const hidden = layoutStateRef.current.chartLayout.toolbarHidden === true && !tool.armed;
+    if (!hidden && tool.armed) tool.putDown();
+    patchLayout({ toolbarHidden: !hidden });
+  }, [patchLayout]);
+  const toggleLegendCollapsed = useCallback(() => patchLayout((layout) => ({ legendCollapsed: !layout.legendCollapsed })), [patchLayout]);
+  const resetPanelHeights = useCallback(() => {
+    setDraftPanelWeights(null);
+    patchLayout({ panelWeights: undefined });
+  }, [patchLayout]);
+  const resetPanelMaximized = useCallback(() => patchLayout({ maximizedPanelId: undefined }), [patchLayout]);
+  const togglePanelMaximized = useCallback((panelId: string) => {
+    const maximized = layoutStateRef.current.maximizedPanelId;
+    patchLayout({ maximizedPanelId: maximized === panelId ? undefined : panelId });
+  }, [patchLayout]);
+  // A panel given the whole plot is let go once the chart no longer has it, so
+  // it never comes back maximized, and when a panel is added beside it, so the
+  // new one shows. The chart's panels are the ones it is given and the ones
+  // its series bring; a panel whose data is loading is still given.
+  const chartPanelIds = useMemo(() => {
+    const ids = new Set(panels.map((panel) => panel.id));
+    for (const panel of projectedScene?.panels ?? []) ids.add(panel.id);
+    return [...ids].join("\u0000");
+  }, [panels, projectedScene]);
+  const seenPanelIdsRef = useRef<readonly string[] | null>(null);
+  const savedMaximizedPanelId = chartLayout.maximizedPanelId;
+  const chartDrawn = projectedScene !== null;
+  useEffect(() => {
+    const ids = chartPanelIds ? chartPanelIds.split("\u0000") : [];
+    const previous = seenPanelIdsRef.current;
+    seenPanelIdsRef.current = ids;
+    if (!savedMaximizedPanelId) return;
+    const gone = chartDrawn && !ids.includes(savedMaximizedPanelId);
+    const added = !!previous && previous.length > 1 && previous.includes(savedMaximizedPanelId)
+      && ids.some((id) => !previous.includes(id));
+    if (gone || added) patchLayout({ maximizedPanelId: undefined });
+  }, [chartDrawn, chartPanelIds, patchLayout, savedMaximizedPanelId]);
+  // Shift+Up and Shift+Down: the top panel a row taller or shorter.
+  const stepTopPanelRows = useCallback((direction: 1 | -1) => {
+    const { rows } = panelLayoutRef.current;
+    const plotRows = rows.reduce((sum, entry) => sum + entry.rows, 0);
+    const weight = stepTopPanel(rows, direction, minimumPanelRows(plotRows, rows.length));
+    const top = rows[0];
+    if (weight === null || !top) return;
+    patchLayout((layout) => ({ panelWeights: { ...layout.panelWeights, [top.id]: weight } }));
+  }, [patchLayout]);
+  const legendCollapsible = showLegend && visibleLegendSeries.length > 1;
+  const legendCollapsed = legendCollapsible && chartLayout.legendCollapsed === true;
+  const projectedPanelCount = projectedScene?.panels.length ?? 0;
+  const layoutControls = useMemo(() => ({
+    toolbarHidden: chartLayout.toolbarHidden === true,
+    toggleToolbar,
+    legendCollapsible,
+    legendCollapsed,
+    toggleLegend: toggleLegendCollapsed,
+    panelsResizable: (layoutPanels?.length ?? 0) > 1,
+    stepTopPanel: stepTopPanelRows,
+    panelHeightsSet: projectedPanelCount > 1 && !!chartLayout.panelWeights,
+    resetPanelHeights,
+    panelMaximized: !!maximizedPanelId,
+    restorePanels: resetPanelMaximized,
+  }), [
+    chartLayout.panelWeights,
+    chartLayout.toolbarHidden,
+    layoutPanels?.length,
+    legendCollapsed,
+    legendCollapsible,
+    maximizedPanelId,
+    projectedPanelCount,
+    resetPanelHeights,
+    resetPanelMaximized,
+    stepTopPanelRows,
+    toggleLegendCollapsed,
+    toggleToolbar,
+  ]);
 
   const {
     armedTool,
@@ -431,19 +705,22 @@ function ThemedCompositeChart({
     scene,
     cursorDate,
     updateCursor: updateKeyboardCursor,
+    pin: pinnable ? { pinned: pinnedCursor, toggle: togglePin } : null,
     onActivate,
     timePick,
-    levels,
+    pricePick,
+    levels: displayedLevels,
     visibleLegendSeries,
     visibleSeriesIds,
     onToggleSeries,
     isSeriesToggleable,
     navigationFrame,
     activeUserViewport,
+    scaledByHand,
     panViewportByRatio,
     zoomViewport,
     setViewportRange,
-    resetViewport,
+    resetViewport: resetView,
     drawings,
     selectedDrawingId,
     setSelectedDrawingId,
@@ -451,7 +728,17 @@ function ThemedCompositeChart({
     addDrawing,
     removeDrawing,
     pickDrawColor,
+    layout: layoutControls,
   });
+  toolInHandRef.current = { armed: armedTool !== null, putDown: () => armTool(null) };
+  const pressFromPointer = useCallback(() => {
+    onPress?.();
+    activateFromPointer();
+  }, [activateFromPointer, onPress]);
+  const pressPlot = useCallback(() => {
+    cancelKeyboardPlacement();
+    onPress?.();
+  }, [cancelKeyboardPlacement, onPress]);
   const handleEmptyMouseScroll = useCallback((event: ChartMouseEvent) => {
     const scroll = event.scroll;
     if (!interactive || !navigationFrame || !scroll) return;
@@ -477,6 +764,116 @@ function ThemedCompositeChart({
     resetViewport,
     zoomViewport,
   ]);
+
+  // The time axis under the pointer: a drag zooms time from the newest bar
+  // in view, in (left) or out (right), as +/- do; a double click resets it.
+  const timeScalable = interactive && navigable && !!navigationFrame && !xAxis;
+  const timeAxisGestureRef = useRef<{
+    startColumn: number;
+    frame: CompositeNavigationFrame;
+    from: CompositeViewportRange;
+    moved: boolean;
+  } | null>(null);
+  const lastTimeAxisPressRef = useRef<number | null>(null);
+  const latestTimeAxisRef = useRef({ navigationFrame, effectiveViewport, resetViewport, zoomViewport, activateFromPointer, cellWidthPx });
+  latestTimeAxisRef.current = { navigationFrame, effectiveViewport, resetViewport, zoomViewport, activateFromPointer, cellWidthPx };
+  const timeAxisGestures = useMemo(() => {
+    if (!timeScalable) return undefined;
+    const column = (event: ChartMouseEvent) => typeof event.preciseX === "number" ? event.preciseX : event.x;
+    const release = () => {
+      timeAxisGestureRef.current = null;
+    };
+    return {
+      onMouseDown: (event: ChartMouseEvent) => {
+        const latest = latestTimeAxisRef.current;
+        latest.activateFromPointer();
+        consumeChartMouseEvent(event);
+        const now = Date.now();
+        const last = lastTimeAxisPressRef.current;
+        const double = typeof event.detail === "number"
+          ? event.detail >= 2
+          : last !== null && now - last < AXIS_DOUBLE_PRESS_MS;
+        if (double) {
+          lastTimeAxisPressRef.current = null;
+          timeAxisGestureRef.current = null;
+          latest.resetViewport();
+          return;
+        }
+        lastTimeAxisPressRef.current = now;
+        timeAxisGestureRef.current = latest.navigationFrame && latest.effectiveViewport
+          ? { startColumn: column(event), frame: latest.navigationFrame, from: latest.effectiveViewport, moved: false }
+          : null;
+      },
+      onMouseDrag: (event: ChartMouseEvent) => {
+        const gesture = timeAxisGestureRef.current;
+        if (!gesture) return;
+        consumeChartMouseEvent(event);
+        const latest = latestTimeAxisRef.current;
+        const deltaPx = (column(event) - gesture.startColumn) * latest.cellWidthPx;
+        if (!gesture.moved && Math.abs(deltaPx) < 1) return;
+        gesture.moved = true;
+        lastTimeAxisPressRef.current = null;
+        latest.zoomViewport(1 / resolveAxisDragSpanFactor(deltaPx), 1, { frame: gesture.frame, from: gesture.from });
+      },
+      onMouseUp: release,
+      onMouseDragEnd: release,
+    };
+  }, [timeScalable]);
+
+  // The line between two panels on the desktop and the web: a drag moves it a
+  // row at a time, the panel above taking what the one below gives, and a
+  // double click puts back the split the chart was made with.
+  const [resizingPanelIndex, setResizingPanelIndex] = useState<number | null>(null);
+  const panelResizeRef = useRef<{
+    index: number;
+    startPixelY: number;
+    rows: { id: string; rows: number }[];
+    weightTotal: number;
+    weights: Readonly<Record<string, number>> | null;
+  } | null>(null);
+  const latestPanelResizeRef = useRef({ activateFromPointer, cellHeightPx });
+  latestPanelResizeRef.current = { activateFromPointer, cellHeightPx };
+  const panelsResizableByPointer = interactive && isDesktopWeb && !maximizedPanelId && (layoutPanels?.length ?? 0) > 1;
+  const panelDividerGestures = useMemo(() => {
+    if (!panelsResizableByPointer) return null;
+    const release = () => {
+      const gesture = panelResizeRef.current;
+      panelResizeRef.current = null;
+      setResizingPanelIndex(null);
+      const weights = gesture?.weights;
+      if (weights) patchLayout((layout) => ({ panelWeights: { ...layout.panelWeights, ...weights } }));
+    };
+    return (index: number) => ({
+      onMouseDown: (event: ChartMouseEvent) => {
+        latestPanelResizeRef.current.activateFromPointer();
+        consumeChartMouseEvent(event);
+        if ((event.detail ?? 0) >= 2) {
+          panelResizeRef.current = null;
+          setResizingPanelIndex(null);
+          resetPanelHeights();
+          return;
+        }
+        const { rows, weightTotal } = panelLayoutRef.current;
+        panelResizeRef.current = { index, startPixelY: event.pixelY ?? 0, rows, weightTotal, weights: null };
+        setResizingPanelIndex(index);
+      },
+      onMouseDrag: (event: ChartMouseEvent) => {
+        const gesture = panelResizeRef.current;
+        if (!gesture) return;
+        consumeChartMouseEvent(event);
+        const deltaRows = ((event.pixelY ?? gesture.startPixelY) - gesture.startPixelY) / Math.max(1, latestPanelResizeRef.current.cellHeightPx);
+        const plotRows = gesture.rows.reduce((sum, entry) => sum + entry.rows, 0);
+        // Back where it started, or never a row away, the line saves nothing.
+        const weights = draggedPanelWeights(gesture, gesture.index, deltaRows, minimumPanelRows(plotRows, gesture.rows.length));
+        gesture.weights = weights;
+        setDraftPanelWeights(weights
+          ? (current) => ({ ...(current ?? layoutStateRef.current.chartLayout.panelWeights), ...weights })
+          : null);
+      },
+      onMouseUp: release,
+      onMouseDragEnd: release,
+    });
+  }, [panelsResizableByPointer, patchLayout, resetPanelHeights]);
 
   const leftPadding = leftAxisWidth + (leftAxisWidth ? axisGap : 0);
   const rightPadding = rightAxisWidth + (rightAxisWidth ? axisGap : 0);
@@ -522,7 +919,7 @@ function ThemedCompositeChart({
             accessoryWidth={legendAccessoryWidth}
             formatValue={formatValue}
             showLatestChangePercent={showLatestChangePercent}
-            onActivate={activateFromPointer}
+            onActivate={pressFromPointer}
             onToggleSeries={onToggleSeries}
             isSeriesToggleable={isSeriesToggleable}
             keyboardIndex={legendKeyboardIndex}
@@ -548,7 +945,17 @@ function ThemedCompositeChart({
               data-gloom-role="composite-chart-empty"
               data-gloom-label={emptyMessage}
             >
-              <Text fg={resolvedColors.textDim}>{emptyMessage}</Text>
+              {emptyDetail ? (
+                // The kit's empty state: the message dim, what to do about it muted under it.
+                <Box flexDirection="column" alignItems="center">
+                  <Text fg={resolvedColors.textDim}>{emptyMessage}</Text>
+                  {centeredLines(emptyDetail, plotWidth - 2).map((line, index) => (
+                    <Text key={index} fg={activeThemeColors.textMuted}>{line}</Text>
+                  ))}
+                </Box>
+              ) : (
+                <Text fg={resolvedColors.textDim}>{emptyMessage}</Text>
+              )}
             </ChartSurface>
             {rightPadding > 0 ? <Box width={rightPadding} /> : null}
           </Box>
@@ -569,7 +976,14 @@ function ThemedCompositeChart({
     );
   }
 
-  const showToolbar = interactive && navigable && plotWidth > CHART_TOOLBAR_WIDTH + 4;
+  // The tools belong to the focused pane, and stay while one is in hand or a
+  // press drags the plot, so focus moving elsewhere never hides what is
+  // drawing. A chart outside a pane (a share page) keeps them.
+  const toolbarWanted = paneFocused !== false || armedTool !== null || pointerDragging || toolSpan !== null;
+  const showToolbar = interactive && navigable && toolbarWanted && plotWidth > CHART_TOOLBAR_WIDTH + 4;
+  // Hidden, the bar folds to the button that brings it back, and opens again
+  // while a tool picked from the keys is in hand, so the plot says which one.
+  const toolbarFolded = showToolbar && chartLayout.toolbarHidden === true && armedTool === null;
   // Bars shorter than a day carry a time of day the cursor reads out.
   const intradayBars = scene.timeZone !== undefined || visibleSeries.some((entry) => (
     !!entry.historyResolution && isIntradayResolution(entry.historyResolution)
@@ -627,10 +1041,17 @@ function ThemedCompositeChart({
           accessoryWidth={legendAccessoryWidth}
           formatValue={formatValue}
           showLatestChangePercent={showLatestChangePercent}
-          onActivate={activateFromPointer}
+          onActivate={pressFromPointer}
           onToggleSeries={onToggleSeries}
           isSeriesToggleable={isSeriesToggleable}
           keyboardIndex={legendKeyboardIndex}
+          rows={legendRows}
+          onWantedRowsChange={setLegendWantedRows}
+          collapsed={legendCollapsed}
+          onToggleCollapsed={legendCollapsible && interactive ? () => {
+            pressFromPointer();
+            toggleLegendCollapsed();
+          } : undefined}
         />
       ) : null}
       {showToolbar ? (
@@ -642,15 +1063,55 @@ function ThemedCompositeChart({
           drawColor={drawColor}
           showColors={isDrawingTool(armedTool) || !!selectedDrawingId}
           levelTool={levelsEditable}
+          folded={toolbarFolded}
+          onToggleFolded={() => {
+            pressFromPointer();
+            toggleToolbar();
+          }}
           onArmTool={(tool) => {
-            activateFromPointer();
+            pressFromPointer();
             armTool(tool);
           }}
           onPickColor={(color) => {
-            activateFromPointer();
+            pressFromPointer();
             pickDrawColor(color);
           }}
         />
+      ) : null}
+      {maximizedPanelId && interactive ? (
+        // A panel with the whole plot says so at its corner, as a value axis
+        // scaled by hand does at its foot, and that is the way back.
+        <Box
+          position="absolute"
+          left={leftPadding + Math.max(0, plotWidth - RESTORE_PANELS_LABEL.length - 1)}
+          top={legendRows}
+          width={RESTORE_PANELS_LABEL.length}
+          height={1}
+          zIndex={30}
+          style={isDesktopWeb
+            ? {
+              left: "auto",
+              right: `calc(${rightPadding} * var(--cell-w) + var(--gloom-space-xs))`,
+              top: `calc(${legendRows} * var(--cell-h) + var(--gloom-space-xs))`,
+              width: "auto",
+              height: "auto",
+            }
+            : undefined}
+          data-gloom-role="composite-chart-panels-restore"
+        >
+          <Button
+            label="Show All Panels"
+            displayLabel={RESTORE_PANELS_LABEL}
+            title="One panel has the chart. Show every panel again (or double-click the plot)."
+            variant="secondary"
+            compact
+            stopPropagation
+            onPress={() => {
+              pressFromPointer();
+              resetPanelMaximized();
+            }}
+          />
+        </Box>
       ) : null}
       {paneInstanceId ? (
         <ChartDrawingStore
@@ -659,7 +1120,7 @@ function ThemedCompositeChart({
           onRestore={setDrawings}
         />
       ) : null}
-      {scene.panels.map((panel) => (
+      {scene.panels.map((panel, index) => (
         <CompositePanelSurface
           key={panel.id}
           panel={panel}
@@ -689,13 +1150,22 @@ function ThemedCompositeChart({
           onZoomViewport={zoomViewport}
           onSetViewport={setViewportRange}
           onToolSpanChange={setToolSpan}
+          onDragActiveChange={setPointerDragging}
           keyboardToolDrag={keyboardToolDrag?.panelId === panel.id ? keyboardToolDrag : null}
-          onPointerPress={cancelKeyboardPlacement}
+          onPointerPress={pressPlot}
           showTextFallback={showTextFallback}
           onPickTime={timePick?.onPick}
-          levels={levelHost?.panel.id === panel.id ? levels ?? null : null}
+          onPickPrice={pricePick?.onPick}
+          levels={levelHost?.panel.id === panel.id ? displayedLevels ?? null : null}
           selectedLevelId={selectedLevelId}
           onSelectLevel={setSelectedLevelId}
+          valueScalable={interactive}
+          onSetValueScale={setValueScale}
+          onResetValueScale={resetPanelValueScale}
+          dividerAbove={index > 0 && panelDividerGestures
+            ? { active: resizingPanelIndex === index, gestures: panelDividerGestures(index) }
+            : null}
+          onToggleMaximized={interactive && navigable && projectedPanelCount > 1 ? () => togglePanelMaximized(panel.id) : undefined}
         />
       ))}
       {watermarkScale ? (
@@ -735,7 +1205,15 @@ function ThemedCompositeChart({
         </Box>
       ) : null}
       {timeAxisLayout ? (
-        <Box flexDirection="row" width={totalWidth} height={1} style={isDesktopWeb ? DESKTOP_FULL_ROW : undefined}>
+        <Box
+          flexDirection="row"
+          width={totalWidth}
+          height={1}
+          style={isDesktopWeb ? timeAxisGestures ? TIME_AXIS_ROW : DESKTOP_FULL_ROW : undefined}
+          {...timeAxisGestures}
+          data-gloom-interactive={timeAxisGestures ? "true" : undefined}
+          data-gloom-role="composite-chart-time-scale"
+        >
           {leftPadding > 0 ? <Box width={leftPadding} /> : null}
           <StaticXAxisLabels
             labels={xAxis?.ticks ? [] : xAxis?.labels ? [...xAxis.labels] : [timeAxisLayout.text]}

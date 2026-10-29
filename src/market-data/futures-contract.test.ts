@@ -2,11 +2,17 @@ import { expect, setSystemTime, test } from "bun:test";
 import type { FuturesContractTermsPayload } from "../api-client/futures-curve";
 import {
   fitFuturesContractLines,
+  futuresChangeBasis,
   futuresContractLines,
+  futuresRollLines,
   futuresSettleText,
   futuresTickText,
   isFuturesInstrument,
   loadFuturesPriceUnit,
+  futuresPricePer,
+  loadUsdPerMmbtu,
+  usdPerMmbtu,
+  usdPerMmbtuText,
   resetFuturesPriceUnits,
   validateFuturesContractTerms,
 } from "./futures-contract";
@@ -46,9 +52,93 @@ test("Settle is the confirmed settlement dated by its session, -- without one, a
   const quote = { currency: "USD", instrumentType: "FUTURE" };
   expect(futuresSettleText(gold, quote)).toBe("$4,216.30 (2026-10-09)");
   expect(futuresSettleText({ settlement: null }, quote)).toBe("--");
-  expect(futuresSettleText({ settlement: { price: 479.75, date: "2026-10-09" } }, { ...quote, currency: "USX" })).toBe("USX479.75 (2026-10-09)");
+  expect(futuresSettleText({ settlement: { price: 479.75, date: "2026-10-09" } }, { ...quote, currency: "USX" })).toBe("479.75¢ (2026-10-09)");
   // No quote yet: the tick's decimals survive and no currency is guessed.
   expect(futuresSettleText({ settlement: { price: 3.2952, date: "2026-10-09" } }, undefined)).toBe("3.2952 (2026-10-09)");
+  // Beside a move from a later session than the settlement's it waits for that session's, never an older one in its place.
+  expect(futuresSettleText(gold, quote, "2026-10-12")).toBe("-- (2026-10-12 not confirmed yet)");
+  expect(futuresSettleText(gold, quote, "2026-10-09")).toBe("$4,216.30 (2026-10-09)");
+  // A settlement of the move's own session, newer than the close it is from, is the latest and stays.
+  expect(futuresSettleText(gold, quote, "2026-10-08")).toBe("$4,216.30 (2026-10-09)");
+  expect(futuresSettleText({ settlement: null }, quote, "2026-10-12")).toBe("--");
+});
+
+test("a price in cents and every energy price say what they are per; any other dollar price reads as before", () => {
+  const coffee = { spec: { ...gold.spec!, unit: "US cents / lb" } };
+  expect(futuresPricePer(coffee, "USX")).toBe("/lb");
+  expect(futuresPricePer({ spec: { ...gold.spec!, unit: "US cents / bushel" } }, "USX")).toBe("/bu");
+  expect(futuresPricePer(gold, "USD")).toBe("");
+  // Terms in another currency than the quote's, or none, add nothing rather than a wrong unit.
+  expect(futuresPricePer(gold, "USX")).toBe("");
+  expect(futuresPricePer(null, "USX")).toBe("");
+  // Energy, from the exchange's unit, or the catalog's for Dutch TTF gas, which has no terms from the server.
+  const energy = (root: string, unit: string | null) => ({ root, spec: unit ? { ...gold.spec!, unit } : null });
+  expect(futuresPricePer(energy("TTF", null), "EUR")).toBe("/MWh");
+  expect(futuresPricePer(energy("NG", "USD / MMBtu"), "USD")).toBe("/MMBtu");
+  expect(futuresPricePer(energy("CL", "USD / barrel"), "USD")).toBe("/bbl");
+  expect(futuresPricePer(energy("HO", "USD / gallon"), "USD")).toBe("/gal");
+  expect(futuresPricePer(energy("TTF", null), "USD")).toBe("");
+  expect(futuresPricePer(energy("CL", null), "USD")).toBe("");
+});
+
+test("TTF without terms names its unit in the Contract block, and its dollar equivalent per MMBtu is a marked conversion", async () => {
+  const ttf: FuturesContractTermsPayload = {
+    symbol: "TTF=F", root: "TTF", name: "Dutch TTF Gas", contract: "TTFX26", contractSymbol: "TTFX26.NYM", deliveryMonth: "2026-11",
+    spec: null, lastTrade: "2026-10-29", firstNotice: null, inDelivery: false, settlement: { price: 90.043, date: "2026-10-22" },
+  };
+  expect(text(futuresContractLines(ttf, "TTF=F"))).toEqual(["Contract: TTFX26", "Unit: EUR / MWh", "Last Trade: 2026-10-29"]);
+  // €90.30/MWh at EUR/USD 1.1650: 90.30 x 1.1650 / 3.412 dollars per MMBtu.
+  expect(usdPerMmbtu(90.3, ttf, "EUR", 1.165)).toBeCloseTo(30.8318, 3);
+  const asked: string[] = [];
+  const rate = async (currency: string) => { asked.push(currency); return 1.165; };
+  const usd = await loadUsdPerMmbtu(90.3, ttf, "eur", rate);
+  expect(usd && usdPerMmbtuText(usd)).toBe("≈ $30.832/MMBtu at EUR/USD 1.1650");
+  // Natural gas is already in dollars per MMBtu, and is not converted, nor asked a rate for.
+  const ng = { root: "NG", spec: { ...gold.spec!, unit: "USD / MMBtu" } };
+  expect(usdPerMmbtu(2.769, ng, "USD", 1)).toBeNull();
+  expect(await loadUsdPerMmbtu(2.769, ng, "USD", rate)).toBeNull();
+  expect(asked).toEqual(["EUR"]);
+  // A rate that does not load converts nothing.
+  expect(usdPerMmbtu(90.3, ttf, "EUR", Number.NaN)).toBeNull();
+  expect(await loadUsdPerMmbtu(90.3, ttf, "EUR", async () => { throw new Error("offline"); })).toBeNull();
+});
+
+test("a futures move names what it is measured from, as far as the settlement in the terms shows", () => {
+  const tick = { tick: 0.25 };
+  const basis = (settlement: { price: number; date: string } | null, price: number, change: number, sessionDate = "2026-10-19") =>
+    futuresChangeBasis({ settlement, spec: tick }, { price, change, sessionDate }, "CME");
+  // Monday's move from Friday's settlement, which the terms still carry.
+  expect(basis({ price: 5645, date: "2026-10-16" }, 5626, -19)).toEqual({ kind: "settle", session: "2026-10-16" });
+  // Once Monday settles the terms no longer hold Friday's settlement: Friday's close, unchecked.
+  expect(basis({ price: 5630, date: "2026-10-19" }, 5626, -19)).toEqual({ kind: "close", session: "2026-10-16" });
+  // A move from Monday's own settlement is from Monday, whatever the date it carries.
+  expect(basis({ price: 5630, date: "2026-10-19" }, 5640, 10)).toEqual({ kind: "settle", session: "2026-10-19" });
+  // From Friday's last trade, not its settlement.
+  expect(basis({ price: 5645, date: "2026-10-16" }, 5626, -22)).toEqual({ kind: "last trade", session: "2026-10-16" });
+  // Friday has not settled yet: Friday's close, without claiming a settlement.
+  expect(basis({ price: 5600, date: "2026-10-15" }, 5626, -22)).toEqual({ kind: "close", session: "2026-10-16" });
+  expect(basis(null, 5626, -22, "2026-10-21")).toEqual({ kind: "close", session: "2026-10-20" });
+  // A source that rounds the move stays within half a tick of the settlement; a tick away is another price.
+  expect(basis({ price: 5645.25, date: "2026-10-16" }, 5626.25, -19.1)?.kind).toBe("settle");
+  expect(basis({ price: 5645.25, date: "2026-10-16" }, 5626.25, -18.75)?.kind).toBe("last trade");
+  // Without a tick, half a basis point of the price: 311.9 - 6.3 is 305.59999999999997.
+  expect(futuresChangeBasis({ settlement: { price: 305.6, date: "2026-10-16" } }, { price: 311.9, change: 6.3, sessionDate: "2026-10-19" }, "CBT")?.kind)
+    .toBe("settle");
+  expect(basis({ price: 5645, date: "2026-10-16" }, 5626, -19, "")).toBeNull();
+  expect(futuresChangeBasis({ settlement: null }, { price: 5626, change: null, sessionDate: "2026-10-19" }, "CME")).toBeNull();
+});
+
+test("on a Saturday the move is Friday's, from Thursday", () => {
+  const thursday = { price: 312.4, date: "2026-10-15" };
+  const friday = { price: 314.95, date: "2026-10-16" };
+  const move = { price: 314.95, change: 2.55 };
+  const coffee = (settlement: { price: number; date: string }, sessionDate: string) =>
+    futuresChangeBasis({ settlement, spec: { tick: 0.05 } }, { ...move, sessionDate }, "NYB");
+  // Friday not settled yet, or a source that dates the quote by the Saturday it was read: still Thursday's settlement.
+  expect(coffee(thursday, "2026-10-16")).toEqual({ kind: "settle", session: "2026-10-15" });
+  expect(coffee(thursday, "2026-10-17")).toEqual({ kind: "settle", session: "2026-10-15" });
+  // Friday settled: the terms hold Friday's settlement only, so Thursday's reference is its close.
+  expect(coffee(friday, "2026-10-17")).toEqual({ kind: "close", session: "2026-10-15" });
 });
 
 test("only futures symbols are looked up, and a malformed answer is refused", () => {
@@ -60,6 +150,29 @@ test("only futures symbols are looked up, and a malformed answer is refused", ()
     { ...gold, inDelivery: undefined }, { error: "Not a futures symbol with known contract terms" }]) {
     expect(() => validateFuturesContractTerms(bad as FuturesContractTermsPayload)).toThrow("invalid futures contract terms");
   }
+});
+
+test("quote's roll lines: the roll date, the front with its own price, the month left behind and the day's most active", () => {
+  const nov = { contract: "NGX26", contractSymbol: "NGX26.NYM", deliveryMonth: "2026-11" };
+  // NG=F on the front: its roll, and the most active month apart from it.
+  const alias = { roll: { label: "1 day before last trade", date: "2026-10-27" }, front: null, nearest: null,
+    mostActive: { ...nov, volume: 215_260, date: "2026-10-16" } };
+  expect(text(futuresRollLines(alias))).toEqual(["Rolls: 2026-10-27, 1 day before last trade",
+    "Most Active: NGX26 (Nov 2026), 215,260 contracts on 2026-10-16"]);
+  // A deferred month (NGF27) names the front it is not, priced from the front's own quote.
+  const deferred = { roll: null, front: { ...nov, lastTrade: "2026-10-28" }, mostActive: alias.mostActive };
+  const front = { price: 3.116, lastUpdated: Date.parse("2026-10-16T20:59:57Z"), currency: "USD", instrumentType: "FUTURE" };
+  expect(text(futuresRollLines(deferred, front))[0]).toBe("Front: NGX26 (Nov 2026) $3.116, 2026-10-16 20:59 UTC");
+  expect(text(futuresRollLines(deferred, null))[0]).toBe("Front: NGX26 (Nov 2026), last trade 2026-10-28");
+  // CL=F the day it rolled: December now, November still trading.
+  expect(text(futuresRollLines({ roll: { label: "open interest switch", date: null },
+    nearest: { contract: "CLX26", contractSymbol: "CLX26.NYM", deliveryMonth: "2026-11", lastTrade: "2026-10-20" } })))
+    .toEqual(["Rolls: open interest switch", "Nearest: CLX26 (Nov 2026), last trade 2026-10-20"]);
+  // Servers that send none of them add no lines; a malformed one is dropped and the terms stand.
+  expect(futuresRollLines(gold)).toEqual([]);
+  const odd = validateFuturesContractTerms({ ...gold, roll: { label: "", date: "2026-10-27" }, front: { contract: "GCZ26" } as never,
+    mostActive: { ...nov, volume: -1, date: "2026-10-16" } });
+  expect([odd.roll, odd.front, odd.mostActive, odd.settlement]).toEqual([null, null, null, gold.settlement]);
 });
 
 test("a futures price unit is asked once per symbol at a time, and a failed ask falls back to the catalog and is retried", async () => {

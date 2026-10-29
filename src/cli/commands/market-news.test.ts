@@ -4,7 +4,9 @@ import { createTestCliContext } from "../../test-support/cli-context";
 import { DEFAULT_CLI_OPTIONS } from "../options";
 import { serializeCliResult } from "../result";
 import { marketDataCliCommands } from "./market";
-import { newsSearchText } from "./news-search";
+import type { NewsArticle } from "../../news/types";
+import { mapCloudNewsArticle } from "../../sources/gloomberb-cloud/news";
+import { commonWordCandidate, newsSearchText, wordMeansMore } from "./news-search";
 
 const news = marketDataCliCommands.find((command) => command.name === "news")!;
 
@@ -51,7 +53,7 @@ function unknownSymbol() {
   return { ...cli, calls };
 }
 
-test("several words, quoted or not, search story text newest first without looking up a listing", async () => {
+test("several words, quoted or not, search story text in the service's order without looking up a listing", async () => {
   const requests = serveSearch(STORIES);
   const cli = createTestCliContext({ dataProvider: { getNews: async () => { throw new Error("no ticker lookup"); } } });
   await news.execute(["european gas"], cli.context);
@@ -59,7 +61,8 @@ test("several words, quoted or not, search story text newest first without looki
 
   expect(requests.map((url) => [url.pathname, url.searchParams.get("query"), url.searchParams.get("limit")]))
     .toEqual([["/news/search", "european gas", "20"], ["/news/search", "european gas", "20"]]);
-  expect((cli.printed[0]!.result.data as Array<{ id: string }>).map((article) => article.id)).toEqual(["newer", "older"]);
+  // Headline hits lead the service's answer, so an older one stays above a newer summary hit.
+  expect((cli.printed[0]!.result.data as Array<{ id: string }>).map((article) => article.id)).toEqual(["older", "newer"]);
   expect(cli.printed[0]!.result.metadata).toMatchObject({ ticker: null, search: "european gas" });
   const text = render(cli.printed[0]!);
   expect(text.split("\n")[0]).toBe('Stories matching "european gas"');
@@ -76,7 +79,7 @@ test("a word no listing answers to is searched as text, and says why under its h
   expect(cli.printed[0]!.result.data).toHaveLength(2);
 });
 
-test("a futures board code, which resolves to its future, is searched as text; a short one and a contract symbol are not", async () => {
+test("a futures board code, which resolves to its future, is searched as text; a short one and a future with no commodity are not", async () => {
   const requests = serveSearch(STORIES);
   const future = (name: string) => createTestCliContext({
     dataProvider: { getNews: async () => [], getQuote: async () => ({ symbol: "TTF=F", name, instrumentType: "FUTURE", exchangeName: "NYM" }) },
@@ -90,12 +93,81 @@ test("a futures board code, which resolves to its future, is searched as text; a
   await news.execute(["ttf"], ttf.context);
   expect(render(ttf.printed[1]!)).toContain("No stories match TTF, and news is filed under company tickers, not futures; try news LNG.");
 
-  // ZN matches names that merely contain it, and CL=F is a contract, not a word: both keep the futures answer.
+  // ZN is mostly a piece of other names, and ES=F has no commodity to search: both keep the futures answer.
   const treasury = future("10-Year T-Note Dec 26");
   await news.execute(["ZN"], treasury.context);
-  await news.execute(["CL=F"], treasury.context);
+  await news.execute(["ES=F"], treasury.context);
   expect(found).toHaveLength(1);
   expect(render(treasury.printed[0]!)).toContain("news is filed under company tickers, not futures");
+});
+
+test("a commodity's future searches the stories of its commodity, and offers no route to itself when there are none", async () => {
+  const requests = serveSearch(STORIES);
+  const coffee = createTestCliContext({
+    dataProvider: { getNews: async () => [], getQuote: async () => ({ symbol: "KC=F", name: "Coffee Dec 26", instrumentType: "FUTURE", exchangeName: "NYB" }) },
+  });
+  await news.execute(["KC=F"], coffee.context);
+  expect(requests.map((url) => url.searchParams.get("query"))).toEqual(["coffee"]);
+  expect(render(coffee.printed[0]!).split("\n")[0]).toBe('Stories matching "coffee"  ·  the commodity KC=F trades');
+
+  const none = serveSearch([]);
+  await news.execute(["KC=F"], coffee.context);
+  expect(none).toHaveLength(1);
+  expect(render(coffee.printed[1]!)).toContain("No news for Coffee Dec 26 (NYB): news is filed under company tickers, not futures");
+});
+
+test("a search no story matches says so, never a near miss, and offers the commodity's future only when its news has stories", async () => {
+  // The service finds nothing for the text and one story for the commodity's own name.
+  const requests: string[] = [];
+  setCloudApiFetchTransport(async (url) => {
+    const query = new URL(url).searchParams.get("query")!;
+    requests.push(query);
+    const items = query === "sugar" || query === "coffee" ? [STORIES[0]] : [];
+    return new Response(JSON.stringify({ items, nextCursor: null }), { headers: { "Content-Type": "application/json" } });
+  });
+  const cli = unknownSymbol();
+  await news.execute(["sugar prices"], cli.context);
+  await news.execute(["arabica"], cli.context);
+  await news.execute(["sugar", "beet", "pulp"], cli.context);
+  await news.execute(["european gas"], cli.context);
+  await news.execute(["palm oil"], cli.context);
+  expect(render(cli.printed[0]!)).toContain('No stories match "sugar prices". For the Sugar #11 future, try: gloom news SB=F');
+  expect(cli.printed[0]!.result.metadata).toMatchObject({ futuresNews: "gloom news SB=F" });
+  expect(render(cli.printed[1]!)).toContain('No stories match "arabica". For the Coffee future, try: gloom news KC=F');
+  expect(render(cli.printed[2]!)).toContain('No stories match "sugar beet pulp". For the Sugar #11 future');
+  expect(render(cli.printed[3]!)).toContain('No stories match "european gas".');
+  expect(render(cli.printed[3]!)).not.toContain("try:");
+  // Palm oil is no crude: its search offers no WTI route.
+  expect(render(cli.printed[4]!)).toContain('No stories match "palm oil".');
+  expect(render(cli.printed[4]!)).not.toContain("try:");
+  expect(requests).toEqual(["sugar prices", "sugar", "arabica", "coffee", "sugar beet pulp", "sugar", "european gas", "palm oil"]);
+
+  // A route that would search what just found nothing, or that has no story either, is not offered.
+  const quiet = serveSearch([]);
+  await news.execute(['"sugar"'], cli.context);
+  await news.execute(["cocoa prices"], cli.context);
+  await news.execute(['"soybeans"'], cli.context);
+  expect(render(cli.printed[5]!)).toContain('No stories match "sugar".');
+  expect(render(cli.printed[6]!)).toContain('No stories match "cocoa prices".');
+  expect(render(cli.printed[6]!)).not.toContain("news CC=F");
+  expect(quiet.map((url) => url.searchParams.get("query"))).toEqual(["sugar", "cocoa prices", "cocoa", "soybeans"]);
+});
+
+test("a word whose story search fails says the search failed, with the lookup's answer, never that no story matches", async () => {
+  const requests = serveSearch([]);
+  setCloudApiFetchTransport(async (url) => {
+    requests.push(new URL(url));
+    return new Response("Search is down", { status: 503 });
+  });
+  const cli = unknownSymbol();
+  await news.execute(["arabica"], cli.context);
+  const text = render(cli.printed[0]!);
+  expect(text).not.toContain("No stories match");
+  expect(text).toContain("No listing answers to ARABICA. news takes a company ticker");
+  expect(cli.printed[0]!.result.warnings).toEqual(['Searching stories for "arabica" failed: Search is down']);
+  // No futures route is offered off a search that never answered.
+  expect(requests).toHaveLength(1);
+  expect(cli.printed[0]!.result.metadata).not.toHaveProperty("futuresNews");
 });
 
 test("a word nothing answers to and no story mentions keeps the not-a-ticker answer", async () => {
@@ -107,7 +179,53 @@ test("a word nothing answers to and no story mentions keeps the not-a-ticker ans
   // A search that cannot be made leaves the lookup's own answer rather than failing the command.
   setCloudApiFetchTransport(async () => new Response("{}", { status: 503 }));
   await news.execute(["ZZQXV"], cli.context);
-  expect(render(cli.printed[1]!)).toContain("No listing answers to ZZQXV and no stories match it.");
+  expect(render(cli.printed[1]!)).toContain("No listing answers to ZZQXV. news takes a company ticker");
+});
+
+test("a metal's future, name or bare board code is the metal's market news (NI METALS); the ticker in capitals keeps its company news", async () => {
+  const requests = serveSearch(STORIES);
+  const tickerNews: string[] = [];
+  // GOLD is Gold.com Inc.; no listing answers to GC.
+  const cli = createTestCliContext({
+    dataProvider: {
+      getNews: async (query: { ticker?: string }) => { tickerNews.push(query.ticker ?? ""); return []; },
+      getQuote: async (symbol: string) => {
+        if (symbol === "GOLD") return { symbol: "GOLD", name: "Gold.com Inc.", exchangeName: "NYSE" };
+        throw new Error(`Not a ticker: ${symbol}.`);
+      },
+    },
+  });
+  for (const typed of ["GC=F", "SI=F", "hg=f", "PA=F", "gold", "Silver", "GC"]) await news.execute([typed], cli.context);
+
+  expect(requests.map((url) => [url.searchParams.get("query"), url.searchParams.get("topics")])).toEqual([
+    ["gold", "metals"], ["silver", "metals"], ["copper", "metals"], ["palladium", "metals"], ["gold", "metals"], ["silver", "metals"],
+    ["gold", "metals"],
+  ]);
+  const headings = cli.printed.map((printed) => render(printed).split("\n")[0]);
+  expect(headings).toEqual([
+    'Metals news matching "gold"  ·  the commodity GC=F trades',
+    'Metals news matching "silver"  ·  the commodity SI=F trades',
+    'Metals news matching "copper"  ·  the commodity HG=F trades',
+    'Metals news matching "palladium"  ·  the commodity PA=F trades',
+    'Metals news matching "gold"',
+    'Metals news matching "silver"',
+    'Metals news matching "gold"  ·  GC is the futures board\'s code for Gold',
+  ]);
+  expect(cli.printed[4]!.result.metadata).toMatchObject({ ticker: null, search: "gold", topics: ["metals"], companyNews: "gloom news GOLD" });
+  expect(render(cli.printed[4]!)).toContain("gold → gold's market news. For Gold.com Inc. (ticker GOLD), try: gloom news GOLD");
+  // No ticker is SILVER here, so none is offered.
+  expect(cli.printed[5]!.result.metadata).not.toHaveProperty("companyNews");
+
+  // GOLD in capitals is the ticker: its company news, no metals search.
+  await news.execute(["GOLD"], cli.context);
+  expect(requests).toHaveLength(7);
+  expect(tickerNews).toEqual(["GC", "GOLD"]);
+  expect(render(cli.printed[7]!).split("\n")[0]).toContain("Gold.com Inc.");
+
+  // No story tagged METALS: every story that names the metal is one search away.
+  serveSearch([]);
+  await news.execute(["PL=F"], cli.context);
+  expect(render(cli.printed[8]!)).toContain(`No metals stories match "platinum". For every story that mentions it, try: gloom news '"platinum"'`);
 });
 
 test("a real listing, with or without stories, never falls back to a text search", async () => {
@@ -125,6 +243,26 @@ test("a real listing, with or without stories, never falls back to a text search
   expect(requests).toHaveLength(0);
 });
 
+test("a coin pair whose stories came from searching the coin says so, with the name its quote gives to search", async () => {
+  const queries: Array<{ ticker?: string; listingName?: string }> = [];
+  const cli = createTestCliContext({
+    dataProvider: {
+      getNews: async (query) => {
+        queries.push({ ticker: query.ticker, listingName: query.listingName });
+        return [{ ...mapCloudNewsArticle(story("btc", "Bitcoin snaps back after a failed downside break", "2026-10-15T09:00:00.000Z")), searchedFor: "hyperliquid" }];
+      },
+      getQuote: async () => ({ symbol: "HYPE32196-USD", name: "Hyperliquid USD", exchangeName: "CCC", instrumentType: "CRYPTOCURRENCY" }),
+    },
+  });
+  await news.execute(["HYPE32196-USD"], cli.context);
+
+  expect(queries).toEqual([{ ticker: "HYPE32196-USD", listingName: "Hyperliquid USD" }]);
+  const text = render(cli.printed[0]!);
+  expect(text.split("\n")[0]).toBe('Stories matching "hyperliquid"  ·  no stories filed under HYPE32196-USD');
+  expect(text).toContain("Bitcoin snaps back");
+  expect(cli.printed[0]!.result.metadata).toMatchObject({ ticker: "HYPE32196-USD", search: "hyperliquid" });
+});
+
 test("text search refuses a symbol's options and text the service would reject", async () => {
   const requests = serveSearch(STORIES);
   const cli = createTestCliContext();
@@ -134,9 +272,22 @@ test("text search refuses a symbol's options and text the service would reject",
   expect(requests).toHaveLength(0);
 });
 
-test("only several words are text up front; one word stays a symbol", () => {
+test("only several words, or one that kept its quotes, are text up front; a bare word stays a symbol", () => {
   expect(newsSearchText([])).toBeNull();
   expect(newsSearchText(["TTF"])).toBeNull();
   expect(newsSearchText(["european gas"])).toBe("european gas");
   expect(newsSearchText(["european", "  gas "])).toBe("european gas");
+  // A shell drops one pair of quotes: news '"gold"' arrives as "gold" and searches the text.
+  expect(newsSearchText(['"gold"'])).toBe("gold");
+});
+
+test("a word that is also its company's name hints at the text search only when its stories are mostly elsewhere", () => {
+  const filed = (tickers: string[]) => ({ tickers }) as unknown as NewsArticle;
+  expect(commonWordCandidate("gold", "Gold.com Inc.")).toBe(true);
+  // Typed as a ticker, or not a word of the name: no lookup of the stories at all.
+  expect(commonWordCandidate("GOLD", "Gold.com Inc.")).toBe(false);
+  expect(commonWordCandidate("tsla", "Tesla, Inc.")).toBe(false);
+  expect(wordMeansMore([filed([]), filed(["NEM"]), filed(["GOLD"])], "GOLD")).toBe(true);
+  expect(wordMeansMore([filed(["META"]), filed(["META", "GOOGL"]), filed([])], "META")).toBe(false);
+  expect(wordMeansMore([filed([]), filed([])], "GOLD")).toBe(false);
 });

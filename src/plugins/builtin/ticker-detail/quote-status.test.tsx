@@ -11,6 +11,8 @@ import { TestPaneProvider, createTestPaneConfig, createTestTicker } from "../../
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
 import type { Quote, TickerFinancials } from "../../../types/financials";
+import { attentionCache } from "../attention/client";
+import { attentionFixture } from "../attention/test-fixture";
 import { TickerResearchPane } from "./pane";
 
 const paneId = "research:status";
@@ -22,6 +24,7 @@ let footer: CombinedPaneFooter;
 
 afterEach(() => {
   mock.restore();
+  attentionCache.reset();
   setSharedMarketDataCoordinator(null);
 });
 
@@ -40,9 +43,15 @@ async function frame() {
 }
 
 async function render(plan: "free" | "pro", width: number) {
+  attentionCache.reset();
   spyOn(Date, "now").mockReturnValue(now);
   spyOn(apiClient, "getCurrentUser").mockReturnValue({ id: "local-status-test", emailVerified: true, plan } as any);
   spyOn(apiClient, "recordResearchActivity").mockResolvedValue(undefined as any);
+  spyOn(apiClient, "getCloudAttention").mockResolvedValue(attentionFixture({
+    window: "today", entitlement: plan === "pro" ? "pro" : "preview", status: "collecting",
+    rows: [], sectors: [], countries: [], counts: { rows: 0, sectors: 0, countries: 0 },
+    coverage: { publishedHours: 0, publishedTickers: 0, baselineDays: 0 },
+  }));
   setSharedMarketDataCoordinator(null);
   const config = createTestPaneConfig("/unused/status-test", {
     instanceId: paneId, paneId: TICKER_RESEARCH_PANE_ID, binding: { kind: "fixed", symbol: "9988" },
@@ -112,3 +121,42 @@ test("unknown source timestamps do not become fabricated dates and nonquote tabs
   expect(financial).not.toContain("Stale quote");
   expect(footer.info.some((segment) => segment.id === "ticker-research-stale")).toBe(false);
 });
+
+for (const width of [36, 48, 120]) {
+  test(`a listing that no longer trades keeps its delisting date whole in the header: ${width}`, async () => {
+    await render("pro", width);
+    const delisting = { status: "delisted" as const, lastTradeDate: "2026-09-10", historyStart: "2016-01-04" };
+    const delisted = await replaceQuote({ ...quote(), delisting });
+    const header = delisted.split("\n").find((line) => line.includes("Delisted")) ?? "";
+    expect(header).toContain("Delisted Sep 10, 2026");
+    // The footer gives the date in place of a stale-quote warning.
+    expect(footer.info.find((segment) => segment.id === "ticker-research-stale")?.parts.map((part) => part.text))
+      .toEqual(["Delisted Sep 10, 2026"]);
+    // The venue, then the name, give way on a narrow pane; a wide one keeps both.
+    if (width === 120) expect(header).toContain("Alibaba Group (HKEX) Delisted Sep 10, 2026");
+    // A listing still trading is laid out as before.
+    expect(await replaceQuote(quote())).not.toContain("Delisted");
+  });
+}
+
+test("a listing that no longer trades reads as its last session: no move, no book, no delay", async () => {
+  await render("free", 120);
+  const trading = { ...quote(), bid: 107.4, ask: 107.6, open: 106.9, low: 106.5, high: 108 };
+  const live = await replaceQuote(trading);
+  expect(live).toContain("+0.60");
+  expect(live).toContain("Bid");
+  expect(live).toContain("Day Range");
+  const accessText = () => footer.info.flatMap((segment) => segment.parts.map((part) => part.text)).join(" ");
+  // A free plan's delay segment (its clock and the upgrade behind it), whatever its wording.
+  const delaySegment = () => footer.info.find((segment) => segment.id === "ticker-research-access");
+  expect(delaySegment()).toBeDefined();
+  const delisting = { status: "delisted" as const, lastTradeDate: "2026-09-10", historyStart: "2016-01-04" };
+  const ended = await replaceQuote({ ...trading, delisting });
+  expect(ended).toContain("Delisted Sep 10, 2026");
+  expect(ended).toContain("HK$107.50");
+  for (const live of ["+0.60", "+0.56%", "Bid", "Ask", "Spr", "Day Range"]) expect(ended).not.toContain(live);
+  expect(ended).toContain("Last Session");
+  expect(delaySegment()).toBeUndefined();
+  expect(accessText()).toBe("Delisted Sep 10, 2026");
+});
+

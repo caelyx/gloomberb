@@ -64,7 +64,7 @@ class DebugLog {
     }
     this.mirrorEntryToConsole(entry);
     for (const listener of this.listeners) {
-      try { listener(entry); } catch { /* ignore */ }
+      try { listener(entry); } catch { /* Intentional ignore: A broken log listener must not block other listeners or recursively log itself. */ }
     }
   }
 
@@ -146,7 +146,7 @@ class DebugLog {
   exportAsText(filter?: { level?: LogLevel; source?: string }): string {
     const entries = this.getEntries(filter);
     const lines: string[] = [
-      `Gloomberb Debug Log — exported ${new Date().toISOString()}`,
+      `Gloom Debug Log — exported ${new Date().toISOString()}`,
       `Total entries: ${entries.length}`,
       "=".repeat(80),
       "",

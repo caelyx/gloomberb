@@ -54,6 +54,7 @@ export const researchModule: PluginModule = {
       component: AnalystResearchView,
       defaultPosition: "right",
       tickerFollower: true,
+      instruments: ["equity"],
       defaultMode: "floating",
       defaultFloatingSize: { width: 90, height: 28 },
       tableExport: true,
@@ -68,6 +69,7 @@ export const researchModule: PluginModule = {
       component: EquityDiagnosticView,
       defaultPosition: "right",
       tickerFollower: true,
+      instruments: ["equity"],
       defaultMode: "floating",
       defaultFloatingSize: { width: 96, height: 30 },
     },
@@ -101,6 +103,7 @@ export const researchModule: PluginModule = {
       component: EarningsEstimatesPane,
       defaultPosition: "right",
       tickerFollower: true,
+      instruments: ["equity"],
       defaultMode: "floating",
       defaultFloatingSize: { width: 104, height: 22 },
       tableExport: true,
@@ -156,7 +159,8 @@ export const researchModule: PluginModule = {
       paneId: "relative-valuation",
       label: "Relative Valuation",
       description: "Compare valuation and operating metrics across peers.",
-      keywords: ["relative", "valuation", "comps", "peers", "rv"],
+      // The words an analyst asks for a comp table by.
+      keywords: ["relative", "valuation", "comps", "peers", "rv", "comp table", "comparable companies", "peer comparison", "competitors"],
       shortcut: { prefix: "RV", argPlaceholder: "tickers", argKind: "ticker-list" },
       canCreate: (context, options) => !!(options?.symbols?.length || options?.arg || context.activeTicker),
       createInstance: (context, options) => {

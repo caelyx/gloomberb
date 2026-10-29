@@ -1,9 +1,13 @@
 import { formatNumber } from "../../../utils/format";
+import { TREASURY_CURVE_CUTOFF } from "../shared/treasury-cutoffs";
 import type { StatDef } from "./defs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAILY = 6 * DAY_MS;
 const WEEKLY = 21 * DAY_MS;
+// GDPNow is dated at quarter start but updated through the following month's
+// advance GDP release; allow that ~120-day span plus two weeks.
+const NOWCAST_QUARTERLY = 135 * DAY_MS;
 // FRED dates a print at the start of its period, so an on-time print is two
 // periods plus the release lag old just before the next one lands. Each limit
 // adds about two weeks to the slowest normal lag of its group.
@@ -15,11 +19,14 @@ const QUARTERLY = 235 * DAY_MS; // GDP, productivity: two quarters plus a lag up
 const pct = (value: number) => `${formatNumber(value, 1)}%`;
 const pct2 = (value: number) => `${formatNumber(value, 2)}%`;
 const plain = (value: number) => formatNumber(value, 1);
+const index2 = (value: number) => formatNumber(value, 2);
 /** FRED reports payrolls and claims in thousands already. */
 const thousands = (value: number) => `${formatNumber(value / 1000, value >= 10_000 ? 1 : 2)}M`;
 const signedThousands = (value: number) =>
   `${value > 0 ? "+" : ""}${formatNumber(value, 0)}k`;
 const billions = (value: number) => `${formatNumber(value, 0)}B`;
+/** A spread already scaled to basis points; the label says the unit. */
+const basisPoints = (value: number) => formatNumber(value, 0);
 
 function stat(def: StatDef): StatDef {
   return def;
@@ -248,6 +255,69 @@ export const STATS: readonly StatDef[] = [
     limit: 500,
   }),
 
+  // ---- Nowcasts & conditions --------------------------------------------
+  stat({
+    id: "gdpnow",
+    measurementBasis: "Estimate · q/q annualized",
+    label: "Atlanta Fed GDPNow",
+    shortLabel: "GDPNow",
+    category: "nowcasts",
+    seriesId: "GDPNOW",
+    transform: "level",
+    direction: "higher-is-good",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: { value: 0, label: "flat" },
+    staleAfterMs: NOWCAST_QUARTERLY,
+    note: "Atlanta Fed model estimate of real GDP growth, updated within the quarter. Already an annualized percentage change, not a GDP level.",
+    keywords: ["nowcast", "GDP nowcast"],
+  }),
+  stat({
+    id: "nfci",
+    measurementBasis: "Weekly · index",
+    label: "Chicago Fed Financial Conditions",
+    shortLabel: "Chicago NFCI",
+    category: "nowcasts",
+    seriesId: "NFCI",
+    transform: "level",
+    direction: "higher-is-bad",
+    axisUnit: "",
+    formatValue: index2,
+    reference: { value: 0, label: "average" },
+    staleAfterMs: WEEKLY,
+    note: "Chicago Fed National Financial Conditions Index. Positive values mean tighter-than-average conditions; negative values mean looser conditions.",
+  }),
+  stat({
+    id: "financial-stress",
+    measurementBasis: "Weekly · index",
+    label: "St. Louis Fed Financial Stress",
+    shortLabel: "St. Louis FSI",
+    category: "nowcasts",
+    seriesId: "STLFSI4",
+    transform: "level",
+    direction: "higher-is-bad",
+    axisUnit: "",
+    formatValue: index2,
+    reference: { value: 0, label: "average" },
+    staleAfterMs: WEEKLY,
+    note: "St. Louis Fed Financial Stress Index, current fourth version. Positive values mean above-average stress; negative values mean below-average stress.",
+  }),
+  stat({
+    id: "median-cpi",
+    measurementBasis: "m/m annualized · seasonally adjusted",
+    label: "Cleveland Fed Median CPI",
+    shortLabel: "Median CPI",
+    category: "nowcasts",
+    seriesId: "MEDCPIM158SFRBCLE",
+    transform: "level",
+    direction: "higher-is-bad",
+    axisUnit: "%",
+    formatValue: pct,
+    reference: null,
+    staleAfterMs: MONTHLY_EARLY,
+    note: "Cleveland Fed weighted median consumer price change. Published as an annualized monthly percentage change, not a year-over-year inflation rate.",
+  }),
+
   // ---- Consumer --------------------------------------------------------
   stat({
     id: "retail-sales",
@@ -377,6 +447,41 @@ export const STATS: readonly StatDef[] = [
     note: "Newly built homes sold, at an annual rate.",
     limit: 900,
   }),
+  stat({
+    id: "mortgage-30y",
+    measurementBasis: "Weekly · Freddie Mac PMMS",
+    label: "30-Year Mortgage Rate",
+    shortLabel: "30Y mortgage rate",
+    category: "housing",
+    seriesId: "MORTGAGE30US",
+    transform: "level",
+    direction: "neutral",
+    axisUnit: "%",
+    formatValue: pct2,
+    reference: null,
+    staleAfterMs: WEEKLY,
+    note: "Freddie Mac's weekly average 30-year fixed mortgage rate, what a home purchase is financed at.",
+    keywords: ["mortgage rates", "PMMS", "Freddie Mac", "homebuilders"],
+  }),
+  stat({
+    id: "mortgage-spread",
+    measurementBasis: "30Y mortgage minus 10Y Treasury on the PMMS date",
+    label: "Mortgage–10Y Spread (bp)",
+    shortLabel: "Mortgage–10Y (bp)",
+    category: "housing",
+    seriesId: "MORTGAGE30US10Y",
+    derivedFrom: ["mortgage-30y", "ten-year"],
+    transform: "level",
+    // Gloom Cloud serves it in percentage points, as FRED does its spreads.
+    scale: 100,
+    direction: "neutral",
+    axisUnit: "",
+    formatValue: basisPoints,
+    reference: null,
+    staleAfterMs: WEEKLY,
+    note: "The 30-year mortgage rate less the 10-year Treasury yield on each survey date, how much mortgages pay over Treasuries.",
+    keywords: ["mortgage spread", "PMMS", "homebuilders"],
+  }),
   // ---- Rates & money ---------------------------------------------------
   stat({
     id: "fed-funds",
@@ -392,6 +497,7 @@ export const STATS: readonly StatDef[] = [
     reference: null,
     staleAfterMs: DAILY,
     note: "Daily effective overnight rate; the FOMC sets a separate target range.",
+    rankMoves: true,
   }),
   stat({
     id: "ten-year",
@@ -406,6 +512,8 @@ export const STATS: readonly StatDef[] = [
     reference: null,
     staleAfterMs: DAILY,
     note: "The benchmark long rate that discounts almost everything else.",
+    rankMoves: true,
+    cutoff: TREASURY_CURVE_CUTOFF,
   }),
   stat({
     id: "two-year",
@@ -420,6 +528,8 @@ export const STATS: readonly StatDef[] = [
     reference: null,
     staleAfterMs: DAILY,
     note: "The short end, which tracks where policy is expected to go.",
+    rankMoves: true,
+    cutoff: TREASURY_CURVE_CUTOFF,
   }),
   stat({
     id: "curve-spread",
@@ -437,6 +547,8 @@ export const STATS: readonly StatDef[] = [
     reference: { value: 0, label: "inversion" },
     staleAfterMs: DAILY,
     note: "The curve spread. Below zero it has preceded every modern recession.",
+    rankMoves: true,
+    cutoff: TREASURY_CURVE_CUTOFF,
   }),
   stat({
     id: "real-ten-year",
@@ -452,6 +564,8 @@ export const STATS: readonly StatDef[] = [
     reference: { value: 0, label: "zero" },
     staleAfterMs: DAILY,
     note: "The inflation-protected long rate, the real cost of money.",
+    rankMoves: true,
+    cutoff: TREASURY_CURVE_CUTOFF,
   }),
   stat({
     id: "m2-yoy",
