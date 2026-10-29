@@ -6,9 +6,9 @@ requiring a Gloom Cloud sign-in to open the workspace or use public-data
 plugins. Gloom Cloud itself is not modified or self-hosted: `/api/*` still goes
 to `https://api.gloom.sh`, and Gloom's own authentication rules still apply to it.
 
-Baseline: upstream `gloom-sh/gloomberb` at `e21757bcfbcede7841f7bbd13d0526374b87379c`
-("Lay the groundwork for splitting the big built-in plugins (Linear: GLO-340)
-(#1528)", 10 October 2026), merged into this branch. Originally written against
+Baseline: upstream `gloom-sh/gloomberb` at its `v0.18.5` tag
+(`1c310f72ca2dbb4b9f8dbbf258a7bd39a84ec7d0`, 25 October 2026), through the
+fork's `main`, merged into this branch. Originally written against
 `62317c477c1ef9b8394a12eac971c5546441b76e` (29 September 2026).
 
 ## Two separate kinds of authentication
@@ -354,12 +354,13 @@ the origin.
 
 ## Keeping up with upstream
 
-The fork's `main` mirrors upstream `gloom-sh/gloomberb` `main` and carries no
-downstream changes; everything in this document lives on the long-lived
-`feature/private-deployment` branch. To sync: bring `main` up to upstream (a
-fast-forward, or GitHub's "Sync fork"), then merge `main` into
-`feature/private-deployment`. Never commit downstream changes to `main`, with
-one exception: `.github/workflows/deploy-private.yml` is also on `main`, because
+The fork's `main` is upstream `gloom-sh/gloomberb` plus the fork's own fixes
+and features (secondary desktop windows, listing and calendar fixes, the
+unsigned macOS build); everything in this document lives on the long-lived
+`feature/private-deployment` branch. To sync: merge upstream into `main` (by
+pull request, since `main` has commits of its own), then merge `main` into
+`feature/private-deployment`. Never commit private-deployment changes to
+`main`, with one exception: `.github/workflows/deploy-private.yml` is also on `main`, because
 GitHub only offers Run workflow for a `workflow_dispatch` workflow on the
 default branch. Keep the two copies identical (edit it here, then copy it to
 `main`) so merging `main` into this branch never conflicts; the copy on the
