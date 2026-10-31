@@ -19,8 +19,8 @@ import {
   type DataTableKeyEvent,
   type StatItem,
 } from "gloomberb/components";
-import { useAsyncResource, useAutoRefresh, usePluginPaneState } from "gloomberb/react";
-import { colors, priceColor } from "gloomberb/theme";
+import { useAsyncResource, useAutoRefresh, usePaneSettingValue, usePluginPaneState } from "gloomberb/react";
+import { blendHex, colors, priceColor } from "gloomberb/theme";
 import type { PaneProps } from "gloomberb/types/plugin";
 import { Box } from "gloomberb/ui";
 import { isPlainKey } from "gloomberb/utils";
@@ -29,15 +29,21 @@ import { useCacheStatus } from "../shared/cache-status";
 import { formatDay, sydneyToday } from "../shared/time";
 import { cachedRbap, loadRbap } from "./client";
 import { moveOddsText, moveSteps } from "./model";
-import { bpText, meetingLabel, pathNotices, priceText, rbapView, stepsText, type ContractRow, type PathRow, type RbapView } from "./view";
+import { bpText, historyMonths, meetingLabel, pathNotices, priceText, probabilityTable, probabilityText, rbapView, stepsText, targetHistory, targetLine, type ContractRow, type HistoryMonths, type PathRow, type ProbabilityTable, type RbapView } from "./view";
 
 export const RBAP_PANE_ID = "au-rbap";
 
+/** Pane setting: months of the actual target drawn before the path. */
+export const HISTORY_SETTING = "historyMonths";
+/** Pane setting: today's target held flat across the meetings. */
+export const CURRENT_TARGET_SETTING = "showCurrentTarget";
+
 const RATE_TRACKER = "https://www.asx.com.au/markets/trade-our-derivatives-market/futures-market/rba-rate-tracker";
 
-type Tab = "path" | "contracts";
+type Tab = "path" | "probabilities" | "contracts";
 const TABS: Array<{ label: string; value: Tab }> = [
   { label: "Path", value: "path" },
+  { label: "Probabilities", value: "probabilities" },
   { label: "Contracts", value: "contracts" },
 ];
 
@@ -64,6 +70,22 @@ const CONTRACT_COLUMNS: ContractColumn[] = [
   { id: "volume", label: "Volume", width: 8, align: "right" },
 ];
 
+type ProbabilityRow = ProbabilityTable["rows"][number];
+
+/** The meeting, then one column per 25 bp target level, ids indexing the row's odds. */
+function probabilityColumns(levels: readonly number[]): DataTableColumn[] {
+  return [PATH_COLUMNS[0]!, ...levels.map((level, index) => ({ id: String(index), label: formatRate(level), width: 9, align: "right" as const }))];
+}
+
+/** Shaded by probability as on WIRP, with dark text once the shade is strong. */
+function probabilityCell(row: ProbabilityRow, column: DataTableColumn): DataTableCell {
+  if (column.id === "date") return pathCell(row.meeting, PATH_COLUMNS[0]!);
+  const probability = row.odds[Number(column.id)] ?? null;
+  return { text: probabilityText(probability), value: probability,
+    backgroundColor: probability == null ? undefined : blendHex(colors.bg, colors.positive, probability * 0.7),
+    color: probability != null && probability > 0.65 ? colors.bg : colors.text };
+}
+
 const CAPTION = "Implied cash rate target % by RBA meeting";
 
 /** Hikes up, cuts down, by the sign the text shows, so a move that rounds to zero stays neutral. */
@@ -71,13 +93,17 @@ function signColor(value: number | null, digits: number): string {
   return value == null || !Number.isFinite(value) ? colors.textDim : priceColor(Number(value.toFixed(digits)));
 }
 
-/** The implied path, today's target as a reference line, then the look-backs. */
-function pathCurves(view: RbapView): CurveSeries[] {
+/**
+ * The implied path, the target line (the actual target, then today's held
+ * flat: a reference, so never a row or the cursor), then the look-backs.
+ */
+function pathCurves(view: RbapView, target: ReadonlyArray<{ date: string; rate: number }>, months: HistoryMonths): CurveSeries[] {
   const point = (date: string, rate: number | null, estimated: boolean) => ({ id: date, label: meetingLabel(date, estimated), x: Date.parse(date), value: rate });
   const points = view.meetings.map((row) => point(row.date, row.rate, row.estimated));
   const series: CurveSeries[] = [{ id: "implied", label: "Implied", role: "primary", style: "step", color: colors.positive, points }];
-  if (view.target != null && points.length) {
-    series.push({ id: "target", label: "Target", role: "reference", color: colors.borderFocused, points: points.map((entry) => ({ ...entry, value: view.target })) });
+  if (target.length) {
+    series.push({ id: "target", label: months === "0M" ? "Target" : `Target (${months})`, role: "reference", style: "step", color: colors.warning,
+      points: target.map((entry) => ({ id: `target:${entry.date}`, label: formatDay(entry.date), x: Date.parse(entry.date), value: entry.rate })) });
   }
   const ghostColors = curveGhostColors(colors);
   for (const ghost of view.ghosts) {
@@ -114,6 +140,7 @@ function contractCell(row: ContractRow, column: ContractColumn): DataTableCell {
 }
 
 const meetingKey = (row: PathRow) => row.date;
+const probabilityKey = (row: ProbabilityRow) => row.meeting.date;
 const meetingDate = (row: PathRow) => new Date(row.date);
 
 /** RBAP: the RBA path the ASX 30-day interbank cash rate futures price, WIRP's Australian counterpart. */
@@ -121,6 +148,10 @@ export function RbapPane({ focused, width, height }: PaneProps) {
   const [tab, setTab] = usePluginPaneState<Tab>("tab", "path");
   const [selected, setSelected] = usePluginPaneState<string | null>("meeting", null);
   const [contract, setContract] = usePluginPaneState<string | null>("contract", null);
+  // A pane setting rather than private state, so the settings dialog shows it.
+  const [historySetting] = usePaneSettingValue<string>(HISTORY_SETTING, "3M");
+  const months = historyMonths(historySetting);
+  const [showCurrent] = usePaneSettingValue<boolean>(CURRENT_TARGET_SETTING, true);
   const loader = useCallback((force: boolean) => loadRbap({ force }), []);
   const { data, loading, error, updatedAt, load, reload } = useAsyncResource(loader, { initialData: cachedRbap });
   useAutoRefresh(updatedAt, load);
@@ -128,6 +159,8 @@ export function RbapPane({ focused, width, height }: PaneProps) {
   const tabs = usePaneTabs({ tabs: TABS, activeValue: tab, onSelect: (value) => setTab(value as Tab), focused, dense: true });
   const view = useMemo(() => (data ? rbapView(data, sydneyToday()) : null), [data]);
   const meetings = view?.meetings ?? [];
+  const probabilities = useMemo(() => (view ? probabilityTable(view) : { levels: [], rows: [] }), [view]);
+  const levelColumns = useMemo(() => probabilityColumns(probabilities.levels), [probabilities]);
   const selectedId = meetings.some((row) => row.date === selected) ? selected! : meetings[0]?.date ?? null;
   useChartTableSelection({ rows: meetings, getId: meetingKey, getDate: meetingDate, selectedId, onSelect: setSelected, focused, enabled: tab === "path" });
 
@@ -161,7 +194,8 @@ export function RbapPane({ focused, width, height }: PaneProps) {
     return true;
   }, [reload]);
 
-  const curves = useMemo(() => (view ? pathCurves(view) : []), [view]);
+  const curves = useMemo(() => (view && data ? pathCurves(view, targetLine(view, targetHistory(data.f1, sydneyToday(), months), showCurrent !== false), months) : []),
+    [data, months, showCurrent, view]);
   const next = meetings[0];
   const last = meetings.at(-1);
   const stats: StatItem[] = view ? [
@@ -206,6 +240,24 @@ export function RbapPane({ focused, width, height }: PaneProps) {
         renderCell={pathCell}
         selectedTextOverridesCellColor
         emptyStateTitle={view.unanchored ? "No path without the cash rate: see the notice below." : "No upcoming meetings the futures can price."}
+      />
+    );
+  } else if (tab === "probabilities") {
+    body = (
+      <DataTableView<ProbabilityRow, DataTableColumn>
+        focused={focused}
+        rootWidth={width}
+        rootHeight={bodyHeight}
+        rootBefore={header(levelColumns, probabilities.rows.length)}
+        selection={{ kind: "id", selectedId, getId: probabilityKey, onChange: setSelected }}
+        onRootKeyDown={handleKey}
+        columns={levelColumns}
+        items={probabilities.rows}
+        sortColumnId={null}
+        sortDirection="asc"
+        getItemKey={probabilityKey}
+        renderCell={probabilityCell}
+        emptyStateTitle={view.target == null ? "No probabilities without the cash rate target: see the notice below." : "No upcoming meetings the futures can price."}
       />
     );
   } else {

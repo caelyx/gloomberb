@@ -42,6 +42,19 @@ export async function loadFranking(code: string, options: { force?: boolean; sig
   return (await loadFrankingCached(code, options)).data;
 }
 
+/**
+ * The snapshot, reusing a cached copy up to `maxAgeMs` old even past the
+ * cache's own freshness window. For AULRT, which needs dividend dates daily
+ * rather than every six hours.
+ */
+export async function loadFrankingWithin(code: string, maxAgeMs: number, options: { signal?: AbortSignal } = {}): Promise<FrankingSnapshot> {
+  const normalized = code.trim().toUpperCase();
+  const now = Date.now();
+  const cached = cache.peek(normalized, now);
+  if (cached && cached.fetchedAt <= now && now - cached.fetchedAt < maxAgeMs) return cached.data;
+  return loadFranking(normalized, options);
+}
+
 /** What is cached for a code, without fetching: for synchronous renderers such as list columns. */
 export function peekFranking(code: string): { snapshot: FrankingSnapshot | null; fresh: boolean } {
   const cached = cache.peek(code.trim().toUpperCase());

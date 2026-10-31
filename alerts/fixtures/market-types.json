@@ -1,0 +1,194 @@
+{
+  "data": {
+    "items": [
+      {
+        "announcementTypes": [
+          "Progress Report"
+        ],
+        "date": "2026-10-09T09:13:06.000Z",
+        "documentKey": "2924-03146793-2A1703342",
+        "fileSize": "334KB",
+        "headline": "Exploration Report Until Sept 30, 2026",
+        "isPriceSensitive": false,
+        "symbol": "ATM"
+      },
+      {
+        "announcementTypes": [
+          "Results of Meeting"
+        ],
+        "date": "2026-10-09T07:05:55.000Z",
+        "documentKey": "2924-03146759-6A1348562",
+        "fileSize": "402KB",
+        "headline": "Results of General Meeting",
+        "isPriceSensitive": false,
+        "symbol": "SLB"
+      },
+      {
+        "announcementTypes": [
+          "Notification of Results/Reporting Date",
+          "Web Cast"
+        ],
+        "date": "2026-10-09T05:23:10.000Z",
+        "documentKey": "2924-03146668-6A1348503",
+        "fileSize": "168KB",
+        "headline": "September 2026 Quarterly Results Conference Call",
+        "isPriceSensitive": false,
+        "symbol": "BOE"
+      },
+      {
+        "announcementTypes": [
+          "Annual Report",
+          "Top 20 shareholders",
+          "Full Year Accounts",
+          "Full Year Audit Review",
+          "Full Year Directors' Statement",
+          "Full Year Directors' Report"
+        ],
+        "date": "2026-10-09T05:17:25.000Z",
+        "documentKey": "2924-03146664-2A1703297",
+        "fileSize": "7142KB",
+        "headline": "2026 Annual Report",
+        "isPriceSensitive": false,
+        "symbol": "NTD"
+      },
+      {
+        "announcementTypes": [
+          "Annual Report",
+          "Top 20 shareholders",
+          "Full Year Accounts",
+          "Full Year Audit Review",
+          "Full Year Directors' Statement",
+          "Full Year Directors' Report"
+        ],
+        "date": "2026-10-09T04:05:55.000Z",
+        "documentKey": "2924-03146626-3A703779",
+        "fileSize": "2190KB",
+        "headline": "Annual Report to shareholders",
+        "isPriceSensitive": false,
+        "symbol": "DGL"
+      },
+      {
+        "announcementTypes": [
+          "Dividend Reinvestment Plan",
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "date": "2026-10-09T04:04:45.000Z",
+        "documentKey": "2924-03146623-3A703777",
+        "fileSize": "12KB",
+        "headline": "Update - Dividend/Distribution - KIT",
+        "isPriceSensitive": false,
+        "symbol": "KIT"
+      },
+      {
+        "announcementTypes": [
+          "Trading Halt Lifted",
+          "Progress Report"
+        ],
+        "date": "2026-10-09T03:43:05.000Z",
+        "documentKey": "2924-03146611-2A1703265",
+        "fileSize": "130KB",
+        "headline": "Firmus update",
+        "isPriceSensitive": true,
+        "symbol": "MGH"
+      },
+      {
+        "announcementTypes": [
+          "Trading Halt"
+        ],
+        "date": "2026-10-09T02:30:49.000Z",
+        "documentKey": "2924-03146579-2A1703258",
+        "fileSize": "510KB",
+        "headline": "Trading Halt",
+        "isPriceSensitive": true,
+        "symbol": "NMR"
+      },
+      {
+        "announcementTypes": [
+          "Dividend Reinvestment Plan",
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "date": "2026-10-09T01:10:09.000Z",
+        "documentKey": "2924-03146554-2A1703249",
+        "fileSize": "137KB",
+        "headline": "Estimated Special Distribution Details",
+        "isPriceSensitive": true,
+        "symbol": "FRG"
+      },
+      {
+        "announcementTypes": [
+          "Structured Products Distribution"
+        ],
+        "date": "2026-10-09T00:37:19.000Z",
+        "documentKey": "2924-03146533-2A1703247",
+        "fileSize": "28KB",
+        "headline": "CitiFirst IOZ SFI MINI Dividend - Final Amount",
+        "isPriceSensitive": false,
+        "symbol": "CTW"
+      },
+      {
+        "announcementTypes": [
+          "Reinstatement to Official Quotation"
+        ],
+        "date": "2026-10-08T22:44:24.000Z",
+        "documentKey": "2924-03146453-2A1703198",
+        "fileSize": "221KB",
+        "headline": "Security Class Reinstatement to Quotation - AAUOD",
+        "isPriceSensitive": true,
+        "symbol": "AAU"
+      },
+      {
+        "announcementTypes": [
+          "First Quarter Activities Report"
+        ],
+        "date": "2026-10-08T21:24:13.000Z",
+        "documentKey": "2924-03146329-6A1348402",
+        "fileSize": "176KB",
+        "headline": "September 2026 Quarter Production Update",
+        "isPriceSensitive": true,
+        "symbol": "ALK"
+      },
+      {
+        "announcementTypes": [
+          "Suspension from Official Quotation"
+        ],
+        "date": "2026-10-08T06:28:30.000Z",
+        "documentKey": "2924-03146172-2A1703035",
+        "fileSize": "211KB",
+        "headline": "CBAPJ - Hybrid Security Suspension and Upcoming Removal",
+        "isPriceSensitive": true,
+        "symbol": "CBA"
+      },
+      {
+        "announcementTypes": [
+          "Dividend - Special",
+          "Dividend Record Date",
+          "Dividend Pay Date",
+          "Dividend Rate"
+        ],
+        "date": "2026-10-06T05:42:46.000Z",
+        "documentKey": "2924-03145021-6A1347921",
+        "fileSize": "540KB",
+        "headline": "Special Dividend",
+        "isPriceSensitive": true,
+        "symbol": "KAT"
+      },
+      {
+        "announcementTypes": [
+          "Profit Guidance",
+          "Progress Report"
+        ],
+        "date": "2026-10-05T20:30:14.000Z",
+        "documentKey": "2924-03144525-2A1701857",
+        "fileSize": "279KB",
+        "headline": "AFT reports double digit growth in 1H FY27 and R&D progress",
+        "isPriceSensitive": false,
+        "symbol": "AFP"
+      }
+    ],
+    "count": 15
+  }
+}

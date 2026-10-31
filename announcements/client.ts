@@ -78,6 +78,18 @@ export async function loadMarketAnnouncements(query: MarketFeedQuery = {}, optio
   return (await loadMarketFeed(query, options)).data;
 }
 
+/** Most items the feed serves per page. */
+export const MARKET_FEED_PAGE_SIZE = 500;
+
+/**
+ * One page of the whole feed, newest first (page 0 is the latest 500). Not
+ * cached: AULRT reads it once a check, only as deep as its last check.
+ */
+export async function fetchMarketFeedPage(page: number, signal?: AbortSignal): Promise<AsxAnnouncement[]> {
+  const search = new URLSearchParams({ itemsPerPage: String(MARKET_FEED_PAGE_SIZE), page: String(page) });
+  return parseMarketAnnouncementsJson(await fetchJson<unknown>(`${MARKET_FEED_URL}?${search}`, signal));
+}
+
 /** The feed on disk, for a pane's first paint. */
 export function cachedMarketFeed(query: MarketFeedQuery = {}): Cached<AsxAnnouncement[]> | null {
   return marketCache.peek(marketSearch(query).toString());

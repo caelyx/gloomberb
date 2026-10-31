@@ -12,14 +12,17 @@ The `RBAP` pane (alias `WIRA`) is the Australian counterpart of Gloomberb's `WIR
 
   Meetings run as far as the strip does. A date marked `~` is estimated, because the RBA has not yet published that year's schedule (see [Estimated meetings](#estimated-meetings)).
 
-  The chart above the table steps through the implied path, with today's target as a reference line and the path as priced 1 week, 1 month and 1 year ago where those exist (see [Look-backs](#look-backs)). Left and Right step along the meetings.
+  The chart above the table steps through the implied path, against a yellow target line, with the path as priced 1 week, 1 month and 1 year ago where those exist (see [Look-backs](#look-backs)). Left and Right step along the meetings.
+
+  The target line is the actual cash rate target (RBA table F1) over the months before today, then today's target held flat across the meetings, so the implied path reads against where the rate is now. Two pane settings shape it: **Actual target before the path** (none, 1, 3 or 6 months; 3 by default) and **Current target line** (the flat part, on by default). The history ends at F1's latest day, so a decision F1 does not show yet stays on the implied path. The line is drawn but never a row: the cursor and the readout stay on the meetings. Without F1 it is left off.
+- **Probabilities:** the odds of each cash rate target level after each meeting, one column per 25 bp level, shaded by probability, laid out as on WIRP. Each meeting's implied change since today is split between the two whole 25 bp steps either side of it: an implied target of 4.69% against today's 4.60% (+9 bp, 0.36 steps) reads as 64% at 4.60% and 36% at 4.85%. The columns run from the lowest level any meeting reaches to the highest. This is the same two-outcome reading as the odds on the Path tab, carried through to the level: when less than one move is priced at the next meeting, its higher (or lower) column is its `hike` (or `cut`) odds, to one decimal place where the Path tab rounds to a whole per cent (28.9% beside `29% hike`). It is not a full distribution: each meeting puts all its odds on two neighbouring levels, however uncertain the market is. Without table F1 there is no target to measure from, so the tab is empty.
 - **Contracts:** every listed contract with
   - the average cash rate it implies for its month (100 less the price);
   - its settlement, last trade, bid, ask and the day's volume.
 
   A last trade from before the settlement day is dimmed (one during the next session is not): most of the strip trades rarely, and its settlement is ASX's daily mark, not a trade.
 
-The figures at the top give the next meeting's odds, the cash rate target, the overnight cash rate (and its gap to the target) and how far the path moves by its last meeting. `o` opens ASX's RBA Rate Tracker; `r` reloads. `gloomberb fn RBAP` prints the summary, the path and the contracts (`--json`, `--csv`).
+The figures at the top give the next meeting's odds, the cash rate target, the overnight cash rate (and its gap to the target) and how far the path moves by its last meeting. `o` opens ASX's RBA Rate Tracker; `r` reloads. `gloomberb fn RBAP` prints the summary, the path, the probabilities and the contracts (`--json`, `--csv`).
 
 ## Method
 
@@ -59,7 +62,7 @@ The gap is measured on the overnight rate's own date, because F1 can publish the
 - **The last meetings are the least certain.** A meeting late in the last listed month can only be split from that month (there is no following contract), so its noise is magnified. The ~21 March 2028 meeting leaves 10 of 31 days, about three times.
 - **F1 behind a decision.** The path starts from F1's latest target, and meetings count from the day F1 is as at, not from today. So a decision F1 does not show yet (the day it takes effect, or while the RBA's site is down and an older copy is shown) stays on its own meeting, with a notice that it is shown as priced, not as decided.
 - **Gaps in the strip.** If a contract the path needs is missing, the path stops at the meeting before it.
-- **Without table F1** the path starts from the front contract's average, with no target adjustment, and a notice says so. If a meeting takes effect inside the front month, that average mixes the rates before and after it, so nothing anchors the path: the pane then prices no path (rather than a false 0% at that meeting) and still lists the contracts.
+- **Without table F1** the path starts from the front contract's average, with no target adjustment, and a notice says so. If a meeting takes effect inside the front month, that average mixes the rates before and after it, so nothing anchors the path: the pane then prices no path (rather than a false 0% at that meeting) and still lists the contracts. Either way the Probabilities tab is empty and `fn RBAP` leaves that section out, since there is no target for the 25 bp levels.
 
 ## Estimated meetings
 
