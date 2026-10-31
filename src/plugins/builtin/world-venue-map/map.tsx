@@ -1,3 +1,4 @@
+import { logFailure } from "../../../utils/log-failure";
 import { createElement, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { CloudWorldVenuePayload } from "../../../api-client";
 import { Box, ChartSurface, Text, useNativeRenderer, useUiCapabilities, useUiHost } from "../../../ui";
@@ -8,6 +9,7 @@ import { drawCircle, drawLine, fillOpaque, parseHex } from "../../../components/
 import type { NativeChartBitmap } from "../../../components/chart/native/chart-rasterizer";
 import { getLocalPlotPointer, type ChartMouseEvent } from "../../../components/chart/core/pointer";
 import { usePaneFooter } from "../../../components/layout/pane/footer";
+import { FLAT_SURFACE_STYLE, TOOLTIP_SURFACE_STYLE } from "../../../components/ui/frame";
 import {
   clampWorldMapViewport,
   closestWorldVenueCluster,
@@ -398,7 +400,7 @@ function useCountryLabels(): readonly CountryLabel[] | null {
     let current = true;
     loadCountryLabels().then((loaded) => {
       if (current) setLabels(loaded);
-    }, () => {});
+    }, logFailure("world-venue-map.map", "Load country labels failed"));
     return () => {
       current = false;
     };
@@ -992,19 +994,15 @@ function MapTooltip({ title, detail, x, y, width }: { title: string; detail: str
         left: flip ? undefined : x + 14,
         right: flip ? width - x + 14 : undefined,
         top: Math.max(4, y - 30),
-        padding: "3px 8px",
-        background: colors.panel,
-        border: `1px solid ${colors.border}`,
-        borderRadius: 4,
+        ...TOOLTIP_SURFACE_STYLE,
         color: colors.textBright,
-        fontSize: "0.85em",
         lineHeight: 1.35,
         whiteSpace: "nowrap",
         pointerEvents: "none",
       },
     },
     title,
-    detail ? createElement("span", { style: { color: colors.textDim, marginLeft: 8 } }, detail) : null,
+    detail ? createElement("span", { style: { color: colors.textDim, marginLeft: "var(--gloom-space-sm)" } }, detail) : null,
   );
 }
 
@@ -1041,14 +1039,15 @@ function GeoLegend({ overlay, venues, tones }: { overlay: GeoMapOverlay; venues:
       "data-gloom-role": "geo-legend",
       style: {
         position: "absolute",
-        left: 6,
-        bottom: 6,
+        // A chart's legend: the app's type, dim, at the pane's inset.
+        left: "var(--gloom-inset)",
+        bottom: "var(--gloom-inset)",
         display: "flex",
         flexDirection: "column",
         alignItems: "flex-start",
-        gap: 6,
+        gap: "var(--gloom-space-xs)",
         color: colors.textDim,
-        fontSize: "0.85em",
+        fontSize: "var(--gloom-type-ui)",
         pointerEvents: "none",
       },
     },
@@ -1060,11 +1059,9 @@ function GeoLegend({ overlay, venues, tones }: { overlay: GeoMapOverlay; venues:
           display: "grid",
           gridTemplateColumns: "14px auto",
           alignItems: "center",
-          gap: "3px 8px",
-          padding: "6px 9px",
-          background: colors.panel,
-          border: `1px solid ${colors.border}`,
-          borderRadius: 4,
+          gap: "var(--gloom-space-xs) var(--gloom-space-sm)",
+          // Part of the legend, not floating over the map: the flat surface.
+          ...FLAT_SURFACE_STYLE,
         },
       },
       ...SHIP_CLASS_KEY.flatMap(({ id, label, tone, symbol }) => [
@@ -1075,7 +1072,7 @@ function GeoLegend({ overlay, venues, tones }: { overlay: GeoMapOverlay; venues:
     createElement(
       "div",
       // A soft backing so the names read over coastlines and markers.
-      { style: { display: "flex", flexWrap: "wrap", gap: "4px 14px", padding: "3px 6px", borderRadius: 4, background: withAlpha(colors.bg, 0.78) } },
+      { style: { display: "flex", flexWrap: "wrap", gap: "var(--gloom-space-xs) var(--gloom-space-md)", padding: "var(--gloom-space-xs) var(--gloom-space-sm)", borderRadius: "var(--gloom-radius-sm)", background: withAlpha(colors.bg, 0.78) } },
       ...items.map((item) => createElement(
         "span",
         {
@@ -1083,7 +1080,7 @@ function GeoLegend({ overlay, venues, tones }: { overlay: GeoMapOverlay; venues:
           style: {
             display: "inline-flex",
             alignItems: "center",
-            gap: 6,
+            gap: "var(--gloom-space-xs)",
             ...(item.id === ships?.id ? { pointerEvents: "auto", cursor: "default" } : {}),
           },
           ...(item.id === ships?.id ? {

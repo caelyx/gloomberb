@@ -26,6 +26,7 @@ import { createRssNewsCapability } from "./rss/source";
 import { rssCliCommand } from "./rss/cli";
 import { newsFeedHeadless } from "../headless";
 import type { PaneDef } from "../../../../types/plugin";
+import { logFailure } from "../../../../utils/log-failure";
 
 const TopPane = createNewsPresetPane({
   paneKey: "top:curated",
@@ -91,6 +92,7 @@ const newsWirePanes: PluginModule["panes"] = [
     {
       id: NEWS_STORY_PANE_ID,
       reportFreshness: NEWS_REPORT_FRESHNESS,
+      reportArgument: { kind: "free-text", placeholder: "story id", description: "The id of the story to open." },
       name: "Story",
       icon: "A",
       component: NewsStoryPane,
@@ -146,8 +148,8 @@ const newsWirePaneTemplates: PluginModule["paneTemplates"] = [
     id: "news-industry-pane",
     paneId: "news-industry",
     label: TOPIC_NEWS_TITLE,
-    description: "Market news by topic code (MNA, CB, ENERGY, REG, CRYPTO, EARN, IPO) or sector, and public fund letters (LTR)",
-    keywords: ["news", "industry", "sector", "topic", "ni", "mna", "central banks", "crypto", "ipo", "earnings", "regulation", "letters", "ltr", "fund letters", "investor letters"],
+    description: "Market news by topic code (MNA, CB, ENERGY, METALS, REG, CRYPTO, EARN, IPO) or sector, and public fund letters (LTR)",
+    keywords: ["news", "industry", "sector", "topic", "ni", "mna", "central banks", "metals", "precious metals", "crypto", "ipo", "earnings", "regulation", "letters", "ltr", "fund letters", "investor letters"],
     shortcut: {
       prefix: "NI",
       argPlaceholder: "code",
@@ -195,11 +197,15 @@ export const newsWireModule: PluginModule = {
   setup(ctx) {
     const initialSettings = loadNewsFeedSettings(ctx.configState);
     if (initialSettings.needsMigration) {
-      void saveNewsFeedSettings(ctx.configState, initialSettings);
+      void saveNewsFeedSettings(ctx.configState, initialSettings)
+        .catch(logFailure("news.feed-config", "Migrate news feed settings failed"));
     }
 
     const source = createRssNewsCapability(
-      () => getEnabledNewsFeeds(loadNewsFeedSettings(ctx.configState)),
+      () => {
+        const settings = loadNewsFeedSettings(ctx.configState);
+        return { feeds: getEnabledNewsFeeds(settings), error: settings.error };
+      },
       { persistence: ctx.persistence },
     );
     ctx.registerCapability(source);

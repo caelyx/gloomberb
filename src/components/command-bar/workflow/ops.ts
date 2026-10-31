@@ -1,17 +1,20 @@
 import { type LayoutConfig, type PaneBinding, type PaneInstanceConfig } from "../../../types/config";
 import type { PaneSettingField, PaneTemplateContext, PaneTemplateCreateOptions, PaneTemplateInstanceConfig, PaneTemplateDef } from "../../../types/plugin";
 import { getFocusedCollectionId, getFocusedTickerSymbol } from "../../../state/app/context";
+import { commandPromptTicker } from "../../../layout/selected-ticker";
 import { resolveInstrumentForPane, resolveListingForPane } from "../../../core/state/app/instrument";
 import { resolveTickerOpenTarget, tickerOpenFailureMessage } from "../../../tickers/open-target";
 import { instrumentFromTicker } from "../../../market-data/request-types";
 import { scopedBrokerContractIdentityKey } from "../../../utils/instrument-identity";
 import { tickerSelectionFromSearchResult } from "../../../tickers/selection";
 import { tickerInstrumentLabel } from "../../../tickers/instrument-label";
+import { knownInstrumentOfTicker, uncoveredInstrumentKind, uncoveredInstrumentMessage } from "../../../tickers/instrument-coverage";
 import type { PluginRegistry } from "../../../plugins/registry";
 import { PluginOffError } from "../../../plugins/plugin-off";
 import { formatTickerListInput } from "../../../tickers/list";
 import { PANE_LOCK_SETTING_KEY, setPaneLocked, updatePaneInstance, setPaneSettings } from "../../../pane-settings";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
+import { findPaneLocation } from "../../../layout/pane-manager";
 import { cleanPortfolioPaneSettings, resolvePortfolioPaneCollectionId } from "../../../plugins/builtin/portfolio-list/settings";
 import {
   DEFAULT_RELATIONSHIP_SECOND_SYMBOL,
@@ -19,7 +22,7 @@ import {
   buildRelationshipGraphPaneTitle,
 } from "../../../plugins/builtin/correlation/relationship/model";
 import { buildQuoteMonitorPaneTitle } from "../../../plugins/builtin/ticker-detail/settings";
-import { getPaneTemplateDisplayLabel } from "../pane-templates/items";
+import { getPaneTemplateDisplayLabel, paneTemplateArgError } from "../pane-templates/items";
 import { automationActive, describeUsageFunction, recordFunctionOpen } from "../../../telemetry/usage-counts";
 import { attentionActionForPane, captureAttentionAction } from "../../../telemetry/attention-counts";
 import { publicTickerKey } from "../../../utils/exchanges";
@@ -100,13 +103,20 @@ async function resolvePaneTemplateOptions(
   resolvedOptions: PaneTemplateCreateOptions | undefined;
 }> {
   const state = deps.getState();
+  const focusedSymbol = getFocusedTickerSymbol(state);
+  // A required ticker follows the prompt, including a linked desk the focused
+  // pane does not hold. An optional ticker stays unbound unless one was named.
+  const requiresTicker = (template.shortcut?.argPlaceholder === "ticker" || template.shortcut?.argKind === "ticker")
+    && !template.shortcut?.argOptional;
+  const prompt = requiresTicker ? commandPromptTicker(state) : null;
+  const tickerRootId = prompt?.rootInstanceId ?? state.focusedPaneId;
   const baseContext: PaneTemplateContext = {
     config: state.config,
     layout: state.config.layout,
     focusedPaneId: state.focusedPaneId,
-    activeTicker: getFocusedTickerSymbol(state),
-    activeInstrument: state.focusedPaneId ? resolveInstrumentForPane(state, state.focusedPaneId)?.instrument : undefined,
-    activeListing: state.focusedPaneId ? resolveListingForPane(state, state.focusedPaneId) : undefined,
+    activeTicker: prompt?.symbol ?? focusedSymbol,
+    activeInstrument: tickerRootId ? resolveInstrumentForPane(state, tickerRootId)?.instrument : undefined,
+    activeListing: tickerRootId ? resolveListingForPane(state, tickerRootId) : undefined,
     activeCollectionId: getFocusedCollectionId(state),
   };
 
@@ -184,6 +194,24 @@ async function resolvePaneTemplateOptions(
   };
 }
 
+/**
+ * Why a function with company data refused a ticker it has none for, as `fn`
+ * says it: "INS covers companies only, and ^VIX is an index." Null for any
+ * other refusal.
+ */
+function uncoveredTemplateMessage(
+  template: PaneTemplateDef,
+  registry: Pick<PluginRegistry, "panes">,
+  options: PaneTemplateCreateOptions | undefined,
+): string | null {
+  const covered = registry.panes.get(template.paneId)?.instruments;
+  const symbol = options?.ticker?.metadata.ticker ?? options?.symbol;
+  if (!covered?.length || !symbol) return null;
+  const instrument = knownInstrumentOfTicker(symbol, options?.ticker);
+  if (!instrument || !uncoveredInstrumentKind(covered, instrument.kind)) return null;
+  return uncoveredInstrumentMessage(template.shortcut?.prefix ?? getPaneTemplateDisplayLabel(template), covered, instrument);
+}
+
 export async function createPaneTemplateOrThrow(
   templateId: string,
   options: PaneTemplateCreateOptions | undefined,
@@ -207,8 +235,15 @@ export async function createPaneTemplateOrThrow(
 
   const { context, resolvedOptions } = await resolvePaneTemplateOptions(template, options, deps);
 
+  // A name the function knows nothing of opens nothing, rather than its default view.
+  const argError = paneTemplateArgError(template, resolvedOptions?.arg, context);
+  if (argError) {
+    throw new Error(argError.detail ? `${argError.message}. ${argError.detail}.` : `${argError.message}.`);
+  }
+
   if (template.canCreate && !template.canCreate(context, resolvedOptions)) {
-    throw new Error(`Can't create ${getPaneTemplateDisplayLabel(template).toLowerCase()} right now.`);
+    throw new Error(uncoveredTemplateMessage(template, deps.pluginRegistry, resolvedOptions)
+      ?? `Can't create ${getPaneTemplateDisplayLabel(template).toLowerCase()} right now.`);
   }
 
   const createInstanceResult = await template.createInstance?.(context, resolvedOptions);
@@ -252,7 +287,14 @@ export async function createPaneTemplateOrThrow(
     template,
     deps.pluginRegistry.paneTemplates,
     spec,
-    { focusedPaneId: deps.getState().focusedPaneId, paneDef: deps.pluginRegistry.panes.get(template.paneId) },
+    {
+      focusedPaneId: deps.getState().focusedPaneId,
+      paneDef: deps.pluginRegistry.panes.get(template.paneId),
+      // In a secondary window this layout is its view: "main" there is its own grid.
+      preferPaneIds: new Set(instances
+        .filter((entry) => findPaneLocation(deps.getState().config.layout, entry.instanceId)?.window === "main")
+        .map((entry) => entry.instanceId)),
+    },
   );
   if (existing) {
     const retargeted = retargetPaneInstance(existing, spec);

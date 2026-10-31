@@ -25,12 +25,8 @@ export const ETF_FILING_FORMS = [
 
 export const ETF_FORMS_SETTING = ETF_FILING_FORMS.join(",");
 
-/**
- * How many filings the SEC pane asks for: the most the filings service
- * returns for one issuer. A form filter searches only these, so when an issuer
- * has this many, older matching filings may exist.
- */
-export const SEC_FILING_FETCH_LIMIT = 20_000;
+/** How many filings the SEC pane asks for: every filing the service lists for the issuer. */
+export { SEC_FILING_FETCH_LIMIT } from "../../../utils/sec-filings";
 
 function normalizeFilingForm(form: string): string {
   return form.trim().toUpperCase();
@@ -51,6 +47,19 @@ export function filterFilingsByForms(filings: readonly SecFilingItem[], forms: r
     const form = normalizeFilingForm(filing.form);
     return accepted.has(form) || (form.endsWith("/A") && accepted.has(form.slice(0, -2)));
   });
+}
+
+/**
+ * A fund's own filings out of its trust's (ProShares Trust files for 166
+ * funds): the ones the service marks as filed for the fund's series. A list
+ * the service could not mark, a fund whose registrant runs no other series,
+ * or a list in which nothing is marked as the fund's own (a series list that
+ * came back empty) stays whole.
+ */
+export function fundSeriesFilings(filings: readonly SecFilingItem[]): readonly SecFilingItem[] {
+  return filings.some((filing) => filing.fundSeries === true)
+    ? filings.filter((filing) => filing.fundSeries === true)
+    : filings;
 }
 
 /** A form as typed or filed, without punctuation or the `SC`/`SCHEDULE` prefix of ownership schedules. */

@@ -22,6 +22,7 @@ import {
   useAppDispatch,
   useAppSelector,
   useAppStateRef,
+  useDesktopWindowCommands,
 } from "../../../state/app/context";
 import { useThemeColors } from "../../../theme/theme-context";
 import { getPaneDisplayTitle } from "../pane/title";
@@ -103,6 +104,13 @@ interface TransientFocusLayoutState {
   active: boolean;
 }
 
+const NO_LAYOUT_MOVES: ReturnType<typeof useShellPaneLayoutMoves> = {
+  movePaneBack: () => false,
+  movePaneToNewLayout: () => false,
+  paneLayoutMoveMenu: () => ({}),
+  togglePaneNewLayout: () => false,
+};
+
 export function Shell({
   pluginRegistry,
   dataProvider,
@@ -126,6 +134,10 @@ export function Shell({
   const uiKind = useUiHost().kind;
   const shortcutDisplayMode = getShortcutDisplayMode(uiKind);
   const keybindings = useKeybindings();
+  // A secondary window's layout is its view of the main window's: an edit here
+  // changes the view at once and reaches the saved layout through the main
+  // window (see SecondaryWindowSync), whose undo history it joins.
+  const secondaryWindow = desktopWindowBridge?.kind === "window";
   const openCommandBar = useCallback(() => {
     dispatch({ type: "SET_COMMAND_BAR", open: true, query: "" });
   }, [dispatch]);
@@ -142,6 +154,10 @@ export function Shell({
   const appHeaderHeight = chrome.header ? resolveAppHeaderHeightCells({ titleBarOverlay, cellHeightPx }) : 0;
   const contentHeight = Math.max(1, height - appHeaderHeight - (chrome.statusBar ? 1 : 0));
   pluginRegistry.bindHost({ getTermSize: () => ({ width, height: contentHeight }) });
+  const windowCommands = useDesktopWindowCommands();
+  useEffect(() => {
+    windowCommands?.noteWindowSize({ width, height: contentHeight });
+  }, [contentHeight, width, windowCommands]);
 
   const layout = useAppSelector((state) => state.config.layout);
   const dialogOpen = useDialogState((dialog) => dialog.isOpen);
@@ -211,20 +227,22 @@ export function Shell({
       disabledPaneIds,
       pluginRegistry.panes,
     );
-    if (options?.pushHistory !== false) {
+    if (options?.pushHistory !== false && !secondaryWindow) {
       dispatch({ type: "PUSH_LAYOUT_HISTORY" });
     }
     const hasFocusTarget = !!options && Object.prototype.hasOwnProperty.call(options, "focusedPaneId");
     dispatch(hasFocusTarget
       ? { type: "UPDATE_LAYOUT", layout: nextLayout, focusedPaneId: options.focusedPaneId ?? null }
       : { type: "UPDATE_LAYOUT", layout: nextLayout });
+    // The main window saves a secondary window's edit when it applies it.
+    if (secondaryWindow) return;
     const currentState = stateRef.current;
     scheduleConfigSave(syncConfigActiveLayoutState(
       { ...currentState.config, layout: nextLayout },
       currentState.paneState,
       hasFocusTarget ? (options.focusedPaneId ?? null) : currentState.focusedPaneId,
     ));
-  }, [disabledPaneIds, dispatch, pluginRegistry, stateRef]);
+  }, [disabledPaneIds, dispatch, pluginRegistry, secondaryWindow, stateRef]);
 
   const focusPane = useCallback((paneId: string) => {
     dispatch({ type: "FOCUS_PANE", paneId });
@@ -350,6 +368,8 @@ export function Shell({
   }, [closePaneMenu, config.activeLayoutIndex, config.layouts, dispatch, focusPane, setTransientFocusLayout]);
   /** Fullscreen for a given pane: the focused one from the key, the menu's own from its item. */
   const togglePaneFullscreen = useCallback((paneId: string | null) => {
+    // Pane fullscreen is tied to the main window's layout tabs.
+    if (secondaryWindow) return false;
     const current = transientFocusLayoutStateRef.current;
     if (current?.active) {
       setTransientFocusLayout(null);
@@ -386,6 +406,7 @@ export function Shell({
     config.activeLayoutIndex,
     focusPane,
     pluginRegistry,
+    secondaryWindow,
     setTransientFocusLayout,
     visibleLayout,
   ]);
@@ -398,12 +419,7 @@ export function Shell({
   const leaveTransientFocusForPane = useCallback((paneId: string) => {
     if (transientFocusLayoutStateRef.current?.paneId === paneId) setTransientFocusLayout(null);
   }, [setTransientFocusLayout]);
-  const {
-    movePaneBack,
-    movePaneToNewLayout,
-    paneLayoutMoveMenu,
-    togglePaneNewLayout,
-  } = useShellPaneLayoutMoves({
+  const layoutMoves = useShellPaneLayoutMoves({
     closePaneMenu,
     dispatch,
     keybindings,
@@ -412,6 +428,10 @@ export function Shell({
     shortcutDisplayMode,
     stateRef,
   });
+  // Layout tabs belong to the main window, so a secondary window's panes do not move between them.
+  const { movePaneBack, movePaneToNewLayout, paneLayoutMoveMenu, togglePaneNewLayout } = secondaryWindow
+    ? NO_LAYOUT_MOVES
+    : layoutMoves;
   const toggleFocusedPaneNewLayout = useCallback(
     () => togglePaneNewLayout(focusedPaneId),
     [focusedPaneId, togglePaneNewLayout],
@@ -672,6 +692,7 @@ export function Shell({
       canReportPaneBug(nativePaneChrome || !!nativeRenderer.capturePaneImage)
         ? () => { pluginRegistry.reportPaneBug(paneId); }
         : undefined,
+      windowCommands,
     );
     const showKitMenu = () => {
       const fallbackSourceItems = withPluginContextMenuItems(context, items, pluginRegistry);
@@ -714,7 +735,7 @@ export function Shell({
     void showContextMenu(context, items, event).then((shown) => {
       if (!shown) showKitMenu();
     });
-  }, [askAboutPane, canAsk, canExportPaneCsv, closePaneMenu, contentHeight, copyPaneScreenshot, desktopWindowBridge, exportPaneCsv, focusPane, getPaneTitle, handlePaneQuickSetting, nativePaneChrome, nativeRenderer, togglePaneFullscreen, openPaneDocs, openPaneSettings, paneAccelerators, paneLayoutMoveMenu, paneMap, persistLayout, pluginRegistry, rendererHost.copyPngImage, sharePane, shortcutDisplayMode, showContextMenu, titleState, visibleLayout, width]);
+  }, [askAboutPane, canAsk, canExportPaneCsv, closePaneMenu, contentHeight, copyPaneScreenshot, desktopWindowBridge, exportPaneCsv, focusPane, getPaneTitle, handlePaneQuickSetting, nativePaneChrome, nativeRenderer, togglePaneFullscreen, openPaneDocs, openPaneSettings, paneAccelerators, paneLayoutMoveMenu, paneMap, persistLayout, pluginRegistry, rendererHost.copyPngImage, sharePane, shortcutDisplayMode, showContextMenu, titleState, visibleLayout, width, windowCommands]);
   openPaneMenuRef.current = openPaneMenu;
 
 
@@ -847,15 +868,17 @@ export function Shell({
         justifyContent="center"
       >
         <Box flexDirection="column" alignItems="center">
-          <AsciiText text="Gloomberb" font="wordmark" color={colors.textMuted} />
+          <AsciiText text="Gloom" font="wordmark" color={colors.textMuted} />
           <Box height={1} />
           {/* An empty layout starts at the command bar: a click opens it, the key is beside it. */}
-          <Button
-            label="Search or run a command"
-            shortcut={formatAdvertisedChord(keybindings, "command-bar", shortcutDisplayMode) || undefined}
-            onPress={openCommandBar}
-            stopPropagation
-          />
+          {!secondaryWindow ? (
+            <Button
+              label="Search or run a command"
+              shortcut={formatAdvertisedChord(keybindings, "command-bar", shortcutDisplayMode) || undefined}
+              onPress={openCommandBar}
+              stopPropagation
+            />
+          ) : null}
         </Box>
       </Box>
 
@@ -881,6 +904,7 @@ export function Shell({
         dockDividerLayouts={dockDividerLayouts}
         dockLeafLayouts={dockLeafLayouts}
         focusedPaneId={focusedPaneId}
+        floatingOrder={activeLayout.floating}
         getPaneTitle={getPaneTitle}
         getPaneQuickSettings={getPaneQuickSettings}
         handleFloatingClose={handleFloatingClose}

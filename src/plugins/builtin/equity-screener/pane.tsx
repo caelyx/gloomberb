@@ -3,8 +3,10 @@ import {
   Box,
   ScrollBox,
   useRendererHost,
+  useUiCapabilities,
   type ScrollBoxRenderable,
 } from "../../../ui";
+import { withCompanyLogo } from "../../../components/company-logo";
 import {
   Button,
   confirmDialog,
@@ -34,7 +36,7 @@ import {
 } from "../../../public/react";
 import { useDialog } from "../../../ui/dialog";
 import { useThemeColors } from "../../../theme/theme-context";
-import { priceColor } from "../../../theme/colors";
+import { priceColor, shownPriceColor } from "../../../theme/colors";
 import { apiClient } from "../../../api-client";
 import {
   NUMERIC_FIELDS,
@@ -52,6 +54,7 @@ import { useSampledValue } from "../../../state/hooks/live-ticker-financials";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import { SignInWall } from "../cloud/auth-actions";
 import { CriterionEditor } from "./criterion-editor";
+import { ScreenTickerCheck } from "./ticker-check";
 import {
   fetchSavedScreens,
   fetchScreenFields,
@@ -62,14 +65,19 @@ import {
   columnWidth,
   criterionText,
   DEFAULT_SCREEN,
+  dividendYieldBasis,
+  formatScreenMetric,
   formatScreenValue,
   metricDate,
   parseScreenDefinition,
   resultFields,
-  SHORT_LABELS,
   SIGN_COLORED,
+  screenColumnLabel,
+  screenCurrencyEmpty,
+  screenDefinitionKey,
   screenLabel,
   screenRowId,
+  screenYtdBase,
 } from "./model";
 import { useScreenResults } from "./results";
 import { overlayLiveScreenRows, screenExtendedMove, screenExtendedSessions, sortLiveScreenRows, type LiveScreenRow } from "./live";
@@ -100,20 +108,19 @@ const EXTENDED_COLUMN_PREFIX = "ext:";
  * CHG% for each session in `extendedSessions`, and is added only whole, as
  * the metrics are.
  */
-function resultColumns(
+export function resultColumns(
   width: number,
   definition: ScreenDefinition,
   metric: NumericField,
   asOf: boolean,
   extendedSessions: readonly ExtendedSession[] = [],
+  ytdBase: string | null = null,
 ): DataTableColumn[] {
   const [focus, ...others] = resultFields(definition, metric);
-  const metricColumn = (field: NumericField): DataTableColumn => ({
-    id: `m:${field}`,
-    label: SHORT_LABELS[field],
-    width: columnWidth(field),
-    align: "right",
-  });
+  const metricColumn = (field: NumericField, form: "pane" | "compact"): DataTableColumn => {
+    const label = screenColumnLabel(field, ytdBase, form);
+    return { id: `m:${field}`, label, width: columnWidth(field, label), align: "right" };
+  };
   const extendedColumns = extendedSessions.map((session): DataTableColumn => ({
     id: `${EXTENDED_COLUMN_PREFIX}${session}`,
     label: extendedSessionStateLabel(session),
@@ -121,20 +128,21 @@ function resultColumns(
     align: "right",
   }));
   // The extended move reads beside CHG%, or first after the focus metric when that is CHG%.
-  const extras = [
+  const extras = (form: "pane" | "compact") => [
     ...(focus === "changePercent" ? extendedColumns : []),
-    ...others.flatMap((field) => field === "changePercent" ? [metricColumn(field), ...extendedColumns] : [metricColumn(field)]),
+    ...others.flatMap((field) => field === "changePercent" ? [metricColumn(field, form), ...extendedColumns] : [metricColumn(field, form)]),
   ];
   const build = (
     extra: DataTableColumn[],
     exchange: boolean,
     sector: boolean,
+    form: "pane" | "compact",
   ): DataTableColumn[] => [
     { id: "symbol", label: "SYMBOL", width: 8, align: "left" },
     { id: "name", label: "NAME", width: 18, flexGrow: 1, align: "left" },
     ...(exchange ? [{ id: "exchange", label: "EXCH", width: 7, align: "left" as const }] : []),
     ...(sector ? [{ id: "sector", label: "SECTOR", width: 22, align: "left" as const }] : []),
-    metricColumn(focus!),
+    metricColumn(focus!, form),
     { id: "percentile", label: "PCTL", width: 4, align: "right" },
     ...(asOf ? [{ id: "date", label: "AS OF", width: 10, align: "left" as const }] : []),
     ...extra,
@@ -142,15 +150,15 @@ function resultColumns(
   // Measured the way the table draws them (header floor, gaps, lead gaps), so a
   // column is only added when it fits whole.
   const fits = (columns: DataTableColumn[]) => getTableWidth(columns) <= width;
-  let shown: DataTableColumn[] = [];
-  for (const column of extras) {
-    const next = [...shown, column];
-    if (!fits(build(next, false, false))) break;
-    shown = next;
-  }
-  const exchange = fits(build(shown, true, false));
-  const sector = exchange && fits(build(shown, true, true));
-  return build(shown, exchange, sector);
+  // Columns are chosen with YTD's short header (`YTD% 31 Dec`), which reads
+  // `YTD% vs 31 Dec` when that still fits: naming the close never costs a column.
+  const compact = extras("compact");
+  let shown = 0;
+  while (shown < compact.length && fits(build(compact.slice(0, shown + 1), false, false, "compact"))) shown++;
+  const exchange = fits(build(compact.slice(0, shown), true, false, "compact"));
+  const sector = exchange && fits(build(compact.slice(0, shown), true, true, "compact"));
+  const named = build(extras("pane").slice(0, shown), exchange, sector, "pane");
+  return fits(named) ? named : build(compact.slice(0, shown), exchange, sector, "compact");
 }
 const loadFields = () => fetchScreenFields();
 function ScreenDetail({
@@ -174,12 +182,13 @@ function ScreenDetail({
           const metric = row.metrics[field];
           const stamp = metricDate(metric);
           const extended = field === "changePercent" ? row.extended : undefined;
+          const basis = field === "dividendYieldPercent" ? dividendYieldBasis(metric) : null;
           return (
             <Fragment key={field}>
               <KeyValueRow
                 label={screenLabel(field)}
                 labelWidth={24}
-                value={`${formatScreenValue(field, metric.value)} ${metric.unit}`}
+                value={metric.value == null && metric.notMeaningful ? formatScreenMetric(field, metric) : `${formatScreenValue(field, metric.value)} ${metric.unit}`}
                 detail={
                   metric.value === null
                     ? (metric.reason ?? "unavailable")
@@ -199,6 +208,7 @@ function ScreenDetail({
                   detail={`${formatPercentRaw(extended.changePercent)}${extended.mark ? " mid" : ""}`}
                 />
               ) : null}
+              {basis ? <KeyValueRow label="Yield basis" labelWidth={24} value={basis} /> : null}
             </Fragment>
           );
         })}
@@ -237,6 +247,7 @@ function EquityScreenView({
   const colors = useThemeColors(),
     dialog = useDialog(),
     host = useRendererHost();
+  const logos = useUiCapabilities().nativePaneChrome === true;
   const { notify } = usePluginAppActions();
   const openDescription = useOpenDescription();
   const session = useResearchCloudSession(),
@@ -270,6 +281,10 @@ function EquityScreenView({
   const [saveForm, setSaveForm] = useState(false),
     [name, setName] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
+  const [check, setCheck] = useState<{
+    definition: ScreenDefinition;
+    snapshotId?: string;
+  } | null>(null);
   const fields = useAsyncResource(loadFields);
   const savedLoader = useCallback(
     () => fetchSavedScreens(),
@@ -348,11 +363,16 @@ function EquityScreenView({
   const staleFocus = snapshotRows.some((row) => row.metrics[metric]?.state === "stale");
   // A pre-market, after-hours or overnight column only while a row has such a print.
   const extendedSessions = screenExtendedSessions(rows);
-  const columns = resultColumns(width, definition, metric, staleFocus, extendedSessions);
+  // YTD names the close it is measured from, `31 Dec`.
+  const ytdBase = screenYtdBase(snapshotRows, data?.snapshot?.assembledAt);
+  // A screen its currency emptied says so, not that no company matches.
+  const currencyEmpty = data && data.rows.length === 0 ? screenCurrencyEmpty(data.definition, data.universe) : null;
+  const columns = resultColumns(width, definition, metric, staleFocus, extendedSessions, ytdBase);
   const apply = (next: ScreenDefinition) => {
     try {
       setDefinition(parseScreenDefinition(next));
       setOpenId(null);
+      setCheck(null);
       setActionError(null);
     } catch (error) {
       setActionError(errorText(error));
@@ -362,11 +382,22 @@ function EquityScreenView({
     setMode(next);
     setEditing(null);
     setSaveForm(false);
+    setCheck(null);
     setActionError(null);
   };
   const research = () => {
     if (selected) openDescription(selected.symbol, selected.exchange);
   };
+  const startCheck = () => {
+    setCheck({
+      definition,
+      snapshotId: data?.snapshot && screenDefinitionKey(data.definition) === screenDefinitionKey(definition)
+        ? data.snapshot.id
+        : undefined,
+    });
+    setActionError(null);
+  };
+  const checkHint = { id: "check", key: "t", label: "check ticker", title: "Check ticker", onPress: startCheck, disabled: false };
   const startSave = () => {
     if (!access.emailVerified) { switchMode("saved"); return; }
     setName(currentSaved?.name ?? "");
@@ -463,7 +494,7 @@ function EquityScreenView({
   useAutoRefresh(results.updatedAt, results.load);
   const openQueryControl = () => queryControl.current?.open();
   const hints =
-    saveForm || editing !== null
+    saveForm || editing !== null || check
       ? []
       : mode === "criteria"
         ? [
@@ -490,6 +521,7 @@ function EquityScreenView({
                 }),
               disabled: !definition.criteria.length,
             },
+            checkHint,
           ]
         : mode === "saved"
           ? [
@@ -509,6 +541,7 @@ function EquityScreenView({
                 ? [{ id: "metric", key: "m", label: "etric", onPress: openQueryControl }]
                 : []),
               { id: "save", key: "s", label: "ave screen", onPress: startSave },
+              checkHint,
               {
                 id: "export",
                 key: "x",
@@ -529,7 +562,7 @@ function EquityScreenView({
             ];
   usePaneFooter(
     "equity-screener",
-    () => ({
+    () => check ? null : ({
       info: [
         ...(results.loading || results.loadingMore
           ? [
@@ -585,11 +618,13 @@ function EquityScreenView({
       saving,
       exporting,
       hints,
+      check,
     ],
   );
   usePaneNoticeFooter({
     registrationId: "equity-screener:notices",
     focused,
+    enabled: !check,
     notices: [
       ...(data?.warnings ?? []),
       ...(opened?.warnings ?? []),
@@ -641,6 +676,7 @@ function EquityScreenView({
       event.targetEditable ||
       event.ctrl ||
       event.meta ||
+      check ||
       editing !== null
     )
       return;
@@ -670,7 +706,7 @@ function EquityScreenView({
     tabs: TABS,
     activeValue: mode,
     onSelect: switchMode,
-    focused: focused && !saveForm && editing === null,
+    focused: focused && !saveForm && editing === null && !check,
     dense: true,
   });
   const bodyHeight = Math.max(5, height - 1 - tabRows);
@@ -883,11 +919,8 @@ function EquityScreenView({
         </PaneStatusBody>
       )
     ) : (
-      <PaneStatusBody
-        loading={results.loading && !data}
-        error={!data ? results.error : null}
-        subject="equity screen"
-      >
+      // The metric stays above the results while a new sort loads.
+      <>
         {!opened ? (
           <QueryBar
             width={width}
@@ -912,112 +945,127 @@ function EquityScreenView({
             }]}
           />
         ) : null}
-        <DataTableStackView
-          columns={columns}
-          items={rows}
-          focused={focused && !saveForm}
-          rootWidth={width}
-          rootHeight={bodyHeight - 1}
-          scrollRef={tableScroll}
-          onBodyScrollActivity={loadMore}
-          resetScrollKey={JSON.stringify(definition)}
-          visibleRangeKey={JSON.stringify(definition)}
-          onVisibleRangeChange={setVisibleRange}
-          getItemKey={screenRowId}
-          selection={{
-            kind: "id",
-            selectedId: selectedId ?? (rows[0] ? screenRowId(rows[0]) : null),
-            getId: screenRowId,
-            onChange: setSelectedId,
-          }}
-          onActivate={(row) => setOpenId(screenRowId(row))}
-          detailOpen={!!opened}
-          onBack={() => setOpenId(null)}
-          detailTitle={opened?.name ?? opened?.symbol}
-          detailContent={
-            opened ? (
-              <ScreenDetail
-                row={opened}
-                width={width}
-                height={bodyHeight - 2}
-              />
-            ) : null
-          }
-          renderCell={(row, column) => {
-            if (column.id.startsWith(EXTENDED_COLUMN_PREFIX)) {
-              // The extended print's move from the close in PRICE and CHG%.
-              const move = screenExtendedMove(row, column.id.slice(EXTENDED_COLUMN_PREFIX.length) as ExtendedSession);
-              return move == null
-                ? { text: "--", color: colors.textDim }
-                : { text: formatPercentRaw(move), color: priceColor(move, colors) };
+        <PaneStatusBody
+          loading={results.loading && !data}
+          error={!data ? results.error : null}
+          subject="equity screen"
+        >
+          <DataTableStackView
+            columns={columns}
+            items={rows}
+            focused={focused && !saveForm}
+            rootWidth={width}
+            rootHeight={bodyHeight - 1}
+            scrollRef={tableScroll}
+            onBodyScrollActivity={loadMore}
+            resetScrollKey={JSON.stringify(definition)}
+            visibleRangeKey={JSON.stringify(definition)}
+            onVisibleRangeChange={setVisibleRange}
+            getItemKey={screenRowId}
+            selection={{
+              kind: "id",
+              selectedId: selectedId ?? (rows[0] ? screenRowId(rows[0]) : null),
+              getId: screenRowId,
+              onChange: setSelectedId,
+            }}
+            onActivate={(row) => setOpenId(screenRowId(row))}
+            detailOpen={!!opened}
+            onBack={() => setOpenId(null)}
+            detailTitle={opened?.name ?? opened?.symbol}
+            detailContent={
+              opened ? (
+                <ScreenDetail
+                  row={opened}
+                  width={width}
+                  height={bodyHeight - 2}
+                />
+              ) : null
             }
-            const field = column.id.startsWith("m:")
-              ? (column.id.slice(2) as NumericField)
-              : null;
-            if (field) {
-              const observation = row.metrics[field];
-              const change = SIGN_COLORED.has(field) && observation.value != null
-                // A move that prints 0.0 stays neutral.
-                ? priceColor(Math.abs(observation.value) < 0.05 ? 0 : observation.value, colors)
-                : undefined;
-              return {
-                text: formatScreenValue(field, observation.value),
-                color: observation.state === "stale" ? colors.warning : change,
-              };
+            renderCell={(row, column) => {
+              if (column.id.startsWith(EXTENDED_COLUMN_PREFIX)) {
+                // The extended print's move from the close in PRICE and CHG%.
+                const move = screenExtendedMove(row, column.id.slice(EXTENDED_COLUMN_PREFIX.length) as ExtendedSession);
+                return move == null
+                  ? { text: "--", color: colors.textDim }
+                  : { text: formatPercentRaw(move), color: shownPriceColor(move, 2, colors) };
+              }
+              const field = column.id.startsWith("m:")
+                ? (column.id.slice(2) as NumericField)
+                : null;
+              if (field) {
+                const observation = row.metrics[field];
+                const change = SIGN_COLORED.has(field) && observation.value != null
+                  // A move that prints 0.0 stays neutral.
+                  ? priceColor(Math.abs(observation.value) < 0.05 ? 0 : observation.value, colors)
+                  : undefined;
+                return {
+                  text: formatScreenMetric(field, observation),
+                  color: observation.state === "stale" ? colors.warning : change,
+                };
+              }
+              const focus = row.metrics[metric];
+              if (column.id === "percentile")
+                return { text: rank(focus.percentile.value) };
+              if (column.id === "date")
+                return focus.state === "stale"
+                  ? { text: metricDate(focus).text, color: colors.warning }
+                  : { text: "" };
+              if (column.id === "name") return withCompanyLogo({ text: row.name ?? "--" }, row.name ? row : null, logos);
+              return { text: String(row[column.id as "symbol"] ?? "--") };
+            }}
+            sortColumnId={
+              (NUMERIC_FIELDS as readonly string[]).includes(definition.sort.field)
+                ? `m:${definition.sort.field}`
+                : definition.sort.field
             }
-            const focus = row.metrics[metric];
-            if (column.id === "percentile")
-              return { text: rank(focus.percentile.value) };
-            if (column.id === "date")
-              return focus.state === "stale"
-                ? { text: metricDate(focus).text, color: colors.warning }
-                : { text: "" };
-            if (column.id === "name") return { text: row.name ?? "--" };
-            return { text: String(row[column.id as "symbol"] ?? "--") };
-          }}
-          sortColumnId={
-            (NUMERIC_FIELDS as readonly string[]).includes(definition.sort.field)
-              ? `m:${definition.sort.field}`
-              : definition.sort.field
-          }
-          sortDirection={definition.sort.direction}
-          onHeaderClick={(id) => {
-            const field = id.startsWith("m:")
-              ? (id.slice(2) as NumericField)
-              : id === "percentile" || id === "date"
-                ? metric
-                : ["symbol", "sector", "exchange"].includes(id)
-                  ? (id as ScreenField)
-                  : null;
-            if (!field) return;
-            if ((NUMERIC_FIELDS as readonly string[]).includes(field))
-              setMetric(field as NumericField);
-            apply({
-              ...definition,
-              sort: {
-                field,
-                direction:
-                  definition.sort.field === field &&
-                  definition.sort.direction === "desc"
-                    ? "asc"
-                    : "desc",
-              },
-            });
-          }}
-          emptyStateTitle="No equities match this screen."
-        />
-      </PaneStatusBody>
+            sortDirection={definition.sort.direction}
+            onHeaderClick={(id) => {
+              const field = id.startsWith("m:")
+                ? (id.slice(2) as NumericField)
+                : id === "percentile" || id === "date"
+                  ? metric
+                  : ["symbol", "sector", "exchange"].includes(id)
+                    ? (id as ScreenField)
+                    : null;
+              if (!field) return;
+              if ((NUMERIC_FIELDS as readonly string[]).includes(field))
+                setMetric(field as NumericField);
+              apply({
+                ...definition,
+                sort: {
+                  field,
+                  direction:
+                    definition.sort.field === field &&
+                    definition.sort.direction === "desc"
+                      ? "asc"
+                      : "desc",
+                },
+              });
+            }}
+            emptyStateTitle={currencyEmpty?.title ?? "No equities match this screen."}
+            emptyStateHint={currencyEmpty ? `${currencyEmpty.detail} Choose ${currencyEmpty.base.currency} to screen in the base currency.` : undefined}
+          />
+        </PaneStatusBody>
+      </>
     );
   return (
     <Box width={width} height={height} flexDirection="column">
       {tabStrip}
       <PageStackView
         focused={focused}
-        detailOpen={saveForm}
-        onBack={() => setSaveForm(false)}
-        detailTitle="Save screen"
+        detailOpen={saveForm || !!check}
+        onBack={() => { setSaveForm(false); setCheck(null); }}
+        detailTitle={check ? "Check ticker" : "Save screen"}
         rootContent={body}
-        detailContent={saveForm ? saveContent : null}
+        detailContent={check ? (
+          <ScreenTickerCheck
+            definition={check.definition}
+            snapshotId={check.snapshotId}
+            width={width}
+            height={bodyHeight - 1}
+            focused={focused}
+          />
+        ) : saveForm ? saveContent : null}
       />
     </Box>
   );

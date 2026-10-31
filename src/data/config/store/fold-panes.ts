@@ -81,6 +81,7 @@ function asLayout(value: unknown): LayoutConfig | null {
     instances: value.instances as PaneInstanceConfig[],
     floating: Array.isArray(value.floating) ? value.floating as LayoutConfig["floating"] : [],
     detached: Array.isArray(value.detached) ? value.detached as LayoutConfig["detached"] : [],
+    ...(Array.isArray(value.windows) ? { windows: value.windows as NonNullable<LayoutConfig["windows"]> } : {}),
   };
 }
 
@@ -158,6 +159,13 @@ export function foldPaneLayout(layout: LayoutConfig): FoldedLayout {
     }),
     floating: layout.floating.map((entry) => ({ ...entry, instanceId: idMap.get(entry.instanceId) ?? entry.instanceId })),
     detached: (layout.detached ?? []).map((entry) => ({ ...entry, instanceId: idMap.get(entry.instanceId) ?? entry.instanceId })),
+    ...(layout.windows ? {
+      windows: layout.windows.map((window) => ({
+        ...window,
+        dockRoot: mapNode(window.dockRoot, idMap),
+        floating: window.floating.map((entry) => ({ ...entry, instanceId: idMap.get(entry.instanceId) ?? entry.instanceId })),
+      })),
+    } : {}),
   };
   return { layout: removePaneInstances(mapped, removed), idMap, removed, fixedIncomeRoutes };
 }

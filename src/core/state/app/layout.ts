@@ -1,4 +1,4 @@
-import { getDockLeafLayouts, getDockedPaneIds } from "../../../layout/pane-manager";
+import { compactFloatingZ, getDockLeafLayouts, getDockedPaneIds } from "../../../layout/pane-manager";
 import { pinFollowingPane } from "../../../layout/pane-follow";
 import {
   cloneLayout,
@@ -79,6 +79,11 @@ function cloneRuntimeValue<T>(value: T): T {
 // with their identity. Cloning each object once per identity, at every
 // level, keeps the mirror a real copy while making the rebuild cost
 // proportional to what changed rather than to every pane in every layout.
+// An object and its copy are entered as a pair, so copying the copy hands
+// back the object it came from. A layout switch makes the saved copy live
+// and the next mirror copies it again: a fresh copy there would be keyed on
+// the last one, so every switch would add a generation and the chain would
+// keep all of them alive for the rest of the session.
 const runtimeValueClones = new WeakMap<object, unknown>();
 /** Clone to the object it was copied from, so a saved copy can be traced to live state. */
 const paneStateOrigins = new WeakMap<object, object>();
@@ -93,6 +98,7 @@ function cloneRuntimeValueShared<T>(value: T): T {
       Object.entries(value as Record<string, unknown>).map(([key, entry]) => [key, cloneRuntimeValueShared(entry)]),
     );
   runtimeValueClones.set(value, clone);
+  runtimeValueClones.set(clone, value);
   return clone as T;
 }
 
@@ -503,7 +509,7 @@ export function moveHistoryIndex(
   return next;
 }
 
-/** If paneId is a floating pane, bump its zIndex to the top. */
+/** If paneId is a floating pane, bump its zIndex to the top, renumbering a stack that would climb past the shell's overlays. */
 export function bringFloatingToFront(layout: LayoutConfig, paneId: string): LayoutConfig {
   const entryIndex = layout.floating.findIndex((e) => e.instanceId === paneId);
   const entry = entryIndex >= 0 ? layout.floating[entryIndex] : undefined;
@@ -513,9 +519,9 @@ export function bringFloatingToFront(layout: LayoutConfig, paneId: string): Layo
   if ((entry.zIndex ?? 50) === maxZ && entryIndex === topEqualIndex) return layout; // already on top
   return {
     ...layout,
-    floating: layout.floating.map((e) =>
+    floating: compactFloatingZ(layout.floating.map((e) =>
       e.instanceId === paneId ? { ...e, zIndex: maxZ + 1 } : e,
-    ),
+    )),
   };
 }
 
@@ -588,6 +594,7 @@ export function withFocusedPane(
     config: syncedConfig,
     paneState: nextPaneState,
     brokerAccounts: reconcileBrokerAccounts(syncedConfig, state.brokerAccounts),
+    brokerSyncErrors: Object.fromEntries(Object.entries(state.brokerSyncErrors).filter(([id]) => syncedConfig.brokerInstances.some((instance) => instance.id === id))),
     focusedPaneId,
     previousFocusedPaneId: state.focusedPaneId && state.focusedPaneId !== focusedPaneId
       ? state.focusedPaneId
@@ -599,6 +606,7 @@ export function hydrateDesktopSnapshot(state: AppState, snapshot: DesktopSharedS
   return withFocusedPane({
     ...state,
     paneState: snapshot.paneState,
+    brokerSyncErrors: snapshot.brokerSyncErrors ?? {},
     focusedPaneId: snapshot.focusedPaneId,
     statusBarVisible: snapshot.statusBarVisible,
   }, snapshot.config);

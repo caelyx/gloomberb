@@ -15,7 +15,7 @@ import { linkedLayoutStatus, type LinkedLayoutStatus } from "./linked";
 import type { LayoutMarketplaceEntry } from "../shares/portable-layout";
 import { paneImagery, type PaneImagery } from "./pane-imagery";
 
-type PanePlacement = "docked" | "floating" | "detached";
+type PanePlacement = "docked" | "floating" | "detached" | "window";
 
 export interface GalleryPaneSummary {
   instanceId: string;
@@ -63,6 +63,10 @@ function placedInstances(layout: LayoutConfig): Array<{ instance: PaneInstanceCo
     [getDockedPaneIds(layout), "docked"],
     [layout.floating.map((entry) => entry.instanceId), "floating"],
     [(layout.detached ?? []).map((entry) => entry.instanceId), "detached"],
+    [(layout.windows ?? []).flatMap((window) => [
+      ...getDockedPaneIds({ ...layout, dockRoot: window.dockRoot }),
+      ...window.floating.map((entry) => entry.instanceId),
+    ]), "window"],
   ];
   const result: Array<{ instance: PaneInstanceConfig; placement: PanePlacement }> = [];
   for (const [instanceIds, placement] of placements) {
@@ -135,11 +139,12 @@ export function missingPaneIds(
 }
 
 export function describeArrangement(layout: LayoutConfig): string {
-  const counts = { docked: 0, floating: 0, detached: 0 };
+  const counts = { docked: 0, floating: 0, detached: 0, window: 0 };
   for (const { placement } of placedInstances(layout)) counts[placement] += 1;
   const parts = [`${counts.docked} docked`];
   if (counts.floating > 0) parts.push(`${counts.floating} floating`);
   if (counts.detached > 0) parts.push(`${counts.detached} detached`);
+  if (counts.window > 0) parts.push(`${counts.window} in other windows`);
   return parts.join(" · ");
 }
 

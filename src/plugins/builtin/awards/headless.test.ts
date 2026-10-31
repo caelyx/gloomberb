@@ -36,7 +36,7 @@ test("a ticker the preview cannot filter by is named as such, never as the ticke
   expect(result.errors).toEqual([lock]);
   expect(result.metadata).toMatchObject({ filters: { ticker: "LMT" }, filtersApplied: false });
   // Whether LMT has awards is not in a preview, so the report does not say it has none.
-  expect(text).toContain(`Pro: ${lock}`);
+  expect(text).toContain(`Pro: ${lock.replace(/\.$/, "")} · gloom.sh/cloud`);
   expect(text).not.toMatch(/No LMT awards|Not a ticker/);
 });
 
@@ -59,6 +59,25 @@ test("with no ticker the preview is the latest awards, and an award date after t
   const dated = await awardsHeadless.load(createTestHeadlessArgs({ options: { tab: "feed" } }), ctx);
   // A future period start is a schedule, not an award date.
   expect(dated.notes).toEqual(["1 award date is after today, as the source published it."]);
+});
+
+test("collection health is a coverage note, never an error, and an empty selection says so once", async () => {
+  const gaps = ["Some jurisdictions are awaiting their first collection.", "Some source records were quarantined; historical coverage is incomplete."];
+  const run = async (payload: AwardsPayload) => {
+    const args = createTestHeadlessArgs({ options: { tab: "feed" } });
+    const result = await awardsHeadless.load(args, createTestHeadlessContext({ apiClient: { getCloudAwards: async () => payload } as unknown as HeadlessPaneContext["apiClient"] }));
+    return { result, text: renderHeadlessPaneText(awardsHeadless, result, args, "AWARDS") };
+  };
+  const partial = await run(awardsPayload({ status: "partial", gaps }));
+  expect(partial.result.errors).toEqual([]);
+  expect(partial.result.notes).toEqual(gaps);
+  expect(partial.text).toContain(`Notes:\n  ${gaps[0]}\n  ${gaps[1]}`);
+  expect(partial.text).not.toContain("Errors");
+
+  const none = await run(awardsPayload({ status: "unavailable", rows: [], alerts: [], history: [], agencies: [], sectors: [], gaps: ["No awards are available for this selection.", gaps[0]!] }));
+  expect(none.result).toMatchObject({ empty: "No awards are available for this selection.", notes: [gaps[0]], errors: [] });
+  expect(none.text).toContain("No awards are available for this selection.");
+  expect(none.text).not.toContain("Errors");
 });
 
 test("cohort amounts print compact as the pane draws them, while exports keep the source's exact decimals", async () => {

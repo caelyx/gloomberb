@@ -1,3 +1,4 @@
+import { logFailure } from "../../utils/log-failure";
 import { useEffect, type Dispatch } from "react";
 import { apiClient } from "../../api-client";
 import { getDockedPaneIds } from "../../layout/pane-manager";
@@ -81,9 +82,7 @@ function parseGloomUrl(rawUrl: string): ParsedGloomUrl | null {
   let url: URL;
   try {
     url = new URL(rawUrl);
-  } catch {
-    return null;
-  }
+  } catch { /* Intentional ignore: Malformed external deep links are rejected as non-matches. */ return null; }
   if (url.protocol !== "gloomberb:") return null;
 
   const host = url.hostname.trim().toLowerCase();
@@ -185,7 +184,7 @@ function parseCloudDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
       message: "Pro is active.",
     };
   }
-  return { type: "unsupported", message: "Unsupported Gloomberb cloud link." };
+  return { type: "unsupported", message: "Unsupported Gloom cloud link." };
 }
 
 function parseTickerDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
@@ -208,7 +207,7 @@ function parseCollectionDeepLink(parsed: ParsedGloomUrl, kind: CollectionDeepLin
 
 function parseAlertDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
   if ((parsed.segments[0] ?? "new") !== "new") {
-    return { type: "unsupported", message: "Unsupported Gloomberb alert link." };
+    return { type: "unsupported", message: "Unsupported Gloom alert link." };
   }
   const symbol = normalizeSymbol(param(parsed.url, "symbol", "ticker"));
   const condition = normalizeAlertCondition(param(parsed.url, "condition", "side", "trigger"));
@@ -256,7 +255,7 @@ function parseNewsDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
   if (route === "top") {
     return { type: "open-news", kind: "top", symbol: null, message: "Opened top news." };
   }
-  return { type: "unsupported", message: "Unsupported Gloomberb news link." };
+  return { type: "unsupported", message: "Unsupported Gloom news link." };
 }
 
 function parseLayoutDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
@@ -275,7 +274,7 @@ function parseShareDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
 
 export function resolveDesktopDeepLinkAction(rawUrl: string): DesktopDeepLinkAction {
   const parsed = parseGloomUrl(rawUrl);
-  if (!parsed) return { type: "unsupported", message: "Unsupported Gloomberb link." };
+  if (!parsed) return { type: "unsupported", message: "Unsupported Gloom link." };
 
   switch (parsed.host) {
     case "cloud":
@@ -299,7 +298,7 @@ export function resolveDesktopDeepLinkAction(rawUrl: string): DesktopDeepLinkAct
     case "layout":
       return parseLayoutDeepLink(parsed);
     default:
-      return { type: "unsupported", message: "Unsupported Gloomberb link." };
+      return { type: "unsupported", message: "Unsupported Gloom link." };
   }
 }
 
@@ -575,7 +574,7 @@ export function handleDesktopDeepLink(rawUrl: string, options: DesktopDeepLinkHa
       if (action.route.kind === "cloud-success") {
         requestAccountManagementTab("pro");
         // Checkout just completed: re-read the session so the new plan shows at once.
-        void chatController.refreshSession().catch(() => {});
+        void chatController.refreshSession().catch(logFailure("app.runtime.desktop-deeplink", "Checkout session refresh failed"));
       }
       options.pluginRegistry.showPane("account-management");
       notifySuccess(options.pluginRegistry, action.message);
@@ -634,7 +633,7 @@ export function useDesktopDeepLinkRuntime({
   }, [initialized, pluginRegistry]);
 
   useEffect(() => {
-    if (!initialized || desktopWindowKind === "detached" || !desktopDeepLinkBridge) return;
+    if (!initialized || (desktopWindowKind && desktopWindowKind !== "main") || !desktopDeepLinkBridge) return;
     return desktopDeepLinkBridge.subscribe((deeplink) => {
       handleDesktopDeepLink(deeplink.url, { dispatch, pluginRegistry, stateRef });
     });

@@ -11,12 +11,14 @@ import {
   type ElectrobunBackendInit,
   type RemoteControlRequestMessage,
   type ElectrobunDesktopRpcSchema,
+  type WindowIntentRequestMessage,
 } from "../shared/protocol";
 import { decodeRpcResponse, decodeRpcValue, encodeRpcValue } from "../shared/rpc-codec";
 import { subscribeCapability, type CapabilitySubscriptionOptions } from "./capability-subscription";
 import { RpcTimeoutError } from "../../../utils/rpc-timeout-error";
 import { nameRpcTimeout, RPC_MAX_REQUEST_TIME_MS } from "./rpc-timeout";
 import type { RemoteControlRequest, RemoteControlResponse } from "../../../remote/types";
+import type { DesktopWindowIntent, DesktopWindowIntentResult } from "../../../types/desktop-window";
 
 type BackendMessages = ElectrobunDesktopRpcSchema["webview"]["messages"];
 type BackendMessageName = keyof BackendMessages;
@@ -24,9 +26,11 @@ type BackendMessageName = keyof BackendMessages;
 type KeyedBackendMessageName = "context-menu.select" | "capability.event" | "http.stream.chunk";
 type BackendMessageListener<K extends BackendMessageName> = (message: BackendMessages[K]) => void;
 type RemoteControlRequestHandler = (request: RemoteControlRequest) => Promise<RemoteControlResponse>;
+type WindowIntentHandler = (windowId: string, intent: DesktopWindowIntent) => DesktopWindowIntentResult;
 
 let initSnapshot: ElectrobunBackendInit | null = null;
 let remoteControlRequestHandler: RemoteControlRequestHandler | null = null;
+let windowIntentHandler: WindowIntentHandler | null = null;
 const messageListeners = new Map<string, Set<(message: unknown) => void>>();
 const pendingDesktopDeepLinks: DesktopDeepLinkMessage[] = [];
 
@@ -60,8 +64,19 @@ const rpc = Electroview.defineRPC<ElectrobunDesktopRpcSchema>({
         const decoded = decodeRpcValue<RemoteControlRequest>(message.request);
         return encodeRpcValue(await remoteControlRequestHandler(decoded)) as RemoteControlResponse;
       },
+      "window.intent": async (message: WindowIntentRequestMessage) => {
+        // Only the main window applies changes; anywhere else, or before it is ready, they are dropped.
+        if (!windowIntentHandler || typeof message?.windowId !== "string") return { applied: false };
+        return windowIntentHandler(message.windowId, decodeRpcValue<DesktopWindowIntent>(message.intent));
+      },
     },
     messages: {
+      "desktop.activeWindow": (message) => {
+        emit("desktop.activeWindow", { windowKey: typeof message?.windowKey === "string" ? message.windowKey : null });
+      },
+      "desktop.focusPane": (message) => {
+        if (typeof message?.paneId === "string") emit("desktop.focusPane", { paneId: message.paneId });
+      },
       "context-menu.select": (message) => {
         emit("context-menu.select", message, message.requestId);
       },
@@ -144,7 +159,7 @@ export async function backendRequest(
   return decodeRpcResponse(result);
 }
 
-export async function initElectrobunBackend(payload?: { kind?: "main" | "detached"; paneId?: string }): Promise<ElectrobunBackendInit> {
+export async function initElectrobunBackend(payload?: { kind?: "main" | "detached" | "window"; paneId?: string; windowId?: string }): Promise<ElectrobunBackendInit> {
   initSnapshot = await backendRequest("init", payload ?? {});
   return initSnapshot;
 }
@@ -165,6 +180,14 @@ export function getElectrobunBackendInitSnapshot(): ElectrobunBackendInit | null
 export function replaceElectrobunCapabilityManifests(manifests: ElectrobunBackendInit["capabilityManifests"]): void {
   if (!initSnapshot) return;
   initSnapshot = { ...initSnapshot, capabilityManifests: manifests };
+}
+
+/** The main window's handler for changes secondary windows send it. */
+export function setElectrobunWindowIntentHandler(handler: WindowIntentHandler): () => void {
+  windowIntentHandler = handler;
+  return () => {
+    if (windowIntentHandler === handler) windowIntentHandler = null;
+  };
 }
 
 export function setElectrobunRemoteRequestHandler(handler: RemoteControlRequestHandler | null): () => void {

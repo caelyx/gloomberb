@@ -4,12 +4,22 @@
  * appears here without an app release.
  */
 import { apiClient } from "../../api-client";
-import type { BrokerOrderType } from "../../types/trading";
+import type { BrokerOrderClass, BrokerOrderType, BrokerTrailingUnit } from "../../types/trading";
 
 interface SignedInBrokerCapabilities {
   history: boolean;
   executions: boolean;
-  orders: false | { mode: "review" | "direct"; types: BrokerOrderType[] };
+  /**
+   * Review: the broker keeps each order for the user to submit there. Direct: Gloom checks the
+   * order with the broker, the user confirms that check in the ticket, and Gloom places it.
+   */
+  orders: false | {
+    mode: "review" | "direct"; types: BrokerOrderType[]; tif?: string[];
+    /** Brackets and OCO pairs the broker places and runs itself; absent from a server that sends none. */
+    orderClasses?: BrokerOrderClass[];
+    /** How a trailing stop (`TRAIL` in `types`) is set. */
+    trailing?: BrokerTrailingUnit[];
+  };
   /** Connecting Gloom replaces this broker's link to other AI apps. */
   singleConnection: boolean;
   /** Shown before connecting, e.g. an account the user must create first. */
@@ -19,6 +29,8 @@ interface SignedInBrokerCapabilities {
 export interface SignedInBroker {
   id: string;
   name: string;
+  /** Under the name where brokers are listed, for one that is not itself a broker (SnapTrade). */
+  description?: string;
   capabilities: SignedInBrokerCapabilities;
 }
 
@@ -52,11 +64,16 @@ export function fetchSignedInBrokerConnection(brokerId: string): Promise<SignedI
   return apiClient.brokerRequest(brokerId, "");
 }
 
+/**
+ * Opens a connect ticket. This app shows no code: it asks for a ticket that
+ * only the account's own Gloom session in the browser can continue. A Cloud
+ * that predates that still answers with a code, which the dialog then shows.
+ */
 export function startSignedInBrokerConnect(
   brokerId: string,
   write: boolean,
-): Promise<{ connectUrl: string; code: string; expiresAt: string }> {
-  return apiClient.brokerRequest(brokerId, "/connect", { method: "POST", body: { write } });
+): Promise<{ connectUrl: string; code?: string | null; expiresAt: string }> {
+  return apiClient.brokerRequest(brokerId, "/connect", { method: "POST", body: { write, code: false } });
 }
 
 export function disconnectSignedInBroker(brokerId: string): Promise<{ disconnected: boolean }> {

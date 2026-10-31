@@ -1,3 +1,4 @@
+import { logFailure } from "../../../utils/log-failure";
 import { existsSync, readdirSync, type Dirent } from "fs";
 import { mkdir, readFile, rename, rm, writeFile } from "fs/promises";
 import { dirname, join, resolve } from "path";
@@ -14,6 +15,7 @@ import {
 } from "./normalize";
 
 const configLog = debugLog.createLogger("config");
+const IN_MEMORY_DATA_DIR = ":memory:";
 
 /**
  * The config.json for a data directory: the file inside it, except that the
@@ -46,7 +48,9 @@ export async function getDataDir(): Promise<string | null> {
     const recorded = config.dataDir || null;
     if (recorded && dirs.kind !== "home" && !existsSync(recorded)) return dirs.data;
     return recorded;
-  } catch {
+  } catch (error) {
+    // An absent optional file or directory is expected.
+    if ((error as { code?: unknown } | null)?.code !== "ENOENT") logFailure("data.config.store.node", "Reading the configured data directory failed")(error);
     return null;
   }
 }
@@ -62,7 +66,9 @@ function hasAbsorbedPluginCheckout(pluginId: string): boolean {
   let entries: Dirent[];
   try {
     entries = readdirSync(pluginsDir, { withFileTypes: true });
-  } catch {
+  } catch (error) {
+    // An absent optional file or directory is expected.
+    if ((error as { code?: unknown } | null)?.code !== "ENOENT") logFailure("data.config.store.node", "Reading installed plugins for migration failed")(error);
     return false;
   }
   return entries.some((entry) => {
@@ -114,7 +120,7 @@ async function writeConfigFile(configPath: string, contents: string): Promise<vo
     await writeFile(tempPath, contents, "utf-8");
     await rename(tempPath, configPath);
   } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => {});
+    await rm(tempPath, { force: true }).catch(() => { /* Intentional ignore: Remove a partial temporary file while preserving the write error rethrown below. */ });
     throw error;
   }
 }
@@ -125,12 +131,15 @@ async function writeConfigFile(configPath: string, contents: string): Promise<vo
  * and the next one still runs.
  */
 export async function saveConfig(config: AppConfig): Promise<void> {
+  // `:memory:` is the data directory of a config kept in memory (tests, as for
+  // SQLite): there is no file, and writing one would land under the working directory.
+  if (config.dataDir === IN_MEMORY_DATA_DIR) return;
   const configPath = configFileFor(config.dataDir);
   // Written as it was when called, however the caller's object changes while
   // earlier saves are still running.
   const contents = JSON.stringify(normalizeConfigForSave(config), null, 2);
   const result = (saveQueues.get(configPath) ?? Promise.resolve()).then(() => writeConfigFile(configPath, contents));
-  const settled = result.catch(() => {});
+  const settled = result.catch(() => { /* Intentional ignore: The caller receives result; only the serialization chain consumes its duplicate rejection. */ });
   saveQueues.set(configPath, settled);
   void settled.then(() => {
     if (saveQueues.get(configPath) === settled) saveQueues.delete(configPath);

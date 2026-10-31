@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { RbaSeries } from "../rba/model";
 import type { IbContract, IbStrip } from "./model";
 import { moveOddsText } from "./model";
-import { bpText, contractLabel, meetingLabel, rbapView, stepsText } from "./view";
+import { bpText, contractLabel, historyMonths, meetingLabel, monthsBefore, outcomeOdds, probabilityTable, probabilityText, rbapView, stepsText, targetHistory, targetLine } from "./view";
 
 const MEETINGS = ["2026-09-29", "2026-11-03", "2026-12-08"];
 
@@ -100,6 +100,69 @@ describe("rbapView", () => {
   });
 });
 
+describe("targetHistory", () => {
+  const history = f1([["2026-03-31", 4.1], ["2026-04-01", 4.1], ["2026-05-06", 4.35], ["2026-05-07", 4.35], ["2026-09-30", 4.6], ["2026-10-09", 4.6]], []);
+
+  test("starts at the target in force n months back, then steps at each change to the latest observation", () => {
+    expect(targetHistory(history, "2026-10-10", "6M")).toEqual([
+      { date: "2026-04-10", rate: 4.1 },
+      { date: "2026-05-06", rate: 4.35 },
+      { date: "2026-09-30", rate: 4.6 },
+      { date: "2026-10-09", rate: 4.6 },
+    ]);
+    expect(targetHistory(history, "2026-10-10", "1M")).toEqual([
+      { date: "2026-09-10", rate: 4.35 },
+      { date: "2026-09-30", rate: 4.6 },
+      { date: "2026-10-09", rate: 4.6 },
+    ]);
+  });
+
+  test("no history at 0 months", () => {
+    expect(targetHistory(history, "2026-10-10", "0M")).toEqual([]);
+  });
+
+  test("empty without F1 or any target before the start", () => {
+    expect(targetHistory(null, "2026-10-10", "3M")).toEqual([]);
+    expect(targetHistory(f1([["2026-10-09", 4.6]], []), "2026-10-10", "3M")).toEqual([{ date: "2026-10-09", rate: 4.6 }]);
+    expect(targetHistory(f1([], []), "2026-10-10", "3M")).toEqual([]);
+  });
+
+  test("calendar months back, clamped to the shorter month; unknown settings fall back to 3 months", () => {
+    expect(monthsBefore("2026-05-31", 3)).toBe("2026-02-28");
+    expect(monthsBefore("2026-01-15", 1)).toBe("2025-12-15");
+    expect(monthsBefore("2028-08-31", 6)).toBe("2028-02-29");
+    expect(historyMonths("6M")).toBe("6M");
+    expect(historyMonths("0M")).toBe("0M");
+    expect(historyMonths("12M")).toBe("3M");
+    expect(historyMonths(undefined)).toBe("3M");
+  });
+});
+
+describe("targetLine", () => {
+  const view = { target: 4.6, targetAsOf: "2026-10-09", meetings: [{ date: "2026-11-03" }, { date: "2026-12-08" }] };
+  const history = [{ date: "2026-09-10", rate: 4.35 }, { date: "2026-09-30", rate: 4.6 }, { date: "2026-10-09", rate: 4.6 }];
+
+  test("the actual target, then today's held flat across the meetings", () => {
+    expect(targetLine(view, history, true)).toEqual([...history, { date: "2026-11-03", rate: 4.6 }, { date: "2026-12-08", rate: 4.6 }]);
+  });
+
+  test("without history the flat line starts where F1 is as at", () => {
+    expect(targetLine(view, [], true)).toEqual([{ date: "2026-10-09", rate: 4.6 }, { date: "2026-11-03", rate: 4.6 }, { date: "2026-12-08", rate: 4.6 }]);
+  });
+
+  test("the flat part switched off leaves the history alone, or nothing", () => {
+    expect(targetLine(view, history, false)).toEqual(history);
+    expect(targetLine(view, [], false)).toEqual([]);
+  });
+
+  test("a meeting on the history's last day is not drawn twice; nothing without a path or a target", () => {
+    const behind = { ...view, targetAsOf: "2026-11-03", meetings: [{ date: "2026-11-03" }, { date: "2026-12-08" }] };
+    expect(targetLine(behind, [{ date: "2026-11-03", rate: 4.6 }], true).map((point) => point.date)).toEqual(["2026-11-03", "2026-12-08"]);
+    expect(targetLine({ ...view, meetings: [] }, history, true)).toEqual([]);
+    expect(targetLine({ ...view, target: null }, [], true)).toEqual([]);
+  });
+});
+
 describe("formatting", () => {
   test("basis points and contract months", () => {
     expect(bpText(-0.25)).toBe("-25 bp");
@@ -120,5 +183,52 @@ describe("formatting", () => {
     expect(moveOddsText(-0.003)).toBe("1% cut");
     expect(bpText(0.072, 1)).toBe("+7.2 bp");
     expect(moveOddsText(0.072)).toBe("29% hike");
+  });
+});
+
+describe("outcomeOdds", () => {
+  test("splits a meeting between the two 25 bp steps either side of its implied level", () => {
+    const odds = outcomeOdds(0.09);
+    expect(odds.map((entry) => entry.steps)).toEqual([0, 1]);
+    expect(odds[0]!.probability).toBeCloseTo(0.64, 10);
+    expect(odds[1]!.probability).toBeCloseTo(0.36, 10);
+    const cuts = outcomeOdds(-0.3);
+    expect(cuts.map((entry) => entry.steps)).toEqual([-2, -1]);
+    expect(cuts[0]!.probability).toBeCloseTo(0.2, 10);
+    expect(cuts[1]!.probability).toBeCloseTo(0.8, 10);
+  });
+
+  test("a whole number of steps is certain, despite floating-point noise", () => {
+    expect(outcomeOdds(0)).toEqual([{ steps: 0, probability: 1 }]);
+    expect(outcomeOdds(0.1 + 0.2 + 0.45)).toEqual([{ steps: 3, probability: 1 }]);
+    expect(outcomeOdds(-0.25 - 1e-12)).toEqual([{ steps: -1, probability: 1 }]);
+  });
+
+  test("printed to one decimal, as on WIRP", () => {
+    expect([probabilityText(0.64), probabilityText(0.0004), probabilityText(1), probabilityText(null)]).toEqual(["64.0%", "0.0%", "100.0%", "—"]);
+  });
+});
+
+describe("probabilityTable", () => {
+  test("one column per 25 bp target level the meetings reach, odds aligned to them", () => {
+    const view = rbapView({ strip, f1: table, lookbacks: [] }, "2026-10-10", MEETINGS);
+    const { levels, rows } = probabilityTable(view);
+    // Both meetings price a whole cut, so 4.35% is the only outcome.
+    expect(levels).toEqual([4.35]);
+    expect(rows.map((row) => row.meeting.date)).toEqual(["2026-11-03", "2026-12-08"]);
+    expect(rows.map((row) => row.odds)).toEqual([[1], [1]]);
+  });
+
+  test("levels between the outcomes are filled in, at zero odds", () => {
+    const view = { target: 4.6, meetings: [{ cumulative: 0.09 }, { cumulative: 0.6 }] };
+    const { levels, rows } = probabilityTable(view);
+    expect(levels).toEqual([4.6, 4.85, 5.1, 5.35]);
+    expect(rows[0]!.odds.map((value) => Number(value.toFixed(4)))).toEqual([0.64, 0.36, 0, 0]);
+    expect(rows[1]!.odds.map((value) => Number(value.toFixed(4)))).toEqual([0, 0, 0.6, 0.4]);
+  });
+
+  test("nothing without the cash rate target: the front contract's level is not on the target's 25 bp grid", () => {
+    expect(probabilityTable({ target: null, meetings: [{ cumulative: 0.1 }] })).toEqual({ levels: [], rows: [] });
+    expect(probabilityTable({ target: 4.6, meetings: [] })).toEqual({ levels: [], rows: [] });
   });
 });

@@ -42,10 +42,20 @@ function normalizeApplicationMenuCommand(value: unknown): ElectrobunApplicationM
   }
 }
 
+function decodeApplicationMenuAction(action: string): unknown {
+  const prefix = `${ELECTROBUN_APPLICATION_MENU_ACTION}:`;
+  if (!action.startsWith(prefix)) return null;
+  try {
+    return JSON.parse(decodeURIComponent(action.slice(prefix.length)));
+  } catch {
+    return null;
+  }
+}
+
 export function applicationMenuCommand(event: unknown): ElectrobunApplicationMenuCommand | null {
   const payload = menuClickPayload(event);
-  if (payload?.action !== ELECTROBUN_APPLICATION_MENU_ACTION) return null;
-  return normalizeApplicationMenuCommand(payload.data);
+  if (typeof payload?.action !== "string") return null;
+  return normalizeApplicationMenuCommand(decodeApplicationMenuAction(payload.action));
 }
 
 /**

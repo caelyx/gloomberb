@@ -5,6 +5,7 @@ import {
   addPaneToLayout,
   bringToFront,
   findDockLeaf,
+  findPaneLocation,
   getDockedPaneIds,
   isPaneDetached,
   isPaneInLayout,
@@ -56,6 +57,8 @@ interface AppPaneRuntimeArgs {
   externalPlugins: readonly LoadedExternalPlugin[];
   /** Desktop main window: raises a detached pane's own window. */
   focusDetachedPane?: (paneId: string) => void;
+  /** Desktop: brings forward the window whose grid holds a pane, and focuses it there. */
+  focusPaneInItsWindow?: (paneId: string) => void;
   isDetachedWindow: boolean;
   notify: (body: string, options?: { type?: "info" | "success" | "error" }) => void;
   persistConfig: (nextConfig: AppState["config"]) => void;
@@ -72,6 +75,7 @@ export function useAppPaneRuntime({
   dispatch,
   externalPlugins,
   focusDetachedPane,
+  focusPaneInItsWindow,
   isDetachedWindow,
   notify,
   persistConfig,
@@ -156,6 +160,12 @@ export function useAppPaneRuntime({
   }, [buildPaneBinding, state]);
 
   const focusVisiblePane = useCallback((paneId: string, layout: LayoutConfig = state.config.layout) => {
+    // A pane in another window's grid is that window's to focus, and that window comes forward.
+    const location = findPaneLocation(layout, paneId);
+    if (focusPaneInItsWindow && location && location.window !== "main" && location.kind !== "detached") {
+      focusPaneInItsWindow(paneId);
+      return;
+    }
     const nextLayout = layout.floating.some((entry) => entry.instanceId === paneId)
       ? bringToFront(layout, paneId)
       : layout;
@@ -166,7 +176,7 @@ export function useAppPaneRuntime({
     activatePane(paneId);
     // Focus in this window's state alone would leave the pane's window behind this one.
     if (isPaneDetached(nextLayout, paneId)) focusDetachedPane?.(paneId);
-  }, [activatePane, focusDetachedPane, persistLayout, state.config.layout]);
+  }, [activatePane, focusDetachedPane, focusPaneInItsWindow, persistLayout, state.config.layout]);
 
   const placePaneInstance = useCallback((
     instance: PaneInstanceConfig,

@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { ContextMenu, Utils, type BrowserWindow } from "electrobun/bun";
+import { ContextMenu, Utils } from "electrobun/bun";
 import { buildSoundCommand } from "../../../../notifications/app-notifier";
 import type {
   DesktopBackendRequestResponse,
@@ -12,6 +12,7 @@ import { MAIN_WINDOW_RPC_KEY } from "../window/focus";
 import { applyDesktopWindowControl } from "../window/controls";
 import { saveTextFileToDownloads } from "../../../../utils/save-text-file";
 import { setAppBadge } from "./app-badge";
+import { desktopBootFramePath, saveDesktopBootFrame } from "../window/boot-frame";
 import type { DesktopBackend, DesktopRpc } from "./backend";
 
 function normalizeText(value: unknown): string | undefined {
@@ -33,12 +34,6 @@ function playNotificationSound(sound: string | undefined): void {
   }
 }
 
-function windowForRpcKey(backend: DesktopBackend, windowKey: string | undefined): BrowserWindow | null {
-  return windowKey === MAIN_WINDOW_RPC_KEY
-    ? backend.mainWindow
-    : backend.detachedWindows.getWindowForRpcKey(windowKey);
-}
-
 /**
  * Electrobun has no fullscreen event, so the view asks after every resize.
  * A runtime whose native library cannot answer reports windowed, which is the
@@ -46,7 +41,7 @@ function windowForRpcKey(backend: DesktopBackend, windowKey: string | undefined)
  */
 function isWindowFullscreen(backend: DesktopBackend, windowKey: string | undefined): boolean {
   try {
-    return windowForRpcKey(backend, windowKey)?.isFullScreen?.() === true;
+    return backend.windowForRpcKey(windowKey)?.isFullScreen?.() === true;
   } catch {
     return false;
   }
@@ -57,26 +52,13 @@ function controlWindow(
   windowKey: string | undefined,
   action: DesktopWindowControlAction,
 ): boolean {
-  const targetWindow = windowForRpcKey(backend, windowKey);
+  const targetWindow = backend.windowForRpcKey(windowKey);
   if (!targetWindow) return false;
   if (action !== "close") {
     backend.detachedWindows.suppressAutoDockForRpcKey(windowKey);
   }
   applyDesktopWindowControl(targetWindow, action);
   return true;
-}
-
-/** Exiting closes the popped-out windows, services and main window; with no main window it quits directly. */
-function exitDesktopApp(backend: DesktopBackend): void {
-  backend.detachedWindows.closeAll();
-  backend.teardownServices();
-  const mainWindow = backend.mainWindow;
-  if (mainWindow) {
-    mainWindow.close();
-    backend.mainWindow = null;
-    return;
-  }
-  Utils.quit();
 }
 
 function normalizeWindowControlAction(action: unknown): DesktopWindowControlAction {
@@ -93,13 +75,13 @@ export async function handleDesktopHostRequest(
 ): Promise<DesktopBackendRequestResponse<DesktopHostRequest["method"]>> {
   switch (request.method) {
     case "host.exit":
-      exitDesktopApp(backend);
+      backend.exitApp();
       return null;
     case "host.windowControl": {
       const action = normalizeWindowControlAction(request.payload.action);
       const windowKey = backend.rpcs.getRpcWindowKey(rpc);
       if (action === "close" && windowKey === MAIN_WINDOW_RPC_KEY) {
-        exitDesktopApp(backend);
+        backend.exitApp();
         return null;
       }
       if (!controlWindow(backend, windowKey, action)) {
@@ -114,15 +96,14 @@ export async function handleDesktopHostRequest(
         throw new Error("host.openExternal requires a URL.");
       }
       const externalUrl = safeExternalUrl(request.payload.url);
-      if (externalUrl) Utils.openExternal(externalUrl);
-      return null;
+      return externalUrl ? Utils.openExternal(externalUrl) !== false : false;
     }
     case "host.copyText":
       Utils.clipboardWriteText(normalizeText(request.payload.text) ?? "");
       return null;
     case "host.focusWindow": {
       const windowKey = backend.rpcs.getRpcWindowKey(rpc);
-      if (windowKey) backend.detachedWindows.focusWindowForRpcKey(windowKey);
+      if (windowKey) backend.focusWindowForRpcKey(windowKey);
       return null;
     }
     case "host.copyPngImage": {
@@ -142,7 +123,7 @@ export async function handleDesktopHostRequest(
     case "host.notify":
       playNotificationSound(normalizeText(request.payload.sound));
       Utils.showNotification({
-        title: normalizeText(request.payload.title) ?? "Gloomberb",
+        title: normalizeText(request.payload.title) ?? "Gloom",
         body: normalizeText(request.payload.body),
         subtitle: normalizeText(request.payload.subtitle),
         silent: true,
@@ -156,6 +137,12 @@ export async function handleDesktopHostRequest(
       ContextMenu.showContextMenu(menu as never);
       return true;
     }
+    case "host.saveBootFrame":
+      saveDesktopBootFrame(desktopBootFramePath(), request.payload.frame, {
+        mainWindow: backend.rpcs.getRpcWindowKey(rpc) === MAIN_WINDOW_RPC_KEY,
+        session: backend.config !== null,
+      });
+      return null;
     case "host.setAppBadge":
       // One badge for the app, from the main window; a popped-out pane's view
       // has its own chat state and must not overwrite it.

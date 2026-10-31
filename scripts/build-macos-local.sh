@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build an unsigned Gloomberb.app for Apple Silicon from this checkout,
+# Build an unsigned Gloom.app for Apple Silicon from this checkout,
 # including any uncommitted changes, with no update feed
 # (GLOOMBERB_DESKTOP_LOCAL in electrobun.config.ts).
 #
-#   scripts/build-macos-local.sh            # leaves artifacts/local/Gloomberb.app
-#   scripts/build-macos-local.sh --install  # also replaces /Applications/Gloomberb.app
+#   scripts/build-macos-local.sh            # leaves artifacts/local/Gloom.app
+#   scripts/build-macos-local.sh --install  # also replaces /Applications/Gloom.app
+#
+# An earlier local install named Gloomberb.app is left in place: the new app
+# removes it at its first launch and moves the gloom and gloomberb command
+# links to itself (removeLegacyMacApp in src/renderers/electrobun/bun/desktop/app-name.ts).
 
 usage() { echo "usage: $0 [--install]" >&2; }
 
@@ -30,14 +34,16 @@ for tool in bun zstd; do
   fi
 done
 
-dest="/Applications/Gloomberb.app"
+dest="/Applications/Gloom.app"
+legacy="/Applications/Gloomberb.app"
 
 # Checked before the build as well as after it, so a problem shows up now
 # rather than after several minutes of building.
 check_can_install() {
-  # Covers the desktop app and the gloomberb terminal command it bundles.
-  if pgrep -qf "$dest/Contents/"; then
-    echo "Quit Gloomberb (and any gloomberb terminal sessions), then run this again." >&2
+  # Covers the desktop app and the gloom terminal command it bundles, under
+  # the app's current name and the one before it.
+  if pgrep -qf "$dest/Contents/" || pgrep -qf "$legacy/Contents/"; then
+    echo "Quit Gloom (and any gloom or gloomberb terminal sessions), then run this again." >&2
     exit 1
   fi
   if [ ! -w /Applications ] || { [ -e "$dest" ] && [ ! -w "$dest" ]; }; then
@@ -55,23 +61,23 @@ if [ -n "$wanted_bun" ] && [ "$(bun --version)" != "$wanted_bun" ]; then
   echo "Warning: this repo expects Bun $wanted_bun, you have $(bun --version). If the build fails, try: bun upgrade" >&2
 fi
 
-tarball="artifacts/stable-macos-arm64-Gloomberb.app.tar.zst"
+tarball="artifacts/stable-macos-arm64-Gloom.app.tar.zst"
 rm -f "$tarball"
 bun install --frozen-lockfile
 GLOOMBERB_DESKTOP_LOCAL=1 bun run desktop:release
 
 out="artifacts/local"
-app="$out/Gloomberb.app"
+app="$out/Gloom.app"
 rm -rf "$out"
 mkdir -p "$out"
-zstd -q -d -o "$out/Gloomberb.app.tar" "$tarball"
-tar -xf "$out/Gloomberb.app.tar" -C "$out"
-rm "$out/Gloomberb.app.tar"
+zstd -q -d -o "$out/Gloom.app.tar" "$tarball"
+tar -xf "$out/Gloom.app.tar" -C "$out"
+rm "$out/Gloom.app.tar"
 
 # Apple Silicon refuses to run unsigned code; an ad-hoc signature is enough.
 codesign --force --deep --sign - "$app"
 codesign --verify --deep --strict "$app"
-"$app/Contents/Resources/gloomberb" help >/dev/null
+"$app/Contents/Resources/gloom" help >/dev/null
 
 built="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then built="$built plus uncommitted changes"; fi
@@ -79,7 +85,7 @@ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then built="$built plus uncom
 if $install; then
   check_can_install
   # Copy first, so a failed copy leaves the installed app untouched.
-  staging="/Applications/.Gloomberb.app.new"
+  staging="/Applications/.Gloom.app.new"
   rm -rf "$staging"
   ditto "$app" "$staging"
   rm -rf "$dest"

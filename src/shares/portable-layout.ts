@@ -3,6 +3,7 @@ import { foldPaneLayout } from "../data/config/store/fold-panes";
 import { swapDefaultPortfolioAgeColumn } from "../data/config/store/portfolio-as-of-column";
 import { publicTickerBindingSymbol } from "../tickers/selection";
 import { pinFollowingPane } from "../layout/pane-follow";
+import { flattenSecondaryWindows } from "../layout/pane-manager/flatten-windows";
 import {
   CURRENT_CONFIG_VERSION,
   removePaneInstances,
@@ -139,6 +140,7 @@ function encodedSize(value: unknown): number {
   try {
     return new TextEncoder().encode(JSON.stringify(value)).byteLength;
   } catch {
+    // Intentional ignore: Unserializable layouts fail the payload size validator.
     return Number.POSITIVE_INFINITY;
   }
 }
@@ -484,21 +486,29 @@ function publishableBinding(binding: PaneBinding | undefined, ids: ReadonlyMap<s
 export interface PublishableLayoutContext {
   /** Local ticker records, so panes can pin listings the receiver cannot look up. */
   tickers?: ReadonlyMap<string, TickerRecord>;
+  /** The moment the shared pane's layout tab has its crosshair pinned at. */
+  pinnedTime?: number | null;
 }
 
+const NO_TICKERS: ReadonlyMap<string, TickerRecord> = new Map();
+
 function publishableLayout(
-  publicLayout: LayoutConfig,
+  sourceLayout: LayoutConfig,
   paneState: Record<string, PaneRuntimeState>,
   panes: ReadonlyMap<string, PaneDef>,
   context: PublishableLayoutContext = {},
 ): LayoutMarketplacePayload {
+  // The share format has no secondary windows; their panes travel floating.
+  const publicLayout = flattenSecondaryWindows(sourceLayout);
   const ids = new Map(publicLayout.instances.map((instance, index) => [instance.instanceId, `p${index + 1}`]));
   const projectedState: Record<string, PaneRuntimeState> = {};
   const instances = publicLayout.instances.map((sourceInstance) => {
     const instanceId = ids.get(sourceInstance.instanceId)!;
     const def = panes.get(sourceInstance.paneId);
-    const instance = def?.portableShare?.prepare && context.tickers
-      ? def.portableShare.prepare(sourceInstance, { tickers: context.tickers })
+    // Every publish runs it, a gallery layout with no ticker records too, so
+    // what a pane drops on the way out (a chart's held moment) never leaves.
+    const instance = def?.portableShare?.prepare
+      ? def.portableShare.prepare(sourceInstance, { tickers: context.tickers ?? NO_TICKERS, ...(context.pinnedTime != null ? { pinnedTime: context.pinnedTime } : {}) })
       : sourceInstance;
     const privacy = def?.portableShare?.private;
     // A pane from a plugin this terminal lacks arrived already scrubbed by

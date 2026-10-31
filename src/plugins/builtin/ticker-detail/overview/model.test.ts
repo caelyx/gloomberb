@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { Fundamentals, NextEarnings, Quote } from "../../../../types/financials";
 import type { TickerPosition, TickerRecord } from "../../../../types/ticker";
 import { buildOverviewStats, buildPositionRows, buildProfileFields } from "./model";
+import { cashRunway } from "../../../../utils/cash-runway";
+import type { FundBondFacts } from "../../../../api-client/fund-facts";
 import { createTestTicker } from "../../../../test-support/ticker";
 
 function overview(fundamentals: Fundamentals, financialCurrency?: string) {
@@ -36,6 +38,30 @@ test("summary money falls back to the statements' reporting currency, and a zero
   expect(overview({ ...figures, financialCurrency: "USD" }, "ZAR")).toMatchObject({ Revenue: "202.08B USD" });
   expect(overview(figures, " ")).toMatchObject({ EPS: "31.43 (ccy?)", Revenue: "202.08B (ccy?)" });
   expect(overview({ ...figures, enterpriseValue: 5e9 }, "ZAR")).toMatchObject({ EV: "5B HKD" });
+  // A listing quoted in another currency than the statements: an unlabelled block's currency is unknown.
+  const listed = (currency: string, fundamentals: Fundamentals) => Object.fromEntries(buildOverviewStats({
+    quote: { symbol: "YPFD", price: 8350, currency, change: 0, changePercent: 0, lastUpdated: 0 }, fundamentals, financialCurrency: "USD",
+    quoteCurrency: currency, baseCurrency: "USD", toBase: (value) => value,
+  }).map(({ label, value }) => [label, value]));
+  expect(listed("ARS", figures)).toMatchObject({ EPS: "31.43 (ccy?)", Revenue: "202.08B (ccy?)" });
+  expect(listed("ARS", { ...figures, financialCurrency: "ARS" })).toMatchObject({ EPS: "ARS\u00a031.43", Revenue: "202.08B ARS" });
+  expect(listed("USD", figures)).toMatchObject({ EPS: "$31.43", Revenue: "202.08B USD" });
+});
+
+test("an EV at or below zero reads N/M with why, and an insurer's says its investments stay in", () => {
+  const ev = (fundamentals: Fundamentals) => buildOverviewStats({
+    quote: undefined, fundamentals, quoteCurrency: "USD", baseCurrency: "USD", toBase: (value) => value,
+  }).find((stat) => stat.label === "EV");
+  const check = { currency: "USD", marketCap: 100e9, totalDebt: 1e9, balanceSheetDate: "2026-06-30" };
+  // ARVN on 2026-10-23, and a source's negative EV no check judged.
+  expect(ev({ marketCap: 100e9, unavailableFields: ["enterpriseValue"], enterpriseValueCheck: { ...check, status: "not-meaningful",
+    cash: 121e9, computed: -20e9, reason: "Cash and short-term investments exceed market cap + total debt (balance sheet 2026-06-30)" } }))
+    .toEqual({ label: "EV", value: "N/M", detail: ["cash > cap + debt", "cash > cap"] });
+  expect(ev({ marketCap: 100e9, enterpriseValue: -5e9 })?.value).toBe("N/M");
+  // BRK-B's: market cap + debt - cash and equivalents.
+  expect(ev({ marketCap: 100e9, enterpriseValue: 107.8e9, enterpriseValueCheck: { ...check, status: "computed", source: -20e9,
+    cash: 3.5e9, computed: 107.8e9, investmentsKept: true } }))
+    .toEqual({ label: "EV", value: "107.8B USD", detail: ["investments in", "inv. in"] });
 });
 
 test("holdings and short interest read as fractions; blank, zero and past figures are left out", () => {
@@ -81,6 +107,36 @@ function row(position: Partial<TickerPosition>, options: {
     toBase: options.toBase ?? ((value) => value),
   })[0]!;
 }
+
+describe("position account names", () => {
+  const aries = { portfolio: "broker:aries-1:5UA1234567", broker: "aries", brokerInstanceId: "aries-1", brokerAccountId: "5UA1234567" };
+  const account = (position: Partial<TickerPosition>, accountNames: Parameters<typeof buildPositionRows>[0]["accountNames"]) => buildPositionRows({
+    ticker: createTestTicker("TEST", "Controlled position", {
+      portfolios: [position.portfolio ?? "test"],
+      positions: [{ portfolio: "test", broker: "manual", shares: 10, avgCost: 100, ...position }],
+    }),
+    quote: undefined, quoteCurrency: "USD", baseCurrency: "USD", toBase: (value) => value, accountNames,
+  })[0]!.account;
+
+  test("a broker position reads as its portfolio's name, never the raw account id", () => {
+    const portfolio = { id: aries.portfolio, name: "Aries individual (simulation)", brokerInstanceId: "aries-1", brokerAccountId: "5UA1234567" };
+    expect(account(aries, { portfolios: [portfolio] })).toBe("Aries individual (simulation)");
+    expect(account({ ...aries, side: "short" }, { portfolios: [portfolio] })).toBe("Aries individual (simulation) SHORT");
+    // A portfolio restored from positions alone is named by its account id: the broker's own name for the account wins.
+    const restored = { ...portfolio, name: "5UA1234567" };
+    expect(account(aries, {
+      portfolios: [restored],
+      brokerAccounts: { "aries-1": [{ accountId: "5UA1234567", name: "Aries individual (simulation)" }] },
+    })).toBe("Aries individual (simulation)");
+    expect(account(aries, { portfolios: [restored], brokerInstances: [{ id: "aries-1", label: "Aries" }] })).toBe("Aries");
+    expect(account(aries, { portfolios: [] })).toBe("aries");
+  });
+
+  test("a portfolio entered by hand keeps its own name", () => {
+    expect(account({}, { portfolios: [{ id: "test", name: "Long term" }] })).toBe("Long term");
+    expect(account({}, { portfolios: [] })).toBe("test");
+  });
+});
 
 describe("research position valuation", () => {
   test("equivalent short conventions retain gross exposure but reverse price P&L", () => {
@@ -142,5 +198,52 @@ describe("research position valuation", () => {
       .toMatchObject({ cost: "—", value: "—", pnl: "—", ret: "—", pnlValue: null });
     expect(row({ side: "short" }, { quotePrice: null }))
       .toMatchObject({ cost: "$1,000.00", mark: "—", value: "—", pnlValue: null });
+  });
+});
+
+test("a bond fund's yield is its distribution yield, not its SEC yield, which follows it dated with its yield to worst and duration", () => {
+  const source = { source: "iShares", url: "https://www.ishares.com/us/products/239766/ishares-national-muni-bond-etf" };
+  const stats = (bond: FundBondFacts | null) => buildOverviewStats({
+    quote: undefined, fundamentals: { dividendYield: 0.0327, dividendYieldBasis: "forward" }, quoteCurrency: "USD", baseCurrency: "USD",
+    toBase: (value) => value, bond,
+  }).map(({ label, value, detail, link }) => ({ label, value, detail, link: link?.templateId }));
+  expect(stats({
+    kind: "municipal", state: null,
+    secYield: { value: 4.0418, asOf: "2026-10-15", ...source },
+    yieldToWorst: { value: 4.16, asOf: "2026-10-15", ...source },
+    duration: { value: 7.12591, asOf: "2026-10-15", measure: "effective", ...source },
+  })).toEqual([
+    { label: "Fwd Dist Yld", value: "3.27%", detail: ["not SEC yield", "not SEC"], link: undefined },
+    { label: "SEC Yield", value: "4.04%", detail: ["2026-10-15", "10-15"], link: "sec-etf-pane" },
+    { label: "Yld to Worst", value: "4.16%", detail: ["2026-10-15", "10-15"], link: "sec-etf-pane" },
+    { label: "Eff Duration", value: "7.13 yrs", detail: ["2026-10-15", "10-15"], link: "sec-etf-pane" },
+  ]);
+  // Vanguard's month-end average duration, and no yield to worst.
+  expect(stats({
+    kind: "municipal", state: null, yieldToWorst: null,
+    secYield: { value: 4.36, asOf: "2026-10-15", source: "Vanguard" },
+    duration: { value: 7.3, asOf: "2026-09-30", measure: "average", source: "Vanguard" },
+  }).slice(1)).toEqual([
+    { label: "SEC Yield", value: "4.36%", detail: ["2026-10-15", "10-15"], link: "sec-etf-pane" },
+    { label: "Avg Duration", value: "7.30 yrs", detail: ["2026-09-30 month-end", "09-30 month-end"], link: "sec-etf-pane" },
+  ]);
+  // Anything else reads as before.
+  expect(stats(null)).toEqual([{ label: "Fwd Div Yld", value: "3.27%", detail: undefined, link: undefined }]);
+});
+
+
+test("DES shows runway only for a burning TTM, never a seasonal outflow or short history", () => {
+  const quarters = ["2025-09-30", "2025-12-31", "2026-03-31", "2026-06-30"].map((date, index) => ({
+    date, currency: "USD", cashAndCashEquivalents: 1_000, operatingCashFlow: index === 3 ? -30 : 20,
+  }));
+  const stats = (quarterlyStatements: typeof quarters) => buildOverviewStats({
+    quote: undefined, fundamentals: {}, quoteCurrency: "USD", baseCurrency: "USD", toBase: (value) => value,
+    runway: cashRunway({ quarterlyStatements, annualStatements: [] }),
+  });
+  expect(stats(quarters).find((row) => row.label === "Runway")).toBeUndefined();
+  expect(stats(quarters.slice(1)).find((row) => row.label === "Runway")).toBeUndefined();
+  const burning = quarters.map((row) => ({ ...row, operatingCashFlow: -20 }));
+  expect(stats(burning).find((row) => row.label === "Runway")).toMatchObject({
+    value: "> 120 mo", detail: expect.arrayContaining(["qtr to 06-30 · TTM > 120 mo"]),
   });
 });

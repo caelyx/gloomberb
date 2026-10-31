@@ -1,8 +1,11 @@
-import { Box } from "../../../ui";
+import { Box, useUiCapabilities } from "../../../ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TextAttributes, type ScrollBoxRenderable } from "../../../ui";
+import { COUNTRY_FLAG_CELLS, withCountryFlag } from "../../../components/ui/country-flag";
 import {
+  Button,
   DataTableStackView,
+  EmptyState,
   QueryBar,
   usePaneFooter,
   type DataTableCell,
@@ -10,17 +13,26 @@ import {
   type PaneFooterSegment,
 } from "../../../components";
 import { usePluginPaneState } from "../../runtime";
+import { useAppConfig, usePaneSettingValue } from "../../../public/react";
+import { readerTimeZone, timeZoneCity, zonedClock } from "../../../utils/utc-time";
+import { usePaneInstance } from "../../../state/app/context";
+import { commandRequestParams } from "../shared/command-tab";
 import { useAsyncResource } from "../../../react/async-resource";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { usePaneVisible } from "../../../state/app/activity";
+import { formatCountdown } from "../../../utils/datetime-format";
 import type { PaneProps } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
 import { colors, blendHex } from "../../../theme/colors";
-import type { EconEvent } from "./types";
+import { hasNoReleaseTime, hasNoStatedTime, isAllDayEvent, type EconEvent } from "./types";
 import { FRED_CATALOG_SERIES } from "./fred-catalog";
+import { ECON_PRINT_NOTIFICATIONS_ENABLED_KEY, retainVisiblePrintRefresh, setupHighImpactPrintNotifications } from "./print-watch";
 import { EconDetailView } from "./detail-view";
 import {
   COUNTRY_CYCLE,
+  COUNTRY_FILTER_HINT,
+  countriesWithoutEvents,
+  DEFAULT_IMPACT_FILTER,
   FILTER_CYCLE,
   attachEconCalendarPersistence,
   actualColor,
@@ -28,17 +40,23 @@ import {
   CALENDAR_TIME_ZONE_LABEL,
   dateKey,
   dayLabel,
-  formatCountdown,
+  filteredEmptyTitle,
   formatStaleness,
   getCalendarCache,
+  subscribeCalendar,
   impactIndicator,
   loadCalendar,
+  lowerImpactHidden,
+  eventCountry,
   matchesCountry,
   matchesImpact,
+  noScheduledReleasesMessage,
+  parseCountryFilter,
   resetEconCalendarPersistence,
   shortCalendarEnd,
   shortDayLabel,
   timeLabel,
+  valueColumnWidth,
   type CountryFilter,
   type DisplayRow,
   type EconCalendarColumn,
@@ -58,6 +76,10 @@ const IMPACT_LABELS: Record<ImpactFilter, string> = {
 };
 
 const NO_EVENTS: EconEvent[] = [];
+const SPELLED_IMPACT = "IMPACT";
+const SPELLED_COUNTRY = "COUNTRY";
+/** Event names this wide still read; past it the headers spell themselves out. */
+const SPELLED_HEADER_MIN_EVENT_WIDTH = 24;
 /** A result says whether a forced reload asked for it, so its answer can reset the cursor. */
 type CalendarResult = EconCalendarLoadResult & { forced?: boolean };
 const loadEvents = async (force: boolean): Promise<CalendarResult> => ({ ...await loadCalendar(force), forced: force });
@@ -67,17 +89,40 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   // loadCalendar serves a fresh cache without a request, so the pane can always
   // ask and still follow the global cadence once the cache goes stale.
   const calendar = useAsyncResource<CalendarResult>(loadEvents, { initialData: cachedEvents });
+  // A load made elsewhere, such as the print watch asking while a release is
+  // due, reaches the open pane through the cache; the newer of the two wins.
+  const [cacheVersion, setCacheVersion] = useState(0);
+  useEffect(() => subscribeCalendar(() => setCacheVersion((version) => version + 1)), []);
+  const cached = useMemo(() => getCalendarCache(), [cacheVersion]);
+  const shown = cached && (!calendar.data || cached.fetchedAt > calendar.data.fetchedAt) ? cached : calendar.data;
   const { loading } = calendar;
-  const events = calendar.data?.data ?? NO_EVENTS;
-  const stale = calendar.data?.stale ?? false;
-  const fetchedAt = calendar.data?.fetchedAt ?? null;
+  const events = shown?.data ?? NO_EVENTS;
+  const stale = shown?.stale ?? false;
+  const fetchedAt = shown?.fetchedAt ?? null;
   // A cache that could not be refreshed arrives as a result, not a failure.
   const error = calendar.error ?? (loading ? null : calendar.data?.refreshError ?? null);
   // The selected row and the open event are remembered by event id, so a
   // reload or a shared layout comes back to the same release.
   const [selectedKey, setSelectedKey] = usePluginPaneState<string | null>("selectedKey", null);
-  const [impactFilter, setImpactFilter] = usePluginPaneState<ImpactFilter>("impactFilter", "all");
-  const [countryFilter, setCountryFilter] = usePluginPaneState<CountryFilter>("countryFilter", "all");
+  // A level a caller named (`fn ECO --impact all`) is where a new pane opens; a level the reader picks is kept.
+  const [impactSetting] = usePaneSettingValue<string>("impact", "");
+  const openingImpact = FILTER_CYCLE.find((level) => level === impactSetting) ?? DEFAULT_IMPACT_FILTER;
+  const [impactFilter, setImpactFilter] = usePluginPaneState<ImpactFilter>("impactFilter", openingImpact);
+  const [chosenCountry, setCountryFilter] = usePluginPaneState<CountryFilter>("countryFilter", "all");
+  // Countries a caller named (`ECO MX,BR`, `fn ECO --country MX`) are shown once per request; a later choice is the reader's.
+  const pane = usePaneInstance();
+  const [countrySetting] = usePaneSettingValue<string>("country", "");
+  const requestedCountry = pane?.params?.country || countrySetting || null;
+  const countryRequest = pane?.params?.country ? `${pane.params.country}|${pane.params.tabAt ?? ""}`
+    : countrySetting ? `setting|${countrySetting}` : "";
+  const [shownCountryRequest, setShownCountryRequest] = usePluginPaneState("countryRequest", "");
+  const countryPending = !!countryRequest && countryRequest !== shownCountryRequest;
+  const countryFilter: CountryFilter = countryPending && requestedCountry ? requestedCountry : chosenCountry;
+  useEffect(() => {
+    if (!countryPending || !requestedCountry) return;
+    setShownCountryRequest(countryRequest);
+    setCountryFilter(requestedCountry);
+  }, [countryPending, countryRequest, requestedCountry, setCountryFilter, setShownCountryRequest]);
   const [now, setNow] = useState(Date.now());
   const [openKey, setOpenKey] = usePluginPaneState<string | null>("openKey", null);
 
@@ -86,8 +131,11 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
 
   useAutoRefresh(stale ? null : fetchedAt, calendar.load);
 
-  // Tick every 30s to update staleness + countdown, only while the pane can be seen.
   const paneVisible = usePaneVisible();
+  // In view, a due high-impact print is asked for on the print watch's timing
+  // and lands here through the cache; a covered or hidden pane asks nothing.
+  useEffect(() => (paneVisible ? retainVisiblePrintRefresh() : undefined), [paneVisible]);
+  // Tick every 30s to update staleness + countdown, only while the pane can be seen.
   useEffect(() => {
     if (!paneVisible) return;
     setNow(Date.now());
@@ -173,6 +221,12 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
     setSelectedKey(null);
     returnToPresent();
   }, [returnToPresent, setCountryFilter, setSelectedKey]);
+  const showAllEvents = useCallback(() => {
+    setImpactFilter("all");
+    setCountryFilter("all");
+    setSelectedKey(null);
+    returnToPresent();
+  }, [returnToPresent, setCountryFilter, setImpactFilter, setSelectedKey]);
   const cycleImpactFilter = useCallback((step: 1 | -1) => {
     setImpactFilter((prev) => FILTER_CYCLE[(FILTER_CYCLE.indexOf(prev) + step + FILTER_CYCLE.length) % FILTER_CYCLE.length]!);
     setSelectedKey(null);
@@ -196,34 +250,63 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
     handleRefreshKey(event, () => void calendar.reload(), { stopPropagation: true })
   ), [calendar.reload]);
 
+  // The desktop and the web lead each country's code with its flag.
+  const flagged = useUiCapabilities().nativePaneChrome === true;
+  // A reader who set a time zone (`config set timezone`) gets their clock in a column beside UTC.
+  const readerZone = readerTimeZone(useAppConfig().timezone);
   const columns = useMemo<EconCalendarColumn[]>(() => {
     // The header names the zone, so the column is as wide as the header needs.
     const timeLabelText = `TIME (${CALENDAR_TIME_ZONE_LABEL})`;
     const timeWidth = tableColumnWidth({ width: 6, label: timeLabelText });
-    const impactWidth = 4;
-    const flagWidth = 3;
-    const actualWidth = 9;
-    const forecastWidth = 10;
-    const priorWidth = 9;
+    const actualWidth = valueColumnWidth(filtered, "actual", 9);
+    const forecastWidth = valueColumnWidth(filtered, "forecast", 10);
+    const priorWidth = valueColumnWidth(filtered, "prior", 9);
     const minEventWidth = 12;
-    const fixedWidth = timeWidth + impactWidth + flagWidth + actualWidth + forecastWidth + priorWidth;
+    // The reader's clock, with the weekday on rows where it is another day than the UTC one they are listed under.
+    const readerLabel = readerZone ? timeZoneCity(readerZone).toUpperCase() : null;
+    const readerWidth = !readerZone || !readerLabel ? 0 : tableColumnWidth({ label: readerLabel,
+      width: filtered.some((ev) => !hasNoReleaseTime(ev) && zonedClock(ev.date.getTime(), readerZone).label.length > 5) ? 9 : 5 });
     // Padding, one gap per column boundary, and the vertical scrollbar lane;
     // one column short of that clipped the PRIOR values at the right edge.
-    const columnCount = 7;
-    const eventWidth = Math.max(minEventWidth, width - 3 - columnCount - fixedWidth);
+    const roomBeside = (count: number, timesWidth: number) => (impactWidth: number, countryWidth: number) => (
+      width - 3 - count - (timesWidth + impactWidth + countryWidth + actualWidth + forecastWidth + priorWidth)
+    );
+    const codeWidth = 2 + (flagged ? COUNTRY_FLAG_CELLS : 0);
+    // The reader's column only where the event names keep room to read beside it, under the short headers.
+    const withReader = readerWidth > 0 && roomBeside(8, timeWidth + readerWidth)(4, Math.max(3, codeWidth)) >= minEventWidth;
+    const eventRoom = withReader ? roomBeside(8, timeWidth + readerWidth) : roomBeside(7, timeWidth);
+    // IMPACT and COUNTRY in words while event names keep room to read; the
+    // short labels otherwise, with the word on hover where there is one.
+    const spelledImpactWidth = tableColumnWidth({ width: 1, label: SPELLED_IMPACT });
+    const spelledCountryWidth = Math.max(codeWidth, tableColumnWidth({ width: 1, label: SPELLED_COUNTRY }));
+    const spelled = eventRoom(spelledImpactWidth, spelledCountryWidth) >= SPELLED_HEADER_MIN_EVENT_WIDTH;
+    const impactColumn = spelled
+      ? { label: SPELLED_IMPACT, width: spelledImpactWidth }
+      : { label: "IMP", width: 4, title: "Impact" };
+    const countryColumn = spelled
+      ? { label: SPELLED_COUNTRY, width: spelledCountryWidth }
+      : { label: "CTY", width: Math.max(3, codeWidth), title: "Country" };
+    const eventWidth = Math.max(minEventWidth, eventRoom(impactColumn.width, countryColumn.width));
 
     return [
       { id: "time", label: timeLabelText, width: timeWidth, align: "left" },
-      { id: "impact", label: "IMP", width: impactWidth, align: "left" },
-      { id: "country", label: "CTY", width: flagWidth, align: "left" },
+      ...withReader ? [{ id: "readerTime" as const, label: readerLabel!, width: readerWidth, align: "left" as const, title: readerZone! }] : [],
+      { id: "impact", ...impactColumn, align: "left" },
+      { id: "country", ...countryColumn, align: "left" },
       { id: "event", label: "EVENT", width: eventWidth, align: "left" },
       { id: "actual", label: "ACTUAL", width: actualWidth, align: "right" },
       { id: "forecast", label: "FORECAST", width: forecastWidth, align: "right" },
       { id: "prior", label: "PRIOR", width: priorWidth, align: "right" },
     ];
-  }, [width]);
+  }, [filtered, flagged, readerZone, width]);
   const separatorBg = blendHex(colors.bg, colors.border, 0.3);
   const staleness = fetchedAt ? formatStaleness(fetchedAt, now) : "";
+  // The calendar has events and the filters hid them all: say which, with the way back.
+  // Countries named one by one with nothing in the calendar: a quiet window there, said plainly.
+  const unscheduled = useMemo(() => countriesWithoutEvents(countryFilter, events), [countryFilter, events]);
+  const filterEmptyTitle = events.length === 0 ? null
+    : unscheduled.length > 0 && unscheduled.length === countryFilter.split(",").length ? noScheduledReleasesMessage(unscheduled).replace(/\.$/, "")
+    : filteredEmptyTitle(impactFilter, countryFilter);
   const emptyStateHint = !loading && !error
     ? [
         impactFilter !== "all" ? `impact: ${impactFilter}` : null,
@@ -233,7 +316,10 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
 
   // Next upcoming event for countdown
   const nextEvent = nextUpcomingEventIdx >= 0 ? filtered[nextUpcomingEventIdx] : undefined;
-  const nextCountdown = nextEvent ? formatCountdown(nextEvent.date.getTime() - now) : null;
+  // A bank that states no time, or an all-day event, has a day to count to, not an hour.
+  const nextCountdown = !nextEvent ? null
+    : hasNoReleaseTime(nextEvent) ? shortDayLabel(nextEvent.date)
+    : formatCountdown(nextEvent.date.getTime() - now);
   // The countdown changes every tick, so it is footer status, not query bar
   // context; the footer ellipsizes a long event name.
   const nextText = nextEvent && nextCountdown ? `next ${nextEvent.event} ${nextCountdown}` : null;
@@ -241,18 +327,37 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   const showStale = stale && (!loading || calendar.updatedAt !== null);
   // An empty list says it in its empty state instead.
   const listedAfterStatus = listedAfter && !detailEvent && filtered.length > 0 ? listedAfter : null;
+  // What the High filter, where the calendar opens, leaves out, and the key that lists it (Shift+F steps back to All).
+  const hiddenCount = useMemo(() => lowerImpactHidden(events, impactFilter, countryFilter), [countryFilter, events, impactFilter]);
+  const hiddenStatus = hiddenCount > 0 && !detailEvent ? `${hiddenCount} lower-impact hidden` : null;
   const calendarStatus = useMemo<PaneFooterSegment[]>(() => [
+    ...(hiddenStatus ? [{
+      id: "hidden-impact",
+      capture: true,
+      title: `${hiddenStatus}: Shift+F or Impact All lists them`,
+      // First and whole: the countdown and the update time give way before the key does.
+      parts: [{ text: `${hiddenStatus} (Shift+F)`, tone: "muted" as const }],
+    }] : []),
     ...(nextText && !detailEvent ? [{ id: "next", parts: [{ text: nextText, tone: "muted" as const }] }] : []),
     ...(listedAfterStatus ? [{ id: "listed-after", parts: [{ text: listedAfterStatus, tone: "warning" as const }] }] : []),
     ...(showStale ? [{ id: "stale", parts: [{ text: "STALE", tone: "warning" as const }] }] : []),
     ...(staleness ? [{ id: "updated", parts: [{ text: staleness, tone: "muted" as const }] }] : []),
-  ], [detailEvent, listedAfterStatus, nextText, showStale, staleness]);
-  // A report of the pane (`gloomberb fn ECO`) says it too.
+  ], [detailEvent, hiddenStatus, listedAfterStatus, nextText, showStale, staleness]);
+  // A report of the pane (`gloom fn ECO`) says it too.
   const listedThrough = listedEnd ? dateKey(listedEnd) : null;
   useRemoteUiNode(listedAfter && listedThrough ? {
     role: "report-notice",
     label: "Listed through",
     getMetadata: () => ({ text: listedAfter, key: "listedThrough", value: listedThrough }),
+  } : null);
+  useRemoteUiNode(hiddenCount > 0 ? {
+    role: "report-notice",
+    label: "Lower-impact hidden",
+    getMetadata: () => ({
+      text: `${hiddenCount} lower-impact ${hiddenCount === 1 ? "release" : "releases"} hidden: add --impact all to list them.`,
+      key: "lowerImpactHidden",
+      value: hiddenCount,
+    }),
   } : null);
   usePaneStatusFooter({
     registrationId: "econ-calendar",
@@ -308,7 +413,10 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
     const ev = row.event;
     switch (column.id) {
       case "time":
-        return { text: timeLabel(ev.date), color: colors.textMuted };
+        // A bank that states no time has none here, and its detail says why; an all-day event (a plenum, an election) says so.
+        return { text: hasNoStatedTime(ev) ? "" : isAllDayEvent(ev) ? "All day" : timeLabel(ev.date), color: colors.textMuted };
+      case "readerTime":
+        return { text: hasNoReleaseTime(ev) || !readerZone ? "" : zonedClock(ev.date.getTime(), readerZone).label, color: colors.textMuted };
       case "impact": {
         const indicator = impactIndicator(ev.impact);
         return {
@@ -316,10 +424,14 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
           color: indicator.color,
         };
       }
-      case "country":
-        // The ISO code, not a flag emoji: emoji widths do not match a fixed
-        // column and pushed the right-hand columns off the pane.
-        return { text: ev.country, color: colors.textMuted };
+      case "country": {
+        // The ISO code, led on the desktop by the flag drawn as art, never a
+        // flag emoji: emoji widths do not match a fixed column and pushed the
+        // right-hand columns off the pane. A national euro-area release is
+        // its member's (DE for German Ifo), the ECB's the euro area's.
+        const country = eventCountry(ev);
+        return withCountryFlag({ text: country, color: colors.textMuted }, country, flagged);
+      }
       case "event":
         return { text: ev.event, color: colors.text };
       case "actual":
@@ -332,18 +444,20 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
       case "prior":
         return { text: ev.prior ?? "—", color: colors.textDim };
     }
-  }, []);
+  }, [flagged, readerZone]);
 
   const selectedEvent = filtered[selectedIdx];
   const filterControls = (
     <QueryBar
       width={width}
       filters={[
-        { id: "impact", label: "Impact", inline: true, value: impactFilter, defaultValue: "all",
+        { id: "impact", label: "Impact", inline: true, value: impactFilter, defaultValue: DEFAULT_IMPACT_FILTER,
           options: FILTER_CYCLE.map((value) => ({ value, label: IMPACT_LABELS[value] })),
           onChange: (value: string) => selectImpactFilter(value as ImpactFilter) },
         { id: "region", label: "Region", inline: true, value: countryFilter, defaultValue: "all",
-          options: COUNTRY_CYCLE.map((value) => ({ value, label: value === "all" ? "All" : value })),
+          // Countries a command named stay a choice beside the regions while they are shown.
+          options: [...COUNTRY_CYCLE, ...(COUNTRY_CYCLE.includes(countryFilter) ? [] : [countryFilter])]
+            .map((value) => ({ value, label: value === "all" ? "All" : value.split(",").join(", ") })),
           onChange: (value: string) => selectCountryFilter(value as CountryFilter) },
       ]}
       meta={selectedEvent ? dayLabel(selectedEvent.date, today) : undefined}
@@ -398,12 +512,19 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
       renderSectionHeader={renderSectionHeader}
       renderCell={renderCell}
       selectedTextOverridesCellColor
+      emptyContent={filterEmptyTitle ? (
+        <Box width="100%" paddingX={1} paddingY={1}>
+          <EmptyState title={filterEmptyTitle} actions={<Button label="Show all" compact onPress={showAllEvents} />} />
+        </Box>
+      ) : undefined}
       emptyStateTitle={loading ? "Loading economic events..." : listedAfter ?? "No events"}
       emptyStateHint={emptyStateHint}
       showHorizontalScrollbar={false}
     />
   );
 }
+
+let stopPrintWatch: (() => void) | null = null;
 
 export const economicCalendarModule: PluginModule = {
   series: FRED_CATALOG_SERIES,
@@ -417,6 +538,36 @@ export const economicCalendarModule: PluginModule = {
     defaultMode: "floating",
     defaultFloatingSize: { width: 100, height: 30 },
     tableExport: true,
+    reportOptions: [{
+      key: "country",
+      type: "string",
+      placeholder: "countries",
+      description: "Regions or two-letter country codes to list, comma separated: US, G7, EU, or such as MX,BR,ZA",
+      example: "--country MX,BR,ZA",
+      exampleWithoutArgument: true,
+      normalize: (value) => {
+        const parsed = parseCountryFilter(value);
+        if ("error" in parsed) throw new Error(`${parsed.error} ${COUNTRY_FILTER_HINT}`);
+        return parsed.filter;
+      },
+    }, {
+      key: "impact",
+      type: "enum",
+      values: [{ value: "high" }, { value: "medium", aliases: ["med"] }, { value: "low" }, { value: "all" }],
+      description: "Impact level to list: high (where the calendar opens, leaving out most PMIs), medium, low or all",
+      example: "--impact all",
+      exampleWithoutArgument: true,
+    }],
+    settings: {
+      title: "Economic Calendar Settings",
+      fields: [{
+        key: ECON_PRINT_NOTIFICATIONS_ENABLED_KEY,
+        label: "Notifications",
+        description: "Notify when a high-impact release prints, even while this pane is closed.",
+        type: "toggle",
+        storage: "plugin",
+      }],
+    },
   }],
   paneTemplates: [{
     id: "econ-calendar-pane",
@@ -424,13 +575,38 @@ export const economicCalendarModule: PluginModule = {
     label: "Economic Calendar",
     description: "Upcoming economic events, releases, and indicators.",
     // "econ" stays a keyword so the old ECON prefix still finds this pane.
-    keywords: ["econ", "economic", "calendar", "events", "macro", "releases", "fed", "cpi", "gdp"],
-    shortcut: { prefix: "ECO" },
+    keywords: ["econ", "economic", "calendar", "events", "macro", "releases", "fed", "cpi", "gdp", "rate decision", "ipca",
+      "brazil inflation", "pmi", "ism", "purchasing managers", "flash pmi"],
+    // ECO MX,BR opens the calendar on those countries.
+    shortcut: {
+      prefix: "ECO",
+      argKind: "text",
+      argPlaceholder: "countries",
+      argOptional: true,
+      openWithoutArg: true,
+      argOptions: () => [
+        { value: "US", label: "United States" },
+        { value: "G7", label: "G7" },
+        { value: "EU", label: "Euro area" },
+        { value: "MX,BR,ZA,IN,KR", label: "Mexico, Brazil, South Africa, India and Korea" },
+      ],
+    },
+    createInstance: (_context, options) => {
+      const typed = options?.arg?.trim();
+      if (!typed) return {};
+      const parsed = parseCountryFilter(typed);
+      if ("error" in parsed) throw new Error(`${parsed.error} ${COUNTRY_FILTER_HINT}`);
+      return { params: commandRequestParams({ country: parsed.filter }) };
+    },
   }],
   setup(ctx) {
     attachEconCalendarPersistence(ctx.persistence);
+    stopPrintWatch?.();
+    stopPrintWatch = setupHighImpactPrintNotifications(ctx);
   },
   dispose() {
+    stopPrintWatch?.();
+    stopPrintWatch = null;
     resetEconCalendarPersistence();
   },
 };

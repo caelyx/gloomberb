@@ -1,4 +1,6 @@
 export {
+  compactFloatingZ,
+  FLOATING_PANE_MAX_Z,
   MIN_FLOAT_HEIGHT,
   MIN_FLOAT_WIDTH,
   type FloatingRect,
@@ -19,6 +21,7 @@ export {
 } from "./dock-tree";
 
 export {
+  findPaneLocation,
   getLayoutPreview,
   getLeafRect,
   isPaneDetached,

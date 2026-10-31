@@ -63,6 +63,7 @@ function matchesQuery(view: StatViewModel, query: string): boolean {
     view.stat.seriesId,
     categoryLabel(view.stat.category),
     view.stat.note,
+    ...view.stat.keywords ?? [],
   ].join(" ").toLowerCase();
   return query.split(/\s+/).every((token) => haystack.includes(token));
 }
@@ -78,7 +79,7 @@ function buildColumns(width: number, stacked: boolean): Column[] {
     { id: "latest", label: "LATEST", width: 10, align: "right" },
     { id: "previous", label: "PREV", width: 9, align: "right" },
     ...(withPercentile
-      ? [{ id: "percentile" as const, label: "%ILE", width: 6, align: "right" as const }]
+      ? [{ id: "percentile" as const, label: "%ILE", title: "Percentile of the latest reading in the range", width: 6, align: "right" as const }]
       : []),
     ...(withPeriod
       ? [{ id: "period" as const, label: "DATE", width: PERIOD_WIDTH, align: "right" as const }]
@@ -147,8 +148,10 @@ export function EconStatisticsPane({ focused, width, height }: PaneProps) {
   const error = resource.error ?? bundle?.errors[0] ?? null;
   const footerInfo = useMemo<PaneFooterSegment[]>(() => {
     if (!selected) return [];
+    // A Treasury yield names when in the day it was taken, as GC does, so it is not read against ^TNX's earlier close.
+    const cutoff = selected.stat.cutoff ? ` ${selected.stat.cutoff}` : "";
     const info: PaneFooterSegment[] = [
-      { id: "as-of", parts: [{ text: `reading for ${selected.reading}`, tone: "muted" }] },
+      { id: "as-of", parts: [{ text: `reading for ${cutoff ? selected.reading : selected.readingReleased}${cutoff}`, tone: "muted" }] },
     ];
     // The cached first paint is being replaced; its age only counts once that load fails.
     const seeding = resource.loading && resource.updatedAt === null && !selected.refreshError;

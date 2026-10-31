@@ -2,9 +2,10 @@ import type { AppConfig } from "../../../../types/config";
 import type { CliCommandContext } from "../../../../types/plugin";
 import { parseListingArg } from "../../../../cli/listing-arg";
 import { findPortfolio, isManualPortfolio } from "../../../../portfolio/mutations";
-import { CASH_SYMBOL } from "../allocation";
+import { CASH_SYMBOL } from "../../../../portfolio/allocation";
 import { findNamedCollection } from "../../../../portfolio/collection-name";
 import { readCurrencyAmount, readTypedNumber, TYPED_AMOUNT_FORMAT } from "../../../../utils/decimal-comma";
+import { isProviderBusy } from "../../../../sources/provider-errors";
 
 export { listingFields } from "../../../../cli/listing-arg";
 
@@ -16,8 +17,13 @@ export class PortfolioCliError extends Error {
   }
 }
 
-/** Fails the command with the error's message and hint, or the fallback for anything unexpected. */
+/**
+ * Fails the command with the error's message and hint, or the fallback for
+ * anything unexpected. A lookup search was too busy for goes on as it is, for
+ * the CLI to say so as a failure worth retrying.
+ */
 export function failPortfolioCommand(ctx: CliCommandContext, error: unknown, fallback: string): never {
+  if (isProviderBusy(error)) throw error;
   if (error instanceof Error) {
     const details = (error as { details?: unknown }).details;
     return ctx.fail(error.message, typeof details === "string" ? details : undefined);
@@ -85,9 +91,9 @@ export function misplacedSymbolList(
   const more = collections.length - names.length;
   const existing = names.length > 0
     ? `${label}: ${names.join(", ")}${more > 0 ? ` and ${more} more` : ""}`
-    : `no ${label} yet, create one with \`gloomberb ${noun} create <name>\``;
+    : `no ${label} yet, create one with \`gloom ${noun} create <name>\``;
   return {
-    message: `"${preview}" reads as a list of symbols, not a ${noun} name; did you mean \`gloomberb ${noun} ${verb} <name> <list>\`; ${existing}`,
+    message: `"${preview}" reads as a list of symbols, not a ${noun} name; did you mean \`gloom ${noun} ${verb} <name> <list>\`; ${existing}`,
     details: usage,
   };
 }
@@ -140,6 +146,6 @@ export function rejectCashSymbol(symbol: string, exchange: string | undefined, p
   if (!isCashArgument(symbol, exchange)) return;
   throw new PortfolioCliError(
     "CASH is the portfolio's cash line, not a ticker.",
-    `Record cash with: gloomberb portfolio cash set "${portfolioName}" <amount> [currency]. For the stock that trades as CASH, name its exchange: CASH:NASDAQ.`,
+    `Record cash with: gloom portfolio cash set "${portfolioName}" <amount> [currency]. For the stock that trades as CASH, name its exchange: CASH:NASDAQ.`,
   );
 }

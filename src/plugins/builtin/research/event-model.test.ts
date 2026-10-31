@@ -17,7 +17,7 @@ test("pending RIVN earnings show consensus without borrowing prior-quarter actua
   const [row] = buildEventRows({ symbol: "RIVN", currency: "USD", dividends: [], splits: [],
     earnings: [{ date: "2026-11-03", dateType: "announcement", epsEstimate: -0.73, currency: "USD", time: "AMC" }],
   }, null, { quarterlyStatements: [{ date: "2026-06-30", currency: "USD", eps: -0.63, totalRevenue: 1_658_000_000 }] }, "USD");
-  expect(row).toMatchObject({ date: "2026-11-03", period: "AMC", detail: "Pending", qEps: -0.73, epsCurrency: "USD" });
+  expect(row).toMatchObject({ date: "2026-11-03", period: "-", reportTime: "AMC", detail: "Pending, AMC", qEps: -0.73, epsCurrency: "USD" });
   expect(row?.qRevenue).toBeUndefined();
   expect(row?.revenueCurrency).toBeUndefined();
 });
@@ -94,7 +94,7 @@ test("fiscal period ends stay labeled and unknown EPS currency stays unknown", (
   const [row] = buildEventRows({ symbol: "COST", currency: "USD", dividends: [], splits: [],
     earnings: [{ date: "2026-05-31", dateType: "fiscal-period-end", epsActual: 4.93, difference: 0.01 }],
   }, null, null, "USD");
-  expect(row).toMatchObject({ dateType: "fiscal-period-end", detail: "Period end; basis unknown, +0.01 vs est" });
+  expect(row).toMatchObject({ dateType: "fiscal-period-end", detail: "Period end; +0.01 vs est" });
   expect(row?.epsCurrency).toBeUndefined();
 });
 
@@ -166,6 +166,20 @@ test("a resolved quarter shows ERN's figure, basis and fiscal quarter, and a pen
   expect(ttm).toMatchObject({ epsBasis: "GAAP", detail: "GAAP diluted (statements), adj sum -3.85" });
 });
 
+test("an earnings row's period is its fiscal quarter, never the time of day; a report not out yet says the time in its detail", () => {
+  // A report without a fiscal period keeps the time the source gave as reportTime, not as its period.
+  const rows = buildEventRows({ symbol: "WFC", dividends: [], splits: [], earnings: [
+    { date: "2027-01-14", dateType: "announcement", time: "Pre Market", fiscalPeriod: "2026-12", epsEstimate: 1.86, epsAnalysts: 17, dateStatus: "confirmed" },
+    { date: "2026-10-13", dateType: "announcement", time: "Pre Market", fiscalPeriod: "2026-09", epsActual: 1.66, dateStatus: "reported" },
+    { date: "2017-07-14", dateType: "announcement", time: "After Hours", epsActual: 1.07, dateStatus: "reported" },
+  ] }, null, null, "USD");
+  expect(rows.find((row) => row.date === "2027-01-14"))
+    .toMatchObject({ period: "Dec 2026", reportTime: "Pre Market", detail: "confirmed, Pre Market, 17 analysts" });
+  expect(rows.find((row) => row.date === "2026-10-13")).toMatchObject({ period: "Sep 2026", reportTime: "Pre Market" });
+  expect(rows.find((row) => row.date === "2017-07-14")).toMatchObject({ period: "-", reportTime: "After Hours" });
+  expect(rows.find((row) => row.date === "2017-07-14")?.detail).not.toContain("After Hours");
+});
+
 describe("the TTM row's EPS", () => {
   // PLTR: ticker prints the served trailing 1.16, the statement quarters' diluted EPS add to 1.17 and the rows above
   // are two adjusted quarters over two GAAP ones.
@@ -230,7 +244,7 @@ test("a beat against a negative estimate reads as a beat", () => {
   const [row] = buildEventRows({ symbol: "CRWV", dividends: [], splits: [], earnings: [
     { date: "2026-08-11", dateType: "announcement", epsEstimate: -1.47, epsActual: -1.14, difference: 0.33, surprisePercent: -22.45 },
   ] }, null, null, "USD");
-  expect(row).toMatchObject({ surprisePercent: 22.45, value: "+22.45%", tone: "positive", detail: "basis unknown, +0.33 vs est" });
+  expect(row).toMatchObject({ surprisePercent: 22.45, value: "+22.45%", tone: "positive", detail: "+0.33 vs est" });
 });
 
 test("missing or ambiguous fiscal periods and announcements cannot borrow a previous quarter's revenue", () => {

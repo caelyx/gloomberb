@@ -4,12 +4,16 @@ import {
   buildPortfolioRisk,
   portfolioRiskRequests,
   portfolioRiskTickers,
-  riskCoverageHeadline,
+  riskCoverageLine,
   riskCoverageNotices,
   riskCoverageShortfall,
-  riskCoverageText,
-  riskExclusionText,
+  riskEvidence,
+  riskReturnsCurrency,
+  HOLDINGS_SUMMARY_ROW_IDS,
 } from "./risk-model";
+import { FX_NO_PAIR } from "./risk-fx";
+import { parseFxShifts, repriceBook, riskCashLines, type RiskAssetShift, type RiskFxShift } from "./risk-book";
+import { rollingBeta, subtractReturns } from "./risk-math";
 import {
   BEYOND_SIZE_REASON,
   fetchPortfolioRiskMarket,
@@ -80,19 +84,18 @@ test("a broker account estimates on the holdings that qualify and lists every ot
   // 85 US listings worth $365,500 of $468,560: foreign listings at the load's rates, the rest at the broker's value.
   expect(model.coverage).toMatchObject({ holdings: 94, covered: 85, unvalued: 0, marketValue: 468_560, coveredValue: 365_500, sufficient: true });
   expect(model.coverage.share).toBeCloseTo(365_500 / 468_560, 10);
-  expect(riskCoverageText(model.coverage)).toBe("covers 78% of market value \u00b7 9 holdings left out");
-  // The report and the pane name what is left out, by the same covered share.
-  expect(riskExclusionText(model.coverage)).toBe("excludes EUR2, TWD1 +7 more, 22% of value");
+  // The report and the pane name what is left out, the basket and each part a whole percent of the book adding up to 100.
+  expect(riskCoverageLine(model.coverage)).toBe("basket 365,500 USD = 78% of book; left out: EUR2 4%, TWD1 4%, 7 more 14%");
   expect(riskCoverageNotices(model.coverage)).toEqual([
-    "EUR2 (4.3% of market value) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
-    "TWD1 (4.0% of market value) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
-    "EUR1 (3.5% of market value) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
-    "GBP1 (2.7% of market value) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
-    "HKD1 (2.2% of market value) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
-    "JPY1 (2.2% of market value) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
-    "UNQ1 (1.7% of market value) is excluded from the risk estimate: daily history unavailable.",
-    "UNQ2 (1.1% of market value) is excluded from the risk estimate: daily history unavailable.",
-    "UNQ3 (0.4% of market value) is excluded from the risk estimate: daily history unavailable.",
+    "EUR2 (4.3% of the book) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
+    "TWD1 (4.0% of the book) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
+    "EUR1 (3.5% of the book) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
+    "GBP1 (2.7% of the book) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
+    "HKD1 (2.2% of the book) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
+    "JPY1 (2.2% of the book) is excluded from the risk estimate: foreign holdings: daily FX closes unavailable.",
+    "UNQ1 (1.7% of the book) is excluded from the risk estimate: daily history unavailable.",
+    "UNQ2 (1.1% of the book) is excluded from the risk estimate: daily history unavailable.",
+    "UNQ3 (0.4% of the book) is excluded from the risk estimate: daily history unavailable.",
   ]);
   // Weights renormalize over the basket; nothing left out carries one.
   const weights = new Map(model.holdings.map((row) => [row.symbol, row.weight]));
@@ -109,8 +112,7 @@ test("a broker account estimates on the holdings that qualify and lists every ot
   const unvalued = brokerFixtureHoldings().map((row) => (row.symbol === "UNQ3" ? { ...row, brokerValue: undefined } : row));
   const bound = (await brokerModel(unvalued)).model.coverage;
   expect(bound.unvalued).toBe(1);
-  expect(riskCoverageText(bound)).toBe("covers at most 78% of market value \u00b7 9 holdings left out");
-  expect(riskExclusionText(bound)).toBe("excludes EUR2, TWD1 +7 more, at least 22% of value");
+  expect(riskCoverageLine(bound)).toBe("basket 365,500 USD = at most 78% of book; left out: EUR2 4%, TWD1 4%, 7 more 14%");
   expect(riskCoverageNotices(bound).at(-1)).toBe("UNQ3 (value unknown) is excluded from the risk estimate: daily history unavailable.");
 });
 
@@ -121,11 +123,8 @@ test("foreign listings with daily FX closes enter the basket in USD and the foot
     .toEqual(["EURUSD=X", "GBPUSD=X", "HKD=X", "JPY=X", "TWD=X"]);
   // $365,500 of US listings plus $88,060 of foreign ones at the current rates.
   expect(model.coverage).toMatchObject({ covered: 91, converted: 6, coveredValue: 453_560, sufficient: true });
-  expect(riskCoverageText(model.coverage)).toBe(
-    "covers 96% of market value \u00b7 3 holdings left out \u00b7 6 holdings converted from local currency",
-  );
-  expect(riskCoverageHeadline(model.coverage)).toBe(
-    "excludes UNQ1, UNQ2 +1 more, 4% of value \u00b7 6 holdings converted from local currency",
+  expect(riskCoverageLine(model.coverage)).toBe(
+    "basket 453,560 USD = 97% of book; left out: UNQ1 2%, UNQ2 1%, UNQ3 under 1% \u00b7 6 holdings converted from local currency",
   );
   const jpy = model.holdings.find((row) => row.symbol === "JPY1")!;
   // 500 shares at 3,000 JPY, marked at the current rate of 0.0068 USD per yen.
@@ -140,6 +139,64 @@ test("foreign listings with daily FX closes enter the basket in USD and the foot
   expect(model.notes).toContain(
     "Converted holdings are matched to the US close of the same date; where their market closes at another time, correlations and betas to US holdings read lower than they are.",
   );
+});
+test("a TRY account converts each holding's USD returns at its own dates' USD/TRY closes and leaves out only what cannot convert", async () => {
+  const account: Portfolio = { ...BROKER_PORTFOLIO, currency: "TRY" };
+  // Two US listings, a yen listing that converts on to TRY through USD, and a riyal listing no daily pair converts.
+  const holdings = [
+    { symbol: "US01", exchange: "NASDAQ", currency: "USD", quantity: 100, price: 100 },
+    { symbol: "US02", exchange: "NYSE", currency: "USD", quantity: 500, price: 100 },
+    { symbol: "JPY1", exchange: "JPX", currency: "JPY", quantity: 500, price: 3_000 },
+    { symbol: "SAR1", exchange: "TADAWUL", currency: "SAR", quantity: 100, price: 30 },
+  ];
+  const tickers = brokerFixtureTickers(holdings);
+  const load = (currency: string) => fetchPortfolioRiskMarket(
+    portfolioRiskRequests(tickers, BROKER_PORTFOLIO.id), brokerRiskClient(now, holdings, { fx: true }) as never, now, undefined, currency,
+  );
+  const [usdMarket, market] = await Promise.all([load("USD"), load("TRY")]);
+  const usd = buildPortfolioRisk(BROKER_PORTFOLIO, tickers, usdMarket);
+  const model = buildPortfolioRisk(account, tickers, market);
+  const fx = market.accountFx!;
+  expect(fx).toMatchObject({ currency: "TRY", pair: "USD/TRY", error: null });
+  const held = (symbol: string, from = model) => from.holdings.find((row) => row.symbol === symbol)!;
+  // V = USD value / USD per lira on each date, so a return is (1 + r) * fx(start) / fx(end) - 1; the yen listing's USD series chains on.
+  for (const symbol of ["US01", "JPY1"]) {
+    const inUsd = held(symbol, usd).returns, inTry = held(symbol).returns;
+    expect(inTry.map((row) => row.dateKey)).toEqual(inUsd.map((row) => row.dateKey));
+    const error = Math.max(...inUsd.map((row, index) =>
+      Math.abs(inTry[index]!.value - ((1 + row.value) * fx.closes[row.startDateKey]! / fx.closes[row.dateKey]! - 1))));
+    expect(error).toBeLessThan(1e-12);
+    expect(inTry.some((row, index) => Math.abs(row.value - inUsd[index]!.value) > 1e-4)).toBe(true);
+  }
+  // Values and the tail losses in money are in lira at the current rate; the weights are the USD account's.
+  expect(held("US01").value).toBeCloseTo(10_000 / 0.0202, 6);
+  for (const row of model.holdings) expect(row.weight ?? 0).toBeCloseTo(held(row.symbol, usd).weight ?? 0, 12);
+  expect(model.rows.risk.find((row) => row.id === "var")).toMatchObject({ amountCurrency: "TRY", amountBase: model.coverage.coveredValue });
+  expect(model.coverage.coveredValue).toBeCloseTo((10_000 + 50_000 + 500 * 3_000 * 0.0068) / 0.0202, 4);
+  // Only the listing with no FX path is left out; everything else estimates, and says in what currency.
+  expect(model.coverage.leftOut.map((row) => [row.symbol, row.reason])).toEqual([["SAR1", FX_NO_PAIR]]);
+  expect(model.metrics.every((row) => row.value != null)).toBe(true);
+  expect(model.factors.every((row) => row.value != null)).toBe(true);
+  expect(riskReturnsCurrency(model)).toBe("returns in TRY at daily USD/TRY closes");
+  expect(riskReturnsCurrency(usd)).toBeNull();
+  // Factors stay in USD: quality is QUAL less SPY as they trade, not less SPY restated in lira.
+  const usdReturns = (symbol: string) => market.histories.find((row) => row.instrument.symbol === symbol)!.returns;
+  const quality = rollingBeta(model.basket, subtractReturns(usdReturns("QUAL"), usdReturns("SPY")), "", "quality");
+  expect(model.factors.find((row) => row.id === "quality")!.value).toBeCloseTo(quality.value!, 12);
+
+  // A missing lira close on a holding's dates leaves that holding out, never bridged; one whose history starts later still converts.
+  const us02 = market.histories.find((row) => row.instrument.symbol === "US02")!;
+  us02.returns = us02.returns.slice(-80);
+  const gap = held("US01", usd).returns[10]!.dateKey;
+  const { [gap]: _missing, ...closes } = fx.closes;
+  const gapped = buildPortfolioRisk(account, tickers, { ...market, accountFx: { ...fx, closes } });
+  expect(gapped.coverage.leftOut.map((row) => [row.symbol, row.reason])).toEqual([
+    ["JPY1", "USD/TRY daily FX history has gaps on the holding's dates"],
+    ["US01", "USD/TRY daily FX history has gaps on the holding's dates"],
+    ["SAR1", FX_NO_PAIR],
+  ]);
+  expect(gapped.coverage.sufficient).toBe(true);
+  expect(gapped.metrics.every((row) => row.value != null)).toBe(true);
 });
 test("past the size limit the largest holdings by value are modelled and the rest left out", async () => {
   // Listed smallest first, so the limit has to rank by value rather than keep the order.
@@ -172,8 +229,8 @@ test("below half of market value the basket views estimate nothing and say why",
   expect(model.book?.gross).toBe(108_560);
   expect(model.holdings.every((row) => row.weight == null)).toBe(true);
   expect(riskCoverageShortfall(model.coverage)).toEqual({
-    title: "Qualifying holdings cover 5% of market value; basket estimates need 50%.",
-    message: "Most of what is left out: Foreign holdings: daily FX closes unavailable (81.1% of market value).",
+    title: "Qualifying holdings cover 5% of the holdings' value; basket estimates need 50%.",
+    message: "Most of what is left out: Foreign holdings: daily FX closes unavailable (81.1% of the holdings' value).",
   });
   expect(() =>
     buildPortfolioRisk(portfolio, [], market(), {
@@ -235,6 +292,81 @@ test("only held positions marked at a close raise the close-mark warning", () =>
     "1 holding had no current quote; weighted at the latest completed close.",
   ]);
 });
+test("cash counts in the book the coverage is a share of, by currency, but never in the basket, its sufficiency or concentration", () => {
+  const snapshot = { ...market(), fxRates: { TRY: 0.025 } };
+  // $330 of SPY in the basket, a $110 short left out, 4,400 lira ($110) and $220 of cash: a $770 book.
+  const cash = [{ currency: "TRY", amount: 4_400 }, { currency: "USD", amount: 220 }];
+  const model = buildPortfolioRisk(portfolio, [holding("SPY", 3), holding("IWM", -1)], snapshot, null, undefined, {}, cash);
+  expect(model.coverage).toMatchObject({ marketValue: 770, holdingsValue: 440, cashValue: 330, coveredValue: 330, sufficient: true });
+  // The basket is 43% of the book but 75% of the holdings, so it still estimates.
+  expect(model.coverage.holdingsShare).toBe(0.75);
+  expect(riskCoverageLine(model.coverage)).toBe("basket 330 USD = 43% of book; left out: USD cash 29%, IWM 14%, TRY cash 14%");
+  expect(riskCoverageNotices(model.coverage)).toContain(
+    "TRY cash (14.3% of the book) is excluded from the risk estimate: cash is outside the equity basket; its USD value moves with TRY.",
+  );
+  // The holdings view lists each currency's cash in place by value, with what it is worth.
+  expect(model.rows.holdings.filter((row) => !HOLDINGS_SUMMARY_ROW_IDS.has(row.id)).map((row) => [row.label, row.value])).toEqual([
+    ["SPY", 100], ["USD cash", null], ["IWM", null], ["TRY cash", null],
+  ]);
+  expect(model.rows.holdings.find((row) => row.id === "cash:TRY")).toMatchObject({
+    leftOut: "Cash is outside the equity basket; its USD value moves with TRY",
+    detail: "4,400.00 TRY = 110.00 USD; moves with TRY; outside the basket",
+  });
+  // Concentration divides the holdings alone, and says so.
+  expect(model.book?.top).toBe(0.75);
+  expect(model.rows.holdings.find((row) => row.id === "top")).toMatchObject({ unit: "% holdings", detail: "Share of 440 USD in priced holdings, cash aside" });
+  // The tail losses name their method and what their basket is of the book.
+  const tail = model.rows.risk.find((row) => row.id === "var")!;
+  expect(riskEvidence(tail)).toBe("historical, 1-day, 95%, 60 daily returns; basket 330 USD = 43% of book; left out: USD cash 29%, IWM 14%, TRY cash 14%");
+  // Cash is never a holding the basket left out, so a book of covered holdings and cash is complete.
+  expect(buildPortfolioRisk(portfolio, [holding("SPY", 3)], snapshot, null, undefined, {}, cash).complete).toBe(true);
+  // A broker's balances by currency stand in for a manual entry, its summary row left out.
+  expect(riskCashLines({ currency: "USD", cash: { amount: 5, currency: "EUR" } }, {
+    cashBalances: [{ currency: "BASE", quantity: 9_000 }, { currency: "USD", quantity: 220 }, { currency: "try", quantity: 4_400 }],
+  })).toEqual([{ currency: "USD", amount: 220 }, { currency: "TRY", amount: 4_400 }]);
+  // A broker's total cash that names no currency is in the account's.
+  expect(riskCashLines({ currency: "TRY" }, { totalCashValue: 1_000, currency: "" })).toEqual([{ currency: "TRY", amount: 1_000 }]);
+});
+test("currency and price shocks reprice each line of the book, cash included, and total it", () => {
+  const snapshot = { ...market(), fxRates: { TRY: 0.025 } };
+  const cash = [{ currency: "TRY", amount: 4_400 }];
+  const shocked = (fx: RiskFxShift[], assets: RiskAssetShift[] = []) => buildPortfolioRisk(
+    portfolio, [holding("SPY", 3)], snapshot, null, { equity: -10, rates: 100, volatility: 10, fx, assets }, {}, cash,
+  );
+  // The lira 20% weaker takes a fifth off the lira cash; SPY 10% higher adds a tenth to SPY: +$11 on a $440 book.
+  const model = shocked([{ currency: "TRY", percent: -20 }], [{ symbol: "SPY", percent: 10 }]);
+  const rows = model.rows.stress.filter((row) => row.id.startsWith("shock:"));
+  expect(rows.map((row) => [row.label, row.value, row.amount])).toEqual([
+    ["SPY", expect.closeTo(10, 10), expect.closeTo(33, 10)],
+    ["TRY cash", expect.closeTo(-20, 10), expect.closeTo(-22, 10)],
+    ["Book total", expect.closeTo(2.5, 10), expect.closeTo(11, 10)],
+  ]);
+  expect(rows.at(-1)!.detail).toBe("TRY -20% vs USD, SPY +10%; of 440 USD book, cash included");
+  expect(rows[1]!.detail).toBe("TRY -20% vs USD; 110 USD to 88 USD");
+  // The basket regressions stay, as shares of the basket.
+  expect(model.rows.stress[0]!.detail).toStartWith("% of basket; ");
+  // A shock nothing in the book moves with changes nothing, and says so: a three-letter symbol is still a holding.
+  expect(shocked([{ currency: "EUR", percent: 5 }], [{ symbol: "ETH-USD", percent: -30 }, { symbol: "GLD", percent: 10 }]).notes).toEqual(expect.arrayContaining([
+    'Nothing in "Test basket" moves with EUR against USD, so the EUR shift changes nothing.',
+    '"Test basket" holds no ETH-USD, so its shift changes nothing; it holds SPY.',
+    '"Test basket" holds no GLD, so its shift changes nothing; it holds SPY.',
+  ]));
+  // A decimal comma is a decimal, not another shock.
+  expect(parseFxShifts("TRY -2,5, EUR 5")).toEqual([{ currency: "TRY", percent: -2.5 }, { currency: "EUR", percent: 5 }]);
+
+  // In a lira account the lira's fall is every other currency's rise: USD lines gain a quarter, lira cash stays, a euro line takes both moves.
+  const lira = repriceBook([
+    { id: "spy", label: "SPY", currency: "USD", value: 13_200, listing: { symbol: "SPY", exchange: "ARCA" } },
+    { id: "sap", label: "SAP", currency: "EUR", value: 8_000, listing: { symbol: "SAP", exchange: "XETRA" } },
+    { id: "cash:TRY", label: "TRY cash", currency: "TRY", value: 4_400, listing: null },
+  ], "TRY", [{ currency: "TRY", percent: -20 }, { currency: "EUR", percent: 5 }])!;
+  expect(lira.lines.map((line) => [line.label, line.percent, line.change])).toEqual([
+    ["SPY", expect.closeTo(25, 10), expect.closeTo(3_300, 8)],
+    ["SAP", expect.closeTo(31.25, 10), expect.closeTo(2_500, 8)],
+  ]);
+  expect(lira.lines[1]!.shocks).toEqual(["EUR +5% vs USD", "TRY -20% vs USD"]);
+  expect(lira.percent).toBeCloseTo(5_800 / 25_600 * 100, 10);
+});
 test("a short is left out of the basket with its reason and counts in the market value", () => {
   const model = buildPortfolioRisk(
     portfolio,
@@ -246,7 +378,7 @@ test("a short is left out of the basket with its reason and counts in the market
     { id: "ARCA:IWM", symbol: "IWM", reason: "Short positions: signed exposure history required", value: 110, share: 0.25 },
   ]);
   expect(model.holdings.map((row) => row.weight)).toEqual([1, null]);
-  expect(riskExclusionText(model.coverage)).toBe("excludes IWM, 25% of value");
+  expect(riskCoverageLine(model.coverage)).toBe("basket 330 USD = 75% of book; left out: IWM 25%");
   // Concentration reads the whole priced book, the short at its gross value; the weights above are the basket's.
   expect(model.book?.gross).toBe(440);
   expect(model.book?.top).toBe(0.75);
@@ -279,20 +411,18 @@ test("a depositary receipt is an equity in the basket, and what is still left ou
   const adr = [holding("SPY", 3), receipt("IWM", "American Depositary Receipt")];
   const covered = buildPortfolioRisk(portfolio, adr, market());
   expect(covered.coverage).toMatchObject({ covered: 2, share: 1, leftOut: [] });
-  expect(riskExclusionText(covered.coverage)).toBeNull();
+  expect(riskCoverageLine(covered.coverage)).toBe("basket 550 USD = 100% of book");
   // The concentration lines count the receipt: 330 and 220 of 550, not 330 alone.
   expect(covered.book?.top).toBeCloseTo(0.6, 12);
   expect(covered.book?.effectiveHoldings).toBeCloseTo(1 / (0.6 ** 2 + 0.4 ** 2), 12);
 
-  // A holding the basket cannot take stays named: one, then two, then "+N more", with the combined share.
+  // A holding the basket cannot take stays named, up to three, then "N more" with their combined share.
   const one = buildPortfolioRisk(portfolio, [...adr, crypto("ETH-USD")], market());
-  expect(riskExclusionText(one.coverage)).toBe("excludes ETH-USD, value unknown");
-  const short = buildPortfolioRisk(portfolio, [...adr, holding("IEF", -1)], market());
-  expect(riskExclusionText(short.coverage)).toBe("excludes IEF, 17% of value");
-  const several = buildPortfolioRisk(portfolio, [...adr, holding("IEF", -1), holding("HYG", -1), holding("IWD", -1)], market());
-  expect(riskExclusionText(several.coverage)).toBe("excludes IEF, HYG +1 more, 38% of value");
-  const two = buildPortfolioRisk(portfolio, [...adr, holding("IEF", -1), holding("HYG", -1)], market());
-  expect(riskExclusionText(two.coverage)).toBe("excludes IEF, HYG, 29% of value");
+  expect(riskCoverageLine(one.coverage)).toBe("basket 550 USD = at most 100% of book; left out: ETH-USD value unknown");
+  const three = buildPortfolioRisk(portfolio, [...adr, holding("IEF", -1), holding("HYG", -1), holding("IWD", -1)], market());
+  expect(riskCoverageLine(three.coverage)).toBe("basket 550 USD = 63% of book; left out: IEF 13%, HYG 12%, IWD 12%");
+  const four = buildPortfolioRisk(portfolio, [...adr, ...["IEF", "HYG", "IWD", "IWF"].map((symbol) => holding(symbol, -1))], market());
+  expect(riskCoverageLine(four.coverage)).toBe("basket 550 USD = 56% of book; left out: IEF 11%, HYG 11%, 2 more 22%");
 });
 test("imported option snapshots use signed dollar sensitivities, preserve scope and reject stale or mixed currencies", () => {
   const position = {
@@ -434,6 +564,24 @@ test("broker option matching requires one exact conId and source contract, prese
   expect(matched.complete).toBe(true);
   expect(matched.positions[0]!.legs[0]!.quantity).toBe(2);
   expect(matched.positions[0]!.legs[0]!.multiplier).toBe(100);
+  // A closed session's chain is valued where its IV was measured, as OMON
+  // values it: at its quotes' time and that session's close, not the
+  // pre-market print and the hours left now.
+  const quoted = Date.parse("2026-09-21T20:14:59Z");
+  const closed = await loadPortfolioOptionBook([ticker], portfolio, {
+    ...dependencies,
+    loadQuote: async () =>
+      ready({ ...quote, regularClose: 108, regularCloseSessionDate: "2026-09-21" }),
+    loadOptions: async () =>
+      ready({
+        underlyingSymbol: "SPY",
+        expirationDates: [expiration],
+        calls: [contract],
+        puts: [],
+        asOf: new Date(quoted).toISOString(),
+      }),
+  });
+  expect(closed.positions[0]).toMatchObject({ spot: 108, asOf: quoted });
   ticker.metadata.broker_contracts[0]!.localSymbol = "SPY261218C00101000";
   const wrong = await loadPortfolioOptionBook(
     [ticker],

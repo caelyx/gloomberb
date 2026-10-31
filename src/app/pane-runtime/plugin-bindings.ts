@@ -17,6 +17,7 @@ import {
 import { applyPluginToggles } from "../../plugins/ownership";
 import { setLayoutManagerDispatch } from "../../plugins/builtin/layout-manager";
 import { setMarketplaceHost } from "../../plugins/marketplace/store";
+import { deactivatePluginForRemoval } from "../../plugins/marketplace/deactivation";
 import type { InstalledPlugin } from "../../plugins/marketplace/model";
 import {
   listExternalPlugins,
@@ -162,20 +163,27 @@ export function bindAppPanePluginRegistry({
   };
   const setPluginEnabled = (pluginId: string, enabled: boolean) => setPluginsEnabled({ [pluginId]: enabled });
 
+  // A popped-out pane's window shows one pane and opens none; a secondary
+  // window has a grid of its own and opens panes there, as the main window does.
+  const popOutWindow = isDetachedWindow && detachedPaneId !== null;
   pluginRegistry.bindHost({
     setPluginEnabled,
     setPluginsEnabled,
     selectTicker: (symbol, paneId) => selectTickerInPane(symbol, paneId),
     switchPanel: (panel) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       const paneId = getPanelFocusTarget(stateRef.current.config.layout, panel);
       if (paneId) dispatch({ type: "FOCUS_PANE", paneId });
     },
     switchTab: (tabId, paneId) => switchTickerResearchTab(tabId, paneId),
     // The bar would open over a dialog without its keys, so it waits for none to be open.
     openCommandBar: (query) => {
-      if (isDetachedWindow || isDialogOpen()) return;
+      if (popOutWindow || isDialogOpen()) return;
       dispatch({ type: "SET_COMMAND_BAR", open: true, query });
+    },
+    runCommandBarQuery: (query) => {
+      if (isDetachedWindow || isDialogOpen()) return;
+      dispatch({ type: "SET_COMMAND_BAR", open: true, query, launch: { kind: "run-query", query } });
     },
     // Forms submit through the main window's state, so a detached window says where to go.
     openPluginCommandWorkflow: (commandId) => {
@@ -205,16 +213,16 @@ export function bindAppPanePluginRegistry({
     },
     getLayout: () => stateRef.current.config.layout,
     updateLayout: (layout) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       persistLayout(layout);
     },
     openPaneSettings: (paneId, options) => { void openPaneSettings(paneId, options); },
     showPane: (paneId) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       showPane(paneId);
     },
     createPaneFromTemplateAsync: async (templateId, options) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       await createPaneTemplateOrThrow(templateId, options, {
         dataProvider,
         tickerRepository,
@@ -231,7 +239,7 @@ export function bindAppPanePluginRegistry({
       const sharedPane = materialized.layout.instances[0];
       if (!sharedPane) throw new Error("This shared pane is invalid.");
       const paneDef = pluginRegistry.panes.get(sharedPane.paneId);
-      if (!paneDef) throw new Error("This shared pane is unavailable in this version of Gloomberb.");
+      if (!paneDef) throw new Error("This shared pane is unavailable in this version of Gloom.");
       const owner = pluginRegistry.getDisabledPaneOwner(sharedPane.paneId, stateRef.current.config.disabledPlugins);
       if (owner) throw new PluginOffError(owner, "this shared pane");
       const instance = buildPaneInstance(sharedPane.paneId, sharedPane);
@@ -244,7 +252,7 @@ export function bindAppPanePluginRegistry({
       placePaneInstance(instance, paneDef, { placement: "floating" });
     },
     createPaneFromTemplate: (templateId, options) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       void createPaneFromTemplate(templateId, options);
     },
     applyPaneSettingValue: async (paneId, field: PaneSettingField, value) => {
@@ -258,17 +266,15 @@ export function bindAppPanePluginRegistry({
       });
     },
     hidePane: (paneId) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       const instanceId = resolvePaneTarget(paneId);
       const layout = stateRef.current.config.layout;
       if (!instanceId || !isPaneInLayout(layout, instanceId)) return;
       persistLayout(removePane(layout, instanceId));
     },
     focusPane: (paneId, layout) => {
-      if (isDetachedWindow) {
-        if (paneId === detachedPaneId) {
-          dispatch({ type: "FOCUS_PANE", paneId });
-        }
+      if (popOutWindow) {
+        if (paneId === detachedPaneId) dispatch({ type: "FOCUS_PANE", paneId });
         return;
       }
       const instanceId = resolvePaneTarget(paneId);
@@ -291,12 +297,12 @@ export function bindAppPanePluginRegistry({
     // Ticker links in panes and menus, and DES from the command bar, open the
     // research pane (or the pane asked for) through these two.
     pinTicker: (symbol, options) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       recordFunctionOpen(usageFunctionForPane(pluginRegistry, options?.paneType ?? TICKER_RESEARCH_PANE_ID));
       void openPinnedTicker(symbol, options);
     },
     navigateTicker: (rawSymbol, options) => {
-      if (isDetachedWindow) return;
+      if (popOutWindow) return;
       // Navigation lands in a research pane, which stays hidden while its plugin is off.
       const researchOwner = pluginRegistry.getDisabledPaneOwner(TICKER_RESEARCH_PANE_ID, stateRef.current.config.disabledPlugins);
       if (researchOwner) {
@@ -475,9 +481,11 @@ export function bindAppPanePluginRegistry({
           throw error;
         }
       }
+      // Recorded before it registers: what redraws as its contributions land
+      // (a broker list and its logo) reads the entry this checkout now is.
+      upsertExternalPlugin(entry);
       try {
         await pluginRegistry.register(entry.plugin);
-        upsertExternalPlugin(entry);
       } catch (error) {
         upsertExternalPlugin({ ...entry, error: error instanceof Error ? error.message : String(error) });
         reportCrash(error, { kind: "plugin", plugin: pluginId });
@@ -496,7 +504,13 @@ export function bindAppPanePluginRegistry({
         for (const instanceId of orphaned) next = removePane(next, instanceId);
         persistLayout(next);
       }
-      if (pluginRegistry.allPlugins.has(pluginId)) pluginRegistry.unregister(pluginId);
+      try {
+        deactivatePluginForRemoval(pluginRegistry, pluginId);
+      } catch (error) {
+        const entry = listExternalPlugins().find((candidate) => candidate.plugin.id === pluginId);
+        if (entry) upsertExternalPlugin({ ...entry, needsRestart: true });
+        throw error;
+      }
       removeExternalPlugin(pluginId, directory);
     },
     contributions: (pluginId) => {

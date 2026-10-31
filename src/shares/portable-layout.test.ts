@@ -277,6 +277,27 @@ describe("layout marketplace payloads", () => {
     expect(JSON.stringify(payload)).not.toContain("placementMemory");
   });
 
+  test("shares a secondary window's panes as floating panes in the usual format", () => {
+    const fixture = portableFixture();
+    const [feed, prediction, portfolio] = fixture.layout.instances.map((instance) => instance.instanceId);
+    const layout = {
+      ...fixture.layout,
+      dockRoot: { kind: "pane" as const, instanceId: feed! },
+      windows: [{
+        id: "w2",
+        dockRoot: { kind: "pane" as const, instanceId: prediction! },
+        floating: [{ instanceId: portfolio!, x: 5, y: 6, width: 30, height: 12, zIndex: 52 }],
+      }],
+    };
+    const payload = publishableMarketplaceLayout(layout, fixture.paneState, panes);
+    // Older clients accept exactly these four keys.
+    expect(Object.keys(payload.layout).sort()).toEqual(["detached", "dockRoot", "floating", "instances"]);
+    expect(payload.layout.dockRoot).toEqual({ kind: "pane", instanceId: "p1" });
+    expect(payload.layout.floating.map((entry) => entry.instanceId).sort()).toEqual(["p2", "p3"]);
+    expect(payload.layout.floating.find((entry) => entry.instanceId === "p3")).toMatchObject({ x: 5, y: 6, width: 30, height: 12 });
+    expect(parseMarketplaceLayoutEntry({ ...validEntry(), layout: payload.layout })).not.toBeNull();
+  });
+
   test("keeps the config of a pane whose plugin is not installed here", () => {
     const payload = publishableMarketplaceLayout({
       dockRoot: { kind: "pane", instanceId: "tv:1" },

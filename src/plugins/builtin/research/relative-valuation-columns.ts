@@ -4,12 +4,14 @@ import type { TickerFinancials } from "../../../types/financials";
 import { isUsListingExchange, parsePublicTickerKey } from "../../../utils/exchanges";
 import { errorMessage } from "../../../utils/errors";
 import { formatNumber } from "../../../utils/format";
+import { formatPriceEarnings, NOT_MEANINGFUL } from "../../../utils/price-earnings";
 import { fetchScreen } from "../equity-screener/client";
 import { refusedLock } from "../shared/cloud-denied";
 import { resolveHeadlessInstrument } from "../shared/headless-market-data";
 import { loadShortInterest } from "../short-interest/client";
 import { buildShortWatchRow } from "../short-interest/watch-model";
 import { analystTargetCurrency, formatAnalystPrice, recommendationTotal } from "./analyst-model";
+import { peerDatesText } from "./relative-valuation-basis";
 
 /** The columns `--columns` adds to RV's report, each read from the path its own function uses. */
 export const EXTRA_COLUMN_IDS = ["shortInterest", "nextEarnings", "target", "grossMargin", "evEbitda"] as const;
@@ -23,14 +25,36 @@ const COLUMN_ALIASES: Record<string, ExtraColumnId> = {
   evebitda: "evEbitda", evtoebitda: "evEbitda",
 };
 
-/** `--columns`: a comma list of the fields above (or their short names), in order, as the canonical names. */
+/**
+ * The report's own columns under the names a caller asks for them by. Asking for one adds nothing: `--columns trailingPE`
+ * was refused as an unknown field, so the P/E the report already carries read as one RV could not give.
+ */
+const REPORT_COLUMN_NAMES = new Set([
+  "symbol", "ticker", "price", "last", "changepercent", "chg", "change",
+  "marketcap", "mktcap", "cap",
+  "trailingpe", "pe", "peratio", "priceearnings", "pricetoearnings", "ttmpe",
+  "forwardpe", "fwdpe",
+  "evsales", "evs", "evtosales", "evrevenue", "evtorevenue",
+  "fcfyield", "fcf", "freecashflowyield",
+  "revenuegrowth", "quarterrevenueyoy", "revenueyoy", "growth",
+  "operatingmargin", "opmargin", "ttmopmargin",
+]);
+
+const REPORT_COLUMNS_SENTENCE = "Last, Chg%, Mkt Cap, P/E, Fwd P/E, EV/S, FCF Yield, Quarter Revenue YoY and TTM Op Margin are always in the report";
+
+/**
+ * `--columns`: a comma list of the fields above (or their short names), in order, as the canonical names. A column the
+ * report always has is accepted and adds nothing, so `--columns trailingPE` alone is the plain report.
+ */
 export function normalizeExtraColumns(value: string): string {
   const tokens = value.split(/[,\s]+/).filter(Boolean);
   if (tokens.length === 0) throw new Error(`--columns needs one or more of: ${EXTRA_COLUMN_IDS.join(", ")}.`);
-  const ids = tokens.map((token) => {
-    const id = COLUMN_ALIASES[token.toLowerCase().replace(/[^a-z]/g, "")];
-    if (!id) throw new Error(`Unknown --columns field "${token}". Use any of: ${EXTRA_COLUMN_IDS.join(", ")}.`);
-    return id;
+  const ids = tokens.flatMap((token) => {
+    const name = token.toLowerCase().replace(/[^a-z]/g, "");
+    const id = COLUMN_ALIASES[name];
+    if (id) return [id];
+    if (REPORT_COLUMN_NAMES.has(name)) return [];
+    throw new Error(`Unknown --columns field "${token}". Use any of: ${EXTRA_COLUMN_IDS.join(", ")}. ${REPORT_COLUMNS_SENTENCE}.`);
   });
   return [...new Set(ids)].join(",");
 }
@@ -48,6 +72,12 @@ interface ColumnSpec {
   sourceKey: string;
   asOfKey: string;
   label: string;
+  /**
+   * What the column's figures are as of, for the report's footer, from the
+   * dates of its cells (`fiscal year to 2025-12-31`). A column dated only by
+   * when it was read (targets, the earnings calendar) has none.
+   */
+  basis?: (dates: string) => string;
 }
 
 const COLUMN_SPECS: Record<ExtraColumnId, ColumnSpec> = {
@@ -56,6 +86,7 @@ const COLUMN_SPECS: Record<ExtraColumnId, ColumnSpec> = {
     columns: [{ key: "shortInterestPercentFloat", header: "Short % Float", align: "right", format: percent }],
     sourceKey: "shortInterestSource",
     asOfKey: "shortInterestAsOf",
+    basis: (dates) => `settlement ${dates}`,
   },
   nextEarnings: {
     label: "Next Earnings",
@@ -71,7 +102,7 @@ const COLUMN_SPECS: Record<ExtraColumnId, ColumnSpec> = {
   target: {
     label: "Avg Target",
     columns: [
-      { key: "targetMean", header: "Avg Target", align: "right", unitKey: "targetCurrency",
+      { key: "targetMean", header: "Avg Target", align: "right", unitKey: "targetCurrency", unitColumn: true,
         format: (value, row) => (typeof value === "number" ? formatAnalystPrice(value, typeof row.targetCurrency === "string" ? row.targetCurrency : undefined) : "-") },
       { key: "analystCount", header: "Analysts", align: "right", format: (value) => (typeof value === "number" ? String(value) : "-") },
     ],
@@ -83,12 +114,17 @@ const COLUMN_SPECS: Record<ExtraColumnId, ColumnSpec> = {
     columns: [{ key: "grossMarginPercent", header: "Gross Margin", align: "right", format: percent }],
     sourceKey: "grossMarginSource",
     asOfKey: "grossMarginAsOf",
+    // The screener stores the fiscal year's margin (its FY GROSS MGN%), dated by the year's end.
+    basis: (dates) => `fiscal year to ${dates}`,
   },
   evEbitda: {
     label: "EV/EBITDA",
-    columns: [{ key: "evEbitda", header: "EV/EBITDA", align: "right", format: (value) => (typeof value === "number" ? formatNumber(value, 1) : "-") }],
+    // N/M over an EV or EBITDA at or below zero, as EQS shows it.
+    columns: [{ key: "evEbitda", header: "EV/EBITDA", align: "right", format: (value, row) => (typeof value === "number" ? formatNumber(value, 1)
+      : row.evEbitdaNotMeaningful ? formatPriceEarnings(NOT_MEANINGFUL) : "-") }],
     sourceKey: "evEbitdaSource",
     asOfKey: "evEbitdaAsOf",
+    basis: (dates) => `statements to ${dates}`,
   },
 };
 
@@ -106,6 +142,20 @@ export function extraColumns(ids: readonly ExtraColumnId[]): { text: HeadlessPan
       { key: spec.asOfKey, header: `${spec.label} as of`, format: text, shrink: false },
     ]),
   };
+}
+
+/**
+ * The footer's word on each added column dated by its figures: `Gross Margin:
+ * fiscal year to 2025-12-31`, beside the TTM columns' `fundamentals through`.
+ */
+export function extraColumnsBasis(ids: readonly ExtraColumnId[], rows: readonly HeadlessPaneRow[]): string[] {
+  return ids.flatMap((id) => {
+    const spec = COLUMN_SPECS[id];
+    const valueKey = spec.columns[0]!.key;
+    const dates = spec.basis && peerDatesText(rows.filter((row) => row[valueKey] != null)
+      .map((row) => ({ symbol: String(row.symbol), date: typeof row[spec.asOfKey] === "string" ? row[spec.asOfKey] as string : null })));
+    return dates ? [`${spec.label}: ${spec.basis!(dates)}`] : [];
+  });
 }
 
 /** Whether a symbol is a US listing, which FINRA short interest, the earnings calendar and the screener cover. */
@@ -251,6 +301,7 @@ async function loadScreenerFields(ids: readonly ExtraColumnId[], symbols: readon
     if (wanted.includes("evEbitda")) {
       const multiple = metricFields(row.metrics.evToEbitda);
       if (multiple) Object.assign(fields, { evEbitda: multiple.value, evEbitdaSource: multiple.source, evEbitdaAsOf: multiple.asOf });
+      else if (row.metrics.evToEbitda?.notMeaningful) Object.assign(fields, { evEbitda: null, evEbitdaNotMeaningful: row.metrics.evToEbitda.reason ?? true });
     }
   }
 }

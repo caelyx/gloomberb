@@ -24,9 +24,11 @@ import { migrateSavedConfig, type ConfigMigrationHost } from "./migrations";
 import { encodeBuiltinDisabledPluginIds, expandBuiltinPluginGroups } from "../../../plugins/ownership";
 import { sanitizeSavedPaneState } from "./pane-state";
 import { isRecord } from "../../../utils/guards";
+import { normalizeStoredBaseCurrency } from "../../../utils/base-currency";
 import { debugLog } from "../../../utils/debug-log";
 import { DEFAULT_THEME, themes } from "../../../theme/themes";
 import { sanitizeStarPrompt } from "../../../app/star-prompt/model";
+import { sanitizeCommandBarOpens } from "../../../app/command-bar-intro";
 import { sanitizeUpdatesConfig } from "../../../updater/channel";
 
 const configLog = debugLog.createLogger("config");
@@ -42,7 +44,7 @@ function sanitizeTheme(value: unknown, fallback: string): string {
   if (typeof value !== "string") return fallback;
   if (!themes[value] && !reportedUnknownThemes.has(value)) {
     reportedUnknownThemes.add(value);
-    configLog.warn(`Unknown theme "${value}" in config; showing ${DEFAULT_THEME}. gloomberb config themes lists the ids.`);
+    configLog.warn(`Unknown theme "${value}" in config; showing ${DEFAULT_THEME}. gloom config themes lists the ids.`);
   }
   return value;
 }
@@ -79,7 +81,9 @@ export function normalizeLoadedConfig(
   const config: AppConfig = {
     dataDir,
     configVersion: CURRENT_CONFIG_VERSION,
-    baseCurrency: typeof candidate.baseCurrency === "string" ? candidate.baseCurrency : defaults.baseCurrency,
+    // A name or sign an older version saved (Canadian dollar, CA$) reads as its code; nothing turns into USD unasked.
+    baseCurrency: typeof candidate.baseCurrency === "string" && candidate.baseCurrency.trim()
+      ? normalizeStoredBaseCurrency(candidate.baseCurrency) : defaults.baseCurrency,
     refreshIntervalMinutes: typeof candidate.refreshIntervalMinutes === "number" ? candidate.refreshIntervalMinutes : defaults.refreshIntervalMinutes,
     portfolios: sanitizePortfolios(candidate.portfolios, defaults.portfolios),
     watchlists: sanitizeWatchlists(candidate.watchlists, defaults.watchlists),
@@ -89,6 +93,7 @@ export function normalizeLoadedConfig(
     brokerInstances: sanitizeBrokerInstances(candidate.brokerInstances),
     disabledPlugins,
     seededPlugins: sanitizeUniqueStringList(candidate.seededPlugins),
+    ...sanitizePluginSeedFailure(candidate.pluginSeedFailure),
     ...(candidate.portfolioCurrenciesAdopted === true ? { portfolioCurrenciesAdopted: true } : {}),
     ...(candidate.presentationMode === true ? { presentationMode: true } : {}),
     ...(typeof candidate.timezone === "string" && candidate.timezone.trim() ? { timezone: candidate.timezone.trim() } : {}),
@@ -100,6 +105,7 @@ export function normalizeLoadedConfig(
     fontSize: sanitizeFontSize(candidate.fontSize, defaults.fontSize),
     recentTickers: sanitizeStringArray(candidate.recentTickers, defaults.recentTickers),
     recentCommands: sanitizeRecentCommands(candidate.recentCommands, defaults.recentCommands),
+    commandBarOpens: sanitizeCommandBarOpens(candidate.commandBarOpens),
     language: isLanguagePreference(candidate.language) ? candidate.language : undefined,
     onboardingComplete,
     onboardingProgress,
@@ -155,6 +161,7 @@ export function normalizeConfigForSave(config: AppConfig): AppConfig {
     // Older apps read the retired group ids, so a group that is all off is saved as one.
     disabledPlugins: encodeBuiltinDisabledPluginIds(sanitizeUniqueStringList(config.disabledPlugins)),
     seededPlugins: sanitizeUniqueStringList(config.seededPlugins),
+    ...sanitizePluginSeedFailure(config.pluginSeedFailure),
     disabledSources: sanitizeUniqueStringList(config.disabledSources),
     pluginConfig: sanitizePluginConfig(config.pluginConfig),
     chartPreferences: sanitizeChartPreferences(config.chartPreferences, defaults.chartPreferences),
@@ -162,6 +169,7 @@ export function normalizeConfigForSave(config: AppConfig): AppConfig {
     fontSize: sanitizeFontSize(config.fontSize, defaults.fontSize),
     recentTickers: sanitizeStringArray(config.recentTickers, []),
     recentCommands: sanitizeRecentCommands(config.recentCommands, []),
+    commandBarOpens: sanitizeCommandBarOpens(config.commandBarOpens),
     onboardingComplete: onboardingProgress ? false : config.onboardingComplete,
     onboardingProgress,
   };
@@ -311,6 +319,13 @@ function sanitizeUniqueStringList(value: unknown): string[] {
   return [...new Set(sanitizeStringArray(value, []))];
 }
 
+/** The last failed plugin seed as saved, or nothing when it is absent or unreadable. */
+function sanitizePluginSeedFailure(value: unknown): Pick<AppConfig, "pluginSeedFailure"> {
+  if (!isRecord(value)) return {};
+  const plugins = sanitizeUniqueStringList(value.plugins).sort();
+  return plugins.length > 0 ? { pluginSeedFailure: { plugins, gitMissing: value.gitMissing === true } } : {};
+}
+
 function isPluginConfigMap(value: unknown): value is Record<string, Record<string, unknown>> {
   if (!isRecord(value)) return false;
   return Object.values(value).every((entry) => isRecord(entry));
@@ -357,13 +372,20 @@ function sanitizePortfolios(value: unknown, fallback: Portfolio[]): Portfolio[] 
     .map(sanitizePortfolioAllocation);
 }
 
-/** Cash, target weights and the import source the portfolio commands write; a malformed one is dropped. */
+/** Cash, target weights, the import source and a fixed currency the portfolio commands write; a malformed one is dropped. */
 function sanitizePortfolioAllocation(entry: Portfolio): Portfolio {
-  const { cash, targetWeights, importedFrom, ...portfolio } = entry;
+  const { cash, targetWeights, importedFrom, fixedCurrency, ...portfolio } = entry;
   const next: Portfolio = { ...portfolio };
+  if (fixedCurrency === true) next.fixedCurrency = true;
   if (isRecord(importedFrom) && importedFrom.kind === "13f"
     && [importedFrom.cik, importedFrom.name, importedFrom.period, importedFrom.filed].every((value) => typeof value === "string" && value)) {
     next.importedFrom = { kind: "13f", cik: importedFrom.cik, name: importedFrom.name, period: importedFrom.period, filed: importedFrom.filed };
+    // All of the 13F weights or none: a subset would renormalise into other weights than the filing's.
+    const weights = isRecord(importedFrom.weights) ? Object.entries(importedFrom.weights) : [];
+    if (weights.length > 0 && weights.every(([symbol, weight]) =>
+      !!symbol.trim() && typeof weight === "number" && Number.isFinite(weight) && weight > 0 && weight <= 1)) {
+      next.importedFrom.weights = Object.fromEntries(weights) as Record<string, number>;
+    }
   }
   if (isRecord(cash) && typeof cash.amount === "number" && Number.isFinite(cash.amount)
     && typeof cash.currency === "string" && /^[A-Z]{3}$/.test(cash.currency)) {

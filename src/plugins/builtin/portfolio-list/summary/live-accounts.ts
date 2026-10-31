@@ -6,6 +6,10 @@ import type { Portfolio } from "../../../../types/ticker";
 import type { BrokerAccount } from "../../../../types/trading";
 import { getBrokerInstance } from "../../../../utils/broker-instances";
 import { usePluginBrokerActions } from "../../../runtime";
+import type { OfflineBroker } from "../../shared/broker-reconnect";
+import { tf } from "../../../../i18n";
+import { isSignedInBrokerProfile, signedInBrokerId } from "../../../../brokers/signed-in/profile";
+import { accountsShownFor } from "../../../../brokers/broker-portfolio-sync";
 import { resolvePortfolioAccountState, type ResolvedPortfolioAccountState } from "./index";
 
 const EMPTY_ACCOUNTS = { instanceId: null, accounts: [] as BrokerAccount[], error: null };
@@ -85,11 +89,45 @@ export interface PortfolioAccountStateResult {
   /** Set when the broker refused to list accounts, so "no cash" is not mistaken for a clean empty. */
   accountsError: string | null;
   /**
-   * The broker's last call failed, such as the sync at startup after its
-   * sign-in lapsed. Accounts are listed only while it is connected, so this
-   * is the only word of why the account is missing or stale.
+   * The portfolio's broker while it cannot be reached, such as after its
+   * sign-in lapsed: the positions on screen are its last sync. Accounts are
+   * listed only while it is connected, so this is the only word of why the
+   * account is missing or stale.
    */
-  brokerError: string | null;
+  offline: OfflineBroker | null;
+}
+
+/**
+ * The broker behind a portfolio while Gloom cannot reach it: disconnected,
+ * failing, without the plugin that connects it, or turned off (`disabled`),
+ * which nothing syncs until it is enabled. Null while it is connected or
+ * connecting, before it reports a status, and for one that only syncs on
+ * demand (IBKR Flex), which is never connected.
+ */
+export function resolveOfflineBroker(
+  portfolio: Portfolio | null,
+  brokerInstance: BrokerInstanceConfig | null | undefined,
+  broker: BrokerAdapter | null | undefined,
+  status: BrokerConnectionStatus | null,
+): OfflineBroker | null {
+  if (!portfolio || !brokerInstance) return null;
+  const syncedAt = portfolio.lastSyncedAt ?? brokerInstance.lastSyncedAt ?? null;
+  // A profile signed in through Gloom names its broker, not the adapter it needs.
+  const brokerName = broker
+    ? broker.describeInstance?.(brokerInstance).brokerName ?? broker.name
+    : (isSignedInBrokerProfile(brokerInstance) ? signedInBrokerId(brokerInstance) : brokerInstance.brokerType).toUpperCase();
+  if (brokerInstance.enabled === false) {
+    return { instance: brokerInstance, brokerName, syncedAt, reason: tf("{broker} disabled", { broker: brokerName }), reconnectable: !!broker, disabled: true };
+  }
+  if (!broker) {
+    return { instance: brokerInstance, brokerName, syncedAt, reason: tf("{broker} unavailable", { broker: brokerName }), reconnectable: false };
+  }
+  if (!status || status.state === "connected" || status.state === "connecting") return null;
+  if (status.mode?.toLowerCase() === "flex") return null;
+  const reason = status.state === "error"
+    ? status.message?.trim() || tf("{broker} unavailable", { broker: brokerName })
+    : tf("{broker} disconnected", { broker: brokerName });
+  return { instance: brokerInstance, brokerName, syncedAt, reason, reconnectable: true };
 }
 
 /**
@@ -109,17 +147,21 @@ export function usePortfolioAccountState(
   const { getBrokerAdapter } = usePluginBrokerActions();
   const broker = brokerInstance ? getBrokerAdapter(brokerInstance.brokerType) : null;
   const live = useLiveBrokerAccounts(broker, brokerInstance, instanceId ? state.brokerAccounts[instanceId] : undefined);
+  // An account another profile holds under its own number is that profile's, here as in sync.
   const snapshot = useMemo(
-    () => ({ status: live.status, accounts: live.accounts }),
-    [live.accounts, live.status],
+    () => ({ status: live.status, accounts: brokerInstance ? accountsShownFor(state.config, brokerInstance, live.accounts) : live.accounts }),
+    [brokerInstance, live.accounts, live.status, state.config],
   );
   const accountState = useMemo(
     () => resolvePortfolioAccountState(portfolio, state, snapshot),
     [portfolio, snapshot, state.brokerAccounts, state.config],
   );
-  const brokerError = live.status?.state === "error" ? live.status.message?.trim() || "Broker unavailable" : null;
+  const offline = useMemo(
+    () => resolveOfflineBroker(portfolio, brokerInstance, broker, live.status),
+    [broker, brokerInstance, live.status, portfolio],
+  );
   return useMemo(
-    () => ({ accountState, accountsError: live.error, brokerError }),
-    [accountState, brokerError, live.error],
+    () => ({ accountState, accountsError: live.error, offline }),
+    [accountState, live.error, offline],
   );
 }

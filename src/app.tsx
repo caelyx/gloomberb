@@ -17,6 +17,7 @@ import { useLinkedLayoutSync } from "./layout-marketplace/linked-sync";
 import { useTeamCollectionsSync } from "./team/collections-sync";
 import { Shell } from "./components/layout/shell";
 import { DetachedPaneShell } from "./components/layout/detached-pane-shell";
+import { SecondaryWindowHeader } from "./components/layout/secondary-window-header";
 import { TransientLayoutProvider } from "./components/layout/transient-layout";
 import { CommandBar } from "./components/command-bar/surface";
 import { OnboardingWizard } from "./components/onboarding/onboarding-wizard";
@@ -34,7 +35,7 @@ import type { CliLaunchRequest, GloomPlugin } from "./types/plugin";
 import type { DataProvider } from "./types/data-provider";
 import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindowBridge } from "./types/desktop-window";
 import type { DesktopApplicationMenuBridge } from "./types/desktop-menu";
-import type { LayoutBounds } from "./layout/pane-manager";
+import { findPaneLocation, type LayoutBounds } from "./layout/pane-manager";
 import type { AppSessionSnapshot } from "./core/state/session-persistence";
 import type { MarketDataCoordinator } from "./market-data/coordinator";
 import { createAppNotifier } from "./notifications/app-notifier";
@@ -185,12 +186,21 @@ function AppInner({
   const rendererHost = useRendererHost();
   const dialog = useDialog();
   const toast = useToastHost();
-  const isDetachedWindow = desktopWindowBridge?.kind === "detached";
-  const detachedPaneId = isDetachedWindow ? desktopWindowBridge.paneId ?? null : null;
+  const isMainWindow = !desktopWindowBridge || desktopWindowBridge.kind === "main";
+  // Any window but the main one: a popped-out pane or a secondary window. Only
+  // the main window opens panes, runs the bar and syncs; the others show state.
+  const isDetachedWindow = !isMainWindow;
+  const detachedPaneId = desktopWindowBridge?.kind === "detached" ? desktopWindowBridge.paneId ?? null : null;
   const focusDetachedPane = useMemo(() => {
     const focus = desktopWindowBridge?.kind === "main" ? desktopWindowBridge.focusDetachedPane : undefined;
     return focus ? (paneId: string) => { void focus(paneId).catch(() => {}); } : undefined;
   }, [desktopWindowBridge]);
+  // The main window and a secondary window run the bar and open panes in their own grid.
+  const opensPanes = isMainWindow || desktopWindowBridge?.kind === "window";
+  const focusPaneInItsWindow = useMemo(() => {
+    const focus = opensPanes ? desktopWindowBridge?.focusPaneInItsWindow : undefined;
+    return focus ? (paneId: string) => { void focus(paneId).catch(() => {}); } : undefined;
+  }, [desktopWindowBridge, opensPanes]);
   const [desktopDockPreview, setDesktopDockPreview] = useState<DesktopDockPreviewState | null>(null);
   const [commandBarNativeOccluder, setCommandBarNativeOccluder] = useState<LayoutBounds | null>(null);
   appActiveRef.current = appActive;
@@ -239,6 +249,15 @@ function AppInner({
       setDesktopDockPreview(preview);
     });
   }, [desktopWindowBridge]);
+
+  // Another window reused or linked to a pane in this one, and the host brought this window forward.
+  useEffect(() => {
+    if (!opensPanes || !desktopWindowBridge?.subscribeFocusPane) return;
+    return desktopWindowBridge.subscribeFocusPane((paneId) => {
+      // Only a pane this window already shows: one it has not heard of yet would go back to the host.
+      if (findPaneLocation(stateRef.current.config.layout, paneId)?.window === "main") pluginRegistry.focusPane(paneId);
+    });
+  }, [desktopWindowBridge, opensPanes, pluginRegistry, stateRef]);
 
   useEffect(() => {
     const disposers = createCoreSyncContributors().map((contributor) => (
@@ -349,7 +368,7 @@ function AppInner({
     // Keep a first-run workspace stable while the local guide is active. Once
     // onboarding finishes, the normal pull-before-push sync starts immediately.
     initialized: state.initialized
-      && desktopWindowBridge?.kind !== "detached"
+      && isMainWindow
       && !onboardingActive
       && !signInGateActive,
   });
@@ -366,6 +385,7 @@ function AppInner({
     dispatch,
     externalPlugins,
     focusDetachedPane,
+    focusPaneInItsWindow,
     isDetachedWindow,
     notify,
     persistConfig,
@@ -417,6 +437,7 @@ function AppInner({
     dispatch,
     focusedTickerSymbol,
     isDetachedWindow,
+    opensPanes,
     keybindings,
     pluginRegistry,
     refreshTicker,
@@ -442,6 +463,47 @@ function AppInner({
                 pluginRegistry={pluginRegistry}
                 desktopWindowBridge={{ ...desktopWindowBridge, kind: "detached", paneId: desktopWindowBridge.paneId }}
               />
+              <ToastViewport position="bottom-right" />
+            </ThemedAppRoot>
+          </RemoteControlHost>
+        </ContextMenuProvider>
+      </KeybindingsProvider>
+    );
+  }
+
+  if (desktopWindowBridge?.kind === "window") {
+    // A secondary window: its own grid under a bare title bar, and a command
+    // bar of its own whose panes open there. The header's prompt and the
+    // status bar stay with the main window.
+    return (
+      <KeybindingsProvider value={keybindings}>
+        <AppDialogBridge />
+        <ContextMenuProvider pluginRegistry={pluginRegistry}>
+          <RemoteControlHost
+            adapter={remoteControlAdapter}
+            dispatch={dispatch}
+            getState={getRemoteState}
+            pluginRegistry={pluginRegistry}
+            desktopWindowBridge={desktopWindowBridge}
+          >
+            <ThemedAppRoot>
+              {chrome.header && <SecondaryWindowHeader />}
+              <Shell
+                pluginRegistry={pluginRegistry}
+                dataProvider={dataProvider}
+                tickerRepository={tickerRepository}
+                desktopWindowBridge={desktopWindowBridge}
+                commandBarNativeOccluder={commandBarNativeOccluder}
+              />
+              {state.commandBarOpen && (
+                <CommandBar
+                  dataProvider={dataProvider}
+                  tickerRepository={tickerRepository}
+                  pluginRegistry={pluginRegistry}
+                  quitApp={() => rendererHost.requestExit()}
+                  onNativeOccluderChange={setCommandBarNativeOccluder}
+                />
+              )}
               <ToastViewport position="bottom-right" />
             </ThemedAppRoot>
           </RemoteControlHost>
@@ -589,7 +651,7 @@ export function App({
   const signInGateActive = requireSignIn && !signedIn;
   const shareHandoff = isPaneShareHandoff();
   const [showOnboarding, setShowOnboarding] = useState(() => (
-    desktopWindowBridge?.kind !== "detached"
+    (!desktopWindowBridge || desktopWindowBridge.kind === "main")
     && !shareHandoff
     && (!effectiveInitialConfig.onboardingComplete || !!effectiveInitialConfig.onboardingProgress)
   ));
@@ -629,11 +691,12 @@ export function App({
     <RemoteUiRegistryProvider>
       <AppProvider
         config={config}
-        sessionStore={desktopWindowBridge?.kind === "detached" ? undefined : services.persistence.sessions}
+        sessionStore={desktopWindowBridge && desktopWindowBridge.kind !== "main" ? undefined : services.persistence.sessions}
         sessionSnapshot={sessionSnapshot}
         desktopBridge={desktopWindowBridge}
         desktopSnapshot={desktopSnapshot}
         initialThemePreview={desktopThemePreview}
+        onWindowConfigChange={(changed) => services.pluginRegistry.events.emit("config:changed", { config: changed })}
       >
         <AppLanguageConfigObserver />
         <AppInner

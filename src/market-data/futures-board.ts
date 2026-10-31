@@ -37,7 +37,7 @@ export interface FuturesContract {
    * is this future wherever a symbol is typed. Codes a security also uses (NG
    * is NovaGold, CL Colgate, ZM Zoom, GC several venues' listings) leave it
    * unset: the security keeps the code and the future is its `=F` symbol.
-   * Checked with `gloomberb quote <code>` signed out on 2026-10-11: each of
+   * Checked with `gloom quote <code>` signed out on 2026-10-11: each of
    * these was "Not a ticker", or for ZT and ZF a quote last updated in 2023 and
    * 2021 that search no longer lists. The sector, index and energy rows were
    * checked the same way on 2026-10-14: XAR is an ETF, XAU Goldmoney, SXI
@@ -45,6 +45,8 @@ export interface FuturesContract {
    * index, and RS1, MES, MYM, M2K, MCL, MNG and HH are listed abroad.
    */
   bareCode?: true;
+  /** Everyday names the board's own does not hold: oil is WTI crude, not heating or soybean oil. */
+  aliases?: readonly string[];
 }
 
 /** 0.005 -> 3, 0.25 -> 2, 1 -> 0. Written for ticks, not general numbers. */
@@ -100,7 +102,7 @@ export const FUTURES_CONTRACTS: FuturesContract[] = [
   { symbol: "ZB=F", code: "ZB", name: "30-Year T-Bond", sector: "rates", venue: "CBT", bareCode: true },
   { symbol: "UB=F", code: "UB", name: "Ultra T-Bond", sector: "rates", venue: "CBT", bareCode: true },
 
-  { symbol: "CL=F", code: "CL", name: "WTI Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01 },
+  { symbol: "CL=F", code: "CL", name: "WTI Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01, aliases: ["oil"] },
   { symbol: "BZ=F", code: "BZ", name: "Brent Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01 },
   { symbol: "NG=F", code: "NG", name: "Natural Gas", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.001 },
   // Quoted in euros per MWh.
@@ -195,6 +197,41 @@ export function futuresContractByCode(code: unknown): FuturesContract | null {
  */
 export function futuresBoardContract(value: unknown): FuturesContract | null {
   return BY_SYMBOL.get(typed(value)) ?? futuresContractByCode(value);
+}
+
+const nameWords = (text: string) => text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+
+/**
+ * The item a typed name means: every word of it starts a word of the item's
+ * name ("orange juice", "sugar" for Sugar #11, "soybean" for Soybeans). Among
+ * those that match, the name with the fewest other words wins, then the
+ * list's order: "crude" is WTI before Brent and the micro, "yen" the Japanese
+ * yen before the Nikkei quoted in yen. A name of fewer than three letters
+ * matches nothing, so a slip of a code does not land on a random row.
+ */
+export function bestNameMatch<T>(items: readonly T[], names: (item: T) => readonly string[], value: unknown): T | null {
+  const wanted = typeof value === "string" ? nameWords(value) : [];
+  if (wanted.join("").length < 3) return null;
+  let best: T | null = null;
+  let fewest = Number.POSITIVE_INFINITY;
+  for (const item of items) {
+    for (const name of names(item)) {
+      const have = nameWords(name);
+      if (have.length >= fewest || !wanted.every((word) => have.some((part) => part.startsWith(word)))) continue;
+      best = item;
+      fewest = have.length;
+    }
+  }
+  return best;
+}
+
+/**
+ * The board row a commodity's name stands for, as a reader types it into a
+ * futures function: cocoa, coffee, sugar, cotton, orange juice, gold, copper,
+ * crude, natural gas. Codes and symbols are `futuresBoardContract`'s.
+ */
+export function futuresContractByName(value: unknown): FuturesContract | null {
+  return bestNameMatch(FUTURES_CONTRACTS, (contract) => [contract.name, ...contract.aliases ?? []], value);
 }
 
 /**

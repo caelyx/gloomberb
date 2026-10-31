@@ -1,3 +1,4 @@
+import { logFailure } from "../../utils/log-failure";
 import { useCallback, useEffect, type Dispatch } from "react";
 import { loadPersistedBrokerAccountMap } from "../../brokers/account-cache";
 import type { AppSessionSnapshot } from "../../core/state/session-persistence";
@@ -7,6 +8,7 @@ import { instrumentFromTicker, type InstrumentRef } from "../../market-data/requ
 import { useSavedLayoutWarmup } from "./layout-warmup";
 import { chatController } from "../../plugins/builtin/chat/controller";
 import { PLUGIN_MARKETPLACE_PANE_ID } from "../../plugins/marketplace/ids";
+import { takePluginSeedNotice } from "../../plugins/seed-notice";
 import type { LoadedExternalPlugin } from "../../plugins/loader";
 import type { PluginRegistry } from "../../plugins/registry";
 import type {
@@ -37,6 +39,8 @@ const appLog = debugLog.createLogger("app");
 
 /** How long the restored panes wait for plugins that register theirs during setup. */
 const RESTORED_FUNCTIONS_WAIT_MS = 15_000;
+/** Long enough to read what to install before it goes. */
+const PLUGIN_SEED_NOTICE_MS = 12_000;
 
 /**
  * One function per pane placed in the layout: docked, floating and popped
@@ -155,7 +159,7 @@ export function useAppStartupRuntime({
           sessionHydrationTargetCount: sessionSnapshot?.hydrationTargets.length ?? 0,
         });
       } catch (err) {
-        // Will show empty state.
+        logFailure("app.runtime.startup", "Workspace startup hydration failed")(err);
       }
     })();
   }, [
@@ -202,6 +206,16 @@ export function useAppStartupRuntime({
     // identity, so this runs when initialization flips and not again.
   }, [externalPlugins, isDetachedWindow, pluginRegistry, state.initialized]);
 
+  // Official plugins the launch could not install (no git, offline) are
+  // otherwise simply missing. One notice, taken once, says which and why.
+  useEffect(() => {
+    if (!state.initialized || isDetachedWindow) return;
+    const notice = takePluginSeedNotice();
+    if (!notice) return;
+    appLog.warn("official plugins not installed at launch", { notice: notice.body });
+    pluginRegistry.notify({ ...notice, duration: PLUGIN_SEED_NOTICE_MS });
+  }, [isDetachedWindow, pluginRegistry, state.initialized]);
+
   // What people keep on screen: the functions open in the workspace restored
   // at launch, counted once per session. The layout is taken as restored,
   // before cloud sync can replace it; the first launch shows the default
@@ -215,9 +229,7 @@ export function useAppStartupRuntime({
     });
     void Promise.race([pluginsReady, waitForPlugins]).then(() => {
       recordRestoredFunctions(restoredUsageFunctions(config.layout, pluginRegistry, config.disabledPlugins));
-    }).catch(() => {
-      /* Counting is best effort and must not surface as a crash. */
-    });
+    }).catch(logFailure("app.runtime.startup", "Restored function usage recording failed"));
   }, [getState, isDetachedWindow, pluginRegistry, pluginsReady, state.initialized]);
 
   useEffect(() => {

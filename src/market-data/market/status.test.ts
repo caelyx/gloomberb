@@ -15,7 +15,9 @@ import {
   quoteMarketStateLabel,
   quoteSessionColor,
   quoteSessionLabel,
+  quoteSessionStateLabel,
 } from "./status";
+import { parseListingDelisting } from "../quotes/delisting";
 import { colors } from "../../theme/colors";
 
 describe("marketStateCountdown", () => {
@@ -226,6 +228,36 @@ describe("a quote older than its venue's latest completed session", () => {
     expect(quoteSessionLabel({ ...delisted, marketState: "POST" }, regular)).toBe("STALE");
   });
 
+  test("a listing Gloom Cloud says no longer trades reads as delisted, dated by its last session, wherever its status shows", () => {
+    // TWTR's last quote says REGULAR; NYSE removed it the day after its last session.
+    const twitter: Quote = { ...nyse("REGULAR", "2022-10-27T23:59:59Z"), symbol: "TWTR", stale: true,
+      delisting: { status: "delisted", lastTradeDate: "2022-10-27", historyStart: "2016-01-04" } };
+    expect(quoteSessionLabel(twitter, regular)).toBe("Delisted Oct 27, 2022");
+    expect(quoteMarketStateLabel(twitter, regular)).toBe("Delisted Oct 27, 2022");
+    expect(quoteSessionStateLabel(twitter, regular)).toBe("DELISTED");
+    expect(quoteSessionColor(twitter, colors, regular)).toBe(colors.warning);
+    expect(quoteDotMarketState(twitter, regular)).toBeUndefined();
+    // Only its last trade known (First Republic, a bank, files no exchange removal with SEC).
+    const firstRepublic = { ...twitter, symbol: "FRC", delisting: { status: "inactive" as const, lastTradeDate: "2023-04-28", historyStart: "2016-01-04" } };
+    expect(quoteSessionLabel(firstRepublic, regular)).toBe("Last traded Apr 28, 2023");
+    expect(quoteSessionStateLabel(firstRepublic, regular)).toBe("INACTIVE");
+    // Its last close, which moves no more, and no extended print, whatever an old quote carries.
+    const lateQuote = { ...twitter, change: 0.51, changePercent: 0.96, marketState: "POST" as const, postMarketPrice: 53.9,
+      postMarketChange: 0.04, postMarketChangePercent: 0.07 };
+    expect(getRegularSessionDisplay(lateQuote)).toEqual({ price: twitter.price });
+    expect(getExtendedSessionDisplay(lateQuote)).toBeNull();
+  });
+
+  test("a delisting the service sends malformed marks nothing", () => {
+    expect(parseListingDelisting({ status: "delisted", lastTradeDate: "2022-10-27", historyStart: "2016-01-04", removal: {} }))
+      .toEqual({ status: "delisted", lastTradeDate: "2022-10-27", historyStart: "2016-01-04" });
+    for (const value of [null, "delisted", { status: "halted", lastTradeDate: "2022-10-27", historyStart: "2016-01-04" },
+      { status: "delisted", lastTradeDate: "Oct 27, 2022", historyStart: "2016-01-04" },
+      { status: "delisted", lastTradeDate: "2022-10-27", historyStart: "2023-01-03" }]) {
+      expect(parseListingDelisting(value)).toBeUndefined();
+    }
+  });
+
   test("the last session's close or after-hours print keeps its state before the open and through the next session", () => {
     const close = nyse("PRE", "2026-10-14T20:00:00Z");
     expect(quoteSessionLabel(close, preMarket)).toBe("PRE-MKT");
@@ -233,6 +265,22 @@ describe("a quote older than its venue's latest completed session", () => {
     // No trade yet in Thursday's session: Wednesday's close is the latest completed one.
     expect(quoteSessionLabel({ ...close, marketState: "REGULAR" }, regular)).toBe("OPEN");
     expect(quoteDotMarketState({ ...close, marketState: "REGULAR" }, regular)).toBe("REGULAR");
+  });
+
+  test("a futures contract reads closed over the weekend, not the OPEN its last Friday tick stamped", () => {
+    // CL=F as the Futures board holds it: the last tick Friday at the 21:00 UTC close, still reading REGULAR.
+    const crude: Quote = { ...nyse("REGULAR", "2026-10-23T21:00:00Z"), symbol: "CL=F", listingExchangeName: "NY MERCANTILE", stale: true };
+    const sunday = Date.parse("2026-10-25T05:35:00Z");
+    expect(quoteSessionLabel(crude, sunday)).toBe("CLOSED");
+    expect(quoteMarketStateLabel(crude, sunday)).toBe("CLOSED");
+    expect(quoteSessionStateLabel(crude, sunday)).toBe("CLOSED");
+    expect(quoteSessionColor(crude, colors, sunday)).toBe(colors.textDim);
+    expect(quoteDotMarketState(crude, sunday)).toBe("CLOSED");
+    // After the Sunday 22:00 UTC open the source's state stands again, and so does a quote that never said.
+    const reopened = Date.parse("2026-10-25T22:05:00Z");
+    expect(quoteSessionLabel(crude, reopened)).toBe("OPEN");
+    expect(quoteDotMarketState(crude, reopened)).toBe("REGULAR");
+    expect(quoteSessionLabel({ ...crude, marketState: undefined }, sunday)).toBeNull();
   });
 
   test("an FX pair or a coin keeps its state: neither has a session to fall behind", () => {

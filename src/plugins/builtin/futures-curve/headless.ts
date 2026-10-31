@@ -2,9 +2,11 @@ import type { FuturesContract, FuturesCurvePayload } from "../../../api-client/f
 import { futuresSpecLines } from "../../../market-data/futures-contract";
 import type { HeadlessPaneColumn, HeadlessPaneDefinition, HeadlessPaneEntry, HeadlessPaneFreshness } from "../../../types/plugin";
 import { formatPercentRaw } from "../../../utils/format";
+import { DATE_OPTION_EXAMPLES } from "../../../utils/calendar-date";
 import { newestReportTime, oldestReportTime } from "../../../utils/utc-time";
-import { fetchFuturesCurve, loadCurveSpot, loadFuturesCurveAsOf } from "./client";
-import { basisSpotSymbol, BASIS_CONVENTION, blankBasisNote, catalogueCurveUnit, curveAsOfDate, curveBasisPercent, curveBasisRows, curveChangeText, curveContractCode, curvePrice, curveRoundedPrice, curveSpotLabel, curveSpotSource, curveSpreadLabel, curveTimestamp, curveUnitLabel, normalizeCurveRoot, shortDatedBasisNote, thinContractCount, unsupportedCurveRootMessage, type ContractBasis } from "./model";
+import { fetchFuturesCurve, loadCurveSpot, loadCurveSpotBars, loadFuturesCurveAsOf } from "./client";
+import { basisSpotSymbol, BASIS_CONVENTION, blankBasisNote, catalogueCurveUnit, curveAsOfDate, curveBasisPercent, curveBasisRows, curveChangeText, curveContractCode, curvePrice, curveRoundedPrice, curveSpotSource, curveSpreadLabel, curveTimestamp, curveNoTradeSince, curveUnitLabel, noTradeChangeNote, normalizeCurveRoot, shortDatedBasisNote, thinSpreadNotice, unpairedContractCount, unsupportedCurveRootMessage, type ContractBasis } from "./model";
+import { COMMODITIES_VIEW_STATE } from "../commodities-energy/view-state";
 
 /** The root a report shows when none is given. */
 const DEFAULT_ROOT = "ES";
@@ -20,6 +22,11 @@ const basisValue = (value: number | null) => value == null ? null : Number(value
  * every root. Prices and changes are at the root's tick precision. `price` is
  * the latest trade and `settlement` the exchange settlement for the curve's
  * settlement session (a past curve's settled rows have no separate trade).
+ * `change` is `price` less `settlement`; `noTradeSince` dates the settlement
+ * a contract has not traded since, whose change is therefore blank. A crypto
+ * root adds the basis: the spot in the minute of `price`'s trade and that
+ * minute (`spot`, `spotTime`), the fractional days from the trade to final
+ * settlement, and the premium and its yearly rate.
  */
 function contractRow(row: FuturesContract, data: FuturesCurvePayload, root: string, past: boolean, basis?: ContractBasis) {
   const price = (value: number | null | undefined) => curveRoundedPrice(value, root);
@@ -28,15 +35,21 @@ function contractRow(row: FuturesContract, data: FuturesCurvePayload, root: stri
     firstNotice: row.firstNotice ?? null, inDelivery: row.inDelivery ?? false,
     settlement: price(row.settlement), settlementDate: row.settlement != null ? data.settlementDate ?? null : null,
     price: past && row.settlement != null ? null : price(row.price), change: price(row.change),
+    noTradeSince: past ? null : curveNoTradeSince(row, data),
     asOf: row.asOf, stale: row.stale, volume: row.volume, openInterest: row.openInterest, percentile: rank(row.percentile),
     samples: row.samples, historyStart: row.historyStart, historyEnd: row.historyEnd,
     currency: row.currency, quoteUnit: curveUnitLabel(data) ?? row.quoteUnit, delayMinutes: row.delayMinutes,
-    ...(basis ? { vsSpotPct: basisValue(basis.vsSpotPct), annualisedBasisPct: basisValue(basis.annualisedBasisPct) } : {}),
+    ...(basis ? { spot: price(basis.spot), spotTime: basis.spotTime, daysToExpiry: basisValue(basis.daysToExpiry),
+      vsSpotPct: basisValue(basis.vsSpotPct), annualisedBasisPct: basisValue(basis.annualisedBasisPct) } : {}),
   };
 }
 
-/** The text table: what a hedge reads, in one order for every root; JSON keeps every field. */
-function contractColumns(root: string, settlementDate: string | null, options: { basis: boolean; last: boolean; notice: boolean }): HeadlessPaneColumn[] {
+/**
+ * The table: what a hedge reads, in one order for every root; JSON keeps every
+ * field. A crypto root's spot is the one each trade is read against; the
+ * export dates it, where the text leaves its minute to As Of UTC, the trade's.
+ */
+function contractColumns(root: string, settlementDate: string | null, options: { basis: boolean; last: boolean; notice: boolean; text?: boolean }): HeadlessPaneColumn[] {
   const price = (value: unknown) => typeof value === "number" ? curvePrice(value, root) : "--";
   const date = (value: unknown) => typeof value === "string" ? value : "--";
   return [
@@ -49,7 +62,10 @@ function contractColumns(root: string, settlementDate: string | null, options: {
     // A Cboe price is the settlement itself, with no separate last trade.
     ...options.last ? [{ key: "price", header: "Last", align: "right" as const, format: price }] : [],
     { key: "change", header: "Change", align: "right", format: (value) => typeof value === "number" ? curveChangeText(value, root) : "--" },
-    ...options.basis ? [{ key: "vsSpotPct", header: "Vs Spot", align: "right" as const, format: (value: unknown) => curveBasisPercent(typeof value === "number" ? value : null, 2) },
+    ...options.basis ? [{ key: "spot", header: "Spot", align: "right" as const, format: price },
+      ...options.text ? [] : [{ key: "spotTime", header: "Spot Time UTC", shrink: false, format: (value: unknown) => typeof value === "string" ? curveTimestamp(value) : "--" }],
+      { key: "vsSpotPct", header: "Vs Spot", align: "right" as const, format: (value: unknown) => curveBasisPercent(typeof value === "number" ? value : null, 2) },
+      { key: "daysToExpiry", header: "Days to Expiry", textHeader: "Days", align: "right" as const, format: (value: unknown) => typeof value === "number" ? value.toFixed(1) : "--" },
       { key: "annualisedBasisPct", header: "Ann Basis", align: "right" as const, format: (value: unknown) => curveBasisPercent(typeof value === "number" ? value : null, 1) }] : [],
     { key: "asOf", header: "As Of UTC", shrink: false, format: (value) => typeof value === "string" ? curveTimestamp(value) : "--" },
     { key: "openInterest", header: "Open Int", align: "right", format: (value) => typeof value === "number" ? value.toLocaleString("en-US") : "--" },
@@ -68,8 +84,9 @@ function fieldColumns(order: readonly string[], fields: object, formats: Record<
     .map((key) => ({ key, header: key, ...formats[key] ? { textFormat: formats[key] } : {} }));
 }
 
+// `basis` says which prices the value subtracts: two last trades made together, or the settlements of the session in `asOf`.
 const FRONT_SPREAD_FIELDS = ["label", "frontSymbol", "nextSymbol", "value", "annualizedRollYield", "percentile", "rollPercentile",
-  "samples", "historyStart", "historyEnd", "asOf", "state"];
+  "samples", "historyStart", "historyEnd", "asOf", "basis", "state", "thinSymbol"];
 const GHOST_FIELDS = ["symbol", "expiration", "price", "asOf"];
 /** The annualized roll yield reads as the percent it is (+32.36%); an export keeps the number. */
 const ROLL_YIELD_FORMAT = { annualizedRollYield: (value: unknown) => typeof value === "number" ? formatPercentRaw(value) : "--" };
@@ -91,36 +108,43 @@ function specEntries(data: FuturesCurvePayload): HeadlessPaneEntry[] {
 export const futuresCurveHeadless: HeadlessPaneDefinition<"bundle"> = {
   discovery: { aliases: ["CTM"], dataRequirements: ["Gloom Cloud futures curve endpoint"],
     limitations: ["Listed-contract catalogues can be incomplete.", "Ghosts and percentiles use the same listed contracts.", "Cboe VIX is daily settlement.",
-    "Ann Basis is simple actual/365 on the latest trade against the spot quote, and noisy under 30 days to expiry."],
+    "Ann Basis is simple actual/365, each last trade against spot in the same minute, and noisy under 7 days to expiry."],
     intents: ["futures basis trade", "cash and carry", "basis against spot"] },
   shape: "bundle", argument: { kind: "free-text", optional: true, placeholder: "root", description: "FUT root such as CL, ES, ZN or VX, or a CME crypto root (BTC, ETH, SOL, XRP). Defaults to ES." },
   // Only the pane reads the tab; the report always carries both.
   options: [{ key: "tab", description: "Curve or the full contract table.", type: "enum",
     values: [{ value: "curve" }, { value: "contracts", aliases: ["contract", "table"] }], defaultValue: "curve",
-    pluginState: { pluginId: "market-overview", key: "tab" } },
-  { key: "date", type: "string", settingKey: "asOfDate", description: "Past date (YYYY-MM-DD): the curve as the daily settlement archive held it, with the curves a week and a month before." }],
+    pluginState: { pluginId: COMMODITIES_VIEW_STATE.curve, key: "tab" } },
+  { key: "date", type: "string", settingKey: "asOfDate", placeholder: "date", description: `Past date, as ${DATE_OPTION_EXAMPLES}: the curve as the daily settlement archive held it, with the curves a week and a month before.` }],
   describe: (args) => `Futures curve ${args.argument || DEFAULT_ROOT}`,
   async load(args, ctx) {
     const input = args.argument || DEFAULT_ROOT;
     const root = normalizeCurveRoot(input);
     if (!root) throw new Error(unsupportedCurveRootMessage(input));
-    const date = curveAsOfDate(args.options.date);
+    const date = curveAsOfDate(args.options.date, new Date(), "--date");
     // The archive keeps no spot history, so a past curve has no basis.
     const spotSymbol = date ? null : basisSpotSymbol(root);
     const now = Date.now();
-    const [data, spot] = await Promise.all([
+    // The quote names the spot and its feed; the one-minute bars price each trade's own minute.
+    const [data, spot, bars] = await Promise.all([
       date ? loadFuturesCurveAsOf(root, date, ctx.apiClient) : fetchFuturesCurve(root, ctx.apiClient),
       spotSymbol ? loadCurveSpot(spotSymbol, ctx.marketData, now) : null,
+      spotSymbol ? loadCurveSpotBars(spotSymbol, ctx.marketData, ctx.refresh === true) : null,
     ]);
-    const bases = spot ? curveBasisRows(data.contracts, spot) : null;
+    const bases = spot && bars ? curveBasisRows(data.contracts, bars) : null;
     const unit = curveUnitLabel(data);
     const terms = specEntries(data);
     const source = spot ? curveSpotSource(spot) : null;
     const notices = [...args.argument ? [] : [`Showing ${DEFAULT_ROOT}. Try fn CTM ${EXAMPLE_ROOT}.`],
-      ...spot ? [spot.status === "ok" ? `Basis against ${curveSpotLabel(spot, root, now)}${source ? ` (${source})` : ""}; not the CME reference rate.` : `Basis blank: ${spot.reason}.`] : []];
+      ...spot ? [`Basis against ${spot.symbol} spot in each last trade's own minute${source ? ` (${source})` : ""}; not the CME reference rate.`] : []];
     // The footnotes under the table: the convention, why a cell is blank, and where a short-dated rate is not to be trusted.
-    // Against a spot that is not usable every cell is blank for the spot's reason, which the notice above already gives.
-    const notes = spot && bases ? [BASIS_CONVENTION, ...spot.status === "ok" ? [blankBasisNote(data.contracts, bases), shortDatedBasisNote(data.contracts, bases, spot)].filter((note): note is string => !!note) : []] : [];
+    const basisNotes = bases ? [BASIS_CONVENTION, blankBasisNote(data.contracts, bases), shortDatedBasisNote(data.contracts, bases)]
+      .filter((note): note is string => !!note) : [];
+    // A blank Change says why, as a blank basis does; a past curve has no session change to blank.
+    const changeNote = date ? null : noTradeChangeNote(data.contracts, data);
+    const thinSpread = thinSpreadNotice(data);
+    const notes = [...thinSpread ? [`${thinSpread}.`] : [], ...changeNote ? [changeNote] : [], ...basisNotes];
+    const columnOptions = { basis: !!bases, last: data.source !== "cboe", notice: data.contracts.some((row) => row.firstNotice) };
     // Dated by the contracts' own quotes; the same-contract history rows are a year of context, not observations.
     const quoted = data.contracts.map((row) => row.asOf);
     const freshness: HeadlessPaneFreshness = date
@@ -130,8 +154,8 @@ export const futuresCurveHeadless: HeadlessPaneDefinition<"bundle"> = {
     return {
       freshness,
       sections: [
-        { title: "Contracts", columns: contractColumns(root, data.settlementDate ?? null,
-          { basis: !!spot, last: data.source !== "cboe", notice: data.contracts.some((row) => row.firstNotice) }),
+        { title: "Contracts", columns: contractColumns(root, data.settlementDate ?? null, columnOptions),
+          ...bases ? { textColumns: contractColumns(root, data.settlementDate ?? null, { ...columnOptions, text: true }) } : {},
           rows: data.contracts.map((row) => contractRow(row, data, root, !!date, bases?.get(row.symbol))) },
         { title: "Front spread", columns: fieldColumns(FRONT_SPREAD_FIELDS, data.slope, ROLL_YIELD_FORMAT), rows: [{ label: curveSpreadLabel(data.slope), ...data.slope, value: curveRoundedPrice(data.slope.value, root),
           annualizedRollYield: data.slope.annualizedRollYield == null ? null : Number(data.slope.annualizedRollYield.toFixed(2)),
@@ -142,7 +166,7 @@ export const futuresCurveHeadless: HeadlessPaneDefinition<"bundle"> = {
       ],
       errors: data.gaps,
       ...(notes.length ? { notes } : {}),
-      metadata: { ...data, quoteUnit: unit, ...(spot && bases ? { spot, basisBlankedThin: thinContractCount(bases.values()) } : {}), ...(args.argument ? {} : { defaultArgument: DEFAULT_ROOT }),
+      metadata: { ...data, quoteUnit: unit, ...(spot && bases ? { spot, basisBlankedUnpaired: unpairedContractCount(bases.values()) } : {}), ...(args.argument ? {} : { defaultArgument: DEFAULT_ROOT }),
         ...(notices.length ? { notices } : {}),
         complete: data.status === "available", percentileBasis: "Same-contract observations within one year; actual sample start/end retained" },
     };

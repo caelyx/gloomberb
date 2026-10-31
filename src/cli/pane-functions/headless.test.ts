@@ -62,7 +62,23 @@ describe("headless pane printer", () => {
     });
   });
 
-  test("--width wraps the notes, errors and source line under a table, and a column marked whole is never cut", () => {
+  test("a series counts its observations as points, not the gaps kept to break its line", async () => {
+    // GE AAPL's quarterly P/E as it was served with gaps across fiscal year ends.
+    const definition: HeadlessPaneDefinition<"series"> = {
+      shape: "series", argument: { kind: "none" }, options: [],
+      load: () => ({ series: [{ id: "pe", label: "AAPL P/E", points: [
+        { date: "2024-11-01", value: null }, { date: "2025-08-01", value: null },
+        { date: "2025-10-31", value: 36.2 }, { date: "2026-07-31", value: 35.4 },
+      ] }] }),
+    };
+    const report = await buildHeadlessFunctionReport({
+      headless: definition, token: "GE", label: "Valuation Graph", options: {}, instance: {}, capability: { id: "valuation-series" },
+    } as ResolvedPaneFunction, { config: createDefaultConfig("/tmp/gloomberb-headless-points") } as MarketContext, "");
+    expect(report.data).toMatchObject({ rowCount: 2, empty: false });
+    expect(report.text.split("\n").find((line) => line.startsWith("AAPL P/E"))?.trimEnd()).toMatch(/ 2$/);
+  });
+
+  test("--width wraps the notes, errors and source line under a table, and never cuts a cell", () => {
     const definition: HeadlessPaneDefinition<"rows"> = {
       shape: "rows", argument: { kind: "none" }, options: [],
       freshness: { source: "SEC EDGAR", status: "not-a-feed", basis: "filed data" },
@@ -78,7 +94,9 @@ describe("headless pane printer", () => {
     try {
       const lines = renderHeadlessPaneText(definition, result, args, "Board").split("\n");
       expect(lines.every((line) => line.length <= 40)).toBe(true);
-      expect(lines.find((line) => line.startsWith("A long"))).toMatch(/…\s+2026-10-09 20:15 UTC$/);
+      // The name wraps in its cell rather than lose its end; the time beside it stays whole.
+      expect(lines.find((line) => line.startsWith("A long"))).toMatch(/^A long index name\s+2026-10-09 20:15 UTC$/);
+      expect(lines.join("\n")).not.toContain("…");
       expect(lines.filter((line) => line.startsWith("Notes:") || line.includes("terminal is only"))).toHaveLength(2);
     } finally {
       setCliWidthOverride(null);
@@ -233,8 +251,8 @@ test("every report shape ends with its source, as-of and status line, and JSON c
     [{ shape: "rows", argument: { kind: "none" }, options: [], load: () => ({ rows: [{ name: "AAPL", dataSource: "delayed", updatedAt: Date.parse("2026-10-08T19:59:00Z") }] }) }, "delayed"],
     [{ shape: "bundle", argument: { kind: "none" }, options: [], freshness: { source: "SEC EDGAR", status: "not-a-feed", basis: "filed data" },
       load: () => ({ sections: [{ title: "Filings", rows: [{ form: "10-K", asOf: "2026-09-30" }] }] }) }, "not a live feed (filed data)"],
-    [{ shape: "series", argument: { kind: "none" }, options: [], load: () => ({ series: [{ id: "x", label: "X", points: [{ date: "2026-10-08", value: 1 }] }] }) }, "status not reported"],
-    [{ shape: "snapshot", argument: { kind: "none" }, options: [], load: () => ({ asOf: "2026-10-08T19:59:00Z", items: [{ headline: "Open" }] }) }, "status not reported"],
+    [{ shape: "series", argument: { kind: "none" }, options: [], load: () => ({ series: [{ id: "x", label: "X", points: [{ date: "2026-10-08", value: 1 }] }] }) }, ""],
+    [{ shape: "snapshot", argument: { kind: "none" }, options: [], load: () => ({ asOf: "2026-10-08T19:59:00Z", items: [{ headline: "Open" }] }) }, ""],
   ];
   for (const [definition, status] of results) {
     const report = await buildHeadlessFunctionReport({
@@ -243,7 +261,8 @@ test("every report shape ends with its source, as-of and status line, and JSON c
     const last = report.text.split("\n").at(-1)!.replace(/\x1b\[[0-9;]*m/g, "");
     expect(last).toStartWith(`Source: ${definition.freshness?.source ?? "Gloom Cloud"} · `);
     expect(last).toMatch(/ · (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{1,2} [A-Z][a-z]{2}\b/);
-    expect(last).toEndWith(` · ${status}`);
+    if (status) expect(last).toEndWith(` · ${status}`);
+    else expect(last).toMatch(/2026(?: 19:59 UTC)?$/);
     expect(report.data.freshness).toMatchObject({ source: definition.freshness?.source ?? "Gloom Cloud", asOf: expect.stringMatching(/^2026-/), retrievedAt: expect.any(String) });
   }
 });
@@ -265,7 +284,7 @@ describe("headless pane arguments and options", () => {
       symbols: ["AAPL", "MSFT"],
     });
     expect(() => buildHeadlessPaneLoadArgs(definition, "CMP", "AAPL", {}))
-      .toThrow("CMP requires at least 2 symbols");
+      .toThrow("CMP needs two or more tickers: fn CMP AAPL,SPY");
   });
 
   test("derives ready catalog capability and validates enum values", () => {
@@ -381,7 +400,11 @@ test("a report with nothing in it says once whether the free view left it empty 
 
   expect(text({ sections }, "KPIS")).toContain("Company KPIs | DUOL\n\nNo data for DUOL: not covered by KPIS.\n");
   expect(text({ sections }, "KPIS")).not.toContain("Latest");
-  expect(text({ sections, errors: ["Free shows 3 of 6 rows. Gloom Pro adds the other 3."] })).toContain("\nLocked: Gloom Pro\n");
+  // The free view left it empty: its one Pro line is the report.
+  const locked = text({ sections, errors: ["Free shows 3 of 6 rows. Gloom Pro adds the other 3."] });
+  expect(locked).toContain("Company KPIs | DUOL\n\nPro: Free shows 3 of 6 rows. Gloom Pro adds the other 3 · gloom.sh/cloud\n");
+  expect(locked.match(/Pro:/g)).toHaveLength(1);
+  expect(locked).not.toContain("Locked");
   // The pane's own reason, and a failure that explains the gap, stay as they were.
   expect(text({ sections: [{ title: "Latest", rows: [], empty: "No KPI named arr." }] })).toContain("Latest\nNo KPI named arr.");
   expect(text({ sections, errors: ["The source did not answer."] })).toContain("Latest\nNo data.");
@@ -390,6 +413,30 @@ test("a report with nothing in it says once whether the free view left it empty 
     .toContain("No data for DUOL with these options.");
   // A board that was asked for no symbol claims nothing about coverage.
   expect(renderHeadlessPaneText(bundle, { sections }, { ...asked, symbols: [] }, "Board")).toContain("Latest\nNo data.");
+  // One reason the bundle gives for all its tables is said once in their place.
+  expect(text({ sections, empty: "DUOL has no mapped apps." })).toContain("Company KPIs | DUOL\n\nDUOL has no mapped apps.\n");
+});
+
+test("a report's locks fold into one Pro line, and tables the free view held back are named there, not under their headings", () => {
+  const bundle: HeadlessPaneDefinition<"bundle"> = { shape: "bundle", argument: { kind: "free-text", optional: true }, options: [], load: () => ({ sections: [] }) };
+  const asked = { symbols: [], options: {}, argument: "BTC", rawArgument: "BTC" };
+  const latest = { title: "Latest market", rows: [{ value: 1 }] };
+  const held = [{ title: "Paid funding", rows: [], locked: true }, { title: "Hourly candles", rows: [], locked: true }];
+  const render = (result: HeadlessBundleResult) => renderHeadlessPaneText(bundle, result, asked, "Perpetuals | BTC");
+
+  // Several Pro lines read as one, ending where to get Pro; locked tables leave no heading or "No data." behind.
+  const folded = render({ sections: [latest, ...held], errors: ["Free shows the latest funding. Gloom Pro adds its history.", "Rankings require Gloom Pro."] });
+  expect(folded.match(/Pro:/g)).toHaveLength(1);
+  expect(folded).toContain("Pro: Free shows the latest funding. Gloom Pro adds its history. Rankings require Gloom Pro · gloom.sh/cloud");
+  expect(folded).not.toContain("Paid funding");
+  expect(folded).not.toContain("No data.");
+  expect(folded).not.toContain("Locked");
+  // Without a Pro line of its own, the line names the tables it held back.
+  expect(render({ sections: [latest, ...held] })).toContain("Pro: Paid funding and Hourly candles need Gloom Pro · gloom.sh/cloud");
+  // A locked table that has rows (Pro sees them) prints as any other, and nothing is gated.
+  const open = render({ sections: [latest, { ...held[0]!, rows: [{ value: 2 }] }] });
+  expect(open).toContain("Paid funding");
+  expect(open).not.toContain("Pro:");
 });
 
 test("a report's caveats print as Notes, what Pro unlocks under Pro, the failures under Errors, and JSON carries all three", async () => {
@@ -409,8 +456,8 @@ test("a report's caveats print as Notes, what Pro unlocks under Pro, the failure
   expect(lines).toContain("  ETH-USD is excluded from the risk estimate.");
   expect(lines).toContain("  1 holding had no current quote; weighted at the latest completed close.");
   expect(lines).toContain("Errors: Treasury yield: Internal server error");
-  expect(lines).toContain("Pro: Full history requires Gloom Pro");
-  expect(report.tables.footer).toEqual(expect.arrayContaining(["pro: Full history requires Gloom Pro", "error: Treasury yield: Internal server error"]));
+  expect(lines).toContain("Pro: Full history requires Gloom Pro · gloom.sh/cloud");
+  expect(report.tables.footer).toEqual(expect.arrayContaining(["pro: Full history requires Gloom Pro · gloom.sh/cloud", "error: Treasury yield: Internal server error"]));
   expect(report.data).toMatchObject({
     complete: false, errors: ["Treasury yield: Internal server error", "Full history requires Gloom Pro"],
     notes: ["ETH-USD is excluded from the risk estimate.", "1 holding had no current quote; weighted at the latest completed close."],
@@ -456,6 +503,65 @@ test("series text distinguishes explicit percent, basis-point, multiple and inde
   expect(renderHeadlessPaneText(definition, { series: [result.series.find(({ id }) => id === "missing")!] }, args, "Unknown")).not.toContain("Unit");
 });
 
+test("a rows report of several symbols names each row's symbol and unit only where it says which fields do", () => {
+  const columns = [
+    { key: "symbol", header: "Symbol" },
+    { key: "price", header: "Last", unitKey: "currency", textFormat: (value: unknown) => `${value}` },
+  ];
+  const rows = [{ symbol: "NESN:SWX", currency: "CHF", price: 83.24 }, { symbol: "AAPL", currency: "USD", price: 348.27 }];
+  const twoSymbols: HeadlessPaneLoadArgs = { rawArgument: "NESN:SWX AAPL", argument: "NESN:SWX AAPL", symbols: ["NESN:SWX", "AAPL"], options: {} };
+  const csvOf = (result: HeadlessRowsResult) => {
+    const definition: HeadlessPaneDefinition<"rows"> = { shape: "rows", argument: { kind: "none" }, options: [], load: () => result };
+    const freshness = deriveHeadlessFreshness(definition, result);
+    return renderReportCsv(headlessReportTables(definition, result, twoSymbols, "Peers", freshness, { complete: true, unavailableSymbols: [] }), freshness).split("\n");
+  };
+  // Reports that name their row fields (fn RV) write each row's own ticker and currency, the price bare under its header.
+  const named = csvOf({ symbols: ["NESN:SWX", "AAPL"], columns, rows, rowSymbolKey: "symbol", rowUnitKey: "currency" });
+  expect(named.slice(0, 3)).toEqual([
+    "Symbol,Last,status,symbol_or_series,currency_or_unit,interval,source,as_of",
+    "NESN:SWX,83.24,,NESN:SWX,CHF,,Gloom Cloud,",
+    "AAPL,348.27,,AAPL,USD,,Gloom Cloud,",
+  ]);
+  // One that does not keeps the rows as it wrote them: a field called `currency` is not claimed to be the unit of every figure.
+  const unnamed = csvOf({ symbols: ["NESN:SWX", "AAPL"], columns: [columns[0]!, { key: "price", header: "Last" }], rows });
+  expect(unnamed.slice(0, 3)).toEqual([
+    "Symbol,Last,symbol_or_series,currency_or_unit,interval,source,as_of",
+    "NESN:SWX,83.24,,,,Gloom Cloud,",
+    "AAPL,348.27,,,,Gloom Cloud,",
+  ]);
+});
+
+test("a series that asks for decimals prints them in text, while JSON and CSV keep every digit", () => {
+  const definition: HeadlessPaneDefinition<"series"> = { shape: "series", argument: { kind: "none" }, options: [], load: () => ({ series: [] }) };
+  const result: HeadlessSeriesResult = { series: [
+    { id: "correlation", label: "Rolling correlation (120)", textDecimals: 3, points: [{ date: "2026-10-21", value: 0.418953387895 }] },
+  ] };
+  expect(renderHeadlessPaneText(definition, result, args, "Relationship").split("\n").find((line) => line.includes("Rolling correlation"))).toMatch(/0\.419\s+1$/);
+  expect(jsonData(definition, result)).toMatchObject({ data: { series: [{ id: "correlation", points: [{ value: 0.418953387895 }] }] } });
+  expect(JSON.stringify(jsonData(definition, result))).not.toContain("textDecimals");
+  const freshness = deriveHeadlessFreshness(definition, result);
+  expect(renderReportCsv(headlessReportTables(definition, result, args, "Relationship", freshness, { complete: true, unavailableSymbols: [] }), freshness)).toContain("2026-10-21,0.418953387895,");
+});
+
+test("a series observed by the day is dated without a time in text and CSV, one read at a time of day keeps it, and ratios and scores print rounded", () => {
+  const definition: HeadlessPaneDefinition<"series"> = { shape: "series", argument: { kind: "none" }, options: [], load: () => ({ series: [] }) };
+  const result: HeadlessSeriesResult = { series: [
+    { id: "ratio", label: "VIX 3M / VIX ratio", unit: "ratio", interval: "daily", points: [
+      { date: Date.parse("2026-10-15T00:00:00Z"), value: 1.12332928311 }, { date: Date.parse("2026-10-16T00:00:00Z"), value: 1.02551275638 }] },
+    { id: "score", label: "Fear & Greed index", unit: "score", interval: "daily", points: [
+      { date: Date.parse("2026-10-15T00:00:00Z"), value: 31.5428571428 }, { date: Date.parse("2026-10-16T23:59:49Z"), value: 17.9383219955 }] },
+  ] };
+  const lines = renderHeadlessPaneText(definition, result, args, "Custom Chart").split("\n");
+  expect(lines.find((line) => line.startsWith("VIX 3M / VIX ratio"))).toMatch(/ 2026-10-16 +1\.03 +ratio /);
+  expect(lines.find((line) => line.startsWith("Fear & Greed index"))).toMatch(/ 2026-10-16 23:59 UTC +17\.9 +score /);
+  // The export keeps every digit, dated as the text is.
+  const freshness = deriveHeadlessFreshness(definition, result);
+  const csv = renderReportCsv(headlessReportTables(definition, result, args, "Custom Chart", freshness, { complete: true, unavailableSymbols: [] }), freshness);
+  expect(csv).toContain("\n2026-10-15,1.12332928311,");
+  expect(csv).toContain("\n2026-10-16,1.02551275638,");
+  expect(csv).toContain("\n2026-10-16T23:59:49Z,17.9383219955,");
+});
+
 async function reportOf(definition: HeadlessPaneDefinition, rawArgument = "") {
   return buildHeadlessFunctionReport({
     headless: definition, token: "TEST", label: "Test report", options: {}, instance: {}, capability: { id: "test" },
@@ -493,12 +599,12 @@ describe("fn --csv", () => {
     });
     expect(csvOf(report)).toEqual([
       "# section: Americas",
-      "Index,Last",
-      "SPX,7812.71",
+      "Index,Last,status",
+      "SPX,7812.71,",
       "",
       "# section: Asia-Pacific",
-      "Index,Last",
-      "KOSPI,",
+      "Index,Last,status",
+      "KOSPI,,",
       "",
       "# section: Summary",
       "Metric,Value",
@@ -521,7 +627,7 @@ describe("fn --csv", () => {
     ]);
     // --section writes that one table alone, with the closing lines.
     expect(csvOf(report, "summary").slice(0, 4)).toEqual(["Metric,Value", "Breadth (%),61.5", "Leaders,SPX; DAX", ""]);
-    expect(csvOf(report, "2").slice(0, 2)).toEqual(["Index,Last", "KOSPI,"]);
+    expect(csvOf(report, "2").slice(0, 2)).toEqual(["Index,Last,status", "KOSPI,,"]);
     expect(() => csvOf(report, "Europe")).toThrow("No section \"Europe\". Sections: Americas, Asia-Pacific, Summary, Rates, or a number from 1 to 4.");
   });
 
@@ -544,9 +650,9 @@ describe("fn --csv", () => {
       }),
     }, "HP SBK.JO XYZ");
     expect(csvOf(report)).toEqual([
-      "Symbol,Date,Volume",
-      "HP,2026-10-01,37614444",
-      "SBK.JO,2026-10-01,1838873",
+      "Symbol,Date,Volume,status",
+      "HP,2026-10-01,37614444,",
+      "SBK.JO,2026-10-01,1838873,",
       "",
       "# Source: SEC EDGAR · Thu 1 Oct 2026 00:00 UTC · not a live feed (filed data)",
       "# Publisher: U.S. Securities and Exchange Commission",

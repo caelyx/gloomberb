@@ -8,7 +8,7 @@ The `RBA` pane reads the Reserve Bank of Australia's statistical tables directly
 - **AUD:** the Australian dollar against USD, EUR, JPY, CNY, GBP and NZD, and the trade-weighted index, with percentage changes.
 - **Board:** the cash rate target, its last change, the next Monetary Policy Board decision (2:30 pm Sydney time on the second day of each meeting), and every 2026–2027 meeting with the decision taken.
 
-On the Rates and AUD tabs the chart above the table follows the selected row: the series over 1Y, 5Y or all of the table (F1 from 2011, F2 from 2013, F11.1 from 2023), chosen in the bar above it or from the pane menu (`.`). The cash rate target is drawn as steps, since it moves only on decision days.
+On the Rates and AUD tabs the chart above the table follows the selected row: the series over 1Y, 5Y or all of the table (F1 from 2011, F2 from 2013, F11.1 from 2023), chosen in the bar above it or from the pane menu (`.`). The cash rate target is drawn as steps, since it moves only on decision days. The Board tab charts the cash rate target over the same range, above the meetings.
 
 `o` opens the matching RBA page. `gloomberb fn RBA` prints all three.
 

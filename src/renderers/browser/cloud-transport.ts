@@ -2,6 +2,7 @@ import { apiClient, setCloudApiFetchTransport, setCloudApiUploadTransport } from
 import { ApiRequestError } from "../../api-client/errors";
 import type { CloudApiUploadRequest } from "../../api-client/request";
 import { settleWithin } from "../../utils/async-deadline";
+import { DataServiceUnreachableError } from "../../utils/network-failure";
 import { setHttpFetchTransport } from "../../utils/http-transport";
 import { createBrowserHttpProxyTransport } from "./http-proxy-transport";
 import { SESSION_COOKIE_NAMES } from "../../api-client/session-cookie";
@@ -117,6 +118,8 @@ const FETCH_FAILURE = /failed to fetch|networkerror|load failed|fetch failed/i;
  */
 function isExpectedSessionFailure(error: unknown): boolean {
   if (error instanceof ApiRequestError || error instanceof SyntaxError) return true;
+  // The API client names a fetch that never connected this way (it wraps the TypeError below).
+  if (error instanceof DataServiceUnreachableError) return true;
   if (!(error instanceof Error)) return false;
   if (error.name === "AbortError" || error.name === "TimeoutError") return true;
   return error instanceof TypeError && FETCH_FAILURE.test(error.message);

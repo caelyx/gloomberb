@@ -1,13 +1,12 @@
 import { useCallback, useMemo } from "react";
 import {
+  chartTableChromeRows,
   ChartTableHeader,
   DataTableView,
   formatPercentAxis,
   PaneStatusBody,
   QueryBar,
   spanAxisFormatter,
-  StatGrid,
-  statGridRows,
   usePaneNoticeFooter,
   usePaneStatusLinkFooter,
   usePaneTabs,
@@ -128,6 +127,12 @@ export function RbaPane({ focused, width, height }: PaneProps) {
   const selected = rows.find((row) => row.id === selectedId) ?? rows[0] ?? null;
   const chart = useMemo(() => (selected && data ? rateChart(selected, seriesPoints(data.tables, selected.id), range) : null), [data, range, selected]);
   const board = useMemo(() => (data ? boardView(data.tables, sydneyToday()) : null), [data]);
+  // The Board tab charts the cash rate target over the same range as the other tabs.
+  const boardChart = useMemo(() => {
+    if (!data || tab !== "board") return null;
+    const target = rateRows(data.tables, ["Policy"]).find((row) => row.id === "FIRMMCRTD");
+    return target ? rateChart(target, seriesPoints(data.tables, target.id), range) : null;
+  }, [data, range, tab]);
 
   const handleKey = useCallback((event: DataTableKeyEvent): boolean => {
     if (!isPlainKey(event, "r")) return false;
@@ -167,7 +172,9 @@ export function RbaPane({ focused, width, height }: PaneProps) {
       ? <PaneStatusBody loading align="center" loadingLabel="Loading RBA statistics..." />
       : <PaneStatusBody error={error} errorTitle="RBA statistics unavailable." />;
   } else if (tab === "board" && board) {
+    // Priority order: a short pane drops figures from the end, and the chart already reads the target.
     const stats: StatItem[] = [
+      { id: "next", label: "Next decision", value: formatDay(board.next), detail: board.daysToNext == null ? undefined : `in ${board.daysToNext} days, 2:30 pm Sydney` },
       { id: "target", label: "Cash rate target", value: formatRate(board.target), detail: board.targetAsOf ? formatDay(board.targetAsOf) : undefined },
       {
         id: "last",
@@ -176,27 +183,25 @@ export function RbaPane({ focused, width, height }: PaneProps) {
         detail: board.lastChange?.date ? formatDay(board.lastChange.date) : undefined,
         color: changeColor(board.lastChange?.change ?? null),
       },
-      { id: "next", label: "Next decision", value: formatDay(board.next), detail: board.daysToNext == null ? undefined : `in ${board.daysToNext} days, 2:30 pm Sydney` },
     ];
-    const statRows = statGridRows(stats, width);
     body = (
-      <>
-        <StatGrid items={stats} width={width} />
-        <DataTableView<Decision, DecisionColumn>
-          focused={focused}
-          rootWidth={width}
-          rootHeight={Math.max(1, bodyHeight - statRows)}
-          selection={{ kind: "none" }}
-          onRootKeyDown={handleKey}
-          columns={DECISION_COLUMNS}
-          items={board.meetings}
-          sortColumnId={null}
-          sortDirection="asc"
-          getItemKey={(row) => row.date}
-          renderCell={renderDecision}
-          emptyStateTitle="No board meetings listed."
-        />
-      </>
+      <DataTableView<Decision, DecisionColumn>
+        focused={focused}
+        rootWidth={width}
+        rootHeight={bodyHeight}
+        rootBefore={<ChartTableHeader width={width} height={bodyHeight} figures={stats} tableRows={board.meetings.length}
+          tableChromeRows={chartTableChromeRows(DECISION_COLUMNS, width)} chart={boardChart}
+          query={<QueryBar width={width} view={{ value: range, options: STAT_RANGES, onChange: (value) => setRange(statRange(value)) }} />} />}
+        selection={{ kind: "none" }}
+        onRootKeyDown={handleKey}
+        columns={DECISION_COLUMNS}
+        items={board.meetings}
+        sortColumnId={null}
+        sortDirection="asc"
+        getItemKey={(row) => row.date}
+        renderCell={renderDecision}
+        emptyStateTitle="No board meetings listed."
+      />
     );
   } else {
     const columns = rateColumns(tab, width);

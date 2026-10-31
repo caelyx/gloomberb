@@ -11,6 +11,15 @@ export type ElectrobunApplicationMenuCommand =
   | DesktopApplicationMenuCommand
   | { type: "open-devtools" };
 
+/**
+ * The command rides in the item's action string, not its `data`: Electrobun
+ * keeps `data` in a registry that it clears on the item's first click, so every
+ * later click of the same item arrives with no data. The action string is kept.
+ */
+export function applicationMenuAction(command: ElectrobunApplicationMenuCommand): string {
+  return `${ELECTROBUN_APPLICATION_MENU_ACTION}:${encodeURIComponent(JSON.stringify(command))}`;
+}
+
 function commandItem(
   label: string,
   command: ElectrobunApplicationMenuCommand,
@@ -18,8 +27,7 @@ function commandItem(
 ): ApplicationMenuItemConfig {
   return {
     label,
-    action: ELECTROBUN_APPLICATION_MENU_ACTION,
-    data: command,
+    action: applicationMenuAction(command),
     ...(options.accelerator ? { accelerator: options.accelerator } : {}),
   };
 }
@@ -32,7 +40,7 @@ function buildApplicationMenu(keybindings: ResolvedKeybindings): ApplicationMenu
   const accelerator = (actionId: string) => ({ accelerator: menuAcceleratorFor(keybindings, actionId) });
   return [
     {
-      label: "Gloomberb",
+      label: "Gloom",
       submenu: [
         { role: "about" },
         { type: "divider" },
@@ -43,7 +51,7 @@ function buildApplicationMenu(keybindings: ResolvedKeybindings): ApplicationMenu
         { role: "hideOthers" },
         { role: "showAll" },
         { type: "divider" },
-        commandItem("Quit Gloomberb", { type: "quit" }, { accelerator: "CmdOrCtrl+Q" }),
+        commandItem("Quit Gloom", { type: "quit" }, { accelerator: "CmdOrCtrl+Q" }),
       ],
     },
     {
@@ -122,7 +130,7 @@ function buildApplicationMenu(keybindings: ResolvedKeybindings): ApplicationMenu
     {
       label: "Help",
       submenu: [
-        openCommandBar("Gloomberb Help", "HELP"),
+        openCommandBar("Gloom Help", "HELP"),
         commandItem("Open Issue on GitHub", { type: "open-url", url: GITHUB_ISSUE_URL }),
       ],
     },

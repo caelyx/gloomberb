@@ -5,7 +5,8 @@ import {
   followBindingReaches,
   isTickerLinkPeer,
 } from "../../../layout/ticker-navigation";
-import { isPaneInLayout } from "../../../layout/pane-manager";
+import { findPaneLocation, isPaneInLayout } from "../../../layout/pane-manager";
+import { windowLabelInView } from "../../../layout/pane-manager/secondary-windows";
 import { resolveTickerForPane, type AppState } from "../../../state/app/context";
 import { resolveInstrumentForPane } from "../../../core/state/app/instrument";
 import { paneTitleMnemonic, pinFollowingPane } from "../../../layout/pane-follow";
@@ -89,7 +90,11 @@ export function tickerLinkMenuItems({
       && followBindingReaches(layout, source.instanceId, instance.instanceId)
     ) return [];
     if (peer && !list && !resolveTickerForPane(state as AppState, source.instanceId)) return [];
-    const title = getTickerLinkSourceTitle(state, source, sourceDef, panes, "menu");
+    const location = findPaneLocation(layout, source.instanceId);
+    // A source in another desktop window says which one; `layout` may be a window's view, where its own panes are "main".
+    const title = location && location.window !== "main" && location.kind !== "detached"
+      ? `${getTickerLinkSourceTitle(state, source, sourceDef, panes, "menu")} · ${windowLabelInView(location.window)}`
+      : getTickerLinkSourceTitle(state, source, sourceDef, panes, "menu");
 
     if (source.instanceId !== sourceInstanceId) {
       return linkable

@@ -153,3 +153,34 @@ test("a move that rounds to nothing reads 0.00, never -0.00", async () => {
   expect(frame).not.toContain("-0.00");
   expect(frame).toContain("0.00");
 });
+
+test("a coin's hourly bars ending with the latest trade have no missing-volume warning in the footer or export", async () => {
+  setSystemTime(new Date("2026-10-18T16:00:00Z"));
+  const bar = (date: string, volume?: number) => ({ date: new Date(date), open: 81_000, high: 81_100, low: 80_900, close: 81_050, volume });
+  const latest = bar("2026-10-18T15:57:53Z");
+  const signedIn = await mountHistory([bar("2026-10-18T13:00:00Z", 61_200_000), bar("2026-10-18T14:00:00Z", 73_800_000),
+    bar("2026-10-18T15:00:00Z", 24_100_000), latest], "1W");
+  // Before: "1 of 4 bars has no reported volume (\u2014)" under every signed-in coin history.
+  // The footer's warning marker, which opens the note, is gone with it.
+  expect(signedIn.frame).not.toContain("[!]");
+  expect(signedIn.csv).not.toContain("Volume note");
+  const hole = await mountHistory([bar("2026-10-18T13:00:00Z", 61_200_000), bar("2026-10-18T14:00:00Z"),
+    bar("2026-10-18T15:00:00Z", 24_100_000), latest], "1W");
+  expect(hole.frame).toContain("[!]");
+  expect(hole.csv).toContain("Volume note,1 of 4 bars has no reported volume");
+});
+
+test("ALL says where the source's bars start, names a month without a bar, and marks the change across it with its base", async () => {
+  setSystemTime(new Date("2026-10-21T12:00:00Z"));
+  // BTC-USD's monthly bars start 2014-09; November is missing, so December's change is from October.
+  const { frame, csv } = await mountHistory(bars(["2014-09-01", "2014-10-01", "2014-12-01"]), "ALL");
+  expect(frame).toContain("monthly bars from 2014-09");
+  expect(frame).toContain(" 1.00*");
+  expect(frame).toContain("+0.99%*");
+  expect(frame).toContain("[!]");
+  expect(csv).toContain("Source starts,2014-09");
+  expect(csv).toContain("Gap note,No bar for 2014-11");
+  expect(csv).toContain("Gap note,CHG marked * spans the missing bars: 2014-12 is from 2014-10");
+  // The export keeps the change itself, as a number.
+  expect(csv).toContain("2014-12-01,,,,102,1,0.99009900990099,");
+});

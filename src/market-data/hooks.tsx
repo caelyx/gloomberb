@@ -1,3 +1,5 @@
+import { logFailure } from "../utils/log-failure";
+import { fxRateCurrencies } from "../utils/currency-units";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { SecFilingDocument, SecFilingItem } from "../types/data-provider";
 import type { OptionsChain, PricePoint, Quote, TickerFinancials } from "../types/financials";
@@ -48,7 +50,7 @@ function loadChartRequests(
   options: { forceRefresh?: boolean } = {},
 ): void {
   for (const request of requests) {
-    void coordinator.loadChart(request, options).catch(() => {});
+    void coordinator.loadChart(request, options).catch(logFailure("market-data.hooks", "Loading chart data failed"));
   }
 }
 
@@ -76,13 +78,7 @@ function useCoordinatorKeysVersion(keys: readonly string[]): number {
   return useSyncExternalStore(subscribe, getSnapshot, () => 0);
 }
 
-function stableCurrencyList(currencies: Array<string | null | undefined>): string[] {
-  return [...new Set(
-    currencies
-      .map((currency) => currency?.trim().toUpperCase() ?? "")
-      .filter(Boolean),
-  )].sort((left, right) => left.localeCompare(right));
-}
+
 
 function buildTickerFinancialsMapKey(tickers: TickerRecord[], options: TickerInstrumentOptions = {}): string {
   return tickers.map((ticker) => {
@@ -117,7 +113,7 @@ export function useTickerFinancials(symbol: string | null | undefined, ticker: T
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !instrument) return;
     const timeoutId = setTimeout(() => {
-      void coordinator.loadSnapshot(instrument).catch(() => {});
+      void coordinator.loadSnapshot(instrument).catch(logFailure("market-data.hooks", "Loading a financial snapshot failed"));
     }, TICKER_FINANCIALS_LOAD_DELAY_MS);
     return () => clearTimeout(timeoutId);
   }, [instrumentKey]);
@@ -308,7 +304,7 @@ export function useQuoteEntry(symbol: string | null | undefined, ticker: TickerR
   useEffect(() => {
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !instrument) return;
-    void coordinator.loadQuote(instrument).catch(() => {});
+    void coordinator.loadQuote(instrument).catch(logFailure("market-data.hooks", "Loading a quote failed"));
   }, [instrumentKey]);
 
   return entry;
@@ -475,7 +471,7 @@ export function useOptionsQuery(
   useEffect(() => {
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !request) return;
-    void coordinator.loadOptions(request).catch(() => {});
+    void coordinator.loadOptions(request).catch(logFailure("market-data.hooks", "Loading options failed"));
   }, [requestKey]);
 
   useEffect(() => {
@@ -483,7 +479,7 @@ export function useOptionsQuery(
     if (!coordinator || !request || !visible || refreshIntervalMs <= 0) return;
     const refresh = () => {
       lastRefreshRef.current = { key: requestKey, at: Date.now() };
-      void coordinator.loadOptions(request, { forceRefresh: true }).catch(() => {});
+      void coordinator.loadOptions(request, { forceRefresh: true }).catch(logFailure("market-data.hooks", "Loading options failed"));
     };
     if (Date.now() - lastRefreshRef.current.at >= refreshIntervalMs) refresh();
     const interval = setInterval(refresh, refreshIntervalMs);
@@ -495,14 +491,22 @@ export function useOptionsQuery(
 
 export function useSecFilingsQuery(request: SecFilingsRequest | null | undefined): QueryEntry<SecFilingItem[]> | null {
   const requestKey = request ? buildSecFilingsKey(request) : null;
-  useCoordinatorKeysVersion(requestKey ? [requestKey] : []);
+  const version = useCoordinatorKeysVersion(requestKey ? [requestKey] : []);
   const coordinator = getSharedMarketDataCoordinator();
-  const entry = coordinator && request ? coordinator.getSecFilingsEntry(request) : null;
+  // Read at the version React holds, as useSecFilingContent does. A pane
+  // opened from another (INS from its ranking) can render between the store
+  // write and its announcement; read early, the list is thrown away with that
+  // render, and the filing queue after it stays on "loading".
+  // The key stands for the request: a new object for the same filings reads the same entry.
+  const entry = useMemo(
+    () => coordinator && request ? coordinator.getSecFilingsEntry(request) : null,
+    [coordinator, requestKey, version],
+  );
 
   useEffect(() => {
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !request) return;
-    void coordinator.loadSecFilings(request).catch(() => {});
+    void coordinator.loadSecFilings(request).catch(logFailure("market-data.hooks", "Loading filings failed"));
   }, [requestKey]);
 
   return entry;
@@ -525,7 +529,7 @@ export function useSecFilingContent(filing: SecFilingItem | null | undefined): Q
   useEffect(() => {
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !filing) return;
-    void coordinator.loadSecFilingContent(filing).catch(() => {});
+    void coordinator.loadSecFilingContent(filing).catch(logFailure("market-data.hooks", "Loading filing content failed"));
   }, [key]);
 
   return entry;
@@ -540,7 +544,7 @@ export function useSecFilingDocuments(filing: SecFilingItem | null | undefined):
   useEffect(() => {
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !filing) return;
-    void coordinator.loadSecFilingDocuments(filing).catch(() => {});
+    void coordinator.loadSecFilingDocuments(filing).catch(logFailure("market-data.hooks", "Loading filing documents failed"));
   }, [key]);
 
   return entry;
@@ -555,15 +559,28 @@ export function useArticleSummary(url: string | null | undefined): QueryEntry<st
   useEffect(() => {
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !url) return;
-    void coordinator.loadArticleSummary(url).catch(() => {});
+    void coordinator.loadArticleSummary(url).catch(logFailure("market-data.hooks", "Loading an article summary failed"));
   }, [url]);
 
   return entry;
 }
 
+/** A currency's US dollar rate as the app holds it, and when its source observed it (epoch ms; null when undated, and for USD). */
+export interface FxRateObservation {
+  rate: number;
+  asOf: number | null;
+}
+
 export function useFxRatesMap(currencies: Array<string | null | undefined>): Map<string, number> {
+  const observations = useFxRateObservations(currencies);
+  return useMemo(() => new Map([...observations].map(([currency, observation]) => [currency, observation.rate])), [observations]);
+}
+
+/** useFxRatesMap with each rate's observation time, for a figure that states the rate it was converted at. */
+export function useFxRateObservations(currencies: Array<string | null | undefined>): Map<string, FxRateObservation> {
   const coordinator = getSharedMarketDataCoordinator();
-  const normalizedCurrencyKey = stableCurrencyList(currencies).join("|");
+  // A minor unit's major currency is loaded too: GBX and ILA have no rate of their own.
+  const normalizedCurrencyKey = fxRateCurrencies(currencies).join("|");
   const normalizedCurrencies = useMemo(
     () => (normalizedCurrencyKey ? normalizedCurrencyKey.split("|") : []),
     [normalizedCurrencyKey],
@@ -596,12 +613,12 @@ export function useFxRatesMap(currencies: Array<string | null | undefined>): Map
   }, [appVisible, normalizedCurrencyKey]);
 
   return useMemo(() => {
-    const rates = new Map<string, number>();
-    rates.set("USD", 1);
+    const rates = new Map<string, FxRateObservation>();
+    rates.set("USD", { rate: 1, asOf: null });
     for (const [currency, entry] of entries) {
       const rate = resolveEntryValue(entry);
       if (rate != null) {
-        rates.set(currency, rate);
+        rates.set(currency, { rate, asOf: entry?.asOf ?? null });
       }
     }
     return rates;

@@ -133,14 +133,22 @@ export function findReusablePaneInstance(
   template: PaneTemplateDef,
   templates: ReadonlyMap<string, PaneTemplateDef>,
   spec: PaneTemplateInstanceConfig,
-  options: { focusedPaneId?: string | null; paneDef?: Pick<PaneDef, "identitySettings"> } = {},
+  options: {
+    focusedPaneId?: string | null;
+    paneDef?: Pick<PaneDef, "identitySettings">;
+    /** The panes in the window the request came from: a match there wins over one in another window. */
+    preferPaneIds?: ReadonlySet<string>;
+  } = {},
 ): PaneInstanceConfig | null {
   const paneId = template.paneId;
   if (spec.instanceId) {
     const owner = instances.find((instance) => instance.instanceId === spec.instanceId);
     if (owner && owner.paneId === paneId && !showsOtherTicker(owner, spec)) return owner;
   }
-  const candidates = instances.filter((instance) => instance.paneId === paneId);
+  const prefer = options.preferPaneIds;
+  const candidates = instances
+    .filter((instance) => instance.paneId === paneId)
+    .sort((a, b) => Number(prefer?.has(b.instanceId) ?? false) - Number(prefer?.has(a.instanceId) ?? false));
   const specKey = stableKey([spec.binding ?? { kind: "none" }, spec.params ?? {}, spec.settings ?? {}]);
   const exact = candidates.find((instance) => (
     stableKey([instance.binding ?? { kind: "none" }, instance.params ?? {}, instance.settings ?? {}]) === specKey

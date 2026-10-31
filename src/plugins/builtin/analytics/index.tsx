@@ -66,7 +66,7 @@ import {
   type SectorTableColumn,
 } from "./sector-model";
 import { describePortfolioTab, resolvePortfolioId, resolveTemplatePortfolioId } from "./portfolio-selection";
-import { findNamedCollection } from "../../../portfolio/collection-name";
+import { findNamedCollection, unknownCollectionArgError } from "../../../portfolio/collection-name";
 import {
   analyticsFigures,
   riskFigureNotices,
@@ -256,6 +256,10 @@ function LegacyPortfolioAnalyticsPane({ focused, width, height }: PaneProps) {
   const allocationNotices = [
     ...(sectorAllocation.unvaluedSymbols.length > 0 ? [{
       text: `Weights unavailable: missing prices or FX for ${sectorAllocation.unvaluedSymbols.join(", ")}.`, tone: "warning" as const,
+    }] : []),
+    // Named once in the pane's notices: its totals and its sectors leave the same futures out.
+    ...(sectorAllocation.unsizedSymbols.length > 0 ? [{
+      text: `No contract size, so not valued: ${sectorAllocation.unsizedSymbols.join(", ")}.`, tone: "warning" as const,
     }] : []),
   ];
   const sectorRows = sectorAllocation.rows;
@@ -453,13 +457,16 @@ export const portfolioAnalyticsModule: PluginModule = {
       headless: portfolioRiskHeadless,
       tableExport: true,
       // The risk window reads as trailing until it is set.
-      settings: (context) => ({ values: { riskSince: context.settings.riskSince ?? "trailing" }, fields: [
+      settings: (context) => ({ values: { riskSince: context.settings.riskSince ?? "trailing", riskWeights: context.settings.riskWeights ?? "13f" }, fields: [
         { key: "analyticsView", label: "View", type: "select", options: [{ value: "overview", label: "Overview" }, { value: "risk", label: "Risk depth" }] },
         { key: "riskSince", label: "Risk window", type: "select", options: [{ value: "trailing", label: "Trailing 60 sessions" }, { value: "filed", label: "Since 13F filing" }] },
+        { key: "riskWeights", label: "Since-filing weights", type: "select", options: [{ value: "13f", label: "13F weights, bought and held" }, { value: "current", label: "Current weights, held fixed" }] },
         { key: "riskEvidence", label: "Local evidence JSON", type: "text" },
         { key: "equityShift", label: "Index shift (%)", type: "text" },
         { key: "rateShift", label: "10Y shift (bp)", type: "text" },
         { key: "volShift", label: "VIX shift (points)", type: "text" },
+        { key: "fxShift", label: "FX shift vs USD (TRY -20)", type: "text" },
+        { key: "assetShift", label: "Asset shift (GLD 10)", type: "text" },
       ] }),
       defaultPosition: "right",
       defaultMode: "floating",
@@ -477,8 +484,12 @@ export const portfolioAnalyticsModule: PluginModule = {
       paneId: "analytics",
       label: prefix === "PORT" ? "Portfolio Analytics" : "Portfolio Market Risk",
       description: "Benchmark-relative risk, factor betas, stress shifts and local account evidence.",
-      keywords: ["risk", "analytics", "sharpe", "beta", "sector", "allocation", "portfolio"],
-      shortcut: { prefix, argKind: "text", argOptional: true, argPlaceholder: "portfolio-id" },
+      keywords: ["risk", "analytics", "sharpe", "beta", "sector", "allocation", "portfolio", "style", "quality", "factor tilt"],
+      shortcut: {
+        prefix, argKind: "text", argOptional: true, argPlaceholder: "portfolio-id",
+        // `PORT Nope` names no portfolio: the bar says so, not the first portfolio's risk.
+        argError: (arg, context) => unknownCollectionArgError(arg, context.config.portfolios, "portfolio"),
+      },
       headless: portfolioRiskHeadless,
       canCreate: (context) => context.config.portfolios.length > 0,
       createInstance: (context, options) => {
