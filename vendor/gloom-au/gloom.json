@@ -2,7 +2,7 @@
   "id": "au-markets",
   "name": "Australian Markets",
   "tagline": "ASX, RBA, ABS, ASIC and AEMO data for Australian investors, from free public sources",
-  "description": "Brings Gloomberb's coverage of Australian markets closer to its US coverage, from free public sources. ASX announcements: the market feed and full company histories with PDF extracts, director-interest and substantial-holder filters. Franking credits, ASX options in the built-in options views, and ASIC short positions. RBA rates and the AUD, the RBA path priced by ASX cash rate futures, and ABS indicators and release dates, charted in their panes and in custom charts. An ASX market board with sector rotation, and an ASX heatmap grouped by sector. Australian news, including ASIC media releases, and AusTender government contracts. NEM electricity: prices on a map of Australia, the generation mix by fuel, battery discharge against price and FCAS prices, with prices, demand and the mix in custom charts; an optional OpenElectricity key adds rooftop solar and battery charging. ASX search for companies, ETFs and funds. Panes open with their last data from a local cache.",
+  "description": "Brings Gloomberb's coverage of Australian markets closer to its US coverage, from free public sources. ASX announcements: the market feed and full company histories with PDF extracts, director-interest and substantial-holder filters. ASX alerts on results, dividends, trading halts and dividend dates. Franking credits, ASX options in the built-in options views, and ASIC short positions. RBA rates and the AUD, the RBA path priced by ASX cash rate futures, and ABS indicators and release dates, charted in their panes and in custom charts. An ASX market board with sector rotation, and an ASX heatmap grouped by sector. Australian news, including ASIC media releases, and AusTender government contracts. NEM electricity: prices on a map of Australia, the generation mix by fuel, battery discharge against price and FCAS prices, with prices, demand and the mix in custom charts; an optional OpenElectricity key adds rooftop solar and battery charging. ASX search for companies, ETFs and funds. Panes open with their last data from a local cache.",
   "categories": [
     "markets",
     "research",
@@ -35,6 +35,7 @@
   ],
   "contributes": {
     "panes": [
+      "au-alerts",
       "au-announcements",
       "asx-short-positions",
       "au-rba",
@@ -57,6 +58,16 @@
         "description": "Alias of ASXA (gloom-asx's shortcut): ASX announcements, the market feed or one company's."
       },
       {
+        "code": "AULRT",
+        "name": "ASX Alerts",
+        "description": "Alerts on ASX announcements (results, dividends, trading halts or any) and coming dividend dates, for a company, your holdings or the whole market."
+      },
+      {
+        "code": "AUSA",
+        "name": "Add ASX Alert",
+        "description": "Adds an ASX alert, for the ASX ticker typed or the active one."
+      },
+      {
         "code": "ASXS",
         "name": "ASX Short Positions",
         "description": "ASIC's daily report of short positions in ASX products, most shorted first, or one company's history with an ASX ticker."
@@ -74,7 +85,7 @@
       {
         "code": "RBAP",
         "name": "RBA Rate Path",
-        "description": "The RBA cash rate path priced by ASX 30-day interbank cash rate futures: implied rate and move odds at each board meeting."
+        "description": "The RBA cash rate path priced by ASX 30-day interbank cash rate futures: implied rate, move odds and the odds of each 25 bp target level at each board meeting."
       },
       {
         "code": "WIRA",

@@ -16,11 +16,12 @@ Requires Gloomberb 0.16.0 or newer. Works in the terminal and the desktop app (s
 |---|---|
 | `ASXA` pane | The latest announcements across the ASX in Sydney time, with All / Price sensitive / Directors / Substantial tabs. Enter opens the company. |
 | `ASXA <ticker>` (or `ASX <ticker>`), Ticker Research → **Announcements** | One company's whole announcement history, paged on scroll, with an inline extract of each PDF, other issuers' notices about the company marked, and type, price-sensitive and own-only filters. |
+| `AULRT` pane, **Add ASX Alert** command (`AUSA <ticker>`) | Alerts on ASX announcements (results and earnings, dividends, trading halts, or any) and coming ex, record and pay dates, for a company, your portfolios and watchlists, or the whole market. Checked hourly by default while the app is open; `R` checks now. |
 | Ticker Research → **Franking** (`FRANK <ticker>`) | Latest dividend with franking %, credit, grossed-up amount, dates, cash and gross yield; dividend history. |
 | List columns **FRANK%**, **GROSS YLD** | Franking and grossed-up yield for ASX holdings in any portfolio or watchlist. |
 | `ASXS` / `ASXS <ticker>`, Ticker Research → **Short positions** | ASIC daily short positions: most shorted products with weekly change, and each company's history with a chart. |
 | `RBA` pane | Cash rate, BBSW, government bond yields, the AUD and RBA board decisions; the selected series charted over 1Y, 5Y or all history, and every series also in custom charts. |
-| `RBAP` pane (alias `WIRA`) | The RBA path priced by ASX 30-day interbank cash rate futures, like `WIRP` for the Fed: implied cash rate target and move odds at each board meeting (published dates, then estimated ones marked `~`), a step chart with 1W/1M/1Y look-backs as daily history builds, and the futures strip. |
+| `RBAP` pane (alias `WIRA`) | The RBA path priced by ASX 30-day interbank cash rate futures, like `WIRP` for the Fed: implied cash rate target and move odds at each board meeting (published dates, then estimated ones marked `~`), the odds of each 25 bp target level by meeting, a step chart with 1W/1M/1Y look-backs as daily history builds, and the futures strip. |
 | `ABS` pane | CPI (headline, trimmed mean, weighted median), unemployment, participation, jobs, wages, GDP; upcoming ABS releases; the selected indicator charted in the pane, and all in custom charts. |
 | `ASXM` pane | ASX 200, All Ords, ASX 300 and A-VIX; the 11 GICS sectors with returns, rotation and a one-year chart against the ASX 200; movers among the 100 largest companies. |
 | `HMA` pane | ASX heatmap: the ASX 50, ASX 200 or the 11 GICS sector indices, sized by market cap, coloured by the day's move and grouped by sector. |
@@ -34,7 +35,7 @@ Requires Gloomberb 0.16.0 or newer. Works in the terminal and the desktop app (s
 | `gloomberb au franking <ticker>` | Franking figures from the terminal. |
 | Local cache | Panes open with their last data at once and refresh behind it; see [caching](docs/caching.md). |
 
-Docs: [announcements](docs/announcements.md), [franking](docs/franking.md), [options](docs/options.md), [short positions](docs/short-positions.md), [RBA](docs/rba.md), [RBA rate path](docs/rbap.md), [ABS](docs/abs.md), [market board](docs/market-board.md), [heatmap](docs/heatmap.md), [news](docs/news.md), [AusTender](docs/austender.md), [NEM](docs/nem.md), [caching](docs/caching.md).
+Docs: [announcements](docs/announcements.md), [ASX alerts](docs/alerts.md), [franking](docs/franking.md), [options](docs/options.md), [short positions](docs/short-positions.md), [RBA](docs/rba.md), [RBA rate path](docs/rbap.md), [ABS](docs/abs.md), [market board](docs/market-board.md), [heatmap](docs/heatmap.md), [news](docs/news.md), [AusTender](docs/austender.md), [NEM](docs/nem.md), [caching](docs/caching.md).
 
 ## Data and terms
 

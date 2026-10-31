@@ -4,7 +4,7 @@ import { sydneyToday } from "../shared/time";
 import { formatRate } from "../rba/view";
 import { loadRbap } from "./client";
 import { moveOddsText, moveSteps } from "./model";
-import { bpText, pathNotices, priceText, rbapView, stepsText } from "./view";
+import { bpText, pathNotices, priceText, probabilityTable, probabilityText, rbapView, stepsText } from "./view";
 
 const rate = (value: unknown) => formatRate(typeof value === "number" ? value : null);
 const bp = (value: unknown) => bpText(typeof value === "number" ? value : null, 1);
@@ -31,6 +31,7 @@ export function createRbapHeadless(load: typeof loadRbap = loadRbap, clock: () =
       const next = view.meetings[0];
       const last = view.meetings.at(-1);
       const notes = [...pathNotices(view, today), ...refreshNotice(data.meta)];
+      const probabilities = probabilityTable(view);
       return {
         sections: [
           { title: "Summary", entries: [
@@ -50,6 +51,11 @@ export function createRbapHeadless(load: typeof loadRbap = loadRbap, clock: () =
             { key: "method", header: "Method" },
             { key: "estimated", header: "Date", format: (value) => (value ? "estimated" : "published") },
           ], rows: view.meetings.map((row) => ({ ...row, meeting: day(row), odds: moveOddsText(row.move), moves: row.cumulative })) },
+          ...(probabilities.levels.length ? [{ title: "Probabilities", columns: [
+            { key: "meeting", header: "Meeting" },
+            ...probabilities.levels.map((level, index) => ({ key: `p${index}`, header: formatRate(level), align: "right" as const,
+              format: (value: unknown) => probabilityText(typeof value === "number" ? value : null) })),
+          ], rows: probabilities.rows.map(({ meeting, odds }) => ({ meeting: day(meeting), ...Object.fromEntries(odds.map((value, index) => [`p${index}`, value])) })) }] : []),
           { title: "Contracts", columns: [
             { key: "label", header: "Month" },
             { key: "rate", header: "Implied cash rate", align: "right", format: rate },

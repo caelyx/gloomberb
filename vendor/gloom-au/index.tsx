@@ -1,6 +1,9 @@
 import { assetDataProvider } from "gloomberb/capabilities";
 import type { GloomPlugin, PaneTemplateContext, PaneTemplateCreateOptions } from "gloomberb/types/plugin";
 import { parsePublicTickerKey } from "gloomberb/utils";
+import { AlertsPane } from "./alerts/pane";
+import { INTERVAL_FIELD } from "./alerts/form";
+import { AULRT_PANE_ID, AULRT_TEMPLATE_ID, setupAlerts } from "./alerts/setup";
 import { absChartSource } from "./abs/chart";
 import { absHeadless } from "./abs/headless";
 import { ABS_PANE_ID, AbsPane } from "./abs/pane";
@@ -28,7 +31,8 @@ import { asxOptionsProvider } from "./options/provider";
 import { rbaHeadless } from "./rba/headless";
 import { RBA_PANE_ID, RbaPane } from "./rba/pane";
 import { rbapHeadless } from "./rbap/headless";
-import { RBAP_PANE_ID, RbapPane } from "./rbap/pane";
+import { CURRENT_TARGET_SETTING, HISTORY_SETTING, RBAP_PANE_ID, RbapPane } from "./rbap/pane";
+import { HISTORY_MONTHS, historyMonths } from "./rbap/view";
 import { asxCodeForTicker, asxCodeFromSymbol } from "./shared/asx";
 import { attachDiskCaches } from "./shared/disk-cache";
 import { createAuChartSeriesCapability, registerChartSource } from "./shared/chart-series";
@@ -39,6 +43,8 @@ import { contractsHeadless } from "./tenders/headless";
 import { ContractsPane, TENDERS_PANE_ID } from "./tenders/pane";
 
 export const PLUGIN_ID = "au-markets";
+
+let stopAlerts: (() => void) | null = null;
 
 registerChartSource(absChartSource);
 registerChartSource(nemChartSource);
@@ -72,7 +78,7 @@ export const auMarketsPlugin: GloomPlugin = {
   id: PLUGIN_ID,
   name: "Australian Markets",
   version: "0.2.0",
-  description: "Australian market data from free public sources: ASX announcements, franking, options and short positions, RBA rates, ABS indicators, an ASX market board and heatmap, Australian news, government contracts and electricity prices",
+  description: "Australian market data from free public sources: ASX announcements and alerts, franking, options and short positions, RBA rates, ABS indicators, an ASX market board and heatmap, Australian news, government contracts and electricity prices",
   homepage: "https://github.com/caelyx/gloom-au",
   toggleable: true,
 
@@ -95,11 +101,22 @@ export const auMarketsPlugin: GloomPlugin = {
       required: false,
       description: "Optional. Adds rooftop solar and battery charging to NEM's generation views. Free (non-commercial) key from platform.openelectricity.org.au; see docs/nem.md.",
     },
+    INTERVAL_FIELD,
   ],
   cliCommands: [auCliCommand],
   capabilities: [assetDataProvider(asxOptionsProvider), createAuChartSeriesCapability(), createAuNewsCapability()],
 
   panes: [
+    {
+      id: AULRT_PANE_ID,
+      name: "ASX Alerts",
+      icon: "!",
+      component: AlertsPane,
+      defaultPosition: "right",
+      defaultMode: "floating",
+      defaultFloatingSize: { width: 110, height: 24 },
+      tableExport: true,
+    },
     {
       id: ANNOUNCEMENTS_PANE_ID,
       name: "ASX Announcements",
@@ -143,6 +160,28 @@ export const auMarketsPlugin: GloomPlugin = {
       defaultFloatingSize: { width: 96, height: 30 },
       tableExport: true,
       headless: rbapHeadless,
+      settings: (context) => ({
+        title: "RBA Path Settings",
+        values: {
+          [HISTORY_SETTING]: historyMonths(context.settings[HISTORY_SETTING]),
+          [CURRENT_TARGET_SETTING]: context.settings[CURRENT_TARGET_SETTING] !== false,
+        },
+        fields: [
+          {
+            key: HISTORY_SETTING,
+            label: "Actual target before the path",
+            type: "select",
+            options: HISTORY_MONTHS.map((option) => ({ value: option.value, label: option.label })),
+            description: "How far back the chart's yellow target line starts: the actual cash rate target (from RBA table F1) before the implied path.",
+          },
+          {
+            key: CURRENT_TARGET_SETTING,
+            label: "Current target line",
+            type: "toggle",
+            description: "Carry today's cash rate target flat across the meetings, so the implied path reads against it.",
+          },
+        ],
+      }),
     },
     {
       id: ABS_PANE_ID,
@@ -245,6 +284,15 @@ export const auMarketsPlugin: GloomPlugin = {
 
   paneTemplates: [
     {
+      id: AULRT_TEMPLATE_ID,
+      paneId: AULRT_PANE_ID,
+      label: "ASX Alerts",
+      description: "Alerts on ASX announcements (results, dividends, trading halts or any) and coming dividend dates, for a company, your holdings or the whole market.",
+      keywords: ["alerts", "alrt", "aulrt", "asx", "trading halt", "halt", "dividend", "ex-dividend", "earnings", "results", "announcements", "notify", "australia"],
+      shortcut: { prefix: "AULRT" },
+      createInstance: () => ({ placement: "floating" }),
+    },
+    {
       id: "au-announcements-pane",
       paneId: ANNOUNCEMENTS_PANE_ID,
       label: "ASX Announcements",
@@ -286,7 +334,7 @@ export const auMarketsPlugin: GloomPlugin = {
       id: "au-rbap-pane",
       paneId: RBAP_PANE_ID,
       label: "RBA Rate Path",
-      description: "The RBA cash rate path priced by ASX 30-day interbank cash rate futures: implied rate and move odds at each board meeting.",
+      description: "The RBA cash rate path priced by ASX 30-day interbank cash rate futures: implied rate, move odds and the odds of each 25 bp target level at each board meeting.",
       keywords: ["rba", "cash rate", "rate path", "wirp", "rate expectations", "futures", "interbank", "ib futures", "rate tracker", "probability", "australia", "reserve bank"],
       shortcut: { prefix: "RBAP", aliases: ["WIRA"] },
       headless: rbapHeadless,
@@ -380,6 +428,14 @@ export const auMarketsPlugin: GloomPlugin = {
     ctx.registerColumn(grossYieldColumn);
     ctx.registerCommandBarSearchProvider(createAsxSearchProvider(ctx));
     registerFrankingCommand(ctx);
+    // AULRT: background checks of ASX announcements and dividend dates, and the Add ASX Alert command.
+    stopAlerts?.();
+    stopAlerts = setupAlerts(ctx);
+  },
+
+  dispose() {
+    stopAlerts?.();
+    stopAlerts = null;
   },
 };
 

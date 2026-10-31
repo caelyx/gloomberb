@@ -165,6 +165,115 @@ export function rbapView(data: Pick<RbapLoad, "strip" | "f1" | "lookbacks">, tod
   };
 }
 
+export type HistoryMonths = "0M" | "1M" | "3M" | "6M";
+
+/** The lead-in the path chart can show before the first meeting. */
+export const HISTORY_MONTHS: ReadonlyArray<{ value: HistoryMonths; label: string }> = [
+  { value: "0M", label: "None" },
+  { value: "1M", label: "1 month" },
+  { value: "3M", label: "3 months" },
+  { value: "6M", label: "6 months" },
+];
+
+/** A persisted setting read back safely; anything unknown is 3 months. */
+export function historyMonths(value: unknown): HistoryMonths {
+  return HISTORY_MONTHS.some((option) => option.value === value) ? (value as HistoryMonths) : "3M";
+}
+
+/** `months` calendar months before an ISO date, clamped to the end of a shorter month. */
+export function monthsBefore(date: string, months: number): string {
+  const [year, month, day] = date.split("-").map(Number) as [number, number, number];
+  const first = new Date(Date.UTC(year, month - 1 - months, 1));
+  const last = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
+  first.setUTCDate(Math.min(day, last));
+  return first.toISOString().slice(0, 10);
+}
+
+/**
+ * The cash rate target over the `months` before `today`, as steps: the target
+ * in force at the start, each change, and the latest observation. It ends where
+ * F1 does, so a decision F1 does not show yet stays on the path, not here.
+ */
+export function targetHistory(f1: Map<string, RbaSeries> | null, today: string, months: HistoryMonths): Array<{ date: string; rate: number }> {
+  if (months === "0M") return [];
+  const points = f1?.get("FIRMMCRTD")?.points ?? [];
+  const start = monthsBefore(today, Number(months.slice(0, -1)));
+  const opening = valueOnOrBefore(points, start);
+  const steps = opening ? [{ date: start, rate: opening.value }] : [];
+  for (const point of points) {
+    if (point.date <= start) continue;
+    if (steps.at(-1)?.rate !== point.value) steps.push({ date: point.date, rate: point.value });
+  }
+  const latest = points.at(-1);
+  if (latest && latest.date > start && steps.at(-1)?.date !== latest.date) steps.push({ date: latest.date, rate: latest.value });
+  return steps;
+}
+
+/**
+ * The target line on the path chart: the actual target (`history`), then, when
+ * `showCurrent`, today's target held flat across the meetings, from where the
+ * history ends (or from F1's day without history). Empty without a path.
+ */
+export function targetLine(
+  view: Pick<RbapView, "target" | "targetAsOf"> & { meetings: ReadonlyArray<{ date: string }> },
+  history: ReadonlyArray<{ date: string; rate: number }>,
+  showCurrent: boolean,
+): Array<{ date: string; rate: number }> {
+  if (!view.meetings.length) return [];
+  const line = [...history];
+  if (!showCurrent || view.target == null) return line;
+  if (!line.length && view.targetAsOf) line.push({ date: view.targetAsOf, rate: view.target });
+  for (const meeting of view.meetings) {
+    const last = line.at(-1);
+    if (!last || meeting.date > last.date) line.push({ date: meeting.date, rate: view.target });
+  }
+  return line;
+}
+
+/**
+ * A meeting's outcomes as 25 bp steps from today's target, the two-outcome
+ * reading the odds use, carried to the level: the implied change since today
+ * (`cumulative`, percentage points) splits between the whole steps either side
+ * of it, so +0.09 is 64% no change and 36% one hike. Whole steps (to within
+ * rounding) are certain.
+ */
+export function outcomeOdds(cumulative: number): Array<{ steps: number; probability: number }> {
+  const steps = Math.round((cumulative / 0.25) * 1e9) / 1e9;
+  const lower = Math.floor(steps);
+  const upper = steps - lower;
+  return upper === 0 ? [{ steps: lower, probability: 1 }] : [{ steps: lower, probability: 1 - upper }, { steps: lower + 1, probability: upper }];
+}
+
+export interface ProbabilityTable<T = PathRow> {
+  /** Cash rate target levels in percent, 25 bp apart, from the lowest outcome to the highest. */
+  levels: number[];
+  /** Each meeting's odds of each level, aligned to `levels`. */
+  rows: Array<{ meeting: T; odds: number[] }>;
+}
+
+/**
+ * The odds of each target level after each meeting, like WIRP's probabilities.
+ * Empty without the target: a path from the front contract is not on the
+ * target's 25 bp grid.
+ */
+export function probabilityTable<T extends { cumulative: number }>(view: { target: number | null; meetings: readonly T[] }): ProbabilityTable<T> {
+  const { target } = view;
+  if (target == null || !view.meetings.length) return { levels: [], rows: [] };
+  const outcomes = view.meetings.map((meeting) => ({ meeting, odds: outcomeOdds(meeting.cumulative) }));
+  const all = outcomes.flatMap((entry) => entry.odds.map((odds) => odds.steps));
+  const low = Math.min(...all);
+  const steps = Array.from({ length: Math.max(...all) - low + 1 }, (_, index) => low + index);
+  return {
+    levels: steps.map((step) => Number((target + step * 0.25).toFixed(4))),
+    rows: outcomes.map(({ meeting, odds }) => ({ meeting, odds: steps.map((step) => odds.find((entry) => entry.steps === step)?.probability ?? 0) })),
+  };
+}
+
+/** A probability to one decimal, `64.0%`. */
+export function probabilityText(value: number | null): string {
+  return value == null || !Number.isFinite(value) ? "—" : `${(value * 100).toFixed(1)}%`;
+}
+
 /** Percentage points as signed basis points (`-25 bp`, `-0.3 bp`); a move that rounds to zero prints unsigned. */
 export function bpText(value: number | null, digits = 0): string {
   if (value == null || !Number.isFinite(value)) return "—";
