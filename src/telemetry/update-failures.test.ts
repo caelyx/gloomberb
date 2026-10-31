@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { CrashReportsPayload, UpdateFailureReport } from "../api-client";
 import { performUpdate } from "../updater";
 import { flushCrashReports, installCrashReporter, resetCrashReporterForTests } from "./crash-reports";
@@ -35,6 +35,13 @@ function fakeReporter(overrides: Partial<UpdateFailureReporterHost> = {}) {
   installUpdateFailureReporter(host);
   return { clock, sent, host, stored: () => stored };
 }
+
+// Every test file shares one process, and a crash report another file queued
+// with no reporter installed would be sent by the first reporter installed here.
+beforeEach(() => {
+  resetUpdateFailureReporterForTests();
+  resetCrashReporterForTests();
+});
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
