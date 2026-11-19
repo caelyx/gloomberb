@@ -2769,7 +2769,7 @@ gloom shot OVME --model american --side put --spot 100 --strike 100 --days 30 --
 
 `RRG` or `GRR` opens US sector ETFs versus SPY. `RRG AAPL:NASDAQ,MSFT:NASDAQ` uses an explicit universe. Pane settings choose the benchmark, a linked watchlist or portfolio, custom symbols and a 2-12-week trail (six by default). The benchmark needs a venue for its calendar: an exchange key (`SPY:NYSEARCA`, `STW:ASX`), a listing suffix (`STW.AX`) or a known index such as `^AXJO`. The maximum is 24 instruments.
 
-Each trail fades toward its oldest week; the labelled end is the latest. Select a coloured table row to locate its trail, and open it for dated strength and momentum history. Click column headers to sort. CSV export is in the pane menu. `gloom fn RRG --benchmark SPY:NYSEARCA --trail 6 --json` returns metrics, dated trails, rank sample counts and data limitations. A benchmark without its exchange is read as `quote` reads it (`--benchmark ACWI` is `ACWI:NASDAQ`), and its weeks are dated by that venue's calendar, which covers US listings. A benchmark that cannot be used is one error, not one per row.
+Each trail fades toward its oldest week; the labelled end is the latest. Select a coloured table row to locate its trail, and open it for dated strength and momentum history. Click column headers to sort. CSV export is in the pane menu. `gloom fn RRG --benchmark SPY:NYSEARCA --trail 6 --json` returns metrics, dated trails, rank sample counts and data limitations. A benchmark without its exchange is read as `quote` reads it (`--benchmark ACWI` is `ACWI:NASDAQ`), and its weeks are dated by that venue's published calendar ([which venues](research-data.md)). A benchmark that cannot be used is one error, not one per row.
 
 ## Position sizing: KELLY
 
