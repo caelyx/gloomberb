@@ -1,6 +1,6 @@
 name: Build macOS desktop (unsigned)
 
-# Downstream: runs scripts/build-macos-local.sh to build Gloomberb.app for
+# Downstream: runs scripts/build-macos-local.sh to build Gloom.app for
 # Apple Silicon from the selected branch, for installing this fork's changes in
 # place of the upstream release.
 # Manual only (Actions > Build macOS desktop (unsigned) > Run workflow).
@@ -9,7 +9,7 @@ name: Build macOS desktop (unsigned)
 # has no update feed (GLOOMBERB_DESKTOP_LOCAL in electrobun.config.ts), so it
 # never offers upstream's releases. After downloading, clear the quarantine
 # flag before first launch:
-#   xattr -dr com.apple.quarantine /Applications/Gloomberb.app
+#   xattr -dr com.apple.quarantine /Applications/Gloom.app
 
 on:
   workflow_dispatch:
@@ -25,17 +25,17 @@ jobs:
 
       - uses: ./.github/actions/setup-bun
 
-      - name: Build Gloomberb.app
+      - name: Build Gloom.app
         run: |
           brew install zstd
           scripts/build-macos-local.sh
 
-      - name: Package Gloomberb.app
+      - name: Package Gloom.app
         run: |
           set -euo pipefail
           version="$(node -p 'require("./package.json").version')"
           mkdir -p "$RUNNER_TEMP/app"
-          ditto -c -k --keepParent artifacts/local/Gloomberb.app "$RUNNER_TEMP/app/Gloomberb-$version-${GITHUB_SHA::7}-macos-arm64.zip"
+          ditto -c -k --keepParent artifacts/local/Gloom.app "$RUNNER_TEMP/app/Gloom-$version-${GITHUB_SHA::7}-macos-arm64.zip"
 
       - uses: actions/upload-artifact@v4
         with:
