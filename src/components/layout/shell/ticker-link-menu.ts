@@ -2,15 +2,14 @@ import { tf } from "../../../i18n";
 import { updatePaneInstance } from "../../../pane-settings";
 import {
   canFollowTickerSource,
-  followBindingReaches,
   isTickerLinkPeer,
 } from "../../../layout/ticker-navigation";
-import { findPaneLocation, isPaneInLayout } from "../../../layout/pane-manager";
-import { windowLabelInView } from "../../../layout/pane-manager/secondary-windows";
+import { isPaneInLayout } from "../../../layout/pane-manager";
 import { resolveTickerForPane, type AppState } from "../../../state/app/context";
 import { resolveInstrumentForPane } from "../../../core/state/app/instrument";
-import { paneTitleMnemonic, pinFollowingPane } from "../../../layout/pane-follow";
+import { followBindingReaches, linkFollower, paneTitleMnemonic, pinFollowingPane } from "../../../layout/pane-follow";
 import {
+  findPaneInstance,
   TICKER_RESEARCH_PANE_ID,
   type LayoutConfig,
   type PaneInstanceConfig,
@@ -35,7 +34,7 @@ export function tickerLinkMenuItems({
   instance: PaneInstanceConfig;
   layout: LayoutConfig;
   panes: ReadonlyMap<string, PaneDef>;
-  state: Pick<AppState, "config" | "paneState" | "tickers">;
+  state: Pick<AppState, "config" | "paneState" | "tickers" | "linkedTickers">;
   persistLayout: (nextLayout: LayoutConfig) => void;
 }): ContextMenuItem[] {
   const research = instance.paneId === TICKER_RESEARCH_PANE_ID;
@@ -45,11 +44,15 @@ export function tickerLinkMenuItems({
   const linkable = research || canFollowTickerSource(instance, panes);
 
   const sourceInstanceId = instance.binding?.kind === "follow" ? instance.binding.sourceInstanceId : null;
+  const sourcePaneId = (id: string) => findPaneInstance(layout, id)?.paneId;
   const unlink = (symbol: string) => {
     const contract = resolveInstrumentForPane(state, instance.instanceId)?.instrument;
     persistLayout(updatePaneInstance(layout, instance.instanceId, (current) => {
       const mnemonic = research ? null : paneTitleMnemonic(current.title);
-      return pinFollowingPane(mnemonic ? { ...current, title: mnemonic } : current, symbol, contract);
+      // The user's own unlink: the pane stays on its ticker until they link it again.
+      return pinFollowingPane(mnemonic ? { ...current, title: mnemonic } : current, symbol, contract, {
+        sourcePaneId: sourceInstanceId ? sourcePaneId(sourceInstanceId) : undefined,
+      });
     }));
   };
   const linkToSource = (nextSourceId: string) => {
@@ -59,11 +62,7 @@ export function tickerLinkMenuItems({
         if (current.instanceId === instance.instanceId) {
           // The stored title drops its ticker ("OMON AAPL" to "OMON"); the header adds the live one.
           const mnemonic = research ? null : paneTitleMnemonic(current.title);
-          return {
-            ...current,
-            ...(mnemonic ? { title: mnemonic } : {}),
-            binding: { kind: "follow" as const, sourceInstanceId: nextSourceId },
-          };
+          return linkFollower(mnemonic ? { ...current, title: mnemonic } : current, nextSourceId);
         }
         // Ticker Research keeps one follower per source, so Enter on a source row has one target.
         // Any number of other panes may follow the same source.
@@ -73,12 +72,24 @@ export function tickerLinkMenuItems({
           || current.binding?.kind !== "follow"
           || current.binding.sourceInstanceId !== nextSourceId
         ) return current;
-        return pinFollowingPane(current, resolveTickerForPane(state as AppState, current.instanceId));
+        // The pane it displaces follows the source again once this one leaves it.
+        return pinFollowingPane(current, resolveTickerForPane(state as AppState, current.instanceId), undefined, {
+          auto: true,
+          sourcePaneId: sourcePaneId(nextSourceId),
+        });
       }),
     });
   };
 
-  return layout.instances.flatMap((source): ContextMenuItem[] => {
+  // A source in another desktop window is not in this layout to list; the link can still be cut.
+  const remoteSymbol = sourceInstanceId && !findPaneInstance(layout, sourceInstanceId)
+    ? resolveTickerForPane(state as AppState, instance.instanceId)
+    : null;
+  const remoteUnlink: ContextMenuItem[] = remoteSymbol
+    ? [{ id: `unlink:${sourceInstanceId}`, label: "Unlink from Pane in Another Window", onSelect: () => unlink(remoteSymbol) }]
+    : [];
+
+  return [...remoteUnlink, ...layout.instances.flatMap((source): ContextMenuItem[] => {
     if (source.instanceId === instance.instanceId || !isPaneInLayout(layout, source.instanceId)) return [];
     const sourceDef = panes.get(source.paneId);
     if (!sourceDef) return [];
@@ -90,11 +101,7 @@ export function tickerLinkMenuItems({
       && followBindingReaches(layout, source.instanceId, instance.instanceId)
     ) return [];
     if (peer && !list && !resolveTickerForPane(state as AppState, source.instanceId)) return [];
-    const location = findPaneLocation(layout, source.instanceId);
-    // A source in another desktop window says which one; `layout` may be a window's view, where its own panes are "main".
-    const title = location && location.window !== "main" && location.kind !== "detached"
-      ? `${getTickerLinkSourceTitle(state, source, sourceDef, panes, "menu")} · ${windowLabelInView(location.window)}`
-      : getTickerLinkSourceTitle(state, source, sourceDef, panes, "menu");
+    const title = getTickerLinkSourceTitle(state, source, sourceDef, panes, "menu");
 
     if (source.instanceId !== sourceInstanceId) {
       return linkable
@@ -116,5 +123,5 @@ export function tickerLinkMenuItems({
         onSelect: () => unlink(symbol),
       }]
       : [];
-  });
+  })];
 }

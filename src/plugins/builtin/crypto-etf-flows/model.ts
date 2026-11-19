@@ -1,7 +1,7 @@
 import type { CryptoEtfFlowAsset, CryptoEtfFlowDay, CryptoEtfFlowsPayload } from "../../../api-client/crypto-etf-flows";
 import type { DataTableColumn } from "../../../components";
 import { calendarMonthsBefore } from "../../../utils/calendar-date";
-import { formatCompactAmount, formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatCompactAmount, formatNumber } from "../../../utils/format";
 
 export const CRYPTO_ETF_FLOWS_PANE_ID = "crypto-etf-flows";
 
@@ -45,14 +45,14 @@ export const cryptoEtfFlowAssetLabel = (asset: CryptoEtfFlowAsset) => asset === 
 
 /** A day's flow in US$ millions as the table shows it: `+665.2`, `-83.6`, `0.0`, `—` for none. */
 export function formatFlow(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "—";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   const text = formatNumber(Math.abs(value), 1);
   return value > 0 && text !== "0.0" ? `+${text}` : value < 0 && text !== "0.0" ? `-${text}` : text;
 }
 
 /** A sum of flows in US$ millions as a figure reads it: `+$526.7M`, `-$1.13B`, `$0`. */
 export function formatFlowAmount(millions: number | null | undefined): string {
-  if (millions == null || !Number.isFinite(millions)) return "—";
+  if (millions == null || !Number.isFinite(millions)) return MISSING_VALUE;
   const text = formatCompactAmount(millions * 1_000_000, { signed: true });
   return text.replace(/^([+-]?)/, "$1$");
 }
@@ -63,9 +63,14 @@ export const flowColor = (value: number | null | undefined, colors: { positive: 
 
 export interface CryptoEtfFlowSummary {
   latest: CryptoEtfFlowDay | null;
-  /** Sums of the published daily totals over the newest days listed. */
+  /**
+   * Sums of the published daily totals over the newest days, from the newest complete one: a day at the
+   * newest end still waiting on a fund is left out; an older day still waiting on one is counted as published.
+   */
   week: number | null;
   month: number | null;
+  /** The day those sums end on when newer days are still pending, which they leave out; null when they end on the newest. */
+  through: string | null;
   /** Every listed day's total: the net flow since the first fund launched. */
   sinceLaunch: number | null;
   firstDate: string | null;
@@ -78,10 +83,15 @@ const sumTotals = (days: readonly CryptoEtfFlowDay[]) => days.some((day) => day.
 /** The figures over the table: the newest day, the last 5 and 20 trading days, and since launch. */
 export function cryptoEtfFlowSummary(payload: CryptoEtfFlowsPayload): CryptoEtfFlowSummary {
   const days = payload.days;
+  // The newest days a fund has not reported yet are not complete days' flows: the rolling sums start at the newest
+  // complete day. An older day a fund never reported stays counted, as published, so the window stays 5 and 20 days.
+  const first = days.findIndex((day) => day.pending.length === 0);
+  const complete = first < 0 ? [] : days.slice(first);
   return {
     latest: days[0] ?? null,
-    week: days.length >= 5 ? sumTotals(days.slice(0, 5)) : null,
-    month: days.length >= 20 ? sumTotals(days.slice(0, 20)) : null,
+    week: complete.length >= 5 ? sumTotals(complete.slice(0, 5)) : null,
+    month: complete.length >= 20 ? sumTotals(complete.slice(0, 20)) : null,
+    through: complete[0] && complete[0] !== days[0] ? complete[0].date : null,
     sinceLaunch: sumTotals(days),
     firstDate: days.at(-1)?.date ?? null,
   };
@@ -103,11 +113,24 @@ export function pendingText(day: CryptoEtfFlowDay | null | undefined): string | 
 
 export type CryptoEtfFlowColumn = Omit<DataTableColumn, "id"> & { id: string };
 
-/** Date and the day's total, then each fund in the publisher's order. */
+/** Whether the server sent the funds' daily price move beside the flows. */
+export const hasFundPriceChanges = (payload: CryptoEtfFlowsPayload | null | undefined) =>
+  !!payload?.days.some((day) => day.priceChangePct !== undefined);
+
+/** A day's price move as the table shows it: `+2.15%`, `-0.40%`, `—` for none. */
+export function formatPriceChange(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
+  return `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+/** Date, the day's total and the funds' price move that day, then each fund in the publisher's order. */
 export function cryptoEtfFlowColumns(payload: CryptoEtfFlowsPayload | null | undefined): CryptoEtfFlowColumn[] {
   return [
     { id: "date", label: "Date", width: 12, align: "left" },
     { id: "total", label: "Total", width: 9, align: "right", title: "The day's net flow across the funds, US$ millions" },
+    ...hasFundPriceChanges(payload)
+      ? [{ id: "price", label: "Price %", width: 9, align: "right" as const, title: "The funds' price move that day: the median of their close-to-close changes" }]
+      : [],
     ...(payload?.funds ?? []).map((fund): CryptoEtfFlowColumn => ({
       id: `fund:${fund.ticker}`,
       label: fund.ticker,

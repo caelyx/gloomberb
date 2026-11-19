@@ -5,8 +5,12 @@ import type {
   ASKGToolResultOutcome,
   ASKGTransport,
 } from "../../../../api-client/askg";
-import { ASKGSessionController, CONFIRMATION_CLOSE_MARGIN_MS } from "./controller";
-import type { ASKGToolExecutor } from "./executor";
+import type { MarketContext } from "../../../../cli/types";
+import type { PaneFunctionCatalog } from "../../../../cli/pane-functions/catalog";
+import type { RemoteControlRequest, RemoteControlResponse, RemoteUiNodeSnapshot } from "../../../../remote/types";
+import { ASKGSessionController, CONFIRMATION_CLOSE_MARGIN_MS, type ASKGControllerManifest } from "./controller";
+import { CONFIRMATION_WAITING_NOTE, createASKGToolExecutor, type ASKGToolExecutor } from "./executor";
+import { buildASKGToolManifests } from "./manifest";
 import { canRateTurn, NOT_APPROVED_IN_TIME_NOTE, pendingConfirmation } from "./model";
 import type {
   ASKGFeedback,
@@ -14,8 +18,10 @@ import type {
   ASKGSessionStartRequest,
   ASKGSessionStartResponse,
   ASKGSseEvent,
+  ASKGToolCallEvent,
   ASKGTurnRequest,
   ClientToolManifest,
+  JsonValue,
   ToolResultPayload,
 } from "./protocol";
 
@@ -39,13 +45,13 @@ const WRITE_TOOL: ClientToolManifest = {
 
 const MANIFEST = { tools: [READ_TOOL, WRITE_TOOL], manifestHash: "sha256:test" };
 
-function sessionResponse(): ASKGSessionStartResponse {
+function sessionResponse(manifest: ASKGControllerManifest = MANIFEST): ASKGSessionStartResponse {
   return {
     protocolVersion: 1,
     sessionId: "s1",
-    manifestHash: MANIFEST.manifestHash,
+    manifestHash: manifest.manifestHash,
     serverTools: [],
-    acceptedTools: MANIFEST.tools.map((tool) => tool.name),
+    acceptedTools: manifest.tools.map((tool) => tool.name),
     rejectedTools: [],
     limits: {
       requestsPerMinute: 20,
@@ -90,6 +96,7 @@ interface Harness {
 function createHarness(options: {
   script: ASKGSseEvent[];
   executor?: ASKGToolExecutor;
+  manifest?: ASKGControllerManifest;
   toolResultOutcome?: ASKGToolResultOutcome;
   toolResultError?: Error;
 } ): Harness {
@@ -103,7 +110,7 @@ function createHarness(options: {
     isStreamingSupported: () => true,
     async startSession(request) {
       sessionRequests.push(request);
-      return sessionResponse();
+      return sessionResponse(options.manifest);
     },
     async streamTurn(_sessionId: string, request: ASKGTurnRequest, streamOptions: ASKGStreamOptions) {
       turnRequests.push(request);
@@ -124,7 +131,7 @@ function createHarness(options: {
 
   const controller = new ASKGSessionController({
     transport,
-    loadManifest: async () => MANIFEST,
+    loadManifest: async () => options.manifest ?? MANIFEST,
     getExecutor: () => options.executor ?? null,
     client: { kind: "tui", version: "1" },
     createId: () => "turn-1",
@@ -163,6 +170,9 @@ function executorReturning(payload: Partial<ToolResultPayload>): {
           ...payload,
         };
       },
+      async gate() {
+        return null;
+      },
       async undo() {
         return { status: "ok", elapsedMs: 1 };
       },
@@ -171,7 +181,8 @@ function executorReturning(payload: Partial<ToolResultPayload>): {
 }
 
 async function settle(): Promise<void> {
-  for (let index = 0; index < 8; index += 1) await Promise.resolve();
+  // Calls that change something take turns, which costs a few more microtasks.
+  for (let index = 0; index < 24; index += 1) await Promise.resolve();
 }
 
 /**
@@ -283,17 +294,18 @@ describe("ASKGSessionController", () => {
     await harness.streamed;
   });
 
-  test("offers scripts at session start and asks for them on every turn the session accepted them for", async () => {
-    const harness = negotiationHarness([{ scripts: 1 }, undefined]);
+  test("offers scripts, sources and follow-ups at session start and asks for them on every turn the session accepted them for", async () => {
+    const harness = negotiationHarness([{ scripts: 1, sources: 1, feedback: 1, followUps: 1 }, undefined]);
     await harness.controller.ask("first");
     await harness.controller.ask("second");
 
     expect(harness.sessionRequests).toHaveLength(1);
-    expect(harness.sessionRequests[0]?.capabilities).toEqual({ scripts: 1, feedback: 1 });
-    // Each turn decides alone, so each one repeats what the session accepted.
+    expect(harness.sessionRequests[0]?.capabilities).toEqual({ scripts: 1, feedback: 1, sources: 1, followUps: 1 });
+    // Each turn decides alone, so each one repeats what the session accepted;
+    // a rating is the session's alone and never goes with a turn.
     expect(harness.turnRequests.map((request) => request.capabilities)).toEqual([
-      { scripts: 1 },
-      { scripts: 1 },
+      { scripts: 1, sources: 1, followUps: 1 },
+      { scripts: 1, sources: 1, followUps: 1 },
     ]);
 
     // The session expires, and the server that renews it no longer runs them.
@@ -301,7 +313,7 @@ describe("ASKGSessionController", () => {
     await harness.controller.ask("third");
 
     expect(harness.sessionRequests).toHaveLength(2);
-    expect(harness.sessionRequests[1]?.capabilities).toEqual({ scripts: 1, feedback: 1 });
+    expect(harness.sessionRequests[1]?.capabilities).toEqual({ scripts: 1, feedback: 1, sources: 1, followUps: 1 });
     expect(harness.turnRequests[2]).not.toHaveProperty("capabilities");
   });
 
@@ -362,13 +374,12 @@ describe("ASKGSessionController", () => {
     await settle();
 
     harness.emit(toolCallEvent(1, WRITE_TOOL));
-    harness.emit(toolCallEvent(2, WRITE_TOOL));
     await settle();
     expect(pendingConfirmation(harness.controller.getState())).toMatchObject({ toolCallId: "call-1" });
 
-    // The server stopped waiting for call-1: its prompt closes, call-2 still asks.
+    // The server stopped waiting for call-1: its prompt closes, and the next call asks.
     harness.emit({
-      seq: 3,
+      seq: 2,
       type: "tool-executed",
       turnId: "turn-1",
       toolCallId: "call-1",
@@ -382,18 +393,20 @@ describe("ASKGSessionController", () => {
       status: "timeout",
       note: NOT_APPROVED_IN_TIME_NOTE,
     });
-    expect(pendingConfirmation(harness.controller.getState())).toMatchObject({ toolCallId: "call-2" });
+    harness.emit(toolCallEvent(3, WRITE_TOOL));
+    await settle();
+    expect(pendingConfirmation(harness.controller.getState())).toMatchObject({ toolCallId: "call-3" });
     // A click that arrives anyway writes nothing and tells the server nothing.
     harness.controller.resolveConfirmation("call-1", true);
     await settle();
     expect(calls).toHaveLength(0);
     expect(harness.posted).toHaveLength(0);
 
-    // The turn ends with call-2 still open: it closes the same way.
+    // The turn ends with call-3 still open: it closes the same way.
     harness.emit({ seq: 4, type: "done", turnId: "turn-1", reason: "complete" });
     await harness.streamed;
     expect(pendingConfirmation(harness.controller.getState())).toBeNull();
-    harness.controller.resolveConfirmation("call-2", true);
+    harness.controller.resolveConfirmation("call-3", true);
     await settle();
     expect(calls).toHaveLength(0);
     expect(harness.posted).toHaveLength(0);
@@ -438,6 +451,9 @@ describe("ASKGSessionController", () => {
         executed.push({ confirmed: options?.confirmed, confirmedChange: options?.confirmedChange });
         return { turnId: call.turnId, toolCallId: call.toolCallId, status: "ok", truncated: false, elapsedMs: 1 };
       },
+      async gate() {
+        return null;
+      },
       async undo() {
         return { status: "ok", elapsedMs: 1 };
       },
@@ -468,6 +484,9 @@ describe("ASKGSessionController", () => {
       async execute(call, options) {
         executed.push(options?.confirmed);
         return { turnId: call.turnId, toolCallId: call.toolCallId, status: "ok", truncated: false, elapsedMs: 1 };
+      },
+      async gate() {
+        return null;
       },
       async undo() {
         return { status: "ok", elapsedMs: 1 };
@@ -934,5 +953,383 @@ describe("ASKGSessionController answer ratings", () => {
     await controller.shareAnswer(turn().id);
 
     expect(turn().feedback).toMatchObject({ rating: "down", shared: false, shareFailed: true });
+  });
+});
+
+/**
+ * The app's real manifest and executor over a screen of semantic controls, so
+ * a UI call goes through the policy it shares with the terminal relay.
+ */
+function screenHarness() {
+  const catalog: PaneFunctionCatalog = { panes: new Map(), paneTemplates: new Map(), destroy() {} };
+  const tools = buildASKGToolManifests(catalog).tools;
+  const manifest = { tools, manifestHash: "sha256:screen" };
+  const screen: RemoteUiNodeSnapshot[] = [
+    { id: "ui:1", role: "button", label: "Place LIVE order", actions: ["press"], paneId: "broker-ticket:1" },
+    { id: "ui:2", role: "form-field", label: "Symbol", actions: ["setValue"], paneId: "broker-ticket:1" },
+    { id: "ui:3", role: "table", label: "Data table", actions: ["activateRow", "scrollBy", "selectRow"], paneId: "portfolio-list:1" },
+    { id: "ui:4", role: "menu", label: "Layout", actions: ["select"], metadata: { selection: "none", items: [{ id: "delete", label: "Delete Layout" }] }, paneId: "portfolio-list:1" },
+    { id: "ui:5", role: "menu", label: "Sort by", actions: ["select"], metadata: { selection: "single", items: [{ id: "name", label: "Name" }] }, paneId: "portfolio-list:1" },
+    {
+      id: "ui:6",
+      role: "list",
+      label: "Results",
+      actions: ["activate", "select"],
+      metadata: { scope: "command-bar", items: [{ index: 0, id: "ticker:AAPL", label: "AAPL", kind: "ticker" }, { index: 1, id: "theme", label: "Change Theme", kind: "command" }] },
+    },
+  ];
+  /** What `ui://node/{id}` adds: the pane's title, and a table's every row. */
+  const paneTitles: Record<string, string> = { "broker-ticket:1": "Trade AAPL", "portfolio-list:1": "Main Portfolio" };
+  const tableRows = [
+    { key: "AAPL", cells: [{ text: "AAPL" }, { text: "120" }] },
+    { key: "MSFT", cells: [{ text: "MSFT" }, { text: "40" }] },
+  ];
+  const layouts = [{ name: "Main" }, { name: "Semis" }];
+  const capabilities = [{ id: "broker.example", name: "Example Broker", operations: [{ id: "placeOrder", title: "Place order" }] }];
+  let treeFailures = 0;
+  const ran: RemoteControlRequest[] = [];
+  const remoteHandler = async (request: RemoteControlRequest): Promise<RemoteControlResponse> => {
+    if (request.type === "get") {
+      if (request.resource === "ui://tree") {
+        if (treeFailures > 0) {
+          treeFailures -= 1;
+          return { ok: false, error: { code: "remote_error", message: "The screen could not be read." } };
+        }
+        return { ok: true, data: screen };
+      }
+      if (request.resource.startsWith("ui://node/")) {
+        const node = screen.find((entry) => entry.id === decodeURIComponent(request.resource.slice("ui://node/".length)));
+        if (!node) return { ok: false, error: { code: "remote_error", message: "No such node." } };
+        return {
+          ok: true,
+          data: {
+            ...node,
+            ...(node.role === "table" ? { metadata: { ...node.metadata, rows: tableRows } } : {}),
+            ...(node.paneId && paneTitles[node.paneId] ? { paneTitle: paneTitles[node.paneId] } : {}),
+          },
+        };
+      }
+      if (request.resource === "app://layouts") return { ok: true, data: layouts };
+      if (request.resource === "app://capabilities") return { ok: true, data: capabilities };
+      return { ok: true, data: [] };
+    }
+    ran.push(request);
+    return { ok: true, data: { done: true } };
+  };
+  const executor = createASKGToolExecutor({ manifests: tools, registry: catalog, context: {} as MarketContext, remoteHandler });
+  const harness = createHarness({ script: [], executor, manifest });
+  let seq = 0;
+  const call = (operation: string, args: Record<string, JsonValue>, frame: Partial<ASKGToolCallEvent> = {}): string => {
+    const tool = tools.find((entry) => entry.name === operation)!;
+    seq += 1;
+    harness.emit({
+      seq,
+      type: "tool-call",
+      turnId: "turn-1",
+      toolCallId: `call-${seq}`,
+      name: tool.name,
+      args,
+      writeTier: tool.writeTier,
+      requiresConfirmation: tool.confirm === "always",
+      preview: null,
+      timeoutMs: tool.timeoutMs,
+      expiresAt: new Date(Date.now() + tool.timeoutMs).toISOString(),
+      ...frame,
+    });
+    return `call-${seq}`;
+  };
+  return {
+    ...harness,
+    screen,
+    paneTitles,
+    tableRows,
+    layouts,
+    /** The next `times` reads of the screen fail; every one, unless told. */
+    failTree: (times = Number.POSITIVE_INFINITY) => {
+      treeFailures = times;
+    },
+    call,
+    /** The UI and layout operations that ran, not the reads and dry runs that vetted them. */
+    ran: () => ran.flatMap((request) => (request.type === "call" && !request.dryRun ? [request.operation] : [])),
+    result: (toolCallId: string) => harness.posted.find((payload) => payload.toolCallId === toolCallId),
+    question: () => pendingConfirmation(harness.controller.getState()),
+  };
+}
+
+/** The executor reads the screen and runs under timers, past what microtasks settle. */
+const flush = () => new Promise((resolve) => setTimeout(resolve, 10));
+
+const PLACE_ORDER = { role: "button", label: "Place LIVE order" };
+
+describe("Ask Gloom acting on the screen", () => {
+  test("a press asks first, naming the control by label and role and the pane it is in", async () => {
+    const h = screenHarness();
+    await flush();
+    const id = h.call("ui.invoke_matching", PLACE_ORDER);
+    await flush();
+
+    expect(h.question()).toMatchObject({ toolCallId: id, confirmTitle: "Press \"Place LIVE order\" (button)", preview: "Pane: Trade AAPL" });
+    expect(h.ran()).toEqual([]);
+
+    h.controller.resolveConfirmation(id, true);
+    await flush();
+    expect(h.ran()).toEqual(["ui.invokeMatching"]);
+    expect(h.result(id)?.status).toBe("ok");
+    h.controller.dispose();
+  });
+
+  test("a declined press and one left unanswered do not run", async () => {
+    const h = screenHarness();
+    await flush();
+    const declined = h.call("ui.invoke_matching", PLACE_ORDER);
+    await flush();
+    h.controller.resolveConfirmation(declined, false);
+    await flush();
+    expect(h.result(declined)).toMatchObject({ status: "denied", note: "You declined this action." });
+
+    // The server waits a little longer than the prompt stays open.
+    const unanswered = h.call("ui.invoke_matching", PLACE_ORDER, {
+      expiresAt: new Date(Date.now() + CONFIRMATION_CLOSE_MARGIN_MS + 30).toISOString(),
+    });
+    await flush();
+    expect(h.question()?.toolCallId).toBe(unanswered);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(h.question()).toBeNull();
+    expect(h.result(unanswered)).toMatchObject({ status: "timeout", note: NOT_APPROVED_IN_TIME_NOTE });
+    expect(h.ran()).toEqual([]);
+    h.controller.dispose();
+  });
+
+  test("a control that changed between the question and the answer is not pressed", async () => {
+    const h = screenHarness();
+    await flush();
+    const relabelled = h.call("ui.invoke_matching", PLACE_ORDER);
+    await flush();
+    // The same node now says something else.
+    h.screen[0] = { ...h.screen[0]!, label: "Close all positions" };
+    h.controller.resolveConfirmation(relabelled, true);
+    await flush();
+    expect(h.result(relabelled)).toMatchObject({ status: "denied" });
+    expect(h.result(relabelled)?.note).toContain("changed while the person decided");
+
+    // The same button, but the pane it is in moved to another ticker.
+    h.screen[0] = { ...h.screen[0]!, label: "Place LIVE order" };
+    const moved = h.call("ui.invoke", { nodeId: "ui:1", action: "press" });
+    await flush();
+    h.paneTitles["broker-ticket:1"] = "Trade TSLA";
+    h.controller.resolveConfirmation(moved, true);
+    await flush();
+    expect(h.result(moved)?.status).toBe("denied");
+    expect(h.ran()).toEqual([]);
+    h.controller.dispose();
+  });
+
+  test("a screen that cannot be read refuses the call instead of running it", async () => {
+    const h = screenHarness();
+    await flush();
+    h.failTree();
+    const id = h.call("ui.invoke_matching", PLACE_ORDER);
+    await flush();
+    expect(h.question()).toBeNull();
+    expect(h.result(id)?.status).toBe("error");
+    expect(h.ran()).toEqual([]);
+    h.controller.dispose();
+  });
+
+  test("scrolling and setting a field's value run without asking", async () => {
+    const h = screenHarness();
+    await flush();
+    const scroll = h.call("ui.invoke", { nodeId: "ui:3", action: "scrollBy", input: { delta: 3 } });
+    const type = h.call("ui.invoke_matching", { role: "form-field", label: "Symbol", action: "setValue", input: "AAPL" });
+    await flush();
+
+    expect(h.question()).toBeNull();
+    expect(h.ran()).toEqual(["ui.invoke", "ui.invokeMatching"]);
+    expect([h.result(scroll)?.status, h.result(type)?.status]).toEqual(["ok", "ok"]);
+    h.controller.dispose();
+  });
+
+  test("a frame that asks for confirmation is asked about, even for a call that never asks", async () => {
+    const h = screenHarness();
+    await flush();
+    const id = h.call("ui.invoke", { nodeId: "ui:3", action: "scrollBy", input: { delta: 3 } }, { requiresConfirmation: true });
+    await flush();
+    expect(h.question()?.toolCallId).toBe(id);
+    expect(h.ran()).toEqual([]);
+    h.controller.resolveConfirmation(id, true);
+    await flush();
+    expect(h.ran()).toEqual(["ui.invoke"]);
+    h.controller.dispose();
+  });
+
+  test("an item of a plain menu and a row a table opens are asked about by their label", async () => {
+    const h = screenHarness();
+    await flush();
+    const menu = h.call("ui.invoke", { nodeId: "ui:4", action: "select", input: "delete" });
+    await flush();
+    expect(h.question()).toMatchObject({ toolCallId: menu, confirmTitle: "Choose \"Delete Layout\" from \"Layout\" (menu)", preview: "Pane: Main Portfolio" });
+    h.controller.resolveConfirmation(menu, false);
+    await flush();
+
+    const row = h.call("ui.invoke", { nodeId: "ui:3", action: "activateRow", input: 1 });
+    await flush();
+    expect(h.question()).toMatchObject({ toolCallId: row, confirmTitle: "Choose \"MSFT\" in \"Data table\" (table)" });
+    // The rows moved: the second one is another ticker now.
+    h.tableRows.reverse();
+    h.controller.resolveConfirmation(row, true);
+    await flush();
+    expect(h.result(row)?.status).toBe("denied");
+
+    // A select field's menu only picks a value.
+    const sort = h.call("ui.invoke", { nodeId: "ui:5", action: "select", input: "name" });
+    await flush();
+    expect(h.result(sort)?.status).toBe("ok");
+    expect(h.ran()).toEqual(["ui.invoke"]);
+    h.controller.dispose();
+  });
+
+  test("a command-bar row that opens a ticker runs, one that runs a command asks, and one not there is refused", async () => {
+    const h = screenHarness();
+    await flush();
+    const ticker = h.call("command_bar.activate_result", { label: "AAPL" });
+    await flush();
+    expect(h.result(ticker)?.status).toBe("ok");
+
+    const command = h.call("command_bar.activate_result", { label: "Change Theme" });
+    await flush();
+    expect(h.question()).toMatchObject({ toolCallId: command, confirmTitle: "Run \"Change Theme\" from the command bar" });
+    h.controller.resolveConfirmation(command, true);
+    await flush();
+
+    const missing = h.call("command_bar.activate_result", { label: "Sign Out" });
+    await flush();
+    expect(h.result(missing)).toMatchObject({ status: "denied", note: "No matching command-bar result is visible." });
+    expect(h.ran()).toEqual(["commandBar.activateResult", "commandBar.activateResult"]);
+    h.controller.dispose();
+  });
+
+  test("deleting a layout asks first, naming it, and not if another took its place", async () => {
+    const h = screenHarness();
+    await flush();
+    const id = h.call("layout.delete", { index: 1 });
+    await flush();
+    expect(h.question()).toMatchObject({ toolCallId: id, confirmTitle: "Delete the layout \"Semis\"" });
+
+    h.layouts.splice(1, 1, { name: "Research" });
+    h.controller.resolveConfirmation(id, true);
+    await flush();
+    expect(h.result(id)?.status).toBe("denied");
+    expect(h.ran()).toEqual([]);
+    h.controller.dispose();
+  });
+
+  test("a press on Ask Gloom's own Approve is refused, whatever the call says", async () => {
+    const h = screenHarness();
+    // Another conversation's approval row is on screen; this one waits for nothing.
+    h.screen.push({ id: "ui:9", role: "button", label: "Approve", actions: ["press"], metadata: { scope: "askg-prompt" } });
+    await flush();
+    const byLabel = h.call("ui.invoke_matching", { role: "button", label: "Approve" });
+    const byId = h.call("ui.invoke", { nodeId: "ui:9", action: "press" });
+    await flush();
+
+    expect(h.question()).toBeNull();
+    expect([h.result(byLabel)?.status, h.result(byId)?.status]).toEqual(["denied", "denied"]);
+    expect(h.ran()).toEqual([]);
+    h.controller.dispose();
+  });
+
+  test("while a question waits, nothing else that changes the app runs, and reads still do", async () => {
+    const h = screenHarness();
+    await flush();
+    const remove = h.call("layout.delete", { index: 1 });
+    await flush();
+    const changes = [
+      h.call("ui.invoke", { nodeId: "ui:3", action: "scrollBy", input: { delta: 3 } }),
+      h.call("ui.invoke_matching", PLACE_ORDER),
+      h.call("pane.set_state", { paneId: "broker-ticket:1", patch: { symbol: "TSLA" } }),
+      h.call("ticker.navigate", { symbol: "TSLA" }),
+    ];
+    const read = h.call("app.get_resource", { resource: "app://layouts" });
+    await flush();
+
+    expect(changes.map((id) => h.result(id))).toEqual(changes.map(() => expect.objectContaining({ status: "denied", note: CONFIRMATION_WAITING_NOTE })));
+    expect(h.result(read)?.status).toBe("ok");
+    // The question on screen is still the layout's, and nothing ran.
+    expect(h.question()?.toolCallId).toBe(remove);
+    expect(h.ran()).toEqual([]);
+
+    h.controller.resolveConfirmation(remove, true);
+    await flush();
+    expect(h.ran()).toEqual(["layout.delete"]);
+    h.controller.dispose();
+  });
+
+  test("an order through a plugin is asked about with every line of it, not the plugin's ids again", async () => {
+    const h = screenHarness();
+    await flush();
+    const id = h.call("capability.invoke", {
+      capabilityId: "broker.example",
+      operationId: "placeOrder",
+      payload: { symbol: "AAPL", side: "buy", quantity: 100, orderType: "limit", limitPrice: 187.5, timeInForce: "day", accountId: "U123" },
+    });
+    await flush();
+    expect(h.question()).toMatchObject({
+      toolCallId: id,
+      confirmTitle: "Place order with Example Broker",
+      preview: "Symbol: AAPL\nSide: buy\nSize: 100\nOrder type: limit\nPrice: 187.5\nTime in force: day\nAccount: U123",
+    });
+    h.controller.dispose();
+  });
+
+  test("a call whose screen could not be read, or whose turn was stopped, lets the next call have its turn", async () => {
+    const h = screenHarness();
+    await flush();
+    // The first look at the screen fails; the call behind it still gets asked about.
+    h.failTree(1);
+    const unread = h.call("ui.invoke_matching", PLACE_ORDER);
+    const next = h.call("ui.invoke_matching", PLACE_ORDER);
+    await flush();
+    expect(h.result(unread)?.status).toBe("error");
+    expect(h.question()?.toolCallId).toBe(next);
+
+    // Stopped while its question waits: the next turn's call is not left behind it.
+    h.controller.cancel();
+    await flush();
+    expect(h.question()).toBeNull();
+    void h.controller.ask("try again");
+    await flush();
+    const retried = h.call("ui.invoke_matching", PLACE_ORDER);
+    await flush();
+    expect(h.question()?.toolCallId).toBe(retried);
+    h.controller.resolveConfirmation(retried, true);
+    await flush();
+    expect(h.result(retried)?.status).toBe("ok");
+    expect(h.ran()).toEqual(["ui.invokeMatching"]);
+    h.controller.dispose();
+  });
+
+  test("calls that arrive together take turns: one question at a time, and its approval runs", async () => {
+    const h = screenHarness();
+    await flush();
+    // In the same tick, before anything is read.
+    const press = h.call("ui.invoke_matching", PLACE_ORDER);
+    const remove = h.call("layout.delete", { index: 1 });
+    const patch = h.call("pane.set_state", { paneId: "broker-ticket:1", patch: { symbol: "TSLA" } });
+    await flush();
+
+    expect(h.question()?.toolCallId).toBe(press);
+    expect([h.result(remove)?.note, h.result(patch)?.note]).toEqual([CONFIRMATION_WAITING_NOTE, CONFIRMATION_WAITING_NOTE]);
+    h.controller.resolveConfirmation(press, true);
+    await flush();
+    expect(h.result(press)?.status).toBe("ok");
+    expect(h.ran()).toEqual(["ui.invokeMatching"]);
+
+    // In the other order, the change runs first and the press is asked about after it.
+    const first = h.call("pane.set_state", { paneId: "broker-ticket:1", patch: { symbol: "TSLA" } });
+    const second = h.call("ui.invoke_matching", PLACE_ORDER);
+    await flush();
+    expect(h.result(first)?.status).toBe("ok");
+    expect(h.question()?.toolCallId).toBe(second);
+    h.controller.dispose();
   });
 });

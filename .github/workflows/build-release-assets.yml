@@ -5,6 +5,17 @@ name: Build Release Assets
 # it for a stable tag as the tag is; Nightly runs it for a main commit under a
 # nightly version, with the desktop files named nightly-* so they can never be
 # taken for a stable manifest.
+#
+# No registry plugin runs in these jobs, which hold the signing keys. The
+# plugin check reads these builds after this workflow, in
+# load-registry-plugins.yml, which callers run with no secrets.
+#
+# Each job attests the files it uploads, right before the upload: build
+# provenance signed with an OIDC identity that names this workflow and the
+# run, which no job outside this workflow can take on. The jobs that publish
+# take only files attested here in their own run (scripts/check-built-files.ts),
+# so whatever the plugin check did to the artifacts, in any attempt of the run,
+# fails that check instead of passing it.
 on:
   workflow_call:
     inputs:
@@ -20,11 +31,40 @@ on:
         description: "stable keeps Electrobun's stable-* desktop file names; nightly renames them nightly-*."
         type: string
         default: stable
+    secrets:
+      APPLE_CERTIFICATE_BASE64:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_KEYCHAIN_PASSWORD:
+        required: false
+      ELECTROBUN_APPLEAPIKEY:
+        required: false
+      ELECTROBUN_APPLEAPIKEY_BASE64:
+        required: false
+      ELECTROBUN_APPLEAPIISSUER:
+        required: false
+      ELECTROBUN_DEVELOPER_ID:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  GLOOMBERB_NO_TELEMETRY: "1"
+  DO_NOT_TRACK: "1"
 
 jobs:
   build:
+    # To attest what it uploads; see the top of this file.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
+      # A stable release publishes only once every entry here has uploaded its
+      # binary: scripts/release-assets.ts reads the assets from this matrix.
       matrix:
         include:
           - os: macos-latest
@@ -49,9 +89,10 @@ jobs:
             asset: gloomberb-windows-x64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-bun
 
@@ -62,22 +103,40 @@ jobs:
           BUILD_VERSION: ${{ inputs.version }}
         run: npm pkg set "version=$BUILD_VERSION"
 
+      # build.ts also runs the x64 Linux binaries on an emulated Nehalem CPU,
+      # which has no AVX2 or BMI2, so a build that needs a newer CPU fails here.
+      - name: Install QEMU's user-mode emulator
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
+
       - name: Build
         run: bun run scripts/build.ts ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.asset }}
           path: dist/*
 
   desktop-macos:
     runs-on: macos-latest
+    environment: ${{ inputs.channel == 'nightly' && 'signing-main' || 'release' }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-bun
+        with:
+          desktop: "true"
 
       - name: Set the build version
         if: ${{ inputs.version != '' }}
@@ -86,6 +145,7 @@ jobs:
         run: npm pkg set "version=$BUILD_VERSION"
 
       - name: Configure Apple signing
+        id: signing
         uses: ./.github/actions/apple-signing
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
@@ -102,6 +162,13 @@ jobs:
           ELECTROBUN_APPLEAPIKEY: ${{ secrets.ELECTROBUN_APPLEAPIKEY }}
           ELECTROBUN_DEVELOPER_ID: ${{ secrets.ELECTROBUN_DEVELOPER_ID }}
         run: bun run desktop:release
+
+      # Signed, notarized and stapled: nothing after this signs.
+      - name: Remove the signing keychain and notary key
+        if: ${{ always() && steps.signing.outcome != 'skipped' }}
+        uses: ./.github/actions/apple-signing
+        with:
+          cleanup: "true"
 
       - name: Build Homebrew app archives
         run: |
@@ -148,19 +215,30 @@ jobs:
           for file in stable-*; do mv "$file" "nightly-${file#stable-}"; done
           ls -l
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: artifacts/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gloomberb-desktop-macos-arm64
           path: artifacts/*
 
   desktop-windows:
     runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
 
       - uses: ./.github/actions/setup-bun
+        with:
+          desktop: "true"
 
       - name: Set the build version
         if: ${{ inputs.version != '' }}
@@ -173,8 +251,29 @@ jobs:
         shell: pwsh
         run: ./scripts/build-windows-desktop-package.ps1
 
+      # The runner image comes with an Inno Setup of its own, which moves when
+      # the image does. The installer is built with this one, and a newer one
+      # is taken back to it. ISCC.exe's file properties carry no version (they
+      # read 0.0.0.0), so the check reads the one the compiler prints for its
+      # engine, here on a script it writes no installer for.
       - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
+        shell: pwsh
+        env:
+          INNO_SETUP_VERSION: "6.7.1"
+        run: |
+          choco install innosetup --version $env:INNO_SETUP_VERSION --allow-downgrade -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $Iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $Iscc)) { throw "ISCC.exe is not at $Iscc." }
+          $Script = Join-Path $env:RUNNER_TEMP "inno-setup-version.iss"
+          Set-Content -LiteralPath $Script -Value "[Setup]`nAppName=Version check`nAppVersion=1`nDefaultDirName={autopf}\Version check"
+          $Output = & $Iscc /O- $Script
+          if ($LASTEXITCODE -ne 0) { $Output; throw "ISCC.exe failed on the version check script (exit $LASTEXITCODE)." }
+          $Engine = $Output | Select-String -Pattern '^Compiler engine version: Inno Setup (\S+)' | Select-Object -First 1
+          if (-not $Engine) { $Output; throw "ISCC.exe printed no compiler engine version." }
+          $Installed = $Engine.Matches[0].Groups[1].Value
+          if ($Installed -ne $env:INNO_SETUP_VERSION) { throw "Inno Setup $Installed is installed, not $env:INNO_SETUP_VERSION." }
+          Write-Host "Inno Setup $Installed"
 
       - name: Build Windows installer
         shell: pwsh
@@ -190,6 +289,20 @@ jobs:
         shell: pwsh
         run: ./scripts/verify-windows-desktop.ps1
 
+      # The screenshots and logs the verification judged, a failed run's too,
+      # under a name the jobs that publish do not download. Named for the
+      # attempt, so a rerun keeps the failed one's beside its own.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: windows-desktop-verification-${{ github.run_attempt }}
+          path: artifacts/windows-*-verification
+          if-no-files-found: ignore
+
+      - name: Keep only the release files
+        shell: pwsh
+        run: Remove-Item artifacts/windows-*-verification -Recurse -Force
+
       - name: Name the desktop files for the nightly channel
         if: ${{ inputs.channel == 'nightly' }}
         shell: bash
@@ -199,8 +312,47 @@ jobs:
           for file in stable-*; do mv "$file" "nightly-${file#stable-}"; done
           ls -l
 
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: artifacts/*
+
+      # Only once the build and its verification passed: a Windows build that
+      # failed them uploads nothing, which holds the release back like any
+      # other platform's missing files.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gloomberb-desktop-windows-x64
           path: artifacts/*
+
+  # The catalog snapshot the npm package carries: `gloom catalog` and `fn` read it instead of loading every built-in
+  # plugin. The binaries and the desktop app write their own while they build (scripts/build.ts). The job that
+  # publishes to npm installs nothing, so it takes this file, attested here, and puts it in the package.
+  catalog-snapshot:
+    # Nightly publishes nothing to npm.
+    if: ${{ inputs.channel != 'nightly' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-bun
+
+      - name: Write the catalog snapshot
+        run: bun run catalog:snapshot
+
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: src/cli/pane-functions/catalog-snapshot.json
+
+      # Not named gloomberb-*: the release and nightly jobs download those into the folder they upload from.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: catalog-snapshot
+          path: src/cli/pane-functions/catalog-snapshot.json
+          if-no-files-found: error

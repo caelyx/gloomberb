@@ -8,6 +8,7 @@ import { axisSteps } from "./axis-checks";
 import { desSteps } from "./des-checks";
 import { heatSteps } from "./heat-checks";
 import { headerSteps } from "./header-checks";
+import { queryBarSteps } from "./query-bar-checks";
 import { layoutSteps } from "./layout-checks";
 import { selectionSteps } from "./selection-checks";
 import { tabSweepSteps } from "./tab-sweep-checks";
@@ -38,6 +39,7 @@ interface Step {
   name: string;
   /** The fixture layout the step starts from (fixture.tsx). */
   scenario: string;
+  isolatedClock?: boolean;
   run(cdp: Cdp): Promise<void>;
 }
 
@@ -80,11 +82,18 @@ window.__check = {
     return { x: r.x, y: r.y, width: r.width, height: r.height };
   },
   paneRect(id) { return this.rect(this.pane(id)); },
+  /** A pane on screen: a stack's other tabs stay mounted, out of sight. */
+  shown(id) { const pane = this.pane(id); return !!pane && pane.getClientRects().length > 0; },
   part(id, role) { return this.pane(id)?.querySelector('[data-gloom-role=' + role + ']') ?? null; },
   tab(id, label) {
     return [...(this.pane(id)?.querySelectorAll('[role=tab]') ?? [])].find((tab) => tab.textContent.trim() === label) ?? null;
   },
   tabs(id) { return [...(this.pane(id)?.querySelectorAll('[role=tab]') ?? [])].map((tab) => tab.textContent.trim()); },
+  /** The tabs of the stack a pane shows in, null when it is alone in its spot. */
+  stackTabs(id) {
+    const strip = this.part(id, "pane-stack-tabs");
+    return strip && [...strip.querySelectorAll('[role=tab]')].map((tab) => ({ value: tab.getAttribute("data-tab-value"), selected: tab.getAttribute("aria-selected") === "true", rect: this.rect(tab) }));
+  },
   /** Where a press lands on a pane's header; null when that part is missing. */
   point(id, part) {
     if (part === "empty") return this.emptyBarPoint(id);
@@ -144,18 +153,70 @@ const near = (a: Rect | null, b: Rect | null, tolerance = 2) => !!a && !!b
   && Math.abs(a.width - b.width) <= tolerance && Math.abs(a.height - b.height) <= tolerance;
 const round = (rect: Rect | null) => rect && Object.fromEntries(Object.entries(rect).map(([key, value]) => [key, Math.round(value)]));
 
+/** A drop target drawn while a pane moves: a square of the target on the pane under the pointer, or a strip along the window's edge. */
+const dropTargetRect = (cdp: Cdp, selector: string) => evaluate<(Rect & { active: boolean }) | null>(cdp, `(() => {
+  const element = document.querySelector(${JSON.stringify(selector)});
+  const r = element && __check.rect(element);
+  return r && { ...r, active: element.getAttribute("data-active") === "true" };
+})()`);
+
+/** The landing preview, while it shows. */
+const dropPreviewRect = (cdp: Cdp) => evaluate<Rect | null>(cdp, `(() => { const el = document.querySelector('[data-gloom-role="drop-preview"]'); if (!el || getComputedStyle(el).opacity === "0") return null; return __check.rect(el); })()`);
+
 /**
- * Drags `paneId` by `part` onto the middle of `targetId`, which swaps two
- * docked panes, and checks they really traded places.
+ * Drags `paneId` by `part` over `hostId` and on to the target `selector`
+ * picks out (read while the pointer is over the host, where it is drawn),
+ * checks that target is lit and a preview shows, and lets go on it.
  */
-async function dockSwap(cdp: Cdp, paneId: string, part: string, targetId: string): Promise<void> {
+async function dropOnTarget(cdp: Cdp, paneId: string, part: string, hostId: string | null, selector: string): Promise<{ target: Rect; preview: Rect }> {
+  const from = await pointOf(cdp, paneId, part);
+  const host = hostId ? await rectOf(cdp, hostId) ?? fail(`no ${hostId}`) : null;
+  // Over the host off its target's squares (a quarter of the way in); for a
+  // strip, a little way on, as the targets show once the pane is on the move.
+  const over = host ? { x: host.x + host.width / 4, y: host.y + host.height * 0.7 } : { x: from.x + 24, y: from.y + 24 };
+  await mouse(cdp, "mouseMoved", from.x, from.y, false);
+  await mouse(cdp, "mousePressed", from.x, from.y, true);
+  await frames(cdp);
+  let at = from;
+  const moveTo = async (to: Point, steps = 10) => {
+    for (let step = 1; step <= steps; step += 1) {
+      await mouse(cdp, "mouseMoved", at.x + ((to.x - at.x) * step) / steps, at.y + ((to.y - at.y) * step) / steps, true);
+      await frames(cdp);
+    }
+    at = to;
+  };
+  try {
+    await moveTo(over);
+    const target = await dropTargetRect(cdp, selector) ?? fail(`no ${selector} while ${paneId} moved over ${hostId ?? "the window"}`);
+    if (target.active) fail(`${selector} was lit before the pointer was on it`);
+    await moveTo(center(target), 6);
+    await frames(cdp, 2);
+    const lit = await dropTargetRect(cdp, selector);
+    if (!lit?.active) fail(`${selector} was not lit with the pointer on it`, lit);
+    const preview = await dropPreviewRect(cdp) ?? fail(`no landing preview over ${selector}`);
+    return { target, preview };
+  } finally {
+    await mouse(cdp, "mouseReleased", at.x, at.y, false);
+    await frames(cdp, 2);
+  }
+}
+
+/**
+ * Drags `paneId` by `part` onto the centre of the target on `targetId`,
+ * which stacks it there as the shown tab, and checks the spot now holds both
+ * as tabs.
+ */
+async function stackOnto(cdp: Cdp, paneId: string, part: string, targetId: string): Promise<void> {
   const before = { pane: await rectOf(cdp, paneId), target: await rectOf(cdp, targetId) };
   if (!before.pane || !before.target) fail("pane missing", before);
-  await drag(cdp, await pointOf(cdp, paneId, part), [center(before.target)]);
-  const swapped = `(() => { const pane = __check.paneRect(${JSON.stringify(paneId)}); const target = __check.paneRect(${JSON.stringify(targetId)}); return pane && target && Math.abs(pane.x - ${before.target.x}) <= 2 && Math.abs(pane.y - ${before.target.y}) <= 2 && Math.abs(target.x - ${before.pane.x}) <= 2 && Math.abs(target.y - ${before.pane.y}) <= 2; })()`;
-  if (await waitFor(cdp, swapped)) return;
-  const after = { pane: await rectOf(cdp, paneId), target: await rectOf(cdp, targetId) };
-  fail(`dropping ${paneId} on ${targetId} did not swap them`, { before: { pane: round(before.pane), target: round(before.target) }, after: { pane: round(after.pane), target: round(after.target) } });
+  const { preview } = await dropOnTarget(cdp, paneId, part, targetId, "[data-gloom-role=drop-zone][data-side=center]");
+  if (!near(preview, before.target)) fail(`the tab's preview is not ${targetId} whole`, { preview: round(preview), target: round(before.target) });
+  const stacked = `(() => { const tabs = __check.stackTabs(${JSON.stringify(paneId)}); return !__check.shown(${JSON.stringify(targetId)}) && tabs?.length === 2 && tabs.at(-1).selected; })()`;
+  if (await waitFor(cdp, stacked)) return;
+  fail(`dropping ${paneId} on the centre of ${targetId}'s target did not stack them`, {
+    stack: await evaluate(cdp, `__check.stackTabs(${JSON.stringify(paneId)})`),
+    target: round(await rectOf(cdp, targetId)),
+  });
 }
 
 /** Drags a floating pane by `part` and checks it moved by the pointer's offset and still floats. */
@@ -297,6 +358,17 @@ async function chartWindow(cdp: Cdp): Promise<ChartWindow> {
 }
 
 const day = (time: number) => new Date(time).toISOString().slice(0, 16);
+
+const AXIS_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** The ISO day a chart's time-axis tag names, as `2026-11-03` (with a time of day, intraday) or `3 Nov 2026`. */
+function tagDay(label: string | null): string | undefined {
+  const iso = label?.match(/\d{4}-\d{2}-\d{2}/)?.[0];
+  if (iso) return iso;
+  const words = label?.match(/(\d{1,2}) ([A-Z][a-z]{2}) (\d{4})/);
+  const month = words ? AXIS_MONTHS.indexOf(words[2]!) + 1 : 0;
+  return words && month > 0 ? `${words[3]}-${String(month).padStart(2, "0")}-${words[1]!.padStart(2, "0")}` : undefined;
+}
 
 /** Waits for the chart composer to draw its bars (they arrive after a short delay) and returns its plot. */
 async function loadedChartPlot(cdp: Cdp): Promise<Rect> {
@@ -457,19 +529,31 @@ async function cursorDay(cdp: Cdp, paneId: string, at: Point): Promise<number> {
   return day ?? fail(`${paneId} reads out no observation under the pointer`, at);
 }
 
-/** Presses a tool in the chart's toolbar by the start of its label, focusing the pane first: only the focused pane shows its tools. */
+/**
+ * Presses a tool in the chart's toolbar by the start of its label, focusing the
+ * pane first: only the focused pane shows its tools. The bar is folded to one
+ * button until the pointer is on it, so the pointer goes there first.
+ */
 async function armTool(cdp: Cdp, paneId: string, label: string): Promise<void> {
   const toolbar = `!!__check.pane(${JSON.stringify(paneId)})?.querySelector("[data-gloom-role=composite-chart-toolbar]")`;
   if (!await evaluate<boolean>(cdp, toolbar)) {
     await click(cdp, await pointOf(cdp, paneId, "title"));
     if (!await waitFor(cdp, toolbar)) fail(`${paneId} shows no chart tools once focused`);
   }
-  const at = await evaluate<Point | null>(cdp, `(() => {
-    const tool = [...(__check.pane(${JSON.stringify(paneId)})?.querySelectorAll("[data-gloom-role=composite-chart-tool]") ?? [])]
-      .find((element) => (element.getAttribute("data-gloom-label") ?? "").startsWith(${JSON.stringify(label)}));
-    const r = tool?.getBoundingClientRect();
+  const centerOf = (role: string, match: string) => `(() => {
+    const element = [...(__check.pane(${JSON.stringify(paneId)})?.querySelectorAll("[data-gloom-role=${role}]") ?? [])]
+      .find((candidate) => (candidate.getAttribute("data-gloom-label") ?? "").startsWith(${JSON.stringify(match)}));
+    const r = element?.getBoundingClientRect();
     return r ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null;
-  })()`) ?? fail(`${paneId} has no ${label} tool`);
+  })()`;
+  let at = await evaluate<Point | null>(cdp, centerOf("composite-chart-tool", label));
+  if (!at) {
+    // Folded: the pointer on its button opens the bar.
+    const handle = await evaluate<Point | null>(cdp, centerOf("composite-chart-toolbar-toggle", ""));
+    if (!handle) fail(`${paneId} has no tool bar button`);
+    await mouse(cdp, "mouseMoved", handle.x, handle.y, false);
+    at = await waitFor<Point | null>(cdp, centerOf("composite-chart-tool", label)) ?? fail(`${paneId} has no ${label} tool`);
+  }
   await click(cdp, at);
 }
 
@@ -522,8 +606,9 @@ const nestedChartSteps: Step[] = NESTED_CHARTS.flatMap((paneId) => [
     scenario: "nested",
     async run(cdp: Cdp) {
       await crosshairUnder(cdp, paneId, (plot) => ({ x: plot.x + plot.width * 0.85, y: plot.y + plot.height - 3 }));
-      // Clear of the chart's drawing toolbar at the plot's top left.
-      await crosshairUnder(cdp, paneId, (plot) => ({ x: plot.x + plot.width * 0.5, y: plot.y + 3 }));
+      // Clear of the chart's drawing toolbar at the plot's top left, which reaches
+      // past the middle of a narrow pane.
+      await crosshairUnder(cdp, paneId, (plot) => ({ x: plot.x + plot.width * 0.72, y: plot.y + 3 }));
     },
   },
   {
@@ -772,21 +857,21 @@ const steps: Step[] = [
     name: `first paint has no blank or provisional chart and no blank overview frame (${theme})`, scenario: `paint&theme=${theme}`, run: checkFirstPaint,
   })),
   ...PRESS_POINTS.map(([label, part]): Step => ({
-    name: `docked pane: drag by the ${label} docks it elsewhere`,
-    scenario: "docked",
-    run: (cdp) => dockSwap(cdp, "plain:a", part, "plain:c"),
+    name: `pane in the layout: drag by the ${label} onto the centre of another's target stacks it there`,
+    scenario: "docked&titlebar=1",
+    run: (cdp) => stackOnto(cdp, "plain:a", part, "plain:c"),
   })),
   ...PRESS_POINTS.map(([label, part]): Step => ({
-    name: `tabbed pane: drag by the ${label} docks it elsewhere`,
-    scenario: "docked",
-    run: (cdp) => dockSwap(cdp, "tabs:a", part, "plain:c"),
+    name: `tabbed pane: drag by the ${label} onto the centre of another's target stacks it there`,
+    scenario: "docked&titlebar=1",
+    run: (cdp) => stackOnto(cdp, "tabs:a", part, "plain:c"),
   })),
   ...PRESS_POINTS.map(([label, part]): Step => ({
-    name: `error card pane: drag by the ${label} docks it elsewhere`,
-    scenario: "docked",
+    name: `error card pane: drag by the ${label} onto the centre of another's target stacks it there`,
+    scenario: "docked&titlebar=1",
     async run(cdp) {
       if (!await waitFor(cdp, `__check.pane("broken:a")?.textContent.includes("stopped working")`)) fail("broken:a shows no failure card");
-      await dockSwap(cdp, "broken:a", part, "plain:b");
+      await stackOnto(cdp, "broken:a", part, "plain:b");
     },
   })),
   ...PRESS_POINTS.map(([label, part]): Step => ({
@@ -899,7 +984,8 @@ const steps: Step[] = [
       const [news] = await waitFor<Attachment[] | null>(cdp, `window.__paneChrome.attachments.length ? window.__paneChrome.attachments : null`) ?? [];
       if (news?.paneId !== "news:float") fail("the key did not hand over the focused table", news);
       const lines = news.visibleText?.split("\n") ?? [];
-      if (!/TIME\s+HEADLINE/.test(lines[0] ?? "") || !lines.some((line) => /^1\s/.test(line))) fail("the table's own text did not go", lines.slice(0, 4));
+      // The time column names its zone ("TIME UTC").
+      if (!/TIME(?: \S+)?\s+HEADLINE/.test(lines[0] ?? "") || !lines.some((line) => /^1\s/.test(line))) fail("the table's own text did not go", lines.slice(0, 4));
       if (lines.some((line) => /^(100|159)\s/.test(line))) fail("a row scrolled out of view went with it", lines.length);
     },
   },
@@ -975,6 +1061,149 @@ const steps: Step[] = [
       const after = { pane: await rectOf(cdp, "tabs:a"), target: await rectOf(cdp, "plain:c") };
       if (!near(before.pane, after.pane) || !near(before.target, after.target)) {
         fail("a tab drag moved a pane", { before: { pane: round(before.pane), target: round(before.target) }, after: { pane: round(after.pane), target: round(after.target) } });
+      }
+    },
+  },
+  {
+    name: "stack: a click on a tab shows that pane, a drag takes it out of the stack",
+    scenario: "docked&titlebar=1",
+    async run(cdp) {
+      await stackOnto(cdp, "plain:a", "title", "plain:c");
+      const tabOf = (id: string) => evaluate<Rect | null>(cdp, `__check.stackTabs("plain:a")?.find((tab) => tab.value === ${JSON.stringify(id)})?.rect ?? __check.stackTabs("plain:c")?.find((tab) => tab.value === ${JSON.stringify(id)})?.rect ?? null`);
+      await click(cdp, center(await tabOf("plain:c") ?? fail("no plain:c tab")));
+      if (!await waitFor(cdp, `!__check.shown("plain:a") && __check.stackTabs("plain:c")?.find((tab) => tab.selected)?.value === "plain:c"`)) {
+        fail("clicking the plain:c tab did not show it", await evaluate(cdp, `__check.stackTabs("plain:c")`));
+      }
+      // Out over another pane, off its target: it floats there.
+      const away = await rectOf(cdp, "plain:b") ?? fail("no plain:b");
+      await drag(cdp, center(await tabOf("plain:a") ?? fail("no plain:a tab")), [{ x: away.x + away.width / 4, y: away.y + away.height * 0.7 }]);
+      const out = `__check.pane("plain:a")?.getAttribute("data-floating") === "true" && !__check.stackTabs("plain:c") && __check.pane("plain:c")?.getAttribute("data-floating") === "false"`;
+      if (!await waitFor(cdp, out)) fail("dragging the plain:a tab out did not float it and leave plain:c alone", await evaluate(cdp, `({ a: __check.pane("plain:a")?.getAttribute("data-floating"), c: __check.stackTabs("plain:c") })`));
+    },
+  },
+  ...(["left", "right", "top", "bottom"] as const).map((side): Step => ({
+    name: `floating pane: let go on the ${side} square of a pane's target, it splits that pane on that side`,
+    scenario: "floating&titlebar=1",
+    async run(cdp) {
+      const target = await rectOf(cdp, "plain:b") ?? fail("no plain:b");
+      const { preview } = await dropOnTarget(cdp, "plain:float", "title", "plain:b", `[data-gloom-role=drop-zone][data-side=${side}]`);
+      // The preview is the half of plain:b's spot on that side.
+      const across = side === "left" || side === "right";
+      const half = across ? preview.width < target.width * 0.75 && Math.abs(preview.height - target.height) <= 2 : preview.height < target.height * 0.75 && Math.abs(preview.width - target.width) <= 2;
+      const flush = side === "left" ? Math.abs(preview.x - target.x) <= 2 : side === "right" ? Math.abs(preview.x + preview.width - target.x - target.width) <= 2
+        : side === "top" ? Math.abs(preview.y - target.y) <= 2 : Math.abs(preview.y + preview.height - target.y - target.height) <= 2;
+      if (!half || !flush) fail(`the preview is not the ${side} half of plain:b`, { preview: round(preview), target: round(target) });
+      const landed = `(() => { const r = __check.paneRect("plain:float"); return r && __check.pane("plain:float").getAttribute("data-floating") === "false" && Math.abs(r.x - ${preview.x}) <= 2 && Math.abs(r.y - ${preview.y}) <= 2 && Math.abs(r.width - ${preview.width}) <= 2 && Math.abs(r.height - ${preview.height}) <= 2; })()`;
+      if (!await waitFor(cdp, landed)) fail(`it did not land where the preview showed, ${side} of plain:b`, { preview: round(preview), after: round(await rectOf(cdp, "plain:float")) });
+    },
+  })),
+  ...(["left", "top", "right", "bottom"] as const).map((edge): Step => ({
+    name: `floating pane: let go on the strip along the window's ${edge} edge, it goes along that whole edge of the layout`,
+    scenario: "floating&titlebar=1",
+    async run(cdp) {
+      const ids = ["plain:a", "tabs:a", "plain:b", "broken:a", "plain:c"];
+      const rects = await Promise.all(ids.map(async (id) => await rectOf(cdp, id) ?? fail(`no ${id}`)));
+      const area = { x: Math.min(...rects.map((r) => r.x)), y: Math.min(...rects.map((r) => r.y)), right: Math.max(...rects.map((r) => r.x + r.width)), bottom: Math.max(...rects.map((r) => r.y + r.height)) };
+      const { preview } = await dropOnTarget(cdp, "plain:float", "title", null, `[data-gloom-role=drop-strip][data-edge=${edge}]`);
+      const along = edge === "left" || edge === "right"
+        ? Math.abs(preview.y - area.y) <= 2 && Math.abs(preview.y + preview.height - area.bottom) <= 2 && (edge === "left" ? Math.abs(preview.x - area.x) <= 2 : Math.abs(preview.x + preview.width - area.right) <= 2)
+        : Math.abs(preview.x - area.x) <= 2 && Math.abs(preview.x + preview.width - area.right) <= 2 && (edge === "top" ? Math.abs(preview.y - area.y) <= 2 : Math.abs(preview.y + preview.height - area.bottom) <= 2);
+      if (!along) fail(`the preview does not run along the layout's whole ${edge} edge`, { preview: round(preview), area });
+      const landed = `(() => { const r = __check.paneRect("plain:float"); return r && __check.pane("plain:float").getAttribute("data-floating") === "false" && Math.abs(r.x - ${preview.x}) <= 2 && Math.abs(r.y - ${preview.y}) <= 2 && Math.abs(r.width - ${preview.width}) <= 2 && Math.abs(r.height - ${preview.height}) <= 2; })()`;
+      if (!await waitFor(cdp, landed)) fail(`it did not land along the ${edge} edge where the preview showed`, { preview: round(preview), after: round(await rectOf(cdp, "plain:float")) });
+    },
+  })),
+  {
+    name: "floating windows: a pane let go on the centre of a floating window's target stacks them there as tabs; a tab dragged out floats alone",
+    scenario: "floating&titlebar=1",
+    async run(cdp) {
+      const window = await rectOf(cdp, "plain:float") ?? fail("no floating pane");
+      const { preview } = await dropOnTarget(cdp, "plain:a", "title", "plain:float", "[data-gloom-role=drop-zone][data-side=center]");
+      if (!near(preview, window)) fail("the tab's preview is not the floating window whole", { preview: round(preview), window: round(window) });
+      const stacked = `(() => { const tabs = __check.stackTabs("plain:a"); return __check.pane("plain:a")?.getAttribute("data-floating") === "true" && !__check.shown("plain:float") && tabs?.map((tab) => tab.value).join() === "plain:float,plain:a" && tabs.at(-1).selected; })()`;
+      if (!await waitFor(cdp, stacked)) fail("dropping plain:a on the floating window's centre did not stack them there", await evaluate(cdp, `__check.stackTabs("plain:a")`));
+      if (!near(await rectOf(cdp, "plain:a"), window)) fail("the stack did not keep the floating window's rect", { window: round(window), stack: round(await rectOf(cdp, "plain:a")) });
+      // The other tab, out over a pane of the layout off its target: it floats there on its own, the stack's last tab a window again.
+      const tab = await evaluate<Rect | null>(cdp, `__check.stackTabs("plain:a")?.find((tab) => tab.value === "plain:float")?.rect ?? null`) ?? fail("no plain:float tab");
+      const away = await rectOf(cdp, "plain:b") ?? fail("no plain:b");
+      await drag(cdp, center(tab), [{ x: away.x + away.width / 4, y: away.y + away.height * 0.7 }]);
+      const apart = `__check.pane("plain:float")?.getAttribute("data-floating") === "true" && __check.shown("plain:float") && __check.shown("plain:a") && !__check.stackTabs("plain:a") && !__check.stackTabs("plain:float")`;
+      if (!await waitFor(cdp, apart)) fail("dragging the plain:float tab out did not leave two windows", await evaluate(cdp, `({ a: __check.stackTabs("plain:a"), float: __check.stackTabs("plain:float") })`));
+    },
+  },
+  {
+    name: "floating windows: a pane let go on a side square of a floating window's target shares its rect edge to edge, and their shared edge resizes both",
+    scenario: "floating&titlebar=1",
+    async run(cdp) {
+      const window = await rectOf(cdp, "plain:float") ?? fail("no floating pane");
+      const { preview } = await dropOnTarget(cdp, "plain:a", "title", "plain:float", "[data-gloom-role=drop-zone][data-side=right]");
+      if (Math.abs(preview.x + preview.width - window.x - window.width) > 2 || preview.width > window.width * 0.75) fail("the preview is not the floating window's right half", { preview: round(preview), window: round(window) });
+      const split = `(() => { const a = __check.paneRect("plain:a"); const f = __check.paneRect("plain:float"); return a && f && __check.pane("plain:a").getAttribute("data-floating") === "true" && Math.abs(f.x + f.width - a.x) <= 2 && Math.abs(f.x - ${window.x}) <= 2 && Math.abs(a.x + a.width - ${window.x + window.width}) <= 2 ? { a, f } : null; })()`;
+      const halves = await waitFor<{ a: Rect; f: Rect } | null>(cdp, split) ?? fail("plain:a did not take the right half of the floating window", { a: round(await rectOf(cdp, "plain:a")), float: round(await rectOf(cdp, "plain:float")) });
+      // The edge they share, dragged left: both follow, still edge to edge.
+      const from = { x: halves.f.x + halves.f.width, y: halves.f.y + halves.f.height / 2 };
+      const by = -64;
+      await dragHolding(cdp, from, { x: from.x + by, y: from.y }, async () => {
+        const f = await rectOf(cdp, "plain:float");
+        const a = await rectOf(cdp, "plain:a");
+        if (!f || !a || Math.abs(f.x + f.width - (from.x + by)) > 2 || Math.abs(a.x - (from.x + by)) > 2) {
+          fail("mid-drag, the shared edge did not move both windows with the pointer", { float: round(f), a: round(a), edge: from.x + by });
+        }
+      });
+      const cell = await evaluate<{ width: number; height: number }>(cdp, "window.__paneChrome.cell");
+      const settled = `(() => { const a = __check.paneRect("plain:a"); const f = __check.paneRect("plain:float"); return a && f && Math.abs(f.x + f.width - a.x) <= 2 && Math.abs(a.x - ${from.x + by}) <= ${cell.width / 2 + 1} && Math.abs(a.x + a.width - ${halves.a.x + halves.a.width}) <= 2; })()`;
+      if (!await waitFor(cdp, settled)) fail("releasing the shared edge did not keep both windows edge to edge", { float: round(await rectOf(cdp, "plain:float")), a: round(await rectOf(cdp, "plain:a")) });
+    },
+  },
+  {
+    name: "floating pane: parked at the screen's edge or corner, it stays floating",
+    scenario: "floating&titlebar=1",
+    async run(cdp) {
+      // The dock area: the docked panes reach every edge of it.
+      const docked = await Promise.all(["plain:a", "plain:c", "broken:a"].map(async (id) => await rectOf(cdp, id) ?? fail(`no ${id}`)));
+      const right = Math.max(...docked.map((r) => r.x + r.width));
+      const bottom = Math.max(...docked.map((r) => r.y + r.height));
+      const area = { x: docked[0]!.x, y: docked[0]!.y, width: right - docked[0]!.x, height: bottom - docked[0]!.y };
+      for (const corner of ["edge", "corner"] as const) {
+        const pane = await rectOf(cdp, "plain:float") ?? fail("no floating pane");
+        const from = await pointOf(cdp, "plain:float", "title");
+        // A few px short of the right edge, which the magnet pulls flush, and
+        // for the corner the bottom one too; held a while, as no time decides anything.
+        const dx = area.x + area.width - 3 - (pane.x + pane.width);
+        const dy = corner === "corner" ? area.y + area.height - 3 - (pane.y + pane.height) : 0;
+        const to = { x: from.x + dx, y: from.y + dy };
+        await dragHolding(cdp, from, to, async () => {
+          await evaluate(cdp, "new Promise((done) => setTimeout(done, 700))");
+        });
+        await frames(cdp, 3);
+        const after = await rectOf(cdp, "plain:float");
+        if (await evaluate(cdp, `__check.pane("plain:float")?.getAttribute("data-floating")`) !== "true") {
+          fail(`a window parked at the screen's ${corner} docked`, { before: round(pane), after: round(after), area: round(area) });
+        }
+      }
+    },
+  },
+  {
+    // The targets follow a move, not a press: a click on a title bar to focus
+    // a pane or pick a tab draws none of them, held or let go.
+    name: "floating pane: a press on a title bar that does not move draws no drop targets",
+    scenario: "floating&titlebar=1",
+    async run(cdp) {
+      const targets = `document.querySelectorAll('[data-gloom-role="drop-strip"], [data-gloom-role="drop-zone"]').length`;
+      for (const paneId of ["plain:float", "plain:a"]) {
+        const at = await pointOf(cdp, paneId, "title");
+        await mouse(cdp, "mouseMoved", at.x, at.y, false);
+        await mouse(cdp, "mousePressed", at.x, at.y, true);
+        try {
+          await frames(cdp, 3);
+          const held = await evaluate<number>(cdp, targets);
+          if (held) fail(`a press on ${paneId}'s title bar drew ${held} drop targets before it moved`);
+        } finally {
+          await mouse(cdp, "mouseReleased", at.x, at.y, false);
+          await frames(cdp, 2);
+        }
+        const after = await evaluate<number>(cdp, targets);
+        if (after) fail(`${after} drop targets stayed after a click on ${paneId}'s title bar`);
       }
     },
   },
@@ -1072,6 +1301,7 @@ const steps: Step[] = [
     // frame. The table keeps the size the pane last rendered it at.
     name: "floating board: the table under the chart band keeps its size between catch-ups",
     scenario: "resize&float=board",
+    isolatedClock: true,
     async run(cdp) {
       const width = `__check.rect(__check.pane("board:float")?.querySelector("[data-gloom-role=data-table]"))?.width ?? null`;
       const before = await evaluate<number | null>(cdp, width) ?? fail("board:float has no table");
@@ -1079,17 +1309,24 @@ const steps: Step[] = [
       await mouse(cdp, "mouseMoved", from.x, from.y, false);
       await mouse(cdp, "mousePressed", from.x, from.y, true);
       await frames(cdp);
+      await cdp.send("Emulation.setVirtualTimePolicy", { policy: "pause" });
       let during: number | null = null;
       try {
         await mouse(cdp, "mouseMoved", from.x + 6, from.y + 6, true);
         await mouse(cdp, "mouseMoved", from.x + 140, from.y + 54, true);
-        await frames(cdp, 2);
+        const painted = cdp.once("Emulation.virtualTimeBudgetExpired");
+        await cdp.send("Emulation.setVirtualTimePolicy", { policy: "advance", budget: 2 * 1000 / 60 });
+        await painted;
         during = await evaluate<number | null>(cdp, width);
+        if (during === null || Math.abs(during - before) > 0.5) fail("mid-drag, the table under the chart band was laid out at the frame's size", { before, during });
+        const expired = cdp.once("Emulation.virtualTimeBudgetExpired");
+        await cdp.send("Emulation.setVirtualTimePolicy", { policy: "advance", budget: 1000 });
+        await expired;
+        const caughtUp = await evaluate<number | null>(cdp, width);
+        if (caughtUp === null || Math.abs(caughtUp - before - 140) > 0.5) fail("the table did not catch up while the pointer stayed down", { before, caughtUp });
       } finally {
         await mouse(cdp, "mouseReleased", from.x + 140, from.y + 54, false);
-        await frames(cdp, 2);
       }
-      if (during === null || Math.abs(during - before) > 0.5) fail("mid-drag, the table under the chart band was laid out at the frame's size", { before, during });
     },
   },
   {
@@ -1271,7 +1508,7 @@ const steps: Step[] = [
       const intraday = await plotRect(cdp, "chart-composer:a");
       const latest = await evaluate<State>(cdp, state("chart-composer:b"));
       if (latest.line) fail("the daily chart drew a crosshair before any pointer was on a chart", latest);
-      const day = (label: string | null) => label?.match(/\d{4}-\d{2}-\d{2}/)?.[0];
+      const day = tagDay;
       const seen: State[] = [];
       for (const share of [0.3, 0.7]) {
         await mouse(cdp, "mouseMoved", intraday.x + intraday.width * share, intraday.y + intraday.height * 0.5, false);
@@ -1307,10 +1544,11 @@ const steps: Step[] = [
       })()`;
       type State = { line: boolean; time: string | null };
       const both = `({ a: ${state("chart-composer:a")}, b: ${state("chart-composer:b")} })`;
-      const pinHint = (label: string) => `(() => {
+      // A footer hint is a keycap and its words: the one whose words are `words`.
+      const pinHint = (words: string) => `(() => {
         const footer = __check.pane("chart-composer:a")?.querySelector("[data-gloom-role=pane-footer]");
-        const hit = [...(footer?.querySelectorAll("*") ?? [])].filter((node) => node.textContent?.trim().endsWith(${JSON.stringify(label)}))
-          .sort((x, y) => x.textContent.length - y.textContent.length)[0];
+        const hit = [...(footer?.querySelectorAll("[data-gloom-role=pane-hint]") ?? [])]
+          .find((hint) => hint.querySelector(".gloom-key-hint-words")?.textContent?.trim() === ${JSON.stringify(words)});
         return hit ? __check.rect(hit) : null;
       })()`;
       const press = async (key: string, code: string, keyCode: number) => {
@@ -1325,7 +1563,7 @@ const steps: Step[] = [
       const hovered = await waitFor<{ a: State; b: State } | null>(cdp, `(() => { const s = ${both}; return s.a.line && s.b.line && s.b.time ? s : null; })()`)
         ?? fail("the daily chart did not follow the hovered crosshair", await evaluate(cdp, both));
       // The pointer leaves the plot for the footer's pin: the last crosshair is the one pinned.
-      const pin = await waitFor<Rect | null>(cdp, pinHint("[p]in")) ?? fail("the focused chart's footer has no pin", await evaluate(cdp, `__check.pane("chart-composer:a")?.querySelector("[data-gloom-role=pane-footer]")?.textContent`));
+      const pin = await waitFor<Rect | null>(cdp, pinHint("pin")) ?? fail("the focused chart's footer has no pin", await evaluate(cdp, `__check.pane("chart-composer:a")?.querySelector("[data-gloom-role=pane-footer]")?.textContent`));
       await click(cdp, { x: pin.x + pin.width / 2, y: pin.y + pin.height / 2 });
       const pinned = await waitFor<{ a: State; b: State } | null>(cdp, `(() => { const s = ${both}; return s.a.line && s.b.line && s.b.time === ${JSON.stringify(hovered.b.time)} ? s : null; })()`)
         ?? fail("the charts did not hold the crosshair's moment once pinned and the pointer left", { hovered, now: await evaluate(cdp, both) });
@@ -1370,7 +1608,7 @@ const steps: Step[] = [
       const rest = await waitFor<Charts | null>(cdp, `(() => { const c = ${charts}; return ${JSON.stringify(panes)}.every((id) => c[id].length > 0) && c["fear-greed:a"].length > 1 ? c : null; })()`, 10_000)
         ?? fail("a pane did not draw its charts", await evaluate(cdp, charts));
       if (Object.values(rest).flat().some((chart) => chart.line)) fail("a chart drew a crosshair before any pointer was on a chart", rest);
-      const day = (label: string | null) => label?.match(/\d{4}-\d{2}-\d{2}/)?.[0] ?? null;
+      const day = (label: string | null) => tagDay(label) ?? null;
       // Every chart shows the crosshair as the one under the pointer does: the line, its time and
       // its series tagged on its axis, and in a legend of moving series (not the macro chart's flat
       // mean) the values at that time. Only the chart under the pointer adds the level line and the
@@ -1617,6 +1855,7 @@ const steps: Step[] = [
   ...desSteps,
   ...heatSteps,
   ...headerSteps,
+  ...queryBarSteps,
   ...layoutSteps,
   ...selectionSteps,
   ...axisSteps,
@@ -1653,9 +1892,12 @@ async function main(): Promise<void> {
     for (let round = 1; round <= repeat; round += 1) {
       for (const step of selected) {
         const started = performance.now();
+        const isolated = step.isolatedClock ? await launchBrowser("checks-clock", VIEWPORT.width, VIEWPORT.height) : null;
+        const stepCdp = isolated?.cdp ?? cdp;
         try {
-          await openScenario(cdp, page, step.scenario);
-          await step.run(cdp);
+          if (isolated) await stepCdp.send("Page.addScriptToEvaluateOnNewDocument", { source: PAGE_HELPERS + pageClock(process.env.PANE_CHROME_NOW) });
+          await openScenario(stepCdp, page, step.scenario);
+          await step.run(stepCdp);
           passes.set(step.name, (passes.get(step.name) ?? 0) + 1);
           console.log(`ok   ${step.name} (${Math.round(performance.now() - started)} ms)`);
         } catch (error) {
@@ -1663,7 +1905,9 @@ async function main(): Promise<void> {
           failures.push({ name: step.name, message });
           console.log(`FAIL ${step.name}\n     ${message}`);
           if (process.env.GITHUB_ACTIONS) console.log(`::error title=Pane chrome: ${step.name}::${message.replaceAll("\n", " ")}`);
-          await saveScreenshot(cdp, step.name).catch(() => {});
+          await saveScreenshot(stepCdp, step.name).catch(() => {});
+        } finally {
+          await isolated?.close();
         }
       }
       if (repeat > 1) console.log(`round ${round}/${repeat}: ${failures.length} failures so far`);

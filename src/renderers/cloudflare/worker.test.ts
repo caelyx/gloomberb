@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { handleRequest, SECURITY_HEADERS, type WorkerEnv } from "./worker";
+import { handleRequest, SECURITY_HEADERS, signedOutProxyLimit, type WorkerEnv } from "./worker";
 import { REGISTRY_ORIGIN } from "../../plugins/marketplace/feed";
 import { DOCS_SITE } from "../../docs/content";
 
@@ -70,6 +70,30 @@ describe("static Cloudflare host", () => {
     };
     const response = await handleRequest(new Request("https://term.example/assets/app/main.js"), env);
     expect(response.headers.has("x-robots-tag")).toBe(false);
+  });
+
+  test("keeps files named after their contents for a year, the icons for a day, and nothing else", async () => {
+    const served = (body: string, type: string): WorkerEnv => ({
+      ASSETS: { async fetch() { return new Response(body, { headers: { "content-type": type, "cache-control": "public, max-age=0, must-revalidate" } }); } },
+    });
+    const script = served("export {}", "text/javascript");
+    for (const path of ["/assets/app/main-0123456789abcdef.js", "/assets/app/main-0123456789abcdef.css", "/assets/plugins/gloom-polls/index-0123456789abcdef.js"]) {
+      const response = await handleRequest(new Request(`https://term.example${path}`), script);
+      expect(response.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+    }
+    // Only the build's own hash: a name that merely ends in letters and digits is revalidated.
+    for (const path of ["/assets/app/boot-frame-cgqhseqiov4g-tr2eugf187e4.js", "/assets/app/main-0123456789abcdeg.js", "/assets/app/main-0123456789abcd.js"]) {
+      const response = await handleRequest(new Request(`https://term.example${path}`), script);
+      expect(response.headers.get("cache-control")).toBe("public, max-age=0, must-revalidate");
+    }
+    const icon = await handleRequest(new Request("https://term.example/favicon.svg"), served("<svg/>", "image/svg+xml"));
+    expect(icon.headers.get("cache-control")).toBe("public, max-age=86400");
+    // A lazy chunk keeps its name across builds, so it is still revalidated.
+    const chunk = await handleRequest(new Request("https://term.example/assets/app/natural-earth/index.chunk.js"), script);
+    expect(chunk.headers.get("cache-control")).toBe("public, max-age=0, must-revalidate");
+    // A name an older build had falls back to the app's page, which must not be kept.
+    const gone = await handleRequest(new Request("https://term.example/assets/app/main-fedcba9876543210.js"), served("<!doctype html>", "text/html"));
+    expect(gone.headers.get("cache-control")).toBe("no-store");
   });
 
   test("serves a robots.txt that lets crawlers reach the noindex header", async () => {
@@ -166,7 +190,49 @@ describe("static Cloudflare host", () => {
     expect(proxied).toBe(false);
   });
 
-  test("confirms plugin proxy sessions with api.gloom.sh, sending only the session cookie", async () => {
+  test("keeps every proxied API request on api.gloom.sh", async () => {
+    const { env } = fixture();
+    const proxy = async (path: string) => {
+      const upstream: string[] = [];
+      const response = await handleRequest(new Request(`https://term.example${path}`, {
+        headers: { Cookie: "session=browser-cookie" },
+      }), env, async (request) => {
+        upstream.push(request.url);
+        return Response.json({ ok: true });
+      });
+      return { status: response.status, upstream };
+    };
+
+    // A path starting with two slashes (the URL parser reads `\` as `/`) names
+    // another host when resolved against the API origin.
+    for (const path of [
+      "/api//example.com/x",
+      "/api/\\example.com/x",
+      "/api/\\/example.com/x",
+      "/api//\\example.com/x",
+      "/api///example.com/x",
+      "/api/\t/example.com/x",
+      "/api//example.com/x?next=/",
+    ]) {
+      expect(await proxy(path)).toEqual({ status: 404, upstream: [] });
+    }
+
+    // Encoded separators are path text on the API host, not an authority.
+    for (const [path, expected] of [
+      ["/api/%2F%2Fexample.com/x", "https://api.gloom.sh/%2F%2Fexample.com/x"],
+      ["/api/%5Cexample.com/x", "https://api.gloom.sh/%5Cexample.com/x"],
+      ["/api/%5C%5Cexample.com/x", "https://api.gloom.sh/%5C%5Cexample.com/x"],
+      ["/api/@example.com/x", "https://api.gloom.sh/@example.com/x"],
+      ["/api", "https://api.gloom.sh/"],
+      ["/api/", "https://api.gloom.sh/"],
+      ["/api/auth/get-session", "https://api.gloom.sh/auth/get-session"],
+      ["/api/news?q=//example.com&limit=2", "https://api.gloom.sh/news?q=//example.com&limit=2"],
+    ] as const) {
+      expect(await proxy(path)).toEqual({ status: 200, upstream: [expected] });
+    }
+  });
+
+  test("checks plugin proxy sessions with api.gloom.sh, sending only the session cookie", async () => {
     const { env, requests } = fixture();
     const checks: Request[] = [];
     const response = await handleRequest(new Request("https://term.example/http-proxy", {
@@ -183,7 +249,8 @@ describe("static Cloudflare host", () => {
       return new Response(null, { status: 200 });
     });
 
-    expect(response.status).toBe(401);
+    // Signed out is served too; this target is simply not on the allowlist.
+    expect(response.status).toBe(403);
     expect(checks).toHaveLength(1);
     expect(checks[0]?.url).toBe("https://api.gloom.sh/auth/get-session");
     expect(checks[0]?.headers.get("cookie")).toBe("__Secure-gloomberb.session_token=worker-route-test");
@@ -218,4 +285,45 @@ describe("content security policy", () => {
     expect(connectSrc).toContain(REGISTRY_ORIGIN);
     expect(connectSrc?.split(/\s+/)).toContain(DOCS_SITE);
   });
+
+  test("lets Google One Tap load, and only Google's sign-in paths", () => {
+    const directives = new Map(SECURITY_HEADERS["content-security-policy"]
+      .split(";")
+      .map((directive) => directive.trim().split(/\s+/))
+      .map(([name, ...sources]) => [name!, sources]));
+    expect(directives.get("script-src")).toEqual(["'self'", "https://accounts.google.com/gsi/client"]);
+    expect(directives.get("frame-src")).toEqual(["'self'", "https://accounts.google.com/gsi/"]);
+    expect(directives.get("style-src")).toContain("https://accounts.google.com/gsi/style");
+    expect(directives.get("connect-src")).toContain("https://accounts.google.com/gsi/");
+    expect(directives.get("frame-ancestors")).toEqual(["'none'"]);
+  });
 });
+
+test("a signed-out proxy call is counted by its address and with everyone's, and refused once either is spent", async () => {
+  const counted: string[] = [];
+  const binding = (name: string, allow: (key: string) => boolean) => ({
+    async limit({ key }: { key: string }) {
+      counted.push(`${name}:${key}`);
+      return { success: allow(key) };
+    },
+  });
+  const { env } = fixture();
+  const request = (ip: string) => new Request("https://term.example/http-proxy", { method: "POST", headers: { "cf-connecting-ip": ip } });
+  expect(signedOutProxyLimit(env)).toBeUndefined();
+  const limit = signedOutProxyLimit({
+    ...env,
+    SIGNED_OUT_PROXY_PER_ADDRESS: binding("address", (key) => key !== "ip:203.0.113.9"),
+    SIGNED_OUT_PROXY_TOTAL: binding("total", () => counted.length < 4),
+  })!;
+  expect(await limit(request("203.0.113.1"))).toBe(true);
+  expect(await limit(request("203.0.113.9"))).toBe(false);
+  expect(await limit(request("2001:db8:1:2::5"))).toBe(false);
+  expect(counted).toEqual([
+    "address:ip:203.0.113.1",
+    "total:signed-out",
+    "address:ip:203.0.113.9",
+    "address:ip6:2001:db8:1:2",
+    "total:signed-out",
+  ]);
+});
+

@@ -1,7 +1,7 @@
 import type { PricePoint, Quote } from "../types/financials";
 import type { HistorySession } from "../types/price-history";
 import { hasLikelyQuoteUnitMismatch } from "../utils/currency-units";
-import { pricePointIntegrity } from "../utils/price-history-integrity";
+import { pricePointIntegrity, pricePointOpenWithheld } from "../utils/price-history-integrity";
 import {
   calendarBarStart,
   isCalendarResolution,
@@ -54,6 +54,8 @@ interface HistoryAnchor {
   /** Identity of the loaded version of the history's newest bar. */
   key: string;
   time: number;
+  /** The session's open, from a quote whose session is the whole bar (quoteSessionRange). */
+  open: number | null;
   /** Live extremes and close observed while this bar is still forming. */
   high: number | null;
   low: number | null;
@@ -75,7 +77,8 @@ function anchorKey(point: PricePoint, time: number): string {
 }
 
 function foldIntoBar(bar: PricePoint, observation: PricePoint): PricePoint {
-  const open = isFiniteNumber(bar.open) ? bar.open : bar.close;
+  // A withheld open (pricePointOpenWithheld) sets no range of the bar a print folds into.
+  const open = isFiniteNumber(bar.open) && !pricePointOpenWithheld(bar) ? bar.open : bar.close;
   const extremes = pricePointIntegrity(observation) ? [] : [observation.high, observation.low];
   const prices = [bar.high, bar.low, open, bar.close, observation.close, ...extremes].filter(isFiniteNumber);
   const volume = isFiniteNumber(bar.volume) || isFiniteNumber(observation.volume)
@@ -211,6 +214,7 @@ export class LiveBarAccumulator {
     this.anchor = {
       key,
       time: latestTime,
+      open: forming ? previous?.open ?? null : null,
       high: carried?.high ?? null,
       low: carried?.low ?? null,
       close: carried?.close ?? null,
@@ -316,6 +320,7 @@ export class LiveBarAccumulator {
       return;
     }
     if (!forming && this.inBar(time, anchor.time, options, exchange)) {
+      if (range?.open !== undefined) anchor.open = range.open;
       anchor.high = Math.max(anchor.high ?? price, price, range?.high ?? price);
       anchor.low = Math.min(anchor.low ?? price, price, range?.low ?? price);
       anchor.close = price;
@@ -364,8 +369,18 @@ export class LiveBarAccumulator {
     const anchor = this.anchor!;
     if (anchor.point?.source === latest && anchor.point.version === this.version) return anchor.point.value;
     let value = latest;
-    // A later quote cannot establish which reported OHLC field was wrong.
-    if (!pricePointIntegrity(latest)) {
+    // An open alone outside the bar's range is withheld (pricePointOpenWithheld): a quote that names the whole session
+    // says which field was wrong (GOGL's high, not its open), else the rest of the bar stands and the open sets no range.
+    const openWithheld = pricePointOpenWithheld(latest);
+    if (pricePointIntegrity(latest) || (openWithheld && anchor.open !== null && anchor.close !== null)) {
+      // A later quote cannot establish which reported OHLC field was wrong, unless it names the bar's whole session:
+      // its open, range, price and count are the bar (mergeQuoteIntoLatestBar).
+      if (anchor.open !== null && anchor.close !== null) {
+        const close = anchor.close;
+        value = { ...latest, open: anchor.open, high: Math.max(anchor.high ?? close, anchor.open, close),
+          low: Math.min(anchor.low ?? close, anchor.open, close), close, ...this.cumulative !== null ? { volume: this.cumulative } : {} };
+      }
+    } else {
       let volume = latest.volume;
       const end = anchor.volumeEnd ?? this.cumulative;
       if (isFiniteNumber(volume) && end !== null && anchor.volumeBase !== null) {
@@ -374,13 +389,14 @@ export class LiveBarAccumulator {
       if (anchor.close !== null) {
         const close = anchor.close;
         const open = isFiniteNumber(latest.open) ? latest.open : latest.close;
-        const high = isFiniteNumber(latest.high) ? latest.high : Math.max(open, latest.close);
-        const low = isFiniteNumber(latest.low) ? latest.low : Math.min(open, latest.close);
+        const body = openWithheld ? latest.close : open;
+        const high = isFiniteNumber(latest.high) ? latest.high : Math.max(body, latest.close);
+        const low = isFiniteNumber(latest.low) ? latest.low : Math.min(body, latest.close);
         value = {
           ...latest,
           open,
-          high: Math.max(high, open, latest.close, anchor.high ?? close, close),
-          low: Math.min(low, open, latest.close, anchor.low ?? close, close),
+          high: Math.max(high, body, latest.close, anchor.high ?? close, close),
+          low: Math.min(low, body, latest.close, anchor.low ?? close, close),
           close,
           ...(volume !== latest.volume ? { volume } : {}),
         };

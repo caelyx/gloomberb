@@ -3,6 +3,9 @@ import { isSubMinuteInterval, subMinuteDataMessage } from "../../../cli/known-ga
 import { CHART_BAR_SIZE_PRESETS, parseChartBarSize } from "../../../time-series/resolution";
 import { FINANCIAL_PERIOD_OPTION, FINANCIAL_PERIOD_COUNT_OPTION, HISTORY_RANGE_VALUES, RETURN_RANGE_VALUES } from "../shared/headless-options";
 import { DATE_OPTION_EXAMPLES } from "../../../utils/calendar-date";
+import { PRICE_WINDOW_FROM_HELP, PRICE_WINDOW_TO_HELP } from "../../../utils/price-window";
+import { isCurrencyCode } from "../../../utils/currency-pair";
+import { STATEMENT_CURRENCY_OPTION } from "../shared/statement-currency";
 
 type PaneSchema = Pick<HeadlessPaneDefinition, "argument" | "options" | "discovery">;
 
@@ -14,6 +17,13 @@ type PaneSchema = Pick<HeadlessPaneDefinition, "argument" | "options" | "discove
 const FUNDAMENTAL_PERIOD_OPTION: HeadlessPaneOptionDef = { ...FINANCIAL_PERIOD_OPTION, defaultValue: "quarterly" };
 
 const BAR_SIZES = CHART_BAR_SIZE_PRESETS.map((value) => ({ value }));
+
+const EXTENDED_HOURS_OPTION = {
+  key: "extendedHours",
+  description: "Include pre-market and after-hours bars on an intraday chart of a US listing.",
+  type: "boolean" as const,
+  defaultValue: false,
+};
 
 const BAR_SIZE_DESCRIPTION = "Bar size: any count of minutes, hours, days, weeks or months; one the source does not serve is built from its shorter bars";
 
@@ -30,6 +40,13 @@ function normalizeBarSize(value: string, auto: boolean): string {
   throw new Error(count
     ? `Invalid --chart-resolution value "${value}". Write ${count}m for ${count} minutes or ${count}mo for ${count} months.`
     : `Invalid --chart-resolution value "${value}". Use ${auto ? "auto, or " : ""}a count and a unit: 10m, 4h, 2d, 1wk, 3mo (up to a day of minutes or hours, a year of days or weeks, 12 months).`);
+}
+
+/** `usd` as USD; anything but a three-letter currency code is refused with the form it takes. */
+function normalizeCurrencyCode(value: string): string {
+  const code = value.trim().toUpperCase();
+  if (!isCurrencyCode(code)) throw new Error(`Invalid --currency value "${value}". Use a three-letter currency code: USD, EUR, TRY.`);
+  return code;
 }
 
 export const paneSchemas = {
@@ -51,6 +68,11 @@ export const paneSchemas = {
         values: [{ value: "auto" }, ...BAR_SIZES],
         normalize: (value) => normalizeBarSize(value, true),
       },
+      {
+        key: "exchange",
+        description: "Exchange for every ticker that names none: fn G BDI --exchange TSX is fn G BDI:TSX.",
+        type: "string",
+      },
     ],
     discovery: {
       id: "chart-composer",
@@ -71,12 +93,7 @@ export const paneSchemas = {
         values: HISTORY_RANGE_VALUES,
         defaultValue: "5Y",
       },
-      {
-        key: "extendedHours",
-        description: "Include pre-market and after-hours bars on an intraday chart of a US listing.",
-        type: "boolean",
-        defaultValue: false,
-      },
+      EXTENDED_HOURS_OPTION,
     ],
     discovery: {
       id: "price-chart",
@@ -122,7 +139,7 @@ export const paneSchemas = {
     options: [
       {
         key: "rangePreset",
-        description: "Price-history window. YTD runs from the prior year's last close.",
+        description: "Price-history window. 1D compares intraday bars in the latest session; YTD runs from the prior year's last close.",
         type: "enum",
         aliases: ["range"],
         values: RETURN_RANGE_VALUES,
@@ -138,20 +155,39 @@ export const paneSchemas = {
         ],
         defaultValue: "percent",
       },
+      // A window of dates, measured from the close before it as RETURN is: --from 2026-10-19 compares since the 16th's close.
+      { key: "from", type: "string", placeholder: "year|date", description: `${PRICE_WINDOW_FROM_HELP}; the returns are measured from the last close the tickers share before it, as RETURN measures`,
+        example: "--from 2019-12-31", replaces: ["rangePreset"] },
+      { key: "to", type: "string", placeholder: "year|date", description: PRICE_WINDOW_TO_HELP },
+      {
+        key: "totalReturn",
+        description: "Reinvest each cash distribution at its ex-date close, so the returns are total returns, not price returns.",
+        type: "boolean",
+        defaultValue: false,
+      },
+      {
+        key: "currency",
+        type: "string",
+        placeholder: "code",
+        description: "Convert every ticker into this currency at each day's FX close, so the returns carry its move against theirs",
+        example: "--currency USD",
+        normalize: normalizeCurrencyCode,
+      },
       {
         key: "chartResolution",
-        description: BAR_SIZE_DESCRIPTION,
+        description: `${BAR_SIZE_DESCRIPTION}. Defaults to intraday for 1D and daily otherwise`,
         type: "enum",
         aliases: ["resolution"],
         values: BAR_SIZES,
-        defaultValue: "1d",
         normalize: (value) => normalizeBarSize(value, false),
       },
+      EXTENDED_HOURS_OPTION,
     ],
     discovery: {
       id: "price-comparison",
-      aliases: ["stock comparison", "price performance comparison", "returns comparison", "compare stock prices"],
-      limitations: ["Compares closing-price changes in each listing's currency over shared observation dates. Cash distributions and FX conversion are excluded; these are not reinvested total returns."],
+      aliases: ["stock comparison", "price performance comparison", "returns comparison", "compare stock prices", "hedged vs unhedged",
+        "currency hedged"],
+      limitations: ["Compares price changes over shared bar times for 1D and shared observation dates for daily bars. Uses each listing's currency unless currency is set, which converts each bar at that day's FX close. Cash distributions are excluded unless totalReturn is set, which reinvests each distribution at its ex-date close."],
       screenshotReadiness: "ready",
     },
   },
@@ -170,6 +206,8 @@ export const paneSchemas = {
           { value: "operatingMargin", aliases: ["operating margin"] },
           { value: "netIncome", aliases: ["net income", "profit", "earnings"] },
           { value: "netMargin", aliases: ["net margin", "profit margin"] },
+          { value: "ebitda", aliases: ["ebitda", "operating income plus d&a"] },
+          { value: "depreciationAndAmortization", aliases: ["d&a", "da", "depreciation", "depreciation and amortization"] },
           { value: "operatingCashFlow", aliases: ["operating cash flow", "cash flow", "ocf"] },
           { value: "freeCashFlow", aliases: ["free cash flow", "fcf"] },
           { value: "freeCashFlowMargin", aliases: ["free cash flow margin", "fcf margin"] },
@@ -182,6 +220,7 @@ export const paneSchemas = {
       },
       FUNDAMENTAL_PERIOD_OPTION,
       FINANCIAL_PERIOD_COUNT_OPTION,
+      STATEMENT_CURRENCY_OPTION,
     ],
     discovery: {
       id: "fundamental-series",

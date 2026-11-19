@@ -1,5 +1,5 @@
 import { useEffect, useRef, type Ref } from "react";
-import { Box, ScrollBox, Text, TextAttributes, type BoxRenderable, type ScrollBoxRenderable } from "../../../ui";
+import { Box, ScrollBox, Text, TextAttributes, useNativeRenderer, useUiCapabilities, type BoxRenderable, type ScrollBoxRenderable } from "../../../ui";
 import { Button, FieldLabel, NumberField, SectionHeading, SegmentedControl, TextField, useFieldRing } from "../../../components";
 import { afterLayout, revealInScrollBox } from "../../../components/ui/reveal-in-scroll-box";
 import {
@@ -294,17 +294,30 @@ export function BrokerDetailContent({
   // Enter saves from any field, so what stopped the save can be below the
   // fold; bring it and the buttons into view.
   const actionsRef = useRef<BoxRenderable | null>(null);
+  const desktop = useUiCapabilities().nativePaneChrome === true;
+  const nativeRenderer = useNativeRenderer();
   useEffect(() => {
     if (!editError) return;
-    return afterLayout(() => revealInScrollBox(scrollRef.current, actionsRef.current));
-  }, [editError]);
+    const reveal = () => revealInScrollBox(scrollRef.current, actionsRef.current);
+    if (desktop) return afterLayout(reveal);
+    // The terminal lays the error line out only when it draws a frame, which
+    // can come after a 0 ms timer: measured before it, the buttons are one row
+    // short and the error pushes Save back below the fold.
+    const onFrame = () => {
+      nativeRenderer.off("frame", onFrame);
+      reveal();
+    };
+    nativeRenderer.on("frame", onFrame);
+    nativeRenderer.requestRender();
+    return () => nativeRenderer.off("frame", onFrame);
+  }, [desktop, editError, nativeRenderer]);
 
   if (!row) return <Box flexGrow={1} />;
 
   // The row's STATUS, and in full what the last action on the profile came to,
   // which outranks the profile's own status message until it is news no more.
   // The sign-in's end has a line of its own below.
-  const status = brokerRowStatus({ ...row, signInEndsAt: null }, activity);
+  const status = brokerRowStatus({ ...row, signInEnd: null }, activity);
   const note = activity.note ?? null;
   const detailStatusMessage = note?.text ?? (row.message || t("No status message."));
   const statusMessageColor = note
@@ -327,8 +340,10 @@ export function BrokerDetailContent({
         <Text fg={statusMessageColor} width={width} wrapText>
           {detailStatusMessage}
         </Text>
-        {row.signInEndsAt !== null && (
-          <Text fg={colors.warning} width={width} wrapText>{signInEndNote(row.signInEndsAt)}</Text>
+        {row.signInEnd !== null && (
+          <Text fg={row.signInEnd.soon ? colors.warning : colors.textDim} width={width} wrapText>
+            {signInEndNote(row.signInEnd.endsAt)}
+          </Text>
         )}
         <Text fg={colors.textMuted}>{tf("Last sync {time}", { time: formatRelativeAge(row.lastSyncedAt) })}</Text>
         {row.instance.localOnly ? <Text fg={colors.textMuted}>{t("Account data stays on this device, out of Gloom Cloud")}</Text> : null}

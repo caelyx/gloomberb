@@ -16,6 +16,13 @@ export interface PortfolioPaneSettings {
   hideCash: boolean;
   /** Value a portfolio at the regular close rather than the latest print (`fn PF --close`). */
   valueAtClose: boolean;
+  /**
+   * P&L over a period instead of since cost (`fn PF --from`, `portfolio show
+   * --from`): from the close before this date. Empty for P&L since cost.
+   */
+  pnlFrom: string;
+  /** The period's last day (`--to`); empty for the latest close. */
+  pnlTo: string;
   /** How long the pane is out of sight before coming back tints LAST by each row's move since then. */
   sinceLastSeen: SinceLastSeenAfter;
 }
@@ -174,18 +181,24 @@ function resolveCollectionOptions(entries: CollectionEntry[]): PaneSettingOption
 
 /** Columns that read a portfolio's target weights. */
 const TARGET_COLUMN_IDS = new Set(["target_weight", "drift", "trade", "trade_value"]);
-/** What a portfolio with targets shows when the pane's columns name none of them. */
-const REBALANCE_COLUMN_IDS = ["weight", "target_weight", "drift", "trade"];
+/**
+ * What a portfolio with targets shows when the pane's columns name none of
+ * them: TRADE in units and TRADE VAL in money, where the cash line's trade
+ * shows and the trades add up to nothing.
+ */
+const REBALANCE_COLUMN_IDS = ["weight", "target_weight", "drift", "trade", "trade_value"];
 
 /**
- * A portfolio with target weights shows WEIGHT, TGT WT, DRIFT and TRADE beside
- * its market value, unless the pane's columns already pick target columns.
+ * A portfolio with target weights shows WEIGHT, TGT WT, DRIFT, TRADE and
+ * TRADE VAL right after TICKER, where a rebalance reads them first, unless
+ * the pane's columns already pick target columns. A WEIGHT the columns place
+ * keeps its place, with the others after it.
  */
 function withTargetColumns(columnIds: string[]): string[] {
   if (columnIds.some((id) => TARGET_COLUMN_IDS.has(id))) return columnIds;
   const missing = REBALANCE_COLUMN_IDS.filter((id) => !columnIds.includes(id));
-  const anchor = columnIds.includes("weight") ? columnIds.indexOf("weight") : columnIds.indexOf("mkt_value");
-  const at = anchor >= 0 ? anchor + 1 : columnIds.length;
+  const anchor = columnIds.includes("weight") ? columnIds.indexOf("weight") : columnIds.indexOf("ticker");
+  const at = anchor + 1;
   return [...columnIds.slice(0, at), ...missing, ...columnIds.slice(at)];
 }
 
@@ -217,6 +230,8 @@ export function getPortfolioPaneSettings(settings: Record<string, unknown> | und
     hideHeader: settings?.hideHeader === true,
     hideCash: settings?.hideCash === true,
     valueAtClose: settings?.valueAtClose === true,
+    pnlFrom: typeof settings?.pnlFrom === "string" ? settings.pnlFrom.trim() : "",
+    pnlTo: typeof settings?.pnlTo === "string" ? settings.pnlTo.trim() : "",
     sinceLastSeen: isSinceLastSeenAfter(settings?.sinceLastSeen) ? settings.sinceLastSeen : "2m",
   };
 }
@@ -356,6 +371,22 @@ export function buildPortfolioPaneSettingsDef(
       description: "Price holdings at the regular close instead of the latest print, which includes extended hours.",
       type: "toggle",
     });
+    fields.push({
+      key: "pnlFrom",
+      label: "P&L From",
+      description: "A date, such as 2026-10-26: P&L and each position's contribution then run from the close before it, as portfolio show --from reads them. Leave blank for P&L since cost.",
+      type: "text",
+      placeholder: "since cost",
+    });
+    if (settings.pnlFrom) {
+      fields.push({
+        key: "pnlTo",
+        label: "P&L To",
+        description: "The period's last day. Leave blank for the latest close.",
+        type: "text",
+        placeholder: "latest close",
+      });
+    }
   }
 
   if (settings.collectionScope === "custom") {
@@ -385,7 +416,10 @@ export function buildPortfolioPaneSettingsDef(
     type: "toggle",
   });
   return {
-    title: "Portfolio Pane Settings",
+    // Named for what the pane shows: a watchlist's settings are not a portfolio's.
+    title: activeCollectionId && !activeCollectionIsPortfolio && config.watchlists.some((watchlist) => watchlist.id === activeCollectionId)
+      ? "Watchlist Settings"
+      : "Portfolio Settings",
     values: {
       ...settings,
       columnIds: [...settings.columnIds],

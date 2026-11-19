@@ -6,6 +6,7 @@ import { debugLog } from "../utils/debug-log";
 import { getPluginsDir } from "./loader";
 import { encodeBuiltinDisabledPluginIds } from "./ownership";
 import { pluginDirectoryNames } from "./plugin-names";
+import { samePluginSeedFailure, type PluginSeedNotice } from "./seed-progress";
 
 const log = debugLog.createLogger("plugin-seed");
 
@@ -16,26 +17,36 @@ const log = debugLog.createLogger("plugin-seed");
  * Extracting one must not take a working feature away from someone who upgrades.
  * On first launch after the move, each of these is installed once, then recorded
  * so it is never reinstalled — including when the user removes it deliberately.
+ *
+ * `codes` are the function codes it answered to while it shipped here, for a
+ * profile that does not have it: `gloom fn TV` there names the install rather
+ * than an unknown code, where the registry feed does not list the code.
  */
 export const EXTRACTED_PLUGINS = [
   // TV was a module inside Macro, so a user who turned Macro off was turning
   // it off with it. `previousOwnerIds` keeps that choice: the seeder does not
   // restore what someone disabled.
-  { id: "tv", name: "TV", repo: "gloom-sh/gloom-tv", directory: "gloom-tv", previousOwnerIds: ["macro", "macro-tv"] },
-  { id: "substack", name: "Substack", repo: "gloom-sh/gloom-substack", directory: "gloom-substack" },
-  { id: "ibkr", name: "Interactive Brokers", repo: "gloom-sh/gloom-ibkr", directory: "gloom-ibkr" },
-  { id: "ibkr-gateway", name: "IBKR Gateway", repo: "gloom-sh/gloom-ibkr-gateway", directory: "gloom-ibkr-gateway" },
-  { id: "public", name: "Public", repo: "gloom-sh/gloom-public", directory: "gloom-public" },
-  { id: "robinhood", name: "Robinhood", repo: "gloom-sh/gloom-robinhood", directory: "gloom-robinhood" },
-  { id: "simplefin", name: "SimpleFIN", repo: "gloom-sh/gloom-simplefin", directory: "gloom-simplefin" },
-  { id: "polls", name: "Polls", repo: "gloom-sh/gloom-polls", directory: "gloom-polls" },
-  { id: "prediction-markets", name: "Prediction Markets", repo: "gloom-sh/gloom-prediction-markets", directory: "gloom-prediction-markets" },
+  { id: "tv", name: "TV", repo: "gloom-sh/gloom-tv", directory: "gloom-tv", codes: ["TV"], previousOwnerIds: ["macro", "macro-tv"] },
+  { id: "substack", name: "Substack", repo: "gloom-sh/gloom-substack", directory: "gloom-substack", codes: ["SUB"] },
+  { id: "ibkr", name: "Interactive Brokers", repo: "gloom-sh/gloom-ibkr", directory: "gloom-ibkr", codes: [] },
+  { id: "ibkr-gateway", name: "IBKR Gateway", repo: "gloom-sh/gloom-ibkr-gateway", directory: "gloom-ibkr-gateway", codes: ["IBKR"] },
+  { id: "public", name: "Public", repo: "gloom-sh/gloom-public", directory: "gloom-public", codes: [] },
+  { id: "robinhood", name: "Robinhood", repo: "gloom-sh/gloom-robinhood", directory: "gloom-robinhood", codes: [] },
+  { id: "simplefin", name: "SimpleFIN", repo: "gloom-sh/gloom-simplefin", directory: "gloom-simplefin", codes: [] },
+  { id: "polls", name: "Polls", repo: "gloom-sh/gloom-polls", directory: "gloom-polls", codes: ["POLL"] },
+  { id: "prediction-markets", name: "Prediction Markets", repo: "gloom-sh/gloom-prediction-markets", directory: "gloom-prediction-markets", codes: ["PM"] },
   // Bring-your-own-key AI left under a new id, so the choice to switch the old
   // one off is recorded against `ai` rather than against this entry.
-  { id: "byok-ai", name: "BYOK AI", repo: "gloom-sh/gloom-byok-ai", directory: "gloom-byok-ai", previousOwnerIds: ["ai"] },
+  { id: "byok-ai", name: "BYOK AI", repo: "gloom-sh/gloom-byok-ai", directory: "gloom-byok-ai", codes: ["AGENT", "AI"], previousOwnerIds: ["ai"] },
 ] as const;
 
 type ExtractedPlugin = (typeof EXTRACTED_PLUGINS)[number];
+
+/** Where an install landed: its folder, and the sibling plugins it brought along. */
+interface SeedInstall {
+  directory: string;
+  peers?: string[];
+}
 
 export interface SeedResult {
   installed: string[];
@@ -49,17 +60,18 @@ export interface SeedResult {
  * was renamed sits in a directory under the old one. Missing that install would
  * clone a second copy, and the loader refuses the duplicate id.
  */
-function isInstalled(directory: string, pluginsDir: string): boolean {
-  return pluginDirectoryNames(directory).some((name) => existsSync(join(pluginsDir, name)));
+function installedDirectory(directory: string, pluginsDir: string): string | null {
+  return pluginDirectoryNames(directory).find((name) => existsSync(join(pluginsDir, name))) ?? null;
 }
 
 /**
  * The plugins left to install, each neither recorded as seeded, installed
  * already, nor switched off before the move, and the ids to record as seeded
  * without installing them. After a launch's seed, `pending` is what it could
- * not install.
+ * not install. Reads only the config and the plugins folder, so a launch can
+ * know before its first frame what it will install after.
  */
-function classifyExtractedPlugins(config: AppConfig, pluginsDir: string): { pending: ExtractedPlugin[]; settled: string[] } {
+export function classifyExtractedPlugins(config: AppConfig, pluginsDir: string = getPluginsDir()): { pending: ExtractedPlugin[]; settled: string[] } {
   const alreadySeeded = new Set(config.seededPlugins ?? []);
   // A previous owner that is now a group of built-ins counts as off only while
   // all of them are, which is when its id is saved.
@@ -74,7 +86,7 @@ function classifyExtractedPlugins(config: AppConfig, pluginsDir: string): { pend
     // Present already (installed by hand, or seeded before this record
     // existed), or turned off before the move, which restoring it would
     // override: recorded so we stop looking.
-    if (isInstalled(entry.directory, pluginsDir)
+    if (installedDirectory(entry.directory, pluginsDir)
       || disabled.has(entry.id) || ("previousOwnerIds" in entry && entry.previousOwnerIds.some((id) => disabled.has(id)))) {
       settled.push(entry.id);
       continue;
@@ -85,30 +97,57 @@ function classifyExtractedPlugins(config: AppConfig, pluginsDir: string): { pend
 }
 
 /**
- * Installs any extracted plugin the user has not seen yet.
+ * Installs any extracted plugin the user has not seen yet, one at a time, and
+ * reports each as it settles (`onSettled`, with where it landed when it did).
+ * `plan` is what a launch worked out before its first frame, so each plugin it
+ * said it would install is reported, even one another Gloom installed since.
  *
  * Best effort by design: a failure is logged and retried on the next launch
  * rather than recorded, because the common cause is being offline at startup and
- * marking it seeded would silently drop the plugin forever.
+ * marking it seeded would silently drop the plugin forever. A plugin that is
+ * there by the time its turn comes (a sibling's install brought it along, or
+ * another Gloom running beside this one installed it) counts as installed.
  */
 export async function seedExtractedPlugins(
   config: AppConfig,
-  installPlugin: (ref: string) => Promise<unknown>,
+  installPlugin: (ref: string) => Promise<SeedInstall | void>,
   pluginsDir: string = getPluginsDir(),
+  onSettled?: (id: string, installed: SeedInstall | null) => void,
+  plan: { pending: readonly ExtractedPlugin[]; settled: readonly string[] } = classifyExtractedPlugins(config, pluginsDir),
 ): Promise<SeedResult> {
-  const { pending, settled } = classifyExtractedPlugins(config, pluginsDir);
+  const { pending, settled } = plan;
   const result: SeedResult = { installed: [], failed: [], seeded: [...config.seededPlugins ?? [], ...settled] };
+  // A report that fails never changes what happened to the install it reports.
+  const report = (id: string, installed: SeedInstall | null) => {
+    try {
+      onSettled?.(id, installed);
+    } catch (error) {
+      log.error(`Could not report ${id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
 
   for (const entry of pending) {
-    try {
-      log.info(`Restoring ${entry.id} from ${entry.repo}`);
-      await installPlugin(entry.repo);
+    let installed: SeedInstall | null = null;
+    const present = installedDirectory(entry.directory, pluginsDir);
+    if (present) {
+      installed = { directory: present };
+    } else {
+      try {
+        log.info(`Restoring ${entry.id} from ${entry.repo}`);
+        installed = await installPlugin(entry.repo) ?? { directory: entry.directory };
+      } catch (error) {
+        const raced = installedDirectory(entry.directory, pluginsDir);
+        if (raced) installed = { directory: raced };
+        else log.error(`Could not restore ${entry.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (installed) {
       result.installed.push(entry.id);
       result.seeded.push(entry.id);
-    } catch (error) {
-      log.error(`Could not restore ${entry.id}: ${error}`);
+    } else {
       result.failed.push(entry.id);
     }
+    report(entry.id, installed);
   }
 
   return result;
@@ -132,16 +171,6 @@ function capitalize(text: string): string {
 /** What a seed's result leaves to record: the plugins it could not install, sorted, or nothing. */
 export function pluginSeedFailure(failedIds: readonly string[], gitMissing: boolean): PluginSeedFailure | undefined {
   return failedIds.length > 0 ? { plugins: [...new Set(failedIds)].sort(), gitMissing } : undefined;
-}
-
-/** Whether two recorded seed failures are the same: the same plugins, for the same reason. */
-export function samePluginSeedFailure(a: PluginSeedFailure | undefined, b: PluginSeedFailure | undefined): boolean {
-  return a?.gitMissing === b?.gitMissing && (a?.plugins ?? []).join() === (b?.plugins ?? []).join();
-}
-
-export interface PluginSeedNotice {
-  body: string;
-  type: "error" | "info";
 }
 
 /**

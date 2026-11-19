@@ -1,9 +1,11 @@
-import { METRIC_ALERTS_KEY, isDailyMetric, metricName } from "./metric-model";
+import { MISSING_VALUE } from "../../../utils/format";
+import { METRIC_ALERTS_KEY, RELATIVE_ALERTS_KEY, closeBasis, metricReadingText } from "./metric-model";
 import { metricAvailabilityError } from "./metric-data";
-import { readLevelAlertStores } from "./storage";
+import { relativeAlertText } from "./metric-command";
+import { levelAlertStoreKey, readLevelAlertStores } from "./storage";
 import { Box, type ScrollBoxRenderable } from "../../../ui";
 import { Button, DetailScrollBody, KeyValueRow, Notice, PaneStatusBody, PaneFooterScope, usePaneTabs } from "../../../components";
-import { usePluginPaneState } from "../../runtime";
+import { usePluginPaneState, usePluginState } from "../../runtime";
 import { EventAlertsPane } from "./events-pane";
 import { AlertHistoryPane } from "./history-pane";
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from "react";
@@ -30,21 +32,30 @@ import {
   readAlertsStoreError,
   serializeAlerts,
 } from "./alert-engine";
-import { parseAlertCommandValues } from "./command";
+import { parseAlertEdit } from "./command";
+import { MOVE_CHECKS_KEY, readMoveChecks, withMoveChecks } from "./move-checks";
 import { ALERT_TABS, ALERTS_KEY } from "./constants";
 import {
+  alertListing,
   conditionLabel,
   formatAlertDistance,
   formatAlertTargetPrice,
   formatCurrentPrice,
   formatQuoteChecked,
+  isoUtc,
+  listingWithCurrency,
+  measureLabel,
   relativeTime,
+  triggerLabel,
 } from "./format";
+import { MOVE_ALERTS_KEY, moveBasisText, moveRuleWords } from "./move";
+import { FIRED_LOG_KEY } from "./fired-log";
+import { withAlertChange } from "./alert-log";
 import type { AlertRule } from "./types";
 import { useQuoteEntries } from "../../../market-data/hooks";
 import { buildQuoteKey, resolveEntryData } from "../../../market-data/selectors";
 import { alertInstrument, streamedAlertQuote, syncAlertQuoteStream } from "./live";
-import { quoteAlertFields } from "./quotes";
+import { moveQuoteFields, quoteAlertFields } from "./quotes";
 import { clearPriceAlertFocus, getPriceAlertFocus, subscribePriceAlertFocus } from "./focus";
 import { alertTarget, alertViewHints, priceRuleSubject, useOpenAlertTarget } from "./targets";
 
@@ -57,28 +68,35 @@ type AlertColumnId =
   | "away"
   | "condition"
   | "quote"
-  | "triggered";
+  | "triggered"
+  | "created";
 
 type AlertColumn = DataTableColumn & { id: AlertColumnId };
 
 const ALERT_COLUMNS: AlertColumn[] = [
   { id: "status", label: "State", width: 9, align: "left" },
-  { id: "symbol", label: "Symbol", width: 7, align: "left" },
+  // Wide enough for a listing kept with its venue (7203:JPX).
+  { id: "symbol", label: "Symbol", width: 9, align: "left" },
   { id: "metric", label: "Measure", width: 14, align: "left" },
-  { id: "current", label: "Current", width: 8, align: "right" },
-  { id: "target", label: "Target", width: 11, align: "right" },
+  // Current and Target are one width, so a price reads the same in both, separators kept to 100,000.00. Together
+  // they take no more than before, and at 640 px Quote's heading stays clear of the edge.
+  { id: "current", label: "Current", width: 10, align: "right" },
+  { id: "target", label: "Target", width: 10, align: "right" },
   { id: "away", label: "Away", width: 8, align: "right" },
   { id: "condition", label: "Trigger", width: 12, align: "left" },
-  { id: "quote", label: "Quote", width: 14, align: "left" },
+  // Wide enough to say "not checked yet" for an alert no check has read.
+  { id: "quote", label: "Quote", width: 15, align: "left" },
   { id: "triggered", label: "Alerted", width: 8, align: "left" },
+  // The day the alert was made (UTC), as Events lists its rules; the detail gives the instant.
+  { id: "created", label: "Since", width: 10, align: "left" },
 ];
 
 const DETAIL_ROW = { labelWidth: 10, emphasis: false } as const;
 
-/** "AAPL above 400.00": the rule, which titles its detail. */
+/** "AAPL above 400.00", "GBPUSD=X moves 0.50% from the previous close": the rule, which titles its detail. */
 function alertTitle(alert: AlertRule): string {
-  if (alert.metric) return formatAlertDescription(alert);
-  return `${alert.symbol} ${conditionLabel(alert.condition).toLowerCase()} ${formatAlertTargetPrice(alert)}`;
+  if (alert.metric || alert.move) return formatAlertDescription(alert);
+  return `${alertListing({ symbol: alert.symbol, exchange: alert.exchange })} ${conditionLabel(alert.condition).toLowerCase()} ${formatAlertTargetPrice(alert, 24)}`;
 }
 
 /**
@@ -89,20 +107,30 @@ function AlertDetail({ alert, scrollRef }: { alert: AlertRule; scrollRef: RefObj
   const reason = alert.lastCheckError
     ? alert.lastCheckError.includes(alert.symbol) ? alert.lastCheckError : `${alert.symbol}: ${alert.lastCheckError}`
     : null;
+  const basis = alert.metric ? closeBasis(alert.metric) : null;
   return (
     <DetailScrollBody ref={scrollRef} resetScrollKey={alert.id}>
       <Box flexDirection="column">
         {reason ? <Box paddingBottom={1}><Notice tone="warning">{reason}</Notice></Box> : null}
         <KeyValueRow {...DETAIL_ROW} label="State" value={alert.status === "triggered" ? "Triggered" : "Active"} tone={alert.status === "triggered" ? "positive" : "muted"} />
+        <KeyValueRow {...DETAIL_ROW} label="Listing" value={listingWithCurrency(alertListing(alert), alert.lastQuoteCurrency)} />
         {/* With no quote the reason above says why; the price and its distance wait for one. */}
-        {alert.metric && isDailyMetric(alert.metric) ? <KeyValueRow {...DETAIL_ROW} label="Close date" value={alert.lastDailyClose ?? "Awaiting daily close"} /> : null}
-        {reason ? null : <KeyValueRow {...DETAIL_ROW} label="Current" value={formatCurrentPrice(alert, 24)} />}
-        {reason ? null : <KeyValueRow {...DETAIL_ROW} label="Away" value={formatAlertDistance(alert)} />}
+        {basis ? <KeyValueRow {...DETAIL_ROW} label="Close date" value={alert.lastDailyClose ?? `Awaiting ${basis}`} /> : null}
+        {reason ? null : <KeyValueRow {...DETAIL_ROW} label={alert.move ? "Move" : "Current"} value={formatCurrentPrice(alert, 24, { words: true })} />}
+        {/* What a move is measured from, as the quote's change line names it. */}
+        {!reason && alert.move ? <KeyValueRow {...DETAIL_ROW} label="From" value={moveBasisText(alert.lastMoveBasis).replace(/^vs /, "")} tone="muted" /> : null}
+        {/* The two readings that place the quadrant, as RRG states them. */}
+        {!reason && alert.metric?.kind === "rrg" && alert.lastCheckedPrice != null && alert.lastCheckedTarget != null ? <>
+          <KeyValueRow {...DETAIL_ROW} label="Strength" value={alert.lastCheckedPrice.toFixed(2)} />
+          <KeyValueRow {...DETAIL_ROW} label="Momentum" value={alert.lastCheckedTarget.toFixed(2)} />
+        </> : null}
+        {reason || alert.move ? null : <KeyValueRow {...DETAIL_ROW} label="Away" value={formatAlertDistance(alert)} />}
         {reason
           ? alert.lastCheckedAt ? <KeyValueRow {...DETAIL_ROW} label="Checked" value={relativeTime(alert.lastCheckedAt)} tone="muted" /> : null
           : <KeyValueRow {...DETAIL_ROW} label="Quote" value={formatQuoteChecked(alert)} tone="muted" />}
         {alert.triggeredAt ? <KeyValueRow {...DETAIL_ROW} label="Alerted" value={relativeTime(alert.triggeredAt)} /> : null}
         <KeyValueRow {...DETAIL_ROW} label="Armed" value={relativeTime(alert.armedAt ?? alert.createdAt)} tone="muted" />
+        <KeyValueRow {...DETAIL_ROW} label="Created" value={isoUtc(alert.createdAt)} tone="muted" />
       </Box>
     </DetailScrollBody>
   );
@@ -141,10 +169,19 @@ export function AlertsPane(props: PaneProps) {
   );
 }
 
+/** No readings yet, one object for every render: a fresh `{}` each time would read as a change. */
+const NO_MOVE_CHECKS = {};
+
 function PriceAlertsPane({ focused, width, height }: PaneProps) {
   const [alertsJson, setAlertsJson] = usePluginConfigState<unknown>(ALERTS_KEY, "[]");
   const [metricsJson, setMetricsJson] = usePluginConfigState<unknown>(METRIC_ALERTS_KEY, "[]");
+  const [relativeJson, setRelativeJson] = usePluginConfigState<unknown>(RELATIVE_ALERTS_KEY, "[]");
+  const [movesJson, setMovesJson] = usePluginConfigState<unknown>(MOVE_ALERTS_KEY, "[]");
   const { openPluginCommandWorkflow, notify } = usePluginAppActions();
+  // Deleting or re-arming a rule goes in this device's alert log, beside the alerts that fired.
+  const [, setAlertLog] = usePluginState<unknown>(FIRED_LOG_KEY, []);
+  // A move rule's readings, and whether it went off this session, are this device's, beside the synced rules.
+  const [savedMoveChecks, setMoveChecks] = usePluginState<unknown>(MOVE_CHECKS_KEY, NO_MOVE_CHECKS);
   const dialog = useDialog();
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [detailOpen, setDetailOpen] = useState(false);
@@ -152,13 +189,16 @@ function PriceAlertsPane({ focused, width, height }: PaneProps) {
   const detailAlertId = useRef<string | null>(null);
   const detailScrollRef = useRef<ScrollBoxRenderable | null>(null);
   // Keep the rule and daily-close basis visible in a narrow pane; the detail keeps all figures.
-  const columns = width < 106 ? ALERT_COLUMNS.filter(column => column.id !== "away" && column.id !== "triggered") : ALERT_COLUMNS;
+  const columns = width < 106 ? ALERT_COLUMNS.filter(column => column.id !== "away" && column.id !== "triggered" && column.id !== "created")
+    : width < 118 ? ALERT_COLUMNS.filter(column => column.id !== "created") : ALERT_COLUMNS;
   const showHorizontalScrollbar = columns.reduce((sum, column) => sum + column.width + 1, 2) > width;
-  const stores = useMemo(() => readLevelAlertStores(key => key === ALERTS_KEY ? alertsJson : metricsJson), [alertsJson, metricsJson]);
+  const stores = useMemo(() => readLevelAlertStores(key => key === ALERTS_KEY ? alertsJson : key === METRIC_ALERTS_KEY ? metricsJson
+    : key === MOVE_ALERTS_KEY ? movesJson : relativeJson),
+  [alertsJson, metricsJson, movesJson, relativeJson]);
   const storeError = stores.error;
 
   const { alerts, rows } = useMemo(() => {
-    const parsed = stores.alerts;
+    const parsed = withMoveChecks(stores.alerts, readMoveChecks(savedMoveChecks));
     const activeAlerts = parsed.filter((a) => a.status === "active");
     const triggeredAlerts = parsed
       .filter((a) => a.status === "triggered")
@@ -168,7 +208,7 @@ function PriceAlertsPane({ focused, width, height }: PaneProps) {
       alerts: parsed,
       rows: [...activeAlerts, ...triggeredAlerts],
     };
-  }, [stores]);
+  }, [savedMoveChecks, stores]);
 
   const focusedAlertId = useSyncExternalStore(subscribePriceAlertFocus, getPriceAlertFocus, getPriceAlertFocus);
   useEffect(() => {
@@ -201,20 +241,24 @@ function PriceAlertsPane({ focused, width, height }: PaneProps) {
     }
     if (alert.status !== "active") return alert;
     const quote = streamedAlertQuote(resolveEntryData(liveEntries.get(buildQuoteKey(alertInstrument(alert)))));
-    return quote ? { ...alert, ...quoteAlertFields(quote, quote.receivedAt) } : alert;
+    if (!quote) return alert;
+    // A move rule reads the quote's move, measured from the close its change line names.
+    return alert.move ? { ...alert, ...moveQuoteFields(quote, quote.receivedAt) } : { ...alert, ...quoteAlertFields(quote, quote.receivedAt) };
   }), [liveEntries, rows]);
 
   const savePaneAlerts = useCallback((id: string, next: (current: AlertRule[]) => AlertRule[]): string | null => {
-    const key = alerts.find(alert => alert.id === id)?.metric ? METRIC_ALERTS_KEY : ALERTS_KEY;
+    const found = alerts.find(alert => alert.id === id);
+    const key = found ? levelAlertStoreKey(found) : ALERTS_KEY;
     if (stores.errors[key]) return stores.errors[key];
     let error: string | null = null;
-    const setJson = key === METRIC_ALERTS_KEY ? setMetricsJson : setAlertsJson;
+    const setJson = key === METRIC_ALERTS_KEY ? setMetricsJson : key === RELATIVE_ALERTS_KEY ? setRelativeJson
+      : key === MOVE_ALERTS_KEY ? setMovesJson : setAlertsJson;
     setJson((currentJson: unknown) => {
       error = readAlertsStoreError(currentJson);
       return error ? currentJson : serializeAlerts(next(deserializeAlerts(currentJson)));
     });
     return error;
-  }, [alerts, setAlertsJson, setMetricsJson, stores]);
+  }, [alerts, setAlertsJson, setMetricsJson, setMovesJson, setRelativeJson, stores]);
 
   const deleteAlert = useCallback(async (id: string) => {
     const alert = alerts.find((a) => a.id === id);
@@ -230,15 +274,33 @@ function PriceAlertsPane({ focused, width, height }: PaneProps) {
       notify({ body: error, type: "error" });
       return;
     }
+    setAlertLog((saved: unknown) => withAlertChange(saved, "deleted", alert));
     setSelectedIdx((prev) => Math.max(0, Math.min(prev, rows.length - 2)));
-  }, [alerts, dialog, notify, rows.length, savePaneAlerts]);
+  }, [alerts, dialog, notify, rows.length, savePaneAlerts, setAlertLog]);
 
   const rearmAlert = useCallback((id: string) => {
-    const error = savePaneAlerts(id,
-      (current) => current.map((a) => (a.id === id ? rebuildAlert(a) : a)),
-    );
-    if (error) notify({ body: error, type: "error" });
-  }, [notify, savePaneAlerts]);
+    // A move rule that went off this session is armed again on this device alone, where it went off: its reading goes, the rule stays.
+    const move = alerts.find((alert) => alert.id === id && alert.move);
+    if (move) {
+      if (move.status !== "triggered") return;
+      setMoveChecks((saved: unknown) => Object.fromEntries(Object.entries(readMoveChecks(saved)).filter(([key]) => key !== id)));
+      setAlertLog((saved: unknown) => withAlertChange(saved, "rearmed", move));
+      syncAlertQuoteStream();
+      return;
+    }
+    // Only an alert that went off is re-armed, as the store reads at the write: one still waiting is left, and not logged.
+    const rearmed: AlertRule[] = [];
+    const error = savePaneAlerts(id, (current) => current.map((a) => {
+      if (a.id !== id || a.status !== "triggered") return a;
+      rearmed.push(a);
+      return rebuildAlert(a);
+    }));
+    if (error) {
+      notify({ body: error, type: "error" });
+      return;
+    }
+    for (const alert of rearmed) setAlertLog((saved: unknown) => withAlertChange(saved, "rearmed", alert));
+  }, [alerts, notify, savePaneAlerts, setAlertLog, setMoveChecks]);
 
   const startAddAlert = useCallback(() => {
     openPluginCommandWorkflow("set-alert");
@@ -273,14 +335,13 @@ function PriceAlertsPane({ focused, width, height }: PaneProps) {
             type: "text",
             key: "alert",
             label: "Edit alert",
-            description: "SYMBOL above|below|crosses PRICE",
-            placeholder: "AAPL above 200",
+            description: selected.move ? "SYMBOL moves|up|down PERCENT" : "SYMBOL above|below|crosses PRICE",
+            placeholder: selected.move ? "GBPUSD=X moves 0.5%" : "AAPL above 200",
           }}
-          currentValue={selected.metric ? formatAlertDescription(selected).replace(" (TTM)", "").replace(" · on daily close", "") : `${selected.symbol} ${selected.condition} ${selected.targetPrice}`}
+          currentValue={relativeAlertText(selected) ?? (selected.metric ? formatAlertDescription(selected).replace(" (TTM)", "").replace(" · on daily close", "")
+            : selected.move ? `${selected.symbol} ${moveRuleWords(selected)}` : `${selected.symbol} ${selected.condition} ${selected.targetPrice}`)}
           onApply={async (value) => {
-            const parsed = parseAlertCommandValues({ shortcut: value });
-            if (!parsed) throw new Error("Use SYMBOL above|below|crosses PRICE.");
-            if (!!parsed.metric !== !!selected.metric) throw new Error("Add a new alert to change between price and a valuation or technical measure.");
+            const parsed = parseAlertEdit(selected, value);
             const error = savePaneAlerts(selected.id, (current) => current.map((alert) => (
               alert.id === selected.id
                 ? { ...editAlert(alert, parsed.symbol, parsed.condition, parsed.price), ...(parsed.metric ? { metric: parsed.metric } : {}) }
@@ -373,15 +434,19 @@ function PriceAlertsPane({ focused, width, height }: PaneProps) {
         };
       case "symbol":
         return {
-          text: alert.symbol,
+          // The listing as it was kept: 7203:JPX for Toyota in Tokyo, AAPL for a bare US symbol.
+          text: alertListing({ symbol: alert.symbol, exchange: alert.exchange }),
           color: colors.textBright,
           attributes: TextAttributes.BOLD,
         };
       case "metric":
-        return { text: alert.metric ? metricName(alert.metric) : "Price" };
+        return { text: measureLabel(alert) };
       case "current":
         return {
           text: formatCurrentPrice(alert, column.width),
+          // The quadrant word exports with the readings that place it.
+          ...(alert.metric?.kind === "rrg" && !alert.lastCheckError && alert.lastCheckedPrice != null && alert.lastCheckedTarget != null
+            ? { value: metricReadingText(alert.metric, { value: alert.lastCheckedPrice, target: alert.lastCheckedTarget }) } : {}),
           color: alert.lastCheckError ? colors.negative : colors.text,
         };
       case "target":
@@ -392,17 +457,21 @@ function PriceAlertsPane({ focused, width, height }: PaneProps) {
           color: colors.textDim,
         };
       case "condition":
-        return { text: alert.metric?.kind === "ma_cross" ? `Cross ${alert.metric.direction}` : conditionLabel(alert.condition) };
+        return { text: triggerLabel(alert) };
       case "quote":
         return {
           text: formatQuoteChecked(alert),
+          // A settled close exports as its session date.
+          ...(alert.metric && closeBasis(alert.metric) && alert.lastDailyClose && !alert.lastCheckError ? { value: alert.lastDailyClose } : {}),
           color: alert.lastCheckError ? colors.negative : colors.textDim,
         };
       case "triggered":
         return {
-          text: alert.triggeredAt ? relativeTime(alert.triggeredAt) : "-",
+          text: alert.triggeredAt ? relativeTime(alert.triggeredAt) : MISSING_VALUE,
           color: colors.textDim,
         };
+      case "created":
+        return { text: isoUtc(alert.createdAt).slice(0, 10), color: colors.textDim };
     }
   }, []);
 

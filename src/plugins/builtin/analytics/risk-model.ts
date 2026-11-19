@@ -1,7 +1,9 @@
 import { portfolioOptionGreeks } from "./risk-options";
+import { manualPortfolioValue } from "./manual-value";
 import type { Portfolio, TickerRecord } from "../../../types/ticker";
-import { formatCurrency, formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatCurrency, formatNumber } from "../../../utils/format";
 import { resolveCurrencyUnit } from "../../../utils/currency-units";
+import { canonicalExchange, isUsEquityExchange } from "../../../utils/exchanges";
 import {
   getPortfolioPositionMetrics,
   resolvePortfolioMarketValue,
@@ -10,14 +12,16 @@ import type { Quote } from "../../../types/financials";
 import type { CloudQuotePayload } from "../../../api-client/types";
 import { getCompletedRegularSessionDisplay } from "../../../market-data/market/status";
 import { quoteTradingDay } from "../../../market-data/quotes/day-range";
-import type { DatedReturn } from "./metrics";
+import type { DatedReturn } from "../../../portfolio/return-metrics";
+import { episodeEvidence, episodeIssues, episodeProxyMarker, episodeWindowText, replayEpisodes, RISK_EPISODES } from "./risk-episodes";
 import {
   computeWeightedPortfolioReturns,
   syntheticPositionUnsupportedReason,
-} from "./metrics";
+} from "../../../portfolio/return-metrics";
 import {
   buyAndHoldReturns,
   concentration,
+  matchedReturnCount,
   pairedReturns,
   regressReturns,
   RISK_TAIL_CONFIDENCE,
@@ -45,10 +49,20 @@ import {
 import {
   RISK_FACTOR_INSTRUMENTS,
   riskInstrumentId,
+  riskInstrumentOf,
   type RiskHoldingRequest,
   type RiskMarketSnapshot,
 } from "./risk-client";
-import { accountFxPair, accountFxReason, convertReturnsToAccount, FX_UNAVAILABLE, type AccountFx } from "./risk-fx";
+import {
+  accountFxPair,
+  accountFxReason,
+  bridgedFxClose,
+  convertReturnsToAccount,
+  FX_UNAVAILABLE,
+  fxBridgeNote,
+  riskConversion,
+  type AccountFx,
+} from "./risk-fx";
 
 interface PortfolioRiskHolding {
   id: string;
@@ -77,9 +91,13 @@ interface PortfolioRiskHolding {
   historyAsOf: string | null;
   /** Daily returns in the account currency. */
   returns: DatedReturn[];
+  /** Dates its returns converted at the FX close before them, by pair ("GBP/USD"), its daily closes having none (bridgedFxClose). */
+  fxBridged: ReadonlyMap<string, readonly string[]>;
   error: string | null;
   /** Why the holding is outside the basket; null when it qualifies. */
   leftOut: string | null;
+  /** Set when that is its daily closes not loading, which asked again they may. */
+  historyFailed?: true;
 }
 /** A holding or a currency's cash outside the basket, with its share of the book when one is known. */
 interface RiskLeftOut {
@@ -90,6 +108,8 @@ interface RiskLeftOut {
   share: number | null;
   /** Set on a currency's cash, which is never in the basket and does not make a report incomplete. */
   cash?: true;
+  /** Set when its daily closes did not load, which asked again they may. */
+  historyFailed?: true;
 }
 /** One currency of the book's cash, valued in the account currency. */
 interface RiskCashHolding extends RiskCashLine {
@@ -153,6 +173,59 @@ export interface RiskDisplayRow {
   amountBase?: number;
   /** What a tail loss in money is taken on: the basket's value and share of the book, and what it leaves out. */
   basis?: string;
+  /** The trading days the tail rows' returns are on, when the basket mixes markets (`riskReturnCalendar`). */
+  calendar?: string;
+  /**
+   * The caveat a narrow pane puts beside the label when it has no room for
+   * the evidence: the basket share an episode replays by beta proxy ("22% proxy").
+   */
+  marker?: string;
+  /** Factor rows only: how much of the basket's daily moves the factor explains over the last 60 sessions; null without a fit. */
+  rSquared?: number | null;
+}
+
+/** Below this R² a factor explains too little of the basket's moves for its beta to be read as an exposure. */
+const WEAK_FACTOR_FIT = 0.1;
+
+/** "Factors are US ETF proxies; ASELS, THYAO and 4 more trade outside the US and are measured against them." */
+function usFactorProxyNote(symbols: readonly string[]): string {
+  const sorted = [...symbols].sort();
+  const named = sorted.length <= 6 ? sorted : [...sorted.slice(0, 5), `${sorted.length - 5} more`];
+  const list = named.length > 1 ? `${named.slice(0, -1).join(", ")} and ${named.at(-1)}` : named[0] ?? "";
+  return `Factors are US ETF proxies; ${list} ${sorted.length === 1 ? "trades" : "trade"} outside the US and ${sorted.length === 1 ? "is" : "are"} measured against them.`;
+}
+
+/** "76% USD, 24% TRY": each currency's share of the values given, largest first; currencies under half a percent left out. */
+function bookCurrencyShares(lines: ReadonlyArray<{ currency: string; value: number | null }>): string {
+  const totals = new Map<string, number>();
+  for (const line of lines) {
+    if (line.value == null || !Number.isFinite(line.value) || line.value <= 0) continue;
+    const currency = resolveCurrencyUnit(line.currency).currency;
+    totals.set(currency, (totals.get(currency) ?? 0) + line.value);
+  }
+  const total = [...totals.values()].reduce((sum, value) => sum + value, 0);
+  if (!(total > 0)) return "no valued holdings";
+  return [...totals]
+    .sort((a, b) => b[1] - a[1])
+    .filter(([, value]) => value / total >= 0.005)
+    .map(([currency, value]) => `${Math.round((value / total) * 100)}% ${currency}`)
+    .join(", ");
+}
+
+/** A factor row's evidence without its fit, for a table that gives the fit a column of its own. */
+export function withoutFactorFit(detail: string): string {
+  return detail.replace(new RegExp(String.raw`; R² (?:${MISSING_VALUE}|[0-9.]+(?:, weak fit)?)`), "");
+}
+
+/** Whether a fit is weak as it reads to two decimals: 0.0999 shows as 0.10 and is not. */
+export function isWeakFactorFit(rSquared: number | null | undefined): boolean {
+  return rSquared != null && Number.isFinite(rSquared) && Number(rSquared.toFixed(2)) < WEAK_FACTOR_FIT;
+}
+
+/** "R² 0.28", or "R² 0.03, weak fit" below WEAK_FACTOR_FIT; "R² --" without a fit. */
+export function factorFitText(rSquared: number | null | undefined): string {
+  if (rSquared == null || !Number.isFinite(rSquared)) return `R² ${MISSING_VALUE}`;
+  return `R² ${rSquared.toFixed(2)}${isWeakFactorFit(rSquared) ? ", weak fit" : ""}`;
 }
 /** The tail-loss rows, which also read in money on the covered basket. */
 const TAIL_ROW_IDS: ReadonlySet<string> = new Set(["var", "es"]);
@@ -309,6 +382,27 @@ export function portfolioRiskTickers(
       positions(ticker, portfolioId).length > 0,
   );
 }
+/** Below this share of gross exposure, a book's net value is too small to state its basket per (a market-neutral book). */
+const NET_BASIS_MIN_SHARE = 0.1;
+const basketNetNote = (net: number, currency: string) =>
+  `Basket returns, volatility, betas, stresses and tail losses are per the book's net value, longs less shorts (${formatNumber(net, 0)} ${currency}), as a fund states them.`;
+const BASKET_GROSS_NOTE = "Basket returns, volatility, betas and stresses are per gross exposure, longs plus shorts at their absolute value: the book's net value is under 10% of it.";
+
+/**
+ * What a basket's returns, read per its gross value, are multiplied by to read
+ * per its net value: gross over net, 1 for a long-only basket; 1 and `gross`
+ * when the net is under a tenth of the gross (or short), which no fund states
+ * its risk per.
+ */
+function basketNetScale(values: readonly number[]): { factor: number; basis: "net" | "gross" } {
+  const gross = values.reduce((sum, value) => sum + Math.abs(value), 0);
+  const net = values.reduce((sum, value) => sum + value, 0);
+  if (!(gross > 0)) return { factor: 1, basis: "net" };
+  return net >= NET_BASIS_MIN_SHARE * gross ? { factor: gross / net, basis: "net" } : { factor: 1, basis: "gross" };
+}
+
+/** The basket takes a short at its signed current weight; futures, options and crypto stay out with their reason. */
+const BASKET_TAKES = { shorts: true } as const;
 const signedQuantity = (lots: TickerRecord["metadata"]["positions"]) =>
   lots.reduce(
     (sum, row) => sum + (row.side === "short" ? -Math.abs(row.shares) : row.shares),
@@ -318,6 +412,7 @@ const signedQuantity = (lots: TickerRecord["metadata"]["positions"]) =>
 export function portfolioRiskRequests(
   tickers: readonly TickerRecord[],
   portfolioId: string,
+  estimate = false,
 ): RiskHoldingRequest[] {
   return tickers.map((ticker) => {
     const lots = positions(ticker, portfolioId);
@@ -328,13 +423,13 @@ export function portfolioRiskRequests(
       ? lots.reduce((sum, row) => sum + Math.abs(row.marketValue!), 0)
       : null;
     return {
-      symbol: ticker.metadata.ticker,
-      exchange: ticker.metadata.exchange,
+      ...riskInstrumentOf(ticker),
+      ...(estimate ? { estimate: true, estimateStart: lots.map((lot) => lot.dateAcquired).filter((date): date is string => !!date).sort()[0] } : {}),
       quantity: signedQuantity(lots),
       currency,
       snapshotValue: snapshot,
       unsupported:
-        syntheticPositionUnsupportedReason(ticker, "USD", portfolioId) != null ||
+        syntheticPositionUnsupportedReason(ticker, "USD", portfolioId, BASKET_TAKES) != null ||
         lots.some((row) => !Number.isFinite(row.shares)),
     };
   });
@@ -386,14 +481,42 @@ function cashReason(line: RiskCashLine, accountCurrency: string): string {
     ? "Cash is outside the equity basket"
     : `Cash is outside the equity basket; its ${accountCurrency} value moves with ${own}`;
 }
+/** One note per pair whose missing daily closes the basket's returns were converted across (fxBridgeNote). */
+function fxBridgeNotes(members: readonly Pick<PortfolioRiskHolding, "fxBridged">[]): string[] {
+  const byPair = new Map<string, Set<string>>();
+  for (const member of members)
+    for (const [pair, dates] of member.fxBridged) {
+      const set = byPair.get(pair) ?? new Set<string>();
+      for (const date of dates) set.add(date);
+      byPair.set(pair, set);
+    }
+  return [...byPair].flatMap(([pair, dates]) => fxBridgeNote(pair, dates) ?? []);
+}
 /** USD returns in the account currency, or none with the reason its daily closes cannot convert them. */
-function accountReturns(returns: readonly DatedReturn[], account: AccountFx): { returns: DatedReturn[]; error: string | null } {
-  if (account.error) return { returns: [], error: account.error };
+function accountReturns(
+  returns: readonly DatedReturn[],
+  account: AccountFx,
+): { returns: DatedReturn[]; bridged: string[]; error: string | null } {
+  if (account.error) return { returns: [], bridged: [], error: account.error };
   try {
-    return { returns: convertReturnsToAccount(returns, account), error: null };
+    return { ...convertReturnsToAccount(returns, account), error: null };
   } catch (error) {
-    return { returns: [], error: error instanceof Error ? error.message : accountFxReason(account.currency, FX_UNAVAILABLE) };
+    return { returns: [], bridged: [], error: error instanceof Error ? error.message : accountFxReason(account.currency, FX_UNAVAILABLE) };
   }
+}
+/** The dates a holding's returns converted at the FX close before them, by pair: its listing's into USD, then USD into the account's. */
+function holdingFxBridges(
+  listingCurrency: string | null,
+  listingBridged: readonly string[] | undefined,
+  account: AccountFx | null | undefined,
+  accountBridged: readonly string[] | undefined,
+): Map<string, readonly string[]> {
+  const bridges = new Map<string, readonly string[]>();
+  const listingPair = listingCurrency && listingBridged?.length ? accountFxPair(riskConversion(listingCurrency)?.currency ?? listingCurrency) : null;
+  if (listingPair) bridges.set(listingPair, listingBridged!);
+  const accountPair = account?.pair;
+  if (accountPair && accountBridged?.length) bridges.set(accountPair, [...(bridges.get(accountPair) ?? []), ...accountBridged]);
+  return bridges;
 }
 /**
  * "returns in TRY at daily USD/TRY closes": the currency the basket views of a
@@ -436,18 +559,61 @@ const NAMED_EXCLUSIONS = 2;
  * values is named with "value unknown". Converted listings are counted after.
  */
 export function riskCoverageLine(coverage: RiskCoverage | undefined): string | null {
+  const parts = riskCoverageParts(coverage);
+  return parts ? [parts.text, parts.converted].filter(Boolean).join(" · ") : null;
+}
+/**
+ * The coverage line's parts, for a footer that sets them apart: `text`
+ * ("basket 48,286 USD = 72% of book; left out: BTC-USD 10%, TRY cash 18%"),
+ * `short`, the same without the basket's value ("72% of book; left out: ..."),
+ * `shortest`, without their shares ("72% of book; BTC-USD, TRY cash left out"),
+ * and `converted` ("2 holdings converted from local currency"), null when none was.
+ */
+export function riskCoverageParts(
+  coverage: RiskCoverage | undefined,
+): { text: string; short: string; shortest: string; converted: string | null } | null {
   if (!coverage) return null;
   const named = coverage.leftOut.length <= NAMED_EXCLUSIONS + 1 ? coverage.leftOut : coverage.leftOut.slice(0, NAMED_EXCLUSIONS);
   const rest = coverage.leftOut.slice(named.length);
   const restShare = rest.reduce((sum, row) => sum + (row.share ?? 0), 0);
   const shares = [coverage.share ?? 0, ...named.map((row) => row.share ?? 0), ...(rest.length ? [restShare] : [])];
   const percents = wholePercents(shares);
-  const basket = `basket ${formatNumber(coverage.coveredValue, 0)} ${coverage.currency}${coverage.share == null ? "" : ` = ${coverage.unvalued ? "at most " : ""}${percentText(percents[0]!, shares[0]!)} of book`}`;
+  const share = coverage.share == null ? null : `${coverage.unvalued ? "at most " : ""}${percentText(percents[0]!, shares[0]!)} of book`;
+  const basket = `basket ${formatNumber(coverage.coveredValue, 0)} ${coverage.currency}${share ? ` = ${share}` : ""}`;
   const items = [
     ...named.map((row, index) => `${row.symbol} ${row.share == null ? "value unknown" : percentText(percents[index + 1]!, row.share)}`),
     ...(rest.length ? [`${rest.length} more${restShare > 0 ? ` ${percentText(percents.at(-1)!, restShare)}` : ""}`] : []),
   ];
-  return [`${basket}${items.length ? `; left out: ${items.join(", ")}` : ""}`, convertedText(coverage)].filter(Boolean).join(" · ");
+  const leftOut = items.length ? `; left out: ${items.join(", ")}` : "";
+  const symbols = [...named.map((row) => row.symbol), ...(rest.length ? [`${rest.length} more`] : [])];
+  return {
+    text: `${basket}${leftOut}`,
+    short: `${share ?? basket}${leftOut}`,
+    shortest: `${share ?? basket}${symbols.length ? `; ${symbols.join(", ")} left out` : ""}`,
+    converted: convertedText(coverage),
+  };
+}
+/** US futures exchanges, whose settlements follow the US trading days the basket is on. */
+const US_FUTURES_VENUES: ReadonlySet<string> = new Set(["CME", "CBT", "NYM", "CMX", "NYB", "CFE"]);
+/** Venues a calendar line names before it says "other markets". */
+const NAMED_CALENDAR_VENUES = 2;
+/**
+ * "US trading days, BIST at its last close": the days the basket's returns
+ * are on when it holds a listing abroad. The basket, SPY and the factor
+ * proxies share the US calendar; a market abroad carries its last close over
+ * a US trading day it did not trade (convertClosesToUsd). Null when every
+ * holding in the basket trades on a US venue.
+ */
+export function riskReturnCalendar(members: ReadonlyArray<{ exchange: string; convertedFrom?: string | null }>): string | null {
+  const abroad = [...new Set(members.flatMap((row) => {
+    const venue = canonicalExchange(row.exchange);
+    if (!venue) return row.convertedFrom ? ["other"] : [];
+    return isUsEquityExchange(venue) || US_FUTURES_VENUES.has(venue) ? [] : [venue];
+  }))];
+  if (abroad.length === 0) return null;
+  const named = abroad.filter((venue) => venue !== "other");
+  if (named.length === 0 || named.length > NAMED_CALENDAR_VENUES || named.length < abroad.length) return "US trading days, other markets at their last close";
+  return `US trading days, ${named.join(" and ")} at ${named.length === 1 ? "its" : "their"} last close`;
 }
 /** Whether the basket leaves out a holding, which makes a report incomplete; cash never is in it. */
 export const riskHoldingsLeftOut = (coverage: RiskCoverage) => coverage.leftOut.some((row) => !row.cash);
@@ -474,6 +640,8 @@ export function riskCoverageNotices(coverage: RiskCoverage | undefined): string[
       `${row.symbol} (${row.share == null ? "value unknown" : `${shareText(row.share)} of the book`}) is excluded from the risk estimate: ${lowerFirst(row.reason.replace(/\.$/, ""))}.`,
   );
 }
+/** What an empty portfolio's pane says after "No holdings in this portfolio.": where holdings come from. */
+export const NO_HOLDINGS_HINT = "Add holdings from the Portfolio pane (PF), or connect a broker in BR to sync them.";
 /** Why the basket views show no estimate, when too little of the holdings qualifies. */
 export function riskCoverageShortfall(
   coverage: RiskCoverage | undefined,
@@ -603,10 +771,7 @@ export function buildPortfolioRisk(
     tickers,
     portfolio.id,
   ).map((ticker) => {
-    const instrument = {
-        symbol: ticker.metadata.ticker,
-        exchange: ticker.metadata.exchange,
-      },
+    const instrument = riskInstrumentOf(ticker),
       id = riskInstrumentId(instrument);
     const history = byId.get(id),
       quote = history?.quote,
@@ -629,7 +794,7 @@ export function buildPortfolioRisk(
       quote?.currency ?? close?.currency ?? history?.listing?.currency ?? ticker.metadata.currency;
     const foreign = !convertedFrom && listingCurrency !== "USD";
     const usdError =
-      syntheticPositionUnsupportedReason(ticker, "USD", portfolio.id) ??
+      syntheticPositionUnsupportedReason(ticker, "USD", portfolio.id, BASKET_TAKES) ??
       (lots.some((row) => !Number.isFinite(row.shares))
         ? "Invalid position quantity"
         : null) ??
@@ -640,7 +805,7 @@ export function buildPortfolioRisk(
         : null) ??
       // A foreign listing that did not convert says why: no pair, stale or gapped FX.
       (foreign
-        ? (history?.error ?? syntheticPositionUnsupportedReason(ticker, listingCurrency, portfolio.id))
+        ? (history?.error ?? syntheticPositionUnsupportedReason(ticker, listingCurrency, portfolio.id, BASKET_TAKES))
         : null) ??
       history?.error ??
       (!history ? "Daily history unavailable" : null);
@@ -655,20 +820,21 @@ export function buildPortfolioRisk(
       Number.isFinite(mark.price) &&
       mark.price > 0 &&
       priceDate &&
-      (!syntheticPositionUnsupportedReason(
+      !syntheticPositionUnsupportedReason(
         ticker,
         mark.currency,
         portfolio.id,
-      ) ||
-        error?.startsWith("Short positions"))
+        BASKET_TAKES,
+      )
         ? quantity * mark.price
         : null;
     const accountValue = marked == null || !account ? marked : accountRate! > 0 ? marked / accountRate! : null;
     const value = accountValue != null && Number.isFinite(accountValue) ? accountValue : null;
     const returns = inAccount?.returns ?? history?.returns ?? [];
+    // A short's value is negative: it is marked, and enters the basket at its signed weight.
     const leftOut =
       error ??
-      (value == null || value <= 0
+      (value == null || value === 0
         ? "No current USD mark"
         : returns.length < 60
           ? "Fewer than 60 daily returns"
@@ -690,8 +856,10 @@ export function buildPortfolioRisk(
       // Converted returns end with the account currency's last daily close.
       historyAsOf: (inAccount ? inAccount.returns.at(-1)?.dateKey : null) ?? history?.asOf ?? null,
       returns,
+      fxBridged: holdingFxBridges(convertedFrom, history?.converted?.fxBridged, account, inAccount?.bridged),
       error,
       leftOut,
+      ...(history?.loadFailed && leftOut === history.error ? { historyFailed: true as const } : {}),
     };
   });
   // Each currency's cash once, valued in the portfolio currency.
@@ -712,7 +880,8 @@ export function buildPortfolioRisk(
   // Cash counts in the book the coverage is a share of, at its gross value as a short does.
   const cashGross = cashHoldings.reduce((sum, row) => sum + Math.abs(row.value ?? 0), 0);
   const marketValue = holdingsValue + cashGross;
-  const coveredValue = qualifying.reduce((sum, row) => sum + row.value!, 0);
+  // A short covers its gross value, as it counts in the book.
+  const coveredValue = qualifying.reduce((sum, row) => sum + Math.abs(row.value!), 0);
   const share = marketValue > 0 ? coveredValue / marketValue : null;
   // Whether the basket is most of what is invested: cash is no holding the basket could have taken.
   const holdingsShare = holdingsValue > 0 ? coveredValue / holdingsValue : null;
@@ -741,6 +910,7 @@ export function buildPortfolioRisk(
           reason: row.leftOut!,
           value: row.marketValue,
           share: bookShare(row.marketValue),
+          ...(row.historyFailed ? { historyFailed: true as const } : {}),
         })),
       ...cashHoldings.map((row): RiskLeftOut => {
         const value = row.value == null ? null : Math.abs(row.value);
@@ -751,13 +921,17 @@ export function buildPortfolioRisk(
   // Weights renormalize over the covered basket; nothing outside it is approximated into it.
   const members = sufficient ? qualifying : [];
   const basketWeights = members.length ? concentration(members) : null;
-  for (const holding of members)
-    holding.weight =
-      basketWeights?.rows.find((row) => row.id === holding.id)?.weight ?? null;
+  // Each a share of the basket's gross value, signed as its position: a short is a negative weight.
+  for (const holding of members) {
+    const weight = basketWeights?.rows.find((row) => row.id === holding.id)?.weight;
+    holding.weight = weight == null ? null : Math.sign(holding.value!) * weight;
+  }
   // Concentration needs a value, not a return history: it reads every holding that has one, left out of the basket or not.
   const book = concentration(
     valued.filter((row) => row.marketValue! > 0).map((row) => ({ id: row.id, value: row.marketValue })),
   );
+  // The days the returns are on, when the basket holds a market abroad that carries its last close over US days.
+  const calendar = riskReturnCalendar(members);
   const closeMarked = members.filter((row) => row.markSource === "close").length;
   const converted = members.filter((row) => row.convertedFrom != null).length;
   const held = new Set(holdings.map((row) => row.id));
@@ -774,6 +948,10 @@ export function buildPortfolioRisk(
           "Converted holdings are matched to the US close of the same date; where their market closes at another time, correlations and betas to US holdings read lower than they are.",
         ]
       : []),
+    // The factors are US ETFs: holdings listed elsewhere are measured against them, there being no local factor model.
+    ...(converted ? [usFactorProxyNote(members.filter((row) => row.convertedFrom != null).map((row) => row.symbol))] : []),
+    // A pair's daily closes skip Good Friday, Easter Monday, 25 Dec and 1 Jan; returns across them use the close before.
+    ...fxBridgeNotes(members),
   ];
   const warnings = [
     ...market.warnings,
@@ -784,10 +962,18 @@ export function buildPortfolioRisk(
         : [],
     ),
   ];
+  // A hedged basket's returns are stated per its net value, longs less shorts, as a fund states them (a 130/30
+  // book's beta reads about 1.0); only a book whose net is under a tenth of its gross is read per gross exposure.
+  // A long-only basket's net is its gross: nothing changes.
+  const basketScale = basketNetScale(members.map((row) => row.value ?? 0));
+  if (basketScale.basis === "gross") notes.push(BASKET_GROSS_NOTE);
+  else if (basketScale.factor !== 1)
+    notes.push(basketNetNote(coverage.coveredValue / basketScale.factor, coverage.currency));
   const basket = members.length
     ? computeWeightedPortfolioReturns(
         members.map((row) => ({ weight: row.weight!, returns: row.returns })),
-      )
+        { signed: true },
+      ).map((point) => ({ ...point, value: point.value * basketScale.factor }))
     : [];
   const proxy = (symbol: string) => {
     const instrument = RISK_FACTOR_INSTRUMENTS.find(
@@ -796,12 +982,14 @@ export function buildPortfolioRisk(
     return (instrument && byId.get(riskInstrumentId(instrument))?.returns) || [];
   };
   // SPY's USD returns are the market factor and the equity stress; the risk
-  // rows compare the basket with SPY in the basket's own currency. A session
-  // without an account close is a gap in that benchmark, never bridged, so it
-  // cannot blank the holdings the closes do cover.
+  // rows compare the basket with SPY in the basket's own currency, bridged
+  // across missing account closes as the holdings are (bridgedFxClose). A
+  // session past a longer gap is a gap in that benchmark, so it cannot blank
+  // the holdings the closes do cover.
   const spy = proxy(RISK_BENCHMARK);
+  const accountClose = (date: string) => account ? bridgedFxClose((day) => account.closes[day], date) : null;
   const benchmark = account
-    ? accountReturns(spy.filter((point) => account.closes[point.startDateKey] && account.closes[point.dateKey]), account).returns
+    ? accountReturns(spy.filter((point) => accountClose(point.startDateKey) && accountClose(point.dateKey)), account).returns
     : spy;
   // Since the filing only for a portfolio that has one; any other keeps the trailing window and says why.
   const filed = window.since === "filed" ? portfolio.importedFrom?.filed ?? null : null;
@@ -839,6 +1027,18 @@ export function buildPortfolioRisk(
   const metrics = filed
     ? sinceBasketRisk(sample, filed, RISK_BENCHMARK)
     : rollingBasketRisk(sample, undefined, RISK_BENCHMARK);
+  // USD/account currency over each basket session, from the account's daily closes (USD per unit): the dollar's move in it.
+  const dollarMoves = account && !account.error
+    ? spy.flatMap((point) => {
+        const start = accountClose(point.startDateKey)?.rate, end = accountClose(point.dateKey)?.rate;
+        return start && end ? [{ startDateKey: point.startDateKey, dateKey: point.dateKey, value: start / end - 1 }] : [];
+      })
+    : [];
+  // The book's share in each currency it is exposed to, holdings at their listing's currency and cash at its own.
+  const currencyShares = bookCurrencyShares([
+    ...holdings.map((row) => ({ currency: row.convertedFrom ?? row.currency, value: row.marketValue })),
+    ...cashHoldings.map((row) => ({ currency: row.currency, value: row.value == null ? null : Math.abs(row.value) })),
+  ]);
   // Factor proxies stay in USD: a beta is the account-currency move per unit of the factor as it trades.
   const factors = [
     { id: "market", label: "Market (SPY)", series: spy },
@@ -868,19 +1068,30 @@ export function buildPortfolioRisk(
       label: "Credit (HYG - IEF)",
       series: subtractReturns(proxy("HYG"), proxy("IEF")),
     },
+    // A non-USD account's book moves with the dollar against its currency: its beta to USD/account currency.
+    ...(account && !account.error && dollarMoves.length
+      ? [{ id: "currency", label: `Currency (USD/${portfolio.currency})`, series: dollarMoves }]
+      : []),
   ].map((factor) => ({
     ...rollingBeta(basket, factor.series, factor.label, factor.id),
-    regression: regressReturns(basket.slice(-60), factor.series),
+    regression: regressReturns(basket, factor.series, { window: 60 }),
   }));
+  // The latest 60 returns both holdings have: a US close today and a Singapore close yesterday still pair their common days.
   const correlation = members.flatMap((left, index) =>
     members.slice(index + 1).map((right) => {
-      const regression = regressReturns(left.returns.slice(-60), right.returns);
+      const regression = regressReturns(left.returns, right.returns, { window: 60 });
+      const matched = regression?.samples ?? matchedReturnCount(left.returns, right.returns);
       return {
         left: left.id,
         right: right.id,
         label: `${left.symbol} / ${right.symbol}`,
         ...regression,
         value: regression?.correlation ?? null,
+        // Why a pair has no correlation, in words.
+        evidence: regression?.correlation != null ? `${matched} matched daily returns`
+          : matched === 0 ? "no daily returns on the same dates"
+          : matched < 60 ? `only ${matched} daily returns on the same dates; 60 needed`
+          : `a price that did not move over ${matched} matched daily returns`,
       };
     }),
   );
@@ -914,6 +1125,30 @@ export function buildPortfolioRisk(
       value: regression ? regression.beta * stress.shock * 100 : null,
     };
   });
+  // Past selloffs replayed on today's basket at its current weights, each
+  // holding from its own daily closes or, without them, by its beta to SPY.
+  const episodeState = market.episodes;
+  const episodes = episodeState && !("pending" in episodeState) && members.length
+    ? replayEpisodes(
+        episodeState,
+        members.map((row) => ({
+          id: row.id,
+          symbol: row.symbol,
+          weight: row.weight ?? 0,
+          value: row.value ?? 0,
+          convertedFrom: row.convertedFrom,
+          returns: row.returns,
+        })),
+        { spyReturns: spy, accountCurrency: portfolio.currency, bookValue: marketValue },
+      // Per the net value, as the basket's returns are; its proxied shares stay shares of the gross basket.
+      ).map((replay) => replay.value == null ? replay : { ...replay, value: replay.value * basketScale.factor })
+    : null;
+  if (episodes) {
+    const issues = episodeIssues(episodes);
+    notes.push(...issues.notes);
+    warnings.push(...issues.warnings);
+  } else if (episodeState && "pending" in episodeState && episodeState.error && members.length)
+    warnings.push(`Historical episodes: daily closes did not load: ${episodeState.error}`);
   // The given currency and price shocks reprice every line of the book, cash included, at once.
   const bookLines: RiskBookLine[] = [
     ...holdings.map((row) => ({
@@ -945,6 +1180,10 @@ export function buildPortfolioRisk(
   const performance = evidence?.performance
     ? calculateAccountPerformance(evidence.performance)
     : null;
+  const performanceEstimate = performance ? null : manualPortfolioValue(
+    portfolio, tickers, market,
+    cashHoldings.every((line) => line.value != null) ? cashHoldings.reduce((sum, line) => sum + line.value!, 0) : null,
+  );
   const attribution = evidence?.attribution
     ? calculateBrinson(evidence.attribution)
     : null;
@@ -961,18 +1200,21 @@ export function buildPortfolioRisk(
   warnings.push(...(greeks?.warnings ?? []));
   const rows: Record<RiskView, RiskDisplayRow[]> = {
     risk: metrics.map((row) => {
-      // VaR and expected shortfall are a one-day loss on the covered basket's current value, in the portfolio currency.
+      // VaR and expected shortfall are a one-day loss on the covered basket's current value, in the portfolio currency:
+      // its net value when the returns are stated per net (the gross over the scale), else its gross.
       const tail = TAIL_ROW_IDS.has(row.id) && row.value != null && coverage.coveredValue > 0;
+      const tailBase = coverage.coveredValue / basketScale.factor;
       return {
         ...row,
         percentile: row.rank.percentile,
         // The tail rows name how they are estimated; the other rows' method (price returns, bought and held or at fixed current weights) is in docs.
         detail: TAIL_ROW_IDS.has(row.id) ? riskTailMethod(row.samples, row.value != null) : `${row.samples} sessions`,
+        ...(TAIL_ROW_IDS.has(row.id) && calendar ? { calendar } : {}),
         ...(tail
           ? {
-              amount: (row.value! / 100) * coverage.coveredValue,
+              amount: (row.value! / 100) * tailBase,
               amountCurrency: coverage.currency,
-              amountBase: coverage.coveredValue,
+              amountBase: tailBase,
               basis: riskCoverageLine(coverage) ?? undefined,
             }
           : {}),
@@ -981,7 +1223,10 @@ export function buildPortfolioRisk(
     factors: factors.map((row) => ({
       ...row,
       percentile: row.rank.percentile,
-      detail: `${row.samples} sessions; R² ${row.regression?.rSquared?.toFixed(2) ?? "--"}; independent ETF proxy`,
+      rSquared: row.regression?.rSquared ?? null,
+      detail: row.id === "currency"
+        ? `${currencyShares} of book; ${row.samples} sessions; ${factorFitText(row.regression?.rSquared)}; daily ${account?.pair ?? "FX"} closes`
+        : `${row.samples} sessions; ${factorFitText(row.regression?.rSquared)}; independent ETF proxy`,
     })),
     // Largest current value first, left-out holdings and each currency's cash in place; unvalued ones last.
     holdings: [
@@ -1025,15 +1270,18 @@ export function buildPortfolioRisk(
     ]
       .sort((a, b) => (b.size ?? -1) - (a.size ?? -1))
       .map(({ row }) => row),
-    correlation: correlation.map((row) => ({
-      id: `${row.left}/${row.right}`,
-      label: row.label,
-      value: row.value,
-      unit: "correlation",
-      percentile: null,
-      asOf: row.asOf ?? null,
-      detail: `${row.samples ?? 0} matched daily returns`,
-    })),
+    // Strongest first, either sign: the pairs that move the basket together or against each other lead.
+    correlation: correlation
+      .map((row) => ({
+        id: `${row.left}/${row.right}`,
+        label: row.label,
+        value: row.value,
+        unit: "correlation",
+        percentile: null,
+        asOf: row.asOf ?? null,
+        detail: row.evidence,
+      }))
+      .sort((left, right) => (right.value == null ? -1 : Math.abs(right.value)) - (left.value == null ? -1 : Math.abs(left.value))),
     stress: [
       // A regression scenario moves the basket by its beta; it is a share of the basket, not of the book.
       ...stresses.map((row) => ({
@@ -1043,8 +1291,28 @@ export function buildPortfolioRisk(
         unit: "%",
         percentile: null,
         asOf: row.regression?.asOf ?? null,
-        detail: `% of basket; ${row.regression?.samples ?? 0} sessions; R² ${row.regression?.rSquared?.toFixed(2) ?? "--"}; ${row.source}`,
+        detail: `% of basket; ${row.regression?.samples ?? 0} sessions; R² ${row.regression?.rSquared?.toFixed(2) ?? MISSING_VALUE}; ${row.source}`,
       })),
+      // Dated as the index scenario is: the weights and betas are today's, the window is in the label and the evidence.
+      ...(episodeState
+        ? RISK_EPISODES.map((episode, index): RiskDisplayRow => {
+            const replay = episodes?.[index];
+            const waiting = "pending" in episodeState
+              ? (episodeState.error ? `daily closes did not load: ${episodeState.error}` : "loading daily closes")
+              : "no basket to replay";
+            const marker = replay ? episodeProxyMarker(replay) : null;
+            return {
+              id: `episode:${episode.id}`,
+              label: episode.label,
+              value: replay?.value == null ? null : replay.value * 100,
+              unit: "%",
+              percentile: null,
+              asOf: stresses[0]?.regression?.asOf ?? basket.at(-1)?.dateKey ?? null,
+              detail: replay ? episodeEvidence(replay, portfolio.currency) : `% of basket; ${waiting}; ${episodeWindowText(episode)} closes`,
+              ...(marker ? { marker } : {}),
+            };
+          })
+        : []),
       ...(repricing ? repricingRows(repricing, portfolio.currency, market.fetchedAt) : []),
     ],
     performance: performance
@@ -1077,7 +1345,15 @@ export function buildPortfolioRisk(
           asOf: performance.endDate,
           detail: `${performance.startDate} to ${performance.endDate}; ${row.detail}`,
         }))
-      : [],
+      : performanceEstimate ? [{
+          id: "estimated-value",
+          label: performanceEstimate.label,
+          value: performanceEstimate.points.at(-1)?.value ?? null,
+          unit: portfolio.currency,
+          percentile: null,
+          asOf: performanceEstimate.points.at(-1)?.date ?? null,
+          detail: "Today's holdings at daily closes; cash held flat; not account performance",
+        }] : [],
     attribution: attribution
       ? attribution.rows.map((row) => ({
           id: row.sector,
@@ -1189,7 +1465,9 @@ export function buildPortfolioRisk(
     factors,
     correlation,
     stresses,
+    episodes,
     performance,
+    performanceEstimate,
     attribution,
     greeks,
     evidence,
@@ -1205,6 +1483,8 @@ export function buildPortfolioRisk(
     notes,
     fetchedAt: market.fetchedAt,
     benchmark: RISK_BENCHMARK,
+    /** The days the basket's returns are on when it mixes markets (`riskReturnCalendar`); null when it trades in the US only. */
+    calendar,
     /** The currency a non-USD account's returns converted into, at the daily closes of `pair`; null for USD. */
     accountConversion:
       account && !account.error && account.pair
@@ -1223,15 +1503,36 @@ export function buildPortfolioRisk(
   };
 }
 export type PortfolioRiskModel = ReturnType<typeof buildPortfolioRisk>;
+
+/** The holdings and options the views list by symbol, each a row of its own. */
+function riskRowSymbols(model: Pick<PortfolioRiskModel, "holdings" | "greeks">): string[] {
+  return [...model.holdings.map((row) => row.symbol), ...(model.greeks?.rows ?? []).map((row) => row.symbol)];
+}
+
+/** What a warning says of one holding or option (`AAPL: …`), named by `symbol`, less the name: its row's note. */
+export function riskRowWarnings(model: Pick<PortfolioRiskModel, "warnings">, symbol: string): string[] {
+  return model.warnings.flatMap((warning) => warning.startsWith(`${symbol}: `) ? [warning.slice(symbol.length + 2)] : []);
+}
+
+/**
+ * The warnings the footer says, which concern the whole book: a holding's or
+ * an option's own are its row's (its detail, its note under the table), as
+ * a left-out holding's reason is.
+ */
+export function riskPaneWarnings(model: Pick<PortfolioRiskModel, "warnings" | "holdings" | "greeks">): string[] {
+  const symbols = riskRowSymbols(model);
+  return model.warnings.filter((warning) => !symbols.some((symbol) => warning.startsWith(`${symbol}: `)));
+}
 export const riskValue = (row: RiskDisplayRow) =>
   row.leftOut
     ? "left out"
     : row.value == null
-    ? "--"
+    ? MISSING_VALUE
     : `${row.value.toFixed(2)}${row.unit === "%" ? "%" : ` ${row.unit}`}${riskAmount(row)}`;
 /** A row's evidence with what a tail loss in money is taken on: the basket, its share of the book and what it leaves out. */
 export function riskEvidence(row: RiskDisplayRow): string {
-  return row.basis ? `${row.detail}; ${row.basis}` : row.detail;
+  const method = row.calendar ? `${row.detail} on ${row.calendar}` : row.detail;
+  return row.basis ? `${method}; ${row.basis}` : method;
 }
 /** " ($5,735)": a loss or change in money beside its percent. */
 function riskAmount(row: RiskDisplayRow): string {
@@ -1239,4 +1540,4 @@ function riskAmount(row: RiskDisplayRow): string {
   return ` (${formatCurrency(row.amount, row.amountCurrency, 0)})`;
 }
 export const riskPercentile = (row: RiskDisplayRow) =>
-  row.percentile == null ? "--" : String(Math.round(row.percentile));
+  row.percentile == null ? MISSING_VALUE : String(Math.round(row.percentile));

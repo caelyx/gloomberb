@@ -14,10 +14,11 @@ import { handleRefreshKey } from "../../../components/data-table/table-pane";
 import type { DefiTvlPayload } from "../../../api-client/crypto-markets";
 import { colors, priceColor } from "../../../theme/colors";
 import { SERIES_COLORS } from "../../../theme/series-colors";
-import { formatCompact, formatCompactAmount } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatCompactAmount } from "../../../utils/format";
 import { usePluginPaneState } from "../../runtime";
 import {
   buildDefiColumns,
+  defiHasIncome,
   buildDefiRows,
   DEFAULT_DEFI_SORT,
   DEFI_LISTS,
@@ -32,7 +33,7 @@ import {
   type DefiRow,
   type DefiSortPreference,
 } from "./defi";
-import { formatCryptoPercent } from "./model";
+import { formatCryptoPercent, utcCloseAsOfText } from "./model";
 import { SUPPLY_RANGES, type SupplyRangeId } from "./supply";
 
 const RANGE_OPTIONS = SUPPLY_RANGES.map(({ value, label }) => ({ value, label }));
@@ -46,7 +47,7 @@ function signedPercent(value: number | null): DataTableCell {
 
 function signedAmount(value: number | null): DataTableCell {
   return {
-    text: value == null ? "—" : formatCompactAmount(value, { signed: true }),
+    text: value == null ? MISSING_VALUE : formatCompactAmount(value, { signed: true }),
     color: value == null ? colors.textDim : priceColor(value),
   };
 }
@@ -58,7 +59,7 @@ function renderDefiCell(row: DefiRow, column: DefiColumn): DataTableCell {
     case "name":
       return { text: row.name, color: colors.textBright };
     case "detail":
-      return { text: row.detail ?? "—", color: colors.textDim };
+      return { text: row.detail ?? MISSING_VALUE, color: colors.textDim };
     case "tvl":
       return { text: formatTvl(row.tvl) };
     case "change1dPercent":
@@ -72,9 +73,18 @@ function renderDefiCell(row: DefiRow, column: DefiColumn): DataTableCell {
     case "change30dPercent":
       return signedPercent(row.change30dPercent);
     case "share":
-      return { text: row.share == null ? "—" : `${row.share.toFixed(2)}%`, color: colors.textDim };
+      return { text: row.share == null ? MISSING_VALUE : `${row.share.toFixed(2)}%`, color: colors.textDim };
     case "chains":
-      return { text: row.chains == null ? "—" : String(row.chains), color: colors.textDim };
+      return { text: row.chains == null ? MISSING_VALUE : String(row.chains), color: colors.textDim };
+    case "fees24h":
+    case "fees7d":
+    case "fees30d":
+    case "revenue24h":
+    case "revenue7d":
+    case "revenue30d": {
+      const value = row[column.id];
+      return value == null ? { text: MISSING_VALUE, color: colors.textDim } : { text: formatTvl(value) };
+    }
   }
 }
 
@@ -83,7 +93,7 @@ function changeFigure(id: string, label: string, amount: number | null, percent:
   return {
     id,
     label,
-    value: amount == null ? "—" : formatCompactAmount(amount, { signed: true }),
+    value: amount == null ? MISSING_VALUE : formatCompactAmount(amount, { signed: true }),
     detail: formatCryptoPercent(percent),
     ...(amount == null ? {} : { color: priceColor(amount) }),
   };
@@ -118,7 +128,8 @@ export function DefiTvlView({
   const [selectedId, setSelectedId] = usePluginPaneState<string | null>("defiSelected", null);
   const [sort, setSort] = useState<DefiSortPreference>(DEFAULT_DEFI_SORT);
   const rows = useMemo(() => sortDefiRows(buildDefiRows(payload, list), sort), [list, payload, sort]);
-  const columns = useMemo(() => buildDefiColumns(width, list), [list, width]);
+  const income = defiHasIncome(payload);
+  const columns = useMemo(() => buildDefiColumns(width, list, income), [income, list, width]);
   // A chain's figures are the total's day, which its figure dates; protocols are read live, so they say when.
   const listAsOf = list === "protocol" ? defiListAsOf(payload, list) : null;
 
@@ -132,7 +143,7 @@ export function DefiTvlView({
     if (!payload || !total) return [];
     const since = defiHistoryStart(payload);
     return [
-      { id: "total", label: "Total DeFi TVL", value: formatTvl(total.tvl), ...(payload.asOf ? { detail: `as of ${payload.asOf}` } : {}) },
+      { id: "total", label: "Total DeFi TVL", value: formatTvl(total.tvl), ...(payload.asOf ? { detail: utcCloseAsOfText(payload.asOf) } : {}) },
       changeFigure("change-7d", "7D change", total.change7d, total.change7dPercent),
       changeFigure("change-30d", "30D change", total.change30d, total.change30dPercent),
       { id: "source", label: "Source", value: payload.source.name, ...(since ? { detail: `daily since ${since}` } : {}) },

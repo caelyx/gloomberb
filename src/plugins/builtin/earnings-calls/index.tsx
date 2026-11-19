@@ -23,6 +23,7 @@ export const earningsCallsModule: PluginModule = {
       order: 34,
       component: EarningsCallsPane,
       instruments: ["equity"],
+      proOnly: true,
     });
   },
 
@@ -38,6 +39,7 @@ export const earningsCallsModule: PluginModule = {
       icon: "C",
       component: EarningsCallsPane,
       defaultPosition: "right",
+      shareItem: { ticker: true },
       tickerFollower: true,
       instruments: ["equity"],
       defaultMode: "floating",

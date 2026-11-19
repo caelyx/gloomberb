@@ -60,6 +60,10 @@ async function runInstall(machine: FakeMachine, options: {
   existingInstall?: string;
   /** Puts other files in the install folder before the run. */
   prepare?: (installDir: string) => void;
+  /** The install folder is on PATH, as `~/.local/bin` is on most Linux desktops (the default). */
+  installDirOnPath?: boolean;
+  /** The login shell, `$SHELL`. */
+  shell?: string;
 } = {}): Promise<InstallRun> {
   const binDir = join(workDir, "bin");
   const installDir = join(workDir, "install");
@@ -130,7 +134,8 @@ async function runInstall(machine: FakeMachine, options: {
     cwd: workDir,
     env: {
       ...process.env,
-      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      PATH: [binDir, ...(options.installDirOnPath === false ? [] : [installDir]), process.env.PATH ?? ""].join(":"),
+      SHELL: options.shell ?? "/bin/sh",
       HOME: workDir,
       TMPDIR: tempDir,
       GLOOMBERB_INSTALL_DIR: installDir,
@@ -208,7 +213,7 @@ describe("install.sh architecture detection", () => {
       hardwareArm64: "1",
     });
 
-    // Without release metadata it tries the app's name, then its name before the rename.
+    // It tries the app's name, then its name before the rename.
     expect(run.downloadLog).toContain("releases/latest/download/stable-macos-arm64-Gloom.app.zip");
     expect(run.downloadLog).toContain("releases/latest/download/stable-macos-arm64-Gloomberb.app.zip");
   });
@@ -220,6 +225,15 @@ describe("install.sh architecture detection", () => {
     });
 
     expect(run.downloadLog).toContain("gloomberb-linux-x64.gz");
+  });
+
+  // Git Bash said only "Unsupported OS: MINGW64_NT-10.0-26100".
+  test.each(["MINGW64_NT-10.0-26100", "MSYS_NT-10.0-26100", "CYGWIN_NT-10.0-26100"])("points Windows shells (%s) at the PowerShell install, downloading nothing", async (unameSystem) => {
+    const run = await runInstall({ unameSystem, unameMachine: "x86_64" });
+
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("irm https://gloom.sh/install.ps1 | iex");
+    expect(run.downloadLog).toBe("");
   });
 
   test("installs the arm64 binary on Linux", async () => {
@@ -247,35 +261,27 @@ describe("install.sh architecture detection", () => {
     expect(run.downloadLog).not.toMatch(/gloomberb-linux-(x64|arm64)\.gz/);
     // Downloads fail here, as they would against a release without musl builds.
     expect(run.exitCode).not.toBe(0);
-    expect(run.stderr).toContain("bun install -g gloomberb");
+    expect(run.stderr).toContain("bun install -g @gloom-sh/terminal");
   });
 });
 
 const linuxMachine = { unameSystem: "Linux", unameMachine: "x86_64" };
-const metadataUrl = "https://api.github.com/repos/gloom-sh/gloomberb/releases/latest";
+const latestRelease = "https://github.com/gloom-sh/gloomberb/releases/latest/download";
 const assetName = "gloomberb-linux-x64.gz";
-const assetUrl = `https://github.com/gloom-sh/gloomberb/releases/download/v1.2.3/${assetName}`;
+const assetUrl = `${latestRelease}/${assetName}`;
 const binary = "#!/bin/sh\necho installed\n";
 const compressed = Bun.gzipSync(binary);
 const digest = new Bun.CryptoHasher("sha256").update(compressed).digest("hex");
 
-function releaseMetadata(assetDigest: string | null, checksumName?: string): string {
-  return JSON.stringify({
-    name: 'Release with "quotes", {braces} and a backslash \\',
-    assets: [
-      { name: "other.gz", digest: `sha256:${"0".repeat(64)}`, browser_download_url: `${assetUrl}.other` },
-      { name: assetName, uploader: { name: "Uploader" }, digest: assetDigest, browser_download_url: assetUrl },
-      ...(checksumName ? [{ name: checksumName, browser_download_url: `${assetUrl}/${checksumName}` }] : []),
-    ],
-  });
+/** The latest release's `name`, with the `<name>.sha256` the release workflow writes beside it (sha256sum's line) unless `checksum` says otherwise. */
+function released(name: string, contents: string | Uint8Array, checksum?: string | null): Record<string, string | Uint8Array> {
+  const line = `${new Bun.CryptoHasher("sha256").update(contents).digest("hex")}  ${name}\n`;
+  return { [`${latestRelease}/${name}`]: contents, ...(checksum === null ? {} : { [`${latestRelease}/${name}.sha256`]: checksum ?? line }) };
 }
 
 describe("install.sh verification", () => {
   test("verifies the selected release asset before installing without sudo", async () => {
-    const run = await runInstall(linuxMachine, { downloads: {
-      [metadataUrl]: releaseMetadata(`sha256:${digest}`),
-      [assetUrl]: compressed,
-    } });
+    const run = await runInstall(linuxMachine, { downloads: released(assetName, compressed) });
 
     expect(run.exitCode).toBe(0);
     expect(run.installed).toBe(binary);
@@ -285,14 +291,28 @@ describe("install.sh verification", () => {
     expect(run.temporaryFiles).toEqual([]);
   });
 
+  // ~/.local/bin is not on a new Mac's PATH: "Run 'gloom' to start." then
+  // failed with "command not found". The first run goes by the path, and the
+  // line that puts the folder on PATH is the login shell's.
+  test.each([
+    ["/bin/zsh", `echo 'export PATH="$HOME/install:$PATH"' >> ~/.zshrc`],
+    ["/bin/bash", `echo 'export PATH="$HOME/install:$PATH"' >> ~/.bashrc`],
+    ["/usr/bin/fish", "fish_add_path <install>"],
+  ])("names the command by its path when the install folder is not on PATH (%s)", async (shell, hint) => {
+    const run = await runInstall(linuxMachine, { downloads: released(assetName, compressed), installDirOnPath: false, shell });
+    const installDir = join(workDir, "install");
+
+    expect(run.exitCode).toBe(0);
+    expect(run.stdout).not.toContain("Run 'gloom' to start.");
+    expect(run.stdout).toContain(`start Gloom with:\n  ${join(installDir, "gloom")}\n`);
+    expect(run.stdout).toContain(`  ${hint.replace("<install>", installDir)}\n`);
+  });
+
   // Installs from before the rename have the binary itself at gloomberb.
   // Reinstalling puts it at gloom and leaves gloomberb as a link that runs it.
   test("an install from before the rename becomes gloom, with gloomberb still running it", async () => {
     const run = await runInstall(linuxMachine, {
-      downloads: {
-        [metadataUrl]: releaseMetadata(`sha256:${digest}`),
-        [assetUrl]: compressed,
-      },
+      downloads: released(assetName, compressed),
       existingInstall: "old binary",
     });
 
@@ -307,10 +327,7 @@ describe("install.sh verification", () => {
   // installs Gloom as gloomberb, the way the app leaves such a file alone.
   test("keeps another program's gloom and installs gloomberb", async () => {
     const run = await runInstall(linuxMachine, {
-      downloads: {
-        [metadataUrl]: releaseMetadata(`sha256:${digest}`),
-        [assetUrl]: compressed,
-      },
+      downloads: released(assetName, compressed),
       existingInstall: "old binary",
       prepare: (installDir) => writeFileSync(join(installDir, "gloom"), "another program"),
     });
@@ -334,10 +351,7 @@ describe("install.sh verification", () => {
     }],
   ] as const)("replaces a gloom that is ours: %s", async (_, prepare) => {
     const run = await runInstall(linuxMachine, {
-      downloads: {
-        [metadataUrl]: releaseMetadata(`sha256:${digest}`),
-        [assetUrl]: compressed,
-      },
+      downloads: released(assetName, compressed),
       prepare,
     });
 
@@ -347,12 +361,9 @@ describe("install.sh verification", () => {
     expect(run.stdout).toContain("Run 'gloom' to start.");
   });
 
-  test("rejects a digest mismatch without replacing an existing install", async () => {
+  test("rejects a checksum mismatch without replacing an existing install", async () => {
     const run = await runInstall(linuxMachine, {
-      downloads: {
-        [metadataUrl]: releaseMetadata(`sha256:${"0".repeat(64)}`),
-        [assetUrl]: compressed,
-      },
+      downloads: released(assetName, compressed, `${"0".repeat(64)}  ${assetName}\n`),
       existingInstall: "old binary",
     });
 
@@ -363,14 +374,9 @@ describe("install.sh verification", () => {
     expect(run.temporaryFiles).toEqual([]);
   });
 
-  test("a macOS app digest mismatch aborts before extraction or terminal fallback", async () => {
-    const name = "stable-macos-arm64-Gloomberb.app.zip";
-    const url = `https://github.com/gloom-sh/gloomberb/releases/download/v1.2.3/${name}`;
+  test("a macOS app checksum mismatch aborts before extraction or terminal fallback", async () => {
     const run = await runInstall({ unameSystem: "Darwin", unameMachine: "arm64" }, {
-      downloads: {
-        [metadataUrl]: JSON.stringify({ assets: [{ name, digest: `sha256:${"0".repeat(64)}`, browser_download_url: url }] }),
-        [url]: "corrupt archive",
-      },
+      downloads: released("stable-macos-arm64-Gloom.app.zip", "corrupt archive", "0".repeat(64)),
       existingInstall: "old binary",
     });
 
@@ -382,34 +388,27 @@ describe("install.sh verification", () => {
     expect(run.temporaryFiles).toEqual([]);
   });
 
-  test.each([
-    ["SHA256SUMS", `${digest}  unrelated.gz\n${digest} *${assetName}\n`, true],
-    ["checksums.txt", `SHA256 (${assetName}) = ${digest}\n`, true],
-    [`${assetName}.sha256`, `${digest}\n`, true],
-    ["SHA256SUMS", `${"0".repeat(64)}  ${assetName}\n`, false],
-  ] as const)("uses %s when the asset digest is unavailable", async (name, contents, valid) => {
-    const run = await runInstall(linuxMachine, { downloads: {
-      [metadataUrl]: releaseMetadata(null, name),
-      [assetUrl]: compressed,
-      [`${assetUrl}/${name}`]: contents,
-    } });
-
-    expect(run.exitCode === 0).toBe(valid);
-    expect(run.installed).toBe(valid ? binary : undefined);
-    expect(valid ? run.stdout : run.stderr).toContain(valid ? "Verified SHA-256" : "SHA-256 mismatch");
-    expect(run.temporaryFiles).toEqual([]);
-  });
-
-  test.each([true, false])("warns when no checksum is obtainable (metadata available: %p)", async (metadataAvailable) => {
-    const url = metadataAvailable ? assetUrl : `https://github.com/gloom-sh/gloomberb/releases/latest/download/${assetName}`;
-    const run = await runInstall(linuxMachine, { downloads: {
-      ...(metadataAvailable ? { [metadataUrl]: releaseMetadata(null) } : {}),
-      [url]: compressed,
-    } });
+  test("reads a checksum file holding the bare checksum, in either case", async () => {
+    const run = await runInstall(linuxMachine, { downloads: released(assetName, compressed, `${digest.toUpperCase()}\n`) });
 
     expect(run.exitCode).toBe(0);
     expect(run.installed).toBe(binary);
-    expect(run.stderr).toContain("Continuing without checksum verification.");
+    expect(run.stdout).toContain("Verified SHA-256");
+  });
+
+  // It used to warn and install anyway when no checksum could be had, as when the API's rate limit hid the digests.
+  test.each([
+    ["cannot be read", null, "could not read the SHA-256 checksum"],
+    ["holds no checksum", "Not Found\n", "holds no SHA-256 checksum"],
+  ] as const)("stops, installing nothing, when the checksum file %s", async (_, checksum, message) => {
+    const run = await runInstall(linuxMachine, { downloads: released(assetName, compressed, checksum), existingInstall: "old binary" });
+
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain(message);
+    expect(run.stderr).toContain("Nothing was installed.");
+    expect(run.downloadLog).not.toContain("api.github.com");
+    expect(run.installed).toBeUndefined();
+    expect(run.legacy).toBe("old binary");
     expect(run.temporaryFiles).toEqual([]);
   });
 
@@ -431,7 +430,6 @@ describe("install.sh verification", () => {
 describe("install.sh on an Apple Silicon Mac", () => {
   const appAsset = "stable-macos-arm64-Gloom.app.zip";
   const legacyAsset = "stable-macos-arm64-Gloomberb.app.zip";
-  const releaseUrl = "https://github.com/gloom-sh/gloomberb/releases/download/v1.2.3";
   const mac = { unameSystem: "Darwin", unameMachine: "arm64", hardwareArm64: "1" };
   const hasZip = Bun.which("zip") && Bun.which("unzip");
 
@@ -449,17 +447,9 @@ describe("install.sh on an Apple Silicon Mac", () => {
     return readFileSync(join(root, "app.zip"));
   }
 
-  /** A release listing `archives` by name, with their digests. */
+  /** The latest release with `archives`, each with its checksum file. */
   function release(archives: Record<string, Uint8Array>): Record<string, string | Uint8Array> {
-    const assets = Object.entries(archives).map(([name, archive]) => ({
-      name,
-      digest: `sha256:${new Bun.CryptoHasher("sha256").update(archive).digest("hex")}`,
-      browser_download_url: `${releaseUrl}/${name}`,
-    }));
-    return {
-      [metadataUrl]: JSON.stringify({ assets }),
-      ...Object.fromEntries(Object.entries(archives).map(([name, archive]) => [`${releaseUrl}/${name}`, archive])),
-    };
+    return Object.assign({}, ...Object.entries(archives).map(([name, archive]) => released(name, archive)));
   }
 
   const resources = (bundle = "Gloom.app") => join(workDir, "Applications", bundle, "Contents", "Resources");
@@ -557,6 +547,7 @@ describe("install.sh on an Apple Silicon Mac", () => {
   // while the new one is taken.
   test.skipIf(!hasZip).each([
     ["this app's", "com.vincelwt.gloomberb", ["Gloom.app"], "Gloom.app"],
+    ["this app's, under the identifier it moves to", "sh.gloom.desktop", ["Gloom.app"], "Gloom.app"],
     ["another program's", "com.example.gloom", ["Gloom.app", "Gloomberb.app"], "Gloomberb.app"],
   ] as const)("an existing Gloom.app that is %s", async (_, identifier, apps, installedAs) => {
     const run = await runInstall(mac, {

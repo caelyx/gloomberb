@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { createDefaultConfig } from "../../types/config";
+import { createDefaultConfig, type DockLayoutNode, type SavedLayout } from "../../types/config";
+import { getDockedInstanceIds } from "../../layout/pane-manager/dock-tree";
 import type { TickerRecord } from "../../types/ticker";
 import {
   FIRST_RUN_PANE_IDS,
   applyFirstRunLayout,
   buildFirstRunLayout,
+  isCompactHomeViewport,
+  onboardingDeskLayoutId,
   planFirstRunWatchlist,
+  setupDeskPicks,
 } from "./first-run-workspace";
+import { SEEDED_LIST_MIN_STARTERS, STARTER_SYMBOLS } from "../../tickers/starter-symbols";
 
 function ticker(symbol: string, { held = false, watched = false } = {}): [string, TickerRecord] {
   return [symbol, {
@@ -41,8 +46,40 @@ describe("first-run workspace", () => {
     expect(kept.length + plan.create.length).toBe(7);
   });
 
-  test("lays out heatmap, watchlist, chart and top news, floating a market read", () => {
-    const panes = ["portfolio-list", "chart-composer", "news-top", "ticker-news", "world-indices", "fear-greed"];
+  // The server, the Monday brief and the company picker take a list with fewer
+  // than seven starters as the user's own; with every pick a starter it would
+  // otherwise still read as the seeded list.
+  test("picks lead the list and leave it a starter short of a seeded one, so it reads as the user's own", () => {
+    const seeded = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "BRK.B", "JPM", "V", "BTC-USD", "ETH-USD"];
+    const tickers = new Map(seeded.map((symbol) => ticker(symbol, { watched: true })));
+    /** The watchlist once the plan's writes are saved. */
+    const listed = (plan: ReturnType<typeof planFirstRunWatchlist>) => {
+      const updated = new Map(plan.update.map((entry) => [entry.metadata.ticker, entry]));
+      const kept = [...tickers.values()]
+        .map((record) => updated.get(record.metadata.ticker) ?? record)
+        .filter((record) => record.metadata.watchlists.includes("watchlist"));
+      return new Set([...plan.create.map((metadata) => metadata.ticker), ...kept.map((record) => record.metadata.ticker)]);
+    };
+    const starters = (symbols: Set<string>) => [...symbols].filter((symbol) => STARTER_SYMBOLS.has(symbol)).length;
+
+    const future = { ticker: "ES=F", name: "E-Mini S&P 500", exchange: "CME", currency: "USD", assetCategory: "FUTURE" };
+    const withFuture = planFirstRunWatchlist(tickers, "watchlist", "main", [{ symbol: "ES=F", seed: future }]);
+    expect(withFuture.create[0]).toMatchObject({ ...future, watchlists: ["watchlist"], portfolios: [] });
+    expect(listed(withFuture).has("ES=F")).toBe(true);
+    expect(listed(withFuture).size).toBe(7);
+    expect(starters(listed(withFuture))).toBe(SEEDED_LIST_MIN_STARTERS - 1);
+
+    const allStarters = planFirstRunWatchlist(tickers, "watchlist", "main", [{ symbol: "TSLA" }, { symbol: "NVDA" }, { symbol: "META" }]);
+    const kept = listed(allStarters);
+    for (const symbol of ["TSLA", "NVDA", "META"]) expect(kept.has(symbol)).toBe(true);
+    expect(starters(kept)).toBeLessThan(SEEDED_LIST_MIN_STARTERS);
+
+    // No picks: the list is the seeded one, as before.
+    expect(starters(listed(planFirstRunWatchlist(tickers, "watchlist", "main")))).toBe(SEEDED_LIST_MIN_STARTERS);
+  });
+
+  test("lays out heatmap, watchlist, chart and top news, with a market read docked in front of Trending", () => {
+    const panes = ["portfolio-list", "chart-composer", "news-top", "ticker-news", "world-indices", "fear-greed", "attention-trending"];
     const build = (hasPane: (id: string) => boolean) => buildFirstRunLayout({
       symbol: "MSFT",
       portfolioId: "main",
@@ -56,11 +93,45 @@ describe("first-run workspace", () => {
     expect(byId.get(FIRST_RUN_PANE_IDS.chart)).toMatchObject({ paneId: "chart-composer", binding: { kind: "fixed", symbol: "MSFT" } });
     expect(byId.get(FIRST_RUN_PANE_IDS.news)).toMatchObject({ paneId: "news-top", binding: { kind: "none" } });
     expect(home.layout.instances.some((instance) => instance.paneId === "ticker-news")).toBe(false);
-    expect(home.layout.floating.map((entry) => entry.instanceId)).toEqual([FIRST_RUN_PANE_IDS.sentiment]);
+    // Nothing floats over the docked panes, whatever the window's size.
+    expect(home.layout.floating).toEqual([]);
+    const besideNews = (layout: SavedLayout) => {
+      const right = layout.layout.dockRoot?.kind === "split" ? layout.layout.dockRoot.second : null;
+      const lower = right?.kind === "split" ? right.second : null;
+      return lower?.kind === "split" ? lower.second : null;
+    };
+    expect(besideNews(home)).toMatchObject({
+      tabs: { active: FIRST_RUN_PANE_IDS.sentiment },
+      first: { kind: "pane", instanceId: FIRST_RUN_PANE_IDS.sentiment },
+      second: { kind: "pane", instanceId: FIRST_RUN_PANE_IDS.trending },
+    });
     expect(home.focusedPaneId).toBe(FIRST_RUN_PANE_IDS.chart);
-    // Without the gauge, the indices float instead.
+    // Without the gauge, the indices take its place.
     const withoutGauge = build((id) => id !== "fear-greed" && panes.includes(id));
-    expect(withoutGauge.layout.floating.map((entry) => entry.instanceId)).toEqual([FIRST_RUN_PANE_IDS.indices]);
+    expect(besideNews(withoutGauge)).toMatchObject({ tabs: { active: FIRST_RUN_PANE_IDS.indices } });
+  });
+
+  // At 80x24 five spots cut the headlines to nine characters and the titles to "Main P...".
+  test("a small terminal gets three spots, with every other pane a tab behind the news", () => {
+    expect(isCompactHomeViewport({ width: 80, height: 24 })).toBe(true);
+    expect(isCompactHomeViewport({ width: 120, height: 36 })).toBe(false);
+    const build = (holdings: boolean) => buildFirstRunLayout({
+      symbol: "MSFT", portfolioId: "main", watchlistId: "watchlist", hasPane: () => true, compact: true, holdings,
+    });
+    expect(build(false).layout.dockRoot).toMatchObject({
+      kind: "split",
+      axis: "vertical",
+      first: {
+        first: { kind: "pane", instanceId: FIRST_RUN_PANE_IDS.watchlist },
+        second: { kind: "pane", instanceId: FIRST_RUN_PANE_IDS.chart },
+      },
+      second: { tabs: { active: FIRST_RUN_PANE_IDS.news } },
+    });
+    const tabs = (home: SavedLayout) => getDockedInstanceIds((home.layout.dockRoot as { second: DockLayoutNode }).second);
+    expect(tabs(build(false))).toEqual([FIRST_RUN_PANE_IDS.news, FIRST_RUN_PANE_IDS.sentiment, FIRST_RUN_PANE_IDS.trending, FIRST_RUN_PANE_IDS.heatmap]);
+    // Holdings go beside the chart, and the watchlist behind the news.
+    expect(build(true).layout.dockRoot).toMatchObject({ first: { first: { instanceId: FIRST_RUN_PANE_IDS.heatmap } } });
+    expect(tabs(build(true)).at(-1)).toBe(FIRST_RUN_PANE_IDS.watchlist);
   });
 
   test("skips panes the host cannot render instead of leaving placeholders", () => {
@@ -82,5 +153,61 @@ describe("first-run workspace", () => {
     expect(next.layouts.map((layout) => layout.name)).toEqual(["Home", "Monitor", "Macro"]);
     expect(next.layout).toBe(home.layout);
     expect(next.activeLayoutIndex).toBe(0);
+  });
+
+  test("running again replaces the layouts it made and leaves the user's alone", () => {
+    const config = createDefaultConfig("/tmp/first-run");
+    const home = (symbol: string) => buildFirstRunLayout({ symbol, portfolioId: "main", watchlistId: "watchlist", hasPane: () => true });
+    const desk = (key: "rates" | "fx" | "options", name: string) => ({ ...home("SPY"), name, id: onboardingDeskLayoutId(key) });
+    const first = applyFirstRunLayout(config, home("AAPL"), [desk("rates", "Rates"), desk("fx", "FX & Macro")]);
+    expect(first.layouts.map((layout) => layout.name)).toEqual(["Home", "Rates", "FX & Macro", "Monitor", "Macro"]);
+
+    // The user moves their own layout to the front and adds one of their own.
+    const mine: SavedLayout = { name: "Mine", layout: home("TSLA").layout };
+    const [onboardingHome, rates, fx, monitor, macro] = first.layouts;
+    const edited = { ...first, layouts: [monitor!, onboardingHome!, rates!, fx!, macro!, mine], activeLayoutIndex: 5 };
+
+    const again = applyFirstRunLayout(edited, home("MSFT"), [desk("rates", "Rates"), desk("fx", "FX & Macro")]);
+    expect(again.layouts).toHaveLength(edited.layouts.length);
+    expect(again.layouts.map((layout) => layout.name)).toEqual(["Monitor", "Home", "Rates", "FX & Macro", "Macro", "Mine"]);
+    expect(again.layouts[0]).toBe(monitor!);
+    expect(again.layouts.slice(4)).toEqual([macro!, mine]);
+    expect(again.activeLayoutIndex).toBe(1);
+    expect(again.layout.instances.find((instance) => instance.instanceId === FIRST_RUN_PANE_IDS.chart)?.binding)
+      .toEqual({ kind: "fixed", symbol: "MSFT" });
+
+    // Other picks replace the desks it made, and a skip removes them.
+    expect(applyFirstRunLayout(again, home("MSFT"), [desk("options", "Options")]).layouts.map((layout) => layout.name))
+      .toEqual(["Monitor", "Home", "Options", "Macro", "Mine"]);
+    expect(applyFirstRunLayout(again, home("MSFT")).layouts.map((layout) => layout.name))
+      .toEqual(["Monitor", "Home", "Macro", "Mine"]);
+  });
+
+  test("a run from Settings rebuilds what setup made before it tagged its layouts, and replaces nothing else", () => {
+    const home = (symbol: string) => buildFirstRunLayout({ symbol, portfolioId: "main", watchlistId: "watchlist", hasPane: () => true });
+    const desk = (key: "rates" | "fx" | "options", name: string) => ({ ...home("SPY"), name, id: onboardingDeskLayoutId(key) });
+    const untagged = (name: string): SavedLayout => ({ name, layout: home("TSLA").layout });
+    // Setup's Home and desks as older builds left them, then the user's own:
+    // a later Rates tab is theirs, since only the run right after Home is setup's.
+    const older = {
+      ...createDefaultConfig("/tmp/first-run"),
+      layouts: [untagged("Home"), untagged("Rates"), untagged("FX & Macro"), untagged("Monitor"), untagged("Rates")],
+    };
+    expect(setupDeskPicks(older)).toEqual(["rates", "fx"]);
+
+    const again = applyFirstRunLayout(older, home("MSFT"), [desk("rates", "Rates"), desk("fx", "FX & Macro")], { rerun: true });
+    expect(again.layouts.map((layout) => layout.name)).toEqual(["Home", "Rates", "FX & Macro", "Monitor", "Rates"]);
+    expect(again.layouts.map((layout) => layout.id)).toEqual([
+      "onboarding:home", onboardingDeskLayoutId("rates"), onboardingDeskLayoutId("fx"), undefined, undefined,
+    ]);
+    expect(again.layouts.slice(3)).toEqual(older.layouts.slice(3));
+    expect(setupDeskPicks(again)).toEqual(["rates", "fx"]);
+
+    // A first tab that is not Home is the user's: Home goes in ahead of it.
+    const renamed = { ...older, layouts: [untagged("Main"), ...older.layouts.slice(1)] };
+    expect(setupDeskPicks(renamed)).toEqual([]);
+    const kept = applyFirstRunLayout(renamed, home("MSFT"), [], { rerun: true });
+    expect(kept.layouts.map((layout) => layout.name)).toEqual(["Home", "Main", "Rates", "FX & Macro", "Monitor", "Rates"]);
+    expect(kept.layouts.slice(1)).toEqual(renamed.layouts);
   });
 });

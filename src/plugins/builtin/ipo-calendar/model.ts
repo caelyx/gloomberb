@@ -1,12 +1,12 @@
 import type { IpoDeal, IpoRegion, IpoSourceHealth, IpoStatus } from "../../../api-client/ipo";
 import type { DataTableColumn } from "../../../components";
-import { getTableWidth } from "../../../components/ui/table-layout";
+import { dropColumnsToFit, getTableWidth } from "../../../components/ui/table-layout";
 import { publicTickerKey } from "../../../utils/exchanges";
-import { displayWidth, formatCompact } from "../../../utils/format";
+import { MISSING_VALUE, displayWidth, formatCompact } from "../../../utils/format";
 import { compareSortValues, type SortPreference } from "../../../utils/sort-values";
 
 export const IPO_CALENDAR_PANE_ID = "ipo-calendar";
-export const MISSING = "—";
+export const MISSING = MISSING_VALUE;
 
 export type IpoTab = "all" | Exclude<IpoRegion, "other">;
 
@@ -29,15 +29,30 @@ export const IPO_STATUSES: readonly IpoStatus[] = ["filed", "upcoming", "priced"
  * What the board says a deal is: its status, except for an upcoming deal
  * whose dates have come. One whose book has opened with no listing date named
  * yet is `offering`; one whose listing day has passed at its venue with no
- * pricing or first session reported is `overdue` (pulled, postponed, or late
- * to be reported). Neither is a status the server sends.
+ * pricing or first session reported is `overdue` (late to be reported, or
+ * pulled), and `delayed` once DELAYED_AFTER_BUSINESS_DAYS more weekdays have
+ * passed: no longer upcoming, kept until its source stops listing it. None of
+ * these is a status the server sends.
  */
-export type IpoBoardStatus = IpoStatus | "offering" | "overdue";
+export type IpoBoardStatus = IpoStatus | "offering" | "overdue" | "delayed";
 
 /** Every word the board shows, in the order a deal moves through them. */
 const IPO_BOARD_STATUSES: readonly IpoBoardStatus[] = [
-  "filed", "upcoming", "offering", "overdue", "priced", "listed", "postponed", "withdrawn",
+  "filed", "upcoming", "offering", "overdue", "delayed", "priced", "listed", "postponed", "withdrawn",
 ];
+
+/** Weekdays past its listing date after which a deal not yet priced or trading is delayed. */
+const DELAYED_AFTER_BUSINESS_DAYS = 3;
+
+/** `date` plus `days` weekdays, YYYY-MM-DD. */
+function addWeekdays(date: string, days: number): string {
+  const day = new Date(`${date}T00:00:00Z`);
+  for (let left = days; left > 0;) {
+    day.setUTCDate(day.getUTCDate() + 1);
+    if (day.getUTCDay() !== 0 && day.getUTCDay() !== 6) left -= 1;
+  }
+  return day.toISOString().slice(0, 10);
+}
 
 const venueDays = new Map<string, Intl.DateTimeFormat | null>();
 
@@ -55,6 +70,7 @@ function venueToday(timeZone: string, now = new Date()): string {
     try {
       format = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" });
     } catch {
+      // Intentional ignore: a zone this runtime does not know reads the board at the local date.
       format = null;
     }
     venueDays.set(timeZone, format);
@@ -67,7 +83,10 @@ function venueToday(timeZone: string, now = new Date()): string {
 export function ipoBoardStatus(deal: IpoDeal, now = new Date()): IpoBoardStatus {
   if (deal.status !== "upcoming") return deal.status;
   const today = venueToday(deal.timezone, now);
-  if (deal.listingDate) return deal.listingDate < today ? "overdue" : "upcoming";
+  if (deal.listingDate) {
+    if (deal.listingDate >= today) return "upcoming";
+    return addWeekdays(deal.listingDate, DELAYED_AFTER_BUSINESS_DAYS) < today ? "delayed" : "overdue";
+  }
   const opened = deal.subscriptionOpen ?? deal.subscriptionClose;
   return opened && opened <= today ? "offering" : "upcoming";
 }
@@ -145,6 +164,7 @@ function countryName(code: string): string {
       regionNames ??= new Intl.DisplayNames(["en"], { type: "region" });
       name = regionNames.of(code) ?? "";
     } catch {
+      // Intentional ignore: a region the runtime cannot name leaves the search without a country name.
       name = "";
     }
     countryNames.set(code, name);
@@ -162,15 +182,35 @@ const REGION_WORDS: Partial<Record<IpoRegion, readonly string[]>> = {
 };
 
 /**
+ * Words that name a kind of deal rather than one: `lockup` (`lock-up`,
+ * `lock up`, `lockups`) lists the deals with a lock-up estimate, `spac` the
+ * SPACs' own IPOs, and `de-spac` (`despac`) those too: a SPAC's merger with
+ * its target is no IPO, so the calendar has none of its own.
+ */
+export type IpoKeyword = "lockup" | "spac" | "de-spac";
+
+export function ipoKeyword(query: string): IpoKeyword | null {
+  const word = query.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  if (/^lockups?$/.test(word)) return "lockup";
+  if (/^spacs?$/.test(word)) return "spac";
+  if (/^despacs?$/.test(word)) return "de-spac";
+  return null;
+}
+
+/**
  * Company in either script, symbol, venue, country code or name, and the
  * status the board shows. The word `pending` is no status of its own: it is
  * every deal not priced yet, offering and overdue ones included.
  * A region's name (`europe`, `asia`) lists the region's deals, on whichever tab is open.
+ * A kind of deal (`lockup`, `spac`, `de-spac`, see ipoKeyword) lists that kind.
  */
 function matchesIpoQuery(deal: IpoDeal, query: string, now: Date): boolean {
   const needle = query.trim().toLowerCase();
   if (!needle) return true;
   if (needle === "pending") return NOT_PRICED_STATUSES.includes(deal.status);
+  const keyword = ipoKeyword(needle);
+  if (keyword === "lockup") return !!deal.lockup;
+  if (keyword) return deal.listingType === "spac";
   if (REGION_WORDS[deal.region]?.includes(needle.replace(/\s+/g, "-"))) return true;
   return [
     deal.company, deal.companyLocal, deal.symbol, deal.venue, deal.mic, deal.exchange,
@@ -219,9 +259,11 @@ export function calendarDate(deal: IpoDeal): string | null {
 /**
  * Upcoming deals: the ones in their offer now, then the ones still ahead
  * soonest first, then undated ones, then the overdue ones most recent first,
- * so the board opens on what is next. Everything after them most recent first.
+ * so the board opens on what is next. Everything after them most recent first,
+ * a delayed deal among the ones that stopped.
  */
 function calendarOrder(boardStatus: (deal: IpoDeal) => IpoBoardStatus): (a: IpoDeal, b: IpoDeal) => number {
+  const groupOf = (deal: IpoDeal) => boardStatus(deal) === "delayed" ? calendarGroup("postponed") : calendarGroup(deal.status);
   const upcomingRank = (deal: IpoDeal) => {
     const status = boardStatus(deal);
     if (status === "offering") return 0;
@@ -229,9 +271,9 @@ function calendarOrder(boardStatus: (deal: IpoDeal) => IpoBoardStatus): (a: IpoD
     return calendarDate(deal) === null ? 2 : 1;
   };
   return (a, b) => {
-    const group = calendarGroup(a.status) - calendarGroup(b.status);
+    const group = groupOf(a) - groupOf(b);
     if (group !== 0) return group;
-    const upcoming = a.status === "upcoming";
+    const upcoming = a.status === "upcoming" && boardStatus(a) !== "delayed";
     const rank = upcoming ? upcomingRank(a) - upcomingRank(b) : 0;
     if (rank !== 0) return rank;
     const ascending = upcoming && upcomingRank(a) < 3;
@@ -292,9 +334,9 @@ const IPO_COLUMNS: readonly IpoColumn[] = [
   { id: "status", label: "STATUS", width: 9, align: "left" },
   // "HK$26.20-28.50".
   { id: "price", label: "PRICE", width: 14, align: "right" },
-  // "$218.82M".
-  { id: "size", label: "SIZE", width: 8, align: "right" },
-  { id: "return", label: "RETURN", width: 8, align: "right" },
+  // "$218.82M". A deal's size comes with its terms and its return with its first day: an upcoming one has neither.
+  { id: "size", label: "SIZE", width: 8, align: "right", mayBeBlank: true },
+  { id: "return", label: "RETURN", width: 8, align: "right", mayBeBlank: true },
 ];
 
 /**
@@ -316,12 +358,8 @@ export function marketColumnWidth(deals: readonly IpoDeal[]): number {
 }
 
 export function buildIpoColumns(width: number, marketWidth = 10): IpoColumn[] {
-  let columns = IPO_COLUMNS.map((column) => (column.id === "market" ? { ...column, width: marketWidth } : column));
-  for (const id of NARROW_DROP_ORDER) {
-    if (ipoTableWidth(columns) <= width) break;
-    columns = columns.filter((column) => column.id !== id);
-  }
-  return columns;
+  const columns = IPO_COLUMNS.map((column) => (column.id === "market" ? { ...column, width: marketWidth } : column));
+  return dropColumnsToFit(columns, width - 1, NARROW_DROP_ORDER);
 }
 
 /**
@@ -343,9 +381,17 @@ function amount(value: number): string {
   return value.toLocaleString("en-US", { minimumFractionDigits: whole ? 0 : 2, maximumFractionDigits: 2 });
 }
 
-/** "$18", "HK$26.20-28.50", "240-260p", "CHF 45": the offer price once set, else the range. */
-export function formatIpoPrice(deal: IpoDeal): string {
+/** What a direct listing with no price reads in a column; a report's row says why in full. */
+const DIRECT_LISTING_PRICE = "direct listing";
+const DIRECT_LISTING_NO_PRICE = "direct listing, no offer price";
+
+/**
+ * "$18", "HK$26.20-28.50", "240-260p", "CHF 45": the offer price once set, else the range.
+ * A direct listing sells no shares at a price: "direct listing" (`full`: "direct listing, no offer price").
+ */
+export function formatIpoPrice(deal: IpoDeal, { full = false }: { full?: boolean } = {}): string {
   const low = deal.offerPrice ?? deal.priceLow ?? deal.priceHigh;
+  if (low == null && deal.listingType === "direct") return full ? DIRECT_LISTING_NO_PRICE : DIRECT_LISTING_PRICE;
   if (low == null) return MISSING;
   const high = deal.offerPrice == null && deal.priceLow != null && deal.priceHigh != null && deal.priceHigh !== deal.priceLow
     ? deal.priceHigh
@@ -375,7 +421,7 @@ export function formatIpoReturn(returnPct: number | null | undefined): string {
 const MS_PER_DAY = 86_400_000;
 
 /**
- * "Oct 23" for dates near today, which is nearly every row on a calendar;
+ * "23 Oct" for dates near today, which is nearly every row on a calendar;
  * "Dec 2024" for anything more than half a year off, where the year matters.
  */
 export function formatIpoDate(value: string | null, now = new Date()): string {
@@ -384,6 +430,74 @@ export function formatIpoDate(value: string | null, now = new Date()): string {
   if (!Number.isFinite(date.getTime())) return MISSING;
   const month = date.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
   return Math.abs(date.getTime() - now.getTime()) <= 183 * MS_PER_DAY
-    ? `${month} ${date.getUTCDate()}`
+    ? `${date.getUTCDate()} ${month}`
     : `${month} ${date.getUTCFullYear()}`;
+}
+
+/** "~2026-11-02": when a deal's lock-up is estimated to end; "—" without an estimate. */
+export function formatIpoLockupEnd(endsOn: string | null | undefined): string {
+  return endsOn ? `~${endsOn}` : MISSING;
+}
+
+/** Today in UTC, YYYY-MM-DD. */
+function utcToday(now: Date): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/**
+ * "lockup ends ~2026-11-02 (estimate)", "lockup ended ~2026-07-28 (estimate)":
+ * a deal's lock-up estimate in words; null without one.
+ */
+export function ipoLockupText(deal: Pick<IpoDeal, "lockup">, now = new Date()): string | null {
+  if (!deal.lockup) return null;
+  const verb = deal.lockup.endsOn < utcToday(now) ? "ended" : "ends";
+  return `lockup ${verb} ~${deal.lockup.endsOn} (estimate)`;
+}
+
+/**
+ * What the estimate counts from, as the server made it. The period is the
+ * prospectus's own (`prospectus`) or the typical 180 days; it counts from
+ * the prospectus date when one was read, else from the first session:
+ * - "180 days from the prospectus dated 2026-05-06"
+ * - "90 days from the first session on 2026-05-07, the period the prospectus states"
+ * - "the typical 180 days from the prospectus dated 2026-05-06"
+ * - "the typical 180 days from the first session on 2026-05-07; the prospectus has not been read"
+ */
+export function ipoLockupBasis(deal: Pick<IpoDeal, "lockup" | "listingDate">): string | null {
+  const lockup = deal.lockup;
+  if (!lockup) return null;
+  const stated = lockup.basis === "prospectus";
+  const from = lockup.prospectusDate
+    ? `from the prospectus dated ${lockup.prospectusDate}`
+    : `from the first session${deal.listingDate ? ` on ${deal.listingDate}` : ""}`;
+  if (stated) return `${lockup.days} days ${from}${lockup.prospectusDate ? "" : ", the period the prospectus states"}`;
+  // A prospectus read with no period it states (or none of a lock-up's length) is still read.
+  const read = lockup.prospectusDate != null || lockup.prospectusUrl != null;
+  return `the typical ${lockup.days} days ${from}${read ? "" : "; the prospectus has not been read"}`;
+}
+
+/** A price in the deal's own currency: "$26", "HK$7.20". */
+export function formatIpoAmount(deal: Pick<IpoDeal, "currency">, value: number): string {
+  return formatIpoPrice({ offerPrice: value, priceLow: null, priceHigh: null, currency: deal.currency, listingType: "ipo" } as IpoDeal);
+}
+
+/**
+ * What a listed deal's price has done since it listed: from the offer price,
+ * else (a direct listing) from its first trade. Null without a price now or a
+ * price to measure from.
+ */
+export function ipoReturnSince(deal: IpoDeal, price: number | null | undefined): { from: number; basis: "offer" | "first trade"; returnPct: number } | null {
+  if (price == null || !Number.isFinite(price) || price <= 0) return null;
+  const offer = deal.offerPrice;
+  if (offer != null && offer > 0) return { from: offer, basis: "offer", returnPct: price / offer - 1 };
+  const open = deal.firstDay?.open;
+  if (deal.listingType === "direct" && open != null && open > 0) return { from: open, basis: "first trade", returnPct: price / open - 1 };
+  return null;
+}
+
+/** The lock-up stories worth listing beside a deal: on or after its listing, about its lock-up. */
+const LOCKUP_WORDS = /\block[\s-]?ups?\b/i;
+
+export function isLockupStory(title: string): boolean {
+  return LOCKUP_WORDS.test(title);
 }

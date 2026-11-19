@@ -1,14 +1,21 @@
 $ErrorActionPreference = "Stop"
+$env:GLOOMBERB_NO_TELEMETRY = "1"
+$env:DO_NOT_TRACK = "1"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $PackageJson = Get-Content (Join-Path $Root "package.json") -Raw | ConvertFrom-Json
-$BundleDir = Join-Path $Root "build\stable-win-x64\Gloom-inno-source\Gloom"
-$CoreDir = Join-Path $BundleDir "Resources\gloomberb-tui\node_modules\@opentui\core-win32-x64"
-$InstallerPath = Join-Path $Root "artifacts\stable-win-x64-GloomSetup.exe"
+# Electrobun builds for the machine it runs on: win-x64, or win-arm64 on Windows on Arm.
+$BuiltManifest = Get-ChildItem -LiteralPath (Join-Path $Root "artifacts") -Filter "stable-win-*-update.json" -ErrorAction SilentlyContinue | Select-Object -First 1
+$Platform = if ($BuiltManifest -and $BuiltManifest.Name -match '^stable-(win-(x64|arm64))-update\.json$') { $Matches[1] } else { "win-x64" }
+$BundleDir = Join-Path $Root "build\stable-$Platform\Gloom-inno-source\Gloom"
+$CoreDir = Join-Path $BundleDir "Resources\gloomberb-tui\node_modules\@opentui\core-win32-$($Platform.Substring(4))"
+$InstallerPath = Join-Path $Root "artifacts\stable-$Platform-GloomSetup.exe"
 # What installs from before the rename update from, and the installer under its old name.
-$LegacyUpdateArchivePath = Join-Path $Root "artifacts\stable-win-x64-Gloomberb.tar.zst"
-$LegacyInstallerPath = Join-Path $Root "artifacts\stable-win-x64-GloomberbSetup.exe"
-$UpdateManifestPath = Join-Path $Root "artifacts\stable-win-x64-update.json"
+$LegacyUpdateArchivePath = Join-Path $Root "artifacts\stable-$Platform-Gloomberb.tar.zst"
+$LegacyInstallerPath = Join-Path $Root "artifacts\stable-$Platform-GloomberbSetup.exe"
+$UpdateManifestPath = Join-Path $Root "artifacts\stable-$Platform-update.json"
+# Electrobun's folder for the app, where the installer installs (windows-installer.iss).
+$ManagedAppDir = Join-Path $env:LOCALAPPDATA "com.vincelwt.gloomberb\stable\app"
 $GuiArtifactDir = Join-Path $Root "artifacts\windows-gui-verification"
 $BundleAppIconPath = Join-Path $BundleDir "Resources\app.ico"
 $BundleLogoIconPath = Join-Path $BundleDir "Resources\gloomberb-logo.ico"
@@ -344,12 +351,26 @@ function Capture-DesktopScreenshot {
   Save-ScreenRegion ([System.Windows.Forms.Screen]::PrimaryScreen.Bounds) $Path
 }
 
+# The window as it shows on screen. A sizable window's rect also holds its
+# invisible resize borders, where whatever is behind it shows through, so the
+# frame Windows draws comes first, and the rect only when it has none.
 function Get-WindowBounds {
   param([object]$Window)
 
   $Handle = [IntPtr]::new([long]$Window.Handle)
   $Rect = New-Object GloomberbWindowRect
-  if (-not [GloomberbWin32]::GetWindowRect($Handle, [ref]$Rect)) {
+  $Drawn = $false
+  try {
+    $Drawn = [GloomberbWin32]::DwmGetWindowAttribute(
+      $Handle,
+      9,
+      [ref]$Rect,
+      [System.Runtime.InteropServices.Marshal]::SizeOf([type][GloomberbWindowRect])
+    ) -eq 0
+  } catch {
+    $Drawn = $false
+  }
+  if (-not $Drawn -and -not [GloomberbWin32]::GetWindowRect($Handle, [ref]$Rect)) {
     throw "Could not read window bounds for $($Window.ProcessName) $($Window.Handle)."
   }
 
@@ -734,31 +755,59 @@ function Capture-WindowScreenshotByTitle {
   throw "$Label window was not visible: $Title"
 }
 
+# Every pixel, not a grid of samples: the app's text is a pixel or two wide
+# and its lines sit about 20 pixels apart, so rows of samples that far apart
+# can fall between the lines all the way down and see only the flat fills.
 function Get-ScreenshotStats {
   param([string]$Path)
 
   $Bitmap = [System.Drawing.Bitmap]::FromFile($Path)
   try {
-    $StepX = [Math]::Max(1, [int][Math]::Floor($Bitmap.Width / 48))
-    $StepY = [Math]::Max(1, [int][Math]::Floor($Bitmap.Height / 32))
-    $UniqueColors = @{}
-    $Samples = 0
-    for ($Y = 0; $Y -lt $Bitmap.Height; $Y += $StepY) {
-      for ($X = 0; $X -lt $Bitmap.Width; $X += $StepX) {
-        $Color = $Bitmap.GetPixel($X, $Y).ToArgb()
-        $UniqueColors[[string]$Color] = $true
-        $Samples += 1
+    $Width = $Bitmap.Width
+    $Height = $Bitmap.Height
+    $Pixels = New-Object int[] ($Width * $Height)
+    $Data = $Bitmap.LockBits(
+      (New-Object System.Drawing.Rectangle 0, 0, $Width, $Height),
+      [System.Drawing.Imaging.ImageLockMode]::ReadOnly,
+      [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+    )
+    try {
+      for ($Y = 0; $Y -lt $Height; $Y += 1) {
+        [System.Runtime.InteropServices.Marshal]::Copy([IntPtr]::Add($Data.Scan0, $Y * $Data.Stride), $Pixels, $Y * $Width, $Width)
       }
-    }
-
-    [pscustomobject]@{
-      Width = $Bitmap.Width
-      Height = $Bitmap.Height
-      Samples = $Samples
-      UniqueColors = $UniqueColors.Count
+    } finally {
+      $Bitmap.UnlockBits($Data)
     }
   } finally {
     $Bitmap.Dispose()
+  }
+
+  [pscustomobject]@{
+    Width = $Width
+    Height = $Height
+    Pixels = $Pixels.Length
+    UniqueColors = [System.Collections.Generic.HashSet[int]]::new([System.Collections.Generic.IEnumerable[int]]$Pixels).Count
+  }
+}
+
+# Electrobun's handlers for native window, webview, menu and tray events catch
+# their own errors, so a handler that cannot read what native code passed it
+# only shows in the app's stderr.
+function Assert-NativeEventsRead {
+  param(
+    [string]$Path,
+    [string]$Label
+  )
+
+  $Stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+  try {
+    $Text = (New-Object System.IO.StreamReader $Stream).ReadToEnd()
+  } finally {
+    $Stream.Dispose()
+  }
+  $Failure = [regex]::Match($Text, '(?m)^.*(\[webviewEventJSCallback\] Error|error in eventBridgeHandler|error in internalBridgeHandler|error sending message to bun).*$')
+  if ($Failure.Success) {
+    throw "$Label could not read a native event: $($Failure.Value.Trim())"
   }
 }
 
@@ -768,8 +817,10 @@ function Assert-ScreenshotHasContent {
     [string]$Label
   )
 
+  # A window of flat fills, its bars and outlines drawn but nothing in them,
+  # stays under 32 colors; anti-aliased text and icons put hundreds on screen.
   $Stats = Get-ScreenshotStats $Path
-  if ($Stats.Width -le 1 -or $Stats.Height -le 1 -or $Stats.UniqueColors -lt 8) {
+  if ($Stats.Width -le 1 -or $Stats.Height -le 1 -or $Stats.UniqueColors -lt 32) {
     throw "$Label screenshot appears blank: $($Stats | ConvertTo-Json -Compress)"
   }
 }
@@ -915,6 +966,70 @@ function Assert-WindowControlPaddingMeasurement {
   }
 }
 
+function Assert-ExecutableDetails {
+  param([string]$Path)
+
+  # What Task Manager, a file's properties and Windows' security prompts show.
+  $Details = (Get-Item -LiteralPath $Path).VersionInfo
+  $Name = Split-Path -Leaf $Path
+  Write-Host "$Name details: $($Details.FileDescription), $($Details.ProductName), $($Details.CompanyName), $($Details.ProductVersion)"
+  foreach ($Field in @("FileDescription", "ProductName", "CompanyName")) {
+    if ($Details.$Field -ne "Gloom") {
+      throw "$Name shows $Field '$($Details.$Field)' instead of Gloom"
+    }
+  }
+  if ($Details.ProductVersion -ne $PackageJson.version) {
+    throw "$Name shows version '$($Details.ProductVersion)' instead of $($PackageJson.version)"
+  }
+}
+
+function Assert-UpdaterToolsWork {
+  param([string]$BundleDir)
+
+  # rcedit and resedit rewrite the updater's two tools too: each must still do
+  # its job, as an update runs them, on files this check makes.
+  $ToolCheckDir = Join-Path ([IO.Path]::GetTempPath()) "gloom-updater-tools-$PID"
+  New-Item -ItemType Directory -Force -Path $ToolCheckDir | Out-Null
+  try {
+    $OldFile = Join-Path $ToolCheckDir "old.bin"
+    $NewFile = Join-Path $ToolCheckDir "new.bin"
+    [IO.File]::WriteAllText($OldFile, ("Gloom update check, line one`n" * 4000))
+    [IO.File]::WriteAllText($NewFile, ("Gloom update check, line one`n" * 2000) + ("line two`n" * 2000))
+    $BundledZstd = Join-Path $BundleDir "bin\zig-zstd.exe"
+    if (Test-Path -LiteralPath $BundledZstd) {
+      & $BundledZstd compress -i $NewFile -o "$NewFile.zst"
+      if ($LASTEXITCODE -ne 0) { throw "The bundled zig-zstd.exe could not compress a file (exit $LASTEXITCODE)" }
+      & $BundledZstd decompress -i "$NewFile.zst" -o "$NewFile.out"
+      if ($LASTEXITCODE -ne 0) { throw "The bundled zig-zstd.exe could not decompress a file (exit $LASTEXITCODE)" }
+      if ((Get-FileHash -LiteralPath $NewFile).Hash -ne (Get-FileHash -LiteralPath "$NewFile.out").Hash) {
+        throw "The bundled zig-zstd.exe gave back a different file"
+      }
+      Write-Host "zig-zstd.exe compressed and decompressed a file"
+    }
+    $BundledBspatch = Join-Path $BundleDir "bin\bspatch.exe"
+    # Electrobun 2 keeps bsdiff with its release, in Hutch's store.
+    $Bsdiff = @(Get-ChildItem -Path (Join-Path $env:USERPROFILE ".hutch\releases") -Recurse -Filter "bsdiff.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName)
+    $Bsdiff = if ($Bsdiff.Count -gt 0) { $Bsdiff[0] } else { "" }
+    if ((Test-Path -LiteralPath $BundledBspatch) -and $Bsdiff) {
+      # As Electrobun makes an update's patch and the app applies it.
+      $PatchFile = Join-Path $ToolCheckDir "update.patch"
+      & $Bsdiff $OldFile $NewFile $PatchFile --use-zstd
+      if ($LASTEXITCODE -ne 0) { throw "bsdiff could not make a patch (exit $LASTEXITCODE)" }
+      & $BundledBspatch $OldFile "$OldFile.patched" $PatchFile
+      if ($LASTEXITCODE -ne 0) { throw "The bundled bspatch.exe could not apply a patch (exit $LASTEXITCODE)" }
+      if ((Get-FileHash -LiteralPath $NewFile).Hash -ne (Get-FileHash -LiteralPath "$OldFile.patched").Hash) {
+        throw "The bundled bspatch.exe made a different file from the patch"
+      }
+      Write-Host "bspatch.exe applied a patch"
+    } elseif (Test-Path -LiteralPath $BundledBspatch) {
+      # Windows releases ship no patches (electrobun.config.ts), so nothing runs it.
+      Write-Host "No bsdiff.exe in Hutch's store to make a patch for the bundled bspatch.exe; not checked"
+    }
+  } finally {
+    Remove-Item -LiteralPath $ToolCheckDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Assert-IcoFile {
   param(
     [string]$Path,
@@ -1039,11 +1154,38 @@ function Assert-WindowsUpdateManifest {
   if ($Manifest.platform -ne "win") {
     throw "Windows update manifest platform mismatch: expected win, got $($Manifest.platform)"
   }
-  if ($Manifest.arch -ne "x64") {
-    throw "Windows update manifest arch mismatch: expected x64, got $($Manifest.arch)"
+  if ($Manifest.arch -ne $Platform.Substring(4)) {
+    throw "Windows update manifest arch mismatch: expected $($Platform.Substring(4)), got $($Manifest.arch)"
   }
   if ([string]::IsNullOrWhiteSpace([string]$Manifest.hash)) {
     throw "Windows update manifest is missing the bundle hash."
+  }
+  # Electrobun 2 reads the archive's name from the manifest; Electrobun 1
+  # builds still updating from it ask for the same name.
+  if ($Manifest.artifact.file -ne "stable-$Platform-Gloom.tar.zst") {
+    throw "Windows update manifest names the archive '$($Manifest.artifact.file)', not stable-$Platform-Gloom.tar.zst"
+  }
+}
+
+# Windows keeps a folder locked for a moment after what used it has ended: a
+# virus scan of programs just unpacked, a helper process still exiting. Cleaning
+# up after a check that passed tries again, then leaves the folder behind
+# rather than failing the check.
+function Remove-FolderBestEffort {
+  param([string]$Path, [int]$Attempts = 10)
+
+  for ($Attempt = 1; $Attempt -le $Attempts; $Attempt++) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+      Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+      return
+    } catch {
+      if ($Attempt -eq $Attempts) {
+        Write-Host "Could not remove ${Path}: $($_.Exception.Message)"
+        return
+      }
+      Start-Sleep -Milliseconds (200 * $Attempt)
+    }
   }
 }
 
@@ -1053,7 +1195,7 @@ function Assert-WindowsUpdateManifest {
 function Assert-LegacyUpdateArchive {
   param([string]$Path)
 
-  $Zstd = Join-Path $Root "node_modules\electrobun\dist-win-x64\zig-zstd.exe"
+  $Zstd = Join-Path $BundleDir "bin\zig-zstd.exe"
   $CheckDir = Join-Path $SmokeRoot "legacy-update"
   if (Test-Path $CheckDir) {
     Remove-Item -Recurse -Force $CheckDir
@@ -1078,7 +1220,7 @@ function Assert-LegacyUpdateArchive {
       throw "The update archive under the old name has no Gloomberb\$Required"
     }
   }
-  Remove-Item -Recurse -Force $CheckDir
+  Remove-FolderBestEffort $CheckDir
 }
 
 function Get-NormalizedPathEntries {
@@ -1087,76 +1229,79 @@ function Get-NormalizedPathEntries {
   return @($PathValue -split ";" | ForEach-Object { $_.Trim().Trim('"').TrimEnd("\").ToLowerInvariant() } | Where-Object { $_ })
 }
 
-# An installer from before the rename put the app in Programs\Gloomberb, with
-# that folder's bin on the user's PATH. The new installer, run over it with no
-# /DIR, installs into Programs\Gloom and removes the old folder and PATH entry.
+# An earlier installer put the app in its own folder, Programs\Gloom (or
+# Programs\Gloomberb before the rename), with that folder's bin on the user's
+# PATH. This one, run over it, installs into Electrobun's folder and removes
+# the earlier install: its record, its PATH entry, and its default folder.
+# The earlier install here has no uninstaller of its own, so the installer
+# removes it by hand (scripts/verify-windows-update.ps1 checks one that has).
 # It writes the user's install record and PATH, so it runs only on a CI
 # machine with no install of its own.
-function Assert-InstallerMovesLegacyInstall {
+function Assert-InstallerReplacesEarlierInstall {
   $UninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{D7B2304C-840B-4E5F-956A-3D1C66E67B35}_is1"
-  $LegacyDir = Join-Path $env:LOCALAPPDATA "Programs\Gloomberb"
-  $NewDir = Join-Path $env:LOCALAPPDATA "Programs\Gloom"
   if ($env:GITHUB_ACTIONS -ne "true") {
-    Write-Host "Skipping the move from Programs\Gloomberb outside CI."
+    Write-Host "Skipping the install over an earlier one outside CI."
     return
   }
-  # The smoke install's uninstaller finishes in the background, removing the
-  # same record and then its PATH entry.
-  for ($Attempt = 0; ($Attempt -lt 120) -and (Test-Path $UninstallKey); $Attempt += 1) {
-    Start-Sleep -Seconds 1
-  }
-  Start-Sleep -Seconds 5
-  if ((Test-Path $UninstallKey) -or (Test-Path $LegacyDir) -or (Test-Path $NewDir)) {
-    throw "An install is already recorded on this machine; cannot check the move from Programs\Gloomberb."
+  if ((Test-Path $UninstallKey) -or (Test-Path $ManagedAppDir)) {
+    throw "An install is already recorded on this machine; cannot check the install over an earlier one."
   }
 
   $PreviousUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-  $LegacyBin = Join-Path $LegacyDir "bin"
-  $Log = Join-Path $SmokeRoot "move-install.log"
-  try {
-    New-Item -ItemType Directory -Force -Path $LegacyBin | Out-Null
-    Set-Content -Path (Join-Path $LegacyBin "gloomberb.cmd") -Value "@echo the install from before the rename"
-    New-Item -Path $UninstallKey -Force | Out-Null
-    New-ItemProperty -Path $UninstallKey -Name "Inno Setup: App Path" -Value $LegacyDir -PropertyType String -Force | Out-Null
-    [Environment]::SetEnvironmentVariable("Path", ((@($PreviousUserPath, $LegacyBin) | Where-Object { $_ }) -join ";"), "User")
+  foreach ($EarlierDir in @((Join-Path $env:LOCALAPPDATA "Programs\Gloomberb"), (Join-Path $env:LOCALAPPDATA "Programs\Gloom"))) {
+    $EarlierBin = Join-Path $EarlierDir "bin"
+    $Log = Join-Path $SmokeRoot "install-over-$(Split-Path -Leaf $EarlierDir).log"
+    try {
+      if (Test-Path $EarlierDir) { throw "$EarlierDir already exists on this machine" }
+      New-Item -ItemType Directory -Force -Path $EarlierBin | Out-Null
+      Set-Content -Path (Join-Path $EarlierBin "gloomberb.cmd") -Value "@echo the earlier install"
+      New-Item -Path $UninstallKey -Force | Out-Null
+      New-ItemProperty -Path $UninstallKey -Name "Inno Setup: App Path" -Value $EarlierDir -PropertyType String -Force | Out-Null
+      [Environment]::SetEnvironmentVariable("Path", ((@($PreviousUserPath, $EarlierBin) | Where-Object { $_ }) -join ";"), "User")
 
-    $Process = Start-Process `
-      -FilePath $InstallerPath `
-      -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/LOG=`"$Log`"") `
-      -Wait `
-      -PassThru
-    if ($Process.ExitCode -ne 0) {
-      Get-Content $Log -ErrorAction SilentlyContinue
-      throw "The installer failed over an install in Programs\Gloomberb: $($Process.ExitCode)"
-    }
-
-    foreach ($Required in @("bin\launcher.exe", "bin\gloom.cmd", "bin\gloomberb.cmd")) {
-      if (-not (Test-Path (Join-Path $NewDir $Required))) {
+      $Process = Start-Process `
+        -FilePath $InstallerPath `
+        -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/LOG=`"$Log`"") `
+        -Wait `
+        -PassThru
+      if ($Process.ExitCode -ne 0) {
         Get-Content $Log -ErrorAction SilentlyContinue
-        throw "The installer did not install $Required into $NewDir"
+        throw "The installer failed over an install in ${EarlierDir}: $($Process.ExitCode)"
       }
+
+      foreach ($Required in @("bin\launcher.exe", "bin\gloom.cmd", "bin\gloomberb.cmd")) {
+        if (-not (Test-Path (Join-Path $ManagedAppDir $Required))) {
+          Get-Content $Log -ErrorAction SilentlyContinue
+          throw "The installer did not install $Required into $ManagedAppDir"
+        }
+      }
+      if (Test-Path $EarlierDir) {
+        Get-Content $Log -ErrorAction SilentlyContinue
+        throw "The installer left the earlier folder $EarlierDir"
+      }
+      $Entries = Get-NormalizedPathEntries ([Environment]::GetEnvironmentVariable("Path", "User"))
+      if ($Entries -contains $EarlierBin.TrimEnd("\").ToLowerInvariant()) {
+        throw "The installer left $EarlierBin on the user's PATH"
+      }
+      if (-not ($Entries -contains (Join-Path $ManagedAppDir "bin").ToLowerInvariant())) {
+        throw "The installer did not put $ManagedAppDir\bin on the user's PATH"
+      }
+      if (Test-Path $UninstallKey) {
+        throw "The installer left the earlier install's record"
+      }
+      $Shortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "Gloom.lnk"
+      $Target = (New-Object -ComObject WScript.Shell).CreateShortcut($Shortcut).TargetPath
+      if ($Target -ne (Join-Path $ManagedAppDir "bin\launcher.exe")) {
+        throw "The Start menu shortcut opens '$Target', not the app in $ManagedAppDir"
+      }
+      Write-Host "The installer replaced an install in $EarlierDir with one in $ManagedAppDir."
+    } finally {
+      Remove-Item -Recurse -Force $EarlierDir -ErrorAction SilentlyContinue
+      Remove-Item -Recurse -Force (Split-Path -Parent $ManagedAppDir) -ErrorAction SilentlyContinue
+      Remove-Item -Path $UninstallKey -Recurse -Force -ErrorAction SilentlyContinue
+      Remove-Item -Force (Join-Path ([Environment]::GetFolderPath("Programs")) "Gloom.lnk") -ErrorAction SilentlyContinue
+      [Environment]::SetEnvironmentVariable("Path", $PreviousUserPath, "User")
     }
-    if (Test-Path $LegacyDir) {
-      Get-Content $Log -ErrorAction SilentlyContinue
-      throw "The installer left the old folder $LegacyDir"
-    }
-    $Entries = Get-NormalizedPathEntries ([Environment]::GetEnvironmentVariable("Path", "User"))
-    if ($Entries -contains $LegacyBin.TrimEnd("\").ToLowerInvariant()) {
-      throw "The installer left $LegacyBin on the user's PATH"
-    }
-    if (-not ($Entries -contains (Join-Path $NewDir "bin").ToLowerInvariant())) {
-      throw "The installer did not put $NewDir\bin on the user's PATH"
-    }
-    $Recorded = (Get-ItemProperty -Path $UninstallKey)."Inno Setup: App Path"
-    if ($Recorded.TrimEnd("\") -ne $NewDir) {
-      throw "The install record still names $Recorded"
-    }
-    Write-Host "The installer moved an install from $LegacyDir to $NewDir."
-  } finally {
-    Remove-Item -Recurse -Force $LegacyDir, $NewDir -ErrorAction SilentlyContinue
-    Remove-Item -Path $UninstallKey -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -Force (Join-Path ([Environment]::GetFolderPath("Programs")) "Gloom.lnk") -ErrorAction SilentlyContinue
-    [Environment]::SetEnvironmentVariable("Path", $PreviousUserPath, "User")
   }
 }
 
@@ -1336,10 +1481,63 @@ function Seed-DesktopConfig {
     activeLayoutIndex = 0
   }
 
+  Write-SeededViewIds $DataDir
+
   [pscustomobject]@{
     DataDir = $DataDir
     GlobalConfigPath = $GlobalConfigPath
   }
+}
+
+# The ids the desktop view keeps in its WebView storage have a copy in the
+# data folder, which a build under another bundle identifier, starting with
+# empty storage, takes them back from. The fixture's copy holds them and one
+# key the view does not keep. The view puts its three into its storage, reads
+# them back from there, finds them different from the copy and writes it
+# again: once it holds exactly those three, they went through the storage.
+$SeededViewIds = [ordered]@{
+  "gloomberb.sync.clientId" = "client_verify-windows"
+  "gloomberb.web.anonymous-id" = "0f9d5c1a-58a4-4b6e-9a31-2c1d2b7e8f00"
+  "gloomberb.web.attribution" = '{"first_touch_at":"2026-10-01T00:00:00.000Z"}'
+}
+$UnkeptViewIdKey = "gloomberb.verify.unkept"
+
+function Write-SeededViewIds {
+  param([string]$DataDir)
+
+  $Copy = [ordered]@{}
+  foreach ($Key in $SeededViewIds.Keys) { $Copy[$Key] = $SeededViewIds[$Key] }
+  $Copy[$UnkeptViewIdKey] = "not the view's"
+  $Copy | ConvertTo-Json -Compress | Set-Content -Path (Join-Path $DataDir "desktop-view-ids.json") -Encoding UTF8
+}
+
+function Assert-ViewIdsRestored {
+  param([string]$DataDir)
+
+  $Path = Join-Path $DataDir "desktop-view-ids.json"
+  $Saved = $null
+  for ($Attempt = 0; $Attempt -lt 60; $Attempt += 1) {
+    $Saved = $null
+    if (Test-Path $Path) {
+      try { $Saved = Get-Content $Path -Raw | ConvertFrom-Json } catch { $Saved = $null }
+    }
+    if ($Saved -and -not ($Saved.PSObject.Properties.Name -contains $UnkeptViewIdKey)) { break }
+    Start-Sleep -Seconds 1
+  }
+  if (-not $Saved) {
+    throw "The copy of the view's ids is gone: $Path"
+  }
+  $Names = @($Saved.PSObject.Properties.Name | Sort-Object)
+  $Expected = @($SeededViewIds.Keys | Sort-Object)
+  if (($Names -join ",") -ne ($Expected -join ",")) {
+    throw "The view did not keep its ids through its storage: the copy holds $($Names -join ', ')"
+  }
+  foreach ($Key in $SeededViewIds.Keys) {
+    if ($Saved.$Key -cne $SeededViewIds[$Key]) {
+      throw "The view kept $Key as '$($Saved.$Key)', not '$($SeededViewIds[$Key])'"
+    }
+  }
+  Write-Host "The view restored its ids from the copy on disk and kept them."
 }
 
 function Restore-EnvironmentVariable {
@@ -1507,6 +1705,7 @@ function Capture-OnboardingScreenshot {
       -Path $OutputPath `
       -Label "Onboarding window" `
       -InitialDelaySeconds 8
+    Assert-NativeEventsRead (Join-Path $GuiArtifactDir "windows-onboarding-stderr.log") "The onboarding window"
   } catch {
     $OnboardingFailure = $_
     try {
@@ -1569,8 +1768,7 @@ $RequiredPaths = @(
   (Join-Path $BundleDir "Resources\gloomberb-tui\tui-entry.js"),
   (Join-Path $BundleDir "Resources\gloomberb-tui\shot-view.json.gz"),
   (Join-Path $CoreDir "index.js"),
-  (Join-Path $Root "artifacts\stable-win-x64-Gloom-Setup.zip"),
-  (Join-Path $Root "artifacts\stable-win-x64-Gloom.tar.zst"),
+  (Join-Path $Root "artifacts\stable-$Platform-Gloom.tar.zst"),
   $UpdateManifestPath,
   $InstallerPath,
   $LegacyUpdateArchivePath,
@@ -1581,6 +1779,14 @@ foreach ($Path in $RequiredPaths) {
   if (-not (Test-Path $Path)) {
     throw "Missing expected Windows desktop file: $Path"
   }
+}
+
+# Bun 1.3 writes the code behind bun:ffi into heap memory it marks executable,
+# which Windows' heap can commit again as read-write: the app then crashes on
+# its next native callback, often seconds after it opens (electrobun.config.ts).
+$BundledBunVersion = "$(& (Join-Path $BundleDir "bin\bun.exe") --version)".Trim()
+if (-not ($BundledBunVersion -match '^\d+\.\d+\.\d+') -or [version]$Matches[0] -lt [version]"1.4.0") {
+  throw "The app ships Bun $BundledBunVersion; Windows builds need Bun 1.4 or later"
 }
 
 Assert-WindowsUpdateManifest $UpdateManifestPath
@@ -1598,6 +1804,16 @@ Export-AssociatedIcon `
   -ExecutablePath (Join-Path $BundleDir "bin\bun.exe") `
   -OutputPath (Join-Path $GuiArtifactDir "windows-icon-bun.png") `
   -Label "TUI runtime"
+$AppExecutables = @(Get-ChildItem -LiteralPath (Join-Path $BundleDir "bin") -Filter "*.exe" -File |
+  Where-Object { $_.Name -in @("launcher.exe", "bun.exe", "bspatch.exe", "zig-zstd.exe") -or $_.Name -like "bun Helper*.exe" })
+if ($AppExecutables.Count -lt 3) {
+  throw "Missing the launcher, runtime or Chromium helpers in $(Join-Path $BundleDir 'bin')"
+}
+foreach ($Executable in $AppExecutables) {
+  Assert-ExecutableDetails $Executable.FullName
+}
+
+Assert-UpdaterToolsWork $BundleDir
 Export-AssociatedIcon `
   -ExecutablePath $InstallerPath `
   -OutputPath (Join-Path $GuiArtifactDir "windows-icon-installer.png") `
@@ -1738,6 +1954,7 @@ try {
   $PopOutClientScreenshot = Join-Path $GuiArtifactDir "windows-gui-popout-client.png"
   Capture-WindowClientScreenshot $DetachedWindow $PopOutClientScreenshot
   Assert-ScreenshotHasContent $PopOutClientScreenshot "Detached pop-out client area"
+  Assert-NativeEventsRead (Join-Path $GuiArtifactDir "windows-main-stderr.log") "The app"
 
   $ControlPaddingMeasurements = @(
     Measure-WindowCloseGlyphPadding `
@@ -1769,8 +1986,11 @@ try {
     -Path (Join-Path $GuiArtifactDir "windows-popout-diagnostics.json") `
     -Label "Detached pop-out"
 
-  Assert-WindowControlPaddingMeasurement ($ControlPaddingMeasurements | Where-Object { $_.Label -eq "Main window" })
-  Assert-WindowControlPaddingMeasurement ($ControlPaddingMeasurements | Where-Object { $_.Label -eq "Detached pop-out" })
+  # The page draws the buttons, so their padding is measured in the page's
+  # own pixels: a framed window's capture also holds the border Windows draws
+  # around it, whose lighter pixels read as part of a glyph.
+  Assert-WindowControlPaddingMeasurement ($ControlPaddingMeasurements | Where-Object { $_.Label -eq "Main window client area" })
+  Assert-WindowControlPaddingMeasurement ($ControlPaddingMeasurements | Where-Object { $_.Label -eq "Detached pop-out client area" })
 
   Assert-CustomWindowControls `
     -Window $DetachedWindow `
@@ -1784,6 +2004,7 @@ try {
 
   Resolve-VisibleWindowByTitle -Title "Gloom" -Label "Main window liveness" | Out-Null
   Resolve-VisibleWindowByTitle -Title "Detached Watchlist" -Label "Detached pop-out liveness" | Out-Null
+  Assert-ViewIdsRestored $SeededDesktopConfig.DataDir
 
   $GuiProcess.Refresh()
   if ($GuiProcess.HasExited -and $GuiProcess.ExitCode -ne 0) {
@@ -1822,16 +2043,28 @@ try {
   Close-TrackedProcessHandles $TrackedGuiProcesses.ToArray()
 
   if ($SeededDesktopConfig) {
+    # The app's freeze log, so a run says what held the app up and when.
+    $StallLog = Join-Path $SeededDesktopConfig.DataDir "stall-log.txt"
+    if (Test-Path $StallLog) {
+      Write-Host "Stall log of the desktop smoke run:"
+      Get-Content $StallLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+    } else {
+      Write-Host "Stall log of the desktop smoke run: no stalls."
+    }
     Remove-Item -Path $SeededDesktopConfig.GlobalConfigPath -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $SeededDesktopConfig.DataDir -Recurse -Force -ErrorAction SilentlyContinue
   }
 
   Restore-EnvironmentVariable "GLOOMBERB_HOME" $PreviousGloomberbHome
 
-  $Uninstaller = Get-ChildItem -Path $InstallDir -Filter "unins*.exe" -File -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($Uninstaller) {
-    & $Uninstaller.FullName /VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/LOG=$UninstallLog"
-  }
+  # The installer leaves no uninstaller (windows-installer.iss): the app's
+  # first start in Electrobun's folder writes Electrobun's, and this install
+  # is elsewhere. What it added goes by hand.
+  Remove-Item -LiteralPath $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+  $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  $InstallBin = (Join-Path $InstallDir "bin").ToLowerInvariant()
+  [Environment]::SetEnvironmentVariable("Path", ((@($UserPath -split ";") | Where-Object { $_ -and ($_.Trim().TrimEnd("\").ToLowerInvariant() -ne $InstallBin) }) -join ";"), "User")
+  Remove-Item -Force (Join-Path ([Environment]::GetFolderPath("Programs")) "Gloom.lnk") -ErrorAction SilentlyContinue
 }
 
-Assert-InstallerMovesLegacyInstall
+Assert-InstallerReplacesEarlierInstall

@@ -1,9 +1,12 @@
+import { formatWeekdayDay } from "../../../utils/datetime-format";
 // Alerts on releases in the economic calendar (ECO, `gloom econ`): reading a
 // release typed by name against the calendar's names, finding a followed
 // release's rows as the calendar's feeds name it from week to week, and the
 // notifications sent before it and once its figures are out. CPI and FOMC are
 // two cases of the same alert, whose dates come from their own calendars.
-import { dateKey, eventCountry, matchesCountry, type CountryFilter } from "../econ/calendar-model";
+import {
+  dateKey, econEventName, eventCountry, eventSearchNames, eventSeriesId, matchesCountry, matchesEventSearch, type CountryFilter,
+} from "../econ/calendar-model";
 import { isAllDayEvent, hasNoReleaseTime, type EconEvent, type EconImpact } from "../econ/types";
 import { RENAMED_RELEASES } from "../shared/macro-releases";
 import { MACRO_EVENT_NAMES } from "./research-builder";
@@ -126,7 +129,28 @@ export interface CalendarEventChoice {
 
 const IMPACT_RANK: Record<EconImpact, number> = { high: 0, medium: 1, low: 2 };
 
-type RankedChoice = CalendarEventChoice & { words: string[] };
+type RankedChoice = CalendarEventChoice & {
+  words: string[];
+  /** The words of the name `econ` shows it under, when that is not the feed's (the Fed's rate as its upper bound). */
+  shownWords: string[];
+  /** The words of every name the release is listed under (Non Farm Payrolls and Non-Farm Employment Change). */
+  names: string[][];
+  /** Its rows, which `econ --search` reads by their names, ECST's names for their series and their publisher. */
+  rows: EconEvent[];
+};
+
+/** The qualifier words a name carries (prelim, core, flash): two names of one series that differ in them are two releases. */
+const qualifierWords = (words: readonly string[]) => words.filter((word) => SERIES_QUALIFIERS.has(word)).sort().join(" ");
+
+/**
+ * The series a row is a release of, with its qualifiers, so one release
+ * listed under two names is one (Non Farm Payrolls one month, Non-Farm
+ * Employment Change the next); null for a row of no known series.
+ */
+function releaseSeriesKey(event: Pick<EconEvent, "country" | "event">): string | null {
+  const series = eventSeriesId(event);
+  return series ? `${eventCountry(event)}|series:${series}|${qualifierWords(calendarNameWords(event.event))}` : null;
+}
 
 /**
  * The calendar's releases, one per country and name, each with its next row
@@ -137,7 +161,7 @@ function calendarChoices(events: readonly EconEvent[], now: number): RankedChoic
   for (const event of [...events].sort((left, right) => left.date.getTime() - right.date.getTime())) {
     const words = calendarNameWords(event.event);
     if (words.length === 0) continue;
-    const key = `${eventCountry(event)}|${words.join(" ")}`;
+    const key = releaseSeriesKey(event) ?? `${eventCountry(event)}|${words.join(" ")}`;
     groups.set(key, [...groups.get(key) ?? [], event]);
   }
   return [...groups.values()].map((rows) => {
@@ -150,6 +174,9 @@ function calendarChoices(events: readonly EconEvent[], now: number): RankedChoic
       impact: rows.reduce<EconImpact>((best, event) => IMPACT_RANK[event.impact] < IMPACT_RANK[best] ? event.impact : best, "low"),
       next,
       words: calendarNameWords(named.event),
+      shownWords: calendarNameWords(econEventName(named)),
+      names: [...new Set(rows.map((event) => nameKey(event.event)))].map((name) => name.split(" ")),
+      rows,
     };
   });
 }
@@ -246,13 +273,18 @@ function matchCalendarWords(
   now: number,
 ): CalendarEventMatch {
   const choices = calendarChoices(country ? events.filter((event) => matchesCountry(event, country)) : events, now);
-  const exact = choices.filter((choice) => choice.words.join(" ") === words.join(" "));
-  const naming = (typed: readonly string[], loose: boolean) => typed.length === 0 ? [] : choices.filter((choice) =>
-    typed.every((word) => loose ? wordFound(word, choice.words) : choice.words.includes(word)));
+  // The name as a feed gives it, or as `econ` shows it: the alert keeps the feed's, which the calendar's rows carry.
+  const exact = choices.filter((choice) => [...choice.names, choice.shownWords].some((name) => name.join(" ") === words.join(" ")));
+  const naming = (typed: readonly string[], loose: boolean) => typed.length === 0 ? [] : choices.filter((choice) => choice.names.some((name) =>
+    typed.every((word) => loose ? wordFound(word, name) : name.includes(word))));
   // CPI by the name one feed gives it everywhere but the US (China's Inflation Rate YoY).
   const aliased = words.flatMap((word) => QUERY_ALIASES[word] ?? [word]);
   const typed = exact.length > 0 ? exact : naming(words, words.length > 1);
-  const named = typed.length > 0 || aliased.join(" ") === words.join(" ") ? typed : naming(aliased, false);
+  const worded = typed.length > 0 || aliased.join(" ") === words.join(" ") ? typed : naming(aliased, false);
+  // As `econ --search` finds it, by ECST's names for its series too: NFP, nonfarm payrolls and the jobs report are
+  // Non-Farm Employment Change. A name typed in full is that release; words read either way rank together.
+  const searched = exact.length > 0 ? [] : searchedChoices(words, choices);
+  const named = [...new Set([...worded, ...searched])];
   if (named.length === 0) {
     // Each typed word a slip from one of the name's (NBP PMI), or the name as a whole near what was typed.
     const slipped = choices.filter((choice) => words.length > 0
@@ -266,20 +298,55 @@ function matchCalendarWords(
     const ranked = slipped.sort((left, right) => IMPACT_RANK[left.impact] - IMPACT_RANK[right.impact] || left.words.length - right.words.length);
     return { kind: "none", suggestions: [...ranked, ...alike].slice(0, 3).map(strip) };
   }
-  const ranked = named.sort((left, right) => IMPACT_RANK[left.impact] - IMPACT_RANK[right.impact]
+  const rank = (list: readonly RankedChoice[]) => [...list].sort((left, right) => IMPACT_RANK[left.impact] - IMPACT_RANK[right.impact]
     || (left.next ? 0 : 1) - (right.next ? 0 : 1)
     || (left.words.length - right.words.length)
     || (left.next?.date.getTime() ?? 0) - (right.next?.date.getTime() ?? 0)
     || left.name.localeCompare(right.name));
+  // A word for one series' headline release is that release (`employment` is US payrolls), the rest it names after it.
+  const series = HEADLINE_WORDS[words.join(" ")];
+  const headlined = series ? named.filter((choice) => choice.rows.some((row) => eventSeriesId(row) === series)) : [];
+  // Otherwise the releases listed ahead are what an alert follows: `GDP` is a GDP release still to come, never one
+  // whose next print the calendar does not list yet, which is only offered beside it.
+  const dated = named.filter((choice) => choice.next);
+  const ranked = rank(headlined.length > 0 ? headlined : dated.length > 0 ? dated : named);
+  const rest = rank(named.filter((choice) => !ranked.includes(choice)));
   const countries = [...new Set(ranked.map((choice) => choice.country))];
-  if (countries.length > 1) {
+  // A high-impact headline release outranking every other country's is the one meant (US payrolls over France's
+  // quarterly private payrolls), and the match names the rest; releases alike in impact ask which country.
+  const best = ranked[0]!;
+  const headline = headlined.length > 0
+    || (best.impact === "high" && ranked.every((choice) => choice.country === best.country || IMPACT_RANK[choice.impact] > IMPACT_RANK.high));
+  if (countries.length > 1 && !headline) {
     return { kind: "countries", choices: countries.map((code) => strip(ranked.find((choice) => choice.country === code)!)) };
   }
-  return { kind: "match", choice: strip(ranked[0]!), others: ranked.slice(1).map(strip) };
+  return { kind: "match", choice: strip(best), others: [...ranked.slice(1), ...rest].map(strip) };
 }
 
-function strip({ words: _words, ...choice }: RankedChoice): CalendarEventChoice {
+/**
+ * Words that name one series' headline release when typed alone, as a reader
+ * means them: `employment` is the jobs report's payrolls (Non-Farm
+ * Employment Change), not every country's employment change.
+ */
+const HEADLINE_WORDS: Readonly<Record<string, string>> = { employment: "PAYEMS" };
+
+function strip({ words: _words, shownWords: _shown, names: _names, rows: _rows, ...choice }: RankedChoice): CalendarEventChoice {
   return choice;
+}
+
+/**
+ * The releases `econ --search` finds for typed words: one whose series ECST
+ * names so (`nfp`, `jobs report`), or, of words of four letters and more,
+ * one with every word in its names or its publisher's (`nonfarm payrolls`).
+ * A short word alone (`man`) finds only a name it is, so a slip is offered
+ * rather than read.
+ */
+function searchedChoices(words: readonly string[], choices: readonly RankedChoice[]): RankedChoice[] {
+  if (words.length === 0) return [];
+  const compact = words.join("");
+  const loose = words.every((word) => word.length >= 4);
+  return choices.filter((choice) => choice.rows.some((row) => eventSearchNames(row).includes(compact))
+    || (loose && choice.rows.some((row) => matchesEventSearch(row, words.join(" ")))));
 }
 
 /** "NBS Manufacturing PMI (CN)": a release as lists and notifications name it. */
@@ -319,7 +386,9 @@ function releaseRows(target: CalendarReleaseTarget, events: readonly EconEvent[]
   // An alert kept under a series' former name follows the rows under its current one.
   const keys = new Set([words.join(" "), withCurrentName(words)?.words.join(" ")]);
   const own = events.filter((event) => eventCountry(event) === target.country);
-  const named = own.filter((event) => keys.has(nameKey(event.event)));
+  // And the rows of its series under another feed's name: Non Farm Payrolls one month, Non-Farm Employment Change the next.
+  const series = releaseSeriesKey({ event: target.event, country: target.country });
+  const named = own.filter((event) => keys.has(nameKey(event.event)) || (series != null && releaseSeriesKey(event) === series));
   if (!target.publisher) return named;
   const namedDays = new Set(named.map((event) => dateKey(event.date)));
   const renamed = own.flatMap((event) => {
@@ -387,15 +456,13 @@ export function releaseInstant(event: EconEvent): number | null {
   return hasNoReleaseTime(event) ? null : event.date.getTime();
 }
 
-const dayFormat = new Intl.DateTimeFormat("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
-
 /**
- * The reminder: "NBS Manufacturing PMI (CN) in 21 hours, Sat, Oct 31, 01:30
- * UTC", "Communist Party Fifth Plenum (CN) tomorrow, Mon, Oct 26, all day".
+ * The reminder: "NBS Manufacturing PMI (CN) in 21 hours, Sat 31 Oct, 01:30
+ * UTC", "Communist Party Fifth Plenum (CN) tomorrow, Mon 26 Oct, all day".
  * A timed release counts in hours its last two days, an all-day one in days.
  */
 export function releaseReminderMessage(target: CalendarReleaseTarget, event: EconEvent, now: number): string {
-  const day = dayFormat.format(event.date);
+  const day = formatWeekdayDay(event.date, { timeZone: "UTC" });
   const at = releaseInstant(event);
   if (at == null) {
     const days = Math.round((Date.parse(`${dateKey(event.date)}T00:00:00Z`) - Date.parse(`${utcDay(now)}T00:00:00Z`)) / DAY_MS);

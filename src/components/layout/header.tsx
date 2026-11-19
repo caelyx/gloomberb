@@ -7,6 +7,7 @@ import {
   useActionShortcut,
   useCommandBarShortcut,
   useRendererHost,
+  useShortcutLabel,
   useUiCapabilities,
   type InputRenderable,
 } from "../../ui";
@@ -17,6 +18,7 @@ import {
   commandBarPanelBg,
   commandBarSubtleText,
   commandBarText,
+  placeholderText,
 } from "../../theme/colors";
 import { useThemeColors } from "../../theme/theme-context";
 import { NATIVE_COMMAND_SURFACE, nativeCommandSurfaceBorder } from "../command-bar/panel/native-surface";
@@ -29,13 +31,16 @@ import { useViewport } from "../../react/input";
 import { canRetryUpdate } from "../../updater";
 import { updateFailureReason } from "../../updater/failure";
 import { t, tf } from "../../i18n";
+import { ariaKeyShortcut } from "../../app/keybindings/chord";
 import { displayWidth, truncateToDisplayWidth } from "../../utils/format";
 import { ClippedText, NATIVE_CLIP_STYLE } from "../ui/display";
-import { resolveMarketSummaryFit, useMarketSummary } from "./market-summary";
+import { marketSummaryWidths, resolveMarketSummaryFit, useMarketSummary } from "./market-summary";
+import { HEADER_MARKET_SEARCH } from "../../core/state/app/command-bar-launch";
 import { resolveHeaderPromptGeometry } from "./shell/chrome";
 import { useWindowFullscreen } from "./window-fullscreen";
 import { WindowControls, WINDOWS_CONTROL_GROUP_WIDTH_PX } from "./window-controls";
 import { Button, terminalButtonColumns } from "../ui/button";
+import { KeyHints, keyHintsText } from "../ui/key-hints";
 
 const UPDATE_NOTICE_DURATION_MS = 5_000;
 /** Kept clear after the terminal update status, so its last character never touches the Help pill. */
@@ -67,7 +72,7 @@ function resolveHeaderPromptContent(width: number, shortcutLabel: string): {
   const textSpace = Math.max(0, width - 2 - "> ".length);
   const full = t("Search or run a command");
   const short = t("Search");
-  if (textSpace >= full.length + shortcutLabel.length + 2) return { placeholder: full, shortcut: shortcutLabel };
+  if (textSpace >= full.length + displayWidth(shortcutLabel) + 2) return { placeholder: full, shortcut: shortcutLabel };
   if (textSpace >= full.length) return { placeholder: full, shortcut: "" };
   if (textSpace >= short.length) return { placeholder: short, shortcut: "" };
   return { placeholder: "", shortcut: "" };
@@ -76,6 +81,8 @@ function resolveHeaderPromptContent(width: number, shortcutLabel: string): {
 const PROMPT_CARET = "> ";
 /** Room for a pasted list of a few thousand symbols. */
 const COMMAND_BAR_MAX_LENGTH = 20_000;
+/** Cells kept clear between what the open prompt shows and the keys it names at its end. */
+const PROMPT_HINT_GAP = 2;
 
 /**
  * The topbar's own fill in the terminal. The prompt used to be the only thing
@@ -154,10 +161,16 @@ function HeaderPromptInput({
   width: number;
 }) {
   const colors = useThemeColors();
+  const formatKey = useShortcutLabel();
   const inputRef = useRef<InputRenderable | null>(null);
-  const { ghostSuffix, onQueryChange, placeholder, query, screenKey } = binding;
+  const { ghostSuffix, keyHints, onQueryChange, placeholder, query, screenKey } = binding;
   const textColor = commandBarText(colors);
   const subtleColor = commandBarSubtleText(colors);
+  // The placeholder role, lifted for the command surface this input sits on.
+  const placeholderColor = placeholderText(colors, nativePaneChrome ? commandBarPanelBg(colors) : commandBarBg(colors));
+  // What the field already shows, which the keys at its end must stay clear of.
+  const shownColumns = query ? displayWidth(query) + displayWidth(ghostSuffix ?? "") : displayWidth(placeholder);
+  const hintColumns = keyHints ? displayWidth(keyHintsText(keyHints, formatKey)) : 0;
 
   // The buffer is the source of truth while typing; only an outside change,
   // such as Ctrl+U or a popped route restoring its query, has to be written back.
@@ -170,7 +183,15 @@ function HeaderPromptInput({
 
   const ghostLeft = Math.max(0, Math.min(query.length, width - 1));
   return (
-    <Box width={width} height={1} position="relative" style={nativePaneChrome ? undefined : { overflow: "hidden" }}>
+    // The desktop field takes what the prompt has left after its caret: a window
+    // too narrow for Help and the market summary beside the open prompt squeezes
+    // it, and a field wider than that scrolled the caret out of view on focus.
+    <Box
+      {...(nativePaneChrome ? { flexGrow: 1, flexShrink: 1, minWidth: 0 } : { width })}
+      height={1}
+      position="relative"
+      style={nativePaneChrome ? undefined : { overflow: "hidden" }}
+    >
       <Input
         key={screenKey}
         ref={inputRef}
@@ -188,7 +209,7 @@ function HeaderPromptInput({
         focusedBackgroundColor="transparent"
         textColor={textColor}
         focusedTextColor={textColor}
-        placeholderColor={subtleColor}
+        placeholderColor={placeholderColor}
         cursorColor={colors.textBright}
       />
       {ghostSuffix && (nativePaneChrome ? (
@@ -202,6 +223,28 @@ function HeaderPromptInput({
           <Text fg={subtleColor}>{truncateToDisplayWidth(ghostSuffix, Math.max(0, width - ghostLeft))}</Text>
         </Box>
       ))}
+      {keyHints && (nativePaneChrome ? (
+        // At the field's end, in the room the typed text leaves: the row wraps
+        // and hides its second line, so keys with too little room go whole.
+        <Box
+          position="absolute"
+          top={0}
+          height={1}
+          flexDirection="row"
+          alignItems="center"
+          justifyContent="flex-end"
+          overflow="hidden"
+          data-gloom-role="command-bar-key-hints"
+          style={{ left: `${shownColumns + PROMPT_HINT_GAP}ch`, right: 0, flexWrap: "wrap", alignContent: "flex-start", pointerEvents: "none" }}
+        >
+          <Box width={0} height={1} />
+          <KeyHints keys={keyHints} color={placeholderColor} />
+        </Box>
+      ) : shownColumns + PROMPT_HINT_GAP + hintColumns <= width ? (
+        <Box position="absolute" top={0} left={width - hintColumns} width={hintColumns} height={1}>
+          <KeyHints keys={keyHints} color={placeholderColor} />
+        </Box>
+      ) : null)}
     </Box>
   );
 }
@@ -234,10 +277,10 @@ function HeaderCommandPrompt({
   const caretColor = open
     ? commandBarText(colors)
     : nativePaneChrome ? colors.text : blendHex(colors.headerText, colors.header, 0.15);
-  const mutedColor = nativePaneChrome ? colors.textDim : blendHex(colors.headerText, colors.header, 0.42);
-  // Dimmer than the placeholder it trails: the label is what names the control,
-  // the binding is a footnote to it.
-  const shortcutColor = nativePaneChrome ? colors.textMuted : blendHex(colors.headerText, colors.header, 0.62);
+  // Every field's placeholder colour, lifted only as far as the header needs to
+  // keep it as readable there. The key after it is in the same quiet colour:
+  // one level, a placeholder, not a label and its footnote.
+  const mutedColor = placeholderText(colors, nativePaneChrome ? colors.header : idleBg);
   // Desktop hover lifts the prompt off the header itself, which is the only
   // thing telling the pointer this text is a control. The terminal has no
   // chrome, so it lifts off the strip fill the whole row already wears.
@@ -261,7 +304,7 @@ function HeaderCommandPrompt({
       role={open ? undefined : "button"}
       tabIndex={open ? undefined : 0}
       aria-label={t("Search or run a command")}
-      aria-keyshortcuts={shortcutLabel}
+      aria-keyshortcuts={ariaKeyShortcut(shortcutLabel)}
       onMouseDown={open ? undefined : onOpen}
       onKeyDown={open ? undefined : (event: HeaderActionEvent) => {
         if (event.key === "Enter" || event.key === " ") onOpen(event);
@@ -287,12 +330,14 @@ function HeaderCommandPrompt({
           style={{ flexWrap: "wrap", alignContent: "flex-start" }}
         >
           <Text fg={mutedColor}>{placeholder}</Text>
-          {shortcut ? <Text fg={shortcutColor}>{`  ${shortcut}`}</Text> : null}
+          {/* A key hint, which a touch screen hides (styles.css). */}
+          {shortcut ? <Text fg={mutedColor} className="gloom-key-hint">{`  ${shortcut}`}</Text> : null}
         </Box>
       ) : (
         <>
-          <Text fg={mutedColor}>{placeholder}</Text>
-          {shortcut ? <Text fg={shortcutColor}>{`  ${shortcut}`}</Text> : null}
+          {/* The terminal's placeholder role: faint, as every field's (the OpenTUI host's input). */}
+          <Text fg={mutedColor} attributes={TextAttributes.DIM}>{placeholder}</Text>
+          {shortcut ? <Text fg={mutedColor} attributes={TextAttributes.DIM}>{`  ${shortcut}`}</Text> : null}
           <Box flexGrow={1} minWidth={0} />
         </>
       )}
@@ -756,43 +801,45 @@ function NativeUpdateStatus({ onRestart, trailingGap, updateKey, view }: {
 }
 
 /**
- * Market state, SPY and the base currency at the header's right edge. It fits
- * itself into the columns the prompt geometry reserved rather than into
+ * The market the user follows, at the header's right edge: its venue's state
+ * (`NYSE closed · opens 9:30 ET`, shortened to `NYSE pre` or `pre` where the
+ * room is short) and its quote (`S&P 500 6,843 +0.20%`). It
+ * fits itself into the columns the prompt geometry reserved rather than into
  * whatever this row has left over, so the cluster and the prompt can never
- * both claim the same space.
+ * both claim the same space. Pressing it opens the market picker in the
+ * command bar, as the Header Market command does; the button is flush, so
+ * the cluster sits where its text would without one.
  */
 function HeaderMarketSummary({ nativePaneChrome, width }: { nativePaneChrome: boolean; width: number }) {
   const colors = useThemeColors();
+  const dispatch = useAppDispatch();
   const summary = useMarketSummary();
-  const fit = resolveMarketSummaryFit({
-    available: width,
-    baseCurrencyWidth: displayWidth(summary.baseCurrencyLabel) + 1,
-    countdownWidth: summary.marketLabel.length - summary.marketLabelShort.length,
-    spyWidth: summary.spyText.length + 1,
-    stateWidth: summary.marketLabelShort ? summary.marketLabelShort.length + 1 : 0,
-  });
-  const marketLabel = fit.showCountdown ? summary.marketLabel : summary.marketLabelShort;
+  const fit = resolveMarketSummaryFit({ available: width, ...marketSummaryWidths(summary) });
+  const openPicker = useCallback(() => {
+    dispatch({ type: "SET_COMMAND_BAR", open: true, query: "", launch: { kind: "ticker-search", query: "", payload: HEADER_MARKET_SEARCH } });
+  }, [dispatch]);
+  if (!fit.showQuote) return null;
+  const muted = nativePaneChrome ? colors.textDim : blendHex(colors.headerText, colors.header, 0.42);
 
   return (
-    <>
-      {fit.showState && marketLabel ? (
-        <Box paddingRight={1} flexShrink={0} data-gloom-role="header-market">
-          <Text fg={summary.marketColor} {...(nativePaneChrome ? { attributes: TextAttributes.BOLD } : {})}>
-            {marketLabel}
-          </Text>
+    <Box paddingRight={1} flexShrink={0} data-gloom-role="header-market">
+      <Button variant="plain" compact flush label="Choose Header Market" title={t("Choose the market the header shows")} onPress={openPicker} stopPropagation>
+        <Box flexDirection="row" alignItems="center" gap={1}>
+          {fit.state ? (
+            <Box flexDirection="row" flexShrink={0}>
+              <Text fg={summary.marketColor} {...(nativePaneChrome ? { attributes: TextAttributes.BOLD } : {})}>
+                {summary.marketLabels[fit.state]}
+              </Text>
+              {fit.showDetail && summary.marketDetail ? <Text fg={muted}>{` · ${summary.marketDetail}`}</Text> : null}
+            </Box>
+          ) : null}
+          <Box flexDirection="row" flexShrink={0}>
+            <Text fg={nativePaneChrome ? colors.text : colors.headerText}>{`${summary.quoteLabel} `}</Text>
+            <Text fg={summary.quoteColor}>{fit.showQuoteMove ? summary.quoteText : summary.quotePriceText}</Text>
+          </Box>
         </Box>
-      ) : null}
-      {fit.showSpy ? (
-        <Box paddingRight={1} flexShrink={0} data-gloom-role="header-market">
-          <Text fg={summary.spyColor}>{summary.spyText}</Text>
-        </Box>
-      ) : null}
-      {fit.showBaseCurrency ? (
-        <Box paddingRight={1} flexShrink={0}>
-          <Text fg={nativePaneChrome ? colors.textDim : blendHex(colors.headerText, colors.header, 0.42)}>{summary.baseCurrencyLabel}</Text>
-        </Box>
-      ) : null}
-    </>
+      </Button>
+    </Box>
   );
 }
 
@@ -818,8 +865,10 @@ function HeaderHelpButton({ nativePaneChrome, onPress }: { nativePaneChrome: boo
 export function Header({
   onOpenHelp,
   onRestartForUpdate,
+  commandInputAvailable = true,
 }: {
   onOpenHelp?: () => void;
+  commandInputAvailable?: boolean;
   /** Applies a downloaded desktop update and relaunches; the header offers Restart only when it is given. */
   onRestartForUpdate?: () => void;
 }) {
@@ -846,7 +895,7 @@ export function Header({
   let updateStatusColumns = Math.max(
     0,
     prompt.updateColumns
-      - (onOpenHelp ? terminalButtonColumns(helpButtonProps()) + TERMINAL_HELP_PADDING_COLUMNS : 0)
+      - (commandInputAvailable && onOpenHelp ? terminalButtonColumns(helpButtonProps()) + TERMINAL_HELP_PADDING_COLUMNS : 0)
       - UPDATE_SLOT_PADDING_COLUMNS * (titleBarOverlay ? 2 : 1),
   );
   // Short of that, the closed prompt gives the status its empty room, down to
@@ -870,9 +919,9 @@ export function Header({
   // bar itself wears the prompt's fill and reads as a single strip.
   const headerBg = nativePaneChrome ? colors.header : headerSurface(colors);
 
-  const startWindowDrag = useCallback(() => {
+  const startWindowDrag = useCallback((press?: { detail?: number }) => {
     if (!titleBarOverlay || !nativeWindowChrome) return;
-    void rendererHost.startWindowDrag?.();
+    void rendererHost.startWindowDrag?.(press);
   }, [nativeWindowChrome, rendererHost, titleBarOverlay]);
 
   const openCommandBar = useCallback((event?: HeaderActionEvent) => {
@@ -881,7 +930,9 @@ export function Header({
     dispatch({ type: "SET_COMMAND_BAR", open: true, query: "" });
   }, [dispatch]);
 
-  const commandPrompt = (
+  // An open bar always has its input, whatever opened it: without one, what
+  // the user types or pastes goes nowhere and Enter runs the first suggestion.
+  const commandPrompt = commandInputAvailable || commandBarOpen ? (
     <HeaderCommandPrompt
       nativePaneChrome={nativePaneChrome}
       onOpen={openCommandBar}
@@ -889,7 +940,7 @@ export function Header({
       shortcutLabel={shortcutLabel}
       width={promptWidth}
     />
-  );
+  ) : <Box width={promptWidth} />;
   const marketSummary = prompt.marketColumns > 0
     ? <HeaderMarketSummary nativePaneChrome={nativePaneChrome} width={prompt.marketColumns} />
     : null;
@@ -935,7 +986,7 @@ export function Header({
             <UpdateStatus columns={updateStatusColumns} onRestart={onRestartForUpdate} status={updateStatus} />
           </Box>
         )}
-        {onOpenHelp ? <HeaderHelpButton nativePaneChrome onPress={onOpenHelp} /> : null}
+        {commandInputAvailable && onOpenHelp ? <HeaderHelpButton nativePaneChrome onPress={onOpenHelp} /> : null}
         {marketSummary}
         {showWindowControls ? <Box flexShrink={0} width={`${WINDOWS_CONTROL_GROUP_WIDTH_PX}px`} /> : null}
         {showWindowControls ? <WindowControls /> : null}
@@ -959,7 +1010,7 @@ export function Header({
           <UpdateStatus columns={updateStatusColumns} onRestart={onRestartForUpdate} status={updateStatus} />
         </Box>
       )}
-      {onOpenHelp ? <HeaderHelpButton nativePaneChrome={nativePaneChrome} onPress={onOpenHelp} /> : null}
+      {commandInputAvailable && onOpenHelp ? <HeaderHelpButton nativePaneChrome={nativePaneChrome} onPress={onOpenHelp} /> : null}
       {marketSummary}
       {showWindowControls ? <WindowControls /> : null}
     </Box>

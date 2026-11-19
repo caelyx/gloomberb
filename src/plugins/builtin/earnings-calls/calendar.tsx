@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { CloudEarningsCallPayload } from "../../../api-client";
 import { usePlanAccess } from "../../../api-client/plan-access";
@@ -19,7 +20,9 @@ import {
   type SectionedRow,
 } from "../../../components";
 import { handleRefreshKey } from "../../../components/data-table/table-pane";
-import { TABLE_COLUMN_GAP, tableColumnWidth } from "../../../components/ui/table-layout";
+import { savedCopyFooterInfo } from "../../../components/layout/pane/footer";
+import { isPermanentClientError } from "../../../api-client/errors";
+import { markHiddenTableColumns, TABLE_COLUMN_GAP, tableColumnWidth } from "../../../components/ui/table-layout";
 import { useAsyncResource } from "../../../react/async-resource";
 import { useAgeClock, useAutoRefresh } from "../../../react/auto-refresh";
 import { colors } from "../../../theme/colors";
@@ -29,7 +32,7 @@ import { usePluginPaneState } from "../../runtime";
 import { newYorkToday } from "../earnings/board-model";
 import { ProWall, SignInWall } from "../cloud/auth-actions";
 import { cachedUpcomingCalls, calendarAway, loadUpcomingCalls, statusOf, upcomingCutNotice, type UpcomingCallsResult } from "./data";
-import { formatPeriod } from "./format";
+import { callPeriod } from "./format";
 import {
   calendarDays,
   calendarSections,
@@ -54,7 +57,7 @@ type CalendarColumn = DataTableColumn & { id: CalendarColumnId };
 type CalendarRow = SectionedRow<CloudEarningsCallPayload>;
 
 const COMPANY_MIN_WIDTH = 12;
-const MISSING = "\u2014";
+const MISSING = MISSING_VALUE;
 
 const ALL_COLUMNS: CalendarColumn[] = [
   { id: "ticker", label: "TICKER", width: 6, align: "left" },
@@ -77,13 +80,14 @@ const SORTABLE: Partial<Record<CalendarColumnId, CalendarSort["column"]>> = {
 function calendarColumns(width: number, { localClock }: { localClock: boolean }): CalendarColumn[] {
   const fixed = (list: CalendarColumn[]) =>
     list.reduce((sum, column) => sum + (column.id === "company" ? 0 : tableColumnWidth(column)) + TABLE_COLUMN_GAP, 2);
-  let columns = localClock ? ALL_COLUMNS : ALL_COLUMNS.filter((column) => column.id !== "local");
+  const original = localClock ? ALL_COLUMNS : ALL_COLUMNS.filter((column) => column.id !== "local");
+  let columns = original;
   for (const id of DROP_ORDER) {
     if (fixed(columns) + COMPANY_MIN_WIDTH <= width) break;
     columns = columns.filter((column) => column.id !== id);
   }
   const companyWidth = Math.max(COMPANY_MIN_WIDTH, width - fixed(columns));
-  return columns.map((column) => (column.id === "company" ? { ...column, width: companyWidth } : column));
+  return markHiddenTableColumns(original, columns.map((column) => (column.id === "company" ? { ...column, width: companyWidth } : column)));
 }
 
 function renderCalendarCell(row: CalendarRow, column: CalendarColumn, now: number): DataTableCell {
@@ -106,7 +110,7 @@ function renderCalendarCell(row: CalendarRow, column: CalendarColumn, now: numbe
       return clock ? { text: clock, color: tone(colors.textDim) } : { text: MISSING, color: colors.textMuted };
     }
     case "period":
-      return { text: formatPeriod(call.fiscalYear, call.fiscalQuarter), color: tone(colors.textDim) };
+      return { text: callPeriod(call), color: tone(colors.textDim) };
     case "away":
       return { text: calendarAway(call, now), color: over ? colors.textMuted : colors.textBright };
   }
@@ -162,6 +166,8 @@ export function UpcomingCallsView({ focused, width, height, view, renderCompany 
   }, [range]);
   const resource = useAsyncResource(entitled ? loader : null, {
     keepPreviousData: true,
+    // A refusal asking again will not change takes the calendar off screen, for its wall or its error.
+    clearOnError: isPermanentClientError,
     initialData: () => cachedUpcomingCalls(range),
   });
   const data = resource.data;
@@ -196,7 +202,7 @@ export function UpcomingCallsView({ focused, width, height, view, renderCompany 
 
   const openCall = openTicker ? calls.find((call) => call.ticker === openTicker) ?? null : null;
   const detailOpen = !!openTicker && entitled;
-  const reload = useCallback(() => void resource.reload(), [resource.reload]);
+  const reload = useCallback(() => resource.reload(), [resource.reload]);
 
   const refused = refusal.current;
   const signInRequired = !access.signedIn || (!data && refused === 401);
@@ -204,12 +210,16 @@ export function UpcomingCallsView({ focused, width, height, view, renderCompany 
   const proRequired = !signInRequired && !verificationRequired && (!access.hasProAccess || (!data && refused === 402));
 
   const hints = useMemo<PaneHint[]>(() => [{ id: "search", key: "/", label: "search", onPress: focusSearch }], [focusSearch]);
+  // A refresh that failed shows the calendar an earlier read saved, and says when that copy is from.
+  const savedAt = data?.savedAt ?? null;
+  const savedInfo = useMemo(() => savedCopyFooterInfo([savedAt]), [savedAt]);
   usePaneStatusFooter({
     registrationId: "earnings-calls:calendar",
     enabled: !detailOpen && entitled,
     loading: resource.loading && !!data,
-    error: data ? data.refreshError ?? resource.error : null,
-    stale: !!data && (data.stale || !!resource.error),
+    error: data ? (savedAt == null ? data.refreshError : null) ?? resource.error : null,
+    stale: !!data && savedAt == null && (data.stale || !!resource.error),
+    info: savedInfo,
     hints,
   });
   // A calendar cut at the server's limit says so, rather than end the week early.

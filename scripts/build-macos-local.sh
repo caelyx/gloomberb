@@ -8,9 +8,8 @@ set -euo pipefail
 #   scripts/build-macos-local.sh            # leaves artifacts/local/Gloom.app
 #   scripts/build-macos-local.sh --install  # also replaces /Applications/Gloom.app
 #
-# An earlier local install named Gloomberb.app is left in place: the new app
-# removes it at its first launch and moves the gloom and gloomberb command
-# links to itself (removeLegacyMacApp in src/renderers/electrobun/bun/desktop/app-name.ts).
+# The app has been named Gloom since 0.18.5 (src/renderers/electrobun/shared/app-name.ts);
+# an older install of this build is /Applications/Gloomberb.app.
 
 usage() { echo "usage: $0 [--install]" >&2; }
 
@@ -40,10 +39,9 @@ legacy="/Applications/Gloomberb.app"
 # Checked before the build as well as after it, so a problem shows up now
 # rather than after several minutes of building.
 check_can_install() {
-  # Covers the desktop app and the gloom terminal command it bundles, under
-  # the app's current name and the one before it.
+  # Covers the desktop app and the gloom terminal command it bundles, under either name.
   if pgrep -qf "$dest/Contents/" || pgrep -qf "$legacy/Contents/"; then
-    echo "Quit Gloom (and any gloom or gloomberb terminal sessions), then run this again." >&2
+    echo "Quit Gloom (and any gloom terminal sessions), then run this again." >&2
     exit 1
   fi
   if [ ! -w /Applications ] || { [ -e "$dest" ] && [ ! -w "$dest" ]; }; then
@@ -91,6 +89,9 @@ if $install; then
   rm -rf "$dest"
   mv "$staging" "$dest"
   echo "Installed $dest (built from $built)"
+  if [ -e "$legacy" ]; then
+    echo "An older build is still at $legacy; remove it once $dest works." >&2
+  fi
 else
   echo "Built $app (from $built)"
 fi

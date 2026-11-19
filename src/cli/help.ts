@@ -45,22 +45,24 @@ const START_HERE: Array<[string, string]> = [
 
 const GLOBAL_OPTIONS: Array<[string, string]> = [
   ["--json", "Print the full result as JSON"],
-  ["--csv", "Print rows as CSV under the columns the text shows; fn reports and fundamentals put each table under # section: and end with # source lines"],
+  ["--csv", "Print one rectangular CSV with a single header, readable by pandas.read_csv with no options. Existing columns stay in order; duplicate headers gain unique numeric suffixes, and extra tables add columns and a section column. Header line breaks are escaped as \\n; data cells preserve quoted newlines. The final export_notes column stays single-line and repeats source details, caveats, warnings and truncation notes joined with |, including in files and pipes"],
   ["--ndjson", "Print one JSON object per table row"],
-  ["--limit <n>", "Show at most n rows, the first n as printed"],
+  ["--output <path>, --out <path>", "Write a --csv, --json or --ndjson export to this file in UTF-8, and print where it went (a redirect is UTF-16 in Windows PowerShell 5.1)"],
+  ["--decimal comma|dot", "Write a --csv export's numbers with a decimal comma (17,2), cells split by ;, for a spreadsheet in a decimal-comma locale; or a dot. gloom config set csvDecimal comma makes the comma the default. Text and JSON keep the dot"],
+  ["--limit <n>", "For row/table reports, keep the first n rows in printed order, not the newest n (use --tail). Applies to text, JSON, CSV and NDJSON, not shot or scalar results. Pane reports may set a per-table limit or a source cap; see help fn <function>. It does not request all available source rows"],
   ["--tail <n>", "Show the newest n rows of a dated series (history, fred, econ) in their printed order, or the last n of another list"],
   ["--refresh", "Fetch fresh data instead of reading the cache"],
   ["--dry-run", "Preview config, cache, notes, alerts, plugin on/off, and remote changes without saving"],
   ["-q, --quiet", "Print no results or errors in text mode, for commands that print results"],
   ["--color, --no-color", "Force or turn off colors (NO_COLOR also turns them off)"],
   ["--plain, --no-plain", "Plain text for a screen reader or large text: no rule lines, arrows as words, every table column kept with a dash in empty cells. On by default when NO_COLOR is set or output is piped; --no-plain turns it off"],
-  ["--width <n>", "Fit tables to n columns (default: the terminal width; piped output is not fitted). shot takes its own --width in pixels"],
+  ["--width <n>", "Fit tables to n columns (default: the terminal width; piped output fits COLUMNS when set, else is not fitted). shot takes its own --width in pixels"],
 ];
 
 const EXIT_CODES: Array<[string, string]> = [
   [String(CLI_EXIT_CODES.ok), "Success"],
   [String(CLI_EXIT_CODES.error), "Failed: bad input, no data found or a failed check. fn exits 0 on partial data with warnings; --json ok is false exactly when this is 1"],
-  [String(CLI_EXIT_CODES.unusableShot), "shot --strict saved an image of a pane with no usable data"],
+  [String(CLI_EXIT_CODES.unusableShot), "shot --strict found no usable data and did not save an image"],
 ];
 
 export interface CliHelpEntry {
@@ -171,6 +173,8 @@ export function renderCommandHelp(command: CliCommandDef): string {
       { width, termStyle: cliStyles.command },
     ));
   }
+  lines.push("", renderSection("Output And Row Limits"));
+  lines.push(...renderDefinitions(GLOBAL_OPTIONS.filter(([flag]) => ["--csv", "--limit <n>", "--tail <n>"].includes(flag)), { width, termStyle: cliStyles.command }));
 
   for (const section of help.sections ?? []) {
     lines.push("", renderSection(section.title));

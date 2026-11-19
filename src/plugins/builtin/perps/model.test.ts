@@ -1,6 +1,7 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { expect, test } from "bun:test";
 import { aprFootnote, baseOfLabel, BOARD_COLUMNS, collectedVenueCount, boardColumns, compareColumns, dayChange, fundingSpread, historyCaption, historyCell, historyChange, historyColumns, historyRows, percent, perpBaseCandidates, perpCellText, perpDescription, readingTime,
-  separatedPairBase, underlyingTicker } from "./model";
+  separatedPairBase, underlyingTicker, venueAprSummary } from "./model";
 import { fundingNote } from "./freshness";
 import { equityBoard, longShort, longShortPoint, perpHistory, perpRow, venueRow } from "./test-fixture";
 
@@ -29,7 +30,7 @@ test("history CSV names real units and exports unrounded values with percentage-
   expect(historyCell(row, "value", "funding").value).toBe(0.0125);
   expect(historyCell(row, "change", "funding").value).toBeCloseTo(0.000123456);
   expect(historyCell(row, "change", "funding").text).toBe("+0.0001pp");
-  expect(historyChange(null, "funding")).toBe("--");
+  expect(historyChange(null, "funding")).toBe(MISSING_VALUE);
   expect(historyColumns("oi", "USDC")[1]!.label).toBe("OI USD");
   expect(historyColumns("price", "USDC", false)[1]!.label).toBe("Mark USDC");
 });
@@ -66,8 +67,8 @@ test("a 100-column board and comparison keep the long share beside when each ven
   expect(ids(compareColumns(200)).slice(-3)).toEqual(["longShare", "fundingApr", "observedAt"]);
   expect(perpCellText(venueRow("binance", { longShortRatio: longShort() }), "longShare")).toBe("61.8%");
   // A venue that publishes none, and a server older than the series, show a dash, never a number.
-  expect(perpCellText(perpRow({ longShortRatio: null, longShortRatioReason: "unsupported" }), "longShare")).toBe("--");
-  expect(perpCellText(perpRow(), "longShare")).toBe("--");
+  expect(perpCellText(perpRow({ longShortRatio: null, longShortRatioReason: "unsupported" }), "longShare")).toBe(MISSING_VALUE);
+  expect(perpCellText(perpRow(), "longShare")).toBe(MISSING_VALUE);
 
   const day = "2026-10-08T11:00:00.000Z";
   const data = perpHistory({ longShortRatio: [longShortPoint(day, 0.6, { derived: true }), longShortPoint("2026-10-09T10:00:00.000Z", 0.631, { derived: true }),
@@ -76,7 +77,7 @@ test("a 100-column board and comparison keep the long share beside when each ven
   expect(rows.map((row) => row.value)).toEqual([0.6, 0.631, 0.6183]);
   expect(historyColumns("long-short", "USDT").map((column) => column.label)).toEqual(["Time (UTC)", "Long %", "Change pp", "Short %", "Ratio", "Observation basis"]);
   expect([historyCell(rows[2]!, "value", "long-short").text, historyCell(rows[2]!, "change", "long-short").text, historyCell(rows[2]!, "ratio", "long-short").text])
-    .toEqual(["61.83%", "-1.27pp", "--"]);
+    .toEqual(["61.83%", "-1.27pp", MISSING_VALUE]);
   expect(historyCell(rows[2]!, "change", "long-short").value).toBeCloseTo(-1.27);
   expect(historyCaption(data, "long-short")).toBe("All accounts net long, from ratio");
   // The day's move needs a point a day back; the first day of collection has none.
@@ -129,10 +130,10 @@ test("a pair or plain name reads as the base asset it stands for, and anything e
   expect(["BTC-USD", "btc/usd", "BTCUSD", "BTCUSDT", "BTC-USDT", "BTC_USDC", "BTC-PERP", "BTC/USDT:USDT", "1000PEPEUSDT"].map(perpBaseCandidates))
     .toEqual([["BTC"], ["BTC"], ["BTC"], ["BTC"], ["BTC"], ["BTC"], ["BTC"], ["BTC"], ["1000PEPE"]]);
   // A plain name keeps its spacing and case free, and lists the contracts to try nearest first as the Market column writes them.
-  expect(["Bitcoin", "ETHEREUM", "brent-crude", "Brent Crude"].map(perpBaseCandidates)).toEqual([["BTC"], ["ETH"], ["BZ", "BRENTOIL · XYZ"], ["BZ", "BRENTOIL · XYZ"]]);
+  expect(["Bitcoin", "ETHEREUM", "brent-crude", "Brent Crude"].map(perpBaseCandidates)).toEqual([["BTC"], ["ETH"], ["BZ", "xyz:BRENTOIL"], ["BZ", "xyz:BRENTOIL"]]);
   // A base asset, a currency alone, an identity and free text are not rewritten.
   expect(["BTC", "SP500", "USD", "USDT", "TSLA", "xyz:SP500", "what is a perp"].map(perpBaseCandidates)).toEqual([[], [], [], [], [], [], []]);
-  expect(baseOfLabel("BRENTOIL · XYZ")).toBe("BRENTOIL");
+  expect(baseOfLabel("xyz:BRENTOIL")).toBe("BRENTOIL");
   expect(baseOfLabel("BZ")).toBe("BZ");
   // Only a pair written with a separator is a board search for its base: BTCUSDT is a symbol the board spells.
   expect(["BTC-USD", "btc/usd", "BTCUSD", "BTCUSDT", "BTC"].map(separatedPairBase)).toEqual(["BTC", "BTC", null, null, null]);
@@ -151,4 +152,24 @@ test("the APR note names each funding interval's own annualisation, and venues a
   expect(collectedVenueCount([{ source: "binance", lastOkAt: "2026-10-18T10:00:00Z" }, { source: "bybit", lastOkAt: null }])).toBe(1);
   expect(collectedVenueCount([{ source: "underlying" }])).toBeNull();
   expect(collectedVenueCount(undefined)).toBeNull();
+});
+
+test("one asset's carry across venues: the APR range, weighted by open interest, and the venues paying only the 0.01%/8h baseline", () => {
+  // ZEC on 9 Nov 2026: Hyperliquid's 0.00125%/1h is its baseline, OKX pays the other way.
+  const rows = [perpRow({ baseAsset: "ZEC", fundingRate8h: 0.0001, fundingApr: 0.0000125 * 24 * 365, openInterestUsd: 558.76e6 }),
+    venueRow("binance", { fundingRate8h: -0.0000004, fundingApr: -0.0004, openInterestUsd: 520.23e6 }),
+    venueRow("bybit", { fundingRate8h: 0.0000757, fundingApr: 0.0829, openInterestUsd: 196.3e6 }),
+    venueRow("okx", { marketId: "okx:ZEC-USDT-SWAP", fundingRate8h: -0.0001409, fundingApr: -0.1543, openInterestUsd: 161.64e6 })];
+  const summary = venueAprSummary(rows)!;
+  expect(summary.text).toBe("4 venues: -15.4% to +11.0%, OI-weighted +3.6%; Hyperliquid sits at the 0.01%/8h baseline");
+  expect(summary.oiWeighted).toBeCloseTo(0.0364, 4);
+  // Several contracts on a venue are counted as contracts; a single contract off its baseline says nothing.
+  expect(venueAprSummary([...rows, venueRow("binance", { marketId: "binance:ZECUSDC", fundingRate8h: 0.00002, fundingApr: 0.0219, openInterestUsd: 1e6 })])!.text)
+    .toStartWith("5 contracts on 4 venues: ");
+  expect(venueAprSummary([rows[1]!])).toBeNull();
+  expect(venueAprSummary([rows[0]!])!.text).toBe("Hyperliquid sits at the 0.01%/8h baseline");
+  // A venue not read recently is out of the range and the weighting, and the line counts it.
+  const stale = venueAprSummary(rows.map((row) => row.venue === "okx" ? { ...row, stale: true } : row))!;
+  expect(stale.text).toBe("3 venues: -0.0% to +11.0%, OI-weighted +6.1%; Hyperliquid sits at the 0.01%/8h baseline; 1 stale contract left out");
+  expect([stale.low, stale.stale]).toEqual([-0.0004, 1]);
 });

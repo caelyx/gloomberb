@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
-  cleanFloat32Price, closedPeriodBarDay, formingPeriodBar, historyBarsAfterHole, historyBarStatusNote, historyChangeBaseNote, historyFlagNote,
+  barPriceDecimals, cleanBarPrice, cleanFloat32Price, closedPeriodBarDay, quotedPriceDivisor, formingPeriodBar, historyBarsAfterHole, historyBarStatusNote, historyChangeBaseNote, historyFlagNote, historyOpenNote,
   historyGapNote, historyJumpNote, historyMissingVolumeNote, historyNotes, historyPriceDecimals,
-  historyRows, historyUnbrokenFrom, historyUnit, historyVenueVolumeNote,
+  historyRows, historyUnbrokenFrom, historyUnit, historyVenueVolumeNote, historyWickNote,
+  historyContractDrawdown, historyRollNote, historyThinNote, historyVolumeBasis, historyVolumeNote, withDailyRebuiltBars, dailyRebuildSpans,
+  historyRescaleNote,
 } from "./history-rows";
+import { historyExportStatus } from "./history-export";
+import { extractPriceSeries } from "../time-series/market";
 import { mapPricePoint } from "../sources/gloomberb-cloud/normalizers";
-import { latestTradeIndex, missingVolumeCount, pricePointValues } from "../utils/price-history-integrity";
+import { latestTradeIndex, missingVolumeCount, pricePointValues, pricePointWickFlags } from "../utils/price-history-integrity";
 import type { ManualChartResolution } from "../time-series/resolution";
 import { rowsFreshness } from "./freshness";
 import { formatFreshnessLine } from "./pane-functions/freshness";
@@ -34,6 +38,67 @@ const weekend = (date: Date) => date.getUTCDay() === 0 || date.getUTCDay() === 6
 const between = (date: Date, from: string, to: string) => date.toISOString().slice(0, 10) >= from && date.toISOString().slice(0, 10) <= to;
 
 describe("history rows", () => {
+  /**
+   * `history NG=F --range 1M` on 30 Oct 2026: November's bars to the 23rd (2.640 there), December's from the
+   * 26th, about 0.40 higher. Read across the join the drawdown was -19.6%; within each contract it is far less.
+   * The 28th traded 15 lots between days of about 150,000.
+   */
+  test("a continuous future's rows name the roll, read drawdowns within a contract and flag a thin bar", () => {
+    const bars: Array<[string, number, number, string]> = [
+      ["2026-10-19", 3.15, 160_000, "NGX26"], ["2026-10-20", 3.02, 150_000, "NGX26"], ["2026-10-21", 2.86, 140_000, "NGX26"],
+      ["2026-10-22", 2.74, 155_000, "NGX26"], ["2026-10-23", 2.64, 145_000, "NGX26"], ["2026-10-26", 3.05, 150_000, "NGZ26"],
+      ["2026-10-27", 2.99, 148_000, "NGZ26"], ["2026-10-28", 2.97, 15, "NGZ26"], ["2026-10-29", 2.92, 152_000, "NGZ26"],
+      ["2026-10-30", 2.90, 151_000, "NGZ26"],
+    ];
+    const rows = historyRows(bars.map(([date, close, volume, contract]) => ({ date: new Date(`${date}T00:00:00Z`), close, volume, contract })), "1d");
+    expect(rows.filter((row) => row.roll).map((row) => [row.date, row.contract])).toEqual([["2026-10-26", "NGZ26"]]);
+    expect(historyRollNote("NG=F", rows)).toBe("NG=F is the front month: rolled from NGX26 to NGZ26 on 2026-10-26 (marked roll); drawdowns are read within one contract");
+    // A symbol that follows the most traded month says so, as its quote's roll does: CT=F left a thin October for December early.
+    const cotton = historyRows([["2026-09-17", "CTV26"], ["2026-09-18", "CTV26"], ["2026-09-21", "CTZ26"]]
+      .map(([date, contract], index) => ({ date: new Date(`${date}T00:00:00Z`), close: 79 + index, volume: 30_000, contract })), "1d");
+    expect(historyRollNote("CT=F", cotton, { mostTraded: true }))
+      .toBe("CT=F is the most traded month: rolled from CTV26 to CTZ26 on 2026-09-21 (marked roll); drawdowns are read within one contract");
+    // Across the join the low of 2.64 would sit under December's 3.05 peak; within November it falls from 3.15.
+    const deepest = historyContractDrawdown(rows)!;
+    expect(deepest.contract).toBe("NGX26");
+    expect(deepest.drawdown.peak).toEqual({ date: "2026-10-19", close: 3.15 });
+    expect(deepest.drawdown.trough).toEqual({ date: "2026-10-23", close: 2.64 });
+    // December alone falls under 5% from its first close: no reading pairs its 3.05 with November's 2.64.
+    expect(historyContractDrawdown(rows.slice(5))!.drawdown.drawdown).toBeGreaterThan(-0.05);
+    expect(rows.filter((row) => row.thin).map((row) => row.date)).toEqual(["2026-10-28"]);
+    expect(historyThinNote(rows)).toBe("2026-10-28 traded thin: under 5% of the volume of the bars around it");
+    // A history naming no contract (a stock's, whose 15-share day is just quiet) has no roll, no thin bar and one drawdown.
+    const plain = historyRows(bars.map(([date, close, volume]) => ({ date: new Date(`${date}T00:00:00Z`), close, volume })), "1d");
+    expect(plain.some((row) => row.roll || row.contract || row.thin)).toBe(false);
+    // A bar with no trade at all is no thin one.
+    const idle = historyRows(bars.map(([date, close, volume, contract]) => ({ date: new Date(`${date}T00:00:00Z`), close, volume: volume === 15 ? 0 : volume, contract })), "1d");
+    expect(idle.some((row) => row.thin)).toBe(false);
+    expect(historyRollNote("NG=F", plain)).toBeNull();
+    expect(historyContractDrawdown(plain)!.contract).toBeNull();
+  });
+
+  test("a contract's bar with only its settlement is flagged settle only, in the table's rows and the export", () => {
+    // PL=F in September 2026: October platinum's settlements alone (the source no longer charts the expired month),
+    // then January's own bars from the roll. A stock's close-only bar, a forming one and an unsettled one are not.
+    const rows = historyRows([
+      { date: new Date("2026-09-25T00:00:00Z"), close: 1777.6, volume: 16_740, contract: "PLV26" },
+      { date: new Date("2026-09-28T00:00:00Z"), close: 1724.1, volume: 6_877, contract: "PLV26", unsettled: true },
+      { date: new Date("2026-09-29T00:00:00Z"), open: 1736.6, high: 1741.2, low: 1695.3, close: 1701, volume: 21_847, contract: "PLF27" },
+      { date: new Date("2026-09-30T00:00:00Z"), close: 1718.9, volume: 15_966, contract: "PLF27", partial: true },
+    ], "1d");
+    expect(rows.map((row) => row.settleOnly === true)).toEqual([true, false, false, false]);
+    expect(historyRows([{ date: new Date("2026-09-25T00:00:00Z"), close: 101 }], "1d")[0]!.settleOnly).toBeUndefined();
+  });
+
+  test("a served bar keeps its contract only as a listed contract code: root, month letter and two-digit year", () => {
+    const contract = (value: unknown) => mapPricePoint({ date: "2026-10-26T00:00:00.000Z", close: 3.05, contract: value } as never).contract;
+    for (const code of ["NGZ26", "ZQF27", "6EZ26", "MNQH27", "CLX26"]) expect(contract(code)).toBe(code);
+    // Lower case, a four-digit year, a letter no month has, a bare root, padding or markup is no contract.
+    for (const value of ["ngz26", "NGZ2026", "NGA26", "NG", "NGZ26 ", "", "<b>NGZ26</b>", 26, null, undefined]) {
+      expect(contract(value)).toBeUndefined();
+    }
+  });
+
   test("float32 noise from either source becomes the intended decimal while real precision stays", () => {
     // The feed sends the exact float32.
     expect(cleanFloat32Price(Math.fround(340.33))).toBe(340.33);
@@ -59,22 +124,66 @@ describe("history rows", () => {
       .toBe("2026-09-22T15:15:00Z");
   });
 
-  test("a bar HP blanks is blanked the same way and says which prices disagree", () => {
-    // SBK.JO 2025-10-09 as served: the low is above the open.
+  test("a bar HP blanks is blanked the same way and says which prices disagree; an open alone outside the range is withheld", () => {
+    // SBK.JO 2025-10-09 as served: the low is above the open, and only the open; MTN.JO's 30 Oct 2026 bar was the same.
     const points = [
       { date: new Date("2025-10-09"), open: 245.86, high: 253.3, low: 246.23, close: 252.46, volume: 3018311 },
       { date: new Date("2025-10-10"), open: 249, high: 248, low: 247, close: 250, volume: 1 },
       { date: new Date("2025-10-13"), open: 255, high: 255.97, low: 251.07, close: 254.02, volume: 1854180 },
     ];
     const rows = historyRows(points, "1d", "ZAR");
-    expect(rows.map((row) => row.flag)).toEqual(["low>open", "high<open,high<close", null]);
+    expect(rows.map((row) => row.flag)).toEqual(["open withheld", "high<open,high<close", null]);
+    // The open is withheld; the high, low, close and volume stand.
+    expect(rows[0]).toMatchObject({ open: null, high: 253.3, low: 246.23, close: 252.46, volume: 3018311 });
     for (const [index, row] of rows.entries()) {
       const { open, high, low, close, volume } = pricePointValues(points[index]!);
       expect([row.open, row.high, row.low, row.close, row.volume]).toEqual([open, high, low, close, volume]);
     }
     expect(rows[2]).toMatchObject({ close: 254.02, currency: "ZAR", interval: "1d" });
-    expect(historyFlagNote(rows)).toBe("2 of 3 bars have high below open or close, or low above open or close in the source data; their prices are left blank");
+    expect(historyFlagNote(rows)).toBe("1 of 3 bars has high below open or close in the source data; its prices are left blank");
+    expect(historyOpenNote(rows)).toBe("The open of 2025-10-09 is outside its high and low in the source data; withheld, the rest of the bar kept (flag open withheld)");
     expect(historyFlagNote([rows[2]!])).toBeNull();
+  });
+
+  test("bars the server scaled back from the wrong unit keep their prices, flagged and said, and export no status", () => {
+    // 1306 on JPX, 30-31 Mar 2026: served at a tenth of the price on ten times the volume, scaled back by the server.
+    const served = [
+      { date: "2026-03-27T00:00:00.000Z", open: 379.9, high: 384.8, low: 377.7, close: 382.7, volume: 20_778_200 },
+      { date: "2026-03-30T00:00:00.000Z", open: 370, high: 376.4, low: 367.4, close: 376.4, volume: 7_975_490, rescaled: 10 },
+      { date: "2026-03-31T00:00:00.000Z", open: 371.3, high: 379.3, low: 369.1, close: 371.4, volume: 25_178_030, rescaled: 10 },
+      { date: "2026-04-01T00:00:00.000Z", open: 383.5, high: 389.2, low: 381.3, close: 389.2, volume: 19_862_090 },
+    ];
+    const rows = historyRows(served.map((point) => mapPricePoint(point, 1, "JPX")), "1d", "JPY");
+    expect(rows.map((row) => [row.date, row.close, row.flag])).toEqual([
+      ["2026-03-27", 382.7, null], ["2026-03-30", 376.4, "rescaled*10"], ["2026-03-31", 371.4, "rescaled*10"], ["2026-04-01", 389.2, null],
+    ]);
+    expect(historyFlagNote(rows)).toBeNull();
+    expect(rows.map((row) => historyExportStatus(row as unknown as Record<string, unknown>))).toEqual(["", "", "", ""]);
+    expect(historyRescaleNote(rows)).toBe("2026-03-30 and 2026-03-31 came from the source at 1/10 of their price and 10x their volume; shown scaled back (flag rescaled)");
+  });
+
+  test("a low under half the body or a high over twice it is flagged and left out of ranges, the close kept", () => {
+    // IAG on LSE as served for 2021-11-29: a low of 0.0155 between days trading 1.22 to 1.41.
+    const points = [
+      { date: new Date("2021-11-26"), open: 1.225, high: 1.4138, low: 1.2206, close: 1.314, volume: 177520453 },
+      { date: new Date("2021-11-29"), open: 1.34, high: 1.385371, low: 0.0155, close: 1.3164, volume: 54408860 },
+      { date: new Date("2021-11-30"), open: 1.29, high: 2.9, low: 1.2604, close: 1.2746, volume: 78051066 },
+      // A real wide day: a low just over half the close stays.
+      { date: new Date("2021-12-01"), open: 1.298, high: 1.358, low: 0.66, close: 1.3176, volume: 62147896 },
+    ];
+    const rows = historyRows(points, "1d", "GBP");
+    expect(rows.map((row) => row.flag)).toEqual([null, "low<close/2", "high>2*open", null]);
+    expect(rows.map((row) => [row.low, row.high, row.close])).toEqual([[1.2206, 1.4138, 1.314], [null, 1.385371, 1.3164], [1.2604, null, 1.2746], [0.66, 1.358, 1.3176]]);
+    // The bars keep their prices: no blanking note, no volume counted as missing.
+    expect(historyFlagNote(rows)).toBeNull();
+    expect(historyMissingVolumeNote(rows)).toBeNull();
+    expect(historyWickNote(rows.slice(0, 2))).toBe("The low of 2021-11-29 is under half its open and close, too far to have traded; left blank and out of ranges");
+    expect(historyWickNote(rows)).toBe("2 of 4 bars have a low under half or a high over twice their open and close (2021-11-29 and 2021-11-30), too far to have traded; left blank and out of ranges");
+    // Weekly bars and range estimators read the kept wicks only.
+    const week = extractPriceSeries(points, { kind: "security", instrument: { symbol: "IAG" }, fieldId: "market.low", period: "weekly" } as never);
+    expect(Math.min(...week.map((point) => point.value ?? Infinity))).toBe(0.66);
+    // A bar whose prices contradict each other is blanked whole, flagged for that alone.
+    expect(pricePointWickFlags({ date: new Date(), open: 2, high: 1, low: 0.1, close: 2 })).toEqual([]);
   });
 
   test("a coin's 0 volume is missing, never 0, and counted once; a stock's 0 is a real 0", () => {
@@ -108,6 +217,54 @@ describe("history rows", () => {
     expect(historyMissingVolumeNote(rows)).toBeNull();
     expect(historyVenueVolumeNote(rows)).toBe("2 of 2 bars count IEX trades only, not the market's volume");
     expect(historyVenueVolumeNote(historyRows([mapPricePoint({ ...served[0]!, volume: 600_000 }, 1, "NYSE")], "5m"))).toBeNull();
+  });
+
+  test("a coin's daily and hourly volumes say what they count, since the two differ tenfold", () => {
+    // BTC-USD as Gloom Cloud serves it: hourly bars summed over a few spot venues, the daily bar every venue's total.
+    const hourly = [{ date: "2026-10-30T20:00:00Z", open: 1, high: 1, low: 1, close: 1, volume: 86_000_000, volumeBasis: "3 spot venues" },
+      { date: "2026-10-30T21:00:00Z", open: 1, high: 1, low: 1, close: 1, volume: 91_000_000, volumeBasis: "3 spot venues" }];
+    const hourRows = historyRows(hourly.map((point) => mapPricePoint(point, 1, "CCC", true)), "1h");
+    // Its own field (the CSV's Volume basis), never the venue a venue-only count names.
+    expect(hourRows.map(({ volumeBasis, volumeVenue }) => ({ volumeBasis, volumeVenue }))).toEqual([
+      { volumeBasis: "3 spot venues", volumeVenue: undefined }, { volumeBasis: "3 spot venues", volumeVenue: undefined }]);
+    expect(historyVolumeNote({ unit: "USD" }, "1h", historyVolumeBasis(hourRows))).toBe("volume in USD summed over 3 spot venues");
+    const dayRows = historyRows([mapPricePoint({ ...hourly[0]!, date: "2026-10-30", volume: 24_470_000_000, volumeBasis: "aggregate" }, 1, "CCC", true)], "1d");
+    expect(historyVolumeNote({ unit: "USD" }, "1d", historyVolumeBasis(dayRows))).toBe("volume in USD per UTC day, aggregate across venues");
+    // Bars that disagree, or a server that does not say, keep the plain unit.
+    expect(historyVolumeBasis([...hourRows, ...dayRows])).toBeNull();
+    expect(historyVolumeNote({ unit: "USD" }, "1d", historyVolumeBasis(historyRows([mapPricePoint({ ...hourly[0]!, volumeBasis: undefined }, 1, "CCC", true)], "1d"))))
+      .toBe("volume in USD per UTC day");
+  });
+
+  test("an index's daily and hourly volumes say what they count, since the hours sum below the day", () => {
+    // ^GSPC on Fri 30 Oct 2026: the daily bar 6,149,170,000, the hourly bars 2,475,413,211 between them.
+    const day = historyRows([mapPricePoint({ date: "2026-10-30", open: 7631.07, high: 7637.48, low: 7527.56, close: 7580.07,
+      volume: 6_149_170_000, volumeBasis: "daily total" }, 1, "SNP")], "1d");
+    expect(day[0]).toMatchObject({ volume: 6_149_170_000, volumeBasis: "daily total" });
+    expect(historyVolumeNote(null, "1d", historyVolumeBasis(day))).toBe("volume basis: daily total");
+    const hour = historyRows([mapPricePoint({ date: "2026-10-30T19:30:00Z", open: 7552.04, high: 7588.76, low: 7547.23, close: 7580.95,
+      volume: 619_745_000, volumeBasis: "intraday count" }, 1, "SNP")], "1h");
+    expect(historyVolumeNote(null, "1h", historyVolumeBasis(hour))).toBe("volume basis: intraday count");
+    // A history that does not say keeps no note.
+    expect(historyVolumeNote(null, "1d", null)).toBeNull();
+  });
+
+  // ^GDAXI's hourly bars, 10 and 11 Nov 2026: the source ended past sessions on the 16:00 bar (26,387.94), short of the
+  // 26,347.45 closing auction; the data service adds the close from the daily bar, or marks the last bar when it has none.
+  test("an index session's closing print among its hourly bars is named, and so is a last bar that ends before the close", () => {
+    const bar = (date: string, close: number, flags: Record<string, boolean> = {}) =>
+      mapPricePoint({ date, open: close, high: close, low: close, close, ...flags }, 1, "XETRA");
+    const rows = historyRows([
+      bar("2026-11-10T15:00:00Z", 26413.23), bar("2026-11-10T16:00:00Z", 26387.94), bar("2026-11-10T16:30:00Z", 26347.45, { sessionClose: true }),
+      bar("2026-11-11T15:00:00Z", 26609.52), bar("2026-11-11T16:00:00Z", 26644.39, { beforeClose: true }),
+    ], "1h");
+    expect(rows.map((row) => [row.date.slice(5, 16), row.sessionClose ?? false, row.beforeClose ?? false])).toEqual([
+      ["11-10T15:00", false, false], ["11-10T16:00", false, false], ["11-10T16:30", true, false],
+      ["11-11T15:00", false, false], ["11-11T16:00", false, true],
+    ]);
+    const note = historyBarStatusNote(rows) ?? "";
+    expect(note).toContain("2026-11-10T16:30:00Z is its session's closing print, the day's close (close)");
+    expect(note).toContain("2026-11-11T16:00:00Z ends before the closing auction: the day's close is on its daily bar (before close)");
   });
 
   test("the latest trade a coin's intraday history ends with is part of the bar before it, never a bar without volume", () => {
@@ -186,7 +343,7 @@ describe("history rows", () => {
     expect(rows.filter((row) => row.flag).map((row) => [row.date, row.flag, row.close])).toEqual([["1992-12-01", "gap,jump", 2.763]]);
     expect(historyFlagNote(rows)).toBeNull();
     const blanked = historyRows([{ date: new Date("1977-09-01"), open: 0.0015, high: 0.0014, low: 0.0014, close: 0.0015 }, ...usdIlsMonthly()], "1mo");
-    expect(historyFlagNote(blanked)).toBe("1 of 38 bars has high below open or close in the source data; their prices are left blank");
+    expect(historyFlagNote(blanked)).toBe("1 of 38 bars has high below open or close in the source data; it keeps its close; open, high and low are blank, the month's daily bars not covering it without contradiction");
     // A daily series breaks where its weekly bars would: Athens shut for five weeks in 2015, and a fall is a jump too.
     const athens = historyRows([
       ...series("2015-06-22", "2015-06-26", DAY), ...series("2015-08-03", "2015-08-05", DAY), { date: new Date("2015-08-06"), close: 0.5 },
@@ -195,6 +352,42 @@ describe("history rows", () => {
     expect(historyGapNote(athens, { listing: "ETE.AT" })).toBe("No bars for 2015-06-27 to 2015-08-02 (5 weeks)");
     expect(historyJumpNote(athens)).toMatch(/^Close falls \d+x from [\d.]+ on 2015-08-05 to 0.5 on 2015-08-06$/);
     expect(historyUnbrokenFrom(athens)).toBe("2015-08-06");
+  });
+
+  test("a monthly bar whose prices contradict each other keeps its close, its range rebuilt from daily bars that cover it", () => {
+    // ZC=F's September 2000 bar: a close above its high blanked the month, and monthly returns broke.
+    const monthly = historyRows([
+      { date: new Date("2000-08-01"), open: 180.25, high: 185, low: 174, close: 182, volume: 386_687 },
+      { date: new Date("2000-09-01"), open: 182, high: 189, low: 176, close: 192, volume: 145 },
+      { date: new Date("2000-10-01"), open: 190, high: 192, low: 180, close: 191, volume: 3_851 },
+    ], "1mo", "USX", "US cents / bushel");
+    expect(monthly[1]).toMatchObject({ open: null, high: null, low: null, close: 192, volume: 145, flag: "high<close" });
+    // Daily bars through the 29th leave no week of September out: rebuilt. Bars that stop on the 12th: left blank.
+    const daily = (from: string, to: string) => series(from, to, DAY).map((point, index) => ({ ...point, open: 185 + index, high: 195 + index, low: 180, close: 190 }));
+    const rebuilt = withDailyRebuiltBars(monthly, [...daily("2000-09-01", "2000-09-29")]);
+    expect(rebuilt[1]).toMatchObject({ open: 185, high: 223, low: 180, close: 192, rebuilt: "daily bars" });
+    expect(historyFlagNote(rebuilt)).toBe("1 of 3 bars has high below open or close in the source data; it keeps its close, with open, high and low from the month's daily bars");
+    expect(withDailyRebuiltBars(monthly, daily("2000-09-01", "2000-09-12"))[1]!.open).toBeNull();
+    // A daily close above the kept one never makes a range that leaves it out: still blank.
+    expect(withDailyRebuiltBars(monthly, daily("2000-09-01", "2000-09-29").map((point) => ({ ...point, high: 191 })))[1]!.high).toBeNull();
+    // Daily bars keep blanking whole: only a monthly bar keeps its close.
+    expect(historyRows([{ date: new Date("2000-09-05"), open: 182, high: 189, low: 176, close: 192 }], "1d")[0]!.close).toBeNull();
+    // A Sydney session is stamped 23:00 UTC the evening before: 1 September's bar is September's on the ASX.
+    const sydney = daily("2000-09-01", "2000-09-29").map((point) => ({ ...point, date: new Date(point.date.getTime() - DAY + 23 * 3_600_000) }));
+    expect(withDailyRebuiltBars(monthly, sydney, 1, "ASX")[1]).toMatchObject({ open: 185, rebuilt: "daily bars" });
+    expect(withDailyRebuiltBars(monthly, sydney)[1]!.open).not.toBe(185);
+  });
+  test("flagged months a few apart share one read of daily bars, a year at most", () => {
+    // ZC=F's twelve flagged months since 2000, a month listed twice and out of order: six reads.
+    const zc = ["2000-09", "2000-12", "2002-09", "2003-06", "2003-09", "2004-02", "2004-03", "2004-06", "2004-07", "2005-08", "2005-10", "2006-03"];
+    expect(dailyRebuildSpans([...zc.slice(6), ...zc, "2000-09"])).toEqual([
+      { from: "2000-09", to: "2000-12" }, { from: "2002-09", to: "2002-09" }, { from: "2003-06", to: "2003-09" },
+      { from: "2004-02", to: "2004-07" }, { from: "2005-08", to: "2005-10" }, { from: "2006-03", to: "2006-03" },
+    ]);
+    // Three months apart every time: a new read once the span would pass a year.
+    expect(dailyRebuildSpans(["2001-01", "2001-04", "2001-07", "2001-10", "2002-01"])).toEqual([
+      { from: "2001-01", to: "2001-10" }, { from: "2002-01", to: "2002-01" },
+    ]);
   });
 
   test("closures, thin trading and round-the-clock coins are no break", () => {
@@ -270,6 +463,36 @@ describe("history rows", () => {
     expect(historyPriceDecimals(daily(shib.map((bar) => bar.map(Math.fround))))).toBe(8);
     // A known kind applies the app's price rules: an equity shows cents even with sub-penny prints.
     expect(historyPriceDecimals(daily([[334.5795, 335.48, 333.1697, 334.225], [334.26, 334.1216, 332.8706, 333.8972]]), "STK")).toBe(2);
+  });
+
+  // BP.L's bars as the cloud served them: float32 pence, divided into pounds (623.6p as 6.2359998).
+  const BP_L_BARS = [[6.2300000, 6.2610002, 6.1190002, 6.1190002], [6.2359998, 6.3853802, 6.1920000, 6.3850002], [6.3529999, 6.3790002, 6.2259998, 6.3080001]];
+
+  test("a London line's prices are the pence they were quoted in, to the venue's finest tick, with no float noise", () => {
+    const rows = historyRows(BP_L_BARS.map(([open, high, low, close], index) => ({
+      date: new Date(Date.UTC(2026, 9, 22 + index)), open, high, low, close: close!,
+    })), "1d", "GBP", null, null, 100);
+    expect(rows.map(({ open, high, low, close }) => [open, high, low, close])).toEqual([
+      [6.23, 6.261, 6.119, 6.119], [6.236, 6.38538, 6.192, 6.385], [6.353, 6.379, 6.226, 6.308],
+    ]);
+    // A sub-penny tick survives, to a ten-thousandth of a penny: 0.1234p.
+    expect(cleanBarPrice(Math.fround(0.1234) / 100, 100)).toBe(0.001234);
+    // A price served in its own currency is cleaned as before.
+    expect(cleanBarPrice(Math.fround(340.33), 1)).toBe(340.33);
+    // Pounds served in pence are cleaned in pence; a quote in pence itself (GBp) is cleaned as it is.
+    expect(quotedPriceDivisor({ currency: "GBP", providerPriceDivisor: 100 })).toBe(100);
+    expect(quotedPriceDivisor({ currency: "GBp", providerPriceDivisor: 100 })).toBe(1);
+    expect(quotedPriceDivisor({ currency: "USD" })).toBe(1);
+  });
+
+  test("a London share under £10 shows a tenth of a penny (6.385 for 638.5p), as no other equity does", () => {
+    const bars = BP_L_BARS.map(([open, high, low, close]) => ({ open, high, low, close }));
+    expect(barPriceDecimals(bars, "EQUITY", 100)).toBe(3);
+    // Saved with no kind, a line priced in pence is still a share.
+    expect(barPriceDecimals(bars, undefined, 100)).toBe(3);
+    // Over £10 a penny is the second decimal already: 49.23 for 4,923p.
+    expect(barPriceDecimals([{ open: 49.23, high: 49.5, low: 48.9, close: 49.23 }], "EQUITY", 100)).toBe(2);
+    expect(barPriceDecimals(bars, "EQUITY")).toBe(2);
   });
 });
 

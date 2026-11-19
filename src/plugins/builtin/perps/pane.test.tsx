@@ -4,7 +4,7 @@ import { MarketDataCoordinator, setSharedMarketDataCoordinator } from "../../../
 import { AssetDataRouter } from "../../../sources/provider-router";
 import { createTestDataProvider } from "../../../test-support/data-provider";
 import type { QuoteSubscriptionTarget } from "../../../types/data-provider";
-import { setCloudApiFetchTransport } from "../../../api-client";
+import { apiClient, setCloudApiFetchTransport } from "../../../api-client";
 import type { PerpBoardPayload, PerpRankingsPayload } from "../../../api-client/perps";
 import { PaneFooterBar, PaneFooterKeys, PaneFooterProvider } from "../../../components/layout/pane/footer";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
@@ -13,17 +13,23 @@ import { createTestPaneConfig, TestPaneProvider } from "../../../test-support/pa
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import type { PaneInstanceConfig } from "../../../types/config";
 import { Box } from "../../../ui";
-import { perpsCache, perpsHistoryCache, perpsMarketCache, perpsRankingsCache } from "./client";
+import { perpsCache, perpsDepthCache, perpsHistoryCache, perpsLiquidationsCache, perpsMarketCache, perpsRankingsCache } from "./client";
 import { perpsInstance } from "./index";
 import { PerpsPane } from "./pane";
-import { equityBoard, longShort, perpBoard, perpHistory, perpRankings, perpRow, venueRow } from "./test-fixture";
+import { depthPayload, equityBoard, liquidationsPayload, longShort, perpBoard, perpHistory, perpRankings, perpRow, venueRow } from "./test-fixture";
 const tui = createOpenTuiTestHarness();
 let coordinator: MarketDataCoordinator | null = null;
 const reset = () => {
-  setCloudApiFetchTransport(null); perpsCache.reset(); perpsHistoryCache.reset(); perpsMarketCache.reset(); perpsRankingsCache.reset();
+  apiClient.setSessionToken(null);
+  setCloudApiFetchTransport(null); perpsCache.reset(); perpsHistoryCache.reset(); perpsMarketCache.reset(); perpsRankingsCache.reset(); perpsLiquidationsCache.reset(); perpsDepthCache.reset();
   setSharedMarketDataCoordinator(null); coordinator?.destroy(); coordinator = null;
 };
 afterEach(reset);
+/** A Pro account: a named market opens its history, which a free one has locked. */
+function signInPro() {
+  apiClient.setSessionToken("perps-test-session");
+  apiClient.restoreCachedUser({ id: "pro-user", name: "Test", email: "pro@example.invalid", emailVerified: true, plan: "pro", effectivePlan: "pro" } as never);
+}
 /** A second pane in the same test starts from empty caches. */
 async function remount() { await tui.destroy(); reset(); }
 /** The mounted app state and its dispatch, for a test that changes the instance the way the app does. */
@@ -51,12 +57,14 @@ function serve({ board = perpBoard(), rankings = perpRankings(), compare = perpB
       const marketId = url.split("marketId=")[1]!.split("&")[0]!;
       return Response.json({ ...board, rows: [...board.rows, ...compare.rows].filter((row) => row.marketId === marketId).slice(0, 1), evidence: [], methodologyUrl: "https://gloom.sh/docs/perpetuals" });
     }
+    if (url.includes("/liquidations?")) return Response.json(liquidationsPayload({ access: board.access, locked: board.access === "preview" }));
+    if (url.includes("/depth?")) return Response.json(depthPayload({ access: board.access, locked: board.access === "preview" }));
     return Response.json(url.includes("/rankings") ? rankings : url.includes("/compare") ? compare : board);
   });
   return calls;
 }
 
-test("no market opens the board in its preview; a named market still opens its history", async () => {
+test("no market opens the board in its preview; a named market opens its latest values, where history is Pro's", async () => {
   serve({ board: perpBoard({ access: "preview", locked: 2501, rows: [perpRow(), venueRow("bybit")] }) });
   await mount({ market: "" });
   const board = await tui.waitForFrameToContain("Upgrade for 2,501 more markets");
@@ -66,11 +74,21 @@ test("no market opens the board in its preview; a named market still opens its h
   await remount();
   serve({ board: perpBoard({ access: "preview", locked: 5, sources: ["hyperliquid", "binance"].map((source) => ({ source })) }) });
   await mount({ market: "BTC" });
+  // A free account lands on the figures it has, not on a lock.
+  const latest = await tui.waitForFrameToContain("Funding 8h / APR");
+  expect(latest).toContain("Premium vs oracle");
+  expect(latest).not.toContain("Full history requires Gloom Pro.");
+  await tui.clickFrameText("History");
   const history = await tui.waitForFrameToContain("Full history requires Gloom Pro.");
   expect(history).toContain("Funding / 8h");
   // The lock says what Pro adds, with the venues Gloom Cloud collects.
   expect(history).toContain("Gloom Pro adds Hyperliquid BTC history and every market on 2 venues.");
   expect(history).toContain("Upgrade for full history");
+  await remount();
+  signInPro();
+  serve({ board: perpBoard({ access: "pro", sources: ["hyperliquid", "binance"].map((source) => ({ source })) }) });
+  await mount({ market: "BTC" });
+  expect(await tui.waitForFrameToContain("Series")).not.toContain("Full history requires Gloom Pro.");
 });
 
 test("asking for a market again brings its pane back to that market from the board, and d opens its stock's DES", async () => {
@@ -80,7 +98,7 @@ test("asking for a market again brings its pane back to that market from the boa
   const first = perpsInstance(stock.marketId);
   await mount(first.settings!, { instanceId: first.instanceId, params: first.params },
     createTestPluginRuntime({ pinTicker: (symbol, options) => { opened.push([options?.paneType ?? "", symbol]); } }));
-  await tui.waitForFrameToContain("Full history requires Gloom Pro.");
+  await tui.waitForFrameToContain("Funding 8h / APR");
   await tui.clickFrameText("Board");
   await tui.waitForFrameToContain("Search markets");
   // A stock's perpetual row pressed again: the workflow finds this pane by its id and stamps the new request on it.
@@ -91,7 +109,7 @@ test("asking for a market again brings its pane back to that market from the boa
   const layout = state.config.layout;
   await act(async () => { dispatch({ type: "SET_CONFIG", config: { ...state.config, layout: { ...layout,
     instances: layout.instances.map((entry) => entry.instanceId === again.instanceId ? { ...entry, params: { ...entry.params, ...again.params } } : entry) } } }); });
-  const frame = await tui.waitForFrameToContain("Full history requires Gloom Pro.");
+  const frame = await tui.waitForFrameToContain("Funding 8h / APR");
   expect(frame).toContain(stock.marketId);
   expect(frame).not.toContain("Search markets");
   await tui.emitKeypress({ name: "d" });
@@ -109,7 +127,7 @@ test("a named market opened on another tab, as `shot PERP <market> --tab evidenc
 
 test("free long/short history keeps the row's latest reading beside the same Pro lock as every series", async () => {
   serve({ board: perpBoard({ access: "preview", locked: 5, rows: [venueRow("binance", { longShortRatio: longShort() })] }) });
-  await mount({ market: "BTC", metric: "long-short" });
+  await mount({ market: "BTC", tab: "history", metric: "long-short" });
   const frame = await tui.waitForFrameToContain("Full history requires Gloom Pro.");
   expect(frame).toContain("Long accounts");
   expect(frame).toContain("61.83%");
@@ -118,6 +136,7 @@ test("free long/short history keeps the row's latest reading beside the same Pro
 });
 
 test("the venue filter narrows the board, and Enter opens the chosen venue's contract in History", async () => {
+  signInPro();
   const calls = serve({ board: perpBoard({ rows: [perpRow(), venueRow("binance"), venueRow("bybit", { fundingRate: 0.0002 })] }) });
   await mount({ market: "", venue: "bybit" });
   const frame = await tui.waitForFrameToContain("+0.02000% /8h");
@@ -148,11 +167,12 @@ test("rankings read as five sections of at most ten markets, with the preview's 
 test("compare spreads 8h funding between the venues it shows, dates each venue, and one venue shows no spread", async () => {
   serve({ compare: perpBoard({ rows: [venueRow("binance", { fundingRate8h: 0.00003, observedAt: "2026-10-03T23:11:40Z" }), venueRow("bybit", { fundingRate8h: 0.0001 })] }) });
   await mount({ market: "", tab: "compare" });
-  const two = await tui.waitForFrameToContain("Funding spread 8h");
+  // The footer line registers a frame after the rows paint, so wait for it: the spread and the table are on screen by then.
+  const two = await tui.waitForFrameToContain("Binance 23:11 · Bybit 23:20 UTC · oldest");
+  expect(two).toContain("Funding spread 8h");
   expect(two).toContain("0.0070pp");
   expect(two).toContain("Bybit over Binance");
   // The footer dates each venue by its own row, as `fn PERP` does, and the table keeps when each was observed.
-  expect(two).toContain("Binance 23:11 · Bybit 23:20 UTC · oldest");
   expect(two).toContain("10-03 23:11");
   await remount();
   serve({ compare: perpBoard({ access: "preview", locked: 3, rows: [perpRow()] }) });
@@ -160,6 +180,30 @@ test("compare spreads 8h funding between the venues it shows, dates each venue, 
   const one = await tui.waitForFrameToContain("Upgrade for 3 more contracts");
   expect(one).toContain("Hyperliquid");
   expect(one).not.toContain("Funding spread");
+});
+
+test("liquidations and depth list one asset's contracts on every venue, with the preview's lock, and Enter opens a contract's history", async () => {
+  const calls = serve({ board: perpBoard({ access: "preview", locked: 5 }) });
+  await mount({ market: "ETH-USD", tab: "liquidations" });
+  const liquidations = await tui.waitForFrameToContain("Upgrade for hourly liquidations and the 20 largest prints");
+  expect(liquidations).toMatch(/Longs 24h\s+3\.2k/);
+  expect(liquidations).toMatch(/Binance\s+ETHUSDT\s+3\.1k\s+29\.2k/);
+  expect(liquidations).toContain("By contract");
+  // A pair reads as its base asset, as Compare reads it; the stream that is down is said in the footer.
+  expect(calls.some((url) => url.includes("/liquidations?baseAsset=ETH-USD"))).toBeTrue();
+  expect(calls.some((url) => url.endsWith("/liquidations?baseAsset=ETH"))).toBeFalse();
+  expect(liquidations).toContain("OKX stream down");
+  expect(liquidations).not.toMatch(/NaN|undefined/);
+  await remount();
+  serve({ board: perpBoard({ access: "preview", locked: 5 }) });
+  await mount({ market: "ETH", tab: "depth" });
+  const depth = await tui.waitForFrameToContain("Upgrade for hourly depth history");
+  expect(depth).toMatch(/Binance\s+ETHUSDT\s+≥57\.58M\s+≥66\.75M/);
+  expect(depth).toMatch(/OKX\s+ETH-USDT-SWAP\s+33\.92M/);
+  expect(depth).toContain("±1% of mid");
+  await tui.emitKeypress({ name: "return" });
+  // The selected book's contract opens by its identity, on Evidence for a free account, as a board row does.
+  expect(await tui.waitForFrameToContain("binance:ETHUSDT")).not.toContain("Upgrade for hourly depth history");
 });
 
 test("the APR % column adds no data warning, and a market nothing matches says which to try", async () => {
@@ -195,6 +239,8 @@ test("evidence distinguishes source time, raw interval, reference price and reta
   // A crypto perp has no listed underlying, so the reference-price rows are left out rather than shown as unavailable.
   expect(frame).not.toContain("Underlying last");
   expect(frame).toContain("Source as of");
+  // Where the figures were read, as an export cites it.
+  expect(frame).toMatch(/Source\s+https:\/\/api\.hyperliquid\.xyz/);
 });
 
 test("the board's footer says live only while every row on screen streams, and otherwise dates them by the oldest price", async () => {
@@ -213,8 +259,7 @@ test("the board's footer says live only while every row on screen streams, and o
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
   expect(subscribed.map((target) => target.symbol).sort()).toEqual(["BTCUSDT:BINANCE", "BTCUSDT:BYBIT", "ETHUSDT:BINANCE"]);
   // Nothing streams yet: the minute's read is neither live nor delayed; the line says how old its oldest price is.
-  const read = tui.frame();
-  expect(read).toContain("UTC · oldest 3 min");
+  const read = await tui.waitForFrameToContain("UTC · oldest 3 min");
   expect(read).not.toMatch(/delayed|· live/);
   const stream = async (index: number) => {
     const row = { ...rows[index]!, markPrice: 81_000 + index, observedAt: new Date().toISOString() };

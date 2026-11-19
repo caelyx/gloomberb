@@ -1,7 +1,9 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { HeadlessPaneDefinition, HeadlessPaneEntry } from "../../../types/plugin";
 import { formatStrikeLabel } from "../../../utils/options";
 import { expirationOptionSeconds, expiryIsoDate, OPTION_EXPIRATION_FORMAT, OPTION_EXPIRATION_PLACEHOLDER } from "../../../utils/option-expiry";
 import { formatUtcTime } from "../../../utils/utc-time";
+import { servedFromSavedCopy } from "../../../data/saved-copies";
 import { loadGamma, loadOpenInterest, positioningSymbol, type GammaPayload, type OpenInterestPayload } from "./client";
 import { listingFateReport, loadListingFate } from "../../../tickers/listing-fate";
 import { resolveHeadlessInstrument } from "../shared/headless-market-data";
@@ -18,6 +20,7 @@ import {
   formatCountChange,
   formatDistance,
   formatGamma,
+  formatGammaTimes,
   formatLevel,
   formatPositioningSpot,
   formatPayout,
@@ -31,28 +34,32 @@ import {
 
 const METHODOLOGY = "https://gloom.sh/docs/options-positioning";
 const UNIT_TEXT = "$ of dealer delta per 1% move";
-const strike = (value: unknown) => typeof value === "number" ? formatStrikeLabel(value) : "--";
+const strike = (value: unknown) => typeof value === "number" ? formatStrikeLabel(value) : MISSING_VALUE;
 const count = (value: unknown) => formatCount(typeof value === "number" ? value : null);
 const coinCount = (value: unknown) => formatContracts(typeof value === "number" ? value : null, true);
 const change = (value: unknown) => formatCountChange(typeof value === "number" ? value : null);
 const gamma = (value: unknown) => formatGamma(typeof value === "number" ? value : null);
 const failure = (error: unknown) => error instanceof Error ? error : new Error(String(error));
-const time = (value: string | null) => value ? formatUtcTime(value) : "--";
-const level = (value: number | null, spot: number | null, none = "--") =>
+const time = (value: string | null) => value ? formatUtcTime(value) : MISSING_VALUE;
+const level = (value: number | null, spot: number | null, none = MISSING_VALUE) =>
   value == null ? none : `${formatLevel(value)}, ${formatDistance(value, spot)} vs spot`;
 const wall = (value: number | null, spot: number | null) =>
-  value == null ? "--" : `${formatStrikeLabel(value)}, ${formatDistance(value, spot)} vs spot`;
+  value == null ? MISSING_VALUE : `${formatStrikeLabel(value)}, ${formatDistance(value, spot)} vs spot`;
 
 /**
- * What the report opens with: spot and the quote time gamma was priced at,
- * apart from the open interest session, then the figures the GEX tab shows.
- * Exports keep each figure whole; the text says them as the pane does.
+ * What the report opens with: spot, the instant gamma is evaluated at and
+ * when the quotes behind its volatilities were taken, apart from the open
+ * interest session, then the figures the GEX tab shows. Exports keep each
+ * figure whole; the text says them as the pane does.
  */
 function summary(openInterest: OpenInterestPayload, dealer: GammaPayload | null): { entries: HeadlessPaneEntry[]; textEntries: HeadlessPaneEntry[] } {
   // Gamma is priced at its own read of spot; the figures and their distances use that one.
   const spot = dealer?.spot ?? openInterest.spot;
   const spotAsOf = dealer ? dealer.spotAsOf : openInterest.spotAsOf;
+  const spotBasis = dealer ? dealer.spotBasis : openInterest.spotBasis;
   const venue = openInterest.venue;
+  // Older servers send no gamma time: their quote time stands alone, as it did.
+  const gammaTimes = dealer ? formatGammaTimes(dealer.gammaAsOf, dealer.quotesAsOf) : null;
   // A venue that publishes open interest live (Deribit) dates it to the read, not to a session.
   const oiAsOf = venue && openInterest.oiAsOf ? openInterest.oiAsOf : null;
   const contract = openInterest.contract;
@@ -61,16 +68,21 @@ function summary(openInterest: OpenInterestPayload, dealer: GammaPayload | null)
     ...(venue ? [{ key: "venue", label: "Venue", value: venue }] : []),
     { key: "spot", label: "Spot", value: spot },
     { key: "spotAsOf", label: "Spot as of", value: spotAsOf },
-    ...(dealer ? [{ key: "quotesAsOf", label: "Quotes as of", value: dealer.quotesAsOf }] : []),
+    // An index outside its session: spot is the close, spotAsOf its time.
+    ...(spotBasis ? [{ key: "spotBasis", label: "Spot basis", value: spotBasis }] : []),
+    ...(dealer && gammaTimes ? [{ key: "gammaAsOf", label: "Gamma at", value: dealer.gammaAsOf ?? null },
+      { key: "quotesAsOf", label: "Vols from", value: dealer.quotesAsOf }]
+      : dealer ? [{ key: "quotesAsOf", label: "Quotes as of", value: dealer.quotesAsOf }] : []),
     { key: "oiDate", label: "Open interest as of", value: oiAsOf ?? openInterest.oiDate },
     ...(contract ? [{ key: "contract", label: "Contract", value: contract }] : []),
     ...(settles ? [{ key: "settles", label: "Expiries settle", value: settles }] : []),
   ];
   const textEntries: HeadlessPaneEntry[] = [
     ...(venue ? [{ label: "Venue", value: venue }] : []),
-    { label: "Spot", value: spot, formatted: formatPositioningSpot(spot, spotAsOf, venue) },
-    ...(dealer ? [{ label: "Quotes as of", value: dealer.quotesAsOf, formatted: time(dealer.quotesAsOf) }] : []),
-    { label: "Open interest as of", value: oiAsOf ?? openInterest.oiDate, formatted: oiAsOf ? `${time(oiAsOf)}, live` : openInterest.oiDate ?? "--" },
+    { label: "Spot", value: spot, formatted: formatPositioningSpot(spot, spotAsOf, venue, spotBasis) },
+    ...(dealer && gammaTimes ? [{ label: "Gamma at", value: dealer.gammaAsOf ?? null, formatted: gammaTimes }]
+      : dealer ? [{ label: "Quotes as of", value: dealer.quotesAsOf, formatted: time(dealer.quotesAsOf) }] : []),
+    { label: "Open interest as of", value: oiAsOf ?? openInterest.oiDate, formatted: oiAsOf ? `${time(oiAsOf)}, live` : openInterest.oiDate ?? MISSING_VALUE },
     ...(contract ? [{ label: "Contract", value: contract, formatted: `${contract.size} ${contract.unit}; OI counts ${contract.unit}` }] : []),
     ...(settles ? [{ label: "Expiries settle", value: settles, formatted: `${settles}, the day each expiry names` }] : []),
   ];
@@ -123,7 +135,8 @@ export const optionsPositioningHeadless = (initialTab: PositioningTab): Headless
   options: [
     { key: "tab", type: "enum", values: POSITIONING_TABS.map((tab) => ({ value: tab.value })), defaultValue: initialTab,
       settingKey: "tab", description: "View the pane opens on: strikes, expiries or gex" },
-    { key: "expiry", type: "string", settingKey: "expiry", placeholder: OPTION_EXPIRATION_PLACEHOLDER, example: "--expiry 2027-01-15",
+    // `--expiration` too, as options and OVDV spell it.
+    { key: "expiry", aliases: ["expiration"], type: "string", settingKey: "expiry", placeholder: OPTION_EXPIRATION_PLACEHOLDER, example: "--expiry 2027-01-15",
       description: `Expiry for the strikes and gamma, as ${OPTION_EXPIRATION_FORMAT}; the busiest near expiry when omitted (all expiries for gamma)`,
       normalize: (value) => expiryIsoDate(expirationOptionSeconds(value, "expiry")) },
   ],
@@ -131,12 +144,20 @@ export const optionsPositioningHeadless = (initialTab: PositioningTab): Headless
     const symbol = positioningSymbol(args.symbols[0] ?? "SPY");
     const expiry = typeof args.options.expiry === "string" && /^\d{4}-\d{2}-\d{2}$/.test(args.options.expiry)
       ? args.options.expiry : null;
-    const [openInterest, dealer, everyExpiry] = await Promise.all([
-      loadOpenInterest(symbol, expiry, { signal: ctx.signal }, ctx.apiClient),
-      loadGamma(symbol, expiry, { signal: ctx.signal }, ctx.apiClient).catch(failure),
+    const [openInterestLoad, dealerLoad, everyExpiryLoad] = await Promise.all([
+      loadOpenInterest(symbol, expiry, { signal: ctx.signal, force: ctx.refresh === true }, ctx.apiClient),
+      loadGamma(symbol, expiry, { signal: ctx.signal, force: ctx.refresh === true }, ctx.apiClient).catch(failure),
       // The Expiries table's Net GEX is every expiry's, whichever one the strikes and gamma are for.
-      expiry ? loadGamma(symbol, null, { signal: ctx.signal }, ctx.apiClient).catch(failure) : null,
+      expiry ? loadGamma(symbol, null, { signal: ctx.signal, force: ctx.refresh === true }, ctx.apiClient).catch(failure) : null,
     ]);
+    const openInterest = openInterestLoad.payload;
+    const dealer = dealerLoad instanceof Error ? dealerLoad : dealerLoad.payload;
+    const everyExpiry = everyExpiryLoad instanceof Error ? everyExpiryLoad : everyExpiryLoad?.payload ?? null;
+    // Copies saved before the service could not be reached end the report with when the oldest was saved.
+    const savedAt = [openInterestLoad, dealerLoad, everyExpiryLoad]
+      .map((load) => load && !(load instanceof Error) ? load.savedAt : undefined)
+      .filter((at): at is number => at != null);
+    const savedCopy = <T>(value: T) => savedAt.length ? servedFromSavedCopy(value, Math.min(...savedAt)) : value;
     const spot = openInterest.spot;
     const allExpiries = everyExpiry ?? dealer;
     // VIX has no dealer gamma, so its expiries have no column for it.
@@ -162,7 +183,7 @@ export const optionsPositioningHeadless = (initialTab: PositioningTab): Headless
     // Each expiry's walls, from the all-expiries gamma; absent from older servers.
     const expiryWalls = allExpiries instanceof Error ? null : wallsByExpiry(allExpiries);
     const settles = openInterest.expiries.some((row) => settlementTime(row.expiresAt));
-    const oiStamp = openInterest.venue && openInterest.oiAsOf ? `${time(openInterest.oiAsOf)}, live` : openInterest.oiDate ?? "--";
+    const oiStamp = openInterest.venue && openInterest.oiAsOf ? `${time(openInterest.oiAsOf)}, live` : openInterest.oiDate ?? MISSING_VALUE;
     const gammaShown = dealer instanceof Error || !dealer.total ? null : dealer;
     const scope = dealer instanceof Error ? null : dealer.expiry ? expiryLabel(dealer.expiry) : "all expiries";
     const walls = gammaShown ? gammaWalls(gammaShown.strikes) : null;
@@ -197,7 +218,7 @@ export const optionsPositioningHeadless = (initialTab: PositioningTab): Headless
           ...(gammaColumn ? { netGamma: expiryGamma?.get(row.date) ?? null, netGammaUnit: GAMMA_UNIT } : {}),
         })) },
         { title: `Strikes · ${openInterest.expiry
-          ? expiryWithTimeLabel(openInterest.expiries.find((row) => row.date === openInterest.expiry) ?? { date: openInterest.expiry }) : "--"}`, columns: [
+          ? expiryWithTimeLabel(openInterest.expiries.find((row) => row.date === openInterest.expiry) ?? { date: openInterest.expiry }) : MISSING_VALUE}`, columns: [
           { key: "strike", header: "Strike", format: strike },
           { key: "callOI", header: `Call OI${unit}`, format: contracts },
           ...(changes ? [{ key: "callChange", header: "Call chg", format: change }] : []),
@@ -221,22 +242,25 @@ export const optionsPositioningHeadless = (initialTab: PositioningTab): Headless
       complete: !!openInterest.expiries.length && !(dealer instanceof Error) && errors.length === 0,
       unavailableSymbols: openInterest.expiries.length ? [] : [symbol],
       errors, ...(fate?.notes.length ? { notes: fate.notes } : {}),
-      metadata: {
+      metadata: savedCopy({
         underlying: openInterest.underlying,
         oiDate: openInterest.oiDate,
         previousOiDate: openInterest.previousOiDate,
         spot,
         spotAsOf: openInterest.spotAsOf,
+        ...(openInterest.spotBasis ? { spotBasis: openInterest.spotBasis } : {}),
         delayed: openInterest.delayed,
         ...(openInterest.venue ? { venue: openInterest.venue, oiAsOf: openInterest.oiAsOf ?? null, contract: openInterest.contract ?? null } : {}),
         ...(dealer instanceof Error ? {} : {
-          gamma: { expiry: dealer.expiry ?? ALL_EXPIRIES, spot: dealer.spot, spotAsOf: dealer.spotAsOf, total: dealer.total, band: dealer.band,
+          gamma: { expiry: dealer.expiry ?? ALL_EXPIRIES, spot: dealer.spot, spotAsOf: dealer.spotAsOf,
+            ...(dealer.spotBasis ? { spotBasis: dealer.spotBasis } : {}), total: dealer.total, band: dealer.band,
             bandWithBoxes: dealer.bandWithBoxes ?? null, boxes: dealer.boxes ?? [], flip: dealer.flip,
             callWall: walls?.callWall ?? null, putWall: walls?.putWall ?? null,
-            unit: "dollars of dealer delta per 1% move", assumption: "dealers long calls, short puts", quotesAsOf: dealer.quotesAsOf },
+            unit: "dollars of dealer delta per 1% move", assumption: "dealers long calls, short puts",
+            gammaAsOf: dealer.gammaAsOf ?? null, quotesAsOf: dealer.quotesAsOf },
         }),
         methodology: METHODOLOGY,
-      },
+      }),
     };
   },
 });

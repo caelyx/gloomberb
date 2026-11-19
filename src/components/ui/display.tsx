@@ -5,8 +5,10 @@ import { blendForContrast, higherContrast } from "../../theme/color-utils";
 import { useThemeColors } from "../../theme/theme-context";
 import { Box, Text, TextAttributes, useUiCapabilities } from "../../ui";
 import { truncateToDisplayWidth } from "../../utils/format";
+import { clipKeepingEnd } from "./table-layout";
 import { CountryFlagLead } from "./country-flag";
 import { usePaneLinkMenuEntry } from "./external-link";
+import { ICON_GLYPHS, Icon, type IconName } from "./icon";
 import { titleCase } from "./header-case";
 import { statToneColor, type StatTone } from "./stat-grid";
 
@@ -95,6 +97,12 @@ export interface ClippedTextProps {
   cut?: (text: string, width: number) => string;
   /** The desktop wraps it onto more lines instead (a message, a description); the terminal still cuts it. */
   wrap?: boolean;
+  /**
+   * The end of `text` a cut keeps whole, as a table cell's `keepEnd` does: what tells it apart from its
+   * neighbours ("Customer 1", "Customer A"). The cut shortens what comes before it, in the terminal by its
+   * count of cells and on the desktop and the web by CSS.
+   */
+  keepEnd?: string | null;
 }
 
 /**
@@ -103,10 +111,18 @@ export interface ClippedTextProps {
  * `wrap`. Its box (or its row, with the siblings that keep their room) has to
  * bound it there.
  */
-export function ClippedText({ text, width, fg, attributes, flex = "0 1 auto", lead = "", cut = truncateToDisplayWidth, wrap = false }: ClippedTextProps) {
+export function ClippedText({ text, width, fg, attributes, flex = "0 1 auto", lead = "", cut = truncateToDisplayWidth, wrap = false, keepEnd = null }: ClippedTextProps) {
   const { nativePaneChrome } = useUiCapabilities();
   const ink = { ...(fg === undefined ? {} : { fg }), ...(attributes === undefined ? {} : { attributes }) };
-  if (!nativePaneChrome) return <Text {...ink}>{`${lead}${cut(text, width)}`}</Text>;
+  const end = keepEnd && text.endsWith(keepEnd) && text.length > keepEnd.length ? keepEnd : null;
+  if (!nativePaneChrome) return <Text {...ink}>{`${lead}${end ? clipKeepingEnd(text, width, end) : cut(text, width)}`}</Text>;
+  // The desktop clips what comes before the end, which keeps its own room beside it.
+  if (end && !wrap) {
+    return <Box flexDirection="row" style={{ minWidth: 0, flex, overflow: "hidden" }}>
+      <Text {...ink} style={{ ...NATIVE_CLIP_STYLE, flex: "0 1 auto" }}>{`${lead}${text.slice(0, -end.length)}`}</Text>
+      <Text {...ink} style={{ flex: "0 0 auto", whiteSpace: "pre" }}>{end}</Text>
+    </Box>;
+  }
   return wrap
     ? <Text {...ink} wrapText style={{ minWidth: 0, flex }}>{`${lead}${text}`}</Text>
     : <Text {...ink} style={{ ...NATIVE_CLIP_STYLE, flex }}>{`${lead}${text}`}</Text>;
@@ -199,6 +215,10 @@ export interface BadgeProps {
   /** For a domain scale, such as a sentiment score or chart series. */
   color?: string;
   variant?: "subtle" | "solid";
+  /** A mark before the label, in its colour: an SVG on the desktop, its glyph in the terminal. */
+  icon?: IconName;
+  /** False for a label that is not English to translate, such as a username. */
+  translate?: boolean;
 }
 
 /**
@@ -209,9 +229,20 @@ export interface BadgeProps {
 export const NATIVE_BADGE_STYLE = { height: "calc(100% - 2px)", borderRadius: "var(--gloom-radius-sm)" };
 /** How far a subtle chip's fill is tinted toward its tone. */
 export const BADGE_TINT = 0.28;
+const NATIVE_ICON_BADGE_STYLE = { ...NATIVE_BADGE_STYLE, gap: "var(--gloom-space-xs)" };
 const NATIVE_BADGE_TEXT_STYLE = { fontWeight: "var(--gloom-weight-regular)" };
+/**
+ * A label with lowercase letters has them in the middle of the chip,
+ * wherever the font puts them in its line: the line is cut to x-height and
+ * baseline, and that is what the chip centres. Centred whole, SF Mono's
+ * lowercase sit a pixel and a half low. An icon centres in the chip, so it
+ * reads on the letters' line. A label in capitals and digits keeps the
+ * whole line, as ticker chips do; a browser without `text-box` keeps it too.
+ */
+const NATIVE_LOWERCASE_BADGE_TEXT_STYLE = { ...NATIVE_BADGE_TEXT_STYLE, textBox: "trim-both ex alphabetic" };
+const LOWERCASE = /\p{Ll}/u;
 
-export function Badge({ label, tone = "neutral", color, variant = "subtle" }: BadgeProps) {
+export function Badge({ label, tone = "neutral", color, variant = "subtle", icon, translate = true }: BadgeProps) {
   const colors = useThemeColors();
   const { nativePaneChrome } = useUiCapabilities();
   const accent = color ?? (tone === "neutral" ? colors.textDim : tone === "accent" ? colors.borderFocused : colors[tone]);
@@ -220,10 +251,20 @@ export function Badge({ label, tone = "neutral", color, variant = "subtle" }: Ba
   const background = neutral ? colors.selected : solid ? accent : blendHex(colors.bg, accent, BADGE_TINT);
   const baseForeground = neutral ? colors.selectedText : solid ? colors.bg : accent;
   const foreground = blendForContrast(baseForeground, background, higherContrast("#000000", "#ffffff", background), 4.5);
+  const text = translate ? t(label) : label;
+  const nativeIcon = nativePaneChrome && icon;
+  // The terminal draws the icon's glyph as text in front of the label.
+  const shown = icon && !nativePaneChrome ? [ICON_GLYPHS[icon], text].filter(Boolean).join(" ") : text;
   const chip = (
     <Box height={nativePaneChrome ? undefined : 1} paddingX={1} backgroundColor={background}
-      data-gloom-ui="badge" justifyContent={nativePaneChrome ? "center" : undefined} style={nativePaneChrome ? NATIVE_BADGE_STYLE : undefined}>
-      <Text fg={foreground} attributes={TextAttributes.BOLD} style={nativePaneChrome ? NATIVE_BADGE_TEXT_STYLE : undefined}>{t(label)}</Text>
+      data-gloom-ui="badge" {...(nativeIcon ? { flexDirection: "row", alignItems: "center" } as const : {})}
+      justifyContent={nativePaneChrome && !nativeIcon ? "center" : undefined}
+      style={nativePaneChrome ? nativeIcon ? NATIVE_ICON_BADGE_STYLE : NATIVE_BADGE_STYLE : undefined}>
+      {nativeIcon ? <Icon name={nativeIcon} color={foreground} fullHeight /> : null}
+      {shown || !nativeIcon ? (
+        <Text fg={foreground} attributes={TextAttributes.BOLD}
+          style={nativePaneChrome ? LOWERCASE.test(text) ? NATIVE_LOWERCASE_BADGE_TEXT_STYLE : NATIVE_BADGE_TEXT_STYLE : undefined}>{shown}</Text>
+      ) : null}
     </Box>
   );
   return nativePaneChrome ? <Box height={1} flexShrink={0} justifyContent="center">{chip}</Box> : chip;

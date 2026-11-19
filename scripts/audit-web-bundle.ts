@@ -3,6 +3,8 @@ import { dirname, join, relative } from "path";
 import { WEB_BUNDLED_PLUGIN_PACKAGES } from "../src/plugins/web-bundled";
 import { WORLD_MAP_DATA_SPECIFIER } from "../src/renderers/dom/build-assets";
 import { isProxiedHost } from "../src/utils/plugin-proxy-hosts";
+import { IMMUTABLE_ASSET_PATH, SECURITY_HEADERS } from "../src/renderers/cloudflare/worker";
+import { WEB_LINK_ONLY_HOSTS } from "./web-link-hosts";
 
 const root = join(process.cwd(), "dist", "web");
 
@@ -42,7 +44,6 @@ const NODE_POLYFILL = /Z_BUF_ERROR|createDiffieHellman|pbkdf2Sync/;
  * once it renders.
  */
 const UNSUPPORTED_PROVIDER_HOSTS = [
-  "api.thebuildout.ai",
   "api.elections.kalshi.com",
   "forms13f.com",
 ].filter((host) => !isProxiedHost(host));
@@ -77,11 +78,34 @@ for (const path of outputFiles) {
  * the list, still starts and still passes every check above. It just quietly
  * drops the panes.
  */
-const appBundle = await readFile(join(root, "assets", "app", "main.js"), "utf8");
+// The Worker keeps a file for a year when its name says it is named after its
+// contents: each such name has to be its file's hash, or a change under the
+// same name would never reach a browser that has it.
+for (const path of outputFiles) {
+  const name = `/${relative(root, path).replaceAll("\\", "/")}`;
+  if (!IMMUTABLE_ASSET_PATH.test(name)) continue;
+  const hash = new Bun.CryptoHasher("sha256").update(await readFile(path)).digest("hex").slice(0, 16);
+  if (!name.endsWith(`-${hash}${name.slice(name.lastIndexOf("."))}`)) failures.push(`${name.slice(1)}: kept as immutable, but its contents hash to ${hash}`);
+}
+// What a page loads before it paints is all kept that way.
+for (const page of ["index.html", "share.html"]) {
+  const html = await readFile(join(root, page), "utf8");
+  for (const [, href] of html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)) {
+    if (!IMMUTABLE_ASSET_PATH.test(href!)) failures.push(`${page}: ${href} is not named after its contents`);
+  }
+}
+
+// Entry files are named after their contents (`main-<hash>.js`).
+const named = (dir: string, stem: string, ext: string) => outputFiles
+  .map((path) => relative(root, path).replaceAll("\\", "/"))
+  .filter((name) => name.startsWith(`${dir}/${stem}-`) && name.endsWith(ext) && !name.slice(dir.length + 1).includes("/"));
+const appBundleName = named("assets/app", "main", ".js")[0];
+if (!appBundleName) throw new Error("Web bundle audit failed:\nassets/app/main-<hash>.js: missing app bundle");
+const appBundle = await readFile(join(root, ...appBundleName.split("/")), "utf8");
 for (const packageName of WEB_BUNDLED_PLUGIN_PACKAGES) {
-  const module = `assets/plugins/${packageName}/index.js`;
-  if (!outputFiles.includes(join(root, ...module.split("/")))) {
-    failures.push(`${module}: missing bundled plugin module`);
+  const module = named(`assets/plugins/${packageName}`, "index", ".js")[0];
+  if (!module) {
+    failures.push(`assets/plugins/${packageName}/index-<hash>.js: missing bundled plugin module`);
   } else if (!appBundle.includes(`/${module}`)) {
     failures.push(`${module}: built but not referenced by the app bundle`);
   }
@@ -102,7 +126,36 @@ for (const path of outputFiles.filter((file) => file.endsWith(".js"))) {
   }
 }
 if (!appBundle.includes(`import(${JSON.stringify(WORLD_MAP_DATA_SPECIFIER)})`)) {
-  failures.push("assets/app/main.js: the world map's land data is not wired in");
+  failures.push(`${appBundleName}: the world map's land data is not wired in`);
+}
+
+/**
+ * Every host the shipped JavaScript names is one the page can fetch (in the
+ * worker's `connect-src`, or on the plugin proxy's allowlist), or one it only
+ * links to (`scripts/web-link-hosts.ts`). A fetch to any other host fails in
+ * the browser with nothing but "Failed to fetch", while the same function
+ * works on the desktop, so it is caught here instead.
+ */
+const connectSrcHosts = new Set((SECURITY_HEADERS["content-security-policy"]
+  .split(";")
+  .map((directive) => directive.trim().split(/\s+/))
+  .find(([name]) => name === "connect-src") ?? [])
+  .filter((source) => source.startsWith("https://"))
+  .map((source) => new URL(source).hostname));
+const unreachableHosts = new Map<string, string>();
+for (const path of outputFiles.filter((file) => file.endsWith(".js"))) {
+  const content = await readFile(path, "utf8");
+  for (const [, raw] of content.matchAll(/https:\/\/([a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,})/gi)) {
+    const host = raw!.toLowerCase();
+    if (connectSrcHosts.has(host) || isProxiedHost(host) || WEB_LINK_ONLY_HOSTS.has(host) || unreachableHosts.has(host)) continue;
+    unreachableHosts.set(host, relative(root, path));
+  }
+}
+for (const [host, name] of unreachableHosts) {
+  failures.push(
+    `${name}: names https://${host}, which the page cannot fetch. If the web build fetches it, declare it in the plugin's hosts `
+      + "and run bun run web:proxy-hosts (or list it in WEB_DIRECT_HOSTS when it sends CORS); if it is only a link, add it to scripts/web-link-hosts.ts.",
+  );
 }
 
 const shareScripts = outputFiles.filter((path) => /assets\/share\/.*\.js$/.test(path));

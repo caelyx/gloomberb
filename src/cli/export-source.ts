@@ -2,9 +2,10 @@
  * Where exported data comes from, said the same way by every command that
  * writes CSV or JSON, so an export can go in an audit file as it is: CSV ends
  * with `#` lines and JSON carries a `source` object with the same fields.
- * CSV and NDJSON rows also end with five fixed columns naming what each row
- * is (`EXPORT_IDENTITY_COLUMNS`), less any the table already has by name; a
- * dated export adds `period`, `released` and `retrieved` after them.
+ * CSV and NDJSON rows also end with five columns naming what each row is
+ * (`EXPORT_IDENTITY_COLUMNS`), less any the table already has by name, then
+ * `retrieved_at`; a dated export adds `period`, `released` and `retrieved`
+ * after the five instead. Columns a report adds later follow them all.
  */
 import { formatFreshnessLine, type ReportFreshness } from "./pane-functions/freshness";
 import { parseReportTime } from "../utils/utc-time";
@@ -63,6 +64,19 @@ export const EXPORT_IDENTITY_COLUMNS = ["symbol_or_series", "currency_or_unit", 
  */
 export const EXPORT_DATING_COLUMNS = ["period", "released", "retrieved"] as const;
 
+/**
+ * The column an undated export ends with after the five: when this export
+ * retrieved the data, an ISO instant in UTC, so a row copied away from the
+ * closing lines still says when it was fetched. A dated export says it in
+ * `retrieved`.
+ */
+export const EXPORT_RETRIEVAL_COLUMN = "retrieved_at";
+
+/** The `retrieved_at` cell: the retrieval time the closing lines give. */
+export function exportRetrievalCell(freshness: ReportFreshness): string {
+  return exportSource(freshness).retrievalTime;
+}
+
 /** What a command knows about the rows it exports; source and as-of come from its freshness. */
 export interface ExportIdentity {
   /** The symbol or series ID asked for: `USDZAR=X`, `SAN:EPA`, `DEXSFUS`. */
@@ -71,6 +85,12 @@ export interface ExportIdentity {
   currencyOrUnit?: string | null;
   /** The bar interval or observation frequency actually returned: `1d`, `1mo`, `daily`, `monthly`. */
   interval?: string | null;
+  /**
+   * Who this row is cited to, where a table's rows come from different
+   * publishers (each venue's own contract): blank leaves the closing lines'
+   * source, which names them all.
+   */
+  source?: string | null;
   /**
    * When this row was observed, where a table's rows are dated apart (each
    * ticker's price in a ranking): an ISO date or instant. Null leaves `as_of`
@@ -102,7 +122,7 @@ export function exportIdentityCells(freshness: ReportFreshness, identity: Export
     identity.symbolOrSeries?.trim() ?? "",
     identity.currencyOrUnit?.trim() ?? "",
     identity.interval?.trim() ?? "",
-    source.name,
+    identity.source?.trim() || source.name,
     identity.asOf !== undefined ? rowAsOf(identity.asOf) : source.observationDate ?? "",
   ];
 }

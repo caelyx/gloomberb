@@ -8,11 +8,15 @@ import {
   usePaneStatusFooter,
   type StatItem,
 } from "../../../components";
+import { ageFooterSegment, savedCopyFooterSegment } from "../../../components/layout/pane/footer";
+import { isTransientFailure } from "../../../api-client/errors";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { useAsyncResource } from "../../../react/async-resource";
 import type { PaneProps } from "../../../types/plugin";
 import { Box, ScrollBox, useUiHost } from "../../../ui";
-import { useAutoRefresh, useUpdatedAgo } from "../../../react/auto-refresh";
+import { useAutoRefresh, useUpdatedAgo, useUtcDay } from "../../../react/auto-refresh";
+import { reportFooterSegment } from "../shared/source-footer";
+import { fearGreedHeadless, fearGreedReport } from "./headless";
 import { getCachedFearGreedData, loadFearGreed, type FearGreedLoadResult } from "./cache";
 import { IndexHistoryChart, IndicatorChart } from "./charts";
 import type { FearGreedData } from "./data";
@@ -45,7 +49,9 @@ export function FearGreedPane({ paneId, focused, width, height }: PaneProps) {
   const { loading, reload: refresh } = resource;
   const data = resource.data?.data ?? null;
   const stale = resource.data?.stale ?? false;
-  const error = resource.error ?? resource.data?.refreshError ?? null;
+  // A copy kept because the refresh could not get through says when it was saved, as other panes' copies do.
+  const savedAt = resource.data?.source === "stale-fallback" && isTransientFailure(resource.data.error) ? resource.data.fetchedAt : null;
+  const error = resource.error ?? (savedAt == null ? resource.data?.refreshError : null) ?? null;
   const lastRefreshed = resource.data?.fetchedAt ?? null;
 
   const updatedAgo = useUpdatedAgo(lastRefreshed);
@@ -53,6 +59,8 @@ export function FearGreedPane({ paneId, focused, width, height }: PaneProps) {
 
   usePaneRefreshKey(refresh, { focused });
 
+  const utcDay = useUtcDay();
+  const loaded = resource.data;
   const footerInfo = useMemo(() => [
     ...(data ? [{
       id: "score",
@@ -60,9 +68,14 @@ export function FearGreedPane({ paneId, focused, width, height }: PaneProps) {
         { text: `${formatScore(data.overall.score)} ${ratingLabel(data.overall.rating)}`, color: ratingColor(data.overall.rating), bold: true },
       ],
     }] : []),
-    ...(stale ? [{ id: "stale", parts: [{ text: "stale", tone: "warning" as const }] }] : []),
-    ...(updatedAgo ? [{ id: "age", parts: [{ text: `updated ${updatedAgo}`, tone: "value" as const }] }] : []),
-  ], [data, stale, updatedAgo]);
+    // Its source and when CNN published the reading, as `fn FNG` ends, a stale one with its warning beside it;
+    // a saved copy says when it was saved instead.
+    ...(savedAt != null ? [savedCopyFooterSegment("saved-copy", savedAt)] : [
+      ...(loaded?.data ? [reportFooterSegment(fearGreedHeadless, fearGreedReport({ ...loaded, stale: false }))] : []),
+      ...(stale ? [{ id: "stale", parts: [{ text: "stale", tone: "warning" as const }] }] : []),
+    ]),
+    ...(updatedAgo ? [ageFooterSegment(updatedAgo, { id: "age", verb: "updated", tone: "value" })] : []),
+  ], [data, loaded, savedAt, stale, updatedAgo, utcDay]);
   usePaneStatusFooter({ registrationId: paneId, loading, error, info: footerInfo });
 
   const previousScores = useMemo(() => (data ? previousScoreItems(data) : []), [data]);

@@ -21,6 +21,7 @@ import {
   type DataTableKeyEvent,
   type PaneHint,
 } from "../../../components";
+import { ageFooterSegment } from "../../../components/layout/pane/footer";
 import { loadingErrorFooterInfo } from "../../../components/data-table/table-pane";
 import { useRowNotes } from "../../../components/ui/row-notes";
 import { colors } from "../../../theme/colors";
@@ -251,22 +252,22 @@ function EntryDetail({ entry, width, host, status, failure }: {
       ) : null}
 
       <Box paddingTop={1} flexDirection="column">
-        {contributes.length > 0 ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Adds" value={contributes.join(", ")} /> : null}
-        {opensWith.length > 0 ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Opens with" value={opensWith.join(", ")} /> : null}
+        {contributes.length > 0 ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Adds" value={contributes.join(", ")} /> : null}
+        {opensWith.length > 0 ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Opens with" value={opensWith.join(", ")} /> : null}
         {/*
           * Declared by the plugin author and not enforced: plugins are not
           * sandboxed, so this is a hint about intent, not a limit. Labelled
           * "Declares" rather than "Network" so it does not read as a guarantee.
           */}
-        {entry.hosts.length > 0 ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Declares" value={entry.hosts.join(", ")} /> : null}
-        {entry.repo ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Source" value={`github.com/${entry.repo}`} /> : null}
-        {entry.minGloomberb ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Requires" value={requiredGloomberb(entry.minGloomberb) ? `Gloom ${entry.minGloomberb}, this is ${VERSION}` : `Gloom ${entry.minGloomberb}`} /> : null}
-        {entry.linked ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Linked" value={entry.directory ?? "local checkout"} /> : null}
-        {entry.installedCommit ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Commit" value={entry.installedCommit.slice(0, 7)} /> : null}
-        {!entry.installed && entry.availableCommit ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Pinned" value={`${entry.availableVersion ?? ""} ${entry.availableCommit.slice(0, 7)}`.trim()} /> : null}
-        {entry.needsSetup ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Setup" value="Missing a required setting. Press s." /> : null}
-        {entry.loadError ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Error" value={entry.loadError} /> : null}
-        {entry.lastError && !entry.loadError ? <KeyValueRow labelWidth={10} width={rowWidth} emphasis={false} label="Last error" value={entry.lastError} /> : null}
+        {entry.hosts.length > 0 ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Declares" value={entry.hosts.join(", ")} /> : null}
+        {entry.repo ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Source" value={`github.com/${entry.repo}`} /> : null}
+        {entry.minGloomberb ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Requires" value={requiredGloomberb(entry.minGloomberb) ? `Gloom ${entry.minGloomberb}, this is ${VERSION}` : `Gloom ${entry.minGloomberb}`} /> : null}
+        {entry.linked ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Linked" value={entry.directory ?? "local checkout"} /> : null}
+        {entry.installedCommit ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Commit" value={entry.installedCommit.slice(0, 7)} /> : null}
+        {!entry.installed && entry.availableCommit ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Pinned" value={`${entry.availableVersion ?? ""} ${entry.availableCommit.slice(0, 7)}`.trim()} /> : null}
+        {entry.needsSetup ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Setup" value="Missing a required setting. Press s." /> : null}
+        {entry.loadError ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Error" value={entry.loadError} /> : null}
+        {entry.lastError && !entry.loadError ? <KeyValueRow labelWidth={11} width={rowWidth} emphasis={false} label="Last error" value={entry.lastError} /> : null}
       </Box>
 
       {!entry.installed && !entry.bundled && entry.repo ? (
@@ -922,7 +923,7 @@ export function PluginMarketplacePane({ focused, width, height }: PaneProps) {
     info.push({ id: "restart", parts: [{ text: "restart to finish loading", tone: "warning" }] });
   }
   if (status === "ready" && fetchedAt && !stale && !busy) {
-    info.push({ id: "updated", parts: [{ text: formatRelativeAge(fetchedAt), tone: "muted" }] });
+    info.push(ageFooterSegment(formatRelativeAge(fetchedAt)));
   }
 
   const hints: PaneHint[] = [];

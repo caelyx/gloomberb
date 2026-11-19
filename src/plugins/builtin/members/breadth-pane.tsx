@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useMemo } from "react";
 import type { BreadthDay } from "../../../api-client/members";
 import { ChartTableHeader, DataTableView, PaneStatusBody, QueryBar, useChartTableSelection, usePaneNoticeFooter, usePaneStatusFooter, type DataTableColumn } from "../../../components";
@@ -11,7 +12,7 @@ import { cachedBreadth, loadBreadth } from "./client";
 import { useLiveSessionRefresh } from "../shared/volatility/live-session";
 import { decimal } from "./model";
 
-const percent = (value: number | null) => value == null ? "--" : `${value.toFixed(1)}%`;
+const percent = (value: number | null) => value == null ? MISSING_VALUE : `${value.toFixed(1)}%`;
 const CHARTS = [{ value: "adLine", label: "A/D line" }, { value: "ma200", label: "Above 200D" }, { value: "ma50", label: "Above 50D" }, { value: "ma20", label: "Above 20D" }];
 type Metric = "adLine" | "ma200" | "ma50" | "ma20";
 const dateOf = (row: BreadthDay) => new Date(`${row.date}T00:00:00Z`);
@@ -40,9 +41,10 @@ export function Breadth({ fund, width, height, focused, active }: Pick<PaneProps
     color: colors.warning, calendarSpaced: true,
   })], [history, metric, colors.warning]);
   const link = useChartTableSelection({ rows, getId: keyOf, getDate: dateOf, selectedId: selected ?? latest?.date ?? null, onSelect: setSelected, focused });
-  const sessionOpen = useLiveSessionRefresh(() => resource.load(true), data?.access === "realtime" ? 15_000 : 60_000, active && visible, resource.updatedAt);
-  useAutoRefresh(resource.updatedAt, () => { if (active && visible && !sessionOpen) void resource.load(data?.basis === "intraday"); });
-  usePaneRefreshKey(() => void resource.reload(), { focused, enabled: active });
+  // The resource keeps a failed load as its error (stale, and a warning below), so this refresh never rejects.
+  const sessionOpen = useLiveSessionRefresh(() => resource.reloadAndWait(), data?.access === "realtime" ? 15_000 : 60_000, active && visible, resource.updatedAt).live;
+  useAutoRefresh(resource.updatedAt, () => { if (active && visible && !sessionOpen) resource.load(data?.basis === "intraday"); });
+  usePaneRefreshKey(() => resource.reload(), { focused, enabled: active });
   usePaneStatusFooter({ registrationId: "members:breadth", loading: !!data && resource.loading,
     stale: !!data && (data.stale || resource.data!.stale || !!resource.error), info: latest ? [
       { id: "as-of", asOf: true, parts: [{ text: `${data?.basis === "intraday" ? data.access === "realtime" ? "live" : "15m delayed" : "close"} ${latest.date}`, tone: "muted" }] },
@@ -64,15 +66,15 @@ export function Breadth({ fund, width, height, focused, active }: Pick<PaneProps
         if (column.id === "ma20" || column.id === "ma50" || column.id === "ma200") return { text: percent(row[column.id].percent), value: row[column.id].percent };
         const value = row[column.id as "advances"];
         const eligible = column.id === "newHighs" || column.id === "newLows" ? row.highLowEligible : row.advanceDeclineEligible;
-        return { text: eligible ? decimal(value, 0) : "--", value: eligible ? value : null,
+        return { text: eligible ? decimal(value, 0) : MISSING_VALUE, value: eligible ? value : null,
           color: column.id === "advances" || column.id === "newHighs" ? colors.positive : column.id === "declines" || column.id === "newLows" ? colors.negative : colors.text };
       }}
       rootBefore={<ChartTableHeader width={width} height={height} tableRows={rows.length} tableColumns={columns}
         query={<QueryBar width={width} meta="History uses current members (survivorship bias)." filters={[{ kind: "select", id: "chart", label: "History", value: metric, options: CHARTS, onChange: value => setMetric(value as Metric) }]} />}
         figures={[
-          { label: "Adv / Dec", value: latest.advanceDeclineEligible ? `${latest.advances} / ${latest.declines}` : "--", detail: `${latest.unchanged} unchanged` },
+          { label: "Adv / Dec", value: latest.advanceDeclineEligible ? `${latest.advances} / ${latest.declines}` : MISSING_VALUE, detail: `${latest.unchanged} unchanged` },
           ...([20, 50, 200] as const).map(window => ({ label: `Above ${window}D`, value: percent(latest[`ma${window}`].percent), detail: `${latest[`ma${window}`].eligible}/${latest.memberCount} covered` })),
-          { label: "52W high / low", value: latest.highLowEligible ? `${latest.newHighs} / ${latest.newLows}` : "--", detail: `${latest.highLowEligible}/${latest.memberCount} covered` },
+          { label: "52W high / low", value: latest.highLowEligible ? `${latest.newHighs} / ${latest.newLows}` : MISSING_VALUE, detail: `${latest.highLowEligible}/${latest.memberCount} covered` },
         ]}
         chart={{ series, ...link, formatValue: metric === "adLine" ? value => decimal(value, 0) : percent,
           formatAxisValue: metric === "adLine" ? value => decimal(value, 0) : percent, remoteKind: "member-breadth", empty: "History is awaiting sufficient daily bars." }} />}

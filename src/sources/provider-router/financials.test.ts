@@ -306,3 +306,38 @@ test("per-share bases that reprice a multiple stay with that multiple's observat
   expect(mergeRefreshedFinancials(older, createTestFinancials({ fundamentals: { revenue: 200 } })).fundamentals)
     .toMatchObject({ forwardEps: 5, dividendRate: 2 });
 });
+
+test("a block that read next year's consensus stands whole: a forecast loss or none never takes an older multiple", () => {
+  const vendor = createTestFinancials({ fundamentals: { forwardPE: 1.67, revenue: 100 } });
+  const none = createTestFinancials({ fundamentals: { forwardEpsPeriodEnd: null, eps: -329 } });
+  const merged = mergeFinancials(none, vendor)?.fundamentals;
+  expect(merged).toMatchObject({ forwardEpsPeriodEnd: null, revenue: 100 });
+  expect(merged?.forwardPE).toBeUndefined();
+  const loss = createTestFinancials({ fundamentals: { forwardEps: -4.19, forwardEpsPeriodEnd: "2026-12-31", forwardEpsCurrency: "USD" } });
+  expect(mergeFinancials(loss, vendor)?.fundamentals).toMatchObject({ forwardEps: -4.19, forwardEpsPeriodEnd: "2026-12-31" });
+  expect(mergeFinancials(loss, vendor)?.fundamentals?.forwardPE).toBeUndefined();
+  // A refresh that read consensus replaces a cached one's year, figure and multiple together.
+  const cached = createTestFinancials({ fundamentals: { forwardPE: 2.4, forwardEps: 2.08, forwardEpsPeriodEnd: "2027-12-31", forwardEpsCurrency: "USD" } });
+  const refreshed = mergeRefreshedFinancials(cached, none).fundamentals;
+  expect(refreshed).toMatchObject({ forwardEpsPeriodEnd: null });
+  expect(refreshed?.forwardPE).toBeUndefined();
+  expect(refreshed?.forwardEps).toBeUndefined();
+});
+
+// SMSN on the LSE: Gloom Cloud withholds a GDR's cap that was its price x Samsung's ordinaries (27.34T USD).
+test("a withheld market cap stays withheld over an older cached one, until a fresh observation serves a cap", () => {
+  const withheld = createTestFinancials({ fundamentals: {
+    unavailableFields: ["marketCap", "enterpriseValue", "enterpriseToRevenue"], marketCapUnavailable: "receipt-priced-as-ordinary",
+  } });
+  const cached = createTestFinancials({ fundamentals: { marketCap: 27_342_862_889_112, marketCapCurrency: "USD", revenue: 100 } });
+  for (const merged of [mergeFinancials(withheld, cached)?.fundamentals, mergeRefreshedFinancials(cached, withheld).fundamentals]) {
+    expect(merged?.marketCap).toBeUndefined();
+    expect(merged).toMatchObject({ marketCapUnavailable: "receipt-priced-as-ordinary", revenue: 100 });
+  }
+  // A fresh cap ends the withholding and its reason.
+  const priced = mergeFinancials(createTestFinancials({ fundamentals: { marketCap: 995_900_000_000, marketCapCurrency: "USD" } }), withheld)
+    ?.fundamentals;
+  expect(priced).toMatchObject({ marketCap: 995_900_000_000 });
+  expect(priced?.unavailableFields).not.toContain("marketCap");
+  expect(priced?.marketCapUnavailable).toBeUndefined();
+});

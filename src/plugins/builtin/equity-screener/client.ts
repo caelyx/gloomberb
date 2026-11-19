@@ -21,7 +21,7 @@ const savedPath = (id: string) => `saved/${encodeURIComponent(id)}`;
 export const screenerApi = {
   query: (query: ScreenQuery, signal?: AbortSignal, client: ScreenerClient = apiClient) =>
     client.equityScreener<ScreenPayload>("query", json("POST", query, { signal })),
-  fields: (signal?: AbortSignal) => apiClient.equityScreener<ScreenFieldsResponse>("fields?include=social,research,attention,hiring-apps,kpis,volatility,dividends", { signal }),
+  fields: (signal?: AbortSignal) => apiClient.equityScreener<ScreenFieldsResponse>("fields?include=social,research,attention,hiring-apps,kpis,volatility,dividends,technical,option-volatility,ownership,quality,scores,grades", { signal }),
   export: (definition: ScreenDefinition, snapshotId: string) =>
     apiClient.equityScreener<ScreenExportResponse>("export", json("POST", { ...definition, snapshotId }, { headers: { Accept: "application/json" } })),
   saved: async (signal?: AbortSignal, client: ScreenerClient = apiClient) =>
@@ -40,10 +40,12 @@ export async function fetchScreen(
   cursor: string | null = null,
   signal?: AbortSignal,
   client: ScreenerClient = apiClient,
+  /** Rows a page holds, at most the server's 200. */
+  limit = 100,
 ): Promise<ScreenPayload> {
   const payload = validateScreenPayload(
     await screenerApi.query(
-      { ...parseScreenDefinition(definition), limit: 100, cursor },
+      { ...parseScreenDefinition(definition), limit, cursor },
       signal,
       client,
     ),

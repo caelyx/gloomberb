@@ -138,7 +138,7 @@ test("with no current quote the session's snapshot is left out, and a closed ses
   setSystemTime(new Date("2026-10-17T15:00:00Z"));
   const closed = await mountHistory(snapshot, undefined, sessionQuote({ marketState: "CLOSED", lastUpdated: Date.parse("2026-10-16T20:00:00Z") }));
   expect(closed.frame).toContain("2026-10-16");
-  expect(closed.frame).toContain("1.1M");
+  expect(closed.frame).toContain("1.10M");
   expect(closed.frame).not.toContain("DTD");
   // Its move from Thursday, a half cent down, reads 0.00: unsigned, as every other change that rounds to nothing.
   expect(closed.frame).not.toContain("-0.00");
@@ -152,6 +152,20 @@ test("a move that rounds to nothing reads 0.00, never -0.00", async () => {
   ]);
   expect(frame).not.toContain("-0.00");
   expect(frame).toContain("0.00");
+});
+
+test("a London share under £10 reads to a tenth of a penny with its close in pence, in the table and its export", async () => {
+  setSystemTime(new Date("2026-10-27T02:00:00Z"));
+  // BP.L as the cloud serves it: float32 pence, divided into pounds.
+  const quote = createTestQuote({ symbol: "AAPL", currency: "GBP", providerPriceDivisor: 100, instrumentType: "EQUITY", price: 6.308 });
+  const { frame, csv } = await mountHistory([
+    { date: new Date("2026-10-22"), open: 6.23, high: 6.2610002, low: 6.1190002, close: 6.1190002 },
+    { date: new Date("2026-10-23"), open: 6.2359998, high: 6.3853802, low: 6.192, close: 6.3850002 },
+  ], "1M", quote);
+  expect(frame).toContain("6.385 638.5p");
+  expect(frame).toContain("6.236");
+  expect(csv).toContain("2026-10-23,6.236,6.385,6.192,6.385,");
+  expect(csv).not.toContain("638.5p");
 });
 
 test("a coin's hourly bars ending with the latest trade have no missing-volume warning in the footer or export", async () => {
@@ -183,4 +197,23 @@ test("ALL says where the source's bars start, names a month without a bar, and m
   expect(csv).toContain("Gap note,CHG marked * spans the missing bars: 2014-12 is from 2014-10");
   // The export keeps the change itself, as a number.
   expect(csv).toContain("2014-12-01,,,,102,1,0.99009900990099,");
+});
+
+/** `fn HP NG=F` read 2026-10-26's change from November's 2.640 to December's 3.050: two contracts' prices, no move. */
+test("a continuous future's bar on a new contract has no change, in the table and its export, and the notice names the roll", async () => {
+  setSystemTime(new Date("2026-10-31T12:00:00Z"));
+  const rows: Array<[string, number, string]> = [
+    ["2026-10-21", 2.79, "NGX26"], ["2026-10-22", 2.80, "NGX26"], ["2026-10-23", 2.64, "NGX26"],
+    ["2026-10-26", 3.05, "NGZ26"], ["2026-10-27", 3.00, "NGZ26"],
+  ];
+  const { frame, csv } = await mountHistory(rows.map(([date, close, contract]) => ({ date: new Date(`${date}T00:00:00Z`), close, contract })));
+  expect(frame).toContain("[!]");
+  expect(csv).toContain("Gap note,No CHG at the roll to a new contract: 2026-10-26 (NGZ26)");
+  const csvRow = (date: string) => csv.split("\n").find((line) => line.startsWith(date))!.split(",");
+  // The roll's change cells are blank; the bar after it moves from the new contract's close.
+  expect(csvRow("2026-10-26").slice(4, 7)).toEqual(["3.05", "", ""]);
+  expect(Number(csvRow("2026-10-27")[5])).toBeCloseTo(-0.05, 10);
+  expect(Number(csvRow("2026-10-23")[5])).toBeCloseTo(-0.16, 10);
+  const frameRow = frame.split("\n").find((line) => line.includes("2026-10-26"))!;
+  expect(frameRow).not.toMatch(/[+-]\d+\.\d+%/);
 });

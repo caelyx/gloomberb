@@ -1,0 +1,429 @@
+import type { FloatingRect, LayoutBounds } from "../../../../layout/pane-manager";
+
+/**
+ * Magnets: while a floating pane moves or resizes, an edge that comes within
+ * `catch` of another pane's edge (floating or docked), or of the edge of the
+ * area, jumps to it, and stays there until it is pulled more than `release`
+ * away. Distances are in cells per axis (the desktop's 8px and 12px, one and
+ * two cells in the terminal).
+ */
+export interface MagnetDistances {
+  catchX: number;
+  catchY: number;
+  releaseX: number;
+  releaseY: number;
+}
+
+type Side = "start" | "end";
+
+/** The line one edge of the rect holds to on an axis: which edge, at what coordinate. */
+interface AxisLatch {
+  side: Side;
+  line: number;
+}
+
+/** What a move or resize is holding to, kept from one pointer move to the next. */
+export interface MagnetLatch {
+  x: AxisLatch | null;
+  y: AxisLatch | null;
+}
+
+export const NO_LATCH: MagnetLatch = { x: null, y: null };
+
+/** Desktop magnets, in px: an edge this close jumps to a line, and lets go this far from it. */
+const MAGNET_CATCH_PX = 8;
+const MAGNET_RELEASE_PX = 12;
+/** Terminal magnets, in cells: the next cell catches, two let go. */
+const TERMINAL_MAGNETS: MagnetDistances = { catchX: 1, catchY: 1, releaseX: 2, releaseY: 2 };
+
+/**
+ * Past this pointer speed, in catch distances a second (300 px/s on the
+ * desktop, 37.5 cells in the terminal), a release lands the pane where the
+ * pointer puts it, its magnets left out.
+ */
+const MAGNET_TRAVEL_SPEED = 300 / MAGNET_CATCH_PX;
+/**
+ * Below this pointer speed (60 px/s, about a px a frame) the pointer is
+ * placing the pane, and it is drawn where its magnets hold it; faster, it is
+ * drawn under the pointer. Drawing the magnets at a hand's usual speed held
+ * the pane on each line it crossed, then jumped it up to 18 px (three cells
+ * in the terminal), which read as a drag that lags and stutters.
+ */
+const MAGNET_PLACE_SPEED = 60 / MAGNET_CATCH_PX;
+/**
+ * How fast the drawn pane glides between the pointer's place and the
+ * magnets', 1/s: a critically damped spring that settles in about 0.17 s and
+ * moves it at most about a fifth of the distance in a 60 Hz frame.
+ */
+const GLIDE_RATE = 35;
+/** How far back the pointer's speed is read, ms: a few frames. */
+const SPEED_WINDOW_MS = 64;
+/** How long the pointer rests before the magnets catch where it stopped, ms. */
+export const MAGNET_REST_MS = 80;
+/**
+ * The same in the terminal, which hears from the pointer only as it enters
+ * another cell: a hand placing a window there crosses five or so a second, so
+ * a pause shorter than that is still a drag.
+ */
+export const TERMINAL_MAGNET_REST_MS = 200;
+
+/** Where the pointer was during a move, in cells, and when (ms). */
+interface PointerSample {
+  t: number;
+  x: number;
+  y: number;
+}
+
+/** Adds where the pointer is now, keeping only what the speed reads. */
+function trackPointer(track: PointerSample[], sample: PointerSample): void {
+  track.push(sample);
+  const oldest = sample.t - SPEED_WINDOW_MS * 2;
+  while (track.length > 2 && track[1]!.t <= oldest) track.shift();
+}
+
+/**
+ * When a moving pane's magnets act, over one drag. `travelling`
+ * takes each move and says whether the pointer is on its way somewhere; while
+ * it is, a release lands the pane where the pointer puts it, and `rest` (the
+ * move run again) is set to run once the pointer has stopped for
+ * MAGNET_REST_MS, so the magnets catch where it stopped. `placing` says
+ * whether the magnets are drawn. Any later move drops that check, travelling or not:
+ * run after a slower move, it would put the pane back where the pointer was.
+ * The check runs at the start of a frame, after the moves that frame brings,
+ * so a page drawing fewer frames than 1 / MAGNET_REST_MS still sees a
+ * pointer that moves on every frame as travelling.
+ */
+export interface MagnetPace {
+  travelling(sample: PointerSample, distances: MagnetDistances, rest?: () => void): boolean;
+  /** Whether the pointer, as of `now`, moves slowly enough to be placing the pane: its magnets are drawn. */
+  placing(now: number, distances: MagnetDistances): boolean;
+  /**
+   * Runs `onRest` once the pointer has stopped for `ms`, unless another event
+   * of the drag comes first: the terminal, which draws only when an event
+   * comes, draws the magnets that catch where it stopped.
+   */
+  rest(onRest: () => void, ms: number): void;
+  /** Drops the rest check: another event of the drag came first. */
+  cancel(): void;
+  /** Forgets the pointer's path, for a new drag. */
+  reset(): void;
+}
+
+export function createMagnetPace(): MagnetPace {
+  let track: PointerSample[] = [];
+  let rest: ReturnType<typeof setTimeout> | null = null;
+  let frame: number | null = null;
+  const cancel = () => {
+    if (rest) clearTimeout(rest);
+    if (frame !== null) cancelAnimationFrame(frame);
+    rest = null;
+    frame = null;
+  };
+  const restThen = (onRest: () => void, ms = MAGNET_REST_MS) => {
+    cancel();
+    rest = setTimeout(() => {
+      rest = null;
+      if (typeof requestAnimationFrame !== "function") return onRest();
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        onRest();
+      });
+    }, ms);
+  };
+  return {
+    travelling(sample, distances, onRest) {
+      cancel();
+      const last = track[track.length - 1];
+      // The same place again (a rest check, a repeated event) is not a move.
+      if (!last || last.x !== sample.x || last.y !== sample.y) trackPointer(track, sample);
+      if (pointerSpeed(track, sample.t, distances) <= MAGNET_TRAVEL_SPEED) return false;
+      if (onRest) restThen(onRest);
+      return true;
+    },
+    placing: (now, distances) => pointerSpeed(track, now, distances) < MAGNET_PLACE_SPEED,
+    rest: restThen,
+    cancel,
+    reset() {
+      cancel();
+      track = [];
+    },
+  };
+}
+
+/**
+ * How fast the pointer moves as of `now`: how far it went over the last few
+ * frames, in catch distances a second; still since then, none. A move with
+ * nothing before it (the first of a drag) is as fast as can be, so a pane
+ * leaves its spot without catching the lines it sits on.
+ */
+function pointerSpeed(track: readonly PointerSample[], now: number, distances: MagnetDistances): number {
+  const latest = track[track.length - 1];
+  if (!latest) return 0;
+  const since = now - SPEED_WINDOW_MS;
+  let from = track[0]!;
+  for (const sample of track) {
+    if (sample.t > since) break;
+    from = sample;
+  }
+  const span = Math.min(SPEED_WINDOW_MS, now - from.t);
+  if (from === latest) return track.length === 1 && span <= 0 ? Infinity : 0;
+  if (span <= 0) return Infinity;
+  const catches = Math.hypot((latest.x - from.x) / distances.catchX, (latest.y - from.y) / distances.catchY);
+  return (catches / span) * 1000;
+}
+
+/** An offset of a moving pane's drawn place from where the pointer puts it, in cells. */
+export interface GlideOffset {
+  x: number;
+  y: number;
+}
+
+export const NO_GLIDE: GlideOffset = { x: 0, y: 0 };
+
+/**
+ * Desktop: where a moving pane is drawn, as an offset from where the pointer
+ * puts it, gliding toward `target` (where its magnets hold it, or nothing):
+ * a catch or a release moves it over a few frames instead of in one, and it
+ * comes to rest exactly on `target`, so it rests and lands where it would
+ * have without the glide.
+ */
+export interface MagnetGlide {
+  step(now: number, target: GlideOffset): GlideOffset;
+  /** Whether it rests on `target`. */
+  settled(target: GlideOffset): boolean;
+  /**
+   * Draws the pane now with `draw`, and on each frame after until `draw`
+   * says it rests: the frames that carry a glide on once the pointer stops.
+   * A later `draw` takes over from an earlier one.
+   */
+  follow(draw: () => boolean): void;
+  /** Back under the pointer, with no frame to come: a drag ended or began. */
+  reset(): void;
+}
+
+function requestFrame(callback: () => void): ReturnType<typeof setTimeout> | number {
+  return typeof requestAnimationFrame === "function" ? requestAnimationFrame(callback) : setTimeout(callback, 16);
+}
+
+function cancelFrame(frame: ReturnType<typeof setTimeout> | number): void {
+  if (typeof cancelAnimationFrame === "function" && typeof frame === "number") cancelAnimationFrame(frame);
+  else clearTimeout(frame as ReturnType<typeof setTimeout>);
+}
+
+export function createMagnetGlide(): MagnetGlide {
+  let x = 0;
+  let y = 0;
+  let vx = 0;
+  let vy = 0;
+  let last: number | null = null;
+  let frame: ReturnType<typeof setTimeout> | number | null = null;
+  let drawing: (() => boolean) | null = null;
+  const stop = () => {
+    if (frame !== null) cancelFrame(frame);
+    frame = null;
+    drawing = null;
+  };
+  const tick = () => {
+    frame = null;
+    if (drawing && !drawing()) frame = requestFrame(tick);
+  };
+  // One axis of a critically damped spring after `dt` seconds: [place, speed].
+  const spring = (place: number, speed: number, target: number, dt: number): [number, number] => {
+    const off = place - target;
+    const decay = Math.exp(-GLIDE_RATE * dt);
+    const pull = speed + GLIDE_RATE * off;
+    return [target + (off + pull * dt) * decay, (speed - GLIDE_RATE * pull * dt) * decay];
+  };
+  const settled = (target: GlideOffset) => Math.abs(x - target.x) < 1e-3 && Math.abs(y - target.y) < 1e-3 && Math.abs(vx) < 1e-2 && Math.abs(vy) < 1e-2;
+  return {
+    step(now, target) {
+      // A frame drawn late moves it no further than a tenth of a second would.
+      const dt = last === null ? 0 : Math.max(0, Math.min(0.1, (now - last) / 1000));
+      last = now;
+      [x, vx] = spring(x, vx, target.x, dt);
+      [y, vy] = spring(y, vy, target.y, dt);
+      if (settled(target)) {
+        x = target.x;
+        y = target.y;
+        vx = 0;
+        vy = 0;
+      }
+      return { x, y };
+    },
+    settled,
+    follow(draw) {
+      drawing = draw;
+      if (draw()) stop();
+      else frame ??= requestFrame(tick);
+    },
+    reset() {
+      stop();
+      x = 0;
+      y = 0;
+      vx = 0;
+      vy = 0;
+      last = null;
+    },
+  };
+}
+
+/**
+ * The magnets in cells: the desktop's px over its cell size (`cell`), or the
+ * terminal's whole cells, also for a cell size not measured yet (zero), which
+ * would otherwise catch at any distance.
+ */
+export function magnetDistancesFor(cell: { width: number; height: number } | null): MagnetDistances {
+  if (!cell || !(cell.width > 0) || !(cell.height > 0) || !Number.isFinite(cell.width) || !Number.isFinite(cell.height)) {
+    return TERMINAL_MAGNETS;
+  }
+  return {
+    catchX: MAGNET_CATCH_PX / cell.width,
+    catchY: MAGNET_CATCH_PX / cell.height,
+    releaseX: MAGNET_RELEASE_PX / cell.width,
+    releaseY: MAGNET_RELEASE_PX / cell.height,
+  };
+}
+
+interface Span { start: number; end: number }
+
+/** How close two spans across the axis must be for their edges to matter to each other. */
+function near(a: Span, b: Span, slack: number): boolean {
+  return a.start < b.end + slack && b.start < a.end + slack;
+}
+
+/**
+ * The lines an edge can hold to on one axis: the area's two edges, and the
+ * near and far edge of every target that sits beside the rect across the
+ * axis (overlapping it there, or within the catch distance), so a pane lines
+ * up with its neighbours, not with something across the screen.
+ */
+function axisLines(axis: "x" | "y", rect: LayoutBounds, targets: readonly LayoutBounds[], area: LayoutBounds, slack: number): number[] {
+  const across: Span = axis === "x"
+    ? { start: rect.y, end: rect.y + rect.height }
+    : { start: rect.x, end: rect.x + rect.width };
+  const lines = axis === "x" ? [area.x, area.x + area.width] : [area.y, area.y + area.height];
+  for (const target of targets) {
+    const span: Span = axis === "x"
+      ? { start: target.y, end: target.y + target.height }
+      : { start: target.x, end: target.x + target.width };
+    if (!near(across, span, slack)) continue;
+    if (axis === "x") lines.push(target.x, target.x + target.width);
+    else lines.push(target.y, target.y + target.height);
+  }
+  return lines;
+}
+
+/**
+ * Where one axis of the rect snaps: the latch it keeps or takes, or null.
+ * `sides` are the edges allowed to move: both for a move, the dragged one for
+ * a resize. A latch holds while its edge stays within `release` of a line
+ * still there; otherwise the closest edge-to-line pair within `catch` wins.
+ */
+function resolveAxis(
+  edges: Record<Side, number>,
+  sides: readonly Side[],
+  lines: readonly number[],
+  latch: AxisLatch | null,
+  catchDistance: number,
+  releaseDistance: number,
+): AxisLatch | null {
+  if (latch && sides.includes(latch.side) && lines.some((line) => Math.abs(line - latch.line) < 1e-6)) {
+    if (Math.abs(edges[latch.side] - latch.line) <= releaseDistance) return latch;
+  }
+  let best: AxisLatch | null = null;
+  let bestDistance = catchDistance;
+  for (const side of sides) {
+    for (const line of lines) {
+      const distance = Math.abs(edges[side] - line);
+      if (distance <= bestDistance && (best === null || distance < bestDistance)) {
+        best = { side, line };
+        bestDistance = distance;
+      }
+    }
+  }
+  return best;
+}
+
+/** A floating rect being moved, with its edges pulled onto the lines nearby. */
+export function snapMovedRect(
+  rect: FloatingRect,
+  targets: readonly LayoutBounds[],
+  area: LayoutBounds,
+  distances: MagnetDistances,
+  latch: MagnetLatch,
+): { rect: FloatingRect; latch: MagnetLatch } {
+  const xLatch = resolveAxis(
+    { start: rect.x, end: rect.x + rect.width },
+    ["start", "end"],
+    axisLines("x", rect, targets, area, distances.catchY),
+    latch.x,
+    distances.catchX,
+    distances.releaseX,
+  );
+  const yLatch = resolveAxis(
+    { start: rect.y, end: rect.y + rect.height },
+    ["start", "end"],
+    axisLines("y", rect, targets, area, distances.catchX),
+    latch.y,
+    distances.catchY,
+    distances.releaseY,
+  );
+  const x = xLatch ? (xLatch.side === "start" ? xLatch.line : xLatch.line - rect.width) : rect.x;
+  const y = yLatch ? (yLatch.side === "start" ? yLatch.line : yLatch.line - rect.height) : rect.y;
+  return {
+    rect: { ...rect, x: clampStart(x, rect.width, area.x, area.width), y: clampStart(y, rect.height, area.y, area.height) },
+    latch: { x: xLatch, y: yLatch },
+  };
+}
+
+function clampStart(start: number, length: number, areaStart: number, areaLength: number): number {
+  return Math.max(areaStart, Math.min(start, areaStart + Math.max(0, areaLength - length)));
+}
+
+/**
+ * A floating rect being resized by the edges in `edges` (-1 the left or top
+ * one, 1 the right or bottom one, 0 neither), with each of those pulled onto
+ * the lines nearby. The other edges stay put, and neither axis goes under
+ * its minimum.
+ */
+export function snapResizedRect(
+  rect: FloatingRect,
+  edges: { x: -1 | 0 | 1; y: -1 | 0 | 1 },
+  minimum: { width: number; height: number },
+  targets: readonly LayoutBounds[],
+  area: LayoutBounds,
+  distances: MagnetDistances,
+  latch: MagnetLatch,
+): { rect: FloatingRect; latch: MagnetLatch } {
+  const sideOf = (edge: -1 | 0 | 1): Side[] => (edge === -1 ? ["start"] : edge === 1 ? ["end"] : []);
+  const xLatch = resolveAxis(
+    { start: rect.x, end: rect.x + rect.width },
+    sideOf(edges.x),
+    axisLines("x", rect, targets, area, distances.catchY),
+    latch.x,
+    distances.catchX,
+    distances.releaseX,
+  );
+  const yLatch = resolveAxis(
+    { start: rect.y, end: rect.y + rect.height },
+    sideOf(edges.y),
+    axisLines("y", rect, targets, area, distances.catchX),
+    latch.y,
+    distances.catchY,
+    distances.releaseY,
+  );
+  const xs = resizeTo(rect.x, rect.width, xLatch, minimum.width);
+  const ys = resizeTo(rect.y, rect.height, yLatch, minimum.height);
+  return {
+    rect: { ...rect, x: xs.start, y: ys.start, width: xs.length, height: ys.length },
+    latch: { x: xs.latch, y: ys.latch },
+  };
+}
+
+/** One axis resized so the latched edge sits on its line; no latch when that would go under the minimum. */
+function resizeTo(start: number, length: number, latch: AxisLatch | null, minimum: number): { start: number; length: number; latch: AxisLatch | null } {
+  const end = start + length;
+  if (latch?.side === "end" && latch.line - start >= minimum) return { start, length: latch.line - start, latch };
+  if (latch?.side === "start" && end - latch.line >= minimum) return { start: latch.line, length: end - latch.line, latch };
+  return { start, length, latch: null };
+}

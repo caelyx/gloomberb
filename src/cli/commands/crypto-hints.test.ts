@@ -8,6 +8,7 @@ import { marketDataCliCommands } from "./market";
 import { serializeCliResult } from "../result";
 import { setCliColorEnabledOverride } from "../../utils/cli-output";
 import { resetBoardCoins } from "../board-coins";
+import { noProviderError, serviceDidNotAnswerMessage } from "../../sources/provider-errors";
 
 beforeEach(() => resetBoardCoins([]));
 // A quote that finds nothing sets the exit status; it must not become the test run's.
@@ -53,6 +54,13 @@ test("a failed quote says why in text mode, and points crypto pairs at the crypt
   expect((json.data as Array<{ error: string }>)[0]!.error).toBe(`${none} for BTC-USD`);
 });
 
+test("the data service failing for several listings is one line naming each as unchecked, and still says to try again", () => {
+  const failed = (symbol: string) => ({ target: { symbol }, quote: null, error: serviceDidNotAnswerMessage(symbol) });
+  // Unchecked, not missing: a typo and a real ticker read alike until the service answers.
+  expect(quoteNotes([failed("YAR:OSL"), failed("GNC:ASX")]))
+    .toEqual(["Could not check YAR:OSL, GNC:ASX: Gloom's data service did not answer. Try again in a moment."]);
+});
+
 test("a sentence the data service wrote keeps its own ending, before the crypto board pointer too", () => {
   const note = (symbol: string, error: string) => quoteNotes([{ target: { symbol }, quote: null, error }]);
   expect(note("XAU/USD", "Spot gold is not quoted; GC=F is the front-month future.")).toEqual(["XAU/USD: Spot gold is not quoted; GC=F is the front-month future."]);
@@ -60,10 +68,21 @@ test("a sentence the data service wrote keeps its own ending, before the crypto 
   expect(note("BTC-USD", "Not listed on this feed")).toEqual([`BTC-USD: Not listed on this feed. ${HINT}`]);
 });
 
+test("a top coin's delayed quote points at the board that streams it live; a live one or another pair does not", () => {
+  const coin = (symbol: string, dataSource: Quote["dataSource"]) => ({ target: { symbol }, quote: { name: "Bitcoin USD", instrumentType: "CRYPTOCURRENCY" as const, dataSource }, error: null });
+  expect(quoteNotes([coin("BTC-USD", "delayed")])).toEqual(["BTC-USD streams live on the CRYP board (gloom fn CRYP)."]);
+  expect(quoteNotes([coin("BTC-USD:CCC", "delayed"), coin("ETH-USD", "delayed")])).toEqual(["BTC-USD:CCC, ETH-USD stream live on the CRYP board (gloom fn CRYP)."]);
+  expect(quoteNotes([coin("BTC-USD", "live"), coin("BTC-EUR", "delayed"), coin("BTC-USD:COINBASE", "delayed")])).toEqual([]);
+});
+
 test("history keeps its error and adds the crypto board pointer only for crypto pairs in text mode", async () => {
-  const history = async (symbol: string, format: "text" | "json" = "text") => {
+  const history = async (symbol: string, format: "text" | "json" = "text", unserved = false) => {
     const cli = createTestCliContext({ config, store: { loadTicker: async () => null }, dataProvider: {
-      getPriceHistory: async () => { throw new Error(`No history provider available for ${symbol}`); },
+      getPriceHistory: async () => {
+        // The router's bare answer that no source served the bars, none failing or giving a reason.
+        throw unserved ? noProviderError(`No history provider available for ${symbol}`, undefined, symbol)
+          : new Error(`No history provider available for ${symbol}`);
+      },
     } }, { format });
     const context = { ...cli.context, fail: (message: string, details?: string) => {
       throw Object.assign(new Error(message), { details });
@@ -76,25 +95,41 @@ test("history keeps its error and adds the crypto board pointer only for crypto 
   expect(detailsOf(await history("BTC-USD"))).toEqual(["No history provider available for BTC-USD", HINT]);
   expect(detailsOf(await history("AAPL"))).toEqual(["No history provider available for AAPL", undefined]);
   expect(detailsOf(await history("BTC-USD", "json"))).toEqual(["No history provider available for BTC-USD", undefined]);
+  // An intraday range no source served: a listing says it has no current bars and offers the daily view; a coin keeps
+  // the crypto board's pointer, its bars trading around the clock.
+  expect(detailsOf(await history("GUBRF.IS", "text", true))).toEqual(["No current 5-minute bars for GUBRF.IS.", "For daily bars: gloom history GUBRF.IS --range 1M"]);
+  expect(detailsOf(await history("BTC-USD", "text", true))).toEqual(["No history provider available for BTC-USD", HINT]);
 });
 
-test("a bare coin ticker that resolves to a fund says it is not the coin", async () => {
+test("a bare coin ticker read as another listing says where the coin is, firmly when that listing cannot be it", async () => {
   const etf = quote("BTC", "Grayscale Bitcoin Mini Trust ETF", "ETF");
   expect((await runQuote(["BTC"], { BTC: etf })).warnings)
     .toEqual(["BTC is Grayscale Bitcoin Mini Trust ETF, not bitcoin. For bitcoin use BTC-USD."]);
   expect((await runQuote(["ETH"], { ETH: quote("ETH", "Grayscale Ethereum Mini Trust ETF", "ETF") })).warnings)
     .toEqual(["ETH is Grayscale Ethereum Mini Trust ETF, not ethereum. For ethereum use ETH-USD."]);
+  // A company whose name says nothing of the coin, but whose line is stale or delisted, is not what was meant either.
+  const staleSol = { ...quote("SOL", "Emeren Group Ltd", "Common Stock"), stale: true };
+  expect((await runQuote(["SOL"], { SOL: staleSol })).warnings).toEqual(["SOL is Emeren Group Ltd, not solana. For solana use SOL-USD."]);
+  const delisted = { ...quote("LINK", "Interlink Electronics, Inc.", "EQUITY"), delisting: { status: "delisted" as const, lastTradeDate: "2025-12-12", historyStart: "2016-01-04" } };
+  expect((await runQuote(["LINK"], { LINK: delisted })).warnings).toContain("LINK is Interlink Electronics, Inc., not chainlink. For chainlink use LINK-USD.");
 
-  // The real coin, a company that only shares the letters, and an unrelated ticker get no note.
+  // A live company that only shares the letters may be the one meant: it says the coin exists, and no more.
   const quiet = (symbol: string, result: Quote, cliOptions = {}) => runQuote([symbol], { [symbol]: result }, cliOptions);
+  expect((await quiet("LINK", quote("LINK", "Interlink Electronics, Inc.", "EQUITY"))).warnings)
+    .toEqual(["LINK is Interlink Electronics, Inc. Also a coin: LINK-USD."]);
+  expect((await quiet("ATOM", quote("ATOM", "Atomera Incorporated", "EQUITY"))).warnings)
+    .toEqual(["ATOM is Atomera Incorporated. Also a coin: ATOM-USD."]);
+
+  // The real coin and a symbol that is no top coin's get no note, and an explicit listing (--exchange) was asked for on purpose.
   expect((await quiet("BTC", quote("BTC", "Bitcoin USD", "CRYPTOCURRENCY"))).warnings).toBeUndefined();
-  expect((await quiet("LINK", quote("LINK", "Interlink Electronics, Inc.", "EQUITY"))).warnings).toBeUndefined();
   expect((await quiet("AAPL", quote("AAPL", "Apple Inc.", "EQUITY"))).warnings).toBeUndefined();
-  // JSON output is unchanged, and an explicit listing (--exchange) was asked for on purpose.
-  expect((await quiet("BTC", etf, { format: "json" })).warnings).toBeUndefined();
+  expect((await quiet("CAR", quote("CAR", "Avis Budget Group", "EQUITY"))).warnings).toBeUndefined();
   const named = createTestCliContext({ config, dataProvider: { getQuotesBatch: async () => [{ target: { symbol: "BTC", exchange: "NYSE" }, quote: etf }] } });
   await marketDataCliCommands.find((command) => command.name === "quote")!.execute(["BTC", "--exchange", "NYSE"], named.context);
   expect(named.printed[0]!.result.warnings).toBeUndefined();
+  // The line is a warning in JSON too, beside the rows it explains.
+  expect((await quiet("BTC", etf, { format: "json" })).warnings)
+    .toEqual(["BTC is Grayscale Bitcoin Mini Trust ETF, not bitcoin. For bitcoin use BTC-USD."]);
 });
 
 test("a bare coin ticker several companies list, none of them the coin, points at the pair", () => {

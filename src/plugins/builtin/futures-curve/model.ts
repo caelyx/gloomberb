@@ -3,24 +3,21 @@ import type { CurvePalette, CurveSeries } from "../../../components/chart/curve/
 import { spanDigits } from "../../../components/chart-table";
 import { compositeAxisTicks } from "../../../components/chart/composite/format";
 import type { CompositeAxisDomain } from "../../../components/chart/composite/types";
-import { FUTURES_CONTRACTS, futuresBoardContractForTicker, futuresContractByCode, tickDecimals } from "../../../market-data/futures-board";
+import { CME_CRYPTO_FUTURES, FUTURES_CONTRACTS, futuresBoardContractForTicker, futuresContractByCode, tickDecimals } from "../../../market-data/futures-board";
+import { futuresContractCode } from "../../../market-data/futures-contract";
 import { contractMonthLabel } from "../../../utils/contract-month";
-import { formatPercentileRank } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
+import { formatThirtySeconds } from "../../../market-data/market/format";
 import { cryptoPairCoin, isFuturesSymbol } from "../shared/crypto-pair";
-import { parseReportTime } from "../../../utils/utc-time";
-import { zonedWallClockToUtcMs } from "../../../utils/zoned-date-time";
+import { formatUtcDayTime, newestReportTime, oldestReportTime, parseReportTime } from "../../../utils/utc-time";
+import type { HeadlessPaneFreshness } from "../../../types/plugin";
+import { zonedDateKey, zonedDateTimeParts, zonedWallClockToUtcMs } from "../../../utils/zoned-date-time";
+import { isPublishedFuturesClosure } from "../../../market-data/published-futures-sessions";
 import { dateOptionError, dateOptionFormatsOr, readCalendarDate } from "../../../utils/calendar-date";
 import { compareSortValues, type SortDirection } from "../../../utils/sort-values";
 
-/**
- * CME crypto futures have a curve but no FUT board row, so their name and tick
- * live here rather than in the catalogue the board lists. Outright ticks:
- * BTC $5, ETH $0.50, SOL $0.05, XRP $0.0005 (each $25 a contract).
- */
-const CRYPTO_CURVE_ROOTS: readonly { code: string; name: string; tick: number }[] = [
-  { code: "BTC", name: "Bitcoin", tick: 5 }, { code: "ETH", name: "Ether", tick: 0.5 },
-  { code: "SOL", name: "Solana", tick: 0.05 }, { code: "XRP", name: "XRP", tick: 0.0005 },
-];
+/** CME crypto futures have a curve but no FUT board row: their name and tick live with the board's. */
+const CRYPTO_CURVE_ROOTS = CME_CRYPTO_FUTURES;
 const rootLabel = (code: string, name: string) => name === code ? code : `${code} ${name}`;
 
 export const CURVE_ROOTS = [
@@ -35,6 +32,50 @@ export function normalizeCurveRoot(value: unknown): string | null {
   const raw = value.trim().toUpperCase().replace(/=F$/, "");
   const root = raw === "VIX" ? "VX" : raw;
   return CURVE_ROOTS.some((row) => row.value === root) ? root : null;
+}
+
+/** What a commodity is called rather than coded: the WTI and Brent crude curves by the words they are asked for in. */
+const CURVE_ROOT_WORDS: Readonly<Record<string, string>> = {
+  "CRUDE": "CL", "CRUDE OIL": "CL", "OIL": "CL", "WTI": "CL", "BRENT": "BZ", "BRENT CRUDE": "BZ", "BRENT CRUDE OIL": "BZ",
+};
+
+/** The words a root is asked for in, as `curveRootNamed` and `curveStandIn` read them. */
+function curveRootWords(value: string): string {
+  return value.trim().toUpperCase().replace(/=F$/, "").replace(/\s+/g, " ").replace(/( (FUTURES?|CURVE))+$/, "");
+}
+
+const ICE_BRENT = {
+  root: "BZ",
+  note: "ICE Brent (B) is not carried; showing CME's Brent Crude Oil Last Day Financial (BZ), cash-settled to the ICE Brent futures settlement.",
+};
+
+/** Contracts no source here carries, each with the carried root that stands in for it: ICE's Brent is CME's BZ. */
+const CURVE_STAND_INS: Readonly<Record<string, { root: string; note: string }>> = {
+  "B": ICE_BRENT, "ICE BRENT": ICE_BRENT, "ICE BRENT CRUDE": ICE_BRENT, "ICE BRENT CRUDE OIL": ICE_BRENT,
+};
+
+/**
+ * A root CTM does not carry that a carried one stands in for (`B`, `ICE
+ * Brent`): that root, and the line saying which contract is shown instead.
+ * Null for any other value.
+ */
+export function curveStandIn(value: unknown): { root: string; note: string } | null {
+  return typeof value === "string" ? CURVE_STAND_INS[curveRootWords(value)] ?? null : null;
+}
+
+/**
+ * A root named in words, as a typed argument or a question asks for it
+ * ("gold", "Natural Gas futures", "crude oil"): a listed root's name, or a
+ * crude benchmark's. Not for the ticker under the cursor, where GOLD is a
+ * security, so only CTM's typed argument reads it.
+ */
+export function curveRootNamed(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const words = curveRootWords(value);
+  if (!words) return null;
+  return CURVE_ROOT_WORDS[words]
+    ?? CURVE_ROOTS.find((row) => row.label.toUpperCase() === `${row.value} ${words}`)?.value
+    ?? null;
 }
 
 /**
@@ -88,12 +129,16 @@ export function curveRootForTicker(ticker: unknown): string | null {
 
 /**
  * Treasury futures trade in fractions of a 32nd (ZT to 1/256, ZF 1/128, ZN
- * 1/64, ZB and UB 1/32), so the catalogue leaves their tick unset. A root
- * shows every price at the decimals its tick needs to stay exact (ZT 8, ZN 6),
- * so a column and the M2-M1 spread keep one width: 103.50000000 next to
- * 103.51562500, never 103.50 next to 103.515625.
+ * 1/64, ZB and UB 1/32), so the catalogue leaves their tick unset. Their
+ * prices read in 32nds (106-20\u00bd); a report's numbers keep the decimals the
+ * tick needs to stay exact (ZT 8, ZN 6), never float noise.
  */
 const RATE_TICKS: Readonly<Record<string, number>> = { ZT: 1 / 256, ZF: 1 / 128, ZN: 1 / 64, ZB: 1 / 32, UB: 1 / 32 };
+
+/** Whether a root's prices read in 32nds of par (the Treasury futures), not decimals. */
+export function curveReadsThirtySeconds(root: string): boolean {
+  return RATE_TICKS[root] != null;
+}
 
 function curvePriceDecimals(root: string): number {
   const rateTick = RATE_TICKS[root];
@@ -104,7 +149,9 @@ function curvePriceDecimals(root: string): number {
 }
 
 export function curvePrice(value: number | null, root: string): string {
-  if (value == null) return "--";
+  if (value == null) return MISSING_VALUE;
+  // A Treasury future reads in 32nds, as `quote` and FUT write it: 106-20\u00bd, never 106.640625.
+  if (RATE_TICKS[root] != null) return formatThirtySeconds(Math.abs(value) < 1e-9 ? 0 : value);
   const text = value.toFixed(curvePriceDecimals(root));
   // A spread that rounds to zero is unsigned: 0.00, never -0.00.
   return /[1-9]/.test(text) ? text : text.replace("-", "");
@@ -136,7 +183,7 @@ export function curveUnitLabel(data: Pick<FuturesCurvePayload, "root" | "spec" |
 
 /** A contract as traders write it: GCZ26.CMX is GCZ26; a VX symbol stays as Cboe lists it. */
 export function curveContractCode(symbol: string): string {
-  return symbol.replace(/\.[A-Z]+$/, "");
+  return futuresContractCode({ contract: null, contractSymbol: symbol });
 }
 
 /**
@@ -178,6 +225,24 @@ function thinSpreadReason(data: Pick<FuturesCurvePayload, "slope" | "contracts">
   return leg.asOf ? `${code} last traded ${leg.asOf.slice(0, 10)}` : `${code} has not traded`;
 }
 
+/**
+ * The months the front spread passed over for the next one a roll goes to,
+ * with the open interest each holds: "Front spread pairs GCZ26 with GCG27
+ * (77,624 open interest), skipping GCF27 (799)". Null when it skipped none.
+ */
+export function skippedSpreadNotice(data: Pick<FuturesCurvePayload, "slope" | "contracts">): string | null {
+  const skipped = data.slope.skippedSymbols ?? [];
+  if (!skipped.length || !data.slope.frontSymbol || !data.slope.nextSymbol) return null;
+  const held = (symbol: string) => {
+    const interest = data.contracts.find((row) => row.symbol === symbol)?.openInterest;
+    return interest == null ? "" : interest.toLocaleString("en-US");
+  };
+  const next = held(data.slope.nextSymbol);
+  const months = skipped.map((symbol) => `${curveContractCode(symbol)}${held(symbol) ? ` (${held(symbol)})` : ""}`).join(", ");
+  return `Front spread pairs ${curveContractCode(data.slope.frontSymbol)} with ${curveContractCode(data.slope.nextSymbol)}`
+    + `${next ? ` (${next} open interest)` : ""}, skipping ${months}`;
+}
+
 /** The warning a thin front spread carries: why, and that its sign is no slope call. */
 export function thinSpreadNotice(data: Pick<FuturesCurvePayload, "slope" | "contracts">): string | null {
   const reason = thinSpreadReason(data);
@@ -185,12 +250,25 @@ export function thinSpreadNotice(data: Pick<FuturesCurvePayload, "slope" | "cont
 }
 
 /**
+ * The grid a Treasury root's chart axis ticks on, in points: its own fraction
+ * of a 32nd, no finer than a quarter (ZT and ZF quarter 32nds, ZN half, ZB and
+ * UB whole 32nds), so a tick reads 104-25½, never 104-25.60. Undefined for a
+ * root quoted in decimals, whose axis steps 1, 2, 5.
+ */
+export function curveAxisGrid(root: string): number | undefined {
+  const tick = RATE_TICKS[root];
+  return tick == null ? undefined : Math.max(tick, 1 / 128);
+}
+
+/**
  * Axis gridlines sit on round values, so they need no tick precision: one
  * decimal count across the gutter, as many as the plotted range asks for and
  * enough to keep every tick within a percent of that range. A span of hundreds
- * of index points reads 7800, a VIX strip 18.5, a Treasury 1/64 grid 112.25.
+ * of index points reads 7800, a VIX strip 18.5. A Treasury axis reads in 32nds,
+ * its ticks on the root's grid (`curveAxisGrid`).
  */
 export function curveAxisPrice(value: number, domain: CompositeAxisDomain, root: string): string {
+  if (RATE_TICKS[root] != null) return formatThirtySeconds(value);
   const cap = curvePriceDecimals(root);
   const tolerance = Math.abs(domain.max - domain.min) / 100;
   const needed = (tick: number) => {
@@ -216,7 +294,7 @@ export function curveContractMonth(symbol: string, expiration: string): string {
 }
 
 export function curveTimestamp(value: string | null): string {
-  return value?.replace("T", " ").slice(0, 16) ?? "--";
+  return value?.replace("T", " ").slice(0, 16) ?? MISSING_VALUE;
 }
 
 /** The rank against the contract's own history; one observation ranks nothing. */
@@ -249,13 +327,21 @@ function charted<T extends { expiration: string }>(rows: readonly T[], horizon: 
   return rows.filter((row) => Date.parse(row.expiration) <= end.getTime());
 }
 
-export function futuresCurveSeries(data: FuturesCurvePayload, palette?: CurvePalette, horizon = DEFAULT_CURVE_HORIZON, now = Date.now(),
+export function futuresCurveSeries(data: FuturesCurvePayload, palette?: CurvePalette & { settle?: string }, horizon = DEFAULT_CURVE_HORIZON, now = Date.now(),
   currentLabel = data.source === "cboe" ? "Settlement" : "Latest"): CurveSeries[] {
   const contracts = charted(data.contracts, horizon, now);
+  const point = (row: FuturesContract) => ({ id: row.symbol, label: curveContractMonth(row.symbol, row.expiration), x: Date.parse(row.expiration),
+    value: curveShownPrice(row, data), asOf: curveSettleShown(row, data) ?? row.asOf });
+  // The months shown at a settlement beside months that traded since are marked on the line, which keeps their
+  // values for the cursor and the readout. A curve of settlements alone (a past date, a weekend) has nothing to tell apart.
+  const shownAtSettle = contracts.filter((row) => curveSettleShown(row, data));
+  const settled = shownAtSettle.length < contracts.length ? shownAtSettle : [];
   return [{
     id: "current", label: currentLabel, asOf: newestQuote(contracts), color: palette?.current,
-    points: contracts.map((row) => ({ id: row.symbol, label: curveContractMonth(row.symbol, row.expiration), x: Date.parse(row.expiration), value: row.price, asOf: row.asOf })),
-  }, ...data.ghosts.map((ghost) => {
+    points: contracts.map(point),
+  }, ...settled.length ? [{ id: "settle", label: `Settle ${data.settlementDate!.slice(5)}, no trade since`, role: "marker" as const,
+    color: palette?.settle, points: settled.map(point) }] : [],
+  ...data.ghosts.map((ghost) => {
     // The payload dates a ghost by its oldest point, which can be a contract beyond the charted horizon.
     const points = charted(ghost.points, horizon, now);
     const asOf = newestQuote(points);
@@ -271,15 +357,17 @@ export type CurveContractChanges = ReadonlyMap<string, Readonly<Record<CurveLook
 
 /**
  * How far each contract moved since the week- and month-back curves, by
- * symbol: the latest price less the price then. A leg missing either side
- * stays null rather than reading as no move.
+ * symbol: the price it is shown at less its close then, a settlement against
+ * a settlement for a month with no trade since (curveShownPrice). A leg
+ * missing either side stays null rather than reading as no move.
  */
 export function curveContractChanges(data: FuturesCurvePayload): CurveContractChanges {
   const past = new Map(data.ghosts.map((ghost) => [ghost.label, new Map(ghost.points.map((point) => [point.symbol, point.price]))]));
   return new Map(data.contracts.map((row) => {
+    const shown = curveShownPrice(row, data);
     const change = (label: CurveLookback) => {
       const then = past.get(label)?.get(row.symbol);
-      return row.price == null || then == null ? null : row.price - then;
+      return shown == null || then == null ? null : shown - then;
     };
     return [row.symbol, { "1W": change("1W"), "1M": change("1M") }];
   }));
@@ -397,6 +485,24 @@ export interface SpotBar {
   price: number;
 }
 
+/**
+ * The spot bars a basis is read from: the pair's one-minute bars as the
+ * reader's history serves them, and the spot the server read for each
+ * contract's own print minute, which a delayed reader's bars do not reach
+ * yet (a front month prints ten minutes behind, delayed spot fifteen). The
+ * server's wins where both have a minute. Null while the reader's bars are
+ * unknown, so a blank is never explained before they answer.
+ */
+export function curveSpotBars(bars: readonly SpotBar[] | null, contracts: readonly Pick<FuturesContract, "spot">[]): SpotBar[] | null {
+  if (!bars) return null;
+  const byMinute = new Map(bars.map((bar) => [bar.minute, bar.price]));
+  for (const { spot } of contracts) {
+    const time = spot ? Date.parse(spot.minute) : Number.NaN;
+    if (spot && Number.isFinite(time) && positive(spot.price)) byMinute.set(minuteOf(time), spot.price);
+  }
+  return [...byMinute].sort((a, b) => a[0] - b[0]).map(([minute, price]) => ({ minute, price }));
+}
+
 /** One-minute bars as the spot by minute, oldest first; a bar with no usable time or close is left out. */
 export function spotBarsFromHistory(points: readonly { date: Date | string | number; close: number }[]): SpotBar[] {
   const byMinute = new Map<number, number>();
@@ -405,6 +511,56 @@ export function spotBarsFromHistory(points: readonly { date: Date | string | num
     if (Number.isFinite(time) && positive(point.close)) byMinute.set(minuteOf(time), point.close);
   }
   return [...byMinute].sort((a, b) => a[0] - b[0]).map(([minute, price]) => ({ minute, price }));
+}
+
+/**
+ * The cash index a settlement-only root's front contract is read against: VX
+ * against spot VIX. A root missing here shows no spot.
+ */
+const SPOT_INDEX_SYMBOLS: ReadonlyMap<string, { symbol: string; label: string }> = new Map([
+  ["VX", { symbol: "^VIX", label: "Spot VIX" }],
+]);
+
+export function spotIndexSymbol(root: string): string | null {
+  return SPOT_INDEX_SYMBOLS.get(root)?.symbol ?? null;
+}
+
+/**
+ * Spot against the front contract: the index's close on the curve's
+ * settlement session and the front settlement's premium to it, so both are
+ * marks of one session and a live index is never read against an older
+ * settlement. `reason` says why a figure is blank.
+ */
+export interface CurveSpotPremium {
+  symbol: string;
+  label: string;
+  close: number | null;
+  /** The session of `close`, the curve's settlement date. */
+  date: string | null;
+  frontSymbol: string | null;
+  /** The front settlement less `close`, at the root's precision. */
+  premium: number | null;
+  reason: string | null;
+}
+
+/** The front contract's settlement less the index's close on the curve's settlement session. */
+export function curveSpotPremium(data: Pick<FuturesCurvePayload, "root" | "contracts" | "slope" | "settlementDate">,
+  closes: readonly { date: Date | string | number; close: number }[]): CurveSpotPremium | null {
+  const index = SPOT_INDEX_SYMBOLS.get(data.root);
+  if (!index) return null;
+  const front = data.contracts.find((row) => row.symbol === data.slope.frontSymbol)
+    ?? [...data.contracts].filter((row) => row.settlement != null).sort((a, b) => a.expiration.localeCompare(b.expiration))[0];
+  const date = data.settlementDate ?? null;
+  const bar = date ? closes.find((point) => {
+    const time = new Date(point.date).getTime();
+    return Number.isFinite(time) && new Date(time).toISOString().slice(0, 10) === date && positive(point.close);
+  }) : undefined;
+  const close = bar ? bar.close : null;
+  const settle = front ? front.settlement ?? front.price : null;
+  const premium = close != null && positive(settle) ? curveRoundedPrice(settle - close, data.root) : null;
+  const reason = !date ? "the curve has no settlement date" : close == null ? `no ${index.symbol} close on ${date}`
+    : premium == null ? "no front settlement" : null;
+  return { symbol: index.symbol, label: index.label, close, date, frontSymbol: front?.symbol ?? null, premium, reason };
 }
 
 /** The bar in `minute`, else the one nearest it; null when there are none. */
@@ -499,7 +655,7 @@ export function contractBasis(row: Pick<FuturesContract, "price" | "stale" | "ex
 
 /** A basis in percent, signed; one that rounds to zero stays unsigned. */
 export function curveBasisPercent(value: number | null, decimals: number): string {
-  if (value == null) return "--";
+  if (value == null) return MISSING_VALUE;
   const text = Math.abs(value).toFixed(decimals);
   return /[1-9]/.test(text) ? `${value > 0 ? "+" : "-"}${text}%` : `${text}%`;
 }
@@ -507,7 +663,7 @@ export function curveBasisPercent(value: number | null, decimals: number): strin
 /** The footer's spot: `spot BTC-USD 67,250.10 · 07:25 UTC`, with the date when the quote is not from today. */
 export function curveSpotLabel(spot: CurveSpot, root: string, now: number): string {
   const decimals = curvePriceDecimals(root);
-  const price = spot.price == null ? "--" : spot.price.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  const price = spot.price == null ? MISSING_VALUE : spot.price.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
   const stamp = curveTimestamp(spot.asOf);
   const today = new Date(now).toISOString().slice(0, 10);
   return `spot ${spot.symbol} ${price} · ${spot.asOf?.startsWith(today) ? stamp.slice(11) : stamp} UTC`;
@@ -553,11 +709,35 @@ function pairTimes(print: number, spot: number): string {
   return printDate === spotDate ? `print ${printTime}, nearest spot ${spotTime} UTC` : `print ${printDate} ${printTime}, nearest spot ${spotDate} ${spotTime} UTC`;
 }
 
+/**
+ * A curve the server served from a copy it kept, because its source failed:
+ * when that copy was read, and the clock its age is measured against.
+ */
+export interface CurveCache {
+  fetchedAt: string;
+  now: number;
+}
+
+/** The cache a curve was served from, when the server says it was; null for a curve read now. */
+export function curveCache(data: Pick<FuturesCurvePayload, "cached" | "fetchedAt">, now: number): CurveCache | null {
+  return data.cached === true && Number.isFinite(Date.parse(data.fetchedAt)) ? { fetchedAt: data.fetchedAt, now } : null;
+}
+
+/** `cached curve read 21:55 UTC, 9 h old`, with the date when the copy is not from the clock's day. */
+function cachedCurveReason(cache: CurveCache): string {
+  const read = Date.parse(cache.fetchedAt);
+  const stamp = curveTimestamp(new Date(read).toISOString());
+  const today = new Date(cache.now).toISOString().slice(0, 10);
+  const minutes = Math.max(0, Math.floor((cache.now - read) / MINUTE_MS));
+  return `cached curve read ${stamp.startsWith(today) ? stamp.slice(11) : stamp} UTC, ${gapText(minutes)} old`;
+}
+
 /** Why one priced-or-not contract has no basis against known spot bars, in the order `contractBasis` decides it. */
-function blankReason(row: Pick<FuturesContract, "price" | "stale">, basis: ContractBasis): string | null {
+function blankReason(row: Pick<FuturesContract, "price" | "stale">, basis: ContractBasis, cache: CurveCache | null): string | null {
   if (basis.vsSpotPct != null) return null;
   if (!positive(row.price)) return "no price";
-  if (row.stale) return "price over two sessions old";
+  // A cached copy marks every contract stale for being a copy, not for its prices' age.
+  if (row.stale) return cache ? cachedCurveReason(cache) : "price over two sessions old";
   const unpaired = basis.unpaired;
   if (!unpaired) return null;
   if (unpaired.print == null) return "last trade has no time of day";
@@ -570,11 +750,12 @@ function blankReason(row: Pick<FuturesContract, "price" | "stale">, basis: Contr
  * The contracts whose basis cells are blank against known spot bars, grouped by cause and named, so a blank is
  * never unexplained: the far months of a curve print rarely, and a trade no spot bar shares a minute with is not read.
  */
-export function blankBasisNote(rows: readonly Pick<FuturesContract, "symbol" | "price" | "stale">[], basis: CurveBasisRows): string | null {
+export function blankBasisNote(rows: readonly Pick<FuturesContract, "symbol" | "price" | "stale">[], basis: CurveBasisRows,
+  cache: CurveCache | null = null): string | null {
   const groups = new Map<string, string[]>();
   for (const row of rows) {
     const cell = basis.get(row.symbol);
-    const reason = cell ? blankReason(row, cell) : null;
+    const reason = cell ? blankReason(row, cell, cache) : null;
     if (reason) groups.set(reason, [...groups.get(reason) ?? [], curveContractCode(row.symbol)]);
   }
   return groups.size ? `Basis blank for ${[...groups].map(([reason, codes]) => `${codes.join(", ")} (${reason})`).join("; ")}.` : null;
@@ -611,8 +792,42 @@ export function curveAsOfDate(value: unknown, now = new Date(), option = ""): st
   if (!text || text.toLowerCase() === "latest") return "";
   const date = readCalendarDate(text);
   if (!date) throw new Error(dateOptionError(text, option, { now, subject: "an as-of date", formats: dateOptionFormatsOr("latest") }));
-  if (date > now.toISOString().slice(0, 10)) throw new Error("A futures curve cannot use a future date.");
+  // The archive's days are New York's: at 21:00 there, UTC is already on tomorrow, which has no settle yet.
+  if (date > zonedDateKey(now.getTime(), ARCHIVE_ZONE)) throw new Error("A futures curve cannot use a future date.");
   return date;
+}
+
+/** The zone the settlement archive keeps its days in, and the minute of the day (17:30) it takes each day's settlements. */
+const ARCHIVE_ZONE = "America/New_York";
+const ARCHIVED_MINUTES = 17 * 60 + 30;
+
+/**
+ * The line a past curve opens with when the session it shows is not the day
+ * asked for: `No settle for Sun 8 Nov; showing Fri 6 Nov.`, a holiday of the
+ * root's exchange `No settle for Thu 26 Nov, a holiday; showing Wed 25 Nov.`,
+ * and on a trading day before that day's settlements are archived (17:30
+ * New York, whatever time the exchange settles at) `Today's settle reaches
+ * the archive after 17:30 ET; showing Fri 6 Nov.` Null when the curve is that
+ * day's, or has no session.
+ */
+export function curveSessionNote(
+  requested: string | null | undefined,
+  served: string | null | undefined,
+  root?: string | null,
+  now = new Date(),
+): string | null {
+  if (!requested || !served || served >= requested) return null;
+  const day = (date: string) => formatUtcDayTime({ time: Date.parse(`${date}T00:00:00Z`), dateOnly: true }, now.getTime());
+  const showing = `showing ${day(served)}.`;
+  const weekday = new Date(`${requested}T00:00:00Z`).getUTCDay();
+  if (weekday === 0 || weekday === 6) return `No settle for ${day(requested)}; ${showing}`;
+  const venue = root ? futuresContractByCode(root)?.venue : null;
+  if (venue && isPublishedFuturesClosure(venue, requested)) return `No settle for ${day(requested)}, a holiday; ${showing}`;
+  const clock = zonedDateTimeParts(now.getTime(), ARCHIVE_ZONE);
+  if (requested === zonedDateKey(now.getTime(), ARCHIVE_ZONE) && clock.hour * 60 + clock.minute < ARCHIVED_MINUTES) {
+    return `Today's settle reaches the archive after 17:30 ET; ${showing}`;
+  }
+  return `No settle for ${day(requested)} in the archive; ${showing}`;
 }
 
 export function curveLookbackDate(date: string, days: number): string {
@@ -662,14 +877,19 @@ export function withTradedExpirations(data: FuturesCurvePayload): FuturesCurvePa
   };
 }
 
+/** From 18:00 New York a print belongs to the next trade date: six hours later it is that date there. */
+const NEXT_SESSION_SHIFT_MS = 6 * 3_600_000;
+
 /**
  * The trading date a print belongs to, as the server dates sessions: CME's
- * session for a date opens at 18:00 New York the evening before (22:00 or
- * 23:00 UTC), so a two-hour shift puts those evening trades on the next date
- * and leaves day-only venues as they are. A settlement's date is its session.
+ * session for a date opens at 18:00 New York the evening before, so a print
+ * from then on is the next date's, read on New York's clock. The session's
+ * close at 17:00 New York (22:00 UTC in winter, when a two-hour shift of UTC
+ * carried it into the next date) stays on its own date, and day-only venues
+ * are as they are. A settlement's date is its session.
  */
 function curveSessionDate(asOf: string): string {
-  return asOf.length === 10 ? asOf : new Date(Date.parse(asOf) + 2 * 3_600_000).toISOString().slice(0, 10);
+  return asOf.length === 10 ? asOf : zonedDateKey(Date.parse(asOf) + NEXT_SESSION_SHIFT_MS, "America/New_York");
 }
 
 /**
@@ -683,6 +903,26 @@ export function curveNoTradeSince(row: Pick<FuturesContract, "price" | "settleme
   const session = data.settlementDate;
   if (data.source === "cboe" || !session || row.price == null || row.settlement == null || !row.asOf) return null;
   return curveSessionDate(row.asOf) <= session ? session : null;
+}
+
+/**
+ * The session whose settlement a live contract is shown at: it has no trade
+ * since that settlement (curveNoTradeSince), or no last trade at all, as in a
+ * session that has just opened. Its row, its point on the curve and its 1W
+ * and 1M moves read the settlement, so a month with no trade today is never
+ * read as an old print beside months that traded. Null for a contract shown
+ * at its last trade, and on a Cboe curve, whose prices are settlements.
+ */
+export function curveSettleShown(row: Pick<FuturesContract, "price" | "settlement" | "asOf">,
+  data: Pick<FuturesCurvePayload, "source" | "settlementDate">): string | null {
+  if (data.source === "cboe" || !data.settlementDate || row.settlement == null) return null;
+  return row.price == null ? data.settlementDate : curveNoTradeSince(row, data);
+}
+
+/** The price a live contract is plotted and measured at: its settlement when it has not traded since (curveSettleShown), else its last trade. */
+function curveShownPrice(row: Pick<FuturesContract, "price" | "settlement" | "asOf">,
+  data: Pick<FuturesCurvePayload, "source" | "settlementDate">): number | null {
+  return curveSettleShown(row, data) ? row.settlement ?? null : row.price;
 }
 
 /**
@@ -715,6 +955,30 @@ export function noTradeChangeNote(rows: readonly Pick<FuturesContract, "symbol" 
   if (!untraded.length) return null;
   const named = options.count ? `on ${untraded.length} contract${untraded.length === 1 ? "" : "s"}` : `for ${untraded.join(", ")}`;
   return `Change blank ${named} (no trade since ${data.settlementDate})${options.count ? "" : "."}`;
+}
+
+/** Most contract codes a partial curve's status line names before it counts the rest. */
+const NAMED_INCOMPLETE_CONTRACTS = 6;
+
+/**
+ * What a partial curve leaves out, by contract, for its report's status line:
+ * "NGZ31 not resolved", "NGF35, NGG35 unquoted". Null when it names none: a
+ * curve from a server that does not list what it could not resolve, or one
+ * whose gap is not about a contract.
+ */
+export function curveIncompleteDetail(data: Pick<FuturesCurvePayload, "catalogue" | "contracts">): string | null {
+  const codes = (symbols: readonly string[]) => {
+    const named = symbols.map(curveContractCode);
+    return named.length > NAMED_INCOMPLETE_CONTRACTS
+      ? `${named.slice(0, NAMED_INCOMPLETE_CONTRACTS).join(", ")} and ${named.length - NAMED_INCOMPLETE_CONTRACTS} more`
+      : named.join(", ");
+  };
+  const unresolved = data.catalogue.unresolved ?? [];
+  const unquoted = data.contracts.filter((row) => row.price == null).map((row) => row.symbol);
+  return [
+    unresolved.length ? `${codes(unresolved)} not resolved` : null,
+    unquoted.length ? `${codes(unquoted)} unquoted` : null,
+  ].filter((part): part is string => part != null).join(", ") || null;
 }
 
 /**
@@ -756,14 +1020,38 @@ export function archivedFuturesCurve(root: string, curve: FuturesCurveAsOfPayloa
   const thin = [front, next].find((row) => row?.volume != null && row.volume < THIN_SPREAD_LOTS)?.symbol ?? null;
   const days = front && next ? (Date.parse(next.expiration) - Date.parse(front.expiration)) / DAY_MS : 0;
   const roll = front && next && front.price! > 0 && next.price! > 0 && days > 0 ? (front.price! / next.price! - 1) * 365 / days * 100 : null;
+  // The server says its caveats in `gaps` too, for a client that reads no `notes`: they are notes, not what the curve lacks.
+  const notes = curve.notes ?? [];
+  const gaps = curve.gaps.filter((gap) => !notes.includes(gap));
   return {
     root, name: curve.name, source: root === "VX" ? "cboe" : "gloom", currency: curve.currency, quoteUnit: curve.quoteUnit,
-    asOf: curve.asOf, fetchedAt, status: !contracts.length ? "unavailable" : curve.gaps.length ? "partial" : "available", stale: false,
+    asOf: curve.asOf, fetchedAt, status: !contracts.length ? "unavailable" : gaps.length ? "partial" : "available", stale: false,
+    ...notes.length ? { notes } : {},
     catalogue: { method: "provider", complete: true, horizonEnd: null }, contracts, ghosts,
     slope: { frontSymbol: front?.symbol ?? null, nextSymbol: next?.symbol ?? null, value, annualizedRollYield: roll, percentile: null,
       rollPercentile: null, samples: 0, historyStart: null, historyEnd: null, asOf: front && next ? curve.asOf : null,
       basis: front && next ? settled.length >= 2 ? "settle" : "last" : null, thinSymbol: value == null ? null : thin,
       state: value == null ? "unavailable" : thin ? "thin" : Math.abs(value) < 1e-10 ? "flat" : value > 0 ? "contango" : "backwardation" },
-    gaps: curve.gaps, spec: curve.spec ?? null, settlementDate: settled.length ? curve.asOf : null,
+    gaps, spec: curve.spec ?? null, settlementDate: settled.length ? curve.asOf : null,
   };
+}
+
+/**
+ * How current a curve is, one answer for `fn CTM`, its pane and a capture of
+ * it: a past curve is the settlement archive's, Cboe's its daily settlement,
+ * and a live curve is dated by its contracts' own quotes, each delayed by
+ * what its source states (CME's 10 minutes), never a venue's usual lag.
+ */
+export function curveReportFreshness(data: Pick<FuturesCurvePayload, "source" | "contracts" | "asOf">, date?: string | null): HeadlessPaneFreshness {
+  // A past curve is dated by the session it shows, Friday's for a Sunday asked for (curveSessionNote says so).
+  if (date) return { status: "not-a-feed", basis: "settlement archive", asOf: data.asOf ?? date };
+  const quoted = data.contracts.map((row) => row.asOf);
+  return { ...(data.source === "cboe" ? { source: "Cboe", status: "not-a-feed", basis: "daily settlement", cadence: "daily" } as const : {}),
+    asOf: newestReportTime(quoted), oldest: oldestReportTime(quoted) };
+}
+
+/** Each contract's quote as a capture dates the curve from it: its time, the delay its source states, and whether it is stale. */
+export function curveFreshnessObservations(contracts: readonly FuturesContract[]): Array<Record<string, unknown>> {
+  return contracts.flatMap((row) => row.asOf ? [{ symbol: row.symbol, asOf: row.asOf,
+    ...(row.delayMinutes != null ? { delayMinutes: row.delayMinutes } : {}), stale: row.stale }] : []);
 }

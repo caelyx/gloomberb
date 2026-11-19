@@ -10,11 +10,12 @@ import { installTestWebSocket } from "../../../test-support/cloud-api";
 import { parseHex } from "../../../theme/color-utils";
 import { createDefaultConfig } from "../../../types/config";
 import { Box } from "../../../ui";
+import { formatTimeAgo } from "../../../utils/datetime-format";
 import { apiClient, type AccountProfile, type ChatChannel, type ChatMessage } from "../../../api-client";
 import { PluginRenderProvider, type PluginRuntimeAccess } from "../../runtime";
 import { setSharedMarketDataForTests, setSharedRegistryForTests } from "../../registry";
 import { ChatContent } from "./content";
-import { ChatController } from "./controller";
+import { ChatController, chatController } from "./controller";
 import { chatSidebarStore } from "./sidebar-store";
 import { chatHandlePromptStore } from "./handle-prompt";
 
@@ -83,6 +84,16 @@ export function cleanupChatTest(): void {
   originalWebSocket = undefined;
 }
 
+/**
+ * Signs the app's own chat controller in as ada, as a restored session does,
+ * for a test of the real Chat pane: signed out it shows the sign-in wall.
+ * Returns the sign-out.
+ */
+export function signInAppChat(): () => void {
+  chatController.adoptSession("token-123", { id: "u0", username: "ada", emailVerified: true });
+  return () => chatController.clearSession();
+}
+
 export function installServerChannels(controller: ChatController, channels = TEST_CHAT_CHANNELS): void {
   (controller as any).channelCatalog.channels = channels;
 }
@@ -130,6 +141,11 @@ export function makeMessage(index: number): ChatMessage {
       displayName: `User ${index}`,
     },
   };
+}
+
+/** The day a header dates `makeMessage(index)` by in this time zone: "3/30/26", or "3/29/26" west of UTC. */
+export function messageDay(index: number): string {
+  return formatTimeAgo(makeMessage(index).createdAt);
 }
 
 export function createController(options: {

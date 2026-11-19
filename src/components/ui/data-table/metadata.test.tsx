@@ -1,12 +1,17 @@
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { describe, expect, test } from "bun:test";
-import { act, useRef } from "react";
+import { act, useEffect, useRef } from "react";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { createRemoteUiRegistry, RemoteUiRegistryProvider } from "../../../remote/semantic-tree";
 import { AppContext, PaneInstanceProvider, createInitialState } from "../../../state/app/context";
 import { createStaticAppStore } from "../../../test-support/app-store";
 import { createDefaultConfig } from "../../../types/config";
 import { DataTable } from "./index";
+import { MISSING_VALUE } from "../../../utils/format";
+import { exportPaneTable } from "../../../state/pane-table-export-registry";
+import { takeSavedTextFile } from "../../../renderers/opentui/test-utils";
+import { UiHostProvider, useRendererHost, useUiHost } from "../../../ui/host";
+import type { DataTableProps } from "./types";
 
 const tui = createOpenTuiTestHarness();
 
@@ -62,6 +67,68 @@ async function renderTable(selectedId: string | null, reportEveryRow?: boolean) 
 }
 
 describe("DataTable remote metadata", () => {
+  test("an omitted column stays report-only in JSON and present in the registered CSV export", async () => {
+    function OptionalTable() {
+      const scrollRef = useRef<ScrollBoxRenderable>(null);
+      return <DataTable columns={[
+        { id: "name", label: "Name", width: 12, align: "left" },
+        { id: "missing", label: "Missing", width: 10, align: "right", omitWhenEmpty: true },
+      ]} items={[{ id: "one", name: "One" }]} sortColumnId={null} sortDirection="asc"
+        scrollRef={scrollRef} headerScrollRef={scrollRef} syncHeaderScroll={() => {}} onBodyScrollActivity={() => {}}
+        getItemKey={(row) => row.id} isSelected={() => false} onSelect={() => {}}
+        renderCell={(row, column) => column.id === "name" ? { text: row.name } : { text: MISSING_VALUE, value: null }}
+        emptyStateTitle="No rows." reportEveryRow />;
+    }
+    const registry = createRemoteUiRegistry();
+    const state = createInitialState(createDefaultConfig("/tmp/gloomberb-optional-column"));
+    await act(async () => {
+      await tui.render(<RemoteUiRegistryProvider registry={registry}>
+        <AppContext value={createStaticAppStore(state)}>
+          <PaneInstanceProvider paneId="optional-column"><OptionalTable /></PaneInstanceProvider>
+        </AppContext>
+      </RemoteUiRegistryProvider>, { width: 40, height: 6 });
+    });
+    const node = registry.snapshot().find((entry) => entry.role === "table");
+    expect(tui.frame()).not.toContain("MISSING");
+    expect(node?.metadata?.columns).toEqual([{ id: "name", label: "Name" }]);
+    expect(node?.metadata?.rows).toEqual([{ key: "one", selected: false, cells: [
+      { columnId: "name", columnLabel: "Name", text: "One" },
+      { columnId: "missing", columnLabel: "Missing", text: MISSING_VALUE, reportOnly: true },
+    ] }]);
+    await exportPaneTable("optional-column", "optional.csv");
+    expect(takeSavedTextFile()?.text).toContain("Name,Missing\nOne,");
+  });
+
+  test("a range with no rows in it, from a viewport not laid out yet, never hides an in-view column", async () => {
+    // The host table reports before its viewport has a size, then the rows it shows.
+    const drawn: string[][] = [];
+    function HostTable(props: DataTableProps<Row>) {
+      drawn.push(props.columns.map((column) => column.id));
+      useEffect(() => {
+        props.onVisibleRangeChange?.({ start: 0, end: 0 });
+        const measured = setTimeout(() => props.onVisibleRangeChange?.({ start: 0, end: 1 }), 0);
+        return () => clearTimeout(measured);
+      }, []);
+      return null;
+    }
+    function Host() {
+      const scrollRef = useRef<ScrollBoxRenderable>(null);
+      return <UiHostProvider ui={{ ...useUiHost(), DataTable: HostTable }} renderer={useRendererHost()}>
+        <DataTable columns={[{ id: "name", label: "Name", width: 12, align: "left" }, { id: "value", label: "Value", width: 8, align: "right", omitWhenEmpty: "visible" }]}
+          items={[{ id: "one", name: "One" }]} sortColumnId={null} sortDirection="asc" scrollRef={scrollRef} headerScrollRef={scrollRef}
+          syncHeaderScroll={() => {}} onBodyScrollActivity={() => {}} getItemKey={(row) => row.id} isSelected={() => false} onSelect={() => {}}
+          renderCell={(row, column) => ({ text: column.id === "name" ? row.name : "12.5" })} emptyStateTitle="No rows." />
+      </UiHostProvider>;
+    }
+    const state = createInitialState(createDefaultConfig("/tmp/gloomberb-unmeasured-range"));
+    await act(async () => {
+      await tui.render(<AppContext value={createStaticAppStore(state)}><Host /></AppContext>, { width: 40, height: 6 });
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 10)); });
+    expect(drawn.length).toBeGreaterThan(1);
+    expect(drawn.every((columns) => columns.includes("value"))).toBe(true);
+  });
+
   test("publishes the row count and a selected key past the first 200 rows, without row objects", async () => {
     const { node } = await renderTable("row-230");
 

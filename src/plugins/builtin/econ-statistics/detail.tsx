@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useMemo } from "react";
 import { ExternalLinkText, type StatItem } from "../../../components/ui";
 import { fredSeriesUrl, fredSourceLabel } from "../../../sources/gloomberb-cloud/fred-series";
@@ -39,7 +40,7 @@ export function StatDetail({
   const stat = view.stat;
   const visible = view.visible;
   const stats = useMemo<StatItem[]>(() => [
-    { id: "year-ago", label: "1Y ago", value: view.yearAgo ? stat.formatValue(view.yearAgo.value) : "--" },
+    { id: "year-ago", label: "1Y ago", value: view.yearAgo ? stat.formatValue(view.yearAgo.value) : MISSING_VALUE },
     { id: "high", label: "High", value: stat.formatValue(view.high.value), detail: view.high.date },
     { id: "low", label: "Low", value: stat.formatValue(view.low.value), detail: view.low.date },
     // A range longer than the history shows all of it, from where it starts.
@@ -68,6 +69,7 @@ export function StatDetail({
       reference={stat.reference}
       resetKey={`${stat.id}:${view.range}`}
       formatValue={stat.formatValue}
+      formatAxisValue={stat.formatValue}
       // The source line under the chart; the chart takes every other row.
       belowChartRows={SOURCE_ROWS}
       belowChart={(

@@ -1,7 +1,10 @@
-import type { FloatingPaneEntry, LayoutConfig } from "../../types/config";
+import type { DockLayoutNode, FloatingPaneEntry, LayoutConfig } from "../../types/config";
+import { buildDockStack, isDockStack } from "./dock-stack";
+import { floatingStacks, hiddenFloatingTabIds } from "./floating-stack";
 import type { AppNotificationRequest } from "../../types/plugin";
 import {
   boundsForRects,
+  buildGridDockTree,
   inferDockTreeFromRects,
   type GridlockRect,
 } from "./gridlock-inference";
@@ -18,6 +21,17 @@ import {
 const BURIED_VISIBLE_RATIO = 0.2;
 const TITLE_BAR_HEIGHT_RATIO = 0.12;
 const TIDY_FLOATING_THRESHOLD = 3;
+/** Below this many columns Tidy stacks the panes in one column instead of tiling a grid of slivers. */
+const NARROW_TIDY_WIDTH = 80;
+/** Rows a pane needs to show its header and a screen of rows; a shorter terminal shows one stack. */
+const NARROW_TIDY_MIN_ROWS = 12;
+/**
+ * The narrowest pane Tidy tiles: where both the panes' own grid and an even
+ * grid would leave one narrower (six panes at 80 columns were 12-column
+ * tiles, "Main Port›"), it stacks them in one column instead, as a narrow
+ * terminal's Tidy does.
+ */
+const TIDY_MIN_PANE_WIDTH = 30;
 
 type Rect = Pick<FloatingPaneEntry, "x" | "y" | "width" | "height">;
 
@@ -91,6 +105,62 @@ export function shouldShowTidyWindows(layout: LayoutConfig): boolean {
     || analyzeFloatingPaneVisibility(layout).some((pane) => pane.buried);
 }
 
+/**
+ * Whether a screen of `size` cells holds panes side by side and one above
+ * another: as wide as Tidy tiles a grid at, and as tall as two rows of panes
+ * that each show a screen of rows. A phone holds no grid, upright or on its
+ * side, so a workspace made for one (the web's first visit) comes there as
+ * one stack of tabs instead.
+ */
+export function holdsPaneGrid(size: { width: number; height: number }): boolean {
+  return size.width >= NARROW_TIDY_WIDTH && size.height >= NARROW_TIDY_MIN_ROWS * 2;
+}
+
+function withStacks(node: DockLayoutNode | null, stacks: ReadonlyMap<string, readonly string[]>): DockLayoutNode | null {
+  if (!node || stacks.size === 0) return node;
+  if (node.kind === "pane") {
+    const tabs = stacks.get(node.instanceId);
+    return tabs ? buildDockStack(tabs, node.instanceId) : node;
+  }
+  return { ...node, first: withStacks(node.first, stacks)!, second: withStacks(node.second, stacks)! };
+}
+
+/**
+ * A narrow terminal's Tidy: every pane at the full width, in one column of
+ * at most two stacks, one above the other, each holding its share of the
+ * panes as tabs in reading order. A grid of eight panes at 52 columns was
+ * eleven-column tiles no table could be read in.
+ */
+function narrowDockTree(rects: readonly GridlockRect[], stacks: ReadonlyMap<string, readonly string[]>, height: number): DockLayoutNode | null {
+  const order = [...rects]
+    .sort((a, b) => a.y - b.y || a.x - b.x)
+    .flatMap((rect) => stacks.get(rect.instanceId) ?? [rect.instanceId]);
+  if (order.length <= 1 || height < NARROW_TIDY_MIN_ROWS * 2) return buildDockStack(order);
+  const split = Math.ceil(order.length / 2);
+  return {
+    kind: "split",
+    axis: "vertical",
+    ratio: 0.5,
+    first: buildDockStack(order.slice(0, split))!,
+    second: buildDockStack(order.slice(split))!,
+  };
+}
+
+/**
+ * The one column a narrow terminal's Tidy leaves (`narrowDockTree`): one
+ * stack, or a stack above another or above a pane, with nothing floating.
+ * Tidied on a wider terminal, its panes are tiled in a grid again rather
+ * than kept as the two stacks the narrow one needed.
+ */
+function isNarrowTidyColumn(layout: LayoutConfig): boolean {
+  const root = layout.dockRoot;
+  if (!root || layout.floating.length > 0) return false;
+  if (isDockStack(root)) return true;
+  const stackOrPane = (node: DockLayoutNode) => isDockStack(node) || node.kind === "pane";
+  return root.kind === "split" && root.axis === "vertical"
+    && stackOrPane(root.first) && stackOrPane(root.second) && (isDockStack(root.first) || isDockStack(root.second));
+}
+
 export function gridlockAllPanes(
   layout: LayoutConfig,
   bounds: LayoutBounds = { x: 0, y: 0, width: 120, height: 40 },
@@ -99,9 +169,14 @@ export function gridlockAllPanes(
   const visibleLayout = paneTypes
     ? removeUnavailablePaneTypes(layout, paneTypes)
     : layout;
-  const dockedRects: GridlockRect[] = getDockLeafLayouts(visibleLayout, bounds)
-    .map((leaf) => ({ instanceId: leaf.instanceId, ...leaf.rect }));
-  const floatingRects: GridlockRect[] = visibleLayout.floating.map((entry) => ({
+  const leaves = getDockLeafLayouts(visibleLayout, bounds);
+  const dockedRects: GridlockRect[] = leaves.map((leaf) => ({ instanceId: leaf.instanceId, ...leaf.rect }));
+  // A stack is tiled as the tab it shows and keeps its other tabs.
+  const stacks = new Map(leaves.flatMap((leaf) => (leaf.stack ? [[leaf.instanceId, leaf.stack] as const] : [])));
+  // A floating stack is tiled as the tab it shows, and keeps its tabs as a docked stack.
+  for (const [shown, members] of floatingStacks(visibleLayout.floating)) stacks.set(shown, members);
+  const hiddenTabs = hiddenFloatingTabIds(visibleLayout.floating);
+  const floatingRects: GridlockRect[] = visibleLayout.floating.filter((entry) => !hiddenTabs.has(entry.instanceId)).map((entry) => ({
     instanceId: entry.instanceId,
     x: entry.x,
     y: entry.y,
@@ -111,11 +186,21 @@ export function gridlockAllPanes(
   const allRects = [...dockedRects, ...floatingRects];
   if (allRects.length === 0) return visibleLayout;
 
-  return finalizeLayout({
-    ...visibleLayout,
-    dockRoot: inferDockTreeFromRects(allRects, boundsForRects(allRects)),
-    floating: [],
-  });
+  // Decided by the width each time: a column a narrow Tidy left is a grid again on a wider terminal.
+  const wideDockTree = () => isNarrowTidyColumn(visibleLayout)
+    ? buildGridDockTree(dockedRects.flatMap((rect) => stacks.get(rect.instanceId) ?? [rect.instanceId]))
+    : withStacks(inferDockTreeFromRects(allRects, boundsForRects(allRects)), stacks);
+  const tidied = (dockRoot: DockLayoutNode | null) => finalizeLayout({ ...visibleLayout, dockRoot, floating: [] });
+  const narrow = () => tidied(narrowDockTree(allRects, stacks, bounds.height));
+  if (bounds.width < NARROW_TIDY_WIDTH) return narrow();
+  const fits = (tiled: LayoutConfig) => getDockLeafLayouts(tiled, bounds).every((leaf) => leaf.rect.width >= TIDY_MIN_PANE_WIDTH);
+  const inferred = tidied(wideDockTree());
+  if (fits(inferred)) return inferred;
+  // The panes' own arrangement leaves one too narrow (five in a row at 120 columns, a slim sidebar): the same panes
+  // in reading order as an even grid, which holds five at 120 and eight at 200; one column only when that cannot.
+  const reading = [...allRects].sort((a, b) => a.y - b.y || a.x - b.x).map((rect) => rect.instanceId);
+  const even = tidied(withStacks(buildGridDockTree(reading), stacks));
+  return fits(even) ? even : narrow();
 }
 
 /**

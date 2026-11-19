@@ -1,5 +1,5 @@
 import { expect } from "bun:test";
-import { useLayoutEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
+import { useLayoutEffect, useMemo, useReducer, useRef, type Dispatch, type ReactNode } from "react";
 import { AppDialogBridge } from "../../../app/dialog-bridge";
 import type { PluginRegistry } from "../../../plugins/registry";
 import { useShortcut } from "../../../react/input";
@@ -269,10 +269,12 @@ export function CommandBarHarness({
   dataProvider = makeDataProvider(),
   hasPaneSettings,
   onCheckForUpdates,
+  onQuit,
   onAction,
   onUnhandledEnter,
   remoteRegistry,
   storeRef,
+  underlay,
 }: {
   query: string;
   disabledPlugins?: string[];
@@ -287,17 +289,23 @@ export function CommandBarHarness({
   dataProvider?: DataProvider;
   hasPaneSettings?: (paneId: string) => boolean;
   onCheckForUpdates?: () => void | Promise<void>;
+  onQuit?: () => void;
   onAction?: (action: AppAction) => void;
   onUnhandledEnter?: () => void;
   /** The registry the app would own, to see what remote control sees. */
   remoteRegistry?: RemoteUiRegistry;
   /** Receives the live store, to dispatch as the rest of the app would. */
   storeRef?: { current: AppContextStoreValue | null };
+  /** What the app draws under the bar, in the rows between the header and the probes. */
+  underlay?: ReactNode;
 }) {
-  let config = {
+  let config: AppConfig = {
     ...createDefaultConfig("/tmp/gloomberb-test"),
     recentTickers: ["AAPL", "MSFT"],
     disabledPlugins,
+    // The header otherwise follows the machine's time zone and names an
+    // exchange (NYSE, LSE) a test may look for in the rows; BTC names none.
+    headerMarket: { benchmark: "btc" },
   };
   if (configureConfig) {
     config = configureConfig(config);
@@ -348,7 +356,7 @@ export function CommandBarHarness({
           {/* The header hosts the bar's input while it is open, so typing in a
               test needs the real header on the first row. */}
           <Header />
-          <Box flexGrow={1} />
+          <Box flexGrow={1} flexDirection="column">{underlay}</Box>
           {/* The sheet spans the full width and can reach as far down as
               termHeight - 6 (panel/layout.ts), so probes live on the bottom row,
               the one place no sheet height can cover. */}
@@ -362,7 +370,7 @@ export function CommandBarHarness({
               dataProvider={dataProvider}
               tickerRepository={tickerRepository as any}
               pluginRegistry={pluginRegistry}
-              quitApp={() => {}}
+              quitApp={() => onQuit?.()}
               onCheckForUpdates={onCheckForUpdates}
             />
           )}

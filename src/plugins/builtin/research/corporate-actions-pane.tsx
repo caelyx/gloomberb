@@ -22,18 +22,21 @@ import type {
   CorporateActionsData,
 } from "../../../types/financials";
 import { blendHex, colors } from "../../../theme/colors";
-import { formatPercent } from "../../../utils/format";
+import { MISSING_VALUE, formatPercent } from "../../../utils/format";
+import { formatFilingDate } from "../../../utils/datetime-format";
+import { NOT_MEANINGFUL_TEXT } from "../../../utils/growth";
 import { useResolvedEntryValue, useSecFilingDocuments, useSecFilingsQuery } from "../../../market-data/hooks";
 import { instrumentFromTicker } from "../../../market-data/request-types";
 import { usePaneTicker } from "../../../state/app/context";
 import { mayBeUsEquityTicker } from "../../../utils/sec";
+import { loadAnalystResearch } from "./client";
 import { useAssetData, usePluginPaneState } from "../../runtime";
 import { handleRefreshKey } from "../../../components/data-table/table-pane";
 import { SignInWall } from "../cloud/auth-actions";
 import { isCloudSessionRequired, useResearchCloudSession } from "../shared/research-cloud-session";
 import { useBoundTicker as useSymbolBinding, useTickerRequest } from "../shared/ticker-request";
 import { loadEarningsCalendar } from "../earnings/data/cache";
-import { calendarEventOf, newYorkDay, withResolvedEarnings } from "../shared/earnings-calendar";
+import { calendarEventOf, listingDay, withResolvedEarnings } from "../shared/earnings-calendar";
 import {
   documentContentKey,
   formatCompactDocumentLabel,
@@ -48,6 +51,7 @@ import {
   buildEventRows,
   eventSourceNotice,
   formatEventMetric,
+  isFundListing,
   type EventFinancials,
   type EventRow,
   type EventStatus,
@@ -60,14 +64,6 @@ const SEC_EVENT_FILING_LIMIT = 50;
 const SEC_EVENT_MATCH_WINDOW_DAYS = 7;
 
 const eventRowKey = (row: EventRow) => row.id;
-
-function todayDateKey(): string {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
 
 function dateKeyToEpochDay(dateKey: string): number | null {
   const timestamp = new Date(`${dateKey}T00:00:00Z`).getTime();
@@ -141,46 +137,54 @@ export function matchEarningsSecFiling(row: { status: string; date: string; date
   return best?.filing ?? null;
 }
 
-/** Share the currency label; EE marks any unstated currencies separately. */
-function sharedMetricCurrency(rows: readonly EventRow[], allowUnstated = false): string | undefined {
-  const currencies = new Set<string | undefined>();
+/**
+ * The one currency every stated EPS and revenue amount is in, named once above
+ * the table (EVT and EE alike). An amount whose source stated no currency is
+ * marked `?` beside it rather than counted, so it never reads as that currency;
+ * amounts in several currencies keep their own codes.
+ */
+function sharedMetricCurrency(rows: readonly EventRow[]): string | undefined {
+  const currencies = new Set<string>();
   for (const row of rows) {
     for (const [value, currency] of [
       [row.qEps, row.epsCurrency], [row.annualEps, row.epsCurrency],
       [row.qRevenue, row.revenueCurrency], [row.annualRevenue, row.revenueCurrency],
     ] as const) {
-      if (value != null && Number.isFinite(value) && (currency || !allowUnstated)) currencies.add(currency || undefined);
+      if (value != null && Number.isFinite(value) && currency) currencies.add(currency);
     }
   }
   const [only] = currencies;
   return currencies.size === 1 ? only : undefined;
 }
 
-export function buildEventColumns(width: number, unit?: string, variant: "corporate-actions" | "earnings-estimates" = "corporate-actions"): EventColumn[] {
+/** The earnings figures a fund's events never have: its rows are distributions and splits. */
+const EARNINGS_COLUMN_IDS: ReadonlySet<EventColumnId> = new Set(["period", "qEps", "qRevenue", "annualEps", "annualRevenue"]);
+
+export function buildEventColumns(width: number, unit?: string, variant: "corporate-actions" | "earnings-estimates" = "corporate-actions", fund = false): EventColumn[] {
   if (variant === "earnings-estimates") {
     return fitChartTableColumns<EventColumn>([
-      { id: "date", label: "DATE", width: 10, align: "left" },
+      { id: "date", label: "DATE", width: 11, align: "left" },
       { id: "status", label: "EVENT", width: 8, align: "left" },
       { id: "period", label: "PERIOD", width: 9, align: "left" },
       { id: "eps", label: "EPS", width: unit ? 7 : 11, align: "right" },
       { id: "revenue", label: "REVENUE", width: unit ? 9 : 13, align: "right" },
-      { id: "surprise", label: "EPS SURP", width: 9, align: "right" },
-      { id: "growth", label: "YOY GROWTH", width: 14, align: "right" },
+      { id: "surprise", label: "EPS SURP", width: 9, align: "right", omitWhenEmpty: "visible" },
+      { id: "growth", label: "YOY GROWTH", width: 14, align: "right", omitWhenEmpty: true },
       { id: "detail", label: "DETAIL", width: 9, align: "left", flexGrow: 1 },
     ], width, ["detail", "growth", "revenue"]);
   }
-  const withUnit = (label: string) => unit ? `${label} ${unit}` : label;
   const columns: EventColumn[] = [
-    { id: "date", label: "DATE", width: 10, align: "left" },
+    { id: "date", label: "DATE", width: 11, align: "left" },
     { id: "status", label: "EVENT", width: 8, align: "left" },
     { id: "period", label: "PERIOD", width: 12, align: "left" },
-    { id: "qEps", label: withUnit("Q EPS"), width: 12, align: "right" },
-    { id: "qRevenue", label: withUnit("Q REV"), width: 12, align: "right" },
-    { id: "annualEps", label: withUnit("ANN EPS"), width: 12, align: "right" },
-    { id: "annualRevenue", label: withUnit("ANN REV"), width: 12, align: "right" },
+    { id: "qEps", label: "Q EPS", width: 12, align: "right" },
+    { id: "qRevenue", label: "Q REV", width: 12, align: "right" },
+    { id: "annualEps", label: "ANN EPS", width: 12, align: "right" },
+    { id: "annualRevenue", label: "ANN REV", width: 12, align: "right" },
     { id: "value", label: "VALUE", width: 11, align: "right" },
     { id: "detail", label: "DETAIL", width: 9, align: "left", flexGrow: 1 },
   ];
+  if (fund) return fitChartTableColumns(columns.filter((column) => !EARNINGS_COLUMN_IDS.has(column.id)), width, ["detail"]);
   return fitChartTableColumns(columns, width, ["annualRevenue", "annualEps", "qRevenue", "qEps", "detail"]);
 }
 
@@ -198,18 +202,18 @@ function eventDetailTitle(row: EventRow): string {
 /** The row's figures in one line; the date is left to the detail title. */
 function eventSummaryLine(row: EventRow): string {
   return [
-    row.period !== "-" ? row.period : null,
+    row.period !== MISSING_VALUE ? row.period : null,
     row.qEps != null ? `EPS ${formatEventMetric(row.qEps, row.epsCurrency, "eps")}` : null,
     row.qRevenue != null ? `Rev ${formatEventMetric(row.qRevenue, row.revenueCurrency, "revenue")}` : null,
     row.annualEps != null ? `Ann EPS ${formatEventMetric(row.annualEps, row.epsCurrency, "eps")}` : null,
     row.annualRevenue != null ? `Ann Rev ${formatEventMetric(row.annualRevenue, row.revenueCurrency, "revenue")}` : null,
-    row.value !== "-" ? row.value : null,
+    row.value !== MISSING_VALUE ? row.value : null,
     row.detail || null,
   ].filter((line): line is string => !!line).join(" | ");
 }
 
 function earningsInput(value: number | undefined, currency?: string): string {
-  if (value == null || !Number.isFinite(value)) return "-";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   const amount = new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 }).format(value);
   return currency ? `${amount} ${currency}` : amount;
 }
@@ -266,9 +270,9 @@ export function buildEventDetail({
           detailRow("Low", amount(estimate.low)),
           detailRow("High", amount(estimate.high)),
           detailRow("Prior year", amount(estimate.yearAgo)),
-          detailRow("Growth", estimate.growth == null ? "-" : formatPercent(estimate.growth), undefined,
+          detailRow("Growth", estimate.growth == null ? MISSING_VALUE : formatPercent(estimate.growth), undefined,
             estimate.growth == null || estimate.growth === 0 ? undefined : estimate.growth > 0 ? "positive" : "negative"),
-          detailRow("Analysts", estimate.analysts == null ? "-" : String(estimate.analysts)),
+          detailRow("Analysts", estimate.analysts == null ? MISSING_VALUE : String(estimate.analysts)),
           ...(estimate.currency ? [] : [detailNote("Currency unavailable.")]),
         ],
       });
@@ -309,7 +313,9 @@ export function buildEventDetail({
         row.epsActual == null && row.epsBasis === "adjusted" ? "adjusted" : null].filter(Boolean).join(", ") || undefined),
   ];
   if (row.epsDifference != null) comparison.push(detailRow("Difference", earningsInput(row.epsDifference, row.epsCurrency)));
-  if (row.surprisePercent != null) {
+  if (row.surpriseNotMeaningful) {
+    comparison.push(detailRow("Surprise", NOT_MEANINGFUL_TEXT, "against a loss or zero estimate"));
+  } else if (row.surprisePercent != null) {
     comparison.push(detailRow("Surprise", `${earningsInput(row.surprisePercent)}%`, undefined,
       row.surprisePercent === 0 ? undefined : row.surprisePercent > 0 ? "positive" : "negative"));
   }
@@ -443,28 +449,38 @@ export function CorporateActionsView({
   // Only the statements and the trailing EPS are read, so the rows do not rebuild on price ticks.
   const { financials: tickerFinancials } = usePaneTicker();
   const quarterlyStatements = tickerFinancials?.quarterlyStatements;
+  const annualStatements = tickerFinancials?.annualStatements;
   const financialCurrency = tickerFinancials?.financialCurrency;
   const trailingEps = tickerFinancials?.fundamentals?.eps;
   const trailingEpsCurrency = tickerFinancials?.fundamentals?.epsCurrency;
+  const trailingEpsSource = tickerFinancials?.fundamentals?.trailingEpsSource;
   const fundamentalsCurrency = tickerFinancials?.fundamentals?.financialCurrency;
   const marketCapCurrency = tickerFinancials?.fundamentals?.marketCapCurrency;
   const quoteCurrency = tickerFinancials?.quote?.currency;
+  // The listing's type, as `fn EVT` reads it: a fund's events are its distributions, never a feed's EPS rows.
+  const quoteType = tickerFinancials?.quote?.instrumentType;
+  const metadataType = tickerFinancials?.quoteMetadata?.instrumentType;
   const financialsData = useMemo<EventFinancials | null>(
-    () => (quarterlyStatements || financialCurrency || trailingEps != null ? {
+    () => (quarterlyStatements || financialCurrency || trailingEps != null || quoteType || metadataType ? {
       quarterlyStatements: quarterlyStatements ?? [],
+      // Their last end names the fiscal quarters (Q1 FY2027), as GUIDE and ERN name them.
+      annualStatements: annualStatements ?? [],
       financialCurrency,
-      fundamentals: { eps: trailingEps, epsCurrency: trailingEpsCurrency, financialCurrency: fundamentalsCurrency, marketCapCurrency },
-      quote: quoteCurrency ? { currency: quoteCurrency } : null,
+      fundamentals: { eps: trailingEps, epsCurrency: trailingEpsCurrency, financialCurrency: fundamentalsCurrency, marketCapCurrency, trailingEpsSource },
+      quote: quoteCurrency || quoteType ? { currency: quoteCurrency ?? "", instrumentType: quoteType } : null,
+      quoteMetadata: metadataType ? { instrumentType: metadataType } : null,
     } : null),
-    [financialCurrency, fundamentalsCurrency, marketCapCurrency, quarterlyStatements, quoteCurrency, trailingEps, trailingEpsCurrency],
+    [annualStatements, financialCurrency, fundamentalsCurrency, marketCapCurrency, metadataType, quarterlyStatements, quoteCurrency, quoteType,
+      trailingEps, trailingEpsCurrency, trailingEpsSource],
   );
+  const fund = isFundListing(financialsData);
   const actionsLoader = useCallback((nextSymbol: string, nextExchange: string, forceRefresh: boolean) => {
     if (!dataProvider?.getCorporateActions) throw new Error("Corporate actions source unavailable");
     return dataProvider.getCorporateActions(nextSymbol, nextExchange, forceRefresh ? { cacheMode: "refresh" } : undefined);
   }, [dataProvider, cloudSession.requestKey]);
   const analystLoader = useCallback(async (nextSymbol: string, nextExchange: string, forceRefresh: boolean) => {
     if (!dataProvider?.getAnalystResearch) return null;
-    return dataProvider.getAnalystResearch(nextSymbol, nextExchange, forceRefresh ? { cacheMode: "refresh" } : undefined);
+    return loadAnalystResearch(dataProvider, nextSymbol, nextExchange, forceRefresh ? { cacheMode: "refresh" } : undefined);
   }, [dataProvider, cloudSession.requestKey]);
   // The earnings calendar's next report, which the rows are resolved against as `earnings` and ERN read it.
   const calendarLoader = useCallback((nextSymbol: string, _exchange: string, forceRefresh: boolean) => (
@@ -476,8 +492,9 @@ export function CorporateActionsView({
     error: actionsError,
     reload: reloadActions,
   } = useTickerRequest<CorporateActionsData>(actionsLoader, symbol, exchange);
-  const { data: calendarEvent, reload: reloadCalendar } = useTickerRequest(calendarLoader, symbol, exchange);
-  const today = newYorkDay();
+  const { data: calendarEvent, loading: calendarLoading, error: calendarError, reload: reloadCalendar } = useTickerRequest(calendarLoader, symbol, exchange);
+  // The listing's own day, as `earnings` reads a report date: SIE:XETRA's has passed once Berlin's day has.
+  const today = listingDay(exchange);
   const actionsData = useMemo(
     () => (recordedActions ? withResolvedEarnings(recordedActions, calendarEvent, today) : recordedActions),
     [calendarEvent, recordedActions, today],
@@ -492,17 +509,21 @@ export function CorporateActionsView({
   const allRows = useMemo(() => (
     buildEventRows(actionsData, analystData, financialsData, displayCurrency)
   ), [actionsData, analystData, displayCurrency, financialsData]);
+  // In the order they happen, as a calendar reads, from the oldest to the
+  // furthest estimate; the pane opens on the present (selectedIdx). The
+  // model's newest-first order is the report's, cut by a limit; a day's
+  // events keep its order among themselves.
   const rows = useMemo(() => (
     variant === "earnings-estimates"
       ? allRows.filter((row) => EARNINGS_STATUSES.has(row.status))
-      : allRows
-  ), [allRows, variant]);
-  const unit = useMemo(() => sharedMetricCurrency(rows, variant === "earnings-estimates"), [rows, variant]);
+      : [...allRows]
+  ).sort((left, right) => left.date.localeCompare(right.date)), [allRows, variant]);
+  const unit = useMemo(() => sharedMetricCurrency(rows), [rows]);
   const hasUnstatedCurrency = rows.some((row) =>
     ((row.qEps != null || row.annualEps != null) && !row.epsCurrency)
     || ((row.qRevenue != null || row.annualRevenue != null) && !row.revenueCurrency));
   const currencyMeta = [unit, hasUnstatedCurrency ? "? currency unstated" : null].filter(Boolean).join(" · ");
-  const columns = useMemo(() => buildEventColumns(width, unit, variant), [width, unit, variant]);
+  const columns = useMemo(() => buildEventColumns(width, unit, variant, fund), [width, unit, variant, fund]);
   const sourceNotice = useMemo(() => (
     actionsLoading || analystLoading
       ? null
@@ -511,28 +532,39 @@ export function CorporateActionsView({
         symbol: symbol ?? "this ticker",
         actions: actionsData,
         actionsError,
-        estimates: analystData,
-        estimatesError: analystError,
+        // A fund has no analyst estimates to miss.
+        estimates: fund ? null : analystData,
+        estimatesError: fund ? null : analystError,
       })
-  ), [actionsData, actionsError, actionsLoading, analystData, analystError, analystLoading, symbol, variant]);
+  ), [actionsData, actionsError, actionsLoading, analystData, analystError, analystLoading, fund, symbol, variant]);
   // Keyed by row id, not by position, so a reload or a shared layout comes
   // back to the same event.
   const [selectedKey, setSelectedKey] = usePluginPaneState<string | null>("selectedKey", null);
-  const selectedIdx = Math.max(0, rows.findIndex((row) => eventRowKey(row) === selectedKey));
+  // Until one is picked, the next event: the rows run oldest to the furthest estimate, and the present is what is read first.
+  const selectedIdx = useMemo(() => {
+    const picked = rows.findIndex((row) => eventRowKey(row) === selectedKey);
+    if (picked >= 0) return picked;
+    const next = rows.findIndex((row) => row.date >= today);
+    return next >= 0 ? next : Math.max(0, rows.length - 1);
+  }, [rows, selectedKey, today]);
   const [openRowId, setOpenRowId] = usePluginPaneState<string | null>("openRowId", null);
   const detailScrollRef = useRef<ScrollBoxRenderable>(null);
-  const todayKey = todayDateKey();
   const futureRowBackground = blendHex(colors.bg, colors.positive, 0.16);
-  // Memoized so the table's row memo holds while the selection moves.
+  // Tinted after the day the pane opens on, New York's, as the calendar dates
+  // a report: on the local day, a reader east of New York saw today's row
+  // opened untinted beside the next day's. Memoized so the table's row memo
+  // holds while the selection moves.
   const rowBackground = useCallback((row: EventRow) => (
-    row.date > todayKey ? futureRowBackground : undefined
-  ), [futureRowBackground, todayKey]);
-  const loading = actionsLoading || analystLoading;
+    row.date > today ? futureRowBackground : undefined
+  ), [futureRowBackground, today]);
+  const loading = actionsLoading || analystLoading || (calendarLoading && !!recordedActions);
   const authWall = !loading && !actionsData && !analystData && (isCloudSessionRequired(actionsError) || isCloudSessionRequired(analystError));
   // Parallel requests fail with the same message ("No ticker selected"), so the
   // footer must report each distinct reason once.
   const error = [...new Set([actionsError, analystError].filter((value): value is string => !!value && !isCloudSessionRequired(value)))]
     .join(" | ") || null;
+  const loadError = error ?? (sourceNotice?.failed ? sourceNotice.text : null)
+    ?? (recordedActions && !rows.length ? calendarError : null);
   const reload = useCallback(() => {
     reloadActions();
     reloadAnalyst();
@@ -617,34 +649,35 @@ export function CorporateActionsView({
     row: EventRow,
     column: EventColumn,
   ): DataTableCell => {
+    // Bare under the currency named above the table, with its own code otherwise, `?` when its source stated none.
+    const metric = (value: number | undefined, currency: string | undefined, kind: "eps" | "revenue"): DataTableCell => {
+      const text = formatEventMetric(value, unit ? undefined : currency, kind);
+      return { text: value != null && !currency ? `${text} ?` : text, value: unit && currency ? value : undefined, color: colors.textDim };
+    };
     switch (column.id) {
       case "date":
-        return { text: row.date, color: colors.textDim };
+        // Day-first as the Filings tab beside it dates its rows; the ISO day still sorts the column.
+        return { text: formatFilingDate(row.date, row.date), value: row.date, color: colors.textDim };
       case "status":
         return { text: row.status, color: colors.textBright, attributes: TextAttributes.BOLD };
       case "period":
         return { text: row.period, color: colors.textDim };
       case "eps":
-      case "revenue": {
-        const eps = column.id === "eps";
-        const value = eps ? row.qEps ?? row.annualEps : row.qRevenue ?? row.annualRevenue;
-        const currency = eps ? row.epsCurrency : row.revenueCurrency;
-        const text = formatEventMetric(value, unit ? undefined : currency, eps ? "eps" : "revenue");
-        return { text: value != null && !currency ? `${text} ?` : text,
-          value: unit && currency ? value : undefined, color: colors.textDim };
-      }
+        return metric(row.qEps ?? row.annualEps, row.epsCurrency, "eps");
+      case "revenue":
+        return metric(row.qRevenue ?? row.annualRevenue, row.revenueCurrency, "revenue");
       case "surprise":
-        return { text: row.status === "Earnings" ? row.value : "-", value: row.surprisePercent, color: row.status === "Earnings" ? toneColor(row.tone) : colors.textDim };
+        return { text: row.status === "Earnings" ? row.value : MISSING_VALUE, value: row.surprisePercent, color: row.status === "Earnings" ? toneColor(row.tone) : colors.textDim };
       case "growth":
-        return { text: row.estimateGrowthMetric && row.value !== "-" ? `${row.value} ${row.estimateGrowthMetric === "eps" ? "EPS" : "rev"}` : "-", color: row.estimateGrowthMetric ? toneColor(row.tone) : colors.textDim };
+        return { text: row.estimateGrowthMetric && row.value !== MISSING_VALUE ? `${row.value} ${row.estimateGrowthMetric === "eps" ? "EPS" : "rev"}` : MISSING_VALUE, color: row.estimateGrowthMetric ? toneColor(row.tone) : colors.textDim };
       case "qEps":
-        return { text: formatEventMetric(row.qEps, unit ? undefined : row.epsCurrency, "eps"), color: colors.textDim };
+        return metric(row.qEps, row.epsCurrency, "eps");
       case "qRevenue":
-        return { text: formatEventMetric(row.qRevenue, unit ? undefined : row.revenueCurrency, "revenue"), color: colors.textDim };
+        return metric(row.qRevenue, row.revenueCurrency, "revenue");
       case "annualEps":
-        return { text: formatEventMetric(row.annualEps, unit ? undefined : row.epsCurrency, "eps"), color: colors.textDim };
+        return metric(row.annualEps, row.epsCurrency, "eps");
       case "annualRevenue":
-        return { text: formatEventMetric(row.annualRevenue, unit ? undefined : row.revenueCurrency, "revenue"), color: colors.textDim };
+        return metric(row.annualRevenue, row.revenueCurrency, "revenue");
       case "value":
         return { text: row.value, color: toneColor(row.tone) };
       case "detail":
@@ -659,7 +692,8 @@ export function CorporateActionsView({
   usePaneStatusFooter({
     registrationId: footerPaneId,
     loading,
-    error: error ?? (sourceNotice?.failed ? sourceNotice.text : null),
+    error: loadError,
+    emptyResult: !!actionsData && !rows.length && !sourceNotice,
   });
 
   usePaneNoticeFooter({
@@ -693,23 +727,26 @@ export function CorporateActionsView({
       rootWidth={width}
       rootHeight={height}
       rootBefore={<ChartTableHeader width={width} height={height} tableRows={rows.length} tableColumns={columns}
-        query={variant === "earnings-estimates" && currencyMeta ? <QueryBar width={width} meta={currencyMeta} /> : undefined} />}
+        query={currencyMeta ? <QueryBar width={width} meta={currencyMeta} /> : undefined} />}
       onRootKeyDown={handleKeyDown}
       columns={columns}
       items={rows}
+      scrollToIndex={selectedIdx}
+      scrollToIndexAlign={variant === "earnings-estimates" ? "start" : undefined}
+      scrollToIndexVersion={rows.length}
       sortColumnId={null}
-      sortDirection="desc"
+      sortDirection="asc"
       getItemKey={eventRowKey}
       renderCell={renderCell}
-      getExportMetadata={variant === "earnings-estimates" ? () => [
+      getExportMetadata={() => [
         ...(unit ? [["Currency", unit]] : []),
         ...(hasUnstatedCurrency ? [["?", "Currency unstated"]] : []),
-      ] : undefined}
+      ]}
       selectedTextOverridesCellColor
       getRowBackgroundColor={rowBackground}
-      emptyStateTitle={loading
-        ? (variant === "earnings-estimates" ? "Loading earnings estimates..." : "Loading events...")
-        : error ?? sourceNotice?.text ?? (variant === "earnings-estimates" ? "No earnings estimates" : "No events")}
+      status={{ loading: loading && !rows.length, error: !loading && !rows.length ? loadError : null,
+        subject: variant === "earnings-estimates" ? "earnings estimates" : "events" }}
+      emptyStateTitle={sourceNotice?.text ?? (variant === "earnings-estimates" ? "No earnings estimates" : "No events")}
     />
   );
 }

@@ -7,6 +7,7 @@ import {
   renderReportNdjson,
   reportFooterLines,
   selectReportTables,
+  withRefusedRows,
   type CliReportTables,
 } from "./report-tables";
 import type { ReportFreshness } from "./pane-functions/freshness";
@@ -43,6 +44,46 @@ describe("report tables", () => {
       { metric: "Net income", 2025: 112_010_000_000, text: "112.0 +19%" },
     ]);
     expect(table.rows).toEqual([["Revenue", 416.161], ["Net income", 112.01]]);
+  });
+
+  test("a column's scale is decided once from all its figures, so a spread near zero exports at its neighbours' scale", () => {
+    // HIVG's IV-HV spread is a fraction drawn in points: 0.0013 drawn "+0.1" is within a step of itself too, and alone
+    // exported as 0.0013 beside 0.8586.
+    const points = (value: unknown) => `${Number(value) >= 0 ? "+" : ""}${(Number(value) * 100).toFixed(1)}`;
+    const table = exportRowsTable("History", [
+      { key: "date", header: "Date" },
+      { key: "spread", header: "IV-HV", align: "right", format: points },
+    ], [
+      { date: "2026-09-17", spread: 0.00858637789209 },
+      { date: "2026-09-16", spread: 0.00129604323566 },
+      { date: "2026-09-15", spread: -0.000779004930701 },
+    ]);
+    expect(table.rows).toEqual([["2026-09-17", 0.858637789209], ["2026-09-16", 0.129604323566], ["2026-09-15", -0.0779004930701]]);
+    // Where every value fits several scales, the one closest to what is drawn; a column of one row is read alike.
+    const alone = exportRowsTable("History", [{ key: "spread", header: "IV-HV", align: "right", format: points }], [{ spread: 0.00129604323566 }]);
+    expect(alone.rows).toEqual([[0.129604323566]]);
+    // A figure drawn as zero says nothing of the scale: 0.04 drawn "0" is 0.04, never 0.0004.
+    const zero = exportRowsTable("Change", [{ key: "change", header: "Change", align: "right", format: (value) => Number(value).toFixed(0) }], [{ change: 0.04 }]);
+    expect(zero.rows).toEqual([[0.04]]);
+  });
+
+  test("a symbol a list left out still has its row, its reason in status and its figures empty", () => {
+    // `fn VCA "USDJPY Curncy,FXY,7203 JT Equity" --csv` wrote FXY alone; the other two were only on stderr.
+    const table = exportRowsTable("Rich/cheap", [
+      { key: "symbol", header: "Symbol" },
+      { key: "iv30", header: "IV30", format: percent },
+    ], [{ symbol: "FXY", iv30: 0.077 }], { status: true });
+    const report = withRefusedRows({ tables: [table] }, [
+      { symbol: "USDJPY=X", reason: "OTC FX volatility is not covered for USDJPY=X." },
+      { symbol: "7203:JPX", reason: "Implied volatility covers US listings only." },
+    ]);
+    expect(report.tables[0]!.columns).toEqual(["Symbol", "IV30 (%)", "status"]);
+    expect(report.tables[0]!.rows).toEqual([
+      ["FXY", 7.7, ""],
+      ["USDJPY=X", "", "OTC FX volatility is not covered for USDJPY=X."],
+      ["7203:JPX", "", "Implied volatility covers US listings only."],
+    ]);
+    expect(report.tables[0]!.rowIdentities?.map((identity) => identity?.symbolOrSeries)).toEqual([undefined, "USDJPY=X", "7203:JPX"]);
   });
 
   test("a value drawn with its sign turned exports as drawn, every digit, not the rounded figure", () => {
@@ -119,10 +160,10 @@ describe("report tables", () => {
       { label: "Breakdown", value: { up: 3, down: 2 } },
       { label: "Yield", value: 0.0425, formatted: "4.25%" },
       { label: "Tenor", value: "3M" },
-      { label: "EPS", value: 31.43, formatted: "31.43 (ccy?)", unit: "ccy?" },
+      { label: "EPS", value: 31.43, formatted: "31.43 ZAR", unit: "ZAR" },
     ]);
     expect(entries.columns).toEqual(["Metric", "Value"]);
-    expect(entries.rows).toEqual([["Breakdown", "up: 3, down: 2"], ["Yield (%)", 4.25], ["Tenor", "3M"], ["EPS (ccy?)", 31.43]]);
+    expect(entries.rows).toEqual([["Breakdown", "up: 3, down: 2"], ["Yield (%)", 4.25], ["Tenor", "3M"], ["EPS (ZAR)", 31.43]]);
   });
 
   test("a rendered table exports the instant behind a shortened time and numbers from its text", () => {
@@ -132,6 +173,11 @@ describe("report tables", () => {
     ]);
     expect(table.columns).toEqual(["Symbol", "Last", "Last unit", "Time"]);
     expect(table.rows).toEqual([["ES", 7864.25, "", "2026-10-07T15:27:00.000Z"], ["ZC", 480.5, "c", ""]]);
+    // A volume drawn short exports as the source counted it; a price is never swapped for a value behind it.
+    const volumes = exportTextTable("Futures", ["Symbol", "Last", "VOL"], [
+      [{ text: "ES" }, { text: "7,864.25", value: 7864.2512 }, { text: "1.19M", value: 1_193_314 }],
+    ]);
+    expect(volumes.rows).toEqual([["ES", 7864.25, 1_193_314]]);
   });
 
   test("a reason drawn for a missing figure goes to status, and the columns are the same with or without one", () => {
@@ -235,20 +281,30 @@ describe("report CSV and NDJSON", () => {
       ],
       footer: [],
     };
+    const retrieved = "2026-10-09T18:30:00.000Z";
     expect(renderReportCsv(tables, freshness).split("\n")).toEqual([
       "# section: Rates",
-      "Jurisdiction,source,as_of,symbol_or_series,currency_or_unit,interval",
-      "Japan,BIS,2026-10-13,,,",
-      "United States,FRED,2026-10-20,,,",
+      "Jurisdiction,source,as_of,symbol_or_series,currency_or_unit,interval,retrieved_at",
+      `Japan,BIS,2026-10-13,,,,${retrieved}`,
+      `United States,FRED,2026-10-20,,,,${retrieved}`,
       "",
       "# section: Indices",
-      "Index,Last,symbol_or_series,currency_or_unit,interval,source,as_of",
-      "DAX,25087.27,,,,Gloom Cloud,2026-10-09T18:28:00.000Z",
+      "Index,Last,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at",
+      `DAX,25087.27,,,,Gloom Cloud,2026-10-09T18:28:00.000Z,${retrieved}`,
     ]);
     expect(renderReportNdjson(tables, freshness).split("\n").map((line) => JSON.parse(line))).toEqual([
-      { section: "Rates", Jurisdiction: "Japan", source: "BIS", as_of: "2026-10-13", symbol_or_series: null, currency_or_unit: null, interval: null },
-      { section: "Rates", Jurisdiction: "United States", source: "FRED", as_of: "2026-10-20", symbol_or_series: null, currency_or_unit: null, interval: null },
-      { section: "Indices", Index: "DAX", Last: 25087.27, symbol_or_series: null, currency_or_unit: null, interval: null, source: "Gloom Cloud", as_of: "2026-10-09T18:28:00.000Z" },
+      { section: "Rates", Jurisdiction: "Japan", source: "BIS", as_of: "2026-10-13", symbol_or_series: null, currency_or_unit: null, interval: null, retrieved_at: retrieved },
+      { section: "Rates", Jurisdiction: "United States", source: "FRED", as_of: "2026-10-20", symbol_or_series: null, currency_or_unit: null, interval: null, retrieved_at: retrieved },
+      { section: "Indices", Index: "DAX", Last: 25087.27, symbol_or_series: null, currency_or_unit: null, interval: null, source: "Gloom Cloud", as_of: "2026-10-09T18:28:00.000Z", retrieved_at: retrieved },
+    ]);
+    // Columns a table gained after its fixed ones (FUT's group) close the row, so no column an earlier export had moves.
+    const grouped: CliReportTables = {
+      tables: [{ title: "Futures", columns: ["SYM", "LAST", "Group"], rows: [["ES", 7570.75, "Equity Index"]], appendedColumns: 1 }],
+      footer: [],
+    };
+    expect(renderReportCsv(grouped, freshness).split("\n")).toEqual([
+      "SYM,LAST,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at,Group",
+      `ES,7570.75,,,,Gloom Cloud,2026-10-09T18:28:00.000Z,${retrieved},Equity Index`,
     ]);
   });
 

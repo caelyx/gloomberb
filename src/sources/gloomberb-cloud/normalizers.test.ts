@@ -7,6 +7,10 @@ import { deriveQuarterlyStatements } from "../../time-series/fundamentals";
 import { formatMarketChangeWithCurrency, formatMarketPriceWithCurrency, quoteFormatOptions } from "../../market-data/market/format";
 import { sessionQuotes } from "../../test-support/test-fixture-session-quotes";
 import type { Quote } from "../../types/financials";
+import { statedYearRange } from "../../market-data/quotes/live-valuation";
+import { quoteMarketStateLabel } from "../../market-data/market/status";
+import { dailyCloseText } from "../../market-data/quotes/freshness";
+import { quoteSourceName } from "../../market-data/quotes/export-identity";
 
 test("daily fund NAV mapping separates its observation kind from monetary price units", () => {
   const raw: CloudQuotePayload = {
@@ -111,6 +115,44 @@ test("a previous close far below the 52-week low drops the move it implies, and 
   expect(pennyGap).toMatchObject({ previousClose: 0.5, change: 4.5, changePercent: 900 });
   const { low52w: _omitted, ...withoutRange } = base;
   expect(mapQuote({ ...withoutRange, previousClose: 0.0002, change: 3813.79, changePercent: 1 }).change).toBe(3813.79);
+});
+
+test("an index's 0 open is none, a 52-week range that repeats its day's is none, and one from the daily bars says so", () => {
+  const index = (overrides: Partial<CloudQuotePayload>) => mapQuote({
+    symbol: "^CASE30", currency: "EGP", instrumentType: "INDEX", price: 52023.4, previousClose: 52500.5, change: -477.1, changePercent: -0.91,
+    open: 52671.5, low: 51904.4, high: 52691.3, low52w: 51904.4, high52w: 52691.3, lastUpdated: Date.parse("2026-11-12T12:25:00Z"),
+    listingExchangeName: "EGX", providerId: "gloomberb-cloud", dataSource: "delayed", ...overrides,
+  } as CloudQuotePayload);
+  // As served on Thu 12 Nov 2026: the day's range again, so no 52-week range at all.
+  expect(statedYearRange(index({}))).toBeNull();
+  const fromBars = index({ low52w: 39537, high52w: 56931, yearRangeBasis: "daily-bars" });
+  expect(statedYearRange(fromBars)).toEqual({ low: 39537, high: 56931 });
+  expect(fromBars.yearRangeBasis).toBe("daily-bars");
+  // The word goes with its range: a tick relaying the same range keeps it, one with the day's range again (a copy
+  // saved before the server read the bars) drops it, never labelling the day's range "daily bars".
+  const kept = normalizeQuoteContribution(fromBars)!;
+  const { yearRangeBasis: _unsaid, ...relayed } = fromBars;
+  expect(mergeQuoteContribution(kept, { ...relayed, price: 52030 }).yearRangeBasis).toBe("daily-bars");
+  const { yearRangeBasis: _none, ...saved } = index({});
+  const merged = mergeQuoteContribution(kept, saved);
+  expect([merged.high52w, merged.yearRangeBasis]).toEqual([52691.3, undefined]);
+  expect(statedYearRange(merged)).toBeNull();
+  // A share whose range is its day's (a new listing) keeps it; a bound at 0 is none.
+  expect(statedYearRange(index({ symbol: "COMI.CA", instrumentType: "EQUITY" }))).toEqual({ low: 51904.4, high: 52691.3 });
+  expect(statedYearRange(index({ low52w: 0, high52w: 209714 }))).toBeNull();
+  // ^BVSP before B3's open: Open 0.00 and Day Range 0.00 - 0.00 are no prices.
+  const beforeOpen = index({ symbol: "^BVSP", currency: "BRL", open: 0, low: 0, high: 0, listingExchangeName: "B3" });
+  expect([beforeOpen.open, beforeOpen.low, beforeOpen.high]).toEqual([undefined, undefined, undefined]);
+  // ^MERV with no live quote: the latest daily bar's close, labelled with its session.
+  const merval = index({ symbol: "^MERV", currency: "ARS", dailyClose: { session: "2026-11-11" }, listingExchangeName: "BYMA" });
+  expect(merval.dailyClose).toEqual({ session: "2026-11-11" });
+  expect([quoteMarketStateLabel(merval), dailyCloseText(merval)]).toEqual(["DAILY CLOSE", "no live quote, daily close of Wed 11 Nov"]);
+  expect(index({ dailyClose: { session: "yesterday" } } as Partial<CloudQuotePayload>).dailyClose).toBeUndefined();
+  // A Treasury yield index's 0 is a level: ^IRX's open, low and 52-week low of 0.00 stand.
+  const bill = index({ symbol: "^IRX", currency: "USD", price: 0.01, open: 0, low: 0, high: 0.02, low52w: -0.01, high52w: 1.62,
+    listingExchangeName: "CBOE" });
+  expect([bill.open, bill.low, bill.high]).toEqual([0, 0, 0.02]);
+  expect(statedYearRange(bill)).toEqual({ low: -0.01, high: 1.62 });
 });
 
 test("a null last-session move from the service is no move", () => {
@@ -272,4 +314,42 @@ test("the overnight price rides only on the frame that says so, through the merg
     .toEqual(["PRE", undefined, undefined, undefined]);
   // A source that says PRE drops a carried overnight price however it arrived.
   expect(normalizeQuoteContribution({ ...night, marketState: "PRE" })?.overnightPrice).toBeUndefined();
+});
+
+test("a coin priced by one exchange's own trade is named by the exchange, as its source, until a quote without one replaces it", () => {
+  const raw: CloudQuotePayload = {
+    symbol: "USDT-USD", currency: "USD", instrumentType: "CRYPTOCURRENCY", price: 0.99893, previousClose: 0.9986,
+    change: 0.00033, changePercent: 0.033, lastUpdated: Date.parse("2026-11-13T15:08:44Z"), listingExchangeName: "CCC",
+    providerId: "gloomberb-cloud", dataSource: "live", priceVenue: "Coinbase",
+  };
+  const quote = mapQuote(raw);
+  expect(quote.priceVenue).toBe("Coinbase");
+  expect(quoteSourceName(quote)).toBe("Coinbase");
+  // The composite, and a name that is no exchange's, stay Gloom Cloud's.
+  expect(quoteSourceName(mapQuote({ ...raw, priceVenue: undefined }))).toBe("Gloom Cloud");
+  expect(mapQuote({ ...raw, priceVenue: "<script>" }).priceVenue).toBeUndefined();
+  // The venue is said of each observation: the composite read after an exchange's price does not keep its name.
+  const after = mergeQuoteContribution(normalizeQuoteContribution(quote)!, mapQuote({ ...raw, priceVenue: undefined, dataSource: "delayed", lastUpdated: raw.lastUpdated! + 60_000 }));
+  expect(after.priceVenue).toBeUndefined();
+  // A view's quote, resolved from what each source said, names the venue of the price it shows.
+  expect(resolveCanonicalQuote({ "gloomberb-cloud": normalizeQuoteContribution(quote)! }, raw.lastUpdated!).quote?.priceVenue).toBe("Coinbase");
+});
+
+test("what a coin's day range measures goes with that range: kept by a tick relaying it, replaced with a range from elsewhere", () => {
+  const raw: CloudQuotePayload = {
+    symbol: "USDT-USD", currency: "USD", instrumentType: "CRYPTOCURRENCY", price: 0.99893, previousClose: 0.9986,
+    change: 0.00033, changePercent: 0.033, lastUpdated: Date.parse("2026-11-13T15:08:44Z"), listingExchangeName: "CCC",
+    providerId: "gloomberb-cloud", dataSource: "delayed", low: 0.99868, high: 0.99906, volume: 47_340_000_000, statsBasis: "composite",
+  };
+  const served = normalizeQuoteContribution(mapQuote(raw))!;
+  expect(served.statsBasis).toBe("composite");
+  expect(mapQuote({ ...raw, statsBasis: "stream" as never }).statsBasis).toBeUndefined();
+  // A stream tick built on the served quote relays its range without saying: the word stays.
+  const tick = mapQuote({ ...raw, statsBasis: undefined, price: 0.9989, dataSource: "live", lastUpdated: raw.lastUpdated! + 5_000 });
+  expect(mergeQuoteContribution(served, tick).statsBasis).toBe("composite");
+  // One exchange's own day replaces the range, and says so; a range from elsewhere without a word drops it.
+  const exchangeDay = mapQuote({ ...raw, low: 0.998162, high: 0.999736, volume: 763_300, statsBasis: "exchange", dataSource: "live" });
+  expect(mergeQuoteContribution(served, exchangeDay).statsBasis).toBe("exchange");
+  expect(mergeQuoteContribution(served, mapQuote({ ...raw, low: 0.998, statsBasis: undefined })).statsBasis).toBeUndefined();
+  expect(resolveCanonicalQuote({ "gloomberb-cloud": mergeQuoteContribution(served, exchangeDay) }, raw.lastUpdated!).quote?.statsBasis).toBe("exchange");
 });

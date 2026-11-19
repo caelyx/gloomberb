@@ -1,7 +1,8 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { logFailure } from "../../../utils/log-failure";
 import { useCallback, useEffect, useId, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import {
-  Badge, Button, DataTableView, IconButton, PaneStatusBody, RatioBar, SegmentedControl, Notice, SectionHeading, confirmDialog, usePaneFooter, usePaneNoticeFooter,
+  Badge, Button, DataTableView, IconButton, PaneStatusBody, RatioBar, SegmentedControl, Notice, RowNote, SectionHeading, confirmDialog, usePaneFooter, usePaneNoticeFooter,
   type DataTableCell, type DataTableColumn, type SelectControl,
 } from "../../../components";
 import { loadingErrorFooterInfo, usePaneRefreshKey } from "../../../components/data-table/table-pane";
@@ -87,7 +88,7 @@ function orderPriceText(order: BrokerOrder): string {
 }
 
 function age(timestamp: number, now: number): string {
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return "--";
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return MISSING_VALUE;
   const seconds = Math.max(0, Math.floor((now - timestamp) / 1_000));
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
@@ -156,7 +157,7 @@ function renderExecutionCell(execution: BrokerExecution, column: DataTableColumn
     case "side": return { text: execution.side, content: <Badge label={execution.side} tone={isBuySide(execution.side) ? "positive" : "negative"} /> };
     case "quantity": return { text: quantity(execution.shares), value: execution.shares };
     case "price": return { text: price(execution.price), value: execution.price };
-    case "fees": return { text: execution.commission === undefined ? "--" : `${price(execution.commission)} ${execution.commissionCurrency ?? ""}`.trim() };
+    case "fees": return { text: execution.commission === undefined ? MISSING_VALUE : `${price(execution.commission)} ${execution.commissionCurrency ?? ""}`.trim() };
     default: return { text: age(execution.time, now), color: colors.textDim };
   }
 }
@@ -203,7 +204,7 @@ export function BrokerOrdersView({
   useEffect(() => {
     if (feed.fills === fillsSeen.current) return;
     fillsSeen.current = feed.fills;
-    if (canRead) void reload();
+    if (canRead) reload();
   }, [feed.fills, canRead, reload]);
   // A cancel this view sent follows the order feed, and is asked for every 15 seconds without pushed changes or while
   // its outcome is unknown, which only the broker's answer settles. The fills and the end toast from the feed.
@@ -217,7 +218,7 @@ export function BrokerOrdersView({
   const refresh = useCallback(() => {
     void controller.refreshResult().catch(logFailure("broker-trading.orders", "Refresh broker order result failed"));
     brokerOrderFeed.refresh(instance.id);
-    void reload();
+    reload();
   }, [controller, reload, instance.id]);
   usePaneRefreshKey(refresh, { focused, enabled: active && !!account });
 
@@ -504,7 +505,7 @@ export function BrokerOrdersView({
         }}
         selection={{ kind: "id", selectedId: selected ? brokerOrderKey(selected) : "", getId: brokerOrderKey, onChange: (key) => { selectedKeyRef.current = key; setSelectedKey(key); } }}
         onActivate={modifyOrder} selectedTextOverridesCellColor emptyStateTitle="No open orders in this account."
-        rootAfter={selectedNote ? <Box paddingX={1} flexShrink={0}><Notice tone={selectedNote.tone}>{selectedNote.text}</Notice></Box> : undefined} />
+        rootAfter={selectedNote ? <RowNote tone={selectedNote.tone}>{selectedNote.text}</RowNote> : undefined} />
         : <DataTableView<BrokerExecution> rootWidth={width} rootHeight={Math.max(2, height - 2)} focused={focused && !dialogOpen}
           columns={activityColumns.map((column) => column.id === "quantity" && summaries ? { ...column, label: "Cumulative qty" } : column)}
           items={snapshot?.executions ?? []} sortColumnId={null} sortDirection="desc" getItemKey={(execution) => execution.execId}

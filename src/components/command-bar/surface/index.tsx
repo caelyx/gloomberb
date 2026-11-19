@@ -4,6 +4,7 @@ import type { AppTickerRepositoryPort } from "../../../core/app-service-ports";
 import type { PluginRegistry } from "../../../plugins/registry";
 import type { LayoutBounds } from "../../../layout/pane-manager";
 import { usePlanAccess } from "../../../api-client/plan-access";
+import { useRendererHost } from "../../../ui/host";
 import { buildAssistCommandInventory } from "../assist/inventory";
 import { useCommandBarAssist } from "../assist/runtime";
 import { shouldAutoAskAssist, type AssistRowHandlers } from "../assist/model";
@@ -16,6 +17,7 @@ import {
   useCommandBarSearchProviders,
 } from "../routes/root/search-providers";
 import { useRouteListState } from "../routing/list-state";
+import { useHeaderMarketPicker } from "../routes/header-market";
 import { useCommandBarRootRuntime } from "../routes/root/runtime";
 import { useRootPickPrefetch } from "../routes/root/pick-prefetch";
 import { createQuickLookTickerCandidates } from "../routes/ticker-search/results";
@@ -36,7 +38,13 @@ import { useCommandBarRouteEffects } from "../routing/effects";
 import { useCommandBarEnvironment } from "./environment";
 import { useCommandBarActionRuntime } from "../action-runtime";
 import { requestKeybindingCapture } from "../../../app/keybindings";
+import { resolveTickerRetargetPane } from "../../../layout/ticker-retarget";
+import { resolveTickerEnterTarget } from "../pane-actions";
+import { resolveSelectionKeyHints } from "../selection-hint";
+import { findPaneInstance } from "../../../types/config";
+import { getBasePaneDisplayTitle } from "../../layout/pane/title";
 import { isDialogOpen } from "../../../ui/dialog-stack";
+import { logFailure } from "../../../utils/log-failure";
 
 interface CommandBarProps {
   dataProvider: DataProvider;
@@ -44,6 +52,8 @@ interface CommandBarProps {
   pluginRegistry: PluginRegistry;
   quitApp: () => void;
   onCheckForUpdates?: () => void | Promise<void>;
+  /** Settings' Run Setup Again; without it (the browser, or setup already showing) the command is left out. */
+  onRunSetupAgain?: () => Promise<void>;
   onNativeOccluderChange?: (rect: LayoutBounds | null) => void;
 }
 
@@ -53,6 +63,7 @@ export function CommandBar({
   pluginRegistry,
   quitApp,
   onCheckForUpdates,
+  onRunSetupAgain,
   onNativeOccluderChange,
 }: CommandBarProps) {
   const {
@@ -79,10 +90,15 @@ export function CommandBar({
     titleBarOverlay,
     visibleListStateRef,
   } = useCommandBarEnvironment();
+  const canExit = useRendererHost().canExit !== false;
   // Without an updater (the web terminal) neither checking nor a channel means anything.
-  const availableCommands = useMemo(() => onCheckForUpdates
-    ? allAvailableCommands
-    : allAvailableCommands.filter((command) => command.id !== "check-for-updates" && command.id !== "release-channel"), [allAvailableCommands, onCheckForUpdates]);
+  const availableCommands = useMemo(() => allAvailableCommands.filter((command) => {
+    if (command.id === "check-for-updates" || command.id === "release-channel") return !!onCheckForUpdates;
+    if (command.id === "run-setup-again") return !!onRunSetupAgain;
+    // A browser tab is closed by the browser; the page cannot quit.
+    if (command.id === "quit") return canExit;
+    return true;
+  }), [allAvailableCommands, canExit, onCheckForUpdates, onRunSetupAgain]);
   const {
     applyThemePreview,
     clearThemePreview,
@@ -179,7 +195,6 @@ export function CommandBar({
     openInlineConfirm,
     openModeRoute,
     openPaneTemplateWorkflow,
-    openPluginCommandWorkflow,
     paneShortcutItems,
     persistLayoutChange,
     pluginCommandItems,
@@ -200,6 +215,7 @@ export function CommandBar({
     dispatch,
     focusedPaneId: state.focusedPaneId,
     onCheckForUpdates,
+    onRunSetupAgain,
     persistConfig,
     pluginRegistry,
     pushRoute,
@@ -349,14 +365,19 @@ export function CommandBar({
     if (row) runRootRow({ item: row, query: rootQueryRef.current, rank, isShortcut: () => false }, run);
     else run();
   }, [assistState, rootQueryRef, runRootRow, visibleListStateRef]);
+  // The offer runs the step that turns the AI on: Sign Up, or for an account
+  // whose email is not verified yet, sending the verification again.
   const startAssistSignUp = useCallback(() => {
-    const signUpCommand = getAvailablePluginCommands().find((command) => command.id === "auth-signup");
-    if (signUpCommand?.wizard?.length) {
-      openPluginCommandWorkflow(signUpCommand);
+    const commands = getAvailablePluginCommands();
+    const command = commands.find((candidate) => candidate.id === "auth-signup")
+      ?? commands.find((candidate) => candidate.id === "auth-resend-verification");
+    if (command) {
+      Promise.resolve(createPluginCommandItem(command).action())
+        .catch(logFailure("command-bar.assist", "Start sign up from the AI offer failed"));
       return;
     }
     setRootQuery("Sign Up");
-  }, [getAvailablePluginCommands, openPluginCommandWorkflow, setRootQuery]);
+  }, [createPluginCommandItem, getAvailablePluginCommands, setRootQuery]);
   // The assistant pane ships with the cloud plugin, so the row only exists
   // while that pane template is registered.
   const askGloomTemplate = useMemo(() => (
@@ -424,6 +445,7 @@ export function CommandBar({
   const {
     activeMatch,
     orderedRootResults,
+    rootCategoryPriorities,
     rootGhostSuffix,
     rootResultsCurrent,
     rootSearching,
@@ -509,6 +531,7 @@ export function CommandBar({
     activateListSelection,
     runRootQuery,
     setActiveListQuery,
+    typedTickerRow,
   } = useCommandBarSelectionRuntime({
     activeTickerSymbol,
     promptTickerSymbol,
@@ -532,12 +555,14 @@ export function CommandBar({
     rootModeKindRef,
     rootQuery,
     rootQueryRef,
+    rootSelectedIdx,
     rootSelectionNavigatedRef,
     rootShortcutIntent,
     rootThemeBaseIdRef,
     runDirectCommand,
     runRootRow,
     runSecurityDescriptionShortcut,
+    searchPending: rootSearching || !rootResultsCurrent,
     setRootQuery,
     stateConfigLayout: state.config.layout,
     stateRef,
@@ -559,13 +584,26 @@ export function CommandBar({
     if (runRootQuery(launch.query)) settleSearchReport();
   }, [runRootQuery, settleSearchReport, state.commandBarLaunchRequest, state.commandBarOpen]);
 
+  const getLiveState = useCallback(() => stateRef.current, [stateRef]);
+  const notifyFromPicker = useCallback((body: string, options?: { type?: "info" | "success" | "error" }) => {
+    pluginRegistry.notify({ body, ...options });
+  }, [pluginRegistry]);
+  const { adaptHeaderMarketResult, headerMarketItems } = useHeaderMarketPicker({
+    closeAll: closeAfterRun,
+    dispatch,
+    getState: getLiveState,
+    notify: notifyFromPicker,
+    persistConfig,
+  });
   const routeListState = useRouteListState({
     activeMatch,
+    adaptHeaderMarketResult,
     adaptTickerSearchRouteResult,
+    headerMarketItems,
     buildLayoutItems,
     currentRoute,
     orderedRootResults,
-    rootCategoryPriorities: providerCategoryPriorities,
+    rootCategoryPriorities,
     rootHoveredIdx,
     rootModeKind: rootModeInfo.kind,
     rootQuery,
@@ -627,7 +665,37 @@ export function CommandBar({
     visibleListStateRef,
   });
 
+  // Plain ticker search changes the focused pane's ticker when it shows one; DES's own search opens DES.
+  const tickerSearchTarget = useMemo(() => {
+    if (currentRoute?.kind !== "mode" || currentRoute.screen !== "ticker-search" || currentRoute.payload?.action) return null;
+    const layout = state.config.layout;
+    if (!resolveTickerRetargetPane(layout, state.focusedPaneId, pluginRegistry.panes)) return null;
+    const focused = findPaneInstance(layout, state.focusedPaneId!);
+    const paneDef = focused ? pluginRegistry.panes.get(focused.paneId) : undefined;
+    return focused && paneDef ? getBasePaneDisplayTitle(state, focused, paneDef, pluginRegistry.panes) : null;
+  }, [currentRoute, pluginRegistry.panes, state]);
+  const runSecondary = useCallback(() => activateListSelection({ secondary: true }), [activateListSelection]);
+
+  // Where Enter and Shift+Enter open the selected row in different places, the
+  // prompt says so. Plain ticker search says it in its own chrome row
+  // (tickerSearchTarget), and Enter on an add row's listing adds it instead.
+  const { visibleListState } = panelProps;
+  const addingListing = !currentRoute && state.commandBarLaunchRequest?.kind === "add-listing" && !!listingChoiceQuery(rootQuery);
+  const plainTickerSearch = currentRoute?.kind === "mode" && currentRoute.screen === "ticker-search" && !currentRoute.payload?.action;
+  const enterChangesFocusedPane = !!resolveTickerEnterTarget(state.config.layout, state.focusedPaneId, pluginRegistry.panes, "des");
+  // Nothing is highlighted while DES's search is out, and Enter runs the ticker typed.
+  const selectedRow = visibleListState?.results[visibleListState.selectedIdx]
+    ?? (visibleListState?.kind === "root" ? typedTickerRow : null);
+  const selectionKeyHints = themePickerActive || addingListing || plainTickerSearch
+    ? null
+    : resolveSelectionKeyHints(selectedRow, enterChangesFocusedPane);
+
   return (
-    <CommandBarPanel {...panelProps} />
+    <CommandBarPanel
+      {...panelProps}
+      tickerSearchTarget={tickerSearchTarget}
+      onRunSecondary={runSecondary}
+      selectionKeyHints={selectionKeyHints}
+    />
   );
 }

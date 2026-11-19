@@ -1,11 +1,12 @@
 import { logFailure } from "../../utils/log-failure";
 import { apiClient } from "../../api-client";
 import { loadResolvedHeadlessPaneModel, reportCoverage, reportGaps, type LoadedHeadlessPaneModel } from "./headless";
-import { dirname } from "path";
-import { mkdir } from "fs/promises";
+import { createOutputFolder, writeOutputFile } from "../output-file";
 import type { Quote } from "../../types/financials";
 import { isRecord } from "../../utils/guards";
+import { savedCopyAt, savedCopyShownAt } from "../../data/saved-copies";
 import {
+  prepareDesktopPaneShotView,
   renderDesktopPaneScreenshot,
   type DesktopPaneShotBridge,
   type DesktopPaneShotPayload,
@@ -20,6 +21,7 @@ import {
   deriveCaptureReport,
   deriveHeadlessFreshness,
   deriveRenderedFreshness,
+  statusDateEvidence,
   type CaptureReport,
   type CaptureStatusLine,
   type ReportFreshness,
@@ -28,10 +30,21 @@ import { quotesFreshness } from "../freshness";
 import { paneFitsRows, shotMaxHeightCells, buildDesktopShotPayload } from "./screenshot-payload";
 import { resolveDesktopShotApiProxy, createDesktopShotBridge } from "./screenshot-bridge";
 import type { PaneScreenshotResult } from "./screenshot-types";
-import { assessPaneScreenshot } from "./screenshot-assessment";
+import { assessPaneScreenshot, shotLoadedNothing } from "./screenshot-assessment";
+
+/**
+ * Whether a capture's footer keeps a row for the dated status line. A pane of
+ * the user's own state (notes, connections, documentation) declares `local`:
+ * it has no data to date, and "not a live feed" would be said of its own
+ * state. A capture that loaded nothing gives the row back later
+ * (`shotLoadedNothing`).
+ */
+export function shotHasStatusLine(resolved: Pick<ResolvedPaneFunction, "pane" | "template">): boolean {
+  return !declaredReportFreshness(resolved).local;
+}
 
 /** The bridge, keeping every quote it serves the page: what a pane that loads its own quotes (WEI) shows. */
-function recordBridgedQuotes(bridge: DesktopPaneShotBridge): { bridge: DesktopPaneShotBridge; quotes: Quote[] } {
+function recordBridgedQuotes(bridge: DesktopPaneShotBridge, onSavedCopy?: (savedAt: number) => void): { bridge: DesktopPaneShotBridge; quotes: Quote[] } {
   const quotes: Quote[] = [];
   const keep = (value: unknown) => {
     if (isRecord(value) && typeof value.symbol === "string" && typeof value.price === "number") quotes.push(value as unknown as Quote);
@@ -42,6 +55,9 @@ function recordBridgedQuotes(bridge: DesktopPaneShotBridge): { bridge: DesktopPa
       ...bridge,
       async marketData(operation, args) {
         const result = await bridge.marketData(operation, args);
+        // The page gets the answer as JSON, which drops its saved-copy mark: the report keeps when it was saved.
+        const savedAt = savedCopyAt(result) ?? savedCopyShownAt(result);
+        if (savedAt != null) onSavedCopy?.(savedAt);
         if (operation === "getQuote") keep(result);
         if (operation === "getQuotesBatch" && Array.isArray(result)) {
           for (const entry of result) keep(isRecord(entry) ? entry.quote : null);
@@ -213,7 +229,9 @@ export async function renderDesktopShot({
   maxHeightCells,
   options,
   captureImage = true,
+  onlyUsable = false,
   onStalledReport,
+  onDrawing,
 }: {
   resolved: ResolvedPaneFunction;
   context: MarketContext;
@@ -234,18 +252,26 @@ export async function renderDesktopShot({
   maxHeightCells?: number;
   options: Record<string, string | true>;
   captureImage?: boolean;
+  onlyUsable?: boolean;
   /**
    * Called when the report behind the status line was still loading at the
    * wait's end: the load was aborted, but a loader that ignores the signal
    * may keep the process alive.
    */
   onStalledReport?: () => void;
-}): Promise<PaneScreenshotResult> {
-  if (captureImage) await mkdir(dirname(outputPath), { recursive: true });
-  const apiProxy = resolveDesktopShotApiProxy(context);
+  /** Called once the pane's data is read and the page starts to draw it. */
+  onDrawing?: () => void;
+}): Promise<PaneScreenshotResult & { saved: boolean }> {
+  prepareDesktopPaneShotView();
+  if (captureImage) await createOutputFolder(outputPath);
+  // The copies saved earlier the page drew from, where the data service did not answer.
+  const savedCopies: number[] = [];
+  const onSavedCopy = (savedAt: number) => { savedCopies.push(savedAt); };
+  const apiProxy = { ...resolveDesktopShotApiProxy(context), onSavedCopy };
   const previousSessionToken = apiClient.getSessionToken();
   let payload: DesktopPaneShotPayload;
   let render: DesktopPaneShotRenderResult;
+  let image: Uint8Array | undefined;
   let freshness: ReportFreshness | undefined;
   let coverage: Promise<ShotReportCoverage | undefined> | undefined;
   let covered: ShotReportCoverage | undefined;
@@ -277,7 +303,8 @@ export async function renderDesktopShot({
       watermark ?? null,
       loadModel,
     );
-    if (statusLine && captureImage) payload.statusLine = true;
+    onDrawing?.();
+    if (statusLine && captureImage && shotHasStatusLine(resolved)) payload.statusLine = true;
     const fitRoles = [
       ...(fitRows && paneFitsRows(resolved) ? ["data-table-body-scroll"] : []),
       ...(fitReader && resolved.pane.shotFitsReader ? ["detail-scroll-body"] : []),
@@ -290,20 +317,27 @@ export async function renderDesktopShot({
     const report = payload.statusLine ? reportShotFreshness(resolved, loadModel) : undefined;
     // The same load says whether the report is complete, with or without a status line.
     coverage = captureImage ? reportShotCoverage(resolved, loadModel) : undefined;
-    const recorded = recordBridgedQuotes(createDesktopShotBridge(context));
+    const recorded = recordBridgedQuotes(createDesktopShotBridge(context), onSavedCopy);
     const shotPayload = payload;
-    render = await renderDesktopPaneScreenshot(payload, outputPath, apiProxy, {
+    ({ image, ...render } = await renderDesktopPaneScreenshot(payload, apiProxy, {
       captureImage,
       bridge: recorded.bridge,
       statusLine: async (rendered) => {
+        if (shotLoadedNothing(rendered)) {
+          abandonReports();
+          return null;
+        }
         const tab = report && shownReportTab(resolved, rendered.semanticUi);
         const shown = tab ? reportShotFreshness(resolved, () => loadReport({ ...resolved, options: { ...resolved.options, tab } })) : report;
         const line = shotFreshness(resolved, shotPayload, rendered, recorded.quotes, shown && await settledWithin(shown, SHOT_REPORT_WAIT_MS));
         abandonReports();
         freshness = line.freshness;
-        return { variants: line.variants, dates: line.dates };
+        // A row whose read failed is marked on the picture, where its figures are missing.
+        const unread = unreadRowsNote(shotPayload.unreadRows);
+        return { variants: unread ? line.variants.map((variant) => `${variant} · ${unread}`) : line.variants, dates: line.dates,
+          dateEvidence: statusDateEvidence(line.freshness) };
       },
-    });
+    }));
     covered = coverage && await settledWithin(coverage, SHOT_REPORT_WAIT_MS);
   } finally {
     apiClient.setSessionToken(previousSessionToken);
@@ -312,5 +346,16 @@ export async function renderDesktopShot({
   const renderedInstance = payload.config.layout.instances.find(({ instanceId }) => instanceId === payload.paneId);
   if (renderedInstance) resolved = { ...resolved, instance: renderedInstance };
   const assessed = withReportCoverage(assessPaneScreenshot(resolved, payload, render, rawArg, outputPath), covered);
-  return freshness ? { ...assessed, freshness } : assessed;
+  const save = image && (!onlyUsable || assessed.usable) ? image : undefined;
+  if (save) await writeOutputFile(outputPath, save);
+  const unreadRows = payload.unreadRows?.length ? { unreadRows: payload.unreadRows, ...(payload.unreadReasons ? { unreadReasons: payload.unreadReasons } : {}) } : {};
+  return { ...assessed, ...unreadRows, saved: save !== undefined, ...(freshness ? { freshness } : {}),
+    ...(savedCopies.length > 0 ? { savedCopyAt: Math.min(...savedCopies) } : {}) };
+}
+
+/** "FRC did not load": a list's rows whose read failed, as the capture's status line marks them. */
+export function unreadRowsNote(rows: readonly string[] | undefined): string | null {
+  if (!rows?.length) return null;
+  const named = rows.length > 3 ? `${rows.slice(0, 3).join(", ")} and ${rows.length - 3} more` : rows.join(", ");
+  return `${named} did not load`;
 }

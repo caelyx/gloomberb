@@ -60,6 +60,8 @@ export interface InsiderOpenedCompany {
   title: string;
   /** Opens on Insiders, over the ranking's window, its dollars sorted by the ranking's side. */
   control: InsiderViewControl;
+  /** Opened from an insider's row: the Trades view starts narrowed to them, by the name their forms report. */
+  insider?: string;
   width: number;
   height: number;
   focused: boolean;
@@ -149,14 +151,14 @@ export function InsiderSignalsView({ width, height, focused, renderCompany }: In
   useAutoRefresh(resource.updatedAt, resource.load);
   const detailOpen = !!openTicker;
   // An opened company refreshes itself.
-  usePaneRefreshKey(() => void resource.reload(), { focused, enabled: !detailOpen });
+  usePaneRefreshKey(() => resource.reload(), { focused, enabled: !detailOpen });
   // Signing in or out reads the ranking again for the new session.
   const sessionKeyRef = useRef(session.requestKey);
   const reload = resource.reload;
   useEffect(() => {
     if (sessionKeyRef.current === session.requestKey) return;
     sessionKeyRef.current = session.requestKey;
-    void reload();
+    reload();
   }, [reload, session.requestKey]);
 
   const data = shown?.payload ?? null;
@@ -332,7 +334,7 @@ export function InsiderSignalsView({ width, height, focused, renderCompany }: In
         <PaneStatusBody
           loading={resource.loading}
           error={resource.error}
-          retry={{ onRetry: () => void resource.reload(), pending: resource.loading }}
+          retry={{ onRetry: () => resource.reload(), pending: resource.loading }}
           subject="Insider activity"
         />
       </Box>

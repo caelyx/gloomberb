@@ -1,8 +1,8 @@
 import { apiClient } from "../../../api-client";
-import type { SupplyChainPayload, SupplyEntity, SupplyEvidenceItem, SupplyOptions, SupplyRow } from "../../../api-client/supply-chain";
+import type { SupplyChainPayload, SupplyEntity, SupplyEvidenceItem, SupplyOptions, SupplyRead, SupplyRow } from "../../../api-client/supply-chain";
 import { createPluginCache } from "../../../data/plugin-cache";
-import { cachedCloudResource, loadCloudResource, unavailableOnServer } from "../shared/cloud-resource";
-import { activeRelationship, canShowQuote, isUnconfirmed, publicEvidence, supplyOptions, TIER_OPTIONS, trustTier } from "./trust";
+import { batchReplyItems, cachedCloudResource, createCloudBatchAhead, loadCloudResource, unavailableOnServer } from "../shared/cloud-resource";
+import { activeRelationship, canShowQuote, evidenceDate, isUnconfirmed, publicEvidence, supplyOptions, TIER_OPTIONS, trustTier } from "./trust";
 
 export const SUPPLY_UNAVAILABLE = "Supply chain disclosures are not available yet.";
 const SUPPLY_ROLES = ["customer", "supplier", "partner", "competitor", "investee"] as const;
@@ -22,7 +22,7 @@ const date = (value: unknown) => text(value) && /^\d{4}-\d{2}-\d{2}$/.test(value
 const timestamp = (value: unknown) => text(value) && Number.isFinite(Date.parse(value));
 const tier = (value: unknown) => Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 6;
 const claim = (value: unknown) => ["disclosed", "company_confirmed", "reported", "rumored"].includes(String(value));
-const url = (value: unknown) => { try { return text(value) && ["http:", "https:"].includes(new URL(value).protocol); } catch { return false; } };
+const url = (value: unknown) => { try { return text(value) && ["http:", "https:"].includes(new URL(value).protocol); } catch { /* Intentional ignore: malformed URLs fail this web link field validator. */ return false; } };
 function evidence(value: SupplyEvidenceItem): boolean {
   return !!value && text(value.id) && tier(value.tier) && claim(value.claimType) && url(value.url)
     && text(value.title) && text(value.publisher) && timestamp(value.publishedAt) && timestamp(value.fetchedAt)
@@ -32,7 +32,8 @@ function evidence(value: SupplyEvidenceItem): boolean {
     && finite(value.confidence) && value.confidence >= 0 && value.confidence <= 1
     && ["active", "superseded", "rejected", "stale"].includes(value.status)
     && (value.verificationStatus === undefined || ["verified", "lead"].includes(value.verificationStatus))
-    && nullableText(value.valueKind) && (value.value === null || finite(value.value)) && nullableText(value.valueUnit) && nullableText(value.currency);
+    && nullableText(value.valueKind) && (value.value === null || finite(value.value)) && nullableText(value.valueUnit) && nullableText(value.currency)
+    && (value.relatedParty === undefined || typeof value.relatedParty === "boolean");
 }
 export function validSupplyEntity(value: SupplyEntity): boolean {
   return !!value && text(value.id) && text(value.name) && nullableText(value.ticker) && nullableText(value.exchange)
@@ -44,7 +45,8 @@ export function validSupplyEntity(value: SupplyEntity): boolean {
 export function validSupplyRow(value: SupplyRow): boolean {
   return !!value && text(value.id) && validSupplyEntity(value.counterparty) && validSupplyEntity(value.reportingEntity)
     && SUPPLY_ROLES.includes(value.role) && ["in", "out", "mutual"].includes(value.direction)
-    && nullableText(value.pctScope) && nullableNumber(value.pctOfRevenue) && (value.pctOfRevenue === null || value.pctOfRevenue <= 100)
+    && nullableText(value.pctScope) && [undefined, null, "total", "segment"].includes(value.pctScopeBasis)
+    && nullableNumber(value.pctOfRevenue) && (value.pctOfRevenue === null || value.pctOfRevenue <= 100)
     && [null, "revenue", "receivables", "cost", "purchases"].includes(value.pctBasis)
     && nullableNumber(value.usd) && [null, "disclosed", "derived"].includes(value.usdBasis)
     && (value.nativeAmount == null || nonnegative(value.nativeAmount))
@@ -53,6 +55,7 @@ export function validSupplyRow(value: SupplyRow): boolean {
     && (value.nativeAmount == null || (value.nativeCurrency != null && value.nativeScale != null && Number.isFinite(value.nativeAmount * value.nativeScale)))
     && (value.jurisdiction == null || (text(value.jurisdiction) && /^[A-Z]{2}$/.test(value.jurisdiction)))
     && [undefined, null, "entity", "group", "anonymous", "aggregate"].includes(value.entityScope)
+    && (value.relatedParty === undefined || typeof value.relatedParty === "boolean")
     && (value.pctOfRevenue === null || value.pctBasis !== null) && (value.usd === null || value.usdBasis !== null)
     && text(value.period) && validPeriodMonths(value.periodMonths) && nullableText(value.fiscalYear) && ["xbrl", "filing_text", "call", "news", "web", "import", "press_release"].includes(value.sourceKind)
     && nullableText(value.form) && (value.filedDate === null || date(value.filedDate)) && date(value.asOf)
@@ -68,7 +71,10 @@ export function validSupplyRow(value: SupplyRow): boolean {
     && (value.whyUnconfirmed === undefined || nullableText(value.whyUnconfirmed))
     && (value.evidence === undefined || Array.isArray(value.evidence) && value.evidence.every(evidence));
 }
-export function normalizeSupplyRow(value: SupplyRow): SupplyRow {
+export function normalizeSupplyRow(input: SupplyRow): SupplyRow {
+  // A share basis a server sends as null is no basis read yet, as an absent one is.
+  const { pctScopeBasis, ...rest } = input;
+  const value: SupplyRow = pctScopeBasis == null ? rest : input;
   const items = value.evidence?.map(publicEvidence);
   const unconfirmed = isUnconfirmed(value) || !activeRelationship(value);
   // Restrict again before cache, exports or screenshot metadata, even if a server regresses.
@@ -103,11 +109,53 @@ export function validateSupplyChain(data: SupplyChainPayload): SupplyChainPayloa
   return { ...data, entity: data.entity ? normalizeEntity(data.entity) : null, says: data.says.map(normalizeSupplyRow), names: data.names.map(normalizeSupplyRow),
     ...(data.earlier ? { earlier: { says: data.earlier.says.map(normalizeSupplyRow), names: data.earlier.names.map(normalizeSupplyRow) } } : {}) };
 }
-export async function fetchSupplyChain(symbol: string, client: Pick<typeof apiClient, "getCloudSupplyChain"> = apiClient, options: SupplyOptions = {}) {
-  try { return validateSupplyChain(await client.getCloudSupplyChain(symbol, options)); }
+/** A server that answered a cutoff (`asOf`) with disclosures published after it, which it does not read. */
+class AsOfUnsupportedError extends Error {
+  constructor(readonly asOf: string) {
+    super(`Gloom Cloud does not read --as-of ${asOf} yet: it answered with disclosures published after that day, so none are shown.`);
+    this.name = "AsOfUnsupportedError";
+  }
+}
+
+/**
+ * The disclosures known by `asOf` (YYYY-MM-DD): a server that reads the
+ * cutoff sends none published after it, and one that answers with any never
+ * has them shown as that day's (AsOfUnsupportedError).
+ */
+function knownBy(data: SupplyChainPayload, asOf: string | undefined): SupplyChainPayload {
+  if (!asOf) return data;
+  const rows = [...data.says, ...data.names, ...data.earlier?.says ?? [], ...data.earlier?.names ?? []];
+  if (rows.some((row) => evidenceDate(row) > asOf)) throw new AsOfUnsupportedError(asOf);
+  return data;
+}
+export async function fetchSupplyChain(symbol: string, client: Pick<typeof apiClient, "getCloudSupplyChain"> = apiClient, options: SupplyRead = {}) {
+  let data: SupplyChainPayload;
+  try { data = validateSupplyChain(await client.getCloudSupplyChain(symbol, options)); }
   catch (error) { throw unavailableOnServer(error, SUPPLY_UNAVAILABLE, [404, 503]); }
+  return knownBy(data, options.asOf);
 }
 // Account and plan belong in the key: signing out must never reveal a paid cached response.
-const cacheKey = (symbol: string, access: string, options: SupplyOptions) => `${symbol.toUpperCase()}:${access}:${JSON.stringify(supplyOptions(options.tiers))}:${!!options.includeLeads}`;
-export const cachedSupplyChain = (symbol: string, access: string, options: SupplyOptions = {}) => cachedCloudResource(supplyChainCache, cacheKey(symbol, access, options), validateSupplyChain);
-export const loadSupplyChain = (symbol: string, access: string, force = false, options: SupplyOptions = {}) => loadCloudResource(supplyChainCache, cacheKey(symbol, access, options), () => fetchSupplyChain(symbol, apiClient, options), { force, validate: validateSupplyChain });
+const cacheKey = (symbol: string, access: string, options: SupplyRead) => `${symbol.toUpperCase()}:${access}:${JSON.stringify(supplyOptions(options.tiers))}:${!!options.includeLeads}${options.asOf ? `:${options.asOf}` : ""}`;
+export const cachedSupplyChain = (symbol: string, access: string, options: SupplyRead = {}) => cachedCloudResource(supplyChainCache, cacheKey(symbol, access, options), validateSupplyChain);
+export const loadSupplyChain = (symbol: string, access: string, force = false, options: SupplyRead = {}) => loadCloudResource(supplyChainCache, cacheKey(symbol, access, options), () => fetchSupplyChain(symbol, apiClient, options), { force, validate: validateSupplyChain });
+/** Symbols per disclosures batch request: a ripple's sixty holdings are two, read sixteen at a time on the server. */
+const SUPPLY_BATCH_MAX = 30;
+const supplyChainsAheadByOptions = new Map<string, ReturnType<typeof createCloudBatchAhead<SupplyChainPayload>>>();
+/**
+ * Reads many symbols' disclosures ahead in a request per 30 (EARN ripple's
+ * holdings), into the cache loadSupplyChain reads. Answers the symbols stored.
+ */
+export function loadSupplyChainsAhead(symbols: readonly string[], access: string, force = false, options: SupplyOptions = {}): Promise<Set<string>> {
+  const optionsKey = JSON.stringify([supplyOptions(options.tiers), !!options.includeLeads]);
+  let ahead = supplyChainsAheadByOptions.get(optionsKey);
+  if (!ahead) {
+    ahead = createCloudBatchAhead(supplyChainCache, {
+      max: SUPPLY_BATCH_MAX,
+      validate: validateSupplyChain,
+      read: async (ids) => batchReplyItems(await apiClient.getCloudSupplyChains(ids, options))
+        .flatMap((item) => item.chain ? [{ id: item.symbol.toUpperCase(), payload: item.chain }] : []),
+    });
+    supplyChainsAheadByOptions.set(optionsKey, ahead);
+  }
+  return ahead(symbols.map((symbol) => ({ id: symbol.toUpperCase(), key: cacheKey(symbol, access, options) })), force);
+}

@@ -1,14 +1,24 @@
-import { formatCurrency } from "../../../utils/format";
-import { comparablePriceEarnings, notMeaningfulMultiples } from "../../../utils/price-earnings";
-import { marketCapBasisNote, viewMarketCapitalization } from "../../../utils/market-capitalization";
-import { enterpriseValueNotMeaningful, enterpriseValueReconciliationNote, enterpriseValueWithdrawn, reportedEnterpriseValue } from "../../../utils/fundamentals";
+import { MISSING_VALUE, formatCompact, formatCurrency } from "../../../utils/format";
+import { comparablePriceEarnings, forwardFiscalYear, notMeaningfulMultiples } from "../../../utils/price-earnings";
+import { marketCapBasisNote, viewMarketCapitalization, withheldMarketCap } from "../../../utils/market-capitalization";
+import {
+  enterpriseValueNotMeaningful, enterpriseValueReconciliationNote, enterpriseValueWithdrawn, fundamentalsCurrency,
+  financialEnterpriseValue, reportedEnterpriseToRevenue, reportedEnterpriseValue, withFinancialEnterpriseValue,
+} from "../../../utils/fundamentals";
+import { sourceStatements } from "../../../time-series/fundamentals/source-statements";
 import { getExtendedSessionDisplay, getQuoteSessionFields } from "../../../market-data/market/status";
 import { atRegularSessionPrice, movePriceDerivedFigures, regularSessionValuationPrice } from "../../../market-data/quotes/regular-session-valuation";
+import { fiscalPeriodLabel, fiscalYearEndMonth } from "../../../utils/fiscal-period";
 import { latestFinancialPeriod, latestReportedPeriod } from "../../../utils/latest-financial-period";
+import { halfYearGrowthPeriod } from "../../../utils/financial-statements";
+import { servedRatesNotMeaningful } from "../../../utils/served-rates";
+import { isNotMeaningful, rateValue, revenueMargin } from "../../../utils/growth";
+import { trailingEpsFiscalYear } from "../../../utils/fundamentals";
+import { enterpriseValueBridgeBasis, listingEnterpriseValue } from "../../../market-data/quotes/listing-enterprise-value";
 import type { Quote, TickerFinancials } from "../../../types/financials";
 
 export function formatRelativePrice(price: number | null | undefined, currency: string | null | undefined): string {
-  if (price == null) return "-";
+  if (price == null) return MISSING_VALUE;
   return formatCurrency(price, currency ?? "");
 }
 
@@ -23,9 +33,10 @@ const QUOTE_STALE = "quote stale";
 
 const finiteNumber = (value: number | null | undefined): value is number => value != null && Number.isFinite(value);
 
-/** Why EV/S is missing, in the order the figure needs its parts. */
+/** Why EV/S is missing, in the order the figure needs its parts. `currency` is the trailing figures' (`fundamentalsCurrency`). */
 function evSalesGap(
   fundamentals: TickerFinancials["fundamentals"],
+  currency: string | undefined,
   quoteCurrency: string | undefined,
   withdrawn: boolean,
   enterpriseValueGap: boolean,
@@ -34,21 +45,61 @@ function evSalesGap(
   if (!fundamentals) return NOT_REPORTED;
   if (!finiteNumber(fundamentals.enterpriseToRevenue) && !finiteNumber(fundamentals.enterpriseValue)) return "no EV";
   if (!finiteNumber(fundamentals.enterpriseToRevenue) && !(finiteNumber(fundamentals.revenue) && fundamentals.revenue > 0)) return "no revenue";
-  // EV/S is read only where the TTM block names its currency and it is the price's.
-  if (!fundamentals.financialCurrency) return "revenue ccy unstated";
-  if (quoteCurrency && fundamentals.financialCurrency !== quoteCurrency) return `revenue in ${fundamentals.financialCurrency}`;
+  // EV/S is read only where the TTM block's currency is known (its own label, else the statements') and is the price's.
+  if (!currency) return "revenue ccy unstated";
+  if (quoteCurrency && currency !== quoteCurrency) return `revenue in ${currency}`;
   return NOT_REPORTED;
 }
 
 /** Why the FCF yield is missing: no trailing free cash flow, no cap, or the two in different currencies. */
-function fcfYieldGap(fundamentals: TickerFinancials["fundamentals"], capCurrency: string | null): string {
-  if (!finiteNumber(fundamentals?.freeCashFlow)) return "no TTM FCF";
+function fcfYieldGap(freeCashFlow: { value: number; currency: string | undefined } | null, capCurrency: string | null): string {
+  if (!freeCashFlow) return "no TTM FCF";
   if (!capCurrency) return "no market cap";
-  if (!fundamentals?.financialCurrency) return "FCF ccy unstated";
-  if (fundamentals.financialCurrency !== capCurrency) return `FCF in ${fundamentals.financialCurrency}`;
+  if (!freeCashFlow.currency) return "FCF ccy unstated";
+  if (freeCashFlow.currency !== capCurrency) return `FCF in ${freeCashFlow.currency}`;
   return NOT_REPORTED;
 }
+
+/** How far before the latest quarter a trailing free cash flow may end and still stand for today's. */
+const FILED_FCF_MAX_LAG_DAYS = 100;
+
+/**
+ * The trailing twelve months of free cash flow the filed quarters sum, for a
+ * row whose served block has none (Tokyo's trading houses on 9 Nov 2026): the
+ * newest four quarters that all carry it, in the statements' currency, ending
+ * no more than a quarter before the latest one (a quarter reported with its
+ * income ahead of its cash flow). Null otherwise.
+ */
+function filedTrailingFreeCashFlow(financials: TickerFinancials): { value: number; currency: string | undefined; through: string } | null {
+  const trailing = sourceStatements(financials, "ttm").statements;
+  const latest = financials.quarterlyStatements.map((row) => Date.parse(row.date)).filter(Number.isFinite).reduce((max, time) => Math.max(max, time), -Infinity);
+  const statement = trailing.findLast((row) => finiteNumber(row.freeCashFlow));
+  if (!statement || !Number.isFinite(latest) || latest - Date.parse(statement.date) > FILED_FCF_MAX_LAG_DAYS * 86_400_000) return null;
+  return { value: statement.freeCashFlow!, currency: statement.currency ?? financials.financialCurrency, through: statement.date.slice(0, 10) };
+}
 export const RELATIVE_VALUATION_STALE_FUNDAMENTALS_NOTICE = "Fundamentals stale: retained values may be out of date";
+
+/**
+ * The operating margin of the latest fiscal year, for a row whose trailing
+ * twelve months are not whole (a quarter the source has not carried yet):
+ * that year's operating income over its revenue, named for the year ("FY25")
+ * so a cell never passes it off as trailing. Null when the latest year lacks
+ * either figure; an older year is never stood in for it.
+ */
+function fiscalYearOperatingMargin(annualStatements: TickerFinancials["annualStatements"] | undefined) {
+  const latest = latestFinancialPeriod(annualStatements, (row) => row.date);
+  const margin = latest ? revenueMargin(latest.operatingIncome, latest.totalRevenue) : undefined;
+  if (!latest || margin === undefined) return null;
+  const year = /^FY\d{2}(\d{2})$/.exec(fiscalPeriodLabel(latest.date, "annual", fiscalYearEndMonth(annualStatements ?? [])))?.[1];
+  return {
+    // N/M over revenue at or below zero.
+    value: margin,
+    // The fiscal year's own name; the calendar year of its end where the year cannot be named.
+    label: `FY${year ?? latest.date.slice(2, 4)}`,
+    periodEnd: latest.date.slice(0, 10),
+  };
+}
+
 
 /**
  * A peer's row. Last, its change and the extended print are the quote's
@@ -59,7 +110,8 @@ export const RELATIVE_VALUATION_STALE_FUNDAMENTALS_NOTICE = "Fundamentals stale:
  */
 export function relativeValuationValues(snapshot: TickerFinancials | null) {
   const reported = snapshot?.quote;
-  const financials = snapshot ? atRegularSessionPrice(snapshot) : null;
+  // A bank's EV, and so its EV/S, reads n/m: its deposits are funding, not debt.
+  const financials = snapshot ? atRegularSessionPrice({ ...snapshot, fundamentals: withFinancialEnterpriseValue(snapshot.fundamentals, snapshot.profile) }) : null;
   const quote = financials?.quote;
   const fundamentals = financials?.fundamentals;
   const quoteStale = quote?.stale === true;
@@ -72,8 +124,9 @@ export function relativeValuationValues(snapshot: TickerFinancials | null) {
   const enterpriseValue = reportedEnterpriseValue(fundamentals);
   // A zero or non-finite enterprise value is the source's gap, and the ratio it serves beside it comes from the same observation.
   const enterpriseValueGap = fundamentals?.enterpriseValue != null && enterpriseValue == null;
-  const compatibleCurrency = !!fundamentals?.financialCurrency && !!quote?.currency
-    && fundamentals.financialCurrency === quote.currency;
+  // The trailing figures' currency: the block's own label, else the statements' on a listing that trades in it, as `valuation` reads it.
+  const currency = financials ? fundamentalsCurrency(financials) : undefined;
+  const compatibleCurrency = !!currency && !!quote?.currency && currency === quote.currency;
   const reportedMultiples = {
     trailingPE: fundamentals?.trailingPE != null && Number.isFinite(fundamentals.trailingPE) ? fundamentals.trailingPE : null,
     forwardPE: fundamentals?.forwardPE != null && Number.isFinite(fundamentals.forwardPE) ? fundamentals.forwardPE : null,
@@ -82,35 +135,57 @@ export function relativeValuationValues(snapshot: TickerFinancials | null) {
   const { trailingPE: trailingNotMeaningful, forwardPE: forwardNotMeaningful } = notMeaningfulMultiples(fundamentals);
   // An EV at or below zero makes EV/S N/M, whatever the source divided it by, as `valuation` reads the EV.
   const evSalesNotMeaningful = enterpriseValueNotMeaningful(fundamentals);
-  const notMeaningful: Partial<Record<"trailingPE" | "forwardPE" | "evSales", string>> = {
+  const notMeaningful: Partial<Record<"trailingPE" | "forwardPE" | "evSales" | "revenueGrowth" | "operatingMargin", string>> = {
     ...(trailingNotMeaningful ? { trailingPE: trailingNotMeaningful } : {}),
     ...(forwardNotMeaningful ? { forwardPE: forwardNotMeaningful } : {}),
     ...(evSalesNotMeaningful ? { evSales: evSalesNotMeaningful } : {}),
   };
-  const evSalesWithdrawn = enterpriseValueWithdrawn(fundamentals);
-  const evSales = !compatibleCurrency || enterpriseValueGap || evSalesNotMeaningful ? null
-    : fundamentals?.enterpriseToRevenue != null && Number.isFinite(fundamentals.enterpriseToRevenue)
-      ? fundamentals.enterpriseToRevenue
-      : enterpriseValue != null && fundamentals?.revenue != null && fundamentals.revenue > 0
-        ? enterpriseValue / fundamentals.revenue : null;
-  const fcfYield = capitalization && fundamentals?.financialCurrency === capitalization.currency
-    && fundamentals.freeCashFlow != null && Number.isFinite(fundamentals.freeCashFlow) && capitalization.value > 0
-    ? fundamentals.freeCashFlow / capitalization.value : null;
-  const revenueGrowth = fundamentals?.revenueGrowth ?? fundamentals?.lastQuarterGrowth ?? null;
-  const operatingMargin = fundamentals?.operatingMargin ?? null;
+  // A provider EV Gloom Cloud withdrew falls back to the market cap + total debt - cash it was checked against.
+  const fallback = snapshot && enterpriseValueWithdrawn(fundamentals) ? computedEnterpriseValueSales(snapshot, fundamentals) : null;
+  const evSalesWithdrawn = enterpriseValueWithdrawn(fundamentals) && !fallback;
+  const evSales = fallback ? fallback.evSales
+    : !compatibleCurrency || enterpriseValueGap || evSalesNotMeaningful ? null
+      : reportedEnterpriseToRevenue(fundamentals) != null
+        ? reportedEnterpriseToRevenue(fundamentals)!
+        : enterpriseValue != null && fundamentals?.revenue != null && fundamentals.revenue > 0
+          ? enterpriseValue / fundamentals.revenue : null;
+  // The served trailing free cash flow, else the one the filed quarters sum.
+  const filedFreeCashFlow = financials && !finiteNumber(fundamentals?.freeCashFlow) ? filedTrailingFreeCashFlow(financials) : null;
+  const freeCashFlow = finiteNumber(fundamentals?.freeCashFlow) ? { value: fundamentals.freeCashFlow, currency } : filedFreeCashFlow;
+  const fcfYield = capitalization && freeCashFlow && freeCashFlow.currency === capitalization.currency && capitalization.value > 0
+    ? freeCashFlow.value / capitalization.value : null;
+  // Growth off revenue at or below zero a year earlier, and a margin over revenue at or below zero, are N/M, as DES
+  // and `ticker` read them (servedRatesNotMeaningful).
+  const served = servedRatesNotMeaningful(fundamentals, snapshot ?? financials);
+  if (served.revenueGrowth) notMeaningful.revenueGrowth = served.revenueGrowth;
+  const revenueGrowth = served.revenueGrowth ? null : fundamentals?.revenueGrowth ?? fundamentals?.lastQuarterGrowth ?? null;
+  const trailingRevenueNotPositive = served.operatingMargin != null;
+  const trailingOperatingMargin = trailingRevenueNotPositive ? null : fundamentals?.operatingMargin ?? null;
+  const fiscalYearMargin = trailingOperatingMargin == null && !trailingRevenueNotPositive ? fiscalYearOperatingMargin(financials?.annualStatements) : null;
+  if (served.operatingMargin) notMeaningful.operatingMargin = served.operatingMargin;
+  else if (isNotMeaningful(fiscalYearMargin?.value)) notMeaningful.operatingMargin = `${fiscalYearMargin.label} revenue is at or below zero`;
+  const operatingMargin = trailingOperatingMargin ?? rateValue(fiscalYearMargin?.value);
   const trailingPE = trailingNotMeaningful ? null : comparablePriceEarnings(reportedMultiples.trailingPE);
+  // A P/E on a fiscal year's EPS names the year as valuation and the overview do ("FY Mar-26").
+  const trailingPEPeriod = reportedMultiples.trailingPE != null && !trailingNotMeaningful && financials
+    ? trailingEpsFiscalYear(financials) ?? null : null;
   const forwardPE = forwardNotMeaningful ? null : comparablePriceEarnings(reportedMultiples.forwardPE);
+  // The fiscal year the consensus is for, as `valuation` and DES name it (`FY28`): for a September filer, next year
+  // is two fiscal years out.
+  const forwardPEPeriod = (forwardPE != null || reportedMultiples.forwardPE != null) && !forwardNotMeaningful
+    ? forwardFiscalYear(fundamentals?.forwardEpsPeriodEnd) : null;
   // Every figure a row lacks says why, so an export's blank cell is never silent: N/M multiples say so themselves.
   const gaps: Partial<Record<RelativeValuationGapKey, string>> = {};
   if (session.price == null) gaps.price = quoteStale ? QUOTE_STALE : NOT_REPORTED;
   if (session.changePercent == null) gaps.changePercent = quoteStale ? QUOTE_STALE : NOT_REPORTED;
-  if (capitalization == null) gaps.marketCap = quoteStale && !fundamentals?.marketCap ? QUOTE_STALE : NOT_REPORTED;
+  const withheld = withheldMarketCap(fundamentals);
+  if (capitalization == null) gaps.marketCap = withheld?.gap ?? (quoteStale && !fundamentals?.marketCap ? QUOTE_STALE : NOT_REPORTED);
   if (trailingPE == null && !trailingNotMeaningful && reportedMultiples.trailingPE == null) gaps.trailingPE = NOT_REPORTED;
   if (forwardPE == null && !forwardNotMeaningful && reportedMultiples.forwardPE == null) gaps.forwardPE = NOT_REPORTED;
-  if (evSales == null && !evSalesNotMeaningful) gaps.evSales = evSalesGap(fundamentals, quote?.currency, evSalesWithdrawn, enterpriseValueGap);
-  if (fcfYield == null) gaps.fcfYield = fcfYieldGap(fundamentals, capitalization?.currency ?? null);
-  if (revenueGrowth == null) gaps.revenueGrowth = NOT_REPORTED;
-  if (operatingMargin == null) gaps.operatingMargin = NOT_REPORTED;
+  if (evSales == null && !evSalesNotMeaningful) gaps.evSales = evSalesGap(fundamentals, currency, quote?.currency, evSalesWithdrawn, enterpriseValueGap);
+  if (fcfYield == null) gaps.fcfYield = fcfYieldGap(freeCashFlow, capitalization?.currency ?? null);
+  if (revenueGrowth == null && !notMeaningful.revenueGrowth) gaps.revenueGrowth = NOT_REPORTED;
+  if (operatingMargin == null && !notMeaningful.operatingMargin) gaps.operatingMargin = NOT_REPORTED;
   return {
     ...session,
     extendedMark,
@@ -130,29 +205,77 @@ export function relativeValuationValues(snapshot: TickerFinancials | null) {
     fundamentalsThrough: fundamentals && snapshot ? latestReportedPeriod(snapshot) : null,
     /** The end of the latest quarter, the one revenueGrowth compares with a year earlier. */
     revenueGrowthQuarter: revenueGrowth != null ? latestFinancialPeriod(snapshot?.quarterlyStatements, (row) => row.date)?.date ?? null : null,
+    /** For a half-year reporter, the halves revenueGrowth compares, "H1 2026 vs H1 2025"; null for a quarter's growth. */
+    revenueGrowthHalf: revenueGrowth != null && snapshot
+      ? halfYearGrowthPeriod(snapshot) : null,
     currency: quote?.currency ?? null,
+    /** The company the ticker was read as, as its quote names it. */
+    name: reported?.name?.trim() || null,
     marketCap: capitalization?.value ?? null,
     marketCapCurrency: capitalization?.currency ?? null,
     marketCapProvenance: capitalization?.provenance ?? null,
     /** valuation's note when the cap is the share count times the price: the provider's figure it replaced. */
     marketCapNote: marketCapBasisNote(capitalization) ?? null,
+    /** Why Gloom Cloud withheld the cap (a receipt priced as ordinary shares), as `valuation` and EQS say it; null otherwise. */
+    marketCapWithheld: withheld?.note ?? null,
     trailingPE,
+    /** The fiscal year the P/E's EPS is ("FY Mar-26") when it is a year's filed figure, not the trailing four quarters'; null otherwise. */
+    trailingPEPeriod,
     forwardPE,
+    /** The fiscal year of the consensus EPS the forward P/E is on (`FY28`); null when unknown or there is none. */
+    forwardPEPeriod,
     reportedMultiples,
-    /** Why a multiple is N/M: its earnings base is zero or a loss, or for EV/S the enterprise value is at or below zero. */
+    /**
+     * Why a figure is N/M: a P/E's earnings base is zero or a loss, EV/S's enterprise value is at or below zero,
+     * revenue growth's base a year earlier or an operating margin's revenue is at or below zero.
+     */
     notMeaningful,
     // Vendor ADR ratios can mix unverified valuation and reporting units too.
     evSales,
     /** Why EV/S is missing when the provider's EV was withdrawn, as `valuation` says it; null otherwise. */
     evSalesUnavailable: evSalesWithdrawn
       ? enterpriseValueReconciliationNote(fundamentals) ?? "EV unavailable." : null,
-    /** Why EV/S is N/M, as `valuation` says it: "EV N/M: cash and short-term investments exceed ..."; null otherwise. */
-    evSalesNote: evSalesNotMeaningful ? enterpriseValueReconciliationNote(fundamentals) ?? null : null,
+    /** Why EV/S is N/M, as `valuation` says it: "EV N/M: cash and short-term investments exceed ..."; or, for EV/S over a computed EV, what it was computed from; null otherwise. */
+    evSalesNote: fallback ? fallback.note : evSalesNotMeaningful
+      ? enterpriseValueReconciliationNote(fundamentals) ?? (financialEnterpriseValue(fundamentals) ? `EV ${financialEnterpriseValue(fundamentals)}.` : null) : null,
+    /** `computed` where EV/S divides market cap + total debt - cash in place of a withdrawn provider EV; `served` otherwise. */
+    evSalesBasis: fallback ? "computed" as const : evSales != null ? "served" as const : null,
     fcfYield,
+    /** The quarter end the filed quarters' free cash flow runs through, when the yield is theirs; null when it is the served TTM. */
+    fcfYieldThrough: fcfYield != null && filedFreeCashFlow ? filedFreeCashFlow.through : null,
     revenueGrowth,
     operatingMargin,
+    /** The fiscal year the operating margin is of ("FY25") when no trailing figure was served; null when it is trailing twelve months. */
+    operatingMarginPeriod: operatingMargin != null ? fiscalYearMargin?.label ?? null : null,
+    operatingMarginPeriodEnd: fiscalYearMargin?.periodEnd ?? null,
     /** Why each missing figure is missing, in a few words the row draws in its place. */
     gaps,
+  };
+}
+
+/**
+ * EV/S over the market cap + total debt - cash a withdrawn provider EV was
+ * checked against (listingEnterpriseValue), with the note that says so: TTM
+ * revenue in the EV's currency, or converted at the rate the check's balance
+ * sheet was ("EUR at 1.133 USD"). Null when there is no such EV or no revenue
+ * in a currency it can be divided in.
+ */
+function computedEnterpriseValueSales(snapshot: TickerFinancials, fundamentals: TickerFinancials["fundamentals"]) {
+  const listing = listingEnterpriseValue(snapshot);
+  if (listing.kind !== "value" || listing.basis !== "computed") return null;
+  const revenue = fundamentals?.revenue;
+  const currency = fundamentals?.financialCurrency;
+  if (!finiteNumber(revenue) || revenue <= 0 || !currency) return null;
+  const fx = listing.fx;
+  const rate = currency === listing.currency ? 1 : fx && fx.from === currency && finiteNumber(fx.rate) && fx.rate > 0 ? fx.rate : null;
+  if (rate == null) return null;
+  const bridge = listing.bridge;
+  const basis = bridge ? enterpriseValueBridgeBasis(bridge) : "market cap + total debt - cash";
+  const provider = bridge?.source != null ? `; the provider's ${formatCompact(bridge.source)} ${listing.currency} failed validation against it` : "";
+  const noMinority = bridge?.minority === null ? "; no minority interest is on file for that balance sheet" : "";
+  return {
+    evSales: listing.value / (revenue * rate),
+    note: `EV ${formatCompact(listing.value)} ${listing.currency} computed from ${basis}${provider}${noMinority}.`,
   };
 }
 

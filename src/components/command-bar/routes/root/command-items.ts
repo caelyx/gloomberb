@@ -9,6 +9,7 @@ import { updateFailureReason } from "../../../../updater/failure";
 import { t, tf } from "../../../../i18n";
 import { isPrereleaseVersion } from "../../../../utils/semver";
 import { VERSION } from "../../../../version";
+import { resolveHeaderMarket, systemTimeZone } from "../../../../market-data/market/header-market";
 
 /** "Update failed: download interrupted", as the header says it. */
 function failedUpdateLabel(progress: UpdateProgress): string {
@@ -109,6 +110,9 @@ export function createRootCommandItemBuilder({
         if (state.updateProgress?.phase === "ready") return "Update ready, restart to apply";
         if (state.updateProgress?.phase === "error") return failedUpdateLabel(state.updateProgress);
         return command.label;
+      // Unlike its neighbours it started out off, so the row says what the default is now.
+      case "toggle-attention-counts":
+        return `${command.label} (on by default)`;
       default:
         return command.label;
     }
@@ -166,18 +170,24 @@ export function createRootCommandItemBuilder({
         }
         if (state.updateNotice) return state.updateNotice;
         return command.description;
+      case "header-market":
+        return `Currently ${resolveHeaderMarket(state.config.headerMarket, systemTimeZone()).label}`;
       case "toggle-value-flashing":
         return state.config.valueFlashingEnabled ? "Currently on" : "Currently off";
       case "toggle-presentation-mode":
         return state.config.presentationMode ? "Currently on" : "Currently off";
+      case "toggle-since-last-visit":
+        return state.config.sinceLastVisit === false
+          ? "Currently off"
+          : "Currently on: what moved in your tickers shows above the layout when you come back";
       case "toggle-crash-reports":
         return state.config.telemetry?.crashReports === false ? "Currently off" : "Currently on";
       case "toggle-usage-counts":
         return state.config.telemetry?.usage === false ? "Currently off" : "Currently on";
       case "toggle-attention-counts":
-        return state.config.telemetry?.attention === true
-          ? "Currently on: share ticker research counts"
-          : "Currently off: opt in to sharing ticker research counts";
+        return state.config.telemetry?.attention === false
+          ? "Currently off. Signed in, this turns it off on your other devices too"
+          : "Currently on: tickers you open go to Gloom, published only as hourly totals of 20+ people";
       case "release-channel":
         if (resolveUpdateChannel(state.config) === "nightly") return `Currently nightly: ${NIGHTLY_CHANNEL_SUMMARY}`;
         return isPrereleaseVersion(VERSION)
@@ -201,7 +211,9 @@ export function createRootCommandItemBuilder({
       case "toggle-usage-counts":
         return state.config.telemetry?.usage === false ? "off" : "on";
       case "toggle-attention-counts":
-        return state.config.telemetry?.attention === true ? "on" : "off";
+        return state.config.telemetry?.attention === false ? "off" : "on";
+      case "toggle-since-last-visit":
+        return state.config.sinceLastVisit === false ? "off" : "on";
       case "release-channel":
         return resolveUpdateChannel(state.config);
       default:
@@ -223,6 +235,12 @@ export function createRootCommandItemBuilder({
         return "update";
       case "release-channel":
         return "nightly stable beta prerelease update updates channel";
+      case "run-setup-again":
+        return "settings onboarding wizard guide first run start over desks holdings";
+      case "toggle-since-last-visit":
+        return "settings return strip what changed moves since away recap welcome back";
+      case "quit":
+        return "quit exit";
       default:
         return "";
     }

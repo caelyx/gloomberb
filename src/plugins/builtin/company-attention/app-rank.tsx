@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useMemo, useRef } from "react";
 import type { AppRankPayload } from "../../../api-client/app-attention";
 import { isAccessDenied } from "../../../api-client/errors";
@@ -50,7 +51,7 @@ export function AppRankView({ focus, accessKey, width, height, focused }: { focu
   const selection = useChartTableSelection({ rows: points, getId: id, getDate: date, selectedId: selected ? id(selected) : null, onSelect: setSelected, focused });
   const series = useMemo(() => attentionSeries({ chart: { label: `${focus.name} rank`, unit: "rank", points: points.map((point) => ({ date: point.date, value: point.rank })) } }, colors.textBright), [points, focus.name, colors.textBright]);
   const { strip, rows: tabRows } = usePaneTabs({ tabs: [{ value: "chart", label: "Chart" }, { value: "evidence", label: "Evidence" }], activeValue: tab, onSelect: setTab, focused, dense: true, queryBarWidth: width });
-  usePaneRefreshKey(() => { void resource.reload(); pages.reload(); }, { focused });
+  usePaneRefreshKey(() => { resource.reload(); pages.reload(); }, { focused });
   usePaneStatusFooter({ registrationId: `apps-rank:${key}`, loading: resource.loading || pages.loadingMore, error: resource.error ?? resource.data?.refreshError ?? pages.moreError?.message ?? pages.error?.message, stale: resource.data?.stale,
     info: [...(points[0] ? [{ id: "observed", asOf: true, parts: [{ text: `as of ${points[0].observedAt.slice(0, 10)}`, tone: "muted" as const }] }] : []), ...(data?.access === "preview" ? [{ id: "preview", parts: [{ text: "Pro preview", tone: "warning" as const }] }] : [])],
     hints: [...(selected ? [{ id: "source", key: "o", label: "pen source", onPress: () => void host.openExternal(selected.sourceUrl) }] : []), ...(data?.access === "preview" ? [{ id: "upgrade", key: CLOUD_PLAN_KEY, label: "upgrade", title: "Upgrade to Pro", onPress: upgrade }] : [])] });
@@ -63,14 +64,14 @@ export function AppRankView({ focus, accessKey, width, height, focused }: { focu
         onActivate={(point) => void host.openExternal(point.sourceUrl)}
         rootBefore={<ChartTableHeader width={width} height={height - tabRows} tableRows={points.length} tableColumns={tableColumns}
           query={<QueryBar width={width} meta={`${focus.country} · ${focus.chart}`} filters={[{ id: "days", label: "Window", value: days, options: ["30", "90", "365", "730"].map((value) => ({ value, label: `${value}D` })), onChange: setDays }]} />}
-          figures={points[0] ? [{ label: "Rank", value: count(points[0].rank) }, { label: "Rating", value: points[0].rating?.toFixed(2) ?? "--", detail: "/ 5" }, { label: "Ratings", value: count(points[0].ratingCount) }] : []}
+          figures={points[0] ? [{ label: "Rank", value: count(points[0].rank) }, { label: "Rating", value: points[0].rating?.toFixed(2) ?? MISSING_VALUE, detail: "/ 5" }, { label: "Ratings", value: count(points[0].ratingCount) }] : []}
           chart={data && tab === "chart" ? { series, ...selection, formatValue: (value) => `#${count(value)}`, empty: series.length ? undefined : focus.chart === "unranked" ? "Rank unavailable for this source" : "Collecting rank history", remoteKind: "app-rank-history" } : null} />}
         renderCell={(point, column) => {
           const value = point[column.id as keyof Point];
-          if (value == null) return { text: "--", value: null, color: colors.textMuted };
+          if (value == null) return { text: MISSING_VALUE, value: null, color: colors.textMuted };
           // A capture's time as a feed prints it, in the column's own UTC; the store's update is a day.
-          if (column.id === "observedAt") return { text: formatFeedTime(String(value), Date.now(), "--", { utc: true }), value: String(value), color: colors.textDim };
-          if (column.id === "sourceUpdatedAt") return { text: formatShortDate(String(value), { utc: true, fallback: "--" }), value: String(value), color: colors.textDim };
+          if (column.id === "observedAt") return { text: formatFeedTime(String(value), Date.now(), MISSING_VALUE, { utc: true }), value: String(value), color: colors.textDim };
+          if (column.id === "sourceUpdatedAt") return { text: formatShortDate(String(value), { utc: true, fallback: MISSING_VALUE }), value: String(value), color: colors.textDim };
           if (column.id === "present") return { text: value ? "Yes" : "No", value: String(value), color: value ? colors.text : colors.textMuted };
           return { text: column.id === "rating" ? Number(value).toFixed(2) : typeof value === "number" ? count(value) : String(value), value: typeof value === "boolean" ? String(value) : value,
             color: column.id === "rank" ? colors.textBright : colors.text };

@@ -3,7 +3,7 @@ import { access, lstat, readFile, readlink, rename, rm, symlink } from "fs/promi
 import { basename, dirname, isAbsolute, join, relative, resolve } from "path";
 import { HOMEBREW_PREFIXES, macCommandFolders } from "../../../../updater/command-names";
 import { logFailure } from "../../../../utils/log-failure";
-import { DESKTOP_APP_IDENTIFIER, DESKTOP_APP_NAME, LEGACY_DESKTOP_APP_NAME } from "../../shared/app-name";
+import { DESKTOP_APP_NAME, isDesktopAppIdentifier, LEGACY_DESKTOP_APP_NAME } from "../../shared/app-name";
 
 /**
  * A Mac install from before the rename is `Gloomberb.app`, and its updater
@@ -15,7 +15,7 @@ import { DESKTOP_APP_IDENTIFIER, DESKTOP_APP_NAME, LEGACY_DESKTOP_APP_NAME } fro
  *
  * Homebrew installs are left to Homebrew: its record names the bundle it
  * installed, and a bundle renamed under it makes `brew upgrade` fail. The cask
- * moves it to `Gloom.app` at the next `brew upgrade --cask gloomberb`.
+ * moves it to `Gloom.app` at the next `brew upgrade --cask gloom`.
  *
  * Nothing moves when a link into the old bundle sits in a folder this user
  * cannot write, since that command would stop working; the app runs under the
@@ -171,7 +171,7 @@ export async function renameLegacyMacApp(options: MacAppNameOptions): Promise<Ma
 
   const renamed = join(dirname(bundle), APP_BUNDLE);
   const occupied = await exists(renamed);
-  if (occupied && await bundleIdentifier(renamed) !== DESKTOP_APP_IDENTIFIER) return { kind: "skipped", reason: "name-taken" };
+  if (occupied && !isDesktopAppIdentifier(await bundleIdentifier(renamed))) return { kind: "skipped", reason: "name-taken" };
   const links = await movableLinks(bundle, options);
   if (!links) return { kind: "skipped", reason: "command-folder-not-writable" };
 
@@ -209,7 +209,7 @@ export async function removeLegacyMacApp(options: MacAppNameOptions): Promise<st
   const bundle = runningBundle(options.execPath);
   if (!bundle || basename(bundle) !== APP_BUNDLE) return null;
   const legacy = join(dirname(bundle), LEGACY_APP_BUNDLE);
-  if (!(await exists(legacy)) || await bundleIdentifier(legacy) !== DESKTOP_APP_IDENTIFIER) return null;
+  if (!(await exists(legacy)) || !isDesktopAppIdentifier(await bundleIdentifier(legacy))) return null;
   if (await managedByHomebrew(options.homebrewPrefixes ?? HOMEBREW_PREFIXES)) return null;
   const links = await movableLinks(legacy, options);
   if (!links) return null;

@@ -1,7 +1,9 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { act, useReducer, useState } from "react";
 import { Box } from "../../../ui";
 import { PaneFooterBar, PaneFooterProvider } from "../../../components/layout/pane/footer";
+import type { CombinedPaneFooter } from "../../../components/layout/pane/footer/model";
 import type { ScrollBoxRenderable } from "@opentui/core";
 import { createOpenTuiTestHarness, takeSavedTextFile } from "../../../renderers/opentui/test-utils";
 import { exportPaneTable, hasPaneTableExporter } from "../../../state/pane-table-export-registry";
@@ -13,6 +15,7 @@ import type { OptionContract, OptionsChain, Quote, TickerFinancials } from "../.
 import type { TickerRecord } from "../../../types/ticker";
 import { formatExpDate } from "../../../utils/options";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
+import { IV_FILLED_NOTE } from "./analytics";
 import { OptionsView } from "./view";
 import { takeTradeIntent } from "../broker-trading/command";
 import type { BrokerAdapter } from "../../../types/broker";
@@ -84,6 +87,7 @@ function OptionsHarness({
   settings,
   runtime = createTestPluginRuntime(),
   brokerInstances,
+  onFooter,
 }: {
   ticker: TickerRecord;
   quotePrice?: number;
@@ -96,6 +100,8 @@ function OptionsHarness({
   settings?: Record<string, unknown>;
   runtime?: ReturnType<typeof createTestPluginRuntime>;
   brokerInstances?: BrokerInstanceConfig[];
+  /** The footer as the pane registered it, before the bar fits it to its width. */
+  onFooter?: (footer: CombinedPaneFooter) => void;
 }) {
   const config = createTestPaneConfig("/tmp/gloomberb-options-test", {
     instanceId: TEST_PANE_ID,
@@ -121,10 +127,10 @@ function OptionsHarness({
 
   return (
     <TestPaneProvider state={state} dispatch={dispatch} paneId={TEST_PANE_ID} pluginId="ticker-research" runtime={runtime}>
-      {showFooter ? <PaneFooterProvider>{(footer) => <Box width={width} height={height} flexDirection="column">
+      {showFooter ? <PaneFooterProvider>{(footer) => (onFooter?.(footer), <Box width={width} height={height} flexDirection="column">
         <Box width={width} height={height - 1}><OptionsView width={width} height={height - 1} focused nestedInTabs={nestedInTabs} /></Box>
         <PaneFooterBar footer={footer} focused width={width} />
-      </Box>}</PaneFooterProvider> : <OptionsView width={width} height={height} focused nestedInTabs={nestedInTabs} />}
+      </Box>)}</PaneFooterProvider> : <OptionsView width={width} height={height} focused nestedInTabs={nestedInTabs} />}
     </TestPaneProvider>
   );
 }
@@ -233,7 +239,7 @@ test("Enter opens the cursor's contract on its broker, and with trading t opens 
   await act(async () => { await tui.emitKeypress({ name: "return" }); });
   const contract = { brokerId: "demo", brokerInstanceId: "sim", symbol: "AAPL", localSymbol: "AAPL260619C00100000", secType: "OPT", currency: "USD",
     lastTradeDateOrContractMonth: "20260619", right: "C" as const, strike: 100, multiplier: "100" };
-  expect(pinned[0]).toEqual({ symbol: "AAPL260619C00100000", options: { instrument: contract, listing: { name: "AAPL Jun 19 '26 $100 Call", exchange: "", currency: "USD", type: "OPT" } } });
+  expect(pinned[0]).toEqual({ symbol: "AAPL260619C00100000", options: { instrument: contract, listing: { name: "AAPL 19 Jun '26 $100 Call", exchange: "", currency: "USD", type: "OPT" } } });
   await act(async () => { await tui.emitKeypress({ name: "t" }); });
   expect(pinned[1]).toMatchObject({ symbol: "AAPL260619C00100000", options: { instrument: contract, tabId: "broker-trade" } });
   // The ticket opens on Buy and chooses the side itself.
@@ -344,7 +350,7 @@ test("a typed expiry date opens that expiry, and its report names it with the ch
     </RemoteUiRegistryProvider>, { width: 124, height: 16 });
   });
   await renderSettled();
-  expect(tui.frame()).toMatch(/Expiry\s+2026-06-25\s+\(24d\)/);
+  expect(tui.frame()).toMatch(/Expiry\s+25 Jun '26\s+\(24d\)/);
   expect(tui.frame()).not.toContain("NaN");
   const report = renderedReportNotices(registry.snapshot());
   expect(report.notices[0]).toBe("Expiry 2026-06-25 (24d)");
@@ -368,6 +374,29 @@ test("a typed expiry the chain does not list fails its report with the options c
   expect(renderedReportNotices(registry.snapshot()).notices.some((notice) => notice.startsWith("Expiry"))).toBe(false);
 });
 
+test("a strike whose IV was filled from its neighbours prints ~, says so in the footer, and its report carries the notice", async () => {
+  // No bid on the 120 call: it has no two-sided quote to solve, so its IV is read off the strikes either side.
+  const chain = makeChain([100, 101, 120], 101);
+  chain.calls = chain.calls.map((contract) => contract.strike === 120 ? { ...contract, bid: 0, ask: 0.05, lastPrice: 0.02 } : contract);
+  // The 120 put is quoted above its 19.00 intrinsic, so the strike has a market to fill.
+  chain.puts = chain.puts.map((contract) => contract.strike === 120 ? { ...contract, bid: 19.9, ask: 20.1, lastPrice: 20 } : contract);
+  setSharedMarketDataCoordinator(new MarketDataCoordinator(createTestDataProvider({ getOptionsChain: async () => chain })));
+  const registry = createRemoteUiRegistry();
+  await act(async () => {
+    await tui.render(<RemoteUiRegistryProvider registry={registry}>
+      <OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} showFooter width={190} height={16} />
+    </RemoteUiRegistryProvider>, { width: 190, height: 16 });
+  });
+  await renderSettled();
+  const frame = tui.frame();
+  const row = (strike: number) => frame.split("\n").find((line) => new RegExp(`\\s${strike}\\s`).test(line))!;
+  // The filled strike's IV is marked; a solved strike's is not.
+  expect(row(120)).toMatch(/~\d+\.\d%/);
+  expect(row(100)).not.toContain("~");
+  expect(frame).toContain("IV filled");
+  expect(renderedReportNotices(registry.snapshot()).notices).toContain(IV_FILLED_NOTE);
+});
+
 test("shows the spot, volatility statistics and the mirrored default fields", async () => {
   const provider = createTestDataProvider({
     getOptionsChain: async () => makeChain([100, 101], 101),
@@ -385,7 +414,7 @@ test("shows the spot, volatility statistics and the mirrored default fields", as
   const frame = tui.frame();
   expect(frame).toMatch(/Spot\s+101\.00/);
   expect(frame).toMatch(/ATM IV\s+90\.1%/);
-  expect(frame).toMatch(/HV30\s+--/);
+  expect(frame).toMatch(new RegExp(String.raw`HV30\s+${MISSING_VALUE}`));
   expect(frame).toMatch(/Volume\s+4\.0k/);
   for (const header of ["C IV", "C Δ", "C VOL", "C OI", "P OI", "P VOL", "P Δ", "P IV"]) expect(frame).toContain(header);
 });
@@ -531,7 +560,49 @@ test("lets the expiration tab row use the full available width", async () => {
   expect(frame).toContain(formatExpDate(expirationDates.at(-1)!));
 });
 
-test("keeps expiration tabs independently scrollable from a narrow strike table", async () => {
+// The fit counted each field's own width, not the 8 cells "C LAST" takes with its header: from 100 to 105
+// columns the default fields were counted as fitting and the last put column, P BID, was cut.
+test("a chain that gives up fields fits as drawn, its last put column whole, and the footer counts what went", async () => {
+  setSharedMarketDataCoordinator(new MarketDataCoordinator(createTestDataProvider({
+    getOptionsChain: async () => makeChain([100, 101], 101),
+  })));
+  for (const width of [100, 103, 105, 106]) {
+    await act(async () => {
+      await tui.render(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} showFooter width={width} height={16} />,
+        { width, height: 16 });
+    });
+    await renderSettled();
+    const lines = tui.frame().split("\n");
+    const header = lines.find((line) => line.includes("STRIKE"))!;
+    expect(header.trimEnd()).toMatch(/P ASK\s+P BID$/);
+    const bodyScroll = tui.setup().renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable | undefined;
+    expect(bodyScroll?.horizontalScrollBar.visible).toBe(false);
+    // Below 106 columns the last trade gives way on both sides, and the footer says one field is hidden.
+    expect(header.includes("C LAST")).toBe(width >= 106);
+    expect(/1 (field )?hidden/.test(lines.join("\n"))).toBe(width < 106);
+  }
+});
+
+/** `shot OMON SPY --columns gamma,openInterest,volume` printed OI counts with no session: the date gave way in a crowded footer. */
+test("while the chain shows open interest, its date stays in the footer and in a picture of the pane", async () => {
+  setSharedMarketDataCoordinator(new MarketDataCoordinator(createTestDataProvider({
+    getOptionsChain: async () => ({ ...makeChain([100, 101], 101), openInterestAsOf: "2026-05-22" }),
+  })));
+  let footer: CombinedPaneFooter | null = null;
+  for (const width of [66, 90, 190]) {
+    await act(async () => {
+      await tui.render(<OptionsHarness ticker={makeTicker("AAPL")} quotePrice={101} showFooter width={width} height={16}
+        settings={{ optionColumnIds: ["gamma", "openInterest", "volume"] }} onFooter={(registered) => { footer = registered; }} />, { width, height: 16 });
+    });
+    await renderSettled();
+    const footerLine = tui.frame().trimEnd().split("\n").at(-1)!;
+    expect(footerLine).toMatch(width >= 190 ? /OI as of Fri 22 May/ : /OI (as of Fri 22 May|05-22)/);
+  }
+  // A shot keeps a footer's capture segments; this is the one that dates the counts.
+  expect(footer!.info.find((segment) => segment.id === "oi-as-of")).toMatchObject({ capture: true, parts: [{ text: "OI as of Fri 22 May" }] });
+});
+
+test("keeps both sides of a narrow strike table on screen and its expiration tabs independently scrollable", async () => {
   const expirationDates = Array.from({ length: 12 }, (_, index) => (
     Math.floor(Date.UTC(2026, index, 20) / 1000)
   ));
@@ -559,8 +630,10 @@ test("keeps expiration tabs independently scrollable from a narrow strike table"
   });
 
   await renderSettled();
+  // The chain gives up fields on both sides rather than scroll the puts out of view.
   const bodyScroll = tui.setup().renderer.root.findDescendantById("options-table-body-scroll") as ScrollBoxRenderable | undefined;
-  expect(bodyScroll?.horizontalScrollBar.visible).toBe(true);
+  expect(bodyScroll?.horizontalScrollBar.visible).toBe(false);
+  expect(tui.frame()).toMatch(/C BID\s+C ASK.*STRIKE.*P ASK\s+P BID/);
   expect(tui.frame()).not.toContain(formatExpDate(expirationDates.at(-1)!));
 
   for (let index = 1; index < expirationDates.length; index += 1) {
@@ -571,7 +644,6 @@ test("keeps expiration tabs independently scrollable from a narrow strike table"
     await renderSettled();
   }
 
-  expect(bodyScroll?.horizontalScrollBar.visible).toBe(true);
   expect(bodyScroll?.scrollLeft ?? 0).toBe(0);
   expect(requestedExpirations).toContain(expirationDates.at(-1));
   expect(tui.frame()).toContain(formatExpDate(expirationDates.at(-1)!));
@@ -716,7 +788,7 @@ test("stale underlying preserves contract observations but cannot seed current G
   });
   await renderSettled();
   const frame = tui.frame();
-  expect(frame).toMatch(/ATM IV\s+--/);
+  expect(frame).toMatch(new RegExp(String.raw`ATM IV\s+${MISSING_VALUE}`));
   expect(frame).toContain("Underlying quote stale");
   expect(frame).not.toContain("[c]alc");
   await exportPaneTable(TEST_PANE_ID, "stale-options.csv");
@@ -755,10 +827,10 @@ test("rejected history disables HV and IV/HV without discarding healthy chain an
   await renderSettled();
   const frame = tui.frame();
   expect(frame).toMatch(/ATM IV\s+90\.1%/);
-  expect(frame).toMatch(/HV30\s+--/);
-  expect(frame).toMatch(/IV\/HV\s+--/);
+  expect(frame).toMatch(new RegExp(String.raw`HV30\s+${MISSING_VALUE}`));
+  expect(frame).toMatch(new RegExp(String.raw`IV\/HV\s+${MISSING_VALUE}`));
   expect(historyRequests).toContainEqual({ range: "1Y", resolution: "1d" });
-  expect(frame).toContain("HV30 unavailable: inconsistent OHLC");
+  expect(frame).toContain("HV30 unavailable: contradictory prices");
   expect(frame).toContain("[c]alc");
 });
 

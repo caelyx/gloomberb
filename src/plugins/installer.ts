@@ -1,12 +1,14 @@
 import { logFailure } from "../utils/log-failure";
 import { basename, join, resolve } from "path";
-import { existsSync, lstatSync, mkdirSync, readdirSync, rmSync, symlinkSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, symlinkSync } from "fs";
 import { execFile as execFileCallback, execFileSync, spawn } from "child_process";
 import { promisify } from "util";
 import { findAbsorbedPlugin, type AbsorbedPlugin } from "./absorbed";
+import { checkPluginCompatibility, readPluginManifest } from "./compat";
 import type { PluginPin } from "./marketplace/store";
-import { bunCommand, recordDependencyInstall } from "./dependencies";
+import { bunCommand, missingPluginDependencies, recordDependencyInstall } from "./dependencies";
 import { linkHostPackages, missingPeerPlugins } from "./host-link";
+import { importSiblingsFromTheirFolders } from "./peer-imports";
 import {
   findAbsorbedCheckout,
   getPluginsDir,
@@ -18,6 +20,7 @@ import {
 import { pluginDirectoryNames } from "./plugin-names";
 import { gitInstallAdvice } from "./extracted-plugins";
 import { pluginFromModule } from "./plugin-export";
+import { INSTALL_TIMED_OUT, trackInstallCommand } from "./running-installs";
 import type { GloomPlugin } from "../types/plugin";
 import { cliStyles } from "../utils/cli-output";
 import { compareSemver, requiredGloomberb } from "../utils/semver";
@@ -42,8 +45,20 @@ function ensurePluginsDir() {
   }
 }
 
-const GITHUB_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const GITHUB_SEGMENT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*(?![\s\S])/;
 const COMMIT_PATTERN = /^[0-9a-f]{7,40}$/i;
+/**
+ * A tag or branch name as git spells one: never starting with a dash, which
+ * git would read as an option, and without `..`, `//`, `@{`, a trailing slash
+ * or dot, or `.lock` at the end.
+ */
+const PIN_REF_PATTERN = /^(?!.*\.\.)(?!.*\/\/)(?!.*@\{)(?!.*\.lock$)(?!.*[./]$)[A-Za-z0-9][A-Za-z0-9._/@+-]*$/;
+
+/** The registry pin's tag or branch, refused unless it is plainly one. */
+export function validatePinRef(ref: string): string {
+  if (ref.length > 200 || !PIN_REF_PATTERN.test(ref)) throw new Error(`Invalid ref in registry pin: ${JSON.stringify(ref)}.`);
+  return ref;
+}
 
 export function validatePluginDirectoryName(name: string): string {
   if (!GITHUB_SEGMENT_PATTERN.test(name)) {
@@ -90,6 +105,19 @@ export interface PluginInstallOptions {
    */
   quiet?: boolean;
   pin?: PluginPin;
+  /**
+   * How long each git command, and the dependency install, may run before it
+   * is stopped and the install fails with the code `INSTALL_TIMED_OUT`. No
+   * limit when absent.
+   */
+  timeouts?: { gitMs: number; dependenciesMs: number };
+  /**
+   * Fail, leaving nothing installed, when the plugin's dependencies do not
+   * all install, rather than keep a checkout that only loads once the loader
+   * fetches them. For an install nobody is watching, which the next launch
+   * retries.
+   */
+  requireDependencies?: boolean;
 }
 
 export interface PluginDirectoryInfo {
@@ -102,7 +130,7 @@ export interface PluginDirectoryInfo {
 }
 
 class GitError extends Error {
-  constructor(message: string, readonly stderr: string) {
+  constructor(message: string, readonly stderr: string, readonly timedOut = false) {
     super(stderr.trim() ? `${message}: ${stderr.trim().split("\n").pop()}` : message);
     this.name = "GitError";
   }
@@ -112,6 +140,36 @@ interface RunResult {
   code: number | null;
   stdout: string;
   stderr: string;
+  /** Stopped at its time limit. */
+  timedOut?: boolean;
+}
+
+/** How long a command stopped at its time limit has to exit before it is killed. */
+const KILL_GRACE_MS = 2_000;
+
+
+function seconds(ms: number): string {
+  return `${Math.round(ms / 1000)} s`;
+}
+
+/** Resolves git before a command changes into a plugin checkout. */
+function gitExecutable(): string {
+  const executable = Bun.which("git");
+  if (!executable) throw Object.assign(new Error(gitMissingMessage()), { code: "ENOENT" });
+  return executable;
+}
+
+/** Ends a Windows process and every process it started; `fallback` when taskkill cannot run. */
+function stopWindowsTree(pid: number, fallback: () => void): void {
+  const killer = spawn("taskkill", ["/T", "/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true });
+  killer.once("error", () => {
+    try {
+      fallback();
+    } catch {
+      // Intentional ignore: it exited between the check and the signal.
+    }
+  });
+  killer.unref();
 }
 
 /**
@@ -119,6 +177,12 @@ interface RunResult {
  * takes seconds, and the terminal UI and the desktop's Bun process keep
  * serving the app while a plugin updates in the background. Rejects only
  * when the command cannot be started at all.
+ *
+ * With `timeoutMs`, a command still running then is stopped and the result
+ * says so at once: a clone whose connection stalls would otherwise hold its
+ * install for good. The helpers git starts for the transfer are stopped with
+ * it: off Windows it runs in a process group of its own, and on Windows
+ * `taskkill /T` ends its process tree, where a signal reaches only git.
  */
 function run(
   command: string,
@@ -126,22 +190,69 @@ function run(
   cwd: string,
   output: { stdout: "pipe" | "inherit"; stderr: "pipe" | "inherit" },
   env?: NodeJS.ProcessEnv,
+  timeoutMs?: number,
 ): Promise<RunResult> {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(command, args, { cwd, env, stdio: ["ignore", output.stdout, output.stderr] });
+    const group = timeoutMs !== undefined && process.platform !== "win32";
+    const child = spawn(command === "git" ? gitExecutable() : command, args, {
+      cwd,
+      env,
+      stdio: ["ignore", output.stdout, output.stderr],
+      ...(group ? { detached: true } : {}),
+    });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const stop = (signal: NodeJS.Signals) => {
+      try {
+        if (group && child.pid) process.kill(-child.pid, signal);
+        else if (timeoutMs !== undefined && process.platform === "win32" && child.pid) stopWindowsTree(child.pid, () => child.kill(signal));
+        else child.kill(signal);
+      } catch {
+        // Intentional ignore: it exited between the check and the signal.
+      }
+    };
+    // An install with a limit is one nobody waits on: quitting stops it.
+    const forget = timeoutMs === undefined ? null : trackInstallCommand(() => stop("SIGKILL"));
+    child.once("exit", () => forget?.());
+    const timer = timeoutMs === undefined ? null : setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      stop("SIGTERM");
+      // A command that ignores the request is not left running.
+      setTimeout(() => stop("SIGKILL"), KILL_GRACE_MS).unref?.();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolveRun({ code: null, stdout, stderr, timedOut: true });
+    }, timeoutMs);
     child.stdout?.setEncoding("utf-8").on("data", (chunk: string) => { stdout += chunk; });
     child.stderr?.setEncoding("utf-8").on("data", (chunk: string) => { stderr += chunk; });
-    child.once("error", reject);
-    child.once("close", (code) => resolveRun({ code, stdout, stderr }));
+    child.once("error", (error) => {
+      if (timer) clearTimeout(timer);
+      forget?.();
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    child.once("close", (code) => {
+      if (timer) clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      resolveRun({ code, stdout, stderr });
+    });
   });
 }
 
 /** Whether a `git` command is on the PATH; plugins from GitHub need one to install or update. */
 export function gitInstalled(): boolean {
   if (typeof Bun !== "undefined") return Bun.which("git") !== null;
-  return gitSucceeds(["--version"], process.cwd());
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    // Intentional ignore: a git that does not start is the answer this asks for.
+    return false;
+  }
 }
 
 /** What a plugin install says when there is no git to run: what to install, then to try again. */
@@ -155,30 +266,26 @@ function gitMissingMessage(platform: string = process.platform): string {
  * the detached-HEAD advice a pinned checkout prints are chatter, and a failure
  * says what went wrong in its error, from git's last line.
  */
-async function git(args: string[], cwd: string, quiet: boolean, failure: string): Promise<string> {
+async function git(args: string[], cwd: string, quiet: boolean, failure: string, timeoutMs?: number): Promise<string> {
   // Quiet means the app owns the screen, or there is no terminal at all: a
   // repository that wants credentials fails instead of prompting on it.
   const env = quiet ? { ...process.env, GIT_TERMINAL_PROMPT: "0" } : undefined;
   let result: RunResult;
   try {
-    result = await run("git", ["-c", "advice.detachedHead=false", ...args], cwd, { stdout: "pipe", stderr: "pipe" }, env);
+    result = await run("git", ["-c", "advice.detachedHead=false", ...args], cwd, { stdout: "pipe", stderr: "pipe" }, env, timeoutMs);
   } catch (error) {
     // git could not start: almost always because it is not installed.
     const missing = (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
     throw new GitError(failure, missing ? gitMissingMessage() : String(error));
   }
+  if (result.timedOut) throw new GitError(failure, `no answer within ${seconds(timeoutMs!)}`, true);
   if (result.code !== 0) throw new GitError(failure, result.stderr);
   return result.stdout.trim();
 }
 
-function isOnBranch(dir: string): boolean {
-  try {
-    execFileSync("git", ["symbolic-ref", "-q", "HEAD"], { cwd: dir, stdio: "ignore" });
-    return true;
-  } catch {
-    // Intentional ignore: Detached HEAD is expected after a pinned install.
-    return false;
-  }
+/** False on a detached HEAD, which a pinned install leaves. */
+function isOnBranch(dir: string): Promise<boolean> {
+  return gitSucceedsAsync(["symbolic-ref", "-q", "HEAD"], dir);
 }
 
 function pinMatches(commit: string | null, expected: string | undefined): boolean {
@@ -191,12 +298,13 @@ function pinMatches(commit: string | null, expected: string | undefined): boolea
  * is what the ref names and the pinned commit (when known) only verifies it;
  * with a commit alone, that commit is fetched directly.
  */
-async function fetchPin(targetDir: string, pin: PluginPin, quiet: boolean): Promise<string> {
+async function fetchPin(targetDir: string, pin: PluginPin, quiet: boolean, timeoutMs?: number): Promise<string> {
   const wanted = pin.ref ?? pin.commit;
   if (!wanted) throw new Error("The registry pin names no ref or commit.");
+  if (pin.ref) validatePinRef(pin.ref);
   if (pin.commit && !COMMIT_PATTERN.test(pin.commit)) throw new Error(`Invalid commit in registry pin: ${pin.commit}`);
-  await git(["fetch", "--depth", "1", "origin", wanted], targetDir, quiet, `Could not fetch ${wanted}`);
-  const commit = await git(["rev-parse", "FETCH_HEAD^{commit}"], targetDir, quiet, `Could not read ${wanted}`);
+  await git(["fetch", "--depth", "1", "origin", "--", wanted], targetDir, quiet, `Could not fetch ${wanted}`, timeoutMs);
+  const commit = await git(["rev-parse", "FETCH_HEAD^{commit}"], targetDir, quiet, `Could not read ${wanted}`, timeoutMs);
   if (!pinMatches(commit, pin.commit)) {
     throw new Error(`${pin.ref ?? "The pinned ref"} now points at ${commit.slice(0, 7)}, the registry reviewed ${pin.commit!.slice(0, 7)}.`);
   }
@@ -204,31 +312,31 @@ async function fetchPin(targetDir: string, pin: PluginPin, quiet: boolean): Prom
 }
 
 /** Leaves HEAD detached at one exact commit, which is the state `update` expects to find. */
-async function checkoutCommit(targetDir: string, commit: string, quiet: boolean): Promise<void> {
-  await git(["checkout", "--detach", "--force", commit], targetDir, quiet, `Could not check out ${commit.slice(0, 7)}`);
+async function checkoutCommit(targetDir: string, commit: string, quiet: boolean, timeoutMs?: number): Promise<void> {
+  await git(["checkout", "--detach", "--force", commit], targetDir, quiet, `Could not check out ${commit.slice(0, 7)}`, timeoutMs);
 }
 
-function gitSucceeds(args: string[], cwd: string): boolean {
-  try {
-    execFileSync("git", args, { cwd, stdio: "ignore" });
-    return true;
-  } catch {
-    // Intentional ignore: Non-ancestor and shallow histories use package versions and commit dates instead.
-    return false;
-  }
+
+/*
+ * The update path runs in the app (the terminal, the desktop's Bun process),
+ * where a sync git call holds the thread for the whole process start: tens of
+ * milliseconds each on Windows, several per plugin. These never block it.
+ */
+async function gitSucceedsAsync(args: string[], cwd: string): Promise<boolean> {
+  const result = await run("git", args, cwd, { stdout: "pipe", stderr: "pipe" })
+    .catch(logFailure("plugin-installer", "Could not run git", null));
+  return result?.code === 0;
 }
 
-function gitOutput(args: string[], cwd: string): string | null {
-  try {
-    return execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString("utf-8").trim();
-  } catch {
-    // Intentional ignore: Shallow or manifest-free checkouts may lack historical metadata.
-    return null;
-  }
+/** Null when git fails: shallow or manifest-free checkouts may lack historical metadata. */
+async function gitOutputAsync(args: string[], cwd: string): Promise<string | null> {
+  const result = await run("git", args, cwd, { stdout: "pipe", stderr: "pipe" })
+    .catch(logFailure("plugin-installer", "Could not run git", null));
+  return result?.code === 0 ? result.stdout.trim() : null;
 }
 
-function versionAt(dir: string, commit: string): string | null {
-  const text = gitOutput(["show", `${commit}:package.json`], dir);
+async function versionAt(dir: string, commit: string): Promise<string | null> {
+  const text = await gitOutputAsync(["show", `${commit}:package.json`], dir);
   if (!text) return null;
   try {
     const version = JSON.parse(text).version;
@@ -247,39 +355,49 @@ function versionAt(dir: string, commit: string): string | null {
  * it; otherwise the versions the two commits declare decide, then, when
  * those match, their commit dates.
  */
-export function describeOlderCommit(dir: string, installed: string, candidate: string, label = candidate.slice(0, 7)): string | null {
-  if (installed === candidate || gitSucceeds(["merge-base", "--is-ancestor", installed, candidate], dir)) return null;
-  const installedVersion = versionAt(dir, installed);
-  const byVersion = compareSemver(versionAt(dir, candidate), installedVersion);
+export async function describeOlderCommit(dir: string, installed: string, candidate: string, label = candidate.slice(0, 7)): Promise<string | null> {
+  if (installed === candidate || await gitSucceedsAsync(["merge-base", "--is-ancestor", installed, candidate], dir)) return null;
+  const installedVersion = await versionAt(dir, installed);
+  const byVersion = compareSemver(await versionAt(dir, candidate), installedVersion);
   const older = () => `the registry's ${label} is older than the installed ${byVersion ? installedVersion : installed.slice(0, 7)}`;
-  if (gitSucceeds(["merge-base", "--is-ancestor", candidate, installed], dir)) return older();
+  if (await gitSucceedsAsync(["merge-base", "--is-ancestor", candidate, installed], dir)) return older();
   if (byVersion !== null && byVersion !== 0) return byVersion < 0 ? older() : null;
-  const candidateTime = Number(gitOutput(["show", "-s", "--format=%ct", candidate], dir));
-  const installedTime = Number(gitOutput(["show", "-s", "--format=%ct", installed], dir));
+  const candidateTime = Number(await gitOutputAsync(["show", "-s", "--format=%ct", candidate], dir));
+  const installedTime = Number(await gitOutputAsync(["show", "-s", "--format=%ct", installed], dir));
   return candidateTime > 0 && installedTime > 0 && candidateTime < installedTime ? older() : null;
 }
 
 /** Brings `targetDir` to the pinned commit. */
-async function checkoutPin(targetDir: string, pin: PluginPin, quiet: boolean): Promise<void> {
+async function checkoutPin(targetDir: string, pin: PluginPin, quiet: boolean, timeoutMs?: number): Promise<void> {
   if (!pin.ref && !pin.commit) return;
-  await checkoutCommit(targetDir, await fetchPin(targetDir, pin, quiet), quiet);
+  await checkoutCommit(targetDir, await fetchPin(targetDir, pin, quiet, timeoutMs), quiet, timeoutMs);
 }
 
-async function installDependencies(targetDir: string, quiet: boolean): Promise<void> {
+/**
+ * Runs `bun install` in `targetDir` and links the host. `recordAs` is the
+ * folder the plugin is installed under, when `targetDir` is where it is
+ * being put together. Null when there was nothing to install or no bun.
+ */
+async function installDependencies(targetDir: string, quiet: boolean, timeoutMs?: number, recordAs: string = targetDir): Promise<RunResult | null> {
   const pkgPath = join(targetDir, "package.json");
-  if (!existsSync(pkgPath)) return;
+  if (!existsSync(pkgPath)) return null;
   if (!quiet) console.log(cliStyles.muted("Installing plugin dependencies..."));
   // --production: plugin repos depend on `gloomberb` as a devDependency so
   // their own CI can typecheck against the real API. At runtime the host is
   // symlinked in instead, and pulling a second full copy here would both
   // waste a lot of disk and risk a duplicate React.
-  const output = quiet ? "pipe" : "inherit";
+  // Bun's own lines (its version, "[5.00ms] done") are kept off the
+  // terminal like git's, and shown only when they say why it failed.
   const bun = bunCommand();
   const result = bun
-    ? await recordDependencyInstall(targetDir, () => run(bun.command, ["install", "--production"], targetDir, { stdout: output, stderr: output }, bun.env)
+    ? await recordDependencyInstall(recordAs, () => run(bun.command, ["install", "--production"], targetDir, { stdout: "pipe", stderr: "pipe" }, bun.env, timeoutMs)
       .catch(logFailure("plugin-installer", "Plugin dependency installation failed", null)))
     : null;
-  if (result?.code !== 0 && !quiet) console.error(cliStyles.warning("Warning: failed to install plugin dependencies."));
+  if (result?.code !== 0 && !quiet) {
+    console.error(cliStyles.warning("Warning: failed to install plugin dependencies."));
+    const output = result ? result.stderr.trim() || result.stdout.trim() : "";
+    if (output) console.error(output);
+  }
 
   // After `bun install`, which prunes links it does not know about.
   const link = linkHostPackages(targetDir);
@@ -287,6 +405,7 @@ async function installDependencies(targetDir: string, quiet: boolean): Promise<v
     console.error(cliStyles.warning(`Warning: could not link the Gloom runtime (${link.error}).`));
     console.error(cliStyles.muted("The plugin's \"gloomberb/*\" imports will not resolve."));
   }
+  return result;
 }
 
 async function readPluginExport(targetDir: string): Promise<Pick<GloomPlugin, "id" | "name" | "version"> | null> {
@@ -296,6 +415,9 @@ async function readPluginExport(targetDir: string): Promise<Pick<GloomPlugin, "i
   if (missingPeerPlugins(targetDir).length > 0) return null;
   const entryFile = await resolvePluginEntry(targetDir);
   if (!entryFile) return null;
+  // The siblings from their folders, as the loader imports them, so the
+  // modules this caches are the ones a load in this process reuses.
+  importSiblingsFromTheirFolders(targetDir);
   // Fresh so an update is validated against the new code, not the module Bun
   // cached when the previous version loaded.
   const plugin = pluginFromModule(await import(`${entryFile}?validate=${Date.now()}`));
@@ -326,37 +448,67 @@ export async function installPlugin(ref: string, options: PluginInstallOptions =
   ensurePluginsDir();
   const targetDir = join(PLUGINS_DIR, name);
 
-  if (existsSync(targetDir)) {
-    fail(`Plugin "${name}" already exists.`, `Use "gloom update ${name}" to refresh it.`);
-  }
+  const alreadyInstalled = () => fail(`Plugin "${name}" already exists.`, `Use "gloom update ${name}" to refresh it.`);
+  if (existsSync(targetDir)) alreadyInstalled();
 
   say(cliStyles.accent(`Installing ${name}`));
   say(cliStyles.muted(url));
 
+  // Put together beside the plugins, under a dot name the loader and the
+  // seeder pass over, and moved into place only once complete: an install
+  // stopped half way (the app quit, a limit hit) never leaves a folder that
+  // passes for the plugin.
+  removeAbandonedInstalls();
+  const stagingDir = join(PLUGINS_DIR, `${STAGING_PREFIX}${name}-${process.pid}-${++stagingCount}`);
+  const timeoutMs = options.timeouts?.gitMs;
   const pin = options.pin ?? {};
   try {
     const cloneArgs = ["clone", "--depth", "1"];
-    if (pin.ref) cloneArgs.push("--branch", pin.ref);
-    cloneArgs.push(url, targetDir);
-    await git(cloneArgs, PLUGINS_DIR, quiet, `Failed to clone ${url}`);
+    if (pin.ref) cloneArgs.push(`--branch=${validatePinRef(pin.ref)}`);
+    cloneArgs.push("--", url, stagingDir);
+    await git(cloneArgs, PLUGINS_DIR, quiet, `Failed to clone ${url}`, timeoutMs);
     if (pin.ref) {
-      const commit = readPluginCommit(targetDir);
+      const commit = readPluginCommit(stagingDir);
       if (!pinMatches(commit, pin.commit)) {
         throw new Error(`${pin.ref} now points at ${commit?.slice(0, 7) ?? "?"}, the registry reviewed ${pin.commit!.slice(0, 7)}.`);
       }
     } else if (pin.commit) {
-      await checkoutPin(targetDir, pin, quiet);
+      await checkoutPin(stagingDir, pin, quiet, timeoutMs);
     }
     // A fork under another name says what it is in its gloom.json.
-    refuseAbsorbed(findAbsorbedCheckout(targetDir));
+    refuseAbsorbed(findAbsorbedCheckout(stagingDir));
+
+    if (pin.ref || pin.commit) say(cliStyles.muted(`Pinned to ${pin.ref ?? pin.commit}`));
+
+    const dependenciesMs = options.timeouts?.dependenciesMs;
+    const dependencies = await installDependencies(stagingDir, quiet, dependenciesMs, targetDir);
+    if (dependencies?.timedOut) {
+      throw Object.assign(new Error(`Installing ${name}'s dependencies took longer than ${seconds(dependenciesMs!)}.`), { timedOut: true });
+    }
+    if (options.requireDependencies) {
+      const missing = missingPluginDependencies(stagingDir);
+      if (missing.length > 0) throw new Error(`${name}'s dependencies did not install: ${missing.join(", ")}.`);
+    }
   } catch (error) {
-    rmSync(targetDir, { recursive: true, force: true });
-    fail(error instanceof Error ? error.message : String(error));
+    removeStaging(stagingDir);
+    const timedOut = (error as { timedOut?: unknown } | null)?.timedOut === true;
+    fail(error instanceof Error ? error.message : String(error), undefined, timedOut ? INSTALL_TIMED_OUT : undefined);
   }
 
-  if (pin.ref || pin.commit) say(cliStyles.muted(`Pinned to ${pin.ref ?? pin.commit}`));
-
-  await installDependencies(targetDir, quiet);
+  let moved = false;
+  try {
+    moved = await moveIntoPlace(stagingDir, targetDir);
+  } catch (error) {
+    removeStaging(stagingDir);
+    fail(error instanceof Error ? error.message : String(error));
+  }
+  if (!moved) {
+    removeStaging(stagingDir);
+    // Another install of it finished first: the app beside this one, or a second click.
+    alreadyInstalled();
+  }
+  // The links were made from where it was put together.
+  linkHostPackages(targetDir);
 
   const missing = missingPeerPlugins(targetDir);
   if (missing.length > 0) {
@@ -364,6 +516,74 @@ export async function installPlugin(ref: string, options: PluginInstallOptions =
     return describe(targetDir, name, null);
   }
   return validateInstall(targetDir, name, quiet);
+}
+
+/** Where an install is put together: `.installing-<name>-<pid>-<n>` in the plugins folder. */
+const STAGING_PREFIX = ".installing-";
+const STAGING_NAME = /^\.installing-.+-(\d+)-\d+$/;
+let stagingCount = 0;
+
+function processRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: it runs, as another user.
+    return (error as NodeJS.ErrnoException | null)?.code === "EPERM";
+  }
+}
+
+/**
+ * Removes an install's staging folder. A folder that will not go (a git
+ * helper that outlived its stop still holds it on Windows, a read-only file)
+ * never replaces the reason the install failed: it carries a name the loader
+ * passes over, and a later install clears it once its process has ended.
+ */
+function removeStaging(stagingDir: string): void {
+  try {
+    rmSync(stagingDir, { recursive: true, force: true });
+  } catch (error) {
+    logFailure("plugin-installer", "Could not remove an unfinished plugin install")(error);
+  }
+}
+
+/**
+ * Drops what installs left behind when their process ended mid-way. Best
+ * effort: one that cannot be removed stays, and never stops this install.
+ */
+function removeAbandonedInstalls(): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(PLUGINS_DIR);
+  } catch (error) {
+    logFailure("plugin-installer", "Could not list the plugins folder for unfinished installs")(error);
+    return;
+  }
+  for (const entry of entries) {
+    const pid = Number(STAGING_NAME.exec(entry)?.[1]);
+    if (!pid || pid === process.pid || processRunning(pid)) continue;
+    removeStaging(join(PLUGINS_DIR, entry));
+  }
+}
+
+/**
+ * Renames the finished install into place. False when the folder is taken.
+ * Windows refuses a rename while a scanner still holds a file just written,
+ * so a refusal there is tried again for a moment.
+ */
+async function moveIntoPlace(stagingDir: string, targetDir: string): Promise<boolean> {
+  for (let attempt = 0; ; attempt += 1) {
+    if (existsSync(targetDir)) return false;
+    try {
+      renameSync(stagingDir, targetDir);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | null)?.code;
+      if (existsSync(targetDir)) return false;
+      if (attempt >= 10 || (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES")) throw error;
+      await Bun.sleep(200);
+    }
+  }
 }
 
 /** Reads the export of a checkout that was just installed, and says what it is. */
@@ -403,17 +623,27 @@ export interface PluginUpdateResult extends PluginDirectoryInfo {
   kept?: string;
 }
 
+function githubRepoFromUrl(url: string): string | null {
+  const match = /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/i.exec(url.trim());
+  return match ? `${match[1]}/${match[2]}` : null;
+}
+
 /** `owner/repo` from the checkout's origin remote, or null for anything that is not a GitHub clone. */
 export function readPluginRemote(pluginDir: string): string | null {
   try {
-    const url = execFileSync("git", ["config", "--get", "remote.origin.url"], { cwd: pluginDir, stdio: ["ignore", "pipe", "ignore"] })
-      .toString("utf-8").trim();
-    const match = /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/i.exec(url);
-    return match ? `${match[1]}/${match[2]}` : null;
+    return githubRepoFromUrl(execFileSync(gitExecutable(), ["config", "--get", "remote.origin.url"], { cwd: pluginDir, stdio: ["ignore", "pipe", "ignore"] })
+      .toString("utf-8"));
   } catch {
     // Intentional ignore: Hand-copied plugins and local repositories may have no origin remote.
     return null;
   }
+}
+
+/** `readPluginRemote` without holding the thread, for the app's own update check. */
+export async function readPluginRemoteAsync(pluginDir: string): Promise<string | null> {
+  // No origin remote (a hand-copied plugin, a local repository) is a failed git, and no repo.
+  const url = await gitOutputAsync(["config", "--get", "remote.origin.url"], pluginDir);
+  return url ? githubRepoFromUrl(url) : null;
 }
 
 /** The sha from `git ls-remote origin HEAD`; null when the answer is not one. */
@@ -439,7 +669,7 @@ export async function readPluginRemoteHead(name: string): Promise<string | null>
   if (!existsSync(join(dir, ".git"))) return null;
   if (lstatSync(dir, { throwIfNoEntry: false })?.isSymbolicLink()) return null;
   try {
-    const { stdout } = await execFile("git", ["ls-remote", "origin", "HEAD"], {
+    const { stdout } = await execFile(gitExecutable(), ["ls-remote", "origin", "HEAD"], {
       cwd: dir,
       timeout: REMOTE_HEAD_TIMEOUT_MS,
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "echo" },
@@ -500,7 +730,7 @@ export async function updatePlugin(name: string, options: PluginInstallOptions =
     const commit = await fetchPin(targetDir, pin, quiet);
     // Updates only move forward: a checkout installed from the default
     // branch can be ahead of the tag the registry reviewed.
-    const kept = before ? describeOlderCommit(targetDir, before, commit, pin.ref ?? commit.slice(0, 7)) : null;
+    const kept = before ? await describeOlderCommit(targetDir, before, commit, pin.ref ?? commit.slice(0, 7)) : null;
     if (kept) {
       if (!quiet) console.log(cliStyles.muted(`Kept ${name}: ${kept}.`));
       return { ...describe(targetDir, name, null), before, changed: false, kept };
@@ -510,7 +740,7 @@ export async function updatePlugin(name: string, options: PluginInstallOptions =
     // Not in the registry, so there is nothing reviewed to land on: follow the
     // remote's default branch, whether the checkout is on a branch or detached
     // from an earlier pin.
-    if (isOnBranch(targetDir)) {
+    if (await isOnBranch(targetDir)) {
       await git(["pull", "--ff-only"], targetDir, quiet, `Failed to update ${name}`);
     } else {
       await git(["fetch", "--depth", "1", "origin", "HEAD"], targetDir, quiet, `Failed to fetch ${name}`);
@@ -621,6 +851,65 @@ export function installedPluginDirectories(): string[] {
 }
 
 /**
+ * The id an installed plugin goes by: the one its gloom.json declares, which
+ * every registry plugin has and which its export repeats, else its folder.
+ * Read without importing the plugin.
+ */
+export function installedPluginId(directory: string): string {
+  return readPluginManifest(join(PLUGINS_DIR, directory)).id ?? directory;
+}
+
+/**
+ * The installed folders `name` names: the folder itself, or else every
+ * folder whose plugin goes by that id. `gloom install` names the folder for
+ * the repository (`gloom-hackernews`) while `gloom plugins` and `plugin
+ * enable` use the id (`hackernews`), so every command takes either. Two
+ * checkouts of one plugin, a clone and a linked copy, share an id.
+ */
+export function installedPluginDirectoriesNamed(name: string): string[] {
+  const dirs = installedPluginDirectories();
+  if (dirs.includes(name)) return [name];
+  return dirs.filter((dir) => installedPluginId(dir) === name);
+}
+
+/**
+ * The installed folders `name` names, as installedPluginDirectoriesNamed,
+ * and else the folders whose plugin registers under that id with no
+ * gloom.json to say so: `plugin link ./riskwatch` of a plugin whose export
+ * is `risk-watch` is found as `risk-watch` too, as the running app knows it.
+ * Only those folders' exports are read.
+ */
+export async function installedPluginDirectoriesById(name: string): Promise<string[]> {
+  const named = installedPluginDirectoriesNamed(name);
+  if (named.length > 0) return named;
+  const undeclared = installedPluginDirectories().filter((dir) => !readPluginManifest(join(PLUGINS_DIR, dir)).id);
+  const ids = await Promise.all(undeclared.map(async (dir) => [dir, await installedPluginRegistryId(dir)] as const));
+  return ids.filter(([, id]) => id === name).map(([dir]) => dir);
+}
+
+/**
+ * The id the plugin in `directory` registers under, which is what the running
+ * app keys it by. Read from gloom.json when it declares one, which the export
+ * repeats (`plugin doctor` warns when it does not); otherwise from the export,
+ * but only for a checkout the loader would import, so the import is the one
+ * it already made. Null when neither answers.
+ */
+export async function installedPluginRegistryId(directory: string): Promise<string | null> {
+  const dir = join(PLUGINS_DIR, directory);
+  const declared = readPluginManifest(dir).id;
+  if (declared) return declared;
+  if (findAbsorbedCheckout(dir) || checkPluginCompatibility(dir)) return null;
+  const entry = await resolvePluginEntry(dir);
+  if (!entry) return null;
+  try {
+    return pluginFromModule(await import(entry))?.id ?? null;
+  } catch (error) {
+    logFailure("plugin-installer", "Installed plugin id read failed")(error);
+    return null;
+  }
+}
+
+/**
  * Makes a local checkout an installed plugin without cloning it. The link is
  * what the loader sees, so edits are live on the next reload or restart.
  */
@@ -643,7 +932,8 @@ export async function linkPlugin(sourcePath: string, options: PluginInstallOptio
   const plugin = await readPluginExport(source).catch(logFailure("plugin-installer", "Linked plugin validation failed", null));
   if (!options.quiet) {
     console.log(cliStyles.success(`Linked ${plugin?.name ?? name} from ${source}`));
-    console.log(cliStyles.muted(`Check it with "gloom plugin doctor ${name}".`));
+    // By the id it registers under, which every plugin command takes, as the folder is.
+    console.log(cliStyles.muted(`Check it with "gloom plugin doctor ${plugin?.id ?? name}".`));
   }
   return describe(source, name, plugin);
 }

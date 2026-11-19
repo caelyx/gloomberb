@@ -2,13 +2,13 @@
  * `history --csv` as one fixed table, whatever the symbol, its market's state
  * or how many symbols were asked for: the prices, the bar's flag and marks,
  * a coin's or one venue's volume, then the `status` column saying why a row
- * has no figures and the five fixed columns naming what each row is. A list
+ * has no figures and the fixed columns naming what each row is. A list
  * of symbols (`history --file`) writes every symbol's bars in one long table,
  * its rows told apart by `symbol_or_series`, and a symbol that served no bars
  * as one row with only its status.
  */
 import type { CliResultColumn } from "./result";
-import type { HistoryRow } from "./history-rows";
+import { isRescaleFlag, type HistoryRow } from "./history-rows";
 
 /** A bar of one symbol of a list, or the one row of a symbol that served none. */
 export interface HistoryListRow extends HistoryRow {
@@ -16,12 +16,16 @@ export interface HistoryListRow extends HistoryRow {
   symbol: string;
   /** Why the symbol has no bars, as its warning says it; only on a symbol's one row with no bar. */
   status?: string;
+  /** In a list read from a file or standard input, the line the row is for, as typed. */
+  input?: string;
+  /** In such a list, the earlier line that is the same listing. */
+  duplicateOf?: string;
 }
 
 type ExportedRow = Record<string, unknown>;
 
 /** A bar's mark as an export writes it: true or false on a bar, nothing on a symbol's row with no bar. */
-function barMark(key: "partial" | "filled" | "unsettled") {
+function barMark(key: "partial" | "filled" | "unsettled" | "roll" | "thin" | "settleOnly") {
   return (row: ExportedRow) => row.date ? row[key] === true : "";
 }
 
@@ -32,7 +36,7 @@ function barMark(key: "partial" | "filled" | "unsettled") {
  * whether or not any bar of this run has one, so files of different symbols
  * or days line up when joined.
  */
-export const HISTORY_EXPORT_COLUMNS: CliResultColumn<ExportedRow>[] = [
+const HISTORY_EXPORT_COLUMNS: CliResultColumn<ExportedRow>[] = [
   { key: "date", header: "Date" },
   { key: "open", header: "Open" },
   { key: "high", header: "High" },
@@ -47,7 +51,44 @@ export const HISTORY_EXPORT_COLUMNS: CliResultColumn<ExportedRow>[] = [
   { key: "volumeNote", header: "Volume note" },
   { key: "venueVolume", header: "Venue volume" },
   { key: "volumeVenue", header: "Volume venue" },
+  { key: "volumeBasis", header: "Volume basis" },
 ];
+
+/**
+ * A continuous future's contract per bar, the bar it rolled at, a bar that
+ * traded far below those around it, and one that is its contract's
+ * settlement alone (no open, high or low).
+ */
+const CONTRACT_EXPORT_COLUMNS: CliResultColumn<ExportedRow>[] = [
+  { key: "contract", header: "Contract" },
+  { key: "roll", header: "Roll", value: barMark("roll") },
+  { key: "thin", header: "Thin", value: barMark("thin") },
+  { key: "settleOnly", header: "Settle only", value: barMark("settleOnly") },
+];
+
+/**
+ * A history converted into another currency (`history --currency USD`): the
+ * rate each bar's prices were converted at (units of the currency asked for
+ * per unit of the listing's), the date of the FX close it is, and the
+ * listing's own close.
+ */
+const FX_EXPORT_COLUMNS: CliResultColumn<ExportedRow>[] = [
+  { key: "fxRate", header: "FX rate" },
+  { key: "fxDate", header: "FX date" },
+  { key: "localClose", header: "Local close" },
+];
+
+/**
+ * The columns of an export of these rows: HISTORY_EXPORT_COLUMNS, and when a
+ * bar names its contract (a continuous future such as NG=F) Contract, Roll,
+ * Thin and Settle only after them, for every row of the export. A stock's or a coin's file is
+ * as it always was.
+ */
+export function historyExportColumns(rows: readonly Pick<HistoryRow, "contract" | "fxRate">[]): CliResultColumn<ExportedRow>[] {
+  const contract = rows.some((row) => typeof row.contract === "string" && row.contract !== "");
+  const converted = rows.some((row) => row.fxRate !== undefined);
+  return [...HISTORY_EXPORT_COLUMNS, ...contract ? CONTRACT_EXPORT_COLUMNS : [], ...converted ? FX_EXPORT_COLUMNS : []];
+}
 
 /** Flags of a break before a bar, whose prices stay; every other code left the prices blank. */
 const BREAK_FLAGS = new Set(["gap", "jump"]);
@@ -60,7 +101,8 @@ const BREAK_FLAGS = new Set(["gap", "jump"]);
 export function historyExportStatus(row: ExportedRow): string {
   if (typeof row.status === "string" && row.status) return row.status;
   const blanked = [row.open, row.high, row.low, row.close].every((value) => value == null);
-  const codes = (typeof row.flag === "string" ? row.flag : "").split(",").filter((code) => code && !BREAK_FLAGS.has(code));
+  const codes = (typeof row.flag === "string" ? row.flag : "").split(",")
+    .filter((code) => code && !BREAK_FLAGS.has(code) && !isRescaleFlag(code));
   return row.date && blanked && codes.length > 0 ? `prices left blank: ${codes.join(",")}` : "";
 }
 

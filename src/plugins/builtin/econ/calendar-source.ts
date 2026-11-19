@@ -1,5 +1,6 @@
 import { apiClient, type CloudEconEventPayload } from "../../../api-client";
 import { ApiRequestError, isPermanentClientError } from "../../../api-client/errors";
+import { withPercentUnits } from "./figures";
 import type { EconEvent } from "./types";
 
 function toEconEvent(event: CloudEconEventPayload): EconEvent {
@@ -9,9 +10,10 @@ function toEconEvent(event: CloudEconEventPayload): EconEvent {
   };
 }
 
+/** The calendar, a percent indicator's figures in percent on every row (`withPercentUnits`). */
 export async function fetchEconCalendar(): Promise<EconEvent[]> {
   const events = await apiClient.getCloudEconomicCalendar();
-  return events.map(toEconEvent);
+  return withPercentUnits(events.map(toEconEvent));
 }
 
 /** The stored calendar from a day, or why it was not read so the caller reads the current calendar instead. */
@@ -20,6 +22,10 @@ export type EconCalendarFrom =
     events: EconEvent[];
     /** The first UTC day the stored calendar holds; null when it holds nothing. */
     storedFrom: string | null;
+    /** The first UTC day any read lists (the stored calendar's, or the furthest back it reaches); null from an older server. */
+    listedFrom: string | null;
+    /** The last UTC day the calendar lists releases for; null from a server that does not say. */
+    listedThrough: string | null;
   }
   | {
     events: null;
@@ -40,7 +46,12 @@ export async function fetchEconCalendarFrom(from: string): Promise<EconCalendarF
     if (!payload || !Array.isArray(payload.events) || !(payload.storedFrom === null || /^\d{4}-\d{2}-\d{2}$/.test(String(payload.storedFrom)))) {
       return { events: null, failure: "the server returned an unreadable calendar" };
     }
-    return { events: payload.events.map(toEconEvent), storedFrom: payload.storedFrom };
+    return {
+      events: withPercentUnits(payload.events.map(toEconEvent)),
+      storedFrom: payload.storedFrom,
+      listedFrom: typeof payload.listedFrom === "string" && /^\d{4}-\d{2}-\d{2}$/.test(payload.listedFrom) ? payload.listedFrom : null,
+      listedThrough: typeof payload.listedThrough === "string" && /^\d{4}-\d{2}-\d{2}$/.test(payload.listedThrough) ? payload.listedThrough : null,
+    };
   } catch (error) {
     if (error instanceof ApiRequestError && error.status === 404) return { events: null, failure: null };
     if (isPermanentClientError(error)) throw error;

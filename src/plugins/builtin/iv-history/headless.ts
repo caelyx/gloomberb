@@ -1,13 +1,14 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
 import { resolveHeadlessInstrument } from "../shared/headless-market-data";
 import { createRealizedVolatilityDependencies, loadRealizedVolatilityHistory } from "../realized-vol/client";
 import { createHvDependencies, loadIvHistory, loadIvScreen, loadScreenVolatilities } from "./client";
-import { formatPoints, formatRank, formatSpot, formatStat, formatVol, IMPLIED_VOL_WORDS, readingLabel, sharedDates, skewHeader, VCA_DEFINITIONS, verdictLabel } from "./format";
-import { HV_WINDOWS, type HvWindow, type IvLookback, type IvStatRow, projectIvHistory, projectRichCheap, type RichCheapRow, richCheapDates, screenCoverage, VCA_LIMIT, VCA_PRESETS } from "./model";
+import { formatPoints, formatRank, formatSpot, formatStat, formatVol, IMPLIED_VOL_WORDS, readingLabel, sharedDates, skewHeader, statSource, vcaDefinitions, verdictLabel } from "./format";
+import { HV_WINDOWS, type HvWindow, type IvLookback, type IvStatRow, projectIvHistory, projectRichCheap, type RichCheapRow, richCheapDates, screenCoverage, screenRiskReversalNote, screenStaleNote, VCA_LIMIT, VCA_PRESETS } from "./model";
 import { vcaUniverse } from "./universe";
 import { offsetText, releaseOffsetRows } from "./events";
 import { loadMacroReleases } from "../macro-day/client";
-import { MACRO_EVENT_LABELS, MACRO_RELEASE_SOURCES, staleMacroReleasesNotice, US_MACRO_EVENT_KINDS, type MacroRelease, type UsMacroEventKind,
+import { IV_EVENT_KINDS, MACRO_EVENT_LABELS, MACRO_RELEASE_SOURCES, POLICY_DECISION_KINDS, staleMacroReleasesNotice, type MacroEventKind, type MacroRelease,
   type MacroReleaseList } from "../macro-day/releases";
 import { lookupScheduledDates } from "../alerts/scheduled";
 import { fetchCpiBoard } from "../cpi/client";
@@ -16,39 +17,43 @@ import type { HeadlessPaneContext } from "../../../types/headless";
 import { zonedDateKey } from "../../../utils/zoned-date-time";
 import { listingFateNotes, listingFateReport, loadListingFate, MovedSymbolError } from "../../../tickers/listing-fate";
 import { startTickerChangeLookup } from "../../../tickers/ticker-changes";
+import { fxVolatilityRefusal } from "../../../market-data/options-alternatives";
+import { logFailure } from "../../../utils/log-failure";
 
 const METHODOLOGY = "docs/research-data.md#implied-volatility-history";
-const percent = (value: unknown) => typeof value === "number" ? formatVol(value) : "--";
-const points = (value: unknown) => typeof value === "number" ? formatPoints(value) : "--";
+const percent = (value: unknown) => typeof value === "number" ? formatVol(value) : MISSING_VALUE;
+const points = (value: unknown) => typeof value === "number" ? formatPoints(value) : MISSING_VALUE;
 
 export const ivHistoryHeadless: HeadlessPaneDefinition<"bundle"> = {
   shape: "bundle", argument: { kind: "ticker", description: "US option underlying" },
   usListingsOnly: "Implied volatility history",
+  refuseSymbol: fxVolatilityRefusal("HIVG"),
   freshness: { status: "not-a-feed", basis: "daily implied volatility", cadence: "daily", observedKey: "date", oldest: null },
   describe: (args) => `HIVG ${args.symbols[0] ?? ""}`,
   discovery: { aliases: ["HIVG"], suggestFor: IMPLIED_VOL_WORDS, screenshotReadiness: "live-dom", dataRequirements: ["Cloud stored implied volatility", "Daily price history"],
     limitations: ["History starts February 2024 (daily option trade closes).", "Rank and percentile use trade-close readings only.",
       "IV1Y needs long-dated trades: it can start later, has gaps, and ranks from 60 prior sessions.",
-      "skew25d (put-call) and rr25d (call-put) come from the daily quote captures and are blank before the first one."] },
+      "skew25d (put-call) and rr25d (call-put) come from each session's close where it carries the 25-delta wings, else its quote capture.",
+      "The 25D RR percentile ranks closes against closes and needs 20 prior sessions; until a year exists the notes say how many it rests on."] },
   options: [
     { key: "lookback", type: "enum", values: [{ value: "1Y" }, { value: "2Y" }, { value: "ALL" }], defaultValue: "1Y", description: "Visible history" },
     { key: "hvWindow", type: "enum", values: HV_WINDOWS.map((window) => ({ value: String(window) })), defaultValue: "20", description: "Realized volatility window in sessions" },
-    { key: "event", type: "enum", aliases: ["release"], values: US_MACRO_EVENT_KINDS.map((value) => ({ value, ...value === "jobs" ? { aliases: ["nfp", "payrolls"] } : {} })),
-      description: "One row per release of this kind whose session at --offset has closed (the next scheduled FOMC or CPI included), in place of the daily history",
+    { key: "event", type: "enum", aliases: ["release"], values: IV_EVENT_KINDS.map((value) => ({ value, ...value === "jobs" ? { aliases: ["nfp", "payrolls"] } : {} })),
+      description: "One row per release of this kind whose session at --offset has closed (the next scheduled FOMC, CPI, ECB or BoJ decision included), in place of the daily history",
       example: "--event fomc --offset -6", shot: { reportOnly: "lists the readings around past release days" } },
     { key: "offset", type: "integer", minimum: -60, maximum: 60, defaultValue: 0,
       description: "Sessions from each release with --event: 0 is the first session on or after the release day, -6 the sixth session before that",
       example: "--event cpi --offset -1", shot: { reportOnly: "picks the session read around each release" } },
   ],
   async load(args, ctx) {
-    const event = typeof args.options.event === "string" && args.options.event ? args.options.event as UsMacroEventKind : null;
+    const event = typeof args.options.event === "string" && args.options.event ? args.options.event as MacroEventKind : null;
     const offset = Number(args.options.offset) || 0;
-    if (!event && offset !== 0) throw new Error("--offset counts sessions from a release day: add --event fomc, cpi or jobs.");
+    if (!event && offset !== 0) throw new Error("--offset counts sessions from a release day: add --event fomc, cpi, jobs, ecb or boj.");
     const instrument = await resolveHeadlessInstrument(ctx, args.symbols[0]!);
     // What became of the symbol, as `quote` reads it, looked up beside the figures: FB's are the fund listed
     // there now, TWTR stopped trading, and HFC, which became DINO, has none of its own.
     const changes = startTickerChangeLookup(ctx.marketData, instrument.symbol, instrument.exchange);
-    const quote = ctx.marketData.getQuote(instrument.symbol, instrument.exchange ?? "").catch(() => null);
+    const quote = ctx.marketData.getQuote(instrument.symbol, instrument.exchange ?? "").catch(logFailure("iv-history.headless", "Load IV history quote failed", null));
     const [payload, prices, releases] = await Promise.all([
       loadIvHistory(instrument.symbol, { signal: ctx.signal }, ctx.apiClient),
       loadRealizedVolatilityHistory({ instrument, signal: ctx.signal }, createRealizedVolatilityDependencies(ctx.marketData)),
@@ -79,7 +84,8 @@ export const ivHistoryHeadless: HeadlessPaneDefinition<"bundle"> = {
     // With nothing served, the fate is why: no "not a ticker" or missing-history errors beside it.
     const { notes: fateNotes, errors } = listingFateReport(fate, { served },
       [prices.error, ...model.warnings].filter((value): value is string => !!value));
-    const notes = [...fateNotes, ...[model.oneYearNote, model.skewNote].filter((note): note is string => !!note)];
+    const notes = [...fateNotes, ...[model.oneYearNote, model.skewNote, model.riskReversalNote, model.staleNote]
+      .filter((note): note is string => !!note)];
     if (event && releases) {
       const lookback = String(args.options.lookback) as IvLookback;
       const label = MACRO_EVENT_LABELS[event];
@@ -97,15 +103,20 @@ export const ivHistoryHeadless: HeadlessPaneDefinition<"bundle"> = {
         releases.upcomingNote,
         staleMacroReleasesNotice(releases.list),
       ].filter((note): note is string => !!note);
-      const eventColumns = [{ key: "releaseDate", header: "Release date" }, { key: "session", header: "Session" },
+      // A policy decision's row says what it did (ECB raised 75bp to 0.75%), as MDAY's does; the export keeps the rate before too.
+      const decisionColumns = POLICY_DECISION_KINDS.has(event)
+        ? [{ key: "decision", header: "Decision" }, { key: "actual", header: "Actual" }, { key: "prior", header: "Prior" }] : [];
+      const eventColumns = [{ key: "releaseDate", header: "Release date" }, ...decisionColumns, { key: "session", header: "Session" },
         ...historyColumns.slice(1), ...skewColumns];
+      const decided = offsets.rows.some((row) => row.decision != null);
+      const textColumns = eventColumns.filter((column) => decided ? column.key !== "prior" : !decisionColumns.includes(column));
       return {
         sections: [{
           title: `${label} releases, ${offsetText(offset)}`,
           // The export names the release and the offset on every row, so files of several offsets or releases join.
           columns: [{ key: "release", header: "Release" }, eventColumns[0]!, { key: "offset", header: "Offset (sessions)" }, ...eventColumns.slice(1)],
           rows: offsets.rows.map(({ date, ...row }) => ({ ...row, session: date, release: label })),
-          textColumns: offsets.rows.some((row) => row.skew25d != null) ? eventColumns : eventColumns.slice(0, -skewColumns.length),
+          textColumns: offsets.rows.some((row) => row.skew25d != null) ? textColumns : textColumns.slice(0, -skewColumns.length),
         }],
         complete: payload.status === "ready" && errors.length === 0,
         unavailableSymbols: offsets.rows.some((row) => row.iv30 != null) ? [] : [instrument.symbol], errors,
@@ -117,18 +128,27 @@ export const ivHistoryHeadless: HeadlessPaneDefinition<"bundle"> = {
           releaseSource: MACRO_RELEASE_SOURCES[event], unit: "decimal annualized volatility", methodology: METHODOLOGY },
       };
     }
+    // The text report dates a stale measure "stale"; exports keep the bare date and say it in `stale`.
+    const statColumns = [
+      { key: "label", header: "Measure" },
+      { key: "value", header: "Current", format: (value: unknown, row?: unknown) => formatStat(value as number | null, (row as IvStatRow).unit) },
+      { key: "date", header: "As of" }, { key: "method", header: "Method" },
+      { key: "low", header: "52w low", format: (value: unknown, row?: unknown) => formatStat(value as number | null, (row as IvStatRow).unit) },
+      { key: "high", header: "52w high", format: (value: unknown, row?: unknown) => formatStat(value as number | null, (row as IvStatRow).unit) },
+      { key: "rank", header: "Rank", format: (value: unknown) => formatRank(value as number | null) },
+      { key: "percentile", header: "Pctl", format: (value: unknown) => formatRank(value as number | null) },
+      { key: "samples", header: "Sessions" },
+    ];
+    const statTextColumns = statColumns.map((column) => column.key === "date"
+      ? { ...column, textFormat: (value: unknown, row: unknown) => typeof value !== "string" ? MISSING_VALUE : (row as IvStatRow).stale ? `${value} stale` : value }
+      : column.key === "method"
+        // The wording the pane's source column uses; exports keep the raw method and carry the basis.
+        ? { ...column, textFormat: (value: unknown, row: unknown) => typeof value !== "string" ? MISSING_VALUE : statSource(row as IvStatRow) }
+        : column);
     return {
       sections: [
-        { title: "Statistics", columns: [
-          { key: "label", header: "Measure" },
-          { key: "value", header: "Current", format: (value: unknown, row?: unknown) => formatStat(value as number | null, (row as IvStatRow).unit) },
-          { key: "date", header: "As of" }, { key: "method", header: "Method" },
-          { key: "low", header: "52w low", format: (value: unknown, row?: unknown) => formatStat(value as number | null, (row as IvStatRow).unit) },
-          { key: "high", header: "52w high", format: (value: unknown, row?: unknown) => formatStat(value as number | null, (row as IvStatRow).unit) },
-          { key: "rank", header: "Rank", format: (value: unknown) => formatRank(value as number | null) },
-          { key: "percentile", header: "Pctl", format: (value: unknown) => formatRank(value as number | null) },
-          { key: "samples", header: "Sessions" },
-        ], rows: model.stats.map((row) => ({ ...row })) },
+        { title: "Statistics", columns: [...statColumns, { key: "basis", header: "Basis" }, { key: "stale", header: "Stale" }], textColumns: statTextColumns,
+          rows: model.stats.map((row) => ({ ...row })) },
         // Exports always carry the skew columns, so a script's header never moves; the text table drops them when none has a value.
         { title: "Daily history", columns: [...historyColumns, ...skewColumns], rows,
           ...(rows.some((row) => row.skew25d != null) ? {} : { textColumns: historyColumns }) },
@@ -151,6 +171,7 @@ export const ivScreenHeadless: HeadlessPaneDefinition<"bundle"> = {
   freshness: { status: "not-a-feed", basis: "daily implied volatility", cadence: "daily", observedKey: "date" },
   argument: { kind: "symbol-list", optional: true, maximum: VCA_LIMIT, description: "US option underlyings; defaults to index and sector ETFs." },
   usListingsOnly: "Implied volatility",
+  refuseSymbol: fxVolatilityRefusal("VCA"),
   options: [{ key: "preset", type: "enum", values: [{ value: "etfs" }, { value: "megacaps" }], defaultValue: "etfs", description: "Preset when no symbols are given" }],
   describe: "Volatility rich/cheap",
   // The pane names its universe `scope`; symbols typed open their own (custom), which a preset does not replace.
@@ -180,33 +201,39 @@ export const ivScreenHeadless: HeadlessPaneDefinition<"bundle"> = {
     // A listing that stopped trading has its row's note, not a line saying it has no options history.
     const coverage = screenCoverage(rows, { explained: new Set([...noted].filter(([, entry]) => entry.fate.endedOn).map(([symbol]) => symbol)) });
     const dates = richCheapDates(rows);
-    const hasSkew = rows.some((row) => row.skew != null);
+    const hasSkew = rows.some((row) => row.riskReversal != null);
+    const hasSkewRank = rows.some((row) => row.riskReversalPercentile != null);
     const hasIv1y = rows.some((row) => row.iv1y != null), hasIv1yRank = rows.some((row) => row.iv1yPercentile != null);
-    const dated = (value: unknown) => typeof value === "string" ? value : "--";
+    const dated = (value: unknown) => typeof value === "string" ? value : MISSING_VALUE;
     return {
       sections: [{ title: ["Rich/cheap", universe.label, ...sharedDates(dates)].join(" · "), columns: [
         { key: "symbol", header: "Symbol" }, { key: "iv30", header: "IV30", format: percent },
         ...(dates.reading ? [] : [{ key: "date", header: "As of", format: (value: unknown, row?: unknown) =>
-          typeof value === "string" ? readingLabel(value, (row as RichCheapRow).method) : "--" }]),
-        // The underlying price each reading was taken at, on the date the title or the As of column gives.
-        { key: "spot", header: "Spot", format: (value: unknown) => typeof value === "number" ? formatSpot(value) : "--" },
-        ...(dates.rankApart ? [{ key: "rankDate", header: "Rank as of", format: (value: unknown) => typeof value === "string" ? `${value} close` : "--" }] : []),
+          typeof value === "string" ? readingLabel(value, (row as RichCheapRow).method, false,
+            { basis: (row as RichCheapRow).basis, stale: (row as RichCheapRow).stale }) : MISSING_VALUE }]),
+        // The underlying's price on the row's own date, the title's or the As of column's; blank when no capture of it is that day's.
+        { key: "spot", header: "Spot", format: (value: unknown) => typeof value === "number" ? formatSpot(value) : MISSING_VALUE },
         { key: "rank", header: "IVR", format: (value: unknown) => formatRank(value as number | null) },
         { key: "percentile", header: "IVP", format: (value: unknown) => formatRank(value as number | null) },
         { key: "verdict", header: "Rich/Cheap", format: (value: unknown) => verdictLabel(value as never) },
         ...(hasIv1y ? [{ key: "iv1y", header: "IV1Y", format: percent }] : []),
         ...(hasIv1yRank ? [{ key: "iv1yPercentile", header: "IVP1Y", format: (value: unknown) => formatRank(value as number | null) }] : []),
         { key: "termSlope", header: "30-90", format: (value: unknown) => formatPoints(value as number | null) },
-        ...(hasSkew ? [{ key: "skew", header: skewHeader("25D skew", "put-call"), format: (value: unknown) => formatPoints(value as number | null) }] : []),
-        ...(hasSkew && dates.skewApart ? [{ key: "skewDate", header: "Skew as of", format: dated }] : []),
+        ...(hasSkew ? [{ key: "riskReversal", header: skewHeader("25D RR", "call-put"), format: (value: unknown) => formatPoints(value as number | null) }] : []),
+        // Where that risk reversal sits in its own year: how many sessions it rests on is said under the table until a year is in.
+        ...(hasSkewRank ? [{ key: "riskReversalPercentile", header: "RR pctl", format: (value: unknown) => formatRank(value as number | null) }] : []),
+        ...(hasSkew && dates.skewApart ? [{ key: "skewDate", header: "RR as of", format: dated }] : []),
         { key: "hv", header: "HV20", format: percent },
-        { key: "ivHv", header: "IV/HV", format: (value: unknown) => typeof value === "number" ? value.toFixed(2) : "--" },
+        // Said only where an HV is not the one of its IV's date: a stale reading's, or one a few sessions off.
+        ...(dates.hvApart ? [{ key: "hvDate", header: "HV as of", format: dated }] : []),
+        { key: "ivHv", header: "IV/HV", format: (value: unknown) => typeof value === "number" ? value.toFixed(2) : MISSING_VALUE },
         ...(noted.size > 0 ? [{ key: "note", header: "Note", underRow: true }] : []),
       ], rows: rows.map((row) => ({ ...row, ...noted.has(row.symbol) ? { note: noted.get(row.symbol)!.note } : {} })) }],
       // A symbol with no options history is final; only history still to come leaves the screen incomplete.
       complete: !coverage.pending.length && !universe.error, unavailableSymbols: coverage.missing,
       errors: [universe.error].filter((value): value is string => !!value),
-      notes: [...coverage.notes, ...VCA_DEFINITIONS],
+      notes: [...coverage.notes, ...[screenStaleNote(rows), screenRiskReversalNote(rows)].filter((note): note is string => !!note),
+        ...vcaDefinitions({ skew: hasSkew })],
       metadata: { presets: VCA_PRESETS, methodology: METHODOLOGY },
     };
   },
@@ -216,27 +243,30 @@ export const ivScreenHeadless: HeadlessPaneDefinition<"bundle"> = {
  * The releases of `event` HIVG reads around: the days MDAY studies (the list
  * the app ships with, extended by Gloom Cloud's), and the next one scheduled,
  * from the CPI board's release calendar or the FOMC meetings WIRP prices, as
- * scheduled alerts read them. Payrolls have no schedule to read.
+ * scheduled alerts read them, or the ECB's or BoJ's next decision as Gloom
+ * Cloud lists it with its decision days. Payrolls have no schedule to read.
  */
-async function eventReleases(event: UsMacroEventKind, ctx: HeadlessPaneContext): Promise<{
+async function eventReleases(event: MacroEventKind, ctx: HeadlessPaneContext): Promise<{
   list: MacroReleaseList; upcoming: string | null; upcomingNote: string | null;
 }> {
   const label = MACRO_EVENT_LABELS[event];
   const [published, next] = await Promise.all([
     loadMacroReleases({}, () => ctx.apiClient.getCloudMacroReleaseDays()),
-    event === "jobs" ? null : lookupScheduledDates([{ kind: "macro", event }], {
+    event !== "cpi" && event !== "fomc" ? null : lookupScheduledDates([{ kind: "macro", event }], {
       earnings: async () => [],
       cpi: () => fetchCpiBoard(ctx.apiClient),
       fomc: async () => (await fetchRatePath(ctx.apiClient)).meetings,
     }, zonedDateKey(Date.now(), "America/New_York")).then((dates) => dates.get(`macro:${event}`) ?? { date: null }),
   ]);
-  const upcoming = next && "date" in next ? next.date : null;
+  const served = event === "ecb" || event === "boj";
+  const upcoming = served ? published.scheduled?.[event] ?? null : next && "date" in next ? next.date : null;
   const listed = upcoming != null && published.releases.some((release) => release.kind === event && release.date === upcoming);
   const releases: MacroRelease[] = upcoming && !listed ? [...published.releases, { kind: event, date: upcoming }] : published.releases;
   return {
     list: { ...published, releases },
     upcoming,
-    upcomingNote: next == null ? `The next ${label} release is not scheduled here, so it has no row yet.`
+    upcomingNote: served ? upcoming ? null : `The next ${label} decision is not scheduled here, so it has no row yet.`
+      : next == null ? `The next ${label} release is not scheduled here, so it has no row yet.`
       : "error" in next ? `The next ${label} date could not be loaded (${next.error}), so it has no row.` : null,
   };
 }

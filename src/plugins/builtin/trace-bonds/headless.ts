@@ -5,10 +5,22 @@ import {
   fetchBondTape,
   issuerFallbackText,
   noPrintsText,
+  parseBondQuery,
   quotedCompanyName,
+  quotedIssuerListing,
   type CorporateBond,
 } from "./client";
-import { bondStackPriority, formatBondChange, formatBondDecimal, type BondColumnId } from "./model";
+import { bondStackPriority, formatBondChange, formatBondDecimal, sharesOneIssuer, type BondColumnId } from "./model";
+import {
+  HISTORY_RANGES,
+  keptSinceText,
+  pricedDays,
+  readStoredHistory,
+  storedHistoryRefusal,
+  type HistoryRange,
+} from "./history";
+import { logFailure } from "../../../utils/log-failure";
+import { bondIssuerListing, type StoredBondPayload } from "../../../api-client/bond-trades";
 
 const decimal = (digits: number) => (value: unknown) => (
   typeof value === "number" ? formatBondDecimal(value, digits) : "—"
@@ -33,6 +45,15 @@ const COLUMNS: HeadlessPaneColumn[] = [
   column("grade", { key: "traceGradeCode", header: "Grade" }),
 ];
 
+/**
+ * One issuer's tape (`sharesOneIssuer`) leaves the issuer column out of the
+ * text table, as the pane does; exports and piped output keep it.
+ */
+function reportColumns(bonds: readonly CorporateBond[]): HeadlessPaneColumn[] {
+  if (!sharesOneIssuer(bonds)) return COLUMNS;
+  return COLUMNS.map((spec) => spec.key === "issuerName" ? { ...spec, minTableWidth: Number.MAX_SAFE_INTEGER } : spec);
+}
+
 function reportRow(bond: CorporateBond) {
   return {
     id: bond.id,
@@ -48,6 +69,29 @@ function reportRow(bond: CorporateBond) {
   };
 }
 
+const HISTORY_COLUMNS: HeadlessPaneColumn[] = [
+  { key: "date", header: "Date" },
+  { key: "price", header: "Price", align: "right", format: decimal(3) },
+  { key: "yield", header: "Yield", align: "right", format: decimal(3) },
+  { key: "prints", header: "Prints", align: "right" },
+];
+
+/** A bond's kept daily closes in the range, newest first, titled by since when prints are kept. */
+function historySection(history: StoredBondPayload, range: HistoryRange) {
+  const days = HISTORY_RANGES.find((entry) => entry.value === range)!.days;
+  const from = new Date(Date.parse(`${history.to}T00:00:00Z`) - (days - 1) * 86_400_000).toISOString().slice(0, 10);
+  // A server from before daily closes were served answers none.
+  const rows = pricedDays(history.days ?? []).filter((day) => day.date >= from).reverse();
+  return {
+    title: history.keptSince ? `Daily closes, kept since ${history.keptSince}` : "Daily closes",
+    columns: HISTORY_COLUMNS,
+    rows: rows.map((day) => ({ id: day.date, date: day.date, price: day.price, yield: day.yield, prints: day.prints })),
+    empty: history.backfillPending
+      ? "No kept prints yet; the source's earlier prints are still being read."
+      : `No kept prints since ${from}.`,
+  };
+}
+
 /** The latest corporate and agency bond sales, or one issuer's, symbol's or CUSIP's, asked of the tape itself. */
 export const traceBondsHeadless: HeadlessPaneDefinition<"bundle"> = {
   shape: "bundle",
@@ -57,20 +101,37 @@ export const traceBondsHeadless: HeadlessPaneDefinition<"bundle"> = {
     placeholder: "issuer, symbol or CUSIP",
     description: "Issuer name (matched from its start), symbol root, stock ticker or CUSIP. Leave it out for the market's latest sales.",
   },
-  options: [],
+  options: [
+    {
+      key: "range",
+      type: "enum",
+      description: "How far back a CUSIP's kept daily closes reach (Gloom Pro).",
+      values: HISTORY_RANGES.map((entry) => ({ value: entry.value })),
+      defaultValue: "3M",
+      example: "--range 1Y",
+    },
+  ],
   discovery: {
     aliases: ["TRACE"],
-    dataRequirements: ["Corporate and agency bond last sales"],
+    dataRequirements: ["Corporate and agency bond last sales", "Kept bond prints (Gloom Pro)"],
     limitations: [
       "One page of 100 bonds, most recent last sale first",
-      "An issuer name matches the start of the issuer's name; a symbol matches the tape's own symbol root, which can differ from the stock ticker. A ticker with no bonds under either is asked once more by the name its quote gives the company",
+      "An issuer name matches the start of the issuer's name; a symbol matches the tape's own symbol root, which can differ from the stock ticker. A ticker with no bonds under either is asked for the bonds linked to its company, then by the name its quote gives the company",
       "An issuer's bonds that have matured are left out; a CUSIP shows its bond either way",
+      "A CUSIP or a ticker looked up here is kept from then on, with the prints the source still publishes for it (about three years); a CUSIP's daily closes start where its prints are kept, and nothing before that is shown",
     ],
   },
   describe: "Latest corporate and agency bond sales",
   freshness: { source: "FINRA", status: "not-a-feed", basis: "last sales", observedKey: "lastTradeDate" },
   async load(args, ctx) {
     const argument = Array.isArray(args.argument) ? args.argument.join(" ") : args.argument ?? "";
+    // A CUSIP's kept history, and a ticker's bonds kept from now on, read beside the tape: Gloom Pro, and never what fails it.
+    const stored = readStoredHistory(parseBondQuery(argument), ctx.apiClient, { signal: ctx.signal })
+      .then((history) => ({ history, note: null }))
+      .catch((error: unknown) => {
+        if (ctx.signal.aborted) return { history: null, note: null };
+        return { history: null, note: storedHistoryRefusal(error) ?? logFailure("trace-bonds.headless", "Load kept bond prints failed", "Kept price history unavailable.")(error) };
+      });
     const tape = await fetchBondTape(argument, {
       signal: ctx.signal,
       // A stock ticker with no bonds of its own: its company, as its quote names it.
@@ -78,27 +139,48 @@ export const traceBondsHeadless: HeadlessPaneDefinition<"bundle"> = {
         const { symbol, exchange } = await resolveHeadlessInstrument(ctx, ticker);
         return quotedCompanyName(ctx.marketData, symbol, exchange);
       },
+      // Its company's bonds as Gloom Cloud links them, before its name is tried.
+      linkedBonds: async (ticker) => {
+        const { symbol, exchange } = await resolveHeadlessInstrument(ctx, ticker);
+        // A bare code (2318) is the listing its quote is of (2318:HKEX).
+        const listing = exchange ? bondIssuerListing(symbol, exchange) : await quotedIssuerListing(ctx.marketData, symbol);
+        if (!listing) return null;
+        const linked = await ctx.apiClient.getCloudIssuerBondIssues(listing, { signal: ctx.signal });
+        return { company: linked.name, cusips: linked.cusips };
+      },
     });
     const { query, bonds, tradeDate, truncated, issuer, failures } = tape;
     const shown = issuer && bonds.length > 0;
+    // Bonds its links name are the ticker's own; bonds found by its company's name are said to be a guess.
+    const issuerText = shown ? issuerFallbackText(query!, issuer) : null;
+    const range = (HISTORY_RANGES.some((entry) => entry.value === args.options.range) ? args.options.range : "3M") as HistoryRange;
+    const { history, note: historyNote } = await stored;
+    ctx.signal.throwIfAborted();
+    const kept = history ? keptSinceText(history) : null;
     return {
       sections: [{
         // An empty answer is its message alone, dated in its own words.
         title: bonds.length > 0 ? (tradeDate ? `Last sales ${tradeDate}` : "Last sales") : query ? "" : "Last sales",
-        columns: COLUMNS,
+        columns: reportColumns(bonds),
         rows: bonds.map(reportRow),
         ...(query ? { empty: noPrintsText(query, tradeDate, issuer) } : {}),
-      }],
+      }, ...(history ? [historySection(history, range)] : [])],
       complete: failures.length === 0,
       ...(failures.length > 0 ? { errors: failures } : {}),
-      ...(truncated ? { notes: [TRUNCATED_TEXT] } : {}),
-      ...(shown ? { warnings: [issuerFallbackText(query!, issuer)] } : {}),
+      ...(truncated || kept || historyNote || issuer?.linked ? {
+        notes: [
+          ...(issuerText && issuer?.linked ? [issuerText] : []),
+          ...(truncated ? [TRUNCATED_TEXT] : []), ...(kept ? [kept] : []), ...(historyNote ? [historyNote] : []),
+        ],
+      } : {}),
+      ...(issuerText && !issuer?.linked ? { warnings: [issuerText] } : {}),
       metadata: {
         tradeDate,
         matched: bonds.length,
         ...(query ? { query: query.text } : {}),
         ...(issuer ? { issuerName: issuer.name, company: issuer.company } : {}),
         ...(truncated ? { truncated } : {}),
+        ...(history ? { keptSince: history.keptSince, backfillPending: history.backfillPending } : {}),
       },
       // One issuer's rows are each issue's own last sale, however old: a history, not stale rows.
       ...(query ? { freshness: { oldest: null } } : {}),

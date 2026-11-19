@@ -1,5 +1,8 @@
 import { metricDescription, readAlertMetric, validMetricRule } from "./metric-model";
 import type { AlertCondition, AlertRule } from "./types";
+import { alertListing } from "./format";
+import { alertListingKey, alertPriceText } from "./price-text";
+import { moveRuleWords } from "./move";
 import { logFailure } from "../../../utils/log-failure";
 
 export type { AlertRule };
@@ -33,10 +36,15 @@ export function editAlert(
   targetPrice: number,
 ): AlertRule {
   const nextSymbol = symbol.trim().toUpperCase();
+  const sameListing = nextSymbol === alert.symbol.trim().toUpperCase();
   return {
     id: alert.id,
     symbol: nextSymbol,
-    exchange: nextSymbol === alert.symbol.trim().toUpperCase() ? alert.exchange : undefined,
+    exchange: sameListing ? alert.exchange : undefined,
+    // The listing's currency and venue stay with it; a new symbol learns its own at its first check.
+    ...(sameListing && alert.lastQuoteCurrency ? { lastQuoteCurrency: alert.lastQuoteCurrency } : {}),
+    ...(sameListing && alert.lastQuoteExchange ? { lastQuoteExchange: alert.lastQuoteExchange } : {}),
+    ...(sameListing && alert.lastQuotePence ? { lastQuotePence: alert.lastQuotePence } : {}),
     condition,
     targetPrice,
     createdAt: alert.createdAt,
@@ -44,6 +52,8 @@ export function editAlert(
     status: "active",
     message: alert.message,
     ...(alert.metric ? { metric: alert.metric } : {}),
+    // A move rule stays one; the session it went off in is dropped, so it can go off again.
+    ...(alert.move ? { move: true } : {}),
   };
 }
 
@@ -51,8 +61,21 @@ export function rearmAlert(alert: AlertRule): AlertRule {
   return editAlert(alert, alert.symbol, alert.condition, alert.targetPrice);
 }
 
+/**
+ * Whether two level alerts are one rule: the same measure, condition and
+ * target on the same listing, whether it was named with its exchange or read
+ * from the symbol alone. A second add of one names the first and adds nothing.
+ */
+export function sameLevelRule(a: AlertRule, b: AlertRule): boolean {
+  // One key per listing: 7203.T, `7203 JP` and 7203:JPX are one listing, as is AAPL read on NASDAQ.
+  return alertListingKey(a) === alertListingKey(b) && !!a.move === !!b.move
+    && a.condition === b.condition && a.targetPrice === b.targetPrice
+    && JSON.stringify(readAlertMetric(a.metric)) === JSON.stringify(readAlertMetric(b.metric));
+}
+
 export function evaluateAlert(alert: AlertRule, currentPrice: number): boolean {
-  if (alert.metric || alert.status !== "active") return false;
+  // A move from the previous close is judged on the quote's move (`judgeMove`), never on its price.
+  if (alert.metric || alert.move || alert.status !== "active") return false;
 
   switch (alert.condition) {
     case "above":
@@ -70,11 +93,28 @@ export function evaluateAlert(alert: AlertRule, currentPrice: number): boolean {
   }
 }
 
+/**
+ * Whether an above or below rule already holds at a reading. Such a rule is a
+ * state, not a crossing (`evaluateAlert`, `metricTrigger`), so one that holds
+ * when it is added goes off at its first check. `crosses`, a moving-average
+ * cross and an RRG quadrant wait for the next move through their level.
+ */
+export function levelAlreadyMet(
+  condition: AlertCondition,
+  value: number | null | undefined,
+  level: number | null | undefined,
+): boolean {
+  if (value == null || level == null || !Number.isFinite(value) || !Number.isFinite(level)) return false;
+  return condition === "above" ? value > level : condition === "below" ? value < level : false;
+}
+
 export function formatAlertDescription(alert: AlertRule): string {
   if (alert.metric) return metricDescription(alert);
+  if (alert.move) return `${alertListing({ symbol: alert.symbol, exchange: alert.exchange })} ${moveRuleWords(alert)} from the previous close`;
   const prefix = alert.condition === "above" ? ">"
     : alert.condition === "below" ? "<" : "↕";
-  return `${alert.symbol} ${prefix} ${alert.targetPrice}`;
+  // The listing as it was kept (7203:JPX, AAPL), its target at the instrument's precision (1.33750, 70.00p).
+  return `${alertListing({ symbol: alert.symbol, exchange: alert.exchange })} ${prefix} ${alertPriceText(alert, alert.targetPrice)}`;
 }
 
 export function serializeAlerts(alerts: AlertRule[]): string {

@@ -129,11 +129,18 @@ test("a portfolio's cash, target weights and 13F import source survive a save an
       { id: "main", name: "Main", currency: "USD", cash: { amount: 500_000, currency: "USD" }, targetWeights: { VTI: 60, CASH: 40 }, importedFrom },
       { id: "junk-weights", name: "Junk", currency: "USD", importedFrom: { ...importedFrom, weights: { AAPL: 0.5, KO: "half", BAC: -0.1 } } },
       { id: "bad", name: "Bad", currency: "USD", cash: { amount: "lots", currency: "USD" }, targetWeights: { VTI: 140, GLD: -1, BIL: "ten" }, importedFrom: { kind: "13f", cik: "1" } },
+      // Cash in other currencies, a currency twice (once as an older build set `cash`) and a malformed balance.
+      { id: "hk", name: "HK", currency: "USD", cash: { amount: 1_200, currency: "USD" },
+        otherCash: [{ amount: 39_000, currency: "HKD" }, { amount: 900, currency: "USD" }, { amount: 5, currency: "hkd" }, "junk"] },
+      { id: "first-bad", name: "First bad", currency: "USD", cash: { amount: Number.NaN, currency: "USD" }, otherCash: [{ amount: 250_000, currency: "TRY" }] },
     ],
   }));
   const loaded = await loadConfig(dataDir);
   await saveConfig(loaded);
-  const [main, junk, bad] = (await loadConfig(dataDir)).portfolios;
+  const [main, junk, bad, hk, firstBad] = (await loadConfig(dataDir)).portfolios;
+  // Each currency once, `cash` first as an older build reads it; one left after a malformed `cash` takes its place.
+  expect(hk).toEqual({ id: "hk", name: "HK", currency: "USD", cash: { amount: 1_200, currency: "USD" }, otherCash: [{ amount: 39_000, currency: "HKD" }] });
+  expect(firstBad).toEqual({ id: "first-bad", name: "First bad", currency: "USD", cash: { amount: 250_000, currency: "TRY" } });
   expect(main).toEqual({ id: "main", name: "Main", currency: "USD", cash: { amount: 500_000, currency: "USD" }, targetWeights: { VTI: 60, CASH: 40 }, importedFrom });
   // Weights the 13F could not have (negative, not numbers) leave the source without weights, never with some of them.
   expect(junk!.importedFrom).toEqual({ kind: "13f", cik: "0001067983", name: "BERKSHIRE HATHAWAY INC", period: "2026-06-30", filed: "2026-08-14" });
@@ -168,6 +175,19 @@ test("presentation mode survives a save and reload, and anything but true leaves
   expect("presentationMode" in await loadConfig(dataDir)).toBe(false);
 });
 
+test("the header's market survives a save and reload, and a choice this build cannot show is dropped", async () => {
+  const dataDir = await createTempConfigDir();
+  await writeConfigJson(dataDir, createSavedConfig({ headerMarket: { benchmark: "hang-seng" } }));
+  const loaded = await loadConfig(dataDir);
+  expect(loaded.headerMarket).toEqual({ benchmark: "hang-seng" });
+
+  await saveConfig({ ...loaded, headerMarket: { symbol: "AAPL", exchange: "NASDAQ" } });
+  expect((await loadConfig(dataDir)).headerMarket).toEqual({ symbol: "AAPL", exchange: "NASDAQ" });
+
+  await writeConfigJson(dataDir, createSavedConfig({ headerMarket: { benchmark: "ibex35" } }));
+  expect("headerMarket" in await loadConfig(dataDir)).toBe(false);
+});
+
 test("fresh installs skip plugin restoration across config reloads", async () => {
   const dataDir = await createTempConfigDir();
   const fresh = await loadConfig(dataDir);
@@ -197,6 +217,63 @@ test("existing users retain pending and completed plugin migrations", async () =
   expect((await loadConfig(dataDir)).pluginSeedFailure).toBeUndefined();
 });
 
+// The drop targets added nothing to how a layout is saved but the `stack` key
+// of floating windows stacked as tabs. A layout saved before opens and saves
+// back as it was, and a client that does not know the key keeps it.
+describe("saved layouts and floating stacks", () => {
+  const pane = (instanceId: string, paneId: string) => ({ instanceId, paneId, binding: { kind: "none" } });
+  const savedBefore = {
+    dockRoot: {
+      kind: "split",
+      axis: "horizontal",
+      ratio: 0.6,
+      first: { kind: "pane", instanceId: "portfolio-list:main" },
+      second: { kind: "split", axis: "horizontal", ratio: 0.5, first: { kind: "pane", instanceId: "news:main" }, second: { kind: "pane", instanceId: "ticker-research:main" }, tabs: { active: "ticker-research:main" } },
+    },
+    instances: [
+      pane("portfolio-list:main", "portfolio-list"),
+      pane("news:main", "news"),
+      { instanceId: "ticker-research:main", paneId: "ticker-research", binding: { kind: "follow", sourceInstanceId: "portfolio-list:main" } },
+      { instanceId: "ticker-research:float", paneId: "ticker-research", binding: { kind: "follow", sourceInstanceId: "portfolio-list:main" } },
+    ],
+    floating: [{ instanceId: "ticker-research:float", x: 10, y: 4, width: 40, height: 12, zIndex: 51 }],
+    detached: [],
+  };
+
+  test("a layout saved before opens and saves back exactly as it was", async () => {
+    const dataDir = await createTempConfigDir();
+    await writeConfigJson(dataDir, createSavedConfig({ layout: savedBefore, layouts: [{ name: "Desk", layout: savedBefore }] }));
+    const loaded = await loadConfig(dataDir);
+    expect(loaded.layout).toEqual(savedBefore as never);
+    await saveConfig(loaded);
+    const written = JSON.parse(await readFile(join(dataDir, "config.json"), "utf-8"));
+    expect(written.layout).toEqual(savedBefore);
+    expect(written.layouts[0].layout).toEqual(savedBefore);
+  });
+
+  test("windows stacked as tabs keep their stack, at the rect of the tab shown; a key alone or not a name is dropped", () => {
+    const instances = [...savedBefore.instances, pane("news:float", "news"), pane("portfolio-list:float", "portfolio-list")];
+    const layout = sanitizeLayout({
+      dockRoot: { kind: "pane", instanceId: "portfolio-list:main" },
+      instances,
+      floating: [
+        // Moved apart by a client that draws each member as a window of its own.
+        { instanceId: "ticker-research:float", x: 30, y: 9, width: 20, height: 8, zIndex: 51, stack: "s1" },
+        { instanceId: "news:float", x: 10, y: 4, width: 40, height: 12, zIndex: 52, stack: "s1" },
+        { instanceId: "portfolio-list:float", x: 2, y: 2, width: 20, height: 6, zIndex: 50, stack: "alone" },
+        { instanceId: "ticker-research:main", x: 2, y: 2, width: 20, height: 6, zIndex: 49, stack: 7 },
+      ],
+      detached: [],
+    }, DEFAULT_LAYOUT);
+    expect(layout.floating).toEqual([
+      { instanceId: "ticker-research:float", x: 10, y: 4, width: 40, height: 12, zIndex: 51, stack: "s1" },
+      { instanceId: "news:float", x: 10, y: 4, width: 40, height: 12, zIndex: 52, stack: "s1" },
+      { instanceId: "portfolio-list:float", x: 2, y: 2, width: 20, height: 6, zIndex: 50 },
+      { instanceId: "ticker-research:main", x: 2, y: 2, width: 20, height: 6, zIndex: 49 },
+    ]);
+  });
+});
+
 describe("sanitizeLayout", () => {
   test("disk reload keeps explicit public and broker selections for fixed panes and their followers", async () => {
     const dataDir = await createTempConfigDir();
@@ -217,32 +294,6 @@ describe("sanitizeLayout", () => {
     expect(reopened.layouts[0]?.layout.instances.map(pane => pane.binding)).toEqual(layout.instances.map(pane => pane.binding));
   });
 
-  test("disk reload keeps secondary windows in the active and every saved layout", async () => {
-    const dataDir = await createTempConfigDir();
-    const pane = (instanceId: string) => ({ instanceId, paneId: "portfolio-list", binding: { kind: "none" } });
-    const windows = [{
-      id: "w2",
-      dockRoot: { kind: "split", axis: "vertical", ratio: 0.5, first: { kind: "pane", instanceId: "w2-a" }, second: { kind: "pane", instanceId: "w2-b" } },
-      floating: [{ instanceId: "w2-float", x: 3, y: 4, width: 50, height: 20 }],
-    }, { id: "empty", dockRoot: null, floating: [] }];
-    const layout = {
-      dockRoot: { kind: "pane", instanceId: "main" },
-      instances: ["main", "w2-a", "w2-b", "w2-float"].map(pane),
-      floating: [],
-      detached: [],
-      // Malformed entries are dropped; the good windows survive.
-      windows: [...windows, { dockRoot: null, floating: [] }, { id: "", dockRoot: null, floating: [] }, "junk"],
-    };
-    const other = { ...layout, instances: layout.instances.map((instance) => ({ ...instance })) };
-    await writeConfigJson(dataDir, createSavedConfig({ layout, layouts: [{ name: "Two screens", layout }, { name: "Other", layout: other }], activeLayoutIndex: 0 }));
-    const loaded = await loadConfig(dataDir);
-    await saveConfig(loaded);
-    const reopened = await loadConfig(dataDir);
-    expect(reopened.layout.windows).toEqual(windows);
-    expect(reopened.layouts.map((entry) => entry.layout.windows)).toEqual([windows, windows]);
-    expect(reopened.layout.instances.map((instance) => instance.instanceId)).toEqual(["main", "w2-a", "w2-b", "w2-float"]);
-  });
-
   test("preserves an intentionally blank layout", () => {
     expect(sanitizeLayout({
       dockRoot: null,
@@ -255,6 +306,31 @@ describe("sanitizeLayout", () => {
       floating: [],
       detached: [],
     });
+  });
+
+  test("brings the panes of a layout saved with this fork's secondary windows back into the main window", () => {
+    // Before upstream's desktop windows, this fork kept extra windows in layout.windows; their panes
+    // are unreachable from the main window's dock and floating lists and would be dropped on load.
+    const pane = (instanceId: string) => ({ instanceId, paneId: "portfolio-list", binding: { kind: "none" } });
+    const layout = sanitizeLayout({
+      dockRoot: { kind: "pane", instanceId: "main" },
+      instances: [pane("main"), pane("left"), pane("right"), pane("floating")],
+      floating: [],
+      detached: [],
+      windows: [{
+        id: "w2",
+        dockRoot: { kind: "split", axis: "horizontal", ratio: 0.5, first: { kind: "pane", instanceId: "left" }, second: { kind: "pane", instanceId: "right" } },
+        floating: [{ instanceId: "floating", x: 4, y: 3, width: 40, height: 12 }],
+      }, { id: "w3", dockRoot: { kind: "nonsense" }, floating: "nonsense" }],
+    }, DEFAULT_LAYOUT);
+
+    expect(layout.instances.map((entry) => entry.instanceId).sort()).toEqual(["floating", "left", "main", "right"]);
+    expect(getDockedPaneIds(layout)).toEqual(["main"]);
+    expect(layout.floating.map((entry) => entry.instanceId).sort()).toEqual(["floating", "left", "right"]);
+    expect(layout.floating.find((entry) => entry.instanceId === "floating")).toMatchObject({ x: 4, y: 3, width: 40, height: 12 });
+    const [left, right] = ["left", "right"].map((id) => layout.floating.find((entry) => entry.instanceId === id)!);
+    expect(left!.x).toBeLessThan(right!.x);
+    expect("windows" in layout).toBe(false);
   });
 
   test("keeps the pane lock across a save/load round trip", () => {
@@ -354,6 +430,30 @@ describe("sanitizeLayout", () => {
 
     expect(findPaneInstance(layout, "ticker-detail:main")?.binding).toEqual({ kind: "none" });
     expect(getDockedPaneIds(layout)).toEqual(["ticker-detail:main"]);
+  });
+
+  test("keeps a link to a pane on another saved tab, as a pane moved to another desktop window has", async () => {
+    const dataDir = await createTempConfigDir();
+    const follower = (sourceInstanceId: string) => ({
+      dockRoot: { kind: "pane", instanceId: "ticker-detail:moved" },
+      instances: [{ instanceId: "ticker-detail:moved", paneId: "ticker-detail", binding: { kind: "follow", sourceInstanceId } }],
+      floating: [],
+      detached: [],
+    });
+    const { config } = normalizeLoadedConfig({
+      configVersion: CURRENT_CONFIG_VERSION,
+      layout: DEFAULT_LAYOUT,
+      activeLayoutIndex: 0,
+      layouts: [
+        { id: "tab:home", name: "Home", layout: DEFAULT_LAYOUT },
+        { id: "tab:other", name: "Other", layout: follower("portfolio-list:main") },
+        { id: "tab:dangling", name: "Dangling", layout: follower("portfolio-list:missing") },
+      ],
+    }, dataDir);
+
+    expect(findPaneInstance(config.layouts[1]!.layout, "ticker-detail:moved")?.binding)
+      .toEqual({ kind: "follow", sourceInstanceId: "portfolio-list:main" });
+    expect(findPaneInstance(config.layouts[2]!.layout, "ticker-detail:moved")?.binding).toEqual({ kind: "none" });
   });
 
   test("clamps floating placement memory and drops invalid docked placement hints", () => {

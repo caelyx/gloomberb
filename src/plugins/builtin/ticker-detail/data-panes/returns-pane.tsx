@@ -1,22 +1,29 @@
+import { logFailure } from "../../../../utils/log-failure";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { TextAttributes } from "../../../../ui";
+import { Box, TextAttributes, useUiCapabilities } from "../../../../ui";
 import {
   DataTableView,
   QueryBar,
+  StatGrid,
   loadingText,
+  statGridRows,
   unavailableText,
   usePaneNoticeFooter,
   usePaneStatusFooter,
+  usePaneTabs,
   useQueryBarSearch,
   type DataTableCell,
   type DataTableColumn,
   type PaneFooterSegment,
   type PaneHint,
+  type StatItem,
 } from "../../../../components";
 import { usePaneRefreshKey } from "../../../../components/data-table/table-pane";
+import { FILL_REST } from "../../../../components/ui/fill";
 import { CHART_RESOLUTIONS } from "../../../../time-series/range";
 import {
   getChartResolutionLabel,
+  isIntradayResolution,
   type ChartResolutionSupport,
   type ManualChartResolution,
 } from "../../../../time-series/resolution";
@@ -25,8 +32,8 @@ import { cleanFloat32Price, historyPriceDecimals } from "../../../../cli/history
 import { formatPriceObservation, quoteFormatOptions } from "../../../../market-data/market/format";
 import { usePaneTicker } from "../../../../state/app/context";
 import type { PaneProps } from "../../../../types/plugin";
-import { colors, priceColor } from "../../../../theme/colors";
-import { formatPercent } from "../../../../utils/format";
+import { colors, shownPriceColor } from "../../../../theme/colors";
+import { MISSING_VALUE, formatPercent } from "../../../../utils/format";
 import { publicTickerKey } from "../../../../utils/exchanges";
 import { priceHistoryIntegrityNotice } from "../../../../utils/price-history-integrity";
 import { compareSortValues, nextHeaderSort, type SortDirection } from "../../../../utils/sort-values";
@@ -39,17 +46,30 @@ import {
   effectiveReturnResolution,
   isTodayReturnRow,
   returnBaseCloseDay,
+  returnTimeHeader,
+  returnTimeText,
+  defaultReturnInterval,
   RETURN_RANGES,
   type ReturnRange,
   type ReturnRow,
+  summarizeReturns,
 } from "./returns-model";
 import { loadReturnSeries, type ReturnSeries } from "./returns-history";
+import { buildReturnBars } from "./returns-chart-model";
+import { ReturnsChart } from "./returns-chart";
 import { formingHistoryBar, formingHistoryBarText, historyBarDate } from "./history-bars";
 import { periodBaseText } from "../../../../market-data/market/period-return";
 import { DAY_SO_FAR_TEXT } from "../../../../time-series/session-bar";
 
 type ReturnColumnId = "time" | "price" | "intervalChange" | "intervalPercent" | "cumulativeChange" | "cumulativePercent";
 type ReturnColumn = DataTableColumn & { id: ReturnColumnId };
+/** The window's rows as the table, or as a bar per interval. */
+export type ReturnView = "table" | "chart";
+
+const VIEW_TABS: { value: ReturnView; label: string }[] = [
+  { value: "table", label: "Table" },
+  { value: "chart", label: "Chart" },
+];
 
 const INTERVAL_OPTIONS = CHART_RESOLUTIONS.filter((value): value is ManualChartResolution => value !== "auto");
 const SEARCH_MIN_ROWS = 8;
@@ -64,12 +84,6 @@ const COLUMNS: ReturnColumn[] = [
   { id: "cumulativePercent", label: "TOTAL %", width: 9, align: "right", flexGrow: 1 },
 ];
 
-function formatDateTime(date: Date): string {
-  const iso = date.toISOString();
-  const hasTime = date.getUTCHours() !== 0 || date.getUTCMinutes() !== 0 || date.getUTCSeconds() !== 0;
-  return hasTime ? iso.slice(0, 16).replace("T", " ") : iso.slice(0, 10);
-}
-
 /** Every price and dollar change at one decimal count, so the columns line up. */
 function returnPriceDecimals(rows: readonly ReturnRow[], assetCategory?: string): number {
   return historyPriceDecimals(rows.flatMap((row) => row.price === null ? [] : [{
@@ -83,7 +97,7 @@ function returnPriceDecimals(rows: readonly ReturnRow[], assetCategory?: string)
 }
 
 function formatMaybePrice(value: number | null, decimals: number, width: number): string {
-  if (value === null || !Number.isFinite(value)) return "-";
+  if (value === null || !Number.isFinite(value)) return MISSING_VALUE;
   return formatPriceObservation(Number(value.toFixed(Math.min(20, decimals))), { minimumFractionDigits: decimals, maxWidth: width });
 }
 
@@ -92,7 +106,13 @@ function exportPrice(value: number | null, decimals: number): number | null {
 }
 
 function formatMaybePercent(value: number | null): string {
-  return value === null ? "-" : formatPercent(value);
+  return value === null ? MISSING_VALUE : formatPercent(value);
+}
+
+/** A move's tone as it is printed: one that rounds to 0.00% is neutral, never red or green. */
+function moveTone(fraction: number): StatItem["tone"] {
+  const shown = Number((fraction * 100).toFixed(2));
+  return shown > 0 ? "positive" : shown < 0 ? "negative" : "neutral";
 }
 
 function sortValue(row: ReturnRow, id: ReturnColumnId): number | null {
@@ -116,7 +136,12 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
   const dataProvider = useAssetData();
   const { symbol, exchange, ticker } = useBoundTicker();
   const [range, setRange] = usePluginPaneState<ReturnRange>("range", "5D");
-  const [resolution, setResolution] = usePluginPaneState<ManualChartResolution>("interval", "1h");
+  // Unchosen, the interval grows with the range (hourly to 1W, daily to 1Y); a choice stays saved.
+  const [chosenResolution, setResolution] = usePluginPaneState<ManualChartResolution | null>("interval", null);
+  const resolution = chosenResolution ?? defaultReturnInterval(range);
+  const [view, setView] = usePluginPaneState<ReturnView>("view", "table");
+  const chartView = view === "chart";
+  const { nativePaneChrome } = useUiCapabilities();
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<{ columnId: ReturnColumnId; direction: SortDirection }>({ columnId: "time", direction: "desc" });
   const { active: searchActive, focus: focusSearch, blur: blurSearch, searchProps } = useQueryBarSearch();
@@ -127,7 +152,7 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
     symbol && dataProvider?.getChartResolutionSupport
       ? dataProvider.getChartResolutionSupport(symbol, exchange)
       : NO_SUPPORT,
-  ).catch(() => NO_SUPPORT), [dataProvider, exchange, symbol]);
+  ).catch(logFailure("ticker-detail.data-panes.returns-pane", "Read return interval support failed", NO_SUPPORT)), [dataProvider, exchange, symbol]);
   const [support, setSupport] = useState<readonly ChartResolutionSupport[] | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -162,15 +187,21 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
     () => data ? buildReturnRows(data.points, data.visibleFrom, data.visibleTo) : [],
     [data],
   );
+  const barSize = data?.resolution ?? shownResolution;
+  const venue = data?.venue || undefined;
+  // The times are dated on the venue's own clock, which the column's header names.
+  const timeHeader = returnTimeHeader(barSize, venue);
+  const columns = useMemo(() => COLUMNS.map((column) => column.id === "time" ? { ...column, label: timeHeader } : column), [timeHeader]);
   const table = useMemo(() => {
-    const searchable = returnRows.length >= SEARCH_MIN_ROWS;
+    // The chart draws every bar of the window; only the table narrows by a search.
+    const searchable = !chartView && returnRows.length >= SEARCH_MIN_ROWS;
     const needle = searchable ? query.trim().toLowerCase() : "";
     const rows = (needle
-      ? returnRows.filter((row) => formatDateTime(new Date(row.timestamp)).toLowerCase().includes(needle))
+      ? returnRows.filter((row) => returnTimeText(row.timestamp, barSize, venue).includes(needle))
       : returnRows.slice()
     ).sort((left, right) => compareSortValues(sortValue(left, sort.columnId), sortValue(right, sort.columnId), sort.direction));
     return { rows, searchable };
-  }, [query, returnRows, sort]);
+  }, [barSize, chartView, query, returnRows, sort, venue]);
   // The quote knows the instrument type even when the saved ticker does not,
   // so prices take the same decimals as Historical Prices.
   const { financials } = usePaneTicker();
@@ -199,7 +230,7 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
   // Today's daily bar is the session still trading, marked as Historical Prices marks it.
   const dayToDate = !!data && isTodayReturnRow(returnRows[0], data.resolution, data.venue || undefined, Date.now());
   const formingKey = forming || dayToDate ? returnRows[0]?.key : undefined;
-  const barSize = data?.resolution ?? shownResolution;
+  const bars = useMemo(() => buildReturnBars(returnRows, barSize, venue, formingKey), [barSize, formingKey, returnRows, venue]);
   // The close every total is measured from: `from Mon 21 Sep close`.
   const baseText = useMemo(() => {
     const day = data && returnRows.length ? returnBaseCloseDay(data.points, data.visibleFrom, data.resolution, data.venue || undefined, Date.now()) : null;
@@ -218,12 +249,44 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
 
   const integrityNotice = priceHistoryIntegrityNotice(returnRows.filter((row) => row.inconsistent).length);
   const coverageNotice = data ? historyCoverageNotice(data.coverageStart, data.visibleFrom) : null;
+  const selectView = useCallback((value: string) => setView(value as ReturnView), [setView]);
+  const { strip: tabStrip, rows: tabRows } = usePaneTabs({
+    tabs: VIEW_TABS,
+    activeValue: view,
+    onSelect: selectView,
+    focused: focused && !searchActive,
+    dense: true,
+  });
+
   usePaneNoticeFooter({
     registrationId: "returns:notices",
     notices: [coverageNotice, integrityNotice].filter((notice): notice is string => !!notice),
     focused,
     title: "Price history data",
   });
+
+  // The window's total and its best and worst interval, over every bar it holds, whatever the search narrows the table to.
+  const summary = useMemo<StatItem[]>(() => {
+    const { total, best, worst } = summarizeReturns(returnRows);
+    const moveItem = (id: string, label: string, row: ReturnRow | null): StatItem[] => {
+      if (row?.intervalPercent == null) return [];
+      const when = historyBarDate(returnTimeText(row.timestamp, barSize, venue), barSize, false);
+      return [{
+        id,
+        label,
+        value: formatPercent(row.intervalPercent),
+        tone: moveTone(row.intervalPercent),
+        detail: when,
+        // A narrow pane keeps the day without its year, so the three figures stay on one row.
+        ...isIntradayResolution(barSize) ? { detailVariants: [when.slice(5)] } : {},
+      }];
+    };
+    return [
+      ...total === null ? [] : [{ id: "total", label: "Total", value: formatPercent(total), tone: moveTone(total) }],
+      ...moveItem("best", "Best", best),
+      ...moveItem("worst", "Worst", worst),
+    ];
+  }, [barSize, returnRows, venue]);
 
   const chooseSort = useCallback((id: string) => {
     setSort((current) => nextHeaderSort(current, id as ReturnColumnId, { firstDirection: "desc" }));
@@ -232,10 +295,10 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
   const renderCell = useCallback((row: ReturnRow, column: ReturnColumn): DataTableCell => {
     switch (column.id) {
       case "time": {
-        const shown = formatDateTime(new Date(row.timestamp));
+        const shown = returnTimeText(row.timestamp, barSize, venue);
         // A daily or longer bar is a date; a month's reads as the month, and one still running says so.
         return {
-          text: shown.length > 10 ? shown : historyBarDate(shown, barSize, row.key === formingKey),
+          text: isIntradayResolution(barSize) ? shown : historyBarDate(shown, barSize, row.key === formingKey),
           value: new Date(row.timestamp).toISOString(),
           color: colors.textDim,
         };
@@ -243,23 +306,85 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
       case "price":
         return { text: formatMaybePrice(row.price, priceDecimals, column.width), value: exportPrice(row.price, priceDecimals), color: colors.textBright, attributes: TextAttributes.BOLD };
       case "intervalChange":
-        return { text: formatMaybePrice(row.intervalChange, priceDecimals, column.width), value: exportPrice(row.intervalChange, priceDecimals), color: priceColor(row.intervalChange ?? 0) };
+        return { text: formatMaybePrice(row.intervalChange, priceDecimals, column.width), value: exportPrice(row.intervalChange, priceDecimals), color: shownPriceColor(row.intervalChange ?? 0, priceDecimals) };
       case "intervalPercent":
-        return { text: formatMaybePercent(row.intervalPercent), value: row.intervalPercent === null ? null : row.intervalPercent * 100, color: priceColor(row.intervalPercent ?? 0) };
+        return { text: formatMaybePercent(row.intervalPercent), value: row.intervalPercent === null ? null : row.intervalPercent * 100, color: shownPriceColor((row.intervalPercent ?? 0) * 100, 2) };
       case "cumulativeChange":
-        return { text: formatMaybePrice(row.cumulativeChange, priceDecimals, column.width), value: exportPrice(row.cumulativeChange, priceDecimals), color: priceColor(row.cumulativeChange ?? 0) };
+        return { text: formatMaybePrice(row.cumulativeChange, priceDecimals, column.width), value: exportPrice(row.cumulativeChange, priceDecimals), color: shownPriceColor(row.cumulativeChange ?? 0, priceDecimals) };
       case "cumulativePercent":
-        return { text: formatMaybePercent(row.cumulativePercent), value: row.cumulativePercent === null ? null : row.cumulativePercent * 100, color: priceColor(row.cumulativePercent ?? 0) };
+        return { text: formatMaybePercent(row.cumulativePercent), value: row.cumulativePercent === null ? null : row.cumulativePercent * 100, color: shownPriceColor((row.cumulativePercent ?? 0) * 100, 2) };
     }
-  }, [barSize, formingKey, priceDecimals]);
+  }, [barSize, formingKey, priceDecimals, venue]);
 
-  return (
+  const queryBar = (
+    <QueryBar
+      width={width}
+      search={table.searchable ? {
+        value: query,
+        onChange: setQuery,
+        placeholder: "date or time",
+        focused,
+        ...searchProps,
+      } : undefined}
+      filters={[{
+        id: "range",
+        label: "Range",
+        value: range,
+        options: RETURN_RANGES.map((value) => ({ value, label: value })),
+        onChange: setRange,
+      }, {
+        id: "interval",
+        label: "Interval",
+        value: shownResolution,
+        options: INTERVAL_OPTIONS.map((value) => ({
+          value,
+          label: getChartResolutionLabel(value),
+          disabled: support !== null && !availableResolutions.has(value),
+        })),
+        onChange: setResolution,
+      }]}
+    />
+  );
+  const figures = <StatGrid items={summary} width={width} />;
+  const emptyTitle = error
+    ? unavailableText("Returns")
+    : loading
+      ? loadingText("returns")
+      : query.trim()
+        ? "No matching times"
+        : "No bars in this window";
+
+  if (chartView) {
+    // Terminal rows: what the tab row, the query bar and the figures leave.
+    const chartRows = Math.max(1, height - tabRows - 1 - statGridRows(summary, width));
+    return (
+      <Box flexDirection="column" width={width} {...(nativePaneChrome ? FILL_REST : { height })}>
+        {tabStrip}
+        {queryBar}
+        {figures}
+        <Box flexDirection="column" width={width} {...(nativePaneChrome ? FILL_REST : { height: chartRows })}>
+          <ReturnsChart
+            bars={bars}
+            resolution={barSize}
+            venue={venue}
+            width={width}
+            height={chartRows}
+            focused={focused}
+            emptyMessage={emptyTitle}
+            emptyDetail={error ?? undefined}
+          />
+        </Box>
+      </Box>
+    );
+  }
+
+  const tableView = (
     <DataTableView<ReturnRow, ReturnColumn>
       focused={focused && !searchActive}
       selection={{ kind: "none" }}
       rootWidth={width}
-      rootHeight={height}
-      columns={COLUMNS}
+      rootHeight={height - tabRows}
+      columns={columns}
       items={table.rows}
       sortColumnId={sort.columnId}
       sortDirection={sort.direction}
@@ -268,33 +393,10 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
       renderCell={renderCell}
       selectedTextOverridesCellColor
       rootBefore={(
-        <QueryBar
-          width={width}
-          search={table.searchable ? {
-            value: query,
-            onChange: setQuery,
-            placeholder: "date or time",
-            focused,
-            ...searchProps,
-          } : undefined}
-          filters={[{
-            id: "range",
-            label: "Range",
-            value: range,
-            options: RETURN_RANGES.map((value) => ({ value, label: value })),
-            onChange: setRange,
-          }, {
-            id: "interval",
-            label: "Interval",
-            value: shownResolution,
-            options: INTERVAL_OPTIONS.map((value) => ({
-              value,
-              label: getChartResolutionLabel(value),
-              disabled: support !== null && !availableResolutions.has(value),
-            })),
-            onChange: setResolution,
-          }]}
-        />
+        <>
+          {queryBar}
+          {figures}
+        </>
       )}
       getExportMetadata={() => [
         ["Ticker", symbol ? publicTickerKey(symbol, exchange) : ""],
@@ -311,14 +413,15 @@ export function ReturnsPane({ focused, width, height }: PaneProps) {
         ...(integrityNotice ? [["Warning", integrityNotice]] : []),
         ...(error ? [["Error", error]] : []),
       ]}
-      emptyStateTitle={error
-        ? unavailableText("Returns")
-        : loading
-          ? loadingText("returns")
-          : query.trim()
-            ? "No matching times"
-            : "No bars in this window"}
+      emptyStateTitle={emptyTitle}
       emptyStateHint={error ?? undefined}
     />
+  );
+  if (!tabStrip) return tableView;
+  return (
+    <Box flexDirection="column" width={width} height={height}>
+      {tabStrip}
+      {tableView}
+    </Box>
   );
 }

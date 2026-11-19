@@ -1,8 +1,9 @@
-import { createElement, forwardRef, useCallback, useRef, type ComponentProps } from "react";
+import { createElement, forwardRef, memo, useCallback, useRef, type ComponentProps } from "react";
 import { useForwardedScrollBoxRef, useRegisterPaneScrollBox } from "../state/pane-scroll-registry";
 import { useUiHost, type UiHost } from "./host";
 import { scrollBoxScrollsVertically } from "./scroll-box-axis";
-import { useRemoteUiNode } from "../remote/semantic-tree";
+import { useRemoteUiNode, useRemoteUiScope } from "../remote/semantic-tree";
+import { markPure, samePureProps } from "./same-props";
 import { assignRef } from "../react/assign-ref";
 import {
   remoteChartEvent,
@@ -22,6 +23,7 @@ export {
   useCommandBarShortcut,
   useNativeRenderer,
   useRendererHost,
+  useShortcutLabel,
   useSyntaxStyleFactory,
   useUiCapabilities,
   useUiHost,
@@ -60,14 +62,22 @@ export type {
   TextareaRenderable,
 } from "./host";
 
-export const Box = forwardRef<any, ComponentProps<UiHost["Box"]>>((props, ref) => {
+export const Box = markPure(memo(forwardRef<any, ComponentProps<UiHost["Box"]> & { "data-gloom-remote-hidden"?: boolean }>(({
+  "data-gloom-remote-hidden": remoteHidden,
+  ...props
+}, ref) => {
   const { Box: HostBox } = useUiHost();
   const rawProps = props as Record<string, unknown>;
   const onMouseDown = rawProps.onMouseDown as ((event?: unknown) => unknown) | undefined;
   const onMouseUp = rawProps.onMouseUp as ((event?: unknown) => unknown) | undefined;
   const onContextMenu = rawProps.onContextMenu as ((event?: unknown) => unknown) | undefined;
+  // A prompt's scope reaches every control drawn in it, so no assistant's UI
+  // call acts on one (terminal-relay/policy.ts).
+  const scope = useRemoteUiScope();
+  // An owner that registers the control itself (a kit Button) hides this
+  // node, which would be the same control again without its label.
   const remoteNodeId = useRemoteUiNode(
-    onMouseDown || onMouseUp || onContextMenu
+    !remoteHidden && (onMouseDown || onMouseUp || onContextMenu)
       ? {
         role: remotePropRole(rawProps, "box"),
         label: remotePropLabel(rawProps),
@@ -79,18 +89,20 @@ export const Box = forwardRef<any, ComponentProps<UiHost["Box"]>>((props, ref) =
         metadata: {
           width: rawProps.width,
           height: rawProps.height,
+          ...(scope ? { scope } : {}),
         },
       }
       : null,
   );
   return createElement(HostBox as any, { ...props, ref, "data-gloom-remote-node-id": remoteNodeId ?? undefined });
-});
+}), samePureProps));
 Box.displayName = "Box";
 
-export const Text = forwardRef<any, ComponentProps<UiHost["Text"]>>((props, ref) => {
+export const Text = markPure(memo(forwardRef<any, ComponentProps<UiHost["Text"]>>((props, ref) => {
   const { Text: HostText } = useUiHost();
   const rawProps = props as Record<string, unknown>;
   const onMouseDown = rawProps.onMouseDown as ((event?: unknown) => unknown) | undefined;
+  const scope = useRemoteUiScope();
   const remoteNodeId = useRemoteUiNode(
     onMouseDown
       ? {
@@ -101,29 +113,30 @@ export const Text = forwardRef<any, ComponentProps<UiHost["Text"]>>((props, ref)
         actions: {
           press: (input) => onMouseDown(remoteEvent(input)),
         },
+        ...(scope ? { metadata: { scope } } : {}),
       }
       : null,
   );
   return createElement(HostText as any, { ...props, ref, "data-gloom-remote-node-id": remoteNodeId ?? undefined });
-});
+}), samePureProps));
 Text.displayName = "Text";
 
-export const Span = forwardRef<any, ComponentProps<UiHost["Span"]>>((props, ref) => {
+export const Span = markPure(memo(forwardRef<any, ComponentProps<UiHost["Span"]>>((props, ref) => {
   const { Span: HostSpan } = useUiHost();
   return createElement(HostSpan as any, { ...props, ref });
-});
+}), samePureProps));
 Span.displayName = "Span";
 
-export const Strong = forwardRef<any, ComponentProps<UiHost["Strong"]>>((props, ref) => {
+export const Strong = markPure(memo(forwardRef<any, ComponentProps<UiHost["Strong"]>>((props, ref) => {
   const { Strong: HostStrong } = useUiHost();
   return createElement(HostStrong as any, { ...props, ref });
-});
+}), samePureProps));
 Strong.displayName = "Strong";
 
-export const Underline = forwardRef<any, ComponentProps<UiHost["Underline"]>>((props, ref) => {
+export const Underline = markPure(memo(forwardRef<any, ComponentProps<UiHost["Underline"]>>((props, ref) => {
   const { Underline: HostUnderline } = useUiHost();
   return createElement(HostUnderline as any, { ...props, ref });
-});
+}), samePureProps));
 Underline.displayName = "Underline";
 
 export const ScrollBox = forwardRef<any, ComponentProps<UiHost["ScrollBox"]>>((props, ref) => {
@@ -172,13 +185,18 @@ export const ScrollBox = forwardRef<any, ComponentProps<UiHost["ScrollBox"]>>((p
 });
 ScrollBox.displayName = "ScrollBox";
 
-export const Input = forwardRef<any, ComponentProps<UiHost["Input"]>>((props, ref) => {
+export const Input = forwardRef<any, ComponentProps<UiHost["Input"]>>(({
+  "data-gloom-remote-hidden": remoteHidden,
+  ...props
+}: ComponentProps<UiHost["Input"]> & { "data-gloom-remote-hidden"?: boolean }, ref) => {
   const { Input: HostInput } = useUiHost();
   const rawProps = props as Record<string, unknown>;
   const onInput = rawProps.onInput as ((value: string) => unknown) | undefined;
   const onChange = rawProps.onChange as ((value: string) => unknown) | undefined;
   const onSubmit = rawProps.onSubmit as ((value?: string) => unknown) | undefined;
-  const remoteNodeId = useRemoteUiNode({
+  // An owner that registers the field itself (a text field) hides this node,
+  // so what was typed is listed once, under the field's own name and type.
+  const remoteNodeId = useRemoteUiNode(remoteHidden ? null : {
     role: remotePropRole(rawProps, "input"),
     label: remotePropLabel(rawProps),
     disabled: rawProps.disabled === true,
@@ -242,7 +260,7 @@ export const Textarea = forwardRef<any, ComponentProps<UiHost["Textarea"]>>(({
 });
 Textarea.displayName = "Textarea";
 
-export const ChartSurface = forwardRef<any, ComponentProps<UiHost["ChartSurface"]>>((props, ref) => {
+export const ChartSurface = markPure(memo(forwardRef<any, ComponentProps<UiHost["ChartSurface"]>>((props, ref) => {
   const { ChartSurface: HostChartSurface } = useUiHost();
   const rawProps = props as Record<string, unknown>;
   const localRef = useRef<any>(null);
@@ -285,7 +303,7 @@ export const ChartSurface = forwardRef<any, ComponentProps<UiHost["ChartSurface"
     },
   });
   return createElement(HostChartSurface as any, { ...props, ref: setSurfaceRef, "data-gloom-remote-node-id": remoteNodeId ?? undefined });
-});
+}), samePureProps));
 ChartSurface.displayName = "ChartSurface";
 
 export const ImageSurface = forwardRef<any, ComponentProps<UiHost["ImageSurface"]>>((props, ref) => {

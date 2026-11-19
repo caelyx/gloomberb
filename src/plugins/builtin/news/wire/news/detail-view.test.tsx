@@ -9,7 +9,7 @@ import { TestPaneProvider, createTestPaneConfig } from "../../../../../test-supp
 import { createStatefulTestPluginRuntime } from "../../../../../test-support/plugin-runtime";
 import { createInitialState, appReducer } from "../../../../../state/app/context";
 import { PaneFooterProvider, PaneFooterBar } from "../../../../../components/layout/pane/footer";
-import { formatDetailDate } from "../../../../../utils/datetime-format";
+import { formatDetailDate, formatDetailTime } from "../../../../../utils/datetime-format";
 import type { NewsArticle } from "../../../../../news/types";
 import { createTestArticle } from "../../../../../test-support/news";
 import { Box } from "../../../../../ui";
@@ -263,7 +263,7 @@ test("older detail preserves the newer known headline and summary", async () => 
   const headerLine = capture().split("\n").find((line) => line.includes("Controlled wire \u00b7"));
   expect(headerLine).toContain(formatDetailDate(new Date("2026-09-11T12:00:00Z")));
   // Coverage from the story's own day is timed, not dated again.
-  expect(capture()).toContain(new Date("2026-09-11T11:00:00Z").toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }));
+  expect(capture()).toContain(formatDetailTime(new Date("2026-09-11T11:00:00Z")));
   expect(service.getQueryState(query).articles[0]?.title).toBe("Acme acquisition terminated");
 });
 
@@ -278,4 +278,27 @@ test("a newer detail fallback is preferred to an older primary response", async 
   expect(fallback).toBe(1);
   expect(capture()).toContain("Timeline cash consideration 2");
   expect(capture()).not.toContain("Timeline cash consideration 1");
+});
+
+test("an outlet's summary that is the story's lead is printed once", async () => {
+  const detail = story("acme", "Acme plans acquisition", 1, true);
+  const item = { ...detail.items![0]!, summary: detail.summary! };
+  await mount(async () => [story()], async () => ({ ...detail, items: [item] }));
+  await key("return");
+  expect(capture()).toContain("Timeline cash consideration 1");
+  expect(capture().split("Acme cash consideration version 1").length - 1).toBe(1);
+});
+
+// The feed takes a detail in as a new object; one with no coverage still had none, so the open
+// story asked again for every copy, without end ("Maximum update depth exceeded").
+test.each([
+  ["an empty", [] as NewsArticle["items"]],
+  ["no", undefined],
+])("a detail with %s coverage list is asked for once", async (_label, items) => {
+  let calls = 0;
+  await mount(async () => [story()], async () => { calls++; return { ...story(), items }; });
+  await key("return");
+  await settleFrame(tui.setup(), 20);
+  expect(calls).toBe(1);
+  expect(capture()).toContain("Acme cash consideration version 1");
 });

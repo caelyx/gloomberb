@@ -1,4 +1,4 @@
-import { createPluginCache } from "../../data/plugin-cache";
+import { createPluginCache, savedCopyForTransientFailure } from "../../data/plugin-cache";
 import { getPublishedUsEquityCalendarDay } from "../../market-data/published-us-sessions";
 import { zonedDateKey } from "../../utils/zoned-date-time";
 import type {
@@ -9,7 +9,7 @@ import type {
 const CACHE_KIND = "fred-series";
 const CACHE_SOURCE = "gloomberb-cloud";
 // Refresh persisted metadata that predates FRED's source coverage dates.
-const CACHE_SCHEMA_VERSION = 2;
+const CACHE_SCHEMA_VERSION = 3;
 const CACHE_POLICY = {
   staleMs: 24 * 60 * 60 * 1000,
   expireMs: 30 * 24 * 60 * 60 * 1000,
@@ -42,6 +42,8 @@ export interface FredSeriesCacheEntry {
 export interface FredSeriesLoadResult extends FredSeriesCacheEntry {
   source: "cache" | "network" | "stale-fallback";
   refreshError?: string;
+  /** What the failed refresh threw, when a saved copy answered (`stale-fallback`). */
+  error?: unknown;
 }
 
 const cache = createPluginCache<FredSeriesData>({
@@ -60,7 +62,12 @@ interface SeriesNotOnFred {
   /** Whose publication they are read from (the CBRT). */
   via: string;
   url: string;
+  /** The attribution the publisher's licence asks for wherever the series is shown as its own. */
+  attribution?: string;
 }
+
+/** What MAS's Singapore Open Data Licence asks every use of SORA to say, as Gloom Cloud serves it beside the rate. */
+const SORA_ATTRIBUTION = "Contains information from MAS's Domestic Interest Rates, made available under the Singapore Open Data Licence version 1.0.";
 
 const TURKISH_CPI: SeriesNotOnFred = {
   publisher: "TurkStat",
@@ -80,6 +87,13 @@ const NOT_ON_FRED: Readonly<Record<string, SeriesNotOnFred>> = {
   TURCPIMOM: TURKISH_CPI,
   BRAIPCAMOM: brazilianCpi(433),
   BRAIPCA15MOM: brazilianCpi(7478),
+  // MAS's Singapore overnight rate average, from its domestic interest rates page.
+  SORA: {
+    publisher: "MAS",
+    via: "its domestic interest rates page",
+    url: "https://eservices.mas.gov.sg/statistics/dir/DomesticInterestRates.aspx",
+    attribution: SORA_ATTRIBUTION,
+  },
   // NAHB's builder sentiment index as first released, from the economic calendar's actuals.
   NAHBHMI: {
     publisher: "NAHB",
@@ -196,7 +210,9 @@ export async function loadCachedFredSeries(
   const cached = stored ? withFredSourceFreshness(stored) : null;
   if (!options?.force && !pending && cached && !cached.stale) return { ...cached, source: "cache" };
   const result = await cache.load(cacheKey(request), loader, pending ? { ...options, force: true } : options);
-  // An early re-read is opportunistic: a failure keeps the still-fresh copy as it was.
-  if (pending && result.refreshError && cached && !cached.stale && !options?.force) return { ...cached, source: "cache" };
-  return withFredSourceFreshness(result);
+  // An early re-read is opportunistic: a failure keeps the still-fresh copy as it was, as not asking would have.
+  if (pending && result.source === "stale-fallback" && cached && !cached.stale && !options?.force) return { ...cached, source: "cache" };
+  // A refusal (a series no longer served, a signed-out session) or a reply that fails validation is thrown,
+  // whatever copy is saved: a saved copy answers only for a failure asking again may get past.
+  return withFredSourceFreshness(savedCopyForTransientFailure(result));
 }

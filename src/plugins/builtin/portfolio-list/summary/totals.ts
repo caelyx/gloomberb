@@ -1,9 +1,9 @@
 import type { TickerFinancials } from "../../../../types/financials";
 import type { TickerRecord } from "../../../../types/ticker";
-import { convertCurrency, formatCompactAmount } from "../../../../utils/format";
-import { getCurrencySymbol } from "../../../../market-data/market/format";
-import { getActiveQuoteDisplay } from "../../../../market-data/market/status";
-import { combinedChangeBasisLabel, quoteChangeBasis, type QuoteChangeBasis } from "../../../../market-data/market/change-basis";
+import { convertCurrency, formatCompactAmount, formatNumber } from "../../../../utils/format";
+import { currencyMinorDigits, getCurrencySymbol } from "../../../../market-data/market/format";
+import { extendedPrintSession, getActiveQuoteDisplay, type ExtendedSession } from "../../../../market-data/market/status";
+import { dayMoveBasisLabel, futuresQuoteFromSettle, quoteChangeBasis, type QuoteChangeBasis } from "../../../../market-data/market/change-basis";
 import { isQuoteStaleForCurrentSession } from "../../../../market-data/quotes/freshness";
 import { headlineQuoteDisplay } from "../../../../portfolio/column-values";
 import type { AllocationHolding } from "../../../../portfolio/allocation";
@@ -48,10 +48,13 @@ export interface PortfolioSummaryTotals {
   /**
    * What Day (or a watchlist's Avg Day) is measured from, as each holding's
    * change line says it: "vs Fri 16 Oct close" when they agree, "vs mixed
-   * closes" when they do not (an HKEX listing beside a US one). Absent
-   * without a move.
+   * closes" when they do not (an HKEX listing beside a US one), after the
+   * session of the extended-hours prints it is valued at, as the rows mark
+   * them ("AH vs Tue 10 Nov close"). Absent without a move.
    */
   dayChangeBasis?: string;
+  /** Some holding's day is valued at an extended-hours print, which dayChangeBasis names. */
+  dayAtExtendedPrint?: boolean;
   totalCostBasis: number;
   hasPositions: boolean;
   unrealizedPnl: number;
@@ -77,18 +80,42 @@ function currencyCode(value: string | undefined): string | null {
 
 export { resolvePortfolioTotalsCurrency } from "../../../../portfolio/totals-currency";
 
+/** From here a book's totals read in whole units (1,588), as `portfolio show` prints market values; below it, to the minor unit (101.10). */
+const WHOLE_AMOUNT_FROM = 1_000;
+/** From here they read compact (1.23B), so a header row keeps its other figures. */
+const COMPACT_AMOUNT_FROM = 1_000_000_000;
+
 /**
- * A compact total in the portfolio's currency. Bare when both it and the app's
- * base currency are USD, as the pane has always shown it; otherwise it leads
- * with the currency symbol, as prices do: A$108.6k, +$600.12.
+ * An amount with thousands separators: to the currency's minor unit below a
+ * thousand (101.10, ¥950), in whole units from there (1,588, -40,000) and
+ * compact from a billion (1.23B). A signed amount carries + or -, except one
+ * that rounds to zero.
+ */
+function bookAmountText(value: number | undefined, currency: string, signed: boolean): string {
+  if (value == null || !Number.isFinite(value)) return formatCompactAmount(value);
+  const abs = Math.abs(value);
+  if (abs >= COMPACT_AMOUNT_FROM) return formatCompactAmount(value, { signed });
+  const minor = currencyMinorDigits(currency);
+  const body = formatNumber(abs, Number(abs.toFixed(minor)) >= WHOLE_AMOUNT_FROM ? 0 : minor);
+  if (!/[1-9]/.test(body)) return body;
+  return `${value < 0 ? "-" : signed ? "+" : ""}${body}`;
+}
+
+/**
+ * A total in the portfolio's currency (bookAmountText): never rounded to a
+ * hundred, as a compact 1.6k for $1,587.80 was. Bare when both it and the
+ * app's base currency are USD, as the pane has always shown it, unless the
+ * book holds another currency (`named`), beside whose prices a bare total
+ * would not say which it is in; otherwise it leads with the currency symbol,
+ * as prices do: A$108,612, +$600.12.
  */
 export function formatPortfolioAmount(
   value: number | undefined,
   currency: string,
-  { signed = false, baseCurrency = "USD" }: { signed?: boolean; baseCurrency?: string } = {},
+  { signed = false, baseCurrency = "USD", named = false }: { signed?: boolean; baseCurrency?: string; named?: boolean } = {},
 ): string {
-  const text = formatCompactAmount(value, { signed });
-  const bare = currency === "USD" && (currencyCode(baseCurrency) ?? "USD") === "USD";
+  const text = bookAmountText(value, currency, signed);
+  const bare = !named && currency === "USD" && (currencyCode(baseCurrency) ?? "USD") === "USD";
   if (bare || value == null || !Number.isFinite(value)) return text;
   const sign = text.startsWith("+") || text.startsWith("-") ? text.charAt(0) : "";
   return `${sign}${getCurrencySymbol(currency)}${text.slice(sign.length)}`;
@@ -109,6 +136,14 @@ export function calculatePortfolioSummaryTotals(
   valuationBasis: PortfolioValuationBasis = "latest-print",
   /** Each future's contract size and settlement by symbol, as the rows read them. */
   futuresTerms?: ReadonlyMap<string, PortfolioFuturesTerms>,
+  /**
+   * Each held currency's move on the day against `totalsCurrency`, as a
+   * factor (1.001 for +0.1%), from its pair's previous daily close as `fx`
+   * reads it: a holding in another currency was worth its value before at
+   * that close's rate, so the day's move holds the currency's own, as
+   * `portfolio show` counts it. A currency not here moves with its price alone.
+   */
+  fxDayMoves?: ReadonlyMap<string, number>,
 ): PortfolioSummaryTotals {
   let totalMktValue = 0;
   let netMktValue = 0;
@@ -127,6 +162,8 @@ export function calculatePortfolioSummaryTotals(
   let watchlistChangeSum = 0;
   let watchlistCount = 0;
   const dayBases: Array<QuoteChangeBasis | null> = [];
+  // The extended session of each price the day is valued at, null for a regular one.
+  const dayPrints: Array<ExtendedSession | null> = [];
   const unavailableConversions = new Set<string>();
   let livePriced = true;
   const pricedLots: PricedPortfolioLot[] = [];
@@ -137,10 +174,19 @@ export function calculatePortfolioSummaryTotals(
     if (Number.isFinite(value) && !Number.isFinite(converted)) unavailableConversions.add(`${currency}/${totalsCurrency}`);
     return converted;
   };
+  // The currency's move on the day, where it is known and the holding is in another currency.
+  const fxMove = (currency: string) => {
+    const factor = currency === totalsCurrency ? undefined : fxDayMoves?.get(currency);
+    return factor != null && Number.isFinite(factor) && factor > 0 ? factor : null;
+  };
+  // A value at the previous close, at that close's rate where the move on the day is known.
+  const toBaseBefore = (value: number, currency: string) => toBase(value, currency) / (fxMove(currency) ?? 1);
 
   for (const ticker of tickers) {
     const financials = financialsMap.get(ticker.metadata.ticker);
-    const quote = financials?.quote;
+    const terms = futuresTerms?.get(ticker.metadata.ticker);
+    // A future's move as FUT and `quote` measure it with its terms.
+    const quote = futuresQuoteFromSettle(financials?.quote, terms);
     const displayedQuote = getActiveQuoteDisplay(quote);
     let activeQuote = displayedQuote && Number.isFinite(displayedQuote.price) ? displayedQuote : null;
     const quoteCurrency = quote?.currency || ticker.metadata.currency || "USD";
@@ -151,7 +197,7 @@ export function calculatePortfolioSummaryTotals(
       if (changePercent != null) {
         watchlistChangeSum += changePercent;
         watchlistCount++;
-        dayBases.push(quoteChangeBasis(quote));
+        dayBases.push(quoteChangeBasis(quote, { terms }));
       }
       continue;
     }
@@ -159,7 +205,7 @@ export function calculatePortfolioSummaryTotals(
     const positionMetrics = getPortfolioPositionMetrics(ticker, collectionId ?? undefined, quoteCurrency, {
       currency: totalsCurrency, convert: toBase,
     }, quote);
-    activeQuote = getPortfolioValuationDisplay(positionMetrics, quote, valuationBasis, futuresTerms?.get(ticker.metadata.ticker)?.settlement);
+    activeQuote = getPortfolioValuationDisplay(positionMetrics, quote, valuationBasis, terms?.settlement);
     const { totalPriceUnits, grossPriceUnits, totalCost } = positionMetrics;
     if (positionMetrics.positionCount === 0) {
       // Not held, so a missing rate is no gap in the totals: it only leaves the trade in units out.
@@ -220,14 +266,19 @@ export function calculatePortfolioSummaryTotals(
         // A listing that no longer trades does not move: its last session's change is not today's.
         const previousClose = quote?.delisting ? activeQuote.price
           : activeQuote.change != null ? activeQuote.price - activeQuote.change : Number.NaN;
-        totalPrevValue += toBaseQuote(grossPriceUnits * previousClose);
-        signedDailyPnl += toBaseQuote(totalPriceUnits * (activeQuote.price - previousClose));
+        // A future's notional is no money held: the currency moves its P&L alone, never the contract's value.
+        const currencyMoves = !positionMetrics.isFuture && fxMove(quoteCurrency) != null;
+        totalPrevValue += currencyMoves ? toBaseBefore(grossPriceUnits * previousClose, quoteCurrency) : toBaseQuote(grossPriceUnits * previousClose);
+        signedDailyPnl += currencyMoves
+          ? toBaseQuote(totalPriceUnits * activeQuote.price) - toBaseBefore(totalPriceUnits * previousClose, quoteCurrency)
+          : toBaseQuote(totalPriceUnits * (activeQuote.price - previousClose));
         // The move valued: the latest print's from the daily reference, the regular close's from the session before it.
         if (!quote?.delisting) {
           dayBases.push(quoteChangeBasis(quote, {
             session: valuationBasis === "regular-close" ? "regular" : "active",
-            terms: futuresTerms?.get(ticker.metadata.ticker),
+            terms,
           }));
+          dayPrints.push(valuationBasis === "latest-print" ? extendedPrintSession(quote, activeQuote.price) : null);
         }
       } else {
         // A broker mark is not evidence of an unchanged day.
@@ -248,7 +299,7 @@ export function calculatePortfolioSummaryTotals(
   const unrealizedPnl = signedUnrealizedPnl;
   const unrealizedPnlPct = portfolioPnlPercent(unrealizedPnl, totalCostBasis) ?? Number.NaN;
   const avgWatchlistChange = watchlistCount > 0 ? watchlistChangeSum / watchlistCount : 0;
-  const dayChangeBasis = combinedChangeBasisLabel(dayBases, now);
+  const dayChangeBasis = dayMoveBasisLabel(dayBases, dayPrints, { marks: true, now });
 
   return {
     totalMktValue,
@@ -266,6 +317,7 @@ export function calculatePortfolioSummaryTotals(
     dailyPnl,
     dailyPnlPct,
     ...(dayChangeBasis ? { dayChangeBasis } : {}),
+    ...(dayChangeBasis && dayPrints.some((print) => print != null) ? { dayAtExtendedPrint: true } : {}),
     totalCostBasis,
     hasPositions,
     unrealizedPnl,

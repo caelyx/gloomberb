@@ -1,9 +1,11 @@
+import { formatShortDate } from "../utils/datetime-format";
 import type { CloudPricing } from "../api-client";
 import { t, tf } from "../i18n";
 
 const DEFAULT_TRIAL_DAYS = 7;
 
-function formatUsdCents(cents: number): string {
+/** Whole dollars when exact, else cents: $70, $56.50. */
+export function formatUsdCents(cents: number): string {
   const dollars = cents / 100;
   return Number.isInteger(dollars) ? `$${dollars}` : `$${dollars.toFixed(2)}`;
 }
@@ -36,10 +38,10 @@ export function monthsFreeYearly(pricing: CloudPricing | null | undefined): numb
   return saved > 0 ? Math.round(saved) : 0;
 }
 
-/** Short calendar date for the trial countdown, e.g. "Aug 11". */
+/** Short calendar date for the trial countdown, e.g. "11 Aug". */
 export function formatTrialEnd(endsAt: Date | null | undefined): string | null {
   if (!endsAt || Number.isNaN(endsAt.getTime())) return null;
-  return endsAt.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  return formatShortDate(endsAt, { year: false });
 }
 
 /**

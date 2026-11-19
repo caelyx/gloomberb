@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { EarningsCalendarReport, EarningsTiming } from "../../../api-client/earnings";
 import type { SupplyChainPayload, SupplyEntity, SupplyRow } from "../../../api-client/supply-chain";
 import type { GraphPath, GraphPayload } from "../../../api-client/supply-chain-graph";
@@ -29,6 +30,27 @@ export interface RippleRow {
   period: string;
   /** The holding's own next report in the window, when it has one. */
   holdingDate: string | null;
+}
+
+/** Holdings as a sentence names them: "AAPL, NEM", or the first four and how many more. */
+const holdingList = (holdings: readonly string[]) =>
+  holdings.length > 4 ? `${holdings.slice(0, 4).join(", ")} and ${holdings.length - 4} more` : holdings.join(", ");
+
+/**
+ * An empty answer says what it searched and over which window, so "nothing
+ * reports" never reads as "nothing was checked": how many of the holdings'
+ * disclosed customers and suppliers were looked up, and between which days.
+ * `preview`: the free preview cut some holdings' disclosures short.
+ */
+export function rippleEmptyText({ holdings, checked, from, to, preview, secondHop = false }: {
+  holdings: readonly string[]; checked: number; from: string; to: string; preview: boolean; secondHop?: boolean;
+}): string {
+  const window = `from ${from} to ${to} (the next ${RIPPLE_DAYS} days)`;
+  const list = holdingList(holdings);
+  if (secondHop) return `No company two disclosed hops from ${list} reports ${window}.`;
+  const scope = preview ? " in the free preview" : "";
+  if (!checked) return `No US-listed customer or supplier with a share of revenue is disclosed for ${list}${scope}, so no report date was looked up ${window}.`;
+  return `None of the ${checked === 1 ? "1 disclosed customer or supplier" : `${checked} disclosed customers and suppliers`} of ${list}${scope} reports ${window}.`;
 }
 
 /** Whose revenue the share is of. */
@@ -163,12 +185,12 @@ export function secondHopLinks(chains: ReadonlyMap<string, SupplyChainPayload>, 
 function hopShare(graph: GraphPayload, linkId: string): RippleHop {
   const link = graph.links.find((entry) => entry.id === linkId);
   const evidence = link?.evidence.find((item) => item.id === link.primaryEvidenceId);
-  return { owner: evidence ? entityLabel(evidence.reporter) : "--", pct: evidence?.pctOfRevenue ?? null, basis: evidence?.pctBasis ?? null, scoped: !!evidence?.pctScope };
+  return { owner: evidence ? entityLabel(evidence.reporter) : MISSING_VALUE, pct: evidence?.pctOfRevenue ?? null, basis: evidence?.pctBasis ?? null, scoped: !!evidence?.pctScope };
 }
 
 /** `30% of TSM`, `12% of AVGO purchases`, or `--` where the filing names the link without a figure. */
 export function hopLabel(hop: RippleHop) {
-  if (hop.pct == null) return "--";
+  if (hop.pct == null) return MISSING_VALUE;
   return `${hop.pct}%${hop.scoped ? "*" : ""} of ${hop.owner}${hop.basis && hop.basis !== "revenue" ? ` ${hop.basis}` : ""}`;
 }
 

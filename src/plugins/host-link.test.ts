@@ -16,9 +16,8 @@ function scratchDir(prefix: string): string {
   return dir;
 }
 
-// npm installs the host as gloomberb, and as @gloom-sh/terminal once releases
-// are published under that name too. Missing either one leaves every external
-// plugin without `gloomberb/*` imports.
+// npm installs the host as gloomberb or as @gloom-sh/terminal. Missing either
+// one leaves every external plugin without `gloomberb/*` imports.
 test("finds the host package under either published name", () => {
   for (const name of ["@gloom-sh/terminal", "gloomberb"]) {
     const hostRoot = join(scratchDir("gloom-host-root-"), "node_modules", ...name.split("/"));
@@ -26,6 +25,24 @@ test("finds the host package under either published name", () => {
     writeFileSync(join(hostRoot, "package.json"), JSON.stringify({ name }));
     expect(findHostPackageRoot(join(hostRoot, "src", "plugins"))).toBe(hostRoot);
   }
+});
+
+// A plugin with gloomberb as a devDependency has a real host in its own
+// node_modules. A Gloom run from there used to delete it to link to itself.
+test("leaves a host that is the plugin's own node_modules copy in place", () => {
+  const pluginDir = scratchDir("gloom-host-self-");
+  const hostRoot = join(pluginDir, "node_modules", "gloomberb");
+  mkdirSync(join(pluginDir, "node_modules", "react"), { recursive: true });
+  mkdirSync(hostRoot, { recursive: true });
+  writeFileSync(join(hostRoot, "package.json"), JSON.stringify({ name: "gloomberb" }));
+  writeFileSync(join(pluginDir, "node_modules", "react", "package.json"), JSON.stringify({ name: "react" }));
+
+  const result = linkHostPackages(pluginDir, hostRoot, dirname(pluginDir));
+
+  expect(result.error).toBeUndefined();
+  expect(lstatSync(hostRoot).isDirectory()).toBe(true);
+  expect(existsSync(join(hostRoot, "package.json"))).toBe(true);
+  expect(existsSync(join(pluginDir, "node_modules", "react", "package.json"))).toBe(true);
 });
 
 /**

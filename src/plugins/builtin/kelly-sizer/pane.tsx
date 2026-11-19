@@ -20,7 +20,6 @@ import {
 import type { PaneProps } from "../../../types/plugin";
 import { useChartQueries, useFxRatesMap, useResolvedEntryValue } from "../../../market-data/hooks";
 import { buildChartKey } from "../../../market-data/selectors";
-import { clipPriceHistoryToRange } from "../../../time-series/history-window";
 import { useLiveTickerFinancials, useLiveTickerFinancialsMap } from "../../../state/hooks/live-ticker-financials";
 import { buildPortfolioFinancialsMap } from "../../../market-data/portfolio-financials";
 import { convertCurrency, formatCurrency } from "../../../utils/format";
@@ -66,9 +65,11 @@ import {
   estimateKellyHistoryInputs,
   KELLY_HISTORY_DEFAULT_YEARS,
   KELLY_HISTORY_MIN_PERIODS,
-  kellyHistoryRange,
   kellyHistoryRequest,
+  kellyTrailingHistoryRequest,
 } from "./history";
+import { historyReadUnanswered } from "../../../time-series/calendar-month-returns";
+import { kellyCount, kellyCountMultiplier } from "./units";
 import { KELLY_PANE_ID } from "./constants";
 import {
   buildKellyCurveXAxisLabels,
@@ -238,11 +239,15 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
     ? portfolioFinancials.get(requestedSymbol!) ?? null
     : financials;
   const { accountState } = usePortfolioAccountState(activePortfolio, { brokerAccounts, config });
-  // Cash entered by hand counts toward a manual portfolio's bankroll; a broker's is in its Net Liq.
+  // Cash entered by hand, in every currency it is held in, counts toward a manual portfolio's bankroll; a broker's is in its Net Liq.
   const manualCash = accountState ? null : resolvePortfolioCash(activePortfolio, null);
+  const manualCashKey = manualCash?.balances.map((balance) => balance.currency).join(",") ?? "";
+  const manualCashCurrencies = useMemo(() => (manualCashKey ? manualCashKey.split(",") : []), [manualCashKey]);
+  // The sized ticker's own currency too: its units are counted at the base currency's rate to it.
+  const sizedCurrency = financials?.quote?.currency || ticker?.metadata.currency || null;
   const trackedCurrencies = useMemo(
-    () => buildTrackedCurrencies(portfolioTickers, portfolioFinancials, accountState, config.baseCurrency, manualCash?.currency),
-    [accountState, config.baseCurrency, manualCash?.currency, portfolioFinancials, portfolioTickers],
+    () => [...buildTrackedCurrencies(portfolioTickers, portfolioFinancials, accountState, config.baseCurrency, manualCashCurrencies), sizedCurrency],
+    [accountState, config.baseCurrency, manualCashCurrencies, portfolioFinancials, portfolioTickers, sizedCurrency],
   );
   const exchangeRates = useFxRatesMap(trackedCurrencies);
   const portfolioSummary = useMemo(
@@ -267,7 +272,10 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
     netLiquidation,
     brokerPortfolio: !!activePortfolio?.brokerInstanceId,
     holdings: portfolioSummary.allocationHoldings ?? [],
-    cashValue: manualCash ? convertCurrency(manualCash.amount, manualCash.currency, config.baseCurrency, exchangeRates) : null,
+    // Each balance converted once; one without a rate leaves the sum, and so the bankroll, unknown.
+    cashValue: manualCash
+      ? manualCash.balances.reduce((sum, balance) => sum + convertCurrency(balance.amount, balance.currency, config.baseCurrency, exchangeRates), 0)
+      : null,
   });
   const sourceCurrentValue = getPortfolioPositionValue({
     ticker,
@@ -279,6 +287,25 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
   const bankroll = bankrollOverride ?? sourceBankroll;
   const currentValue = currentValueOverride ?? sourceCurrentValue;
   const price = positionFinancials?.quote?.price ?? null;
+  const priceCurrency = positionFinancials?.quote?.currency || ticker?.metadata.currency || config.baseCurrency;
+  // A future is counted in contracts, each worth its price times the contract's multiplier from its terms.
+  const count = ticker
+    ? kellyCount(ticker.metadata.ticker, ticker.metadata.exchange ?? "", positionFinancials?.quote?.instrumentType ?? ticker.metadata.assetCategory)
+    : "shares";
+  const [contractMultiplier, setContractMultiplier] = useState<{ symbol: string; value: number | null } | null>(null);
+  const tickerSymbol = ticker?.metadata.ticker ?? null;
+  useEffect(() => {
+    if (count !== "contracts" || !tickerSymbol) return;
+    let cancelled = false;
+    void kellyCountMultiplier(tickerSymbol, count).then((value) => {
+      if (!cancelled) setContractMultiplier({ symbol: tickerSymbol, value });
+    });
+    return () => { cancelled = true; };
+  }, [count, tickerSymbol]);
+  const multiplier = count !== "contracts" ? 1 : contractMultiplier?.symbol === tickerSymbol ? contractMultiplier.value : null;
+  // Counts divide a base-currency size by one count's value in that currency, at the rate the portfolio values holdings at.
+  const basePrice = price == null || multiplier == null ? null : convertCurrency(price, priceCurrency, config.baseCurrency, exchangeRates) * multiplier;
+  const unitPrice = basePrice != null && Number.isFinite(basePrice) && basePrice > 0 ? basePrice : null;
   // The same daily closes, through the same request, as the KELLY report reads.
   const historyRequest = useMemo(
     () => mode === "history" && ticker
@@ -287,13 +314,23 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
     [historyYears, mode, ticker?.metadata.exchange, ticker?.metadata.ticker],
   );
   const historyEntries = useChartQueries(historyRequest ? [historyRequest] : []);
-  const historyEntry = historyRequest ? historyEntries.get(buildChartKey(historyRequest)) ?? null : null;
+  const datedEntry = historyRequest ? historyEntries.get(buildChartKey(historyRequest)) ?? null : null;
+  // A source with no dated history answers from its trailing range, as the KELLY report does.
+  const datedUnanswered = historyReadUnanswered(datedEntry);
+  const trailingRequest = useMemo(
+    () => datedUnanswered && ticker
+      ? kellyTrailingHistoryRequest({ symbol: ticker.metadata.ticker, exchange: ticker.metadata.exchange ?? "" }, historyYears)
+      : null,
+    [datedUnanswered, historyYears, ticker?.metadata.exchange, ticker?.metadata.ticker],
+  );
+  const trailingEntries = useChartQueries(trailingRequest ? [trailingRequest] : []);
+  const historyEntry = trailingRequest ? trailingEntries.get(buildChartKey(trailingRequest)) ?? null : datedEntry;
   const historyPoints = useResolvedEntryValue(historyEntry);
   const historyInputs = useMemo(
     () => historyPoints
-      ? estimateKellyHistoryInputs(clipPriceHistoryToRange(historyPoints, kellyHistoryRange(historyYears)), historyYears)
+      ? estimateKellyHistoryInputs(historyPoints, historyYears, { exchange: ticker?.metadata.exchange ?? "", symbol: ticker?.metadata.ticker })
       : null,
-    [historyPoints, historyYears],
+    [historyPoints, historyYears, ticker?.metadata.exchange, ticker?.metadata.ticker],
   );
   const rawActiveDraft = drafts[sizingMode] ?? DEFAULT_KELLY_DRAFTS[sizingMode];
   const { commonAssumptions, updateCommon } = useKellyCommonAssumptions(rawActiveDraft);
@@ -365,14 +402,14 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
       draft: activeDraft,
       bankroll,
       currentValue,
-      price,
+      price: unitPrice,
     }),
-    [activeDraft, bankroll, currentValue, price, sizingMode],
+    [activeDraft, bankroll, currentValue, unitPrice, sizingMode],
   );
   const sensitivity = useMemo(() => buildSensitivityGrid(sizingMode, activeDraft), [activeDraft, sizingMode]);
   const curveMaxFraction = useMemo(
     () => getKellyCurveMaxFraction(sizingMode, activeDraft, [
-      result.currentFraction,
+      result.currentFraction ?? 0,
       result.clippedFraction,
       result.fullKellyFraction,
     ]),
@@ -384,7 +421,9 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
   );
   const curveXAxisLabels = useMemo(() => buildKellyCurveXAxisLabels(curveMaxFraction), [curveMaxFraction]);
   const currentGrowth = useMemo(
-    () => calculateExpectedLogGrowthAtFraction(sizingMode, activeDraft, result.currentFraction),
+    () => result.currentFraction == null
+      ? null
+      : calculateExpectedLogGrowthAtFraction(sizingMode, activeDraft, result.currentFraction),
     [activeDraft, sizingMode, result.currentFraction],
   );
   const targetGrowth = useMemo(
@@ -393,15 +432,16 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
   );
   const curveMarkers = useMemo<StaticChartXMarker[]>(() => {
     if (!Number.isFinite(curveMaxFraction) || curveMaxFraction <= 0) return [];
-    const targetLabel = result.clipReasons[0]?.replace(/^max /, "") ?? "target";
+    // Caps apply in turn, so with both binding the last one set the target.
+    const targetLabel = result.clipReasons.at(-1)?.replace(/^max /, "") ?? "target";
     const markers: StaticChartXMarker[] = [
-      {
+      ...(result.currentFraction == null ? [] : [{
         id: "current",
         xRatio: result.currentFraction / curveMaxFraction,
         label: "current",
         color: colors.textDim,
         lineChar: "┊",
-      },
+      }]),
       {
         id: "target",
         xRatio: result.clippedFraction / curveMaxFraction,
@@ -464,7 +504,7 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
   useRemoteUiNode(mode === "history" && historyInputs ? {
     role: "report-freshness",
     label: "History freshness",
-    getMetadata: () => ({ asOf: historyInputs.end }),
+    getMetadata: () => ({ asOf: historyInputs.latest }),
   } : null);
   // History mode says what it is waiting for, or why it has no inputs, before any sizing warning.
   const historyStatus = mode !== "history" || historyInputs ? null
@@ -474,9 +514,6 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
   usePaneFooter(KELLY_PANE_ID, () => ({
     info: historyStatus
       ? [{ id: "history", parts: [historyStatus] }]
-      : bankroll <= 0 && ticker
-      // Every size reads 0% until there is a bankroll; say so where status lives.
-      ? [{ id: "bankroll", parts: [{ text: "no bankroll", tone: "warning" as const }] }]
       : result.warnings.length > 0
         ? [{ id: "warning", parts: [{ text: result.warnings[0]!, tone: "warning" as const }] }]
         : result.clipReasons.length > 0
@@ -488,7 +525,7 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
       { id: "search", key: "/", label: "search", onPress: focusTickerSearch },
       ...(viewInBar ? [] : [{ id: "sensitivity", key: "s", label: showSensitivity ? "ensitivity off" : "ensitivity", onPress: toggleSensitivity }]),
     ],
-  }), [activeInputId, bankroll, editSelectedField, focusTickerSearch, historyStatus?.text, historyStatus?.tone, result.clipReasons, result.warnings, selectedField?.id, selectedField?.label, showSensitivity, ticker, toggleSensitivity, viewInBar]);
+  }), [activeInputId, editSelectedField, focusTickerSearch, historyStatus?.text, historyStatus?.tone, result.clipReasons, result.warnings, selectedField?.id, selectedField?.label, showSensitivity, ticker, toggleSensitivity, viewInBar]);
 
   const portfolioTabs = useMemo(
     () => config.portfolios.map((portfolio) => ({ label: portfolio.name, value: portfolio.id })),
@@ -514,6 +551,7 @@ export function KellySizerPane({ focused, width, height }: PaneProps) {
     ...(mode === "history" && historyInputs ? buildKellyHistoryItems(historyInputs) : []),
     ...buildKellyResultItems({
       result,
+      count,
       baseCurrency: config.baseCurrency,
       currentGrowth,
       targetGrowth,

@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { act } from "react";
 import { Box } from "../../../../ui";
-import { createOpenTuiTestHarness } from "../../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness, TestDialogProvider } from "../../../../renderers/opentui/test-utils";
+import { createRemoteUiRegistry, RemoteUiRegistryProvider } from "../../../../remote/semantic-tree";
+import { planUiCall, UiCallRefusal } from "../../../../plugins/builtin/cloud/terminal-relay/policy";
 import {
   PaneFooterBar,
   PaneFooterProvider,
   usePaneFooter,
 } from "./index";
+import { delayedFooterSegment } from "./model";
 import { useExternalLinkFooter } from "../../../use-external-link-footer";
 import { setLanguage, t } from "../../../../i18n";
 
@@ -153,6 +156,50 @@ describe("PaneFooterBar", () => {
     expect(frame).not.toContain("https://example.com");
   });
 
+  test("a framed footer keeps its status apart from its hints, drops hints from the right, and ends a blank short of its corner", async () => {
+    function Screener() {
+      usePaneFooter("screener", () => ({
+        info: [
+          { id: "loading", parts: [{ text: "loading more", tone: "muted" }] },
+          { id: "matches", parts: [{ text: "777 matches" }] },
+          { id: "currency", parts: [{ text: "USD", tone: "muted" }] },
+          delayedFooterSegment({ id: "delay", detail: "15m delayed", delay: "15m", onPress: () => {} }),
+        ],
+        hints: [
+          { id: "metric", key: "m", label: "etric", onPress: () => {} },
+          { id: "save", key: "s", label: "ave screen", onPress: () => {} },
+          { id: "check", key: "t", label: "check ticker", onPress: () => {} },
+        ],
+      }), []);
+      return null;
+    }
+    const row = async (width: number) => {
+      await tui.render(
+        <PaneFooterProvider>
+          {(footer) => (
+            <Box width={width} height={1}>
+              <Screener />
+              <PaneFooterBar footer={footer} focused width={width} />
+            </Box>
+          )}
+        </PaneFooterProvider>,
+        { width, height: 1 },
+      );
+      await act(async () => {
+        await tui.setup().renderOnce();
+        await tui.setup().renderOnce();
+      });
+      return tui.frame().split("\n")[0]!;
+    };
+    // Room for all of it: the whole status, then the hints, then a blank before the frame's last dash.
+    const wide = await row(90);
+    expect(wide).toMatch(/^└loading more · 777 matches · USD ◷15m +\[m\]etric \[s\]ave screen \[t\]check ticker ─┘$/);
+    // Narrower, the last hint goes under More first and the status stays whole, a column from the hints.
+    const narrow = await row(72);
+    expect(narrow).toMatch(/^└loading more · 777 matches · USD ◷15m +\[m\]etric \[s\]ave screen +More +─┘$/);
+    expect(narrow).not.toContain("[t]check");
+  });
+
   test("hints that do not fit open from More and run from there", async () => {
     const actions: string[] = [];
     function Crowded() {
@@ -208,6 +255,72 @@ describe("PaneFooterBar", () => {
       await tui.setup().renderOnce();
     });
     expect(actions).toEqual(["yank"]);
+  });
+
+  test("More with a prompt's answers in it is that prompt's, so no assistant's UI call picks from it", async () => {
+    const actions: string[] = [];
+    const registry = createRemoteUiRegistry();
+    function Crowded({ prompt }: { prompt: boolean }) {
+      usePaneFooter("crowded", () => ({
+        hints: [
+          { id: "search", key: "/", label: "search", onPress: () => actions.push("search") },
+          { id: "open", key: "o", label: "pen", onPress: () => actions.push("open") },
+          { id: "pop-out", key: "p", label: "op out", onPress: () => actions.push("pop-out") },
+          { id: "share", key: "s", label: "hare", onPress: () => actions.push("share") },
+          { id: "archive", key: "a", label: "rchive", onPress: () => actions.push("archive") },
+          prompt
+            ? { id: "approve", key: "y", label: "es approve", remoteScope: "askg-prompt", onPress: () => actions.push("approve") }
+            : { id: "yank", key: "y", label: "ank", onPress: () => actions.push("yank") },
+        ],
+      }), [prompt]);
+      return null;
+    }
+    const openMore = async (prompt: boolean) => {
+      await tui.render(
+        <RemoteUiRegistryProvider registry={registry}>
+          <TestDialogProvider>
+            <PaneFooterProvider>
+              {(footer) => (
+                <Box width={34} height={18} flexDirection="column">
+                  <Crowded prompt={prompt} />
+                  <PaneFooterBar footer={footer} focused width={34} />
+                </Box>
+              )}
+            </PaneFooterProvider>
+          </TestDialogProvider>
+        </RemoteUiRegistryProvider>,
+        { width: 34, height: 18 },
+      );
+      await act(async () => {
+        await tui.setup().renderOnce();
+      });
+      const lines = tui.frame().split("\n");
+      const moreRow = lines.findIndex((line) => line.includes("More"));
+      await act(async () => {
+        await tui.setup().mockMouse.click(lines[moreRow]!.indexOf("More"), moreRow);
+        await tui.setup().renderOnce();
+        await tui.setup().renderOnce();
+      });
+      return registry.snapshot().find((node) => node.role === "list")!;
+    };
+    const activate = (nodeId: string, input: string) => planUiCall(
+      "ui.invoke",
+      { nodeId, action: "activate", input },
+      { read: async () => registry.snapshot(), promptOpen: false },
+    );
+
+    const list = await openMore(true);
+    expect(list.metadata?.items).toContainEqual(expect.objectContaining({ label: "[y]es approve" }));
+    expect(list.metadata?.scope).toBe("askg-prompt");
+    await expect(activate(list.id, "[y]es approve")).rejects.toBeInstanceOf(UiCallRefusal);
+    // Its frame and anything else drawn in it too.
+    expect(registry.snapshot().filter((node) => node.role !== "pane-hint" && node.label !== "More" && node.metadata?.scope !== "askg-prompt")).toEqual([]);
+
+    // Without one, More asks before it runs an action, as any list does.
+    const plain = await openMore(false);
+    expect(plain.metadata?.scope).toBeUndefined();
+    expect((await activate(plain.id, "[y]ank"))?.confirm?.title).toBe("Choose \"[y]ank\" in \"Pane actions\" (list)");
+    expect(actions).toEqual([]);
   });
 
   test("omits disabled controls instead of rendering muted hints", async () => {

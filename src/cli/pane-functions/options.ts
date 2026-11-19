@@ -1,4 +1,4 @@
-import type { HeadlessPaneDefinition, PaneTemplateCreateOptions, PaneTemplateDef } from "../../types/plugin";
+import type { HeadlessPaneDefinition, PaneDef, PaneTemplateCreateOptions, PaneTemplateDef } from "../../types/plugin";
 import { parseTickerListInput } from "../../tickers/list";
 import { normalizeTickerInput } from "../../tickers/search";
 import { resolveFinancialPeriodOption } from "../../plugins/builtin/ticker-detail/financials/model";
@@ -53,6 +53,8 @@ export interface ParsedPaneFunctionArgs {
   requireBotSafe: boolean;
   /** `shot --strict`: exit with the unusable-shot code when the capture shows no usable data. */
   strict?: boolean;
+  /** The options only `shot` reads (`--theme`, `--height`), as typed, which `fn` refuses rather than ignore. */
+  shotOnly?: string[];
   /** The listing a one-ticker function's argument named, once `applyListingArgument` has resolved it. */
   listing?: CliListing;
   /**
@@ -60,6 +62,16 @@ export interface ParsedPaneFunctionArgs {
    * code was read as, and the ones left out of data that covers US listings only.
    */
   listingNotes?: string[];
+  /**
+   * The listings of a list `applyListingArgument` left out, each with why (data that covers US listings only, a
+   * pair with no options of its own): an export still has a row for each, its reason in the status column.
+   */
+  refusedListings?: Array<{ symbol: string; reason: string }>;
+  /**
+   * The argument's words as the shell passed them, when one holds a space: it was quoted (`fn G "VOD LN"`), so
+   * its words are one entry, not several typed apart (`fn G AAPL MSFT`). `arg` joins them either way.
+   */
+  quotedWords?: string[];
 }
 
 export interface ParsedPaneCatalogArgs {
@@ -72,9 +84,7 @@ function normalizeOptionKey(value: string): string {
   return value.trim().replace(/^-+/, "").replace(/[\s_-]+(.)/g, (_, char: string) => char.toUpperCase());
 }
 
-export function normalizeLookupToken(value: string): string {
-  return value.trim().replace(/^\$/, "").toLowerCase().replace(/[\s_-]+/g, "");
-}
+export { normalizeLookupToken } from "../../utils/lookup-token";
 
 export function cleanTickerInput(value: string): string {
   return value.trim().replace(/^\$/, "").toUpperCase();
@@ -83,12 +93,16 @@ export function cleanTickerInput(value: string): string {
 /**
  * Whether a function's argument names the ticker its pane shows. Its report
  * says first: AUCT's `10Y` and IPO's `pending` are free text its own resolver
- * reads, never a symbol to look up. Without a report, the shortcut says.
+ * reads, never a symbol to look up. Without a report, a rendered pane whose
+ * argument is an id it opens (the story pane's story id) says so, then the
+ * shortcut.
  */
 export function argumentNamesTicker(
   template: Pick<PaneTemplateDef, "shortcut"> | undefined,
   headless: Pick<HeadlessPaneDefinition, "argument"> | undefined,
+  pane?: Pick<PaneDef, "reportArgument">,
 ): boolean {
+  if (!headless && pane?.reportArgument?.identifier) return false;
   const kind = headless?.argument.kind;
   if (kind === "free-text" || kind === "none") return false;
   return kind === "tickers" || kind === "symbol-list" || template?.shortcut?.argKind !== "text";
@@ -112,10 +126,18 @@ export type OptionValueWords = (key: string) => number;
 /** Words in the last value of a list (`TRY -20, EUR 5` ends with two); a decimal comma (`TRY -2,5`) separates nothing. */
 const lastValueWords = (value: string) => value.split(/(?<!\d),|,(?!\d)/).at(-1)!.trim().split(/\s+/).filter(Boolean).length;
 
+/**
+ * What only `shot` draws: the capture's height, theme, text scale, watermark
+ * and status line. `--width` is not one: on `fn` it is the CLI's table width.
+ */
+const SHOT_ONLY_KEYS = new Set(["height", "theme", "scale", "watermark"]);
+
 export function parsePaneFunctionArgs(
   args: string[],
   globalOptions: { limit?: number; tail?: number } = {},
   valueWords?: OptionValueWords,
+  /** Whether an option takes a list, so its flag typed again adds to it rather than replacing it. */
+  listOption?: (key: string) => boolean,
 ): ParsedPaneFunctionArgs {
   const positionals: string[] = [];
   const options: Record<string, string | true> = {};
@@ -131,6 +153,7 @@ export function parsePaneFunctionArgs(
   let strict = false;
   let requireBotSafe = false;
   const clamped: ShotSizeClamp[] = [];
+  const shotOnly: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
     const token = args[index]!;
@@ -151,6 +174,7 @@ export function parsePaneFunctionArgs(
     // A switch: the token after it is the function's argument, never its value.
     if (normalizeOptionKey(key) === "noStatus" && inlineValue === undefined) {
       status = false;
+      shotOnly.push(`--${key}`);
       continue;
     }
     if (normalizeOptionKey(key) === "explain" && inlineValue === undefined) {
@@ -165,6 +189,7 @@ export function parsePaneFunctionArgs(
     const nextValue = inlineValue === undefined && next && !next.startsWith("--") ? args[++index] : true;
     let value: string | true = inlineValue ?? nextValue ?? true;
     const normalizedKey = normalizeOptionKey(key);
+    if (SHOT_ONLY_KEYS.has(normalizedKey)) shotOnly.push(`--${key}`);
     // A value that is a pair (`--fx-shift TRY -20`) takes the words after it, and a list of them the words after a comma.
     const words = value === true ? 1 : valueWords?.(normalizedKey) ?? 1;
     if (words > 1 && value !== true) {
@@ -172,13 +197,17 @@ export function parsePaneFunctionArgs(
         && (lastValueWords(value) < words || value.trimEnd().endsWith(","))) {
         value = `${value} ${args[++index]!}`;
       }
+    }
+    // A list's flag typed again adds to it: `--metric trailingPE --metric dividendYieldPercent`.
+    if ((words > 1 || listOption?.(normalizedKey)) && value !== true) {
       const earlier = options[normalizedKey];
       if (typeof earlier === "string") value = `${earlier}, ${value}`;
     }
     if (normalizedKey === "requireBotSafe" || normalizedKey === "botSafe") {
       requireBotSafe = value === true || String(value).toLowerCase() === "true";
     } else if (normalizedKey === "output" || normalizedKey === "out" || normalizedKey === "o") {
-      outputPath = value === true ? null : value;
+      // A flag with no path is kept as an empty one, which `fn` refuses rather than print as if it had not been given.
+      outputPath = value === true ? "" : value;
     } else if ((normalizedKey === "width" || normalizedKey === "height") && value !== true) {
       const size = parseShotSize(normalizedKey, value);
       if (size.used !== size.requested) clamped.push(size);
@@ -203,6 +232,7 @@ export function parsePaneFunctionArgs(
 
   const target = positionals[0]?.trim() ?? "";
   const arg = positionals.slice(1).join(" ").trim();
+  const quoted = positionals.slice(1).some((word) => /\s/.test(word.trim()));
   // The outer CLI parser consumes --limit and --tail before fn/shot sees its arguments.
   // Restore them for the pane's own schema and loader, including bounds checks,
   // so a function without a tail option says so instead of ignoring it.
@@ -214,6 +244,8 @@ export function parsePaneFunctionArgs(
     ...(heightGiven ? { heightGiven: true as const } : {}),
     ...(explain ? { explain } : {}),
     ...(strict ? { strict } : {}),
+    ...(shotOnly.length > 0 ? { shotOnly } : {}),
+    ...(quoted ? { quotedWords: positionals.slice(1) } : {}),
   };
 }
 

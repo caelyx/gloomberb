@@ -1,9 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { getTimeSeriesField } from "./field-catalog";
 import { normalizeChartSpec, validateChartSpec } from "./spec";
-import { maxStudyWarmupPoints, resolveStudies } from "./studies";
+import { maxStudyWarmupPoints, resolveStudies } from "./studies/resolve";
 import { applyResolvedSeriesTransform } from "./transforms";
 import type { ChartStudySpec, ResolvedSeries, TimeSeriesPoint } from "./types";
+import { createTestResolvedSeries, createTestSeriesPoint } from "../test-support/time-series";
 
 function resolved(id: string, multiplier = 1): ResolvedSeries {
   const points: TimeSeriesPoint[] = Array.from({ length: 60 }, (_, index) => {
@@ -451,6 +452,16 @@ describe("study resolution", () => {
     }
   });
 
+  test("an index's volume is named for its members and is not a unit warning", () => {
+    const input = { ...resolved("hsi"), volumeUnit: undefined, volumeBasis: "index-members" as const, observationKind: "market" as const };
+    const result = resolveStudies([input], [study("volume", "volume", [input.id])]);
+    expect(result.series[0]).toMatchObject({ label: "Members' volume", unit: "", unitGroup: "volume" });
+    expect(result.series[0]?.points.map((point) => point.value)).toEqual(input.points.map((point) => point.volume));
+    expect(result.warnings).toEqual([]);
+    const peer = { ...resolved("msft", 2), observationKind: "market" as const };
+    expect(resolveStudies([input, peer], [study("volume", "volume", [input.id])]).series[0]?.label).toBe("Members' volume HSI");
+  });
+
   test("volume names its security only when another one is charted", () => {
     const input = { ...resolved("aapl"), observationKind: "market" as const };
     const volume = study("volume", "volume", [input.id]);
@@ -638,4 +649,18 @@ describe("study resolution", () => {
     expect(result.series[0]!.unitGroup).toBe(result.series[2]!.unitGroup);
     expect(result.series.every(({ points }) => points.every(({ value }) => value === 1))).toBe(true);
   });
+});
+
+test("volume follows the candles' colours unless a colour was picked for it", () => {
+  const bar = (date: string, open: number, close: number): TimeSeriesPoint => ({ ...createTestSeriesPoint(date, close), open, close, volume: 100 });
+  const price = createTestResolvedSeries({ id: "price", color: "#4c9aff", observationKind: "market", points: [bar("2026-01-05", 10, 12), bar("2026-01-06", 12, 11)] });
+  const volume: ChartStudySpec = { id: "volume", kind: "volume", inputSeriesIds: ["price"], parameters: {}, panelId: "volume", axis: "auto" };
+
+  const [directional] = resolveStudies([price], [volume]).series;
+  expect(directional?.color).toBe("#4c9aff");
+  expect(directional?.points.map((point) => point.fell ?? false)).toEqual([false, true]);
+
+  const [picked] = resolveStudies([price], [{ ...volume, color: "#f5a524" }]).series;
+  expect(picked?.color).toBe("#f5a524");
+  expect(picked?.points.some((point) => point.fell)).toBe(false);
 });

@@ -5,7 +5,9 @@ import type {
   CloudSessionMoversSide,
 } from "../../../api-client/market-movers";
 import { usePlanAccess } from "../../../api-client/plan-access";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
 import { DataTableView, EmptyState, QueryBar, usePaneFooter, type DataTableKeyEvent } from "../../../components";
+import { STALE_SEGMENT } from "../../../components/layout/pane/status-footer";
 import { handleRefreshKey } from "../../../components/data-table/table-pane";
 import {
   buildScreenerQuoteTargets,
@@ -20,8 +22,10 @@ import { nextHeaderSort } from "../../../utils/sort-values";
 import { usePluginPaneState, usePluginTickerActions } from "../../runtime";
 import { ProWall, SignInWall } from "../cloud/auth-actions";
 import { loadSessionMovers, SessionMoversAccessError } from "./client";
+import { ANY_FLOAT, minFloatEmptyTitle, minFloatFilter, minFloatShares, partialFloatFooter } from "./min-float";
 import { summaryFooterSegments } from "./footer";
 import type { MarketSummaryQuote } from "./screener";
+import { isProOnlyTab } from "./model";
 import {
   earlierSessionLabel,
   listAsOfLabel,
@@ -64,7 +68,7 @@ export function SessionMoversBody(props: {
   liveStreaming: boolean;
 }) {
   const access = usePlanAccess();
-  const proOnly = props.view === "gaps";
+  const proOnly = isProOnlyTab(props.view);
   const [denied, setDenied] = useState(false);
   const deny = useCallback(() => setDenied(true), []);
   // A refusal is about the plan the account had then; a new plan asks again.
@@ -104,7 +108,9 @@ function SessionMoversTable({ view, session, focused, width, summaryQuotes, live
   const { pinTicker } = usePluginTickerActions();
   const [savedSide, setSavedSide] = usePluginPaneState<CloudSessionMoversSide>("sessionSide", "up");
   const side = resolveSide(view, savedSide);
-  const listKey = `${view}:${side}`;
+  const [minFloatValue, setMinFloatValue] = usePluginPaneState<string>("minFloat", ANY_FLOAT);
+  const minFloat = minFloatShares(minFloatValue);
+  const listKey = `${view}:${side}:${minFloat ?? ""}`;
   const [loaded, setLoaded] = useState<LoadedList | null>(null);
   // The first frame would otherwise claim an empty list.
   const [loading, setLoading] = useState(true);
@@ -132,9 +138,9 @@ function SessionMoversTable({ view, session, focused, width, summaryQuotes, live
       setLoadError(null);
     }
     try {
-      const next = await loadSessionMovers(view, side, options);
+      const next = await loadSessionMovers(view, side, { ...options, minFloat });
       if (fetchGenRef.current !== gen) return;
-      setLoaded({ key: `${view}:${side}`, payload: next });
+      setLoaded({ key: `${view}:${side}:${minFloat ?? ""}`, payload: next });
       setLoadError(null);
       setLastLoadedAt(Date.now());
     } catch (error) {
@@ -147,7 +153,7 @@ function SessionMoversTable({ view, session, focused, width, summaryQuotes, live
     } finally {
       if (fetchGenRef.current === gen && !options?.background) setLoading(false);
     }
-  }, [onDenied, side, view]);
+  }, [minFloat, onDenied, side, view]);
 
   useEffect(() => {
     setSelectedId(null);
@@ -167,7 +173,7 @@ function SessionMoversTable({ view, session, focused, width, summaryQuotes, live
     freshnessScopeKey: `market-movers:${listKey}`,
     liveStreaming,
   });
-  const columns = useMemo(() => buildSessionMoverColumns(view, width), [view, width]);
+  const columns = useMemo(() => buildSessionMoverColumns(view, width, { float: minFloat != null }), [minFloat, view, width]);
   // The sort survives a change of list, but not onto a column this list or width does not show.
   const sort = columns.some((column) => column.id === sortPreference.columnId) ? sortPreference : DEFAULT_SORT;
   const rows = useMemo(
@@ -187,6 +193,7 @@ function SessionMoversTable({ view, session, focused, width, summaryQuotes, live
   const sessionLabel = payload ? earlierSessionLabel(payload.session, session) : null;
   // While its session trades, a free list says when it was built; a finished one is final and its date says enough.
   const asOfLabel = payload && delayed && sessionTrading ? listAsOfLabel(payload.asOf, payload.session, session) : null;
+  const quoteDelay = useQuoteDelayFooter(payload ? [{ dataSource: delayed ? "delayed" : "live" }] : [], "movers-delay");
   usePaneFooter("market-movers", () => ({
     info: [
       ...(loadError ? [{ id: "load-error", parts: [{ text: loadError, tone: "warning" as const }] }] : []),
@@ -198,9 +205,12 @@ function SessionMoversTable({ view, session, focused, width, summaryQuotes, live
         id: "feed",
         parts: [{ text: feedStatus, tone: feedStatus === "live" ? "value" as const : "muted" as const }],
       }] : []),
-      ...(payload?.stale ? [{ id: "stale", parts: [{ text: "stale", tone: "muted" as const }] }] : []),
+      ...(payload?.stale ? [STALE_SEGMENT] : []),
+      // A float the source does not date says so once, while the FLOAT column shows.
+      ...partialFloatFooter(columns.some((column) => column.id === "floatShares"), rows),
+      ...(quoteDelay ? [quoteDelay] : []),
     ],
-  }), [asOfLabel, feedStatus, loadError, loading, payload?.stale, sessionLabel, summaryQuotes]);
+  }), [asOfLabel, columns, feedStatus, loadError, loading, payload?.stale, quoteDelay, rows, sessionLabel, summaryQuotes]);
 
   const openRow = useCallback((row: SessionMoverRow) => {
     pinTicker(rowKey(row), { floating: true, paneType: TICKER_RESEARCH_PANE_ID, instrument: null });
@@ -217,7 +227,7 @@ function SessionMoversTable({ view, session, focused, width, summaryQuotes, live
   const sides = sessionSides(view);
   // Until this list's first answer the table is loading, including the frame
   // between a change of list and its request going out.
-  const emptyTitle = payload ? "No movers yet." : loadError ?? "Loading movers...";
+  const emptyTitle = payload ? (minFloat != null ? minFloatEmptyTitle(minFloatValue) : "No movers yet.") : loadError ?? "Loading movers...";
   return (
     <DataTableView<SessionMoverRow, SessionMoverColumn>
       focused={focused}
@@ -231,7 +241,7 @@ function SessionMoversTable({ view, session, focused, width, summaryQuotes, live
             value: side,
             options: sides,
             onChange: (value: CloudSessionMoversSide) => setSavedSide(value),
-          }]}
+          }, minFloatFilter(minFloatValue, setMinFloatValue)]}
         />
       )}
       selection={{ kind: "id", selectedId, getId: rowKey, onChange: setSelectedId }}

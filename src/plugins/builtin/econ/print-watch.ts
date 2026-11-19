@@ -1,5 +1,6 @@
 import type { GloomPluginContext } from "../../../types/plugin";
 import {
+  econEventName,
   eventCountry,
   getCalendarCache,
   landedHighImpactPrints,
@@ -10,6 +11,7 @@ import {
   type EconCalendarCacheEntry,
 } from "./calendar-model";
 import type { EconEvent } from "./types";
+import { logFailure } from "../../../utils/log-failure";
 
 /** The ECO setting that turns the print toast on. Off until the user turns it on, as breaking news is. */
 export const ECON_PRINT_NOTIFICATIONS_ENABLED_KEY = "econPrintNotificationsEnabled";
@@ -57,7 +59,8 @@ const DEFAULT_DEPS: PrintWatchDeps = {
 };
 
 function printBody(event: EconEvent): string {
-  return event.forecast ? `${event.event} ${event.actual} vs ${event.forecast}` : `${event.event} ${event.actual}`;
+  const name = econEventName(event);
+  return event.forecast ? `${name} ${event.actual} vs ${event.forecast}` : `${name} ${event.actual}`;
 }
 
 type PrintWatchContext = Pick<GloomPluginContext, "notify" | "showPane">;
@@ -170,8 +173,9 @@ export function startHighImpactPrintWatch(
     try {
       // A due print is asked for past the cache; otherwise a fresh cache answers without a request.
       observe(await deps.load(due), before);
-    } catch {
+    } catch (error) {
       // The next ask follows the same schedule.
+      logFailure("econ.print-watch", "Load calendar for print watch failed")(error);
     } finally {
       running = false;
     }

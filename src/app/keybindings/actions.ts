@@ -18,6 +18,8 @@ export type CoreKeybindingActionId =
   | "notification-dismiss"
   | "quit"
   | "pane-menu"
+  | "pane-next-tab"
+  | "pane-prev-tab"
   | "pane-close"
   | "close-floating-panes"
   | "pane-settings"
@@ -44,6 +46,8 @@ export interface KeybindingActionDef {
   /** Help text. Kept in English here; the help pane translates it. */
   description: string;
   defaults: readonly string[];
+  /** Default chords the terminal adds after `defaults`, for keys only a terminal needs. */
+  terminalDefaults?: readonly string[];
   /** Only the desktop app has this action; the terminal hides the row. */
   desktopOnly?: boolean;
   /** Only the terminal has this action; the desktop app hides the row. */
@@ -52,6 +56,8 @@ export interface KeybindingActionDef {
 
 export const PANE_ACTION_IDS = new Set<CoreKeybindingActionId>([
   "pane-menu",
+  "pane-next-tab",
+  "pane-prev-tab",
   "pane-close",
   "close-floating-panes",
   "pane-settings",
@@ -85,7 +91,7 @@ export const KEYBINDING_ACTIONS: readonly KeybindingActionDef[] = [
   {
     id: "ticker-search",
     category: "Global Keys",
-    description: "Open ticker search directly.",
+    description: "Change the focused pane's ticker.",
     // One chord on purpose: the command bar already searches symbols for
     // free text, so a layout without a backtick key still has Ctrl+P and
     // typing. A dedicated key is a rebind away for anyone who wants one.
@@ -109,6 +115,10 @@ export const KEYBINDING_ACTIONS: readonly KeybindingActionDef[] = [
     category: "Global Keys",
     description: "Switch saved layouts by number.",
     defaults: ["CmdOrCtrl+Digit"],
+    // A terminal without the kitty protocol never sends Control with a digit
+    // (Ctrl+1 arrives as 1, Ctrl+3 as Esc), but it sends Alt+1. A browser
+    // keeps Alt+1 for its own tabs, and a Mac types ¡ with it.
+    terminalDefaults: ["Alt+Digit"],
   },
   {
     id: "focus-next-pane",
@@ -171,9 +181,24 @@ export const KEYBINDING_ACTIONS: readonly KeybindingActionDef[] = [
     defaults: [".", "Shift+F10", "ContextMenu"],
   },
   {
+    id: "pane-next-tab",
+    category: "Pane Management",
+    description: "Show the next tab of the focused pane's stack.",
+    // Tab moves between panes and passes the tabs a stack hides; these step
+    // through them. Ctrl+PageDown is the tab key of browsers and editors and
+    // reaches most terminals; Ctrl+Tab, where the host can tell it from Tab.
+    defaults: ["Ctrl+PageDown", "Ctrl+Tab"],
+  },
+  {
+    id: "pane-prev-tab",
+    category: "Pane Management",
+    description: "Show the previous tab of the focused pane's stack.",
+    defaults: ["Ctrl+PageUp", "Ctrl+Shift+Tab"],
+  },
+  {
     id: "pane-close",
     category: "Pane Management",
-    description: "Close the focused pane, docked or floating. Locked panes stay open.",
+    description: "Close the focused pane, in the layout or floating. Locked panes stay open.",
     defaults: ["CmdOrCtrl+W"],
   },
   {
@@ -205,7 +230,7 @@ export const KEYBINDING_ACTIONS: readonly KeybindingActionDef[] = [
   {
     id: "pane-float",
     category: "Pane Management",
-    description: "Dock or float the focused pane.",
+    description: "Float the focused pane, or return it to the layout.",
     defaults: ["CmdOrCtrl+Shift+D"],
   },
   {

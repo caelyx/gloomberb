@@ -1,10 +1,13 @@
+import { listHomeMarket } from "../../../../portfolio/listed-symbol";
 import { Box, useUiCapabilities } from "../../../../ui";
 import { brokerPortfolioLogo } from "../../../../brokers/logos";
 import { LogoMark } from "../../../../components/ui/logo-mark";
 import { describeFundamentalMarketCap } from "../../../../utils/market-capitalization";
+import { wrapTextLines } from "../../../../utils/text-wrap";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   confirmDialog,
+  RowNote,
   usePaneFooter,
   usePaneMenuItems,
   usePaneNoticeFooter,
@@ -13,16 +16,17 @@ import {
   type TickerListVisibleRange,
 } from "../../../../components";
 import { useTickerSourceActivate } from "../../../../react/ticker-source";
-import { useFxRatesMap, useTickerFinancialsMap } from "../../../../market-data/hooks";
+import { useAnsweredSnapshots, useFxRatesMap, useTickerFinancialsMap } from "../../../../market-data/hooks";
 import { buildPortfolioFinancialsMap } from "../../../../market-data/portfolio-financials";
 import { useAppActive, useAppVisible, usePaneVisible } from "../../../../state/app/activity";
-import { tf } from "../../../../i18n";
+import { t, tf } from "../../../../i18n";
 import { useDialog } from "../../../../ui/dialog";
 import {
   useAppDispatch,
   useAppSelector,
   useAppStateRef,
   usePaneCollection,
+  useOptionalPaneSettingUpdater,
   usePaneInstance,
   usePaneSettingValue,
   usePaneStateValue,
@@ -33,7 +37,9 @@ import { summarizeFxRates, fxStatusLabel } from "../../../../utils/fx-status";
 import { convertCurrency } from "../../../../utils/format";
 import { nextHeaderSort } from "../../../../utils/sort-values";
 import { getSharedMarketDataCoordinator } from "../../../../market-data/coordinator";
+import { DEFAULT_PORTFOLIO_COLUMN_IDS } from "../../../../types/config";
 import type { TickerRecord } from "../../../../types/ticker";
+import type { TickerFinancials } from "../../../../types/financials";
 import type { PaneProps } from "../../../../types/plugin";
 import type { InstrumentRef } from "../../../../market-data/request-types";
 import {
@@ -56,6 +62,7 @@ import {
 } from "../summary";
 import { usePortfolioAccountState } from "../summary/live-accounts";
 import { useOfflineBrokerFooter } from "../../shared/broker-reconnect";
+import { useQuoteDelayFooter } from "../../shared/cloud-upgrade";
 import {
   getCollectionEntries,
   getPortfolioPaneSettings,
@@ -72,6 +79,7 @@ import { useThrottledCursorSymbol } from "../use-throttled-cursor-symbol";
 import { useCursorNeighborPrefetch } from "../use-cursor-neighbor-prefetch";
 import { getSharedRegistry } from "../../../registry";
 import { usePluginAppActions, usePluginBrokerActions } from "../../../runtime";
+import { useFxDayMoves } from "./fx-day-moves";
 import { isManualPortfolio } from "../../../../portfolio/mutations";
 import {
   cursorAfterRemoval,
@@ -79,7 +87,8 @@ import {
   removeTickerFromCollection,
   tickerRemovalSummary,
 } from "./remove-ticker";
-import { QuickAddTickerInput, type QuickAddCollectionKind } from "../quick-add";
+import { QUICK_ADD_KEY, QuickAddTickerInput, type QuickAddCollectionKind } from "../quick-add";
+import { usePositionsImport } from "../positions-import";
 import { delistingLabel } from "../../../../market-data/quotes/delisting";
 import {
   buildTrackedCurrencies,
@@ -97,21 +106,35 @@ import { openPerpLabel, useOpenPerpMarket } from "../../perps/open-market";
 import { useLiveStreamingSetting } from "../../../../state/hooks/live-streaming";
 import { useThrottledTickerOrder } from "../use-throttled-ticker-order";
 import { useThrottledMemo } from "../use-throttled-memo";
+import { useUtcDay } from "../../../../react/auto-refresh";
 import { perpetualDisplaySymbol, perpetualListing, perpetualVenueName } from "../../../../tickers/perpetual-listing";
 import { useColumnClock } from "../use-column-clock";
 import { liveMarketCapitalization } from "../../../../market-data/quotes/live-valuation";
 import { hasUnknownOptionMultiplier } from "../../../../portfolio/position-metrics";
+import { sharePositionMetrics } from "../../../../portfolio/column-values";
 import { withFuturesContractSizes } from "../../../../portfolio/futures-positions";
 import { withPurchaseDateCostFx } from "../../../../portfolio/cost-fx";
 import { usePortfolioFuturesTerms } from "./futures-terms";
+import { useFuturesFrontNotes } from "./futures-front";
 import { usePurchaseDateCostFx } from "./purchase-date-fx";
+import { periodPnlLabel, periodPnlNotices, periodSummaryLines, usePanePeriodPnl } from "./period-pnl";
+import type { LoadedPeriodPnl } from "../period-pnl";
 import {
+  allocationFigures,
   allocationWeightBase,
   buildPortfolioAllocation,
   CASH_SYMBOL,
   hasTargetWeights,
+  pricedCashValue,
   resolvePortfolioCash,
+  type AllocationCashBalance,
 } from "../../../../portfolio/allocation";
+import { allocationSummaryRows, CASH_ROW_KEY } from "../allocation-rows";
+import { useTargetWeightActions, type TargetRow } from "./target-weights";
+import { groupIdOfRowKey, groupRowKey } from "../../../../components/ticker/list-table-view";
+import { withoutWatchlistGroupSymbols } from "../../../../portfolio/watchlist-groups";
+import { scheduleConfigSave } from "../../../../state/config-save-scheduler";
+import { buildWatchlistTableGroups, toggleCollapsedGroup, useWatchlistGroupActions, type CollapsedGroup } from "./groups";
 
 /** Columns that need the portfolio's total. */
 const ALLOCATION_COLUMN_IDS = new Set(["weight", "drift", "trade", "trade_value"]);
@@ -121,6 +144,15 @@ const ALLOCATION_COLUMN_IDS = new Set(["weight", "drift", "trade", "trade_value"
 const FOOTER_TOTALS_THROTTLE_MS = 250;
 const WEIGHT_TOTAL_THROTTLE_MS = 1_000;
 const DAY_MS = 86_400_000;
+/** DRIFT sorts by its size, so its first click puts the largest drift on top. */
+const firstSortDirection = (columnId: string) => columnId === "drift" ? "desc" as const : "asc" as const;
+/** One fallback for every render: a fresh `{}` would read as a changed value each time. */
+const NO_COLLECTION_SORTS: Record<string, CollectionSortPreference> = {};
+/** What the pane's `cursorSummaryRow` holds while the cursor is on the CASH row. */
+const CASH_SUMMARY_ROW = "cash";
+/** What it holds, before the group's id, while the cursor is on a watchlist group's header. */
+const GROUP_SUMMARY_ROW = "group:";
+const NO_COLLAPSED_GROUPS: CollapsedGroup[] = [];
 
 export function PortfolioListPane({ focused, width, height }: PaneProps) {
   const activateTicker = useTickerSourceActivate();
@@ -136,21 +168,41 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
 
   const [currentCollectionId, setCurrentCollectionId] = usePaneStateValue<string>("collectionId", paneCollection.collectionId ?? "");
   const [committedCursorSymbol, setCommittedCursorSymbol] = usePaneStateValue<string | null>("cursorSymbol", null);
-  const [collectionSorts, setCollectionSorts] = usePaneStateValue<Record<string, CollectionSortPreference>>("collectionSorts", {});
+  // The CASH row's and a group header's cursor have a key of their own: `cursorSymbol`, which followers, recent
+  // tickers and saved layouts read, only ever holds a ticker, and keeps the last one while the cursor is on them.
+  const [cursorSummaryRow, setCursorSummaryRow] = usePaneStateValue<string | null>("cursorSummaryRow", null);
+  const committedCursorRow = cursorSummaryRow === CASH_SUMMARY_ROW ? CASH_ROW_KEY
+    : cursorSummaryRow?.startsWith(GROUP_SUMMARY_ROW) ? groupRowKey(cursorSummaryRow.slice(GROUP_SUMMARY_ROW.length))
+      : committedCursorSymbol;
+  const commitCursorRow = useCallback((row: string | null) => {
+    if (row === CASH_ROW_KEY) {
+      setCursorSummaryRow(CASH_SUMMARY_ROW);
+      return;
+    }
+    const group = groupIdOfRowKey(row);
+    if (group != null) {
+      setCursorSummaryRow(`${GROUP_SUMMARY_ROW}${group}`);
+      return;
+    }
+    setCursorSummaryRow(null);
+    setCommittedCursorSymbol(row);
+  }, [setCommittedCursorSymbol, setCursorSummaryRow]);
+  const [collectionSorts, setCollectionSorts] = usePaneStateValue<Record<string, CollectionSortPreference>>("collectionSorts", NO_COLLECTION_SORTS);
   const [cashDrawerExpanded, setCashDrawerExpanded] = usePaneStateValue<boolean>("cashDrawerExpanded", false);
+  // The watchlist groups this pane shows collapsed, of any list.
+  const [collapsedGroups, setCollapsedGroups] = usePaneStateValue<CollapsedGroup[]>("collapsedGroups", NO_COLLAPSED_GROUPS);
   const [, setViewMode] = usePaneSettingValue<PortfolioViewMode>("viewMode", "table");
+  const updateColumnIds = useOptionalPaneSettingUpdater(paneInstance?.instanceId ?? null, "columnIds");
 
   const [streamWindow, setStreamWindow] = useState({ start: 0, end: 24 });
   const [quickAddFocused, setQuickAddFocused] = useState(false);
-  // Bumped by the empty table's "+ ticker" button to open the add row.
-  const [quickAddRequest, setQuickAddRequest] = useState(0);
 
   const {
     cursorSymbol,
     setCursorSymbol,
     flushCursorSymbol,
     cancelPendingCursorSymbol,
-  } = useThrottledCursorSymbol(committedCursorSymbol, setCommittedCursorSymbol);
+  } = useThrottledCursorSymbol(committedCursorRow, commitCursorRow);
 
   const paneSettings = useMemo(
     () => getPortfolioPaneSettings(paneInstance?.settings),
@@ -172,6 +224,9 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       ? config.portfolios.find((portfolio) => portfolio.id === activeCollectionId) ?? null
       : null
   ), [activeCollectionId, config.portfolios, isPortfolioTab]);
+  const currentWatchlist = useMemo(() => (
+    isPortfolioTab ? null : config.watchlists.find((watchlist) => watchlist.id === activeCollectionId) ?? null
+  ), [activeCollectionId, config.watchlists, isPortfolioTab]);
   const viewMode: PortfolioViewMode = isPortfolioTab ? paneSettings.viewMode : "table";
   const valuationBasis = paneSettings.valueAtClose ? "regular-close" as const : "latest-print" as const;
 
@@ -185,7 +240,8 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     [config.baseCurrency, currentPortfolio],
   );
   // A future counts contracts of the size its terms give, and at the close is valued at its settlement.
-  const futuresTerms = usePortfolioFuturesTerms(collectionTickers, { enabled: isPortfolioTab, settlement: valuationBasis === "regular-close" });
+  const futuresTerms = usePortfolioFuturesTerms(collectionTickers, { enabled: true, settlement: isPortfolioTab && valuationBasis === "regular-close" });
+  const futuresFrontNotes = useFuturesFrontNotes(futuresTerms.terms, { enabled: appActive && viewMode === "table", liveStreaming });
   // A dated lot in another currency costs what its purchase date's FX close says in that currency, as portfolio show values it.
   const purchaseDateFx = usePurchaseDateCostFx(collectionTickers, { enabled: isPortfolioTab, portfolioId: activeCollectionId, into: totalsCurrency });
   const tickers = useMemo(
@@ -196,10 +252,26 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     portfolioId: isPortfolioTab ? activeCollectionId : undefined,
   }), [activeCollectionId, isPortfolioTab]);
   const marketFinancialsMap = useTickerFinancialsMap(tickers, financialsInstrumentOptions);
+  // Until a row's snapshot answers, a dash in its company columns may still fill in: PF hides none yet.
+  const answeredSnapshots = useAnsweredSnapshots(tickers, financialsInstrumentOptions);
   const financialsMap = useMemo(
     () => buildPortfolioFinancialsMap(tickers, cachedFinancials, marketFinancialsMap, financialsInstrumentOptions),
     [tickers, cachedFinancials, marketFinancialsMap, financialsInstrumentOptions],
   );
+  // P&L between two closes (the pane's P&L From), as portfolio show --from reads it; since cost without one.
+  const periodPnl = usePanePeriodPnl({
+    from: paneSettings.pnlFrom,
+    to: paneSettings.pnlTo,
+    enabled: isPortfolioTab,
+    portfolioId: activeCollectionId,
+    tickers: collectionTickers,
+    currency: totalsCurrency,
+    futures: futuresTerms.terms,
+    futuresVersion: futuresTerms.version,
+    financialsMap,
+    snapshot: (paneInstance?.settings?.periodPnlSnapshot ?? null) as LoadedPeriodPnl | null,
+  });
+  const periodColumns = periodPnl?.window ? periodPnl : null;
   const valueFlashingEnabled = useAppSelector((state) => state.config.valueFlashingEnabled);
   const flashSymbols = useQuoteFlashMap(financialsMap, valueFlashingEnabled);
 
@@ -215,6 +287,15 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     () => resolveVisibleColumns(paneSettings.columnIds, isPortfolioTab, { targetWeights: hasTargetWeights(currentPortfolio), otherCurrencies }),
     [currentPortfolio, isPortfolioTab, otherCurrencies, paneSettings.columnIds],
   );
+  // A header dragged to a new place rewrites the Columns setting, so Settings lists them as the table shows them;
+  // back in the default order, the setting goes, so columns later added to the defaults still show.
+  const columnReorder = useMemo(() => ({
+    control: {
+      order: paneSettings.columnIds,
+      defaultOrder: DEFAULT_PORTFOLIO_COLUMN_IDS,
+      onChange: (ids: string[] | undefined) => updateColumnIds(() => ids),
+    },
+  }), [paneSettings.columnIds, updateColumnIds]);
   const supplementalData = usePortfolioSupplementalData(tickers, columns, appActive, financialsMap);
   // One lookup for the whole list, only while a perpetual column is on screen.
   const showsPerpetuals = viewMode === "table" && columns.some((column) => PERPETUAL_COLUMN_IDS.has(column.id));
@@ -227,16 +308,19 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     [columns],
   );
 
-  // The broker account's cash when it reports one, else the cash entered by hand.
+  // The broker account's cash when it reports one, else each currency's cash entered by hand.
   const cashLine = useMemo(
     () => isPortfolioTab ? resolvePortfolioCash(currentPortfolio, accountState?.account) : null,
     [accountState, currentPortfolio, isPortfolioTab],
   );
   const trackedCurrencies = useMemo(
-    () => buildTrackedCurrencies(tickers, financialsMap, accountState, totalsCurrency, cashLine?.source === "manual" ? cashLine.currency : undefined),
+    () => buildTrackedCurrencies(tickers, financialsMap, accountState, totalsCurrency,
+      cashLine?.source === "manual" ? cashLine.balances.map((balance) => balance.currency) : undefined),
     [accountState, cashLine, financialsMap, tickers, totalsCurrency],
   );
   const exchangeRates = useFxRatesMap(trackedCurrencies);
+  // The day's move of a holding in another currency holds that currency's move, as `portfolio show` counts it.
+  const fxDayMoves = useFxDayMoves(isPortfolioTab ? trackedCurrencies : [], totalsCurrency);
   const conversionCurrencies = trackedCurrencies.some((currency) => currency !== totalsCurrency) ? trackedCurrencies : [];
   const fxStatus = summarizeFxRates(conversionCurrencies, exchangeRates, (currency) => getSharedMarketDataCoordinator()?.getFxEntry(currency));
   const fxStatusText = fxStatusLabel(fxStatus);
@@ -246,9 +330,14 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     (value: number) => convertCurrency(value, accountCurrency, totalsCurrency, exchangeRates),
     [accountCurrency, exchangeRates, totalsCurrency],
   );
-  const cashValue = cashLine == null ? null
-    : cashLine.source === "broker" ? convertAccountValue(cashLine.amount)
-      : convertCurrency(cashLine.amount, cashLine.currency, totalsCurrency, exchangeRates);
+  // Each balance in the totals currency; one without a rate has no value and stays out of the total, as an unpriced holding does.
+  const cashBalances = useMemo((): AllocationCashBalance[] => (cashLine?.balances ?? []).map(({ amount, currency }) => {
+    const value = cashLine?.source === "broker" ? convertAccountValue(amount) : convertCurrency(amount, currency, totalsCurrency, exchangeRates);
+    return { amount, currency, value: Number.isFinite(value) ? value : null };
+  }), [cashLine, convertAccountValue, exchangeRates, totalsCurrency]);
+  // The cash the total counts, and the whole cash line, unknown while a balance has no rate.
+  const cashValue = pricedCashValue(cashBalances);
+  const cashLineValue = cashBalances.every((balance) => balance.value != null) ? cashValue : null;
   // Only weights divide by the total: skip the walk when nothing shows one.
   const needsWeightTotal = isPortfolioTab
     && (viewMode === "grid" || columns.some((column) => ALLOCATION_COLUMN_IDS.has(column.id)));
@@ -284,18 +373,24 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       activeCollectionId,
       valuationBasis,
       futuresTerms.terms,
+      fxDayMoves,
     ),
     [financialsMap],
-    [activeCollectionId, exchangeRates, futuresTerms.terms, isPortfolioTab, tickers, totalsCurrency, valuationBasis],
+    [activeCollectionId, exchangeRates, futuresTerms.terms, fxDayMoves, isPortfolioTab, tickers, totalsCurrency, valuationBasis],
     FOOTER_TOTALS_THROTTLE_MS,
   );
 
   const now = useColumnClock(columns, appActive && viewMode === "table");
+  // A row outside the list's home market shows its venue (BA:LSE in a US list).
+  const homeMarket = useMemo(() => listHomeMarket(collectionTickers), [collectionTickers]);
   const baseColumnContext = useMemo(() => ({
     activeTab: isPortfolioTab ? activeCollectionId : undefined,
+    homeMarket,
     baseCurrency: totalsCurrency,
     exchangeRates,
-    valuationBasis,
+    fxDayMoves,
+    // A watchlist values nothing: its LAST is the regular session's, as `quote` heads it.
+    ...(isPortfolioTab ? { valuationBasis } : {}),
     portfolioWeightBase,
     portfolioWeightBasis,
     portfolioTargets,
@@ -307,11 +402,15 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     perpetualsVersion: perpetuals.version,
     futuresTerms: futuresTerms.terms,
     futuresTermsVersion: futuresTerms.version,
+    ...(periodColumns ? { periodPnl: { rows: periodColumns.rows, pending: periodColumns.pending, lines: periodSummaryLines(periodColumns.result) }, periodPnlVersion: periodColumns.version } : {}),
   }), [
     activeCollectionId,
     exchangeRates,
+    fxDayMoves,
     futuresTerms,
+    homeMarket,
     isPortfolioTab,
+    periodColumns,
     perpetuals,
     portfolioTargets,
     portfolioWeightBase,
@@ -320,22 +419,24 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     totalsCurrency,
     valuationBasis,
   ]);
-  const columnContext: ColumnContext = useMemo(() => ({ ...baseColumnContext, now }), [baseColumnContext, now]);
+  // Cells and sort keys share each row's position figures: the clock does not move them.
+  const columnContext: ColumnContext = useMemo(() => sharePositionMetrics({ ...baseColumnContext, now }, baseColumnContext), [baseColumnContext, now]);
   // The order only follows the per-second clock when sorting by quote age;
   // day-based columns read the day, which the day's start stands for.
   const sortNow = activeSort.columnId === "latency" ? now : Math.floor(now / DAY_MS) * DAY_MS;
-  const sortContext: ColumnContext = useMemo(() => ({ ...baseColumnContext, now: sortNow }), [baseColumnContext, sortNow]);
+  const sortContext: ColumnContext = useMemo(() => sharePositionMetrics({ ...baseColumnContext, now: sortNow }, baseColumnContext), [baseColumnContext, sortNow]);
 
-  const candidateSortedTickers = useMemo(
+  const candidateSort = useMemo(
     () => sortTickers(tickers, financialsMap, activeSort, sortContext, columns),
     [tickers, financialsMap, activeSort, sortContext, columns],
   );
   const candidateSymbols = useMemo(
-    () => candidateSortedTickers.map((ticker) => ticker.metadata.ticker),
-    [candidateSortedTickers],
+    () => candidateSort.tickers.map((ticker) => ticker.metadata.ticker),
+    [candidateSort],
   );
   const orderResetKey = `${activeCollectionId}|${activeSort.columnId ?? ""}|${activeSort.direction}`;
-  const orderedSymbols = useThrottledTickerOrder(candidateSymbols, orderResetKey);
+  // Rows getting their first figure (the quotes landing after the rows) take their place at once.
+  const orderedSymbols = useThrottledTickerOrder(candidateSymbols, orderResetKey, { valuedSymbols: candidateSort.valued });
   // Keyed on the records, not the re-sorted candidates, so the rows keep their
   // identity across ticks until the throttled order actually moves.
   const tickerBySymbol = useMemo(
@@ -349,6 +450,22 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     }),
     [orderedSymbols, tickerBySymbol],
   );
+  // A watchlist with groups shows its rows under them, each group sorted on its own; any other list has none.
+  const tableGroups = useMemo(
+    () => viewMode === "table" ? buildWatchlistTableGroups(currentWatchlist, sortedTickers, collapsedGroups) : undefined,
+    [collapsedGroups, currentWatchlist, sortedTickers, viewMode],
+  );
+  // The rows the table shows, in its order: a collapsed group's are left out.
+  const displayedTickers = useMemo(
+    () => tableGroups ? tableGroups.flatMap((group) => group.collapsed ? [] : group.tickers) : sortedTickers,
+    [sortedTickers, tableGroups],
+  );
+  // The order quotes stream in: the rows shown, which the visible range counts, then a collapsed group's, off screen.
+  const streamOrder = useMemo(
+    () => tableGroups ? [...displayedTickers, ...tableGroups.flatMap((group) => group.collapsed ? group.tickers : [])] : sortedTickers,
+    [displayedTickers, sortedTickers, tableGroups],
+  );
+  const shownGroupKeys = useMemo(() => new Set(tableGroups?.map((group) => groupRowKey(group.id))), [tableGroups]);
 
   // What LAST shows for each row, snapshotted when the table goes out of sight.
   const priceColumn = viewMode === "table" ? columns.find((column) => column.id === "price") : undefined;
@@ -377,13 +494,12 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
   });
 
   const selectedIdx = sortedTickers.findIndex((ticker) => ticker.metadata.ticker === cursorSymbol);
-  const safeSelectedIdx = selectedIdx >= 0 ? selectedIdx : 0;
 
   const prefetchInstrument = useCallback((instrument: InstrumentRef) => {
     getSharedMarketDataCoordinator()?.warmTickerGaps(instrument);
   }, []);
   const noteCursorForPrefetch = useCursorNeighborPrefetch({
-    tickers: sortedTickers,
+    tickers: displayedTickers,
     cursorSymbol,
     portfolioId: financialsInstrumentOptions.portfolioId,
     enabled: appActive,
@@ -405,11 +521,25 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     if (!isPortfolioTab || accountState || (cashLine == null && portfolioTargets?.[CASH_SYMBOL] == null)) return null;
     const allocation = buildPortfolioAllocation({
       holdings: portfolioSummaryTotals.allocationHoldings ?? [],
-      cashValue: cashValue ?? (cashLine ? Number.NaN : null),
+      cash: cashBalances,
       targets: portfolioTargets,
     });
     return allocation.cash ? { ...allocation.cash, total: allocation.total } : null;
-  }, [accountState, cashLine, cashValue, isPortfolioTab, portfolioSummaryTotals, portfolioTargets]);
+  }, [accountState, cashBalances, cashLine, isPortfolioTab, portfolioSummaryTotals, portfolioTargets]);
+  // Under the holdings of a book with cash entered by hand or targets, its CASH and TOTAL rows, as
+  // `portfolio show` prints them: cash takes a target and a trade like a holding, so the trades add up.
+  const showsAllocationRows = isPortfolioTab && viewMode === "table" && !paneSettings.hideCash
+    && (cashLine?.source === "manual" || hasTargetWeights(currentPortfolio));
+  const allocationRows = useMemo(() => {
+    if (!showsAllocationRows) return undefined;
+    const allocation = buildPortfolioAllocation({
+      holdings: portfolioSummaryTotals.allocationHoldings ?? [],
+      cash: cashBalances,
+      targets: portfolioTargets,
+    });
+    return allocationSummaryRows(allocation, { currency: totalsCurrency });
+  }, [cashBalances, portfolioSummaryTotals, portfolioTargets, showsAllocationRows, totalsCurrency]);
+  const cashRowShown = !!allocationRows?.some((row) => row.id === "cash");
   const summarySegments = useMemo(() => buildPortfolioSummarySegments({
     totals: portfolioSummaryTotals,
     accountState: summaryAccountState,
@@ -420,7 +550,15 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     manualCash,
     brokerPortfolio,
     valuationBasis,
-  }), [brokerPortfolio, config.baseCurrency, convertAccountValue, isPortfolioTab, manualCash, portfolioSummaryTotals, summaryAccountState, totalsCurrency, valuationBasis]);
+    cashInTable: cashRowShown,
+    otherCurrencies,
+    period: periodColumns ? {
+      label: periodPnlLabel(periodColumns),
+      total: periodColumns.result?.total ?? null,
+      contribution: periodColumns.result?.totalContribution ?? null,
+    } : null,
+  }), [brokerPortfolio, cashRowShown, config.baseCurrency, convertAccountValue, isPortfolioTab, manualCash, otherCurrencies, periodColumns, portfolioSummaryTotals,
+    summaryAccountState, totalsCurrency, valuationBasis]);
   // The header row sits in the pane's one-cell side padding, like the table.
   const summaryWidth = Math.max(0, width - 2);
   const summaryLayout = useMemo(() => layoutPortfolioSummaryHeader(summarySegments, summaryWidth, {
@@ -479,7 +617,10 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
   }, [activeCollectionId, collectionSorts, setCollectionSorts]);
 
   const handleHeaderClick = useCallback((columnId: string) => {
-    setSortPreference(nextHeaderSort(activeSort, columnId, { resetTo: { columnId: null, direction: "asc" } }));
+    setSortPreference(nextHeaderSort(activeSort, columnId, {
+      firstDirection: firstSortDirection,
+      resetTo: { columnId: null, direction: "asc" },
+    }));
   }, [activeSort.columnId, activeSort.direction, setSortPreference]);
 
   const openTickerFloating = useCallback((symbol: string, options?: { newPane?: boolean }) => {
@@ -520,13 +661,14 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     if (isEnter && event.shift && !event.ctrl && !event.meta && !event.alt) {
       event.preventDefault?.();
       event.stopPropagation?.();
-      const ticker = sortedTickers[safeSelectedIdx];
+      // The cash row opens nothing.
+      const ticker = selectedIdx >= 0 ? sortedTickers[selectedIdx] : undefined;
       if (ticker) openTickerInNewPane(ticker);
       return true;
     }
 
     return false;
-  }, [dismissSinceLastSeen, focused, openTickerInNewPane, safeSelectedIdx, sortedTickers]);
+  }, [dismissSinceLastSeen, focused, openTickerInNewPane, selectedIdx, sortedTickers]);
 
   useEffect(() => {
     if (activeCollectionId !== currentCollectionId) {
@@ -541,23 +683,27 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       return;
     }
 
-    const hasSelection = cursorSymbol && sortedTickers.some((ticker) => ticker.metadata.ticker === cursorSymbol);
+    // The cash row and a group's header take the cursor too, while they are shown.
+    const hasSelection = cursorSymbol && ((cursorSymbol === CASH_ROW_KEY && cashRowShown) || shownGroupKeys.has(cursorSymbol)
+      || displayedTickers.some((ticker) => ticker.metadata.ticker === cursorSymbol));
     if (!hasSelection) {
-      setCursorSymbol(sortedTickers[0]!.metadata.ticker, { immediate: true });
+      // Every group collapsed: the first header.
+      const first = displayedTickers[0]?.metadata.ticker ?? (tableGroups?.[0] ? groupRowKey(tableGroups[0].id) : null);
+      if (first) setCursorSymbol(first, { immediate: true });
     }
-  }, [cursorSymbol, setCursorSymbol, sortedTickers]);
+  }, [cashRowShown, cursorSymbol, displayedTickers, setCursorSymbol, shownGroupKeys, sortedTickers.length, tableGroups]);
 
   const effectiveStreamWindow = useMemo(() => (
     viewMode === "grid"
       ? { start: 0, end: Math.min(sortedTickers.length, 96) }
       : {
         start: streamWindow.start,
-        end: Math.min(sortedTickers.length, Math.max(streamWindow.end, height + 4)),
+        end: Math.min(displayedTickers.length, Math.max(streamWindow.end, height + 4)),
       }
-  ), [height, sortedTickers.length, streamWindow, viewMode]);
+  ), [displayedTickers.length, height, sortedTickers.length, streamWindow, viewMode]);
 
   const perpetualsInViewKey = showsPerpetuals
-    ? sortedTickers.slice(effectiveStreamWindow.start, effectiveStreamWindow.end).map((ticker) => ticker.metadata.ticker).join("\u001f")
+    ? displayedTickers.slice(effectiveStreamWindow.start, effectiveStreamWindow.end).map((ticker) => ticker.metadata.ticker).join("\u001f")
     : "";
   useEffect(() => {
     setPerpetualsInView(new Set(perpetualsInViewKey ? perpetualsInViewKey.split("\u001f") : []));
@@ -566,7 +712,7 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
   usePortfolioPaneStreaming({
     appActive,
     activeCollectionId: isPortfolioTab ? activeCollectionId : undefined,
-    sortedTickers,
+    sortedTickers: streamOrder,
     cursorSymbol,
     streamWindow: effectiveStreamWindow,
     isPortfolioTab,
@@ -576,6 +722,8 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     liveStreaming,
   });
 
+  // The quotes' time of today drops its day; the next day the footer names it.
+  const utcDay = useUtcDay();
   const summaryFooterInfo = useThrottledMemo(() => buildPortfolioFooterSegments({
     accountState: summaryAccountState,
     accountStatusText: accountsError
@@ -596,8 +744,11 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     portfolioSummaryTotals,
     refreshingSize,
     summaryAccountState,
+    utcDay,
   ], FOOTER_TOTALS_THROTTLE_MS);
   const fxWarning = !!(fxStatus.stale || fxStatus.unknownTime || fxStatus.unavailable);
+  // Signed out or free, the rows' prices are the delayed ones; a list of coins is live and says nothing.
+  const quoteDelay = useQuoteDelayFooter(rowQuotes(sortedTickers, financialsMap), "portfolio-delay");
   const summaryNotices = isPortfolioTab
     ? buildPortfolioSummaryNotices({
       totals: portfolioSummaryTotals,
@@ -617,8 +768,8 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     [activeCollectionId, config],
   );
   const selectedTicker = cursorSymbol ? tickerBySymbol.get(cursorSymbol) : undefined;
-  const sortedTickersRef = useRef(sortedTickers);
-  sortedTickersRef.current = sortedTickers;
+  const sortedTickersRef = useRef(displayedTickers);
+  sortedTickersRef.current = displayedTickers;
   const removingRef = useRef(false);
   // Asks first: a manual portfolio's position goes with the row, and a stray
   // key should not take either.
@@ -648,6 +799,15 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       const symbols = sortedTickersRef.current.map((ticker) => ticker.metadata.ticker);
       setCursorSymbol(cursorAfterRemoval(symbols, symbol), { immediate: true });
       dispatch({ type: "UPDATE_TICKER", ticker: result.ticker });
+      // Out of its group too: added back later, it starts in none.
+      if (collection.kind === "watchlist") {
+        const config = appStateRef.current.config;
+        const next = withoutWatchlistGroupSymbols(config, collection.id, [symbol]);
+        if (next !== config) {
+          dispatch({ type: "SET_CONFIG", config: next });
+          scheduleConfigSave(next);
+        }
+      }
       notify({ type: "success", body: tf("Removed {symbol} from {collection}.", { symbol, collection: collection.name }) });
     } catch {
       notify({ type: "error", body: tf("Failed to remove {symbol}.", { symbol }) });
@@ -655,6 +815,15 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       removingRef.current = false;
     }
   }, [appStateRef, dialog, dispatch, notify, removalCollection, selectedTicker, setCursorSymbol]);
+
+  // A broker's positions export, previewed and then saved to a portfolio; the new one is shown.
+  const positionsImport = usePositionsImport({
+    activePortfolio: currentPortfolio,
+    onImported: setCurrentCollectionId,
+  });
+  usePaneMenuItems("portfolio-list-import", () => [
+    { id: "import-positions", label: t("Import Positions…"), onSelect: positionsImport.start },
+  ], [positionsImport.start]);
 
   // The cursor row's perpetual, for the keyboard: the pane menu opens what clicking its cell opens. A row that is a
   // perpetual market opens its own, as Enter does.
@@ -668,11 +837,54 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
         onSelect: () => openPerpMarket(cursorMarket.marketId) }]
       : null, [cursorMarket, cursorPerpetual, openPerpMarket]);
 
+  // The cursor row's target weight: a holding's, or the cash line's on the CASH row.
+  const targetRow = useMemo<TargetRow | null>(() => {
+    if (!isPortfolioTab || !currentPortfolio) return null;
+    if (cursorSymbol === CASH_ROW_KEY) {
+      return cashRowShown ? { cash: true, symbol: CASH_SYMBOL, label: "Cash", weight: cashWeight(cashLineValue, portfolioWeightBase, portfolioWeightBasis) } : null;
+    }
+    if (!selectedTicker) return null;
+    const symbol = selectedTicker.metadata.ticker;
+    const holding = weightHoldings?.find((entry) => entry.symbol === symbol);
+    const weight = holding ? allocationFigures(holding, portfolioWeightBase, null).weight : null;
+    return { cash: false, symbol, label: symbol, weight };
+  }, [cashLineValue, cashRowShown, currentPortfolio, cursorSymbol, isPortfolioTab, portfolioWeightBase, portfolioWeightBasis, selectedTicker, weightHoldings]);
+  const listedSymbols = useMemo(() => new Set(collectionTickers.map((ticker) => ticker.metadata.ticker)), [collectionTickers]);
+  useTargetWeightActions({ portfolio: currentPortfolio, row: targetRow, listedSymbols, enabled: focused && viewMode === "table" && !quickAddFocused });
+
+  // A group's header collapses or expands its rows; one collapsing with the cursor in it leaves the cursor on it.
+  const toggleGroup = useCallback((id: string) => {
+    const group = tableGroups?.find((entry) => entry.id === id);
+    if (!group || !activeCollectionId) return;
+    if (!group.collapsed && group.tickers.some((ticker) => ticker.metadata.ticker === cursorSymbol)) {
+      setCursorSymbol(groupRowKey(id), { immediate: true });
+    }
+    setCollapsedGroups((current) => toggleCollapsedGroup(current, activeCollectionId, id));
+  }, [activeCollectionId, cursorSymbol, setCollapsedGroups, setCursorSymbol, tableGroups]);
+  // A row moved to a group that is collapsed opens it, so the cursor stays on the row.
+  const showMovedRow = useCallback((symbol: string, group: string | null) => {
+    if (!activeCollectionId) return;
+    const id = group ?? "";
+    setCollapsedGroups((current) => current.filter((entry) => entry.list !== activeCollectionId || entry.group !== id));
+    setCursorSymbol(symbol, { immediate: true });
+  }, [activeCollectionId, setCollapsedGroups, setCursorSymbol]);
+  const cursorGroupId = groupIdOfRowKey(cursorSymbol);
+  const groupRowMenuItems = useWatchlistGroupActions({
+    watchlist: currentWatchlist,
+    cursorTicker: selectedTicker ?? null,
+    // Ungrouped has no name to change.
+    cursorGroup: cursorGroupId ? cursorGroupId : null,
+    enabled: focused && viewMode === "table" && !quickAddFocused,
+    onMoved: showMovedRow,
+  });
+
   usePaneFooter("portfolio-list", () => ({
     info: [
       ...offlineBrokerFooter.asOf,
       ...summaryFooterInfo,
       ...offlineBrokerFooter.status,
+      // The delay clock beside the quotes' source and time; the FX note after it gives way first on a narrow row.
+      ...(quoteDelay ? [quoteDelay] : []),
       ...(fxStatusText && !fxWarning ? [{ id: "fx", parts: [{ text: `FX ${fxStatusText}`, tone: "muted" as const }] }] : []),
       ...(showsPerpetuals && perpetuals.stale ? [{ id: "perpetuals", parts: [{ text: "perpetuals stale", tone: "warning" as const }] }] : []),
     ],
@@ -714,6 +926,7 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     isPortfolioTab,
     offlineBrokerFooter,
     perpetuals.stale,
+    quoteDelay,
     removalCollection,
     removeSelectedTicker,
     selectedTicker,
@@ -735,7 +948,6 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
     return null;
   }, [activeCollectionId, config, currentPortfolio]);
   const showQuickAdd = !!(activeCollectionId && activeCollectionEntry && quickAddCollectionKind);
-  const requestQuickAdd = useCallback(() => setQuickAddRequest((count) => count + 1), []);
   const quickAddHeight = showQuickAdd ? 1 : 0;
   const selectedFinancials = cursorSymbol ? financialsMap.get(cursorSymbol) : undefined;
   const selectedCap = liveMarketCapitalization(selectedFinancials?.quote, selectedFinancials?.fundamentals);
@@ -750,10 +962,14 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
   const delistedNotice = selectedDelisting ? `${cursorSymbol}: ${delistingLabel(selectedDelisting)}.` : undefined;
   usePaneNoticeFooter({
     registrationId: "portfolio-list-notices",
-    notices: [...summaryNotices, delistedNotice, capNotice, multiplierNotice].filter((notice): notice is string => !!notice),
+    notices: [...summaryNotices, ...periodPnlNotices(periodPnl)],
     focused: focused && !quickAddFocused,
   });
-  const contentHeight = Math.max(1, height - headerHeight - summaryHeight - drawerHeight - quickAddHeight);
+  // What concerns the selected holding is said under the list while it is selected, as a table's row note is:
+  // its delisting, where its market cap comes from, its missing multiplier. The footer's notes are the list's.
+  const cursorNote = [delistedNotice, capNotice, multiplierNotice].filter((notice): notice is string => !!notice).join(" ");
+  const cursorNoteHeight = cursorNote ? wrapTextLines(cursorNote, Math.max(1, width - 2)).length : 0;
+  const contentHeight = Math.max(1, height - headerHeight - summaryHeight - drawerHeight - quickAddHeight - cursorNoteHeight);
   const quickAddRow = activeCollectionId && activeCollectionEntry && quickAddCollectionKind ? (
     <QuickAddTickerInput
       collectionId={activeCollectionId}
@@ -763,7 +979,6 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
       width={width}
       onAdded={handleTickerAdded}
       onFocusChange={setQuickAddFocused}
-      focusRequest={quickAddRequest}
     />
   ) : null;
 
@@ -796,6 +1011,7 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
           onCursorChange={handleCursorChange}
           financialsMap={financialsMap}
           columnContext={columnContext}
+          futuresFrontNotes={futuresFrontNotes}
           flashSymbols={flashSymbols}
           sinceLastSeen={sinceLastSeen}
           onRootKeyDown={handleTableKeyDown}
@@ -804,9 +1020,17 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
           visibleRangeBuffer={3}
           resetScrollKey={activeCollectionId}
           onRowActivate={handleRowActivate}
-          onAddTicker={showQuickAdd ? requestQuickAdd : undefined}
+          addTickerShortcut={showQuickAdd ? QUICK_ADD_KEY : undefined}
           onOpenPerpetual={showsPerpetuals ? openPerpMarket : undefined}
           rootHeight={contentHeight}
+          width={width}
+          answeredSnapshots={answeredSnapshots}
+          exportName={activeCollectionEntry?.name}
+          allocationRows={allocationRows}
+          columnReorder={columnReorder}
+          groups={tableGroups}
+          onToggleGroup={toggleGroup}
+          rowMenuItems={groupRowMenuItems}
         />
       ) : (
         <PortfolioGrid
@@ -823,8 +1047,10 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
           height={contentHeight}
         />
       )}
+      <RowNote>{cursorNote}</RowNote>
 
       {quickAddRow}
+      {positionsImport.picker}
 
       {drawerHeight > 0 && accountState && (
         <Box height={drawerHeight} paddingX={1}>
@@ -840,4 +1066,15 @@ export function PortfolioListPane({ focused, width, height }: PaneProps) {
 
     </Box>
   );
+}
+
+/** The cash line's weight, as its row shows it: none against a hedged book's gross exposure. */
+function cashWeight(cashValue: number | null, weightBase: number | undefined, basis: "total" | "gross" | undefined): number | null {
+  if (cashValue == null || basis === "gross") return null;
+  return allocationFigures({ held: true, marketValue: cashValue, units: 0, unitPrice: null }, weightBase, null).weight;
+}
+
+/** The quotes of the rows, in order, for the delayed clock, which stops at the first late one. */
+function* rowQuotes(tickers: readonly TickerRecord[], financialsMap: ReadonlyMap<string, TickerFinancials>) {
+  for (const ticker of tickers) yield financialsMap.get(ticker.metadata.ticker)?.quote;
 }

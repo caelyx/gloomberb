@@ -9,6 +9,7 @@ import {
   createEarningsCallsHeadless,
   type EarningsCallsHeadlessDependencies,
 } from "./headless";
+import { callPeriod, callTitle } from "./format";
 import { buildTranscriptSegments, findCallForQuarter } from "./model";
 
 const calls: CloudEarningsCallPayload[] = [
@@ -153,6 +154,36 @@ describe("earnings transcript headless", () => {
     expect(findCallForQuarter(cost, "FQ4-2025")?.id).toBe("cost-fq4");
     expect(findCallForQuarter(cost, "FY2026")?.id).toBe("cost-fq1");
   });
+  test("a half year's results call is H1, never a second FY call of the same year", () => {
+    // SHKP: interim results in February and annual results in September, both fiscal 2026 with no quarter.
+    const interim = { ...calls[0]!, id: "shkp-h1", ticker: "0016:HKEX", fiscalYear: 2026, fiscalQuarter: null, fiscalHalf: 1, callAt: "2026-02-26T00:00:00Z" };
+    const annual = { ...calls[0]!, id: "shkp-fy", ticker: "0016:HKEX", fiscalYear: 2026, fiscalQuarter: null, callAt: "2026-09-10T00:00:00Z" };
+    expect([interim, annual].map(callPeriod)).toEqual(["H1 26", "FY 26"]);
+    expect(callTitle(interim)).toBe("0016:HKEX H1 26");
+    expect(findCallForQuarter([annual, interim], "H1 2026")?.id).toBe("shkp-h1");
+    expect(findCallForQuarter([annual, interim], "1H26")?.id).toBe("shkp-h1");
+    // A year asks for the year's results call, a newer half aside, and never gets a half: not even when it is all the year has.
+    expect(findCallForQuarter([interim, { ...annual, callAt: "2026-01-10T00:00:00Z" }], "FY2026")?.id).toBe("shkp-fy");
+    expect(findCallForQuarter([interim], "FY2026")).toBeNull();
+    expect(findCallForQuarter([interim], "H1-2026")?.id).toBe("shkp-h1");
+  });
+  test("an event that is not an earnings call is listed by its label and is not the latest earnings call", () => {
+    const deal: CloudEarningsCallPayload = {
+      ...calls[0]!,
+      id: "amd-deal",
+      fiscalYear: null,
+      fiscalQuarter: null,
+      callAt: "2026-09-06T12:00:00.000Z",
+      eventKind: "other",
+      eventLabel: "M&A call",
+    };
+    expect(findCallForQuarter([deal, ...calls], "latest")?.id).toBe("amd-fq2-2026");
+    expect(findCallForQuarter([deal], "latest")?.id).toBe("amd-deal");
+    expect(callTitle(deal)).toBe("AMD M&A call");
+    expect(callPeriod(deal)).toBe("M&A");
+    expect(callTitle(calls[0]!)).toBe("AMD FQ2 26");
+  });
+
   test("a ticker alone lists the company's calls; a quarter or section reads the transcript", async () => {
     const definition = createEarningsCallsHeadless(dependencies());
     const title = definition.describe;
@@ -164,6 +195,22 @@ describe("earnings transcript headless", () => {
     const read = await definition.load(transcriptArgs({ section: "guidance" }), context);
     expect(read.metadata).toMatchObject({ section: "guidance", fiscalQuarter: 2, limit: 20 });
     expect(title(transcriptArgs({ section: "guidance" }))).toBe("Earnings Call Transcript | AMD | latest");
+  });
+
+  // Between calls, the next one is already listed with no transcript: the latest is the last call held.
+  test("the latest transcript is the last call held, and a quarter whose call is ahead says when it is", async () => {
+    const next: CloudEarningsCallPayload = { ...calls[1]!, id: "amd-fq3-2026", fiscalQuarter: 3, callAt: "2026-11-03T21:30:00.000Z", status: "scheduled" };
+    const asked: string[] = [];
+    const definition = createEarningsCallsHeadless({
+      ...dependencies(),
+      now: () => Date.parse("2026-10-20T12:00:00.000Z"),
+      loadCalls: async () => ({ calls: [next, ...calls], fetchedAt: 123, stale: false }),
+      loadTranscript: async (id) => { asked.push(id); return transcript; },
+    });
+    const latest = await definition.load(transcriptArgs({ section: "transcript", quarter: "latest" }), context);
+    expect(latest.metadata).toMatchObject({ fiscalQuarter: 2 });
+    await expect(definition.load(transcriptArgs({ section: "transcript", quarter: "Q3" }), context)).rejects.toThrow("AMD's Q3 call is still to come. Next call");
+    expect(asked).toEqual(["amd-fq2-2026"]);
   });
 
   test("selects a quarter and filters speakers by role acronym", async () => {
@@ -217,6 +264,45 @@ describe("earnings transcript headless", () => {
     expect(second.rows).toHaveLength(1);
     expect(second.rows[0]?.index).toBe(1);
   });
+
+  test("a call held in Chinese says it is translated, and --section original reads its machine transcript, cut into paragraphs", async () => {
+    // Speech transcribed in Chinese comes as one block with spaces at the pauses and no stops.
+    const said = Array.from({ length: 60 }, (_, index) => `第${index}段上半年的经营业绩稳中有进`).join(" ");
+    const translated = { ...transcript, language: "chinese", isTranslated: true, originalText: `${said}\n\n谢谢。` };
+    const definition = createEarningsCallsHeadless({ ...dependencies(), loadTranscript: async () => translated });
+
+    const english = await definition.load(transcriptArgs({ section: "summary", quarter: "latest", offset: 0, limit: 20 }), context);
+    expect(english.metadata).toMatchObject({
+      translatedFrom: "Chinese",
+      notices: ["Translated into English from Chinese; --section original reads the machine transcript it was translated from."],
+    });
+
+    const original = await definition.load(transcriptArgs({ section: "original", quarter: "latest", offset: 0, limit: 50 }), context);
+    const paragraphs = original.rows.map((row) => String(row.text));
+    expect(paragraphs.join(" ")).toBe(`${said} 谢谢。`);
+    expect(paragraphs.length).toBeGreaterThan(2);
+    // Cut at a pause, never inside a phrase.
+    expect(paragraphs.every((text) => text.length <= 360 && /^第\d+段|^谢谢/.test(text))).toBe(true);
+    // Transcribed from its recording, the original is a machine transcript.
+    expect(original.metadata?.notices).toEqual([
+      "A machine transcript of the call's recording in Chinese, before translation; it can mishear names and figures.",
+    ]);
+    // A record published as a document has no timings: it is the call as published.
+    const published = await createEarningsCallsHeadless({
+      ...dependencies(),
+      loadTranscript: async () => ({ ...translated, turns: translated.turns.map((turn) => ({ ...turn, startSeconds: null })) }),
+    }).load(transcriptArgs({ section: "original", quarter: "latest", offset: 0, limit: 50 }), context);
+    expect(published.metadata?.notices).toEqual(["The call as published in Chinese, before translation."]);
+
+    // A language stored as its code reads the same, and an English call says nothing.
+    const coded = await createEarningsCallsHeadless({ ...dependencies(), loadTranscript: async () => ({ ...translated, language: "zh" }) })
+      .load(transcriptArgs({ section: "summary", quarter: "latest", offset: 0, limit: 20 }), context);
+    expect(coded.metadata?.translatedFrom).toBe("Chinese");
+    const plain = await createEarningsCallsHeadless(dependencies())
+      .load(transcriptArgs({ section: "summary", quarter: "latest", offset: 0, limit: 20 }), context);
+    expect(plain.metadata?.translatedFrom).toBeNull();
+    expect(plain.metadata?.notices).toBeUndefined();
+  });
 });
 
 describe("bounded call discovery", () => {
@@ -261,6 +347,17 @@ test("pending discovery is not reported as a complete empty export", async () =>
   expect(result.metadata).toMatchObject({ total: 0, pending: true, totalIsExact: false, sourceLimitReached: false });
 });
 
+test("a listing abroad with no call yet reads not yet available, never an unknown company", async () => {
+  // A listing abroad with no call stored loads as no calls (loadEarningsCalls); a US symbol the SEC does not know as unknown.
+  const deps = dependencies();
+  deps.loadCalls = async (ticker) => ({ calls: [], fetchedAt: 123, stale: false, unknownTicker: !ticker?.includes(":") });
+  const trust = { rawArgument: "C38U:SGX", argument: "C38U:SGX", symbols: ["C38U:SGX"] };
+  const result = await createEarningsCallsHeadless(deps).load({ ...trust, options: {} }, context);
+  expect("empty" in result ? result.empty : null).toBe("Earnings calls for C38U:SGX are not yet available. Calls appear once the company's investor site or filings list a webcast.");
+  await expect(createEarningsCallsHeadless(deps).load({ ...trust, options: { quarter: "latest" } }, context)).rejects.toThrow("Earnings calls for C38U:SGX are not yet available.");
+  await expect(createEarningsCallsHeadless(deps).load({ ...transcriptArgs({}), options: { quarter: "latest" } }, context)).rejects.toThrow("AMD is not a known listed company.");
+});
+
 test("a refused account reads as CALLS's lock note on one line, for the list and for a transcript, with the refusal as its cause", async () => {
   const refused = (status: number) => Promise.reject(new ApiRequestError(status === 401 ? "Unauthorized" : "Refused", status));
   const load = (status: number, args: HeadlessPaneLoadArgs, transcriptOnly = false) => createEarningsCallsHeadless({
@@ -278,28 +375,33 @@ test("a refused account reads as CALLS's lock note on one line, for the list and
 });
 
 describe("upcoming calls", () => {
-  // Wednesday Oct 21 2026, 14:00 in New York.
+  // Wednesday 21 Oct 2026, 14:00 in New York.
   const now = Date.parse("2026-10-21T18:00:00Z");
   const upcoming = (id: string, ticker: string, callAt: string, extra: Partial<CloudEarningsCallPayload> = {}): CloudEarningsCallPayload => ({
     ...calls[1]!, id, ticker, companyName: `${ticker} Inc`, fiscalYear: 2026, fiscalQuarter: 3, callAt, ...extra,
   });
 
   test("fn CALLS TICKER puts the next call first, upcoming with its countdown, and on its own line in the text", async () => {
+    const amdAt = "2026-11-04T21:00:00Z";
+    // The call's day on this machine's clock: Wed 4 Nov in New York, Thu 5 Nov in Hong Kong.
+    const start = new Date(amdAt);
+    const day = `${start.getDate()} ${start.toLocaleDateString("en-US", { month: "short" })}`;
+    const weekday = start.toLocaleDateString("en-US", { weekday: "short" });
     const deps = dependencies();
     deps.now = () => now;
     deps.loadCalls = async () => ({
-      calls: [...calls, upcoming("amd-fq3-2026", "AMD", "2026-11-04T21:00:00Z"), upcoming("amd-fq4-2026", "AMD", "2027-02-03T22:00:00Z")],
+      calls: [...calls, upcoming("amd-fq3-2026", "AMD", amdAt), upcoming("amd-fq4-2026", "AMD", "2027-02-03T22:00:00Z")],
       fetchedAt: 123, stale: false,
     });
     const result = await createEarningsCallsHeadless(deps).load(transcriptArgs({}), context);
     expect(result.rows.slice(0, 2)).toEqual([
-      expect.objectContaining({ id: "amd-fq3-2026", status: "upcoming", upcoming: true, in: "Nov 4" }),
+      expect.objectContaining({ id: "amd-fq3-2026", status: "upcoming", upcoming: true, in: day }),
       expect.objectContaining({ id: "amd-fq4-2026", status: "upcoming" }),
     ]);
     expect((result as { textRows?: unknown[] }).textRows?.map((row) => (row as { id: string }).id)).not.toContain("amd-fq3-2026");
     expect(result.metadata).toMatchObject({
-      notices: [expect.stringMatching(/^Next call Wed Nov 4 .*16:00.*\.$/)],
-      nextCall: { id: "amd-fq3-2026", timeKnown: true, in: "Nov 4" },
+      notices: [expect.stringMatching(new RegExp(`^Next call ${weekday} ${day} .*16:00.*\\.$`))],
+      nextCall: { id: "amd-fq3-2026", timeKnown: true, in: day },
     });
   });
 
@@ -315,7 +417,7 @@ describe("upcoming calls", () => {
           upcoming("tsla", "TSLA", "2026-10-21T21:30:00Z"),
           upcoming("ko", "KO", "2026-10-21T12:30:00Z", { status: "published", hasTranscript: true }),
           upcoming("meta", "META", "2026-10-21T20:30:00Z"),
-          upcoming("aal", "AAL", "2026-10-22T12:30:00Z"),
+          upcoming("aal", "AAL", "2026-10-22T12:30:00Z", { eventKind: "other", eventLabel: "investor day", fiscalYear: null, fiscalQuarter: null }),
         ],
         fetchedAt: 123,
         stale: false,
@@ -332,6 +434,8 @@ describe("upcoming calls", () => {
       ["Tomorrow", "IBM", null, "tomorrow"],
     ]);
     expect(result.metadata).toMatchObject({ view: "upcoming", from: "2026-10-21", to: "2026-10-23", total: 5 });
+    // An event that is not an earnings call keeps its label in the calendar too.
+    expect(result.rows.find((row) => row.ticker === "AAL")).toMatchObject({ period: "Inv day", event: "investor day" });
     const title = definition.describe;
     if (typeof title !== "function") throw new Error("The report title depends on the arguments");
     expect(title(callArgs({}))).toBe("Earnings Calls | Calendar");
@@ -353,7 +457,7 @@ describe("upcoming calls", () => {
     expect(cut.complete).toBe(false);
     expect(cut.metadata).toMatchObject({
       sourceLimit: 1500, sourceLimitReached: true, truncated: true,
-      notices: ["The calendar stops at 1,500 calls: later calls from Oct 22 on may be missing."],
+      notices: ["The calendar stops at 1,500 calls: later calls from 22 Oct on may be missing."],
     });
   });
 });

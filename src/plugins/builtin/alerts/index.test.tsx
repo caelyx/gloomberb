@@ -7,6 +7,7 @@ import type { PluginRuntimeAccess } from "../../runtime";
 import { createConfigBackedTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import { deserializeAlerts, serializeAlerts } from "./alert-engine";
 import { EVENT_ALERTS_KEY, type EventAlertRule } from "./events";
+import { FIRED_LOG_KEY, readFiredAlerts } from "./fired-log";
 import { createResearchAlert } from "./research-builder";
 import { alertsPlugin } from "./index";
 import { AlertsPane } from "./pane";
@@ -130,6 +131,16 @@ describe("AlertsPane", () => {
     expect(frame).toContain("TARGET");
     expect(frame).toContain("200");
     expect(frame).toContain("[a]dd alert");
+  });
+
+  test("Current writes a price as Target does, separators kept from 100,000 up, and a coin pair without its venue", async () => {
+    const btc = { ...makeAlert("alert-btc", "BTC-USD:CCC", "above", 105_000), lastCheckedPrice: 104_250.5, lastCheckedAt: Date.now() - 60_000, lastQuoteCurrency: "USD" };
+    await tui.render(<AlertsHarness width={90} height={8} alerts={[btc]} />, { width: 90, height: 8 });
+    await renderSettled();
+    const row = tui.frame().split("\n").find((line) => line.includes("BTC-USD")) ?? "";
+    expect(row).toContain("104,250.50");
+    expect(row).toContain("105,000.00");
+    expect(row).not.toContain("BTC-USD:");
   });
 
   test("a quote one alert could not get is said on its row and in full in its detail, never in the footer", async () => {
@@ -278,6 +289,29 @@ describe("AlertsPane", () => {
     expect(storedAlerts().map((alert) => alert.id)).toEqual(["alert-aapl"]);
   });
 
+  test("re-arming goes in the alert log once, and m on an alert that is already active writes nothing", async () => {
+    const runtime = makeRuntime();
+    await tui.render(<AlertsHarness alerts={[makeAlert("alert-msft", "MSFT", "below", 300, "triggered")]} runtime={runtime} />, { width: 110, height: 12 });
+    await renderSettled();
+    const pressM = async () => {
+      await act(async () => {
+        await tui.setup().mockInput.typeText("m");
+        await tui.setup().renderOnce();
+      });
+      await renderSettled();
+    };
+    // Twice before the pane has drawn the first: the second press still sees the alert as it was.
+    await act(async () => {
+      await tui.setup().mockInput.typeText("m");
+      await tui.setup().mockInput.typeText("m");
+    });
+    await renderSettled();
+    expect(storedAlerts()[0]?.status).toBe("active");
+    await pressM();
+    const log = readFiredAlerts(runtime.getResumeState("alerts", FIRED_LOG_KEY));
+    expect(log.map((entry) => [entry.action, entry.ruleId])).toEqual([["rearmed", "alert-msft"]]);
+  });
+
   test("an open detail stays on its alert when re-arming moves it, and goes back to the list when it is deleted", async () => {
     await tui.render(
       <AlertsHarness
@@ -407,6 +441,8 @@ describe("alertsPlugin command", () => {
         status: "active",
       });
       expect(notifications[0]?.body).toContain("AAPL");
+      // 201.5 is already above 200, so the toast says it goes off at the next check.
+      expect(notifications[0]?.body).toContain("(current 201.50, already above, so it goes off at the next check)");
       // A target ten times the price is refused, as `alerts add` refuses it, and nothing is stored.
       await expect(command.execute({ shortcut: "AAPL above 2500" })).rejects.toThrow("A target of 2,500 is more than 10 times AAPL's last price of 201.5.");
       expect(deserializeAlerts(String(store.get("alerts")))).toHaveLength(1);
@@ -419,6 +455,90 @@ describe("alertsPlugin command", () => {
       // An alert link's 7203:TSE is Tokyo, where 7203 trades, as `alerts add` reads it.
       await command.execute({ symbol: "7203:TSE", condition: "above", price: "210" });
       expect(deserializeAlerts(String(store.get("alerts")))[1]).toMatchObject({ symbol: "7203:JPX", targetPrice: 210 });
+      // A level the price has not reached says nothing more.
+      expect(notifications.at(-1)?.body).not.toContain("already");
+    } finally {
+      alertsPlugin.dispose?.();
+    }
+  });
+
+  test("SA adds a move from the previous close in the app, with its first reading kept on the device", async () => {
+    const store = new Map<string, unknown>();
+    const resume = new Map<string, unknown>();
+    const commands: any[] = [];
+    const notifications: any[] = [];
+    const ctx = {
+      registerCommand(command: any) { commands.push(command); },
+      registerPane() {},
+      registerPaneTemplate() {},
+      configState: { get: (key: string) => store.get(key), set: (key: string, value: unknown) => { store.set(key, value); } },
+      resume: { getState: (key: string) => resume.get(key), setState: (key: string, value: unknown) => { resume.set(key, value); } },
+      marketData: {
+        // Down 1.2% from Monday's close, in Tuesday's session.
+        getQuote: async (symbol: string) => ({ symbol, price: 650, currency: "USD", change: -7.9, changePercent: -1.2, previousClose: 657.9,
+          changeSessionDate: "2026-11-17", listingExchangeName: "NASDAQ", lastUpdated: Date.now(), dataSource: "live" }),
+        search: async () => [],
+      },
+      tickerRepository: { loadTicker: async () => null, loadAllTickers: async () => [] },
+      notify(notification: any) { notifications.push(notification); },
+      log: { info() {}, warn() {}, error() {} },
+    };
+    try {
+      await alertsPlugin.setup?.(ctx as any);
+      const command = commands.find((entry) => entry.id === "set-alert");
+      await command.execute(command.shortcutArg.parse("Qqq moves 5%"));
+      // Kept in the move list, never the price list a level is kept in.
+      expect(store.get("alerts")).toBeUndefined();
+      const [move] = deserializeAlerts(String(store.get("moveAlerts")));
+      expect(move).toMatchObject({ symbol: "QQQ", condition: "crosses", targetPrice: 5, move: true, status: "active" });
+      expect(notifications[0]?.body).toStartWith("Alert set: QQQ:NASDAQ moves 5.00% from the previous close (once a session, armed again for the next one), now -1.20%");
+      expect(notifications[0]?.body).toContain("The app alerts while it is running");
+      // The same move again is the one already there.
+      await expect(command.execute({ shortcut: "QQQ moves 5%" })).rejects.toThrow(`QQQ:NASDAQ moves 5.00% from the previous close already exists (alert ${move!.id}). Nothing was added.`);
+    } finally {
+      alertsPlugin.dispose?.();
+    }
+  });
+
+  test("reads an unquoted pair as a ratio only when the service says it is no ticker, and never a listing written with a slash", async () => {
+    const commands: any[] = [];
+    const quoted: string[] = [];
+    let pairError = "Not a ticker: XLK/SPY.";
+    const ctx = {
+      registerCommand(command: any) { commands.push(command); },
+      registerPane() {},
+      registerPaneTemplate() {},
+      configState: { get: () => undefined, set() {} },
+      marketData: {
+        getQuote: async (symbol: string) => {
+          quoted.push(symbol);
+          if (symbol === "XLK/SPY") throw new Error(pairError);
+          if (symbol.includes("/")) throw new Error(`Not a ticker: ${symbol}.`);
+          // The ratio's first listing is as far as this needs to go.
+          throw new Error(`Quoted ${symbol} for a ratio.`);
+        },
+        search: async () => [],
+      },
+      tickerRepository: { loadTicker: async () => null, loadAllTickers: async () => [] },
+      notify() {},
+      log: { info() {}, warn() {}, error() {} },
+    };
+    try {
+      await alertsPlugin.setup?.(ctx as any);
+      const command = commands.find((entry) => entry.id === "set-alert");
+      await expect(command.execute({ shortcut: "XLK/SPY above 0.25" })).rejects.toThrow("Quoted XLK for a ratio.");
+      expect([quoted[0], quoted.at(-1)]).toEqual(["XLK/SPY", "XLK"]);
+      // Read as `alerts add` reads them, one listing each (BTC-USD, BRK-B), never a ratio.
+      for (const [symbol, listing] of [["BTC/USD", "BTC-USD"], ["BRK/B", "BRK-B"]] as const) {
+        quoted.length = 0;
+        await expect(command.execute({ shortcut: `${symbol} above 500` })).rejects.toThrow(`Quoted ${listing} for a ratio.`);
+        expect(new Set(quoted)).toEqual(new Set([listing]));
+      }
+      // A pair the service could not answer for is not known to be no ticker.
+      pairError = "The data service timed out.";
+      quoted.length = 0;
+      await expect(command.execute({ shortcut: "XLK/SPY above 0.25" })).rejects.toThrow("The data service timed out.");
+      expect(quoted).toEqual(["XLK/SPY"]);
     } finally {
       alertsPlugin.dispose?.();
     }
@@ -447,6 +567,35 @@ test("disposing alerts ignores an in-flight quote and does not schedule another 
     quote.reject(new Error("quote completed after disposal"));
     await Bun.sleep(0);
     expect({ writes, notifications, schedulingReads }).toEqual({ writes: 0, notifications: 0, schedulingReads: 0 });
+  } finally {
+    alertsPlugin.dispose?.();
+  }
+});
+
+test("a CLI command's plugins check no alert, so a run like `gloom doctor` cannot fire one it would never mark as gone off", async () => {
+  // Already above its target: the app would fire it at its first check.
+  const store = new Map<string, unknown>([["alerts", serializeAlerts([makeAlert("armed", "BTC-USD:CCC", "above", 65_000)])]]);
+  const device = new Map<string, unknown>();
+  let quotes = 0;
+  let notifications = 0;
+  const ctx = {
+    runtime: "command",
+    registerCommand() {}, registerPane() {}, registerPaneTemplate() {},
+    configState: { get: (key: string) => store.get(key), set: (key: string, value: unknown) => { store.set(key, value); } },
+    resume: { getState: (key: string) => device.get(key) ?? null, setState: (key: string, value: unknown) => { device.set(key, value); }, deleteState: (key: string) => { device.delete(key); } },
+    marketData: {
+      getQuote: async (symbol: string) => { quotes += 1; return { symbol, price: 73_500, currency: "USD", change: 0, changePercent: 0, lastUpdated: Date.now(), dataSource: "live" }; },
+      subscribeQuotes: () => { quotes += 1; return () => {}; },
+    },
+    paneSettings: { get: () => "1" },
+    notify: () => { notifications += 1; },
+    log: { info() {}, warn() {}, error() {} },
+  };
+  try {
+    await alertsPlugin.setup?.(ctx as any);
+    await Bun.sleep(20);
+    expect({ quotes, notifications, fired: readFiredAlerts(device.get(FIRED_LOG_KEY)) }).toEqual({ quotes: 0, notifications: 0, fired: [] });
+    expect(deserializeAlerts(String(store.get("alerts")))[0]).toMatchObject({ status: "active" });
   } finally {
     alertsPlugin.dispose?.();
   }
@@ -551,7 +700,8 @@ test("a streamed tick triggers a price alert once, and the poll leaves streaming
     expect(deserializeAlerts(store.get("alerts")!)[0]).toMatchObject({ status: "triggered", lastCheckedPrice: 202 });
     // The device's log keeps it with the quote it went off on, for History with no sign-in.
     expect(device.get("firedLog")).toEqual([expect.objectContaining({
-      kind: "price", ruleId: "above", rule: "AAPL above 200", value: 202, unit: "USD", source: "real-time", symbol: "AAPL",
+      // The rule as every entry of the log names it, its level at the instrument's precision.
+      kind: "price", ruleId: "above", rule: "AAPL above 200.00", value: 202, unit: "USD", source: "real-time", symbol: "AAPL",
       quoteAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
     })]);
     // The first poll ran before any tick; nothing streaming is re-quoted after it.
@@ -736,4 +886,50 @@ test("a slow valuation read leaves price delivery independent and cannot overwri
     expect(deserializeAlerts(store.get("alerts"))[0]?.status).toBe("triggered");
     expect(deserializeAlerts(store.get("metricAlerts"))[0]?.status).toBe("triggered");
   } finally { alertsPlugin.dispose?.(); financials.resolve({}); }
+});
+
+test("the poll asks for move rules' quotes a hundred to a request, and keeps their readings on the device; the synced list gains only the session each went off in", async () => {
+  const rules: AlertRule[] = Array.from({ length: 150 }, (_, index) => ({
+    ...makeAlert(`m${index}`, `S${index}:LSE`, "below", 3), exchange: "LSE", move: true,
+  }));
+  const moves = serializeAlerts(rules);
+  const store = new Map<string, unknown>([["moveAlerts", moves]]);
+  const device = new Map<string, unknown>();
+  const batches: number[] = [];
+  let single = 0;
+  const done = Promise.withResolvers<void>();
+  const ctx = {
+    registerCommand() {}, registerPane() {}, registerPaneTemplate() {},
+    configState: { get: (key: string) => store.get(key) ?? null, set: (key: string, value: unknown) => { store.set(key, value); } },
+    resume: {
+      getState: (key: string) => device.get(key) ?? null,
+      setState: (key: string, value: unknown) => { device.set(key, value); if (key === "moveChecks") done.resolve(); },
+    },
+    marketData: createTestDataProvider({
+      getQuote: async () => { single += 1; throw new Error("asked one at a time"); },
+      getQuotesBatch: async (targets: QuoteSubscriptionTarget[]) => {
+        batches.push(targets.length);
+        return targets.map((target) => ({ target, quote: {
+          symbol: target.symbol, price: 96, change: -4, changePercent: -4, previousClose: 100, currency: "GBP",
+          exchangeName: "LSE", lastUpdated: Date.now(), marketState: "REGULAR", dataSource: "delayed",
+        } as Quote }));
+      },
+    }),
+    paneSettings: { get: () => "300" },
+    notify() {}, showPane() {}, log: { info() {}, warn() {} },
+  };
+  try {
+    await alertsPlugin.setup?.(ctx as any);
+    await done.promise;
+    expect({ batches, single }).toEqual({ batches: [100, 50], single: 0 });
+    // Every rule went off and was read; the synced list is the rules as they were, with the session each went off in.
+    const synced = deserializeAlerts(store.get("moveAlerts"));
+    const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/London" }).format(Date.now());
+    expect(synced).toEqual(rules.map((rule) => ({ ...rule, moveDay: today, syncsMoveDay: true })));
+    const checks = device.get("moveChecks") as Record<string, { percent: number; fired: boolean }>;
+    expect(Object.keys(checks)).toHaveLength(150);
+    expect(checks.m0).toMatchObject({ percent: -4, fired: true });
+  } finally {
+    alertsPlugin.dispose?.();
+  }
 });

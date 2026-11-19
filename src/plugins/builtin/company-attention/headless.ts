@@ -1,8 +1,10 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { HeadlessPaneColumn, HeadlessPaneDefinition, HeadlessPaneRow } from "../../../types/plugin";
 import type { DataTableColumn } from "../../../components";
 import type { AppAttentionPayload, AppChart } from "../../../api-client/app-attention";
 import type { HiringBoard, HiringPayload } from "../../../api-client/hiring";
 import { fetchAppRank, fetchAttention, fetchBuilding, fetchMoves, fetchSignals, type BuildingPayload, type SignalsPayload } from "./client";
+import { companyDataNotes } from "../../../types/company-from";
 import { BUILDING_FILTERS, BUILDING_VIEWS, buildingBoardModel, buildingNumber, buildingPreviewNote, companyBuildingModel, isBuildingFilter, type BuildingSection } from "./building-model";
 import { appsModel, appsPreviewNote, attentionNumber, attentionSectionTitle, attentionTabs, hiringModel, hiringPreviewNote, remoteText, type AttentionKind } from "./model";
 import { companyMovesModel, isMovesFilter, movesBoardModel, movesNumber, movesPreviewNote, MOVES_FILTERS, MOVES_VIEWS, type MovesSection } from "./moves-model";
@@ -17,10 +19,10 @@ import { REPORT_PAGE, REPORT_ROWS } from "../shared/headless-options";
  */
 function reportColumn(column: DataTableColumn): HeadlessPaneColumn {
   if (column.align !== "right") return { key: column.id, header: column.label, align: column.align };
-  const format = (value: unknown) => typeof value === "number" ? attentionNumber(column.id, value) : value == null ? "-" : String(value);
+  const format = (value: unknown) => typeof value === "number" ? attentionNumber(column.id, value) : value == null ? MISSING_VALUE : String(value);
   return { key: column.id, header: column.label, align: column.align, format,
     ...(column.id === "remote" ? { textFormat: (value: unknown, row: HeadlessPaneRow) => typeof value === "number"
-      ? remoteText(value, typeof row.remoteKnown === "number" ? row.remoteKnown : null) ?? "-" : "-" } : {}) };
+      ? remoteText(value, typeof row.remoteKnown === "number" ? row.remoteKnown : null) ?? MISSING_VALUE : MISSING_VALUE } : {}) };
 }
 
 /** A moves view as a report section: paces as `3.4x`, scores signed, and on the board each move's why. */
@@ -28,7 +30,7 @@ function movesSection(title: string, section: MovesSection, why: boolean) {
   return {
     title, empty: section.empty, ...(section.locked ? { locked: true } : {}),
     columns: [...section.columns.map((column): HeadlessPaneColumn => column.align !== "right" ? { key: column.id, header: column.label, align: column.align }
-      : { key: column.id, header: column.label, align: column.align, format: (value: unknown) => typeof value === "number" ? movesNumber(column.id, value) : value == null ? "-" : String(value) }),
+      : { key: column.id, header: column.label, align: column.align, format: (value: unknown) => typeof value === "number" ? movesNumber(column.id, value) : value == null ? MISSING_VALUE : String(value) }),
     ...(why ? [{ key: "why", header: "Why", align: "left" as const }] : [])],
     rows: section.rows.map((row) => ({ ...row.values, ...(row.move ? { why: row.move.why } : {}), ...(row.url ? { sourceUrl: row.url } : {}) })),
   };
@@ -39,7 +41,7 @@ function signalsSection(title: string, section: SignalsSection) {
   return {
     title, empty: section.empty, ...(section.locked ? { locked: true } : {}),
     columns: [...section.columns.map((column): HeadlessPaneColumn => column.align !== "right" ? { key: column.id, header: column.label, align: column.align }
-      : { key: column.id, header: column.label, align: column.align, format: (value: unknown) => typeof value === "number" ? signalsNumber(column.id, value) : value == null ? "-" : String(value) }),
+      : { key: column.id, header: column.label, align: column.align, format: (value: unknown) => typeof value === "number" ? signalsNumber(column.id, value) : value == null ? MISSING_VALUE : String(value) }),
     ...(section.rows.some((row) => row.signal && !row.jobPosting) ? [{ key: "why", header: "Why", align: "left" as const }] : [])],
     rows: section.rows.map((row) => ({ ...row.values, ...(row.signal && !row.jobPosting ? { why: row.signal.why } : {}), ...(row.url ? { sourceUrl: row.url } : {}) })),
   };
@@ -50,7 +52,7 @@ function buildingSection(title: string, section: BuildingSection) {
   return {
     title, empty: section.empty, ...(section.locked ? { locked: true } : {}),
     columns: [...section.columns.map((column): HeadlessPaneColumn => column.align !== "right" ? { key: column.id, header: column.label, align: column.align }
-      : { key: column.id, header: column.label, align: column.align, format: (value: unknown) => typeof value === "number" ? buildingNumber(column.id, value) : value == null ? "-" : String(value) }),
+      : { key: column.id, header: column.label, align: column.align, format: (value: unknown) => typeof value === "number" ? buildingNumber(column.id, value) : value == null ? MISSING_VALUE : String(value) }),
     ...(why ? [{ key: "why", header: "Why", align: "left" as const }] : [])],
     rows: section.rows.map((row) => ({ ...row.values, ...(why && row.shift && !row.jobPosting ? { why: row.shift.why } : {}), ...(row.url ? { sourceUrl: row.url } : {}) })),
   };
@@ -146,7 +148,7 @@ export function attentionHeadless(kind: AttentionKind): HeadlessPaneDefinition<"
       const why = movesModel?.latest?.why;
       const company = args.symbols[0] ? signalsReads[0]?.data : undefined;
       const held = company && !("group" in company) && company.held ? holdText(company.held) : null;
-      const notes = [...model.notices, ...(nextOffset !== null ? [`Additional observations available with --offset ${nextOffset}.`] : []),
+      const notes = [...model.notices, ...companyDataNotes("companyFrom" in data ? data.companyFrom : null), ...(nextOffset !== null ? [`Additional observations available with --offset ${nextOffset}.`] : []),
         ...(movesData instanceof Error ? [movesData.message] : []), ...(why ? [why] : []),
         ...(signalsData instanceof Error ? [signalsData.message] : []), ...(held ? [`No expansion or anomaly signal this week: ${held.toLowerCase()}.`] : []),
         ...(buildingData instanceof Error ? [buildingData.message] : []), ...(buildingHeld ? [`No mix to compare this week: ${buildingHeld.toLowerCase()}.`] : [])];

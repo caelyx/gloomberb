@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { RGBA } from "@opentui/core";
 import { act, useEffect, useState } from "react";
 import { getDockedPaneIds } from "../../layout/pane-manager";
 import { setSharedRegistryForTests } from "../../plugins/registry";
@@ -9,6 +10,8 @@ import { cloneLayout, createDefaultConfig, createPaneInstance, type LayoutConfig
 import type { AppNotificationRequest } from "../../types/plugin";
 import { subscribeFormModalRequests } from "../form-modal/request";
 import { StatusBar } from "./status-bar";
+import { colors } from "../../theme/colors";
+import { ConnectionHealthRegistry, GLOOM_CLOUD_HTTP_CONNECTION_ID, registerGloomCloudConnectionSources } from "../../core/connection-health";
 import { TransientLayoutProvider, useTransientLayout } from "./transient-layout";
 
 const tui = createOpenTuiTestHarness();
@@ -189,6 +192,94 @@ describe("StatusBar", () => {
     } finally {
       unsubscribe();
     }
+  });
+
+  // At 52 columns the bar showed `CIO` of the layout "FX Desk - CIO": the strip scrolled to the end of its name.
+  test("a narrow bar shows the start of the layout in front, cut with an ellipsis, and no tab cut to its end", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-status-bar-narrow");
+    config.layouts = ["Default", "FX Desk - CIO"].map((name) => ({ name, layout: cloneLayout(config.layout) }));
+    config.activeLayoutIndex = 1;
+    const lines = new Map<number, string>();
+    let markerBg: string | undefined;
+    for (const width of [56, 44, 40]) {
+      await tui.render(
+        <AppContext value={createStaticAppStore({ ...createInitialState(config), statusBarVisible: true }, () => {})}>
+          <StatusBar />
+        </AppContext>,
+        { width, height: 1 },
+      );
+      // The strip settles once it has measured its tabs and padded past the last.
+      for (let frame = 0; frame < 3; frame++) await act(async () => { await tui.setup().renderOnce(); });
+      const line = tui.frame().split("\n")[0] ?? "";
+      lines.set(width, line);
+      if (width === 56) markerBg = tui.setup().captureSpans().lines[0]?.spans.find((span) => span.text.includes("‹"))?.bg.toInts().join(",");
+      expect(line).toContain("Feedback");
+      tui.destroy();
+    }
+    // Scrolled to the layout in front, the strip starts at a tab's edge: "^1 Default" is out of view whole, not
+    // cut to "lt", and the marker over the tab's blank first cell says a layout is to its left.
+    expect(lines.get(56)).toStartWith(" ‹^2 FX Desk - CIO  ");
+    // The marker sits on the bar's own panel background, not the app's.
+    expect(colors.panel).not.toBe(colors.bg);
+    expect(markerBg).toBe(RGBA.fromHex(colors.panel).toInts().join(","));
+    // A strip narrower than that tab shows the start of its name, and narrower still, without its key.
+    expect(lines.get(44)).toStartWith(" ‹^2 FX D…  ");
+    expect(lines.get(40)).toStartWith(" ‹FX…  ");
+  });
+
+  test("a terminal 80 columns or wider keeps every name at its full length and scrolls the strip, as it did", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-status-bar-wide");
+    config.layouts = [1, 2, 3, 4].map((index) => ({ name: `Research Desk ${index}`, layout: cloneLayout(config.layout) }));
+    config.activeLayoutIndex = 0;
+    await tui.render(
+      <AppContext value={createStaticAppStore({ ...createInitialState(config), statusBarVisible: true }, () => {})}>
+        <StatusBar />
+      </AppContext>,
+      { width: 100, height: 1 },
+    );
+    for (let frame = 0; frame < 3; frame++) await act(async () => { await tui.setup().renderOnce(); });
+    // Four names cut to 11 letters would fit; at this width they stay at 14 and the strip scrolls past the last.
+    expect(tui.frame().split("\n")[0]).toStartWith("  ^1 Research Desk…  ^2 Research Desk…  ^3 Research Desk…");
+  });
+
+  // A dead link left every cell a dash with nothing saying the app was offline.
+  test("says the data service is unreachable while it is, opens Connections from it, and drops it once it answers", async () => {
+    const health = new ConnectionHealthRegistry();
+    registerGloomCloudConnectionSources(health);
+    const shown: string[] = [];
+    setSharedRegistryForTests({
+      connectionHealth: health,
+      showPane: (paneId: string) => { shown.push(paneId); },
+      renderSlot: () => null,
+    } as any);
+    const config = createDefaultConfig("/tmp/gloomberb-status-bar-connection");
+    await tui.render(
+      <AppContext value={createStaticAppStore({ ...createInitialState(config), statusBarVisible: true }, () => {})}>
+        <StatusBar />
+      </AppContext>,
+      { width: 100, height: 1 },
+    );
+    await tui.setup().renderOnce();
+    expect(tui.frame()).not.toContain("Can't reach");
+
+    await act(async () => {
+      health.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, false);
+      await tui.setup().renderOnce();
+    });
+    const line = tui.frame().split("\n")[0] ?? "";
+    expect(line).toContain("Can't reach the data service");
+    expect(line).toContain("Feedback");
+    await act(async () => {
+      await tui.setup().mockMouse.click(line.indexOf("Can't reach") + 1, 0);
+      await tui.setup().renderOnce();
+    });
+    expect(shown).toEqual(["connections"]);
+
+    await act(async () => {
+      health.reportReachability(GLOOM_CLOUD_HTTP_CONNECTION_ID, true);
+      await tui.setup().renderOnce();
+    });
+    expect(tui.frame()).not.toContain("Can't reach");
   });
 
   /** Float three chat windows at `rect(index)`, then click Tidy Windows. */

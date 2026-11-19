@@ -9,6 +9,7 @@ import { createAppRemoteController } from "./controller";
 import type { CapturePane, PaneScreenshotRequest } from "./pane-screenshot";
 import type { RemoteControlSchema, RemoteUiNodeSnapshot } from "./types";
 import type { RemoteUiRegistry } from "./semantic-tree";
+import { SECURITY_DESCRIPTION_SEARCH } from "../core/state/app/command-bar-launch";
 
 /** What custom views can read here: MOST (a list, no argument) and QQ (tickers, no flags). */
 function createViewSources() {
@@ -152,6 +153,7 @@ function createRegistryHarness(options: {
     register: () => {},
     unregister: () => {},
     snapshot: () => uiNodes,
+    detail: (nodeId) => uiNodes.find((node) => node.id === nodeId) ?? null,
     invoke: async (nodeId, action, input) => {
       invokedUiActions.push({ nodeId, action, input });
       return { nodeId, action, input };
@@ -330,10 +332,11 @@ describe("createAppRemoteController", () => {
     });
 
     expect(response.ok).toBe(true);
+    // DES's search: a remote pick opens the ticker rather than changing the focused pane's.
     expect(actions).toContainEqual({
       type: "SET_COMMAND_BAR",
       open: true,
-      launch: { kind: "ticker-search", query: "google" },
+      launch: { kind: "ticker-search", query: "google", payload: SECURITY_DESCRIPTION_SEARCH },
     });
     expect(getState().commandBarOpen).toBe(true);
     expect(getState().commandBarLaunchRequest).toMatchObject({
@@ -359,6 +362,64 @@ describe("createAppRemoteController", () => {
     expect(await controller.handle({ type: "call", operation: "app.closeDialog", input: {} }))
       .toMatchObject({ ok: false, error: { message: "No dialog is open." } });
     expect((await controller.handle({ type: "call", operation: "app.search", input: { query: "NVDA" } })).ok).toBe(true);
+  });
+
+  test("with the setup dialog over the app, the bar stays shut and a change made behind it says so", async () => {
+    const { controller, getState, setUiNodes } = createRegistryHarness();
+    const paneId = getState().config.layout.instances[0]!.instanceId;
+    setUiNodes([
+      { id: "ui:pane-row", role: "button", label: "NVDA", paneId, actions: ["press"] },
+      { id: "ui:skip", role: "button", label: "Skip", actions: ["press"], metadata: { scope: "form" } },
+      { id: "ui:setup", role: "form", label: "What do you hold?", actions: ["submit"], metadata: { scope: "form", kind: "setup", title: "What do you hold?" } },
+    ]);
+    const behind = 'The setup dialog "What do you hold?" covers the app, so this change is behind it until setup is finished or skipped. app://form lists its fields and buttons.';
+
+    const batch = await controller.handle({
+      type: "batch",
+      requests: [
+        { type: "call", operation: "app.search", input: { mode: "ticker", query: "nvidia" } },
+        { type: "call", operation: "commandBar.activateResult", input: { index: 0 } },
+      ],
+    });
+    expect(batch).toMatchObject({
+      ok: true,
+      data: { ok: false, haltedAt: 0, responses: [{ ok: false, error: { message: expect.stringContaining("the command bar would open behind it") } }] },
+    });
+    expect(getState().commandBarOpen).toBe(false);
+
+    // A pane change, or a press on a pane's control, lands behind it; the setup's own controls do not.
+    expect(await controller.handle({ type: "call", operation: "pane.focus", input: { paneId } }))
+      .toMatchObject({ ok: true, warnings: [behind] });
+    expect(await controller.handle({ type: "call", operation: "ui.invoke", input: { nodeId: "ui:pane-row" } }))
+      .toMatchObject({ ok: true, warnings: [behind] });
+    expect((await controller.handle({ type: "call", operation: "ui.invokeMatching", input: { role: "button", label: "Skip" } })).warnings)
+      .toBeUndefined();
+    // What a settings dialog edits is not behind it.
+    expect((await controller.handle({ type: "call", operation: "pane.setState", input: { paneId, patch: { tab: 1 } } })).warnings)
+      .toBeUndefined();
+    expect(await controller.handle({ type: "batch", requests: [{ type: "call", operation: "layout.undo", input: {} }] }))
+      .toMatchObject({ ok: true, warnings: [behind] });
+
+    // It is not a dialog of the stack: app.closeDialog says how it is left instead.
+    expect(await controller.handle({ type: "call", operation: "app.closeDialog", input: {} }))
+      .toMatchObject({ ok: false, error: { message: expect.stringContaining("cannot skip the whole setup") } });
+  });
+
+  test("the snapshot leaves out the schema, the guide and what panes loaded, and names where they are; /full keeps them", async () => {
+    const { controller, getState } = createRegistryHarness();
+    const paneId = getState().config.layout.instances[0]!.instanceId;
+    await controller.handle({ type: "call", operation: "pane.setState", input: { paneId, patch: { stories: ["a", "b"] } } });
+
+    const lean = await controller.handle({ type: "get", resource: "app://snapshot" });
+    const full = await controller.handle({ type: "get", resource: "app://snapshot/full" });
+    if (!lean.ok || !full.ok) throw new Error("snapshot read failed");
+    const leanData = lean.data as Record<string, unknown> & { panes: Array<Record<string, unknown>> };
+    const fullData = full.data as Record<string, unknown> & { panes: Array<Record<string, unknown>> };
+    expect(Object.keys(leanData)).toEqual(["rev", "app", "config", "panes", "commandBar", "form", "ui", "references"]);
+    expect(leanData.panes.find((pane) => pane.instanceId === paneId)).not.toHaveProperty("runtimeState");
+    expect(Object.keys(fullData)).toEqual(["rev", "app", "config", "panes", "commandBar", "form", "ui", "schema", "help"]);
+    expect(fullData.panes.find((pane) => pane.instanceId === paneId)?.runtimeState).toEqual({ stories: ["a", "b"] });
+    expect(JSON.stringify(leanData).length).toBeLessThan(JSON.stringify(fullData).length / 2);
   });
 
   test("exposes and activates semantic command-bar results", async () => {
@@ -784,6 +845,50 @@ describe("view operations", () => {
     });
     expect(notAView.ok).toBe(false);
     if (!notAView.ok) expect(notAView.error.message).toContain("not a custom view");
+  });
+
+  test("view.create and view.update refuse keys the source's rows never carry and name the keys they do", async () => {
+    const { controller, createdFromTemplate, getState } = createRegistryHarness({ withCustomView: true });
+    const asked = {
+      source: { pane: "MOST" },
+      projection: {
+        columns: ["symbol", { key: "change1d", label: "1D" }, "low30d"],
+        filters: [{ key: "venue", op: "eq", value: "kalshi" }],
+        sort: { by: "change", direction: "desc" },
+      },
+    };
+    const created = await controller.handle({ type: "call", operation: "view.create", input: { spec: asked } });
+    expect(created.ok).toBe(false);
+    if (!created.ok) {
+      expect(created.error.message).toBe(
+        "No view was created. Not in the Market Movers rows: columns change1d, low30d; filter key venue. "
+          + "Its rows carry: symbol, change. Use only those keys, and say which of the asked-for columns this source does not have.",
+      );
+    }
+    expect(createdFromTemplate).toHaveLength(0);
+
+    // Keys the rows carry pass; a filter that drops every loaded row opens with a warning.
+    const empty = await controller.handle({
+      type: "call",
+      operation: "view.create",
+      input: { spec: { source: { pane: "MOST" }, projection: { columns: ["symbol"], filters: [{ key: "change", op: "lt", value: 0 }] } } },
+    });
+    expect(empty.ok && (empty.data as { warnings?: string[] }).warnings).toEqual([
+      "The one row the source loaded does not pass the view's filters, so the view shows no rows.",
+    ]);
+    expect(createdFromTemplate).toHaveLength(1);
+
+    const view = () => getState().config.layout.instances.find((entry) => entry.instanceId === "custom-view:test");
+    const before = view()?.settings?.spec;
+    const updated = await controller.handle({
+      type: "call",
+      operation: "view.update",
+      input: { paneId: "custom-view:test", spec: { source: { pane: "MOST" }, projection: { sort: { by: "lastTrade", direction: "desc" } } }, name: "Broken" },
+    });
+    expect(updated.ok).toBe(false);
+    if (!updated.ok) expect(updated.error.message).toStartWith("The view was left as it was. Not in the Market Movers rows: sort key lastTrade. Its rows carry: symbol, change.");
+    expect(view()?.settings?.spec).toBe(before);
+    expect(view()?.title).toBeUndefined();
   });
 
   test("view.update with a source that cannot load leaves the working spec as it was", async () => {

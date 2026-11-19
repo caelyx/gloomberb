@@ -287,7 +287,8 @@ export function WebTextField({
   const colors = useThemeColors();
   const resolvedBackgroundColor = backgroundColor ?? "var(--gloom-surface-sunken)";
   const resolvedTextColor = textColor ?? colors.text;
-  const resolvedPlaceholderColor = placeholderColor ?? colors.textDim;
+  // The placeholder takes the role from styles.css unless the caller lifts it for its surface.
+  const labelColor = placeholderColor ?? colors.textDim;
   const localInputRef = useRef<InputRenderable>(null);
   const resolvedInputRef = inputRef ?? localInputRef;
   const renderer = useRendererHost();
@@ -301,7 +302,7 @@ export function WebTextField({
       {label && (
         <Box height={comfortable ? undefined : 1} style={comfortable ? { height: 16 } : undefined}>
           <Text
-            fg={focused ? colors.textBright : resolvedPlaceholderColor}
+            fg={focused ? colors.textBright : labelColor}
             style={{ fontWeight: "var(--gloom-weight-bold)", ...(comfortable ? { lineHeight: "16px" } : {}) }}
           >
             {label}
@@ -338,6 +339,8 @@ export function WebTextField({
       >
         <Input
           aria-label={accessibleLabel ?? label}
+          // The shared TextField that renders this registers the field's node.
+          data-gloom-remote-hidden
           disabled={disabled}
           ref={resolvedInputRef as RefObject<InputRenderable | null>}
           width="100%"
@@ -349,7 +352,7 @@ export function WebTextField({
           focused={focused}
           textColor={resolvedTextColor}
           focusedTextColor={resolvedTextColor}
-          placeholderColor={resolvedPlaceholderColor}
+          placeholderColor={placeholderColor}
           backgroundColor={plain ? "transparent" : resolvedBackgroundColor}
           focusedBackgroundColor={plain ? "transparent" : resolvedBackgroundColor}
           cursorColor={colors.textBright}
@@ -435,7 +438,6 @@ export function WebMessageComposer({
           height={height}
           focused={focused}
           placeholder={placeholder}
-          placeholderColor={colors.textMuted}
           textColor={colors.text}
           backgroundColor="transparent"
           focusedBackgroundColor="transparent"
@@ -687,7 +689,7 @@ export function WebPageStackView({
             <WebIcon name="back" size={11} />
             <span className="gloom-qb-text">{backLabel}</span>
           </button>
-          {detailTitle ? <div className="gloom-stack-title">{detailTitle}</div> : <div style={{ flex: 1 }} />}
+          {detailTitle ? <div className="gloom-stack-title" title={detailTitle}>{detailTitle}</div> : <div style={{ flex: 1 }} />}
           {backHint ? <span className="gloom-stack-hint">{backHint}</span> : null}
         </div>
       )}
@@ -698,7 +700,7 @@ export function WebPageStackView({
         style={{ display: "flex", flexDirection: "column", flex: "1 1 0", minWidth: 0, minHeight: 0, overflow: "hidden" }}
       >
         <StackHeaderContext.Provider value={slot}>
-          <NestedPaneTabs>{detailContent}</NestedPaneTabs>
+          <NestedPaneTabs detail>{detailContent}</NestedPaneTabs>
         </StackHeaderContext.Provider>
       </div>
     </Box>

@@ -3,10 +3,11 @@ import type { LayoutConfig, LayoutOrigin, SavedLayout } from "../types/config";
 import type { PaneDef } from "../types/plugin";
 import { layoutContentFingerprint, type CloudLayoutEntry } from "./cloud";
 import { publishableMarketplaceLayout } from "../shares/portable-layout";
+import { logFailure } from "../utils/log-failure";
 
 export interface LinkedLayoutStatus {
   origin: LayoutOrigin;
-  /** Local content differs from the revision the tab last matched. */
+  /** Local content differs from the revision the tab last matched, or cannot be compared with it. */
   dirty: boolean;
   /** The team holds a revision newer than the one linked. */
   updateAvailable: number | null;
@@ -29,8 +30,8 @@ function fingerprintSavedLayout(
 ): string | null {
   try {
     return layoutContentFingerprint(publishableMarketplaceLayout(layout, paneState, panes), derivesTitle(panes));
-  } catch {
-    return null;
+  } catch (error) {
+    return logFailure("layout-marketplace.linked", "Fingerprint linked layout failed", null)(error);
   }
 }
 
@@ -47,7 +48,8 @@ export function linkedLayoutStatus(
   );
   return {
     origin: saved.origin,
-    dirty: fingerprint !== null && fingerprint !== saved.origin.contentHash,
+    // A tab that cannot be fingerprinted may hold edits, so a newer team revision asks instead of replacing it.
+    dirty: fingerprint === null || fingerprint !== saved.origin.contentHash,
     updateAvailable: remoteRevision != null && remoteRevision > saved.origin.revision ? remoteRevision : null,
   };
 }

@@ -6,6 +6,9 @@ export interface DatedObservation {
   value: number | null;
   /** The day the value was released, when the source says (FRED's newest monthly figure). */
   releasedOn?: string;
+  firstReleased?: string;
+  revisedOn?: string;
+  firstReleaseValue?: number;
 }
 
 export interface SeriesCacheMetadata {
@@ -74,9 +77,9 @@ export function createSeriesCache(kind: string, staleMs: number): SeriesCache {
   let generation = 0;
   let persistence: PluginPersistence | null = null;
   const withFailure = <T extends SeriesCacheLoadResult>(key: string, result: T): T => {
-    const failure = failures.get(key);
-    return failure
-      ? { ...result, stale: true, source: "stale-fallback", refreshError: failure }
+    // A failure is one whatever it said: an Error without a message still leaves the copy a saved one.
+    return failures.has(key)
+      ? { ...result, stale: true, source: "stale-fallback", refreshError: failures.get(key) }
       : result;
   };
   const loadEntry: SeriesCache["loadEntry"] = async (key, loader, options) => {
@@ -103,7 +106,7 @@ export function createSeriesCache(kind: string, staleMs: number): SeriesCache {
         if (owner === generation && requests.get(key) === request) requests.delete(key);
       }
     }, options);
-    return withFailure(key, { ...data, fetchedAt, stale, source, ...(refreshError ? { refreshError } : {}) });
+    return withFailure(key, { ...data, fetchedAt, stale, source, ...(source === "stale-fallback" ? { refreshError } : {}) });
   };
   const reset = () => {
     generation += 1;

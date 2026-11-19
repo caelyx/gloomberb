@@ -50,6 +50,15 @@ function templateDeps(
   };
 }
 
+test("a list argument that names a watchlist, AI also a ticker, reads its symbols up to the function's maximum and says so", async () => {
+  const state = createInitialState({ ...createDefaultConfig(":memory:"), watchlists: [{ id: "ai", name: "AI" }] });
+  for (const symbol of ["NVDA", "AMD", "AVGO"]) state.tickers.set(symbol, createTestTicker(symbol, symbol, { watchlists: ["ai"] }));
+  state.tickers.set("AI", createTestTicker("AI", "C3.ai"));
+  const notes: string[] = [];
+  expect(await resolveTickerListInput("ai", null, workflowDeps(state, {}), undefined, { maximum: 2, notes })).toEqual(["NVDA", "AMD"]);
+  expect(notes).toEqual(["Read ai as watchlist AI (3 symbols); the first 2 are read."]);
+});
+
 test("qualified command inputs persist each selected venue without copying existing holdings", async () => {
   for (const savedVenue of [null, "NASDAQ", "AMS"]) {
     const tickerRepository = new JsonTickerRepository();
@@ -319,6 +328,32 @@ describe("createPaneTemplateOrThrow", () => {
       "financial-analysis",
       expect.objectContaining({ instanceId: "financial-analysis:AAPL" }),
     ]);
+  });
+
+  // `PDUFA` and `runway` in the bar open the view `fn` opens for them: one preset is a
+  // setting the pane reads, the other view state, which a window already open on the ticker takes.
+  test("applies a word's preset options as settings or view state, as fn does", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-workflow-ops-preset");
+    const layout = cloneLayout(config.layout);
+    layout.instances = [{ instanceId: "fa:AAPL", paneId: "financial-analysis", title: "FA AAPL", binding: { kind: "fixed", symbol: "AAPL" } }] as never;
+    const state = createInitialState({ ...config, layout });
+    const actions: Array<{ type: string; paneId?: string; patch?: unknown }> = [];
+    const created: Array<Record<string, unknown> | undefined> = [];
+    const open = (id: string, paneId: string, spec: Record<string, unknown>, preset: Record<string, string>) => createPaneTemplateOrThrow(id, { preset }, templateDeps(state, {
+      template: { id, paneId, label: id, description: id, createInstance: () => spec },
+      pane: { id: paneId, name: paneId, component: () => null },
+      registry: { focusPane: () => {}, updateLayout: () => {} },
+      dispatch: (action) => { actions.push(action as never); },
+      buildPaneInstance: (_type, options) => { created.push(options?.settings); return { instanceId: `${paneId}:new`, paneId }; },
+    }));
+
+    await open("catalysts-pane", "catalysts", { title: "Catalysts", settings: { symbol: "" } }, { type: "pdufa" });
+    expect(created).toEqual([{ symbol: "", type: "pdufa" }]);
+    expect(actions).toEqual([]);
+
+    await open("financial-analysis-pane", "financial-analysis", { title: "FA AAPL", binding: { kind: "fixed", symbol: "AAPL" } }, { statement: "liquidity" });
+    expect(created).toHaveLength(1);
+    expect(actions).toEqual([{ type: "UPDATE_PANE_STATE", paneId: "fa:AAPL", patch: { financialSubTab: "liquidity" } }]);
   });
 });
 

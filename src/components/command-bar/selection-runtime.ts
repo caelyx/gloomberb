@@ -1,9 +1,9 @@
-import { useCallback, type MutableRefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, type MutableRefObject } from "react";
 import type { AppState } from "../../state/app/context";
 import type { TickerRecord } from "../../types/ticker";
 import { t } from "../../i18n";
-import { findExactTickerSearchMatch, listingChoiceQuery } from "../../tickers/search";
-import { isKnownExchangeCode, parsePublicTickerKey } from "../../utils/exchanges";
+import { listingChoiceQuery, normalizeTickerInput } from "../../tickers/search";
+import { isKnownExchangeCode } from "../../utils/exchanges";
 import type { PluginRegistry } from "../../plugins/registry";
 import type { Command } from "./commands/registry";
 import type {
@@ -12,7 +12,7 @@ import type {
   PaneTemplateDef,
 } from "../../types/plugin";
 import { resolveCommandBarMode, type CommandBarMode } from "./view-model";
-import type { ListScreenState, ResultItem } from "./list/model";
+import { isDefaultSelectable, type ListScreenState, type ResultItem } from "./list/model";
 import type { CommandBarRoute } from "./workflow/types";
 import type { CollectionCommandId } from "./helpers";
 import type { CommandBarCollectionWorkflowActions } from "./workflow/collection-actions";
@@ -24,6 +24,8 @@ import type { OpenInlineConfirm } from "./routing/confirm";
 import { activatePickerSelectionAction } from "./picker-activation";
 import type { RunRootRow } from "./routes/root/search-report";
 import type { ShortcutIntent } from "./routes/root/shortcuts";
+import { isNamedListingRow } from "./routes/ticker-search/results";
+import { writtenAsSymbol } from "./routes/root/runtime";
 
 type OpenModeRouteFn = (
   screen: "ticker-search" | "layout",
@@ -67,6 +69,7 @@ interface UseCommandBarSelectionRuntimeOptions {
   rootModeKindRef: MutableRefObject<CommandBarMode>;
   rootQuery: string;
   rootQueryRef: MutableRefObject<string>;
+  rootSelectedIdx: number;
   rootSelectionNavigatedRef: MutableRefObject<boolean>;
   rootShortcutIntent: ShortcutIntent;
   rootThemeBaseIdRef: MutableRefObject<string | null>;
@@ -78,6 +81,11 @@ interface UseCommandBarSelectionRuntimeOptions {
    */
   runRootRow?: RunRootRow;
   runSecurityDescriptionShortcut: (query?: string, options?: { forceNewPane?: boolean }) => void | Promise<void>;
+  /**
+   * The search that decides the best row is still out, so the list on screen
+   * is a stand-in for the answer.
+   */
+  searchPending: boolean;
   setRootQuery: (query: string) => void;
   stateConfigLayout: AppState["config"]["layout"];
   stateRef: MutableRefObject<AppState>;
@@ -108,12 +116,14 @@ export function useCommandBarSelectionRuntime({
   rootModeKindRef,
   rootQuery,
   rootQueryRef,
+  rootSelectedIdx,
   rootSelectionNavigatedRef,
   rootShortcutIntent,
   rootThemeBaseIdRef,
   runDirectCommand,
   runRootRow,
   runSecurityDescriptionShortcut,
+  searchPending,
   setRootQuery,
   stateConfigLayout,
   stateRef,
@@ -171,6 +181,15 @@ export function useCommandBarSelectionRuntime({
     setRootQuery,
     startThemePicker,
   ]);
+
+  /**
+   * The typed ticker command Enter runs while no row is highlighted (DES
+   * before its search answers), so the prompt names its keys as a ticker row's.
+   */
+  const typedTickerRow = useMemo(() => (
+    !currentRoute && rootShortcutIntent.kind !== "none" && rootShortcutIntent.argKind === "ticker"
+      ? resolveImmediateRootSelection(rootQuery) : null
+  ), [currentRoute, resolveImmediateRootSelection, rootQuery, rootShortcutIntent]);
 
   /**
    * Tab on a typed shortcut: it completes the prefix, or opens what the
@@ -276,42 +295,51 @@ export function useCommandBarSelectionRuntime({
     updateTopRoute,
   ]);
 
+  /**
+   * An Enter pressed with no row to run while the search is still out. It
+   * waits for the answer instead of running whatever else the list shows, and
+   * is dropped when the user types, moves the selection or leaves the root.
+   */
+  const pendingEnterRef = useRef<{ query: string; secondary: boolean } | null>(null);
+
   const activateListSelection = useCallback((options?: { secondary?: boolean; item?: ResultItem }) => {
     const listState = visibleListStateRef.current;
     if (!listState) return;
-    // Enter submits the typed command until a row is deliberately chosen.
-    // Search ranks suggestions by relevance; its first namesake must not
-    // replace the listing the shared ticker resolver would open.
+    // Enter opens exactly the highlighted row. The typed command runs as typed
+    // only while no listing for it is highlighted: before its search answers
+    // (`DES HFC` then opens the listing `quote HFC` reads), or while the rows
+    // on screen are an earlier query's.
     const queryChanged = rootQueryRef.current !== rootQuery;
     const tickerArgument = rootShortcutIntent.kind !== "none" && rootShortcutIntent.argKind === "ticker"
       ? rootShortcutIntent.argText : null;
-    const listingQuery = listingChoiceQuery(tickerArgument ?? rootQueryRef.current);
+    // `DES BA LN` names its listing as `DES BA:LSE` does.
+    const listingQuery = listingChoiceQuery((tickerArgument === null ? null : normalizeTickerInput(null, tickerArgument)) ?? rootQueryRef.current);
     const choosingVenue = listingQuery && !isKnownExchangeCode(listingQuery.suffix);
-    const submitTyped = !options?.item && !currentRoute
+    const highlighted = listState.results[listState.selectedIdx];
+    // A function given a listing with its venue opens that listing: a row the
+    // user did not pick (a saved BRK.B the letters match, Boeing's BA on NYSE)
+    // runs only when it is that listing, and the typed text runs otherwise.
+    const namedListing = tickerArgument !== null && listingQuery && !choosingVenue ? listingQuery : null;
+    const otherListingHighlighted = !!namedListing && !!highlighted && !rootSelectionNavigatedRef.current
+      && !isNamedListingRow(highlighted, namedListing);
+    const listingHighlighted = !queryChanged && !otherListingHighlighted
+      && (highlighted?.kind === "ticker" || highlighted?.kind === "search");
+    const submitTyped = !options?.item && !currentRoute && !listingHighlighted
       && (queryChanged || (!rootSelectionNavigatedRef.current && !choosingVenue));
-    let typed = submitTyped && (queryChanged || tickerArgument !== null)
+    // A name (`DES Microsoft`, `DES nvda`) is search's to read, not the
+    // resolver's: before the answer, Enter waits for it.
+    const nameAwaitingAnswer = searchPending && !queryChanged && tickerArgument !== null && !namedListing
+      && !writtenAsSymbol(tickerArgument);
+    const typed = submitTyped && !nameAwaitingAnswer && (queryChanged || tickerArgument !== null)
       ? resolveImmediateRootSelection(rootQueryRef.current) : null;
-    const first = listState.results[listState.selectedIdx];
-    if (typed && !queryChanged && rootShortcutIntent.kind !== "none" && rootShortcutIntent.argKind === "ticker"
-      && first && (first.kind === "ticker" || first.kind === "search")) {
-      const argument = rootShortcutIntent.argText;
-      // Company names and partial symbols still accept the suggested match.
-      // An exact symbol or named venue goes through listing resolution.
-      if (!parsePublicTickerKey(argument).exchange && !findExactTickerSearchMatch(
-        listState.results.filter((item) => item.kind === "ticker" || item.kind === "search"), argument,
-      )) typed = null;
-    }
-    // A plain symbol follows the same path once it is the default ticker row.
-    // Commands and company-name searches keep their own default actions.
-    const plainSymbol = submitTyped && !typed && first && (first.kind === "ticker" || first.kind === "search")
-      && findExactTickerSearchMatch([first], rootQueryRef.current);
-    if (plainSymbol && first) {
-      const symbol = rootQueryRef.current;
-      typed = { ...first, action: () => runSecurityDescriptionShortcut(symbol),
-        secondaryAction: () => runSecurityDescriptionShortcut(symbol, { forceNewPane: true }) };
-    }
     const selected = options?.item ?? typed ?? listState.results[listState.selectedIdx];
-    if (!selected || selected.disabled) return;
+    if (!selected) {
+      if (searchPending && !currentRoute && !options?.item && !rootSelectionNavigatedRef.current) {
+        pendingEnterRef.current = { query: rootQueryRef.current, secondary: options?.secondary === true };
+      }
+      return;
+    }
+    if (selected.disabled) return;
 
     // Opened from an add row: a venue picked from the colon list joins that
     // collection. Any other text or screen runs as usual.
@@ -378,8 +406,8 @@ export function useCommandBarSelectionRuntime({
       item: selected,
       query,
       rank: selected === typed ? 0 : Math.max(0, listState.results.indexOf(selected)),
-      // A plain symbol stays a ticker choice; a submitted command is the shortcut itself.
-      isShortcut: () => !plainSymbol && (selected === typed || resolveImmediateRootSelection(query)?.id === selected.id),
+      // A listing row stays a ticker choice; a submitted command is the shortcut itself.
+      isShortcut: () => !listingHighlighted && (selected === typed || resolveImmediateRootSelection(query)?.id === selected.id),
     }, run);
   }, [
     closeAll,
@@ -395,9 +423,36 @@ export function useCommandBarSelectionRuntime({
     rootSelectionNavigatedRef,
     rootShortcutIntent,
     runRootRow,
-    runSecurityDescriptionShortcut,
+    searchPending,
     stateConfigLayout,
     stateRef,
+    visibleListStateRef,
+  ]);
+
+  useEffect(() => {
+    const pending = pendingEnterRef.current;
+    if (!pending) return;
+    if (currentRoute || rootQueryRef.current !== pending.query || rootSelectionNavigatedRef.current) {
+      pendingEnterRef.current = null;
+      return;
+    }
+    const listState = visibleListStateRef.current;
+    if (!listState?.results.some(isDefaultSelectable)) {
+      // Still searching: the answer may bring a row. Answered with none: there is nothing to run.
+      if (!searchPending) pendingEnterRef.current = null;
+      return;
+    }
+    // The selection follows the rows in the render after they land.
+    if (!listState.results[listState.selectedIdx]) return;
+    pendingEnterRef.current = null;
+    activateListSelection({ secondary: pending.secondary });
+  }, [
+    activateListSelection,
+    currentRoute,
+    rootQueryRef,
+    rootSelectedIdx,
+    rootSelectionNavigatedRef,
+    searchPending,
     visibleListStateRef,
   ]);
 
@@ -407,5 +462,6 @@ export function useCommandBarSelectionRuntime({
     activateListSelection,
     runRootQuery,
     setActiveListQuery,
+    typedTickerRow,
   };
 }

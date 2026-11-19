@@ -5,6 +5,8 @@ import type { PaneScreenshotEvidence } from "./screenshot-evidence";
 import type { ReportFreshness } from "./freshness";
 import type { PaneScreenshotFinancialRatioEvidence } from "./financial-ratio-shot";
 
+export const PANE_SWEEP_EVIDENCE_PATH = "GLOOMBERB_PANE_SWEEP_EVIDENCE_PATH";
+
 export interface PaneScreenshotExpectedSelection {
   control: "metric" | "statement" | "ratio" | "period";
   value?: string;
@@ -108,7 +110,17 @@ export type PaneScreenshotDataEvidence =
   | PaneScreenshotEvidence;
 
 export interface PaneScreenshotReadinessSignals {
+  confirmedEmpty?: boolean;
+  /**
+   * A surface to operate rather than data to read (Layouts, Brokers): its rows
+   * and an empty-state marker inside it say nothing of whether it rendered.
+   */
+  interactive?: boolean;
   rowCount: number;
+  /** No rows were counted, but the body shows figures enough to be data (`shotShowsContent`). */
+  contentShown?: boolean;
+  /** The pane drew the capture's refusal of a request where its content goes (`shotShowsRefusal`). */
+  refused?: boolean;
   loadingStateDetected: boolean;
   errorStateDetected: boolean;
   emptyStateDetected: boolean;
@@ -116,6 +128,8 @@ export interface PaneScreenshotReadinessSignals {
   semanticMismatch: boolean;
   requiresStructuredDataEvidence: boolean;
   hasStructuredDataEvidence: boolean;
+  /** Columns blank in every row the capture drew (`shotBlankColumns`). */
+  blankColumns?: readonly string[];
 }
 
 export interface PaneScreenshotResult {
@@ -134,9 +148,29 @@ export interface PaneScreenshotResult {
   empty: boolean;
   complete: boolean;
   unavailableSymbols: string[];
+  /**
+   * When the oldest copy the page drew from was saved (ms): a read the data
+   * service did not answer was answered from a copy saved earlier, through
+   * the market bridge or the API proxy. A report dates its view as saved.
+   */
+  savedCopyAt?: number;
+  /** Rows of a list whose read failed (refused, timed out): pictured without figures and named on the status line. */
+  unreadRows?: string[];
+  /** Why each of `unreadRows` did not load, as the source answered. */
+  unreadReasons?: Record<string, string>;
   semanticMismatch: boolean;
   usable: boolean;
   unusableReason: string | null;
+  /** The pane drew the capture's refusal of the requests it reads its content with (CHAT's channels). */
+  refused?: true;
+  /** Columns blank in every row the capture drew, by their headers: data the pane lost (`shotBlankColumns`). */
+  blankColumns?: string[];
+  /**
+   * Columns the capture cut at the edge of their table, by their headers: a
+   * wider --width shows them. A warning (`shotCutColumnsWarning`), which
+   * leaves the picture usable.
+   */
+  cutColumns?: string[];
   dataEvidence: PaneScreenshotDataEvidence | null;
   /** What the pane says its view leaves out, such as OMON's "21 of 145 strikes". */
   notices?: string[];

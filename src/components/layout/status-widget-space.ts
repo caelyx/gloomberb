@@ -3,12 +3,20 @@ import { useEffect, useSyncExternalStore } from "react";
 /**
  * Space in the status bar for the `status:widget` slot. The bar holds back a
  * fixed number of columns for its widgets; a widget that needs more claims
- * the extra here, so the version chip and the desktop link give way to it,
- * and reads how many columns the widgets have once they have, so it can
- * render nothing rather than run into its neighbours.
+ * the extra here, so the connection note gives way to it, and reads how many
+ * columns the widgets have once they have, so it can render nothing rather
+ * than run into its neighbours.
  */
 /** Held back for the widgets whether or not they claim more. */
 export const STATUS_WIDGET_COLUMNS = 20;
+
+/**
+ * Below this many columns the status bar is a narrow terminal's or a phone's,
+ * as Tidy reads the same width: the layout tabs are cut to fit in the
+ * terminal, and on the desktop and the web, where the tabs give way to the
+ * widgets, a widget takes its short form so the tab in front shows whole.
+ */
+export const NARROW_STATUS_BAR_COLUMNS = 80;
 
 const claims = new Map<string, number>();
 let room = Number.POSITIVE_INFINITY;
@@ -38,8 +46,8 @@ export function useClaimedStatusWidgetColumns(): number {
 
 /**
  * Publishes the columns the widgets can use: right of the layout controls,
- * less Feedback, before the version chip and the desktop link. Infinite while
- * no status bar is mounted, as in isolated renders.
+ * less Feedback. Infinite while no status bar is mounted, as in isolated
+ * renders.
  */
 export function usePublishStatusWidgetRoom(columns: number): void {
   useEffect(() => {
@@ -51,6 +59,15 @@ export function usePublishStatusWidgetRoom(columns: number): void {
     room = Number.POSITIVE_INFINITY;
     emit();
   }, []);
+}
+
+/**
+ * Extra columns the other widgets claim, for a widget that sizes itself to
+ * what they leave rather than run into them.
+ */
+export function useOtherStatusWidgetClaims(id: string): number {
+  const others = () => claimedColumns() - (claims.get(id) ?? 0);
+  return useSyncExternalStore(subscribe, others, others);
 }
 
 /** The columns the widgets can use, as the status bar last published them. */

@@ -1,10 +1,11 @@
 import { useCallback, type Dispatch, type SetStateAction } from "react";
-import type {
-  DockDividerLayout,
-  DockLeafLayout,
-  FloatingRect,
-  LayoutBounds,
-  ResolvedPane,
+import {
+  floatingStacks,
+  type DockDividerLayout,
+  type DockLeafLayout,
+  type FloatingRect,
+  type LayoutBounds,
+  type ResolvedPane,
 } from "../../../layout/pane-manager";
 import {
   constrainFloatingRectToBounds,
@@ -18,6 +19,14 @@ import type {
   VisibleFloatingPane,
 } from "./drag/runtime";
 import type { WindowEditState } from "../window-edit/mode";
+import {
+  paneHeaderTitleStart,
+  stackTabSpans,
+  terminalHeaderTitleWidth,
+  terminalHeaderTrailingWidth,
+  type PaneHeaderQuickSetting,
+} from "../pane/header";
+import { displayWidth } from "../../../utils/format";
 
 interface UseShellTerminalPointerRuntimeOptions {
   appHeaderHeight: number;
@@ -39,12 +48,17 @@ interface UseShellTerminalPointerRuntimeOptions {
   ) => void;
   /** The header's `?`: the pane's entry in DOCS. */
   openPaneDocs: (paneId: string) => void;
+  getPaneTitle: (pane: ResolvedPane) => string;
+  /** A pane's quick settings, which take room from a stack's tabs in its header. */
+  getPaneQuickSettings: (paneId: string) => ReadonlyArray<Pick<PaneHeaderQuickSetting, "icon">>;
   paneMap: Map<string, ResolvedPane>;
   selectWindowModePane: (paneId: string) => void;
   setHoveredMenuItemId: Dispatch<SetStateAction<string | null>>;
   setMenuState: Dispatch<SetStateAction<ActionMenuState | null>>;
   transientFocusActive: boolean;
   visibleFloatingPanes: VisibleFloatingPane[];
+  /** The layout's floating windows in its order: a floating stack's tabs. */
+  floatingOrder: readonly { instanceId: string }[];
   width: number;
   windowMode: WindowEditState | null;
 }
@@ -59,6 +73,31 @@ function getVisibleFloatingRect(
   return dragFloatingRect?.paneId === paneId
     ? constrainFloatingRectToBounds(dragFloatingRect.rect, width, contentHeight)
     : visibleRect;
+}
+
+/**
+ * The tab of a stack whose title is `x` cells into its header's title, laid
+ * out as the header lays it out (`stackTabSpans`) in a header `width` wide
+ * that shows `shown`.
+ */
+function stackTabAt(
+  stack: readonly string[],
+  shown: string,
+  x: number,
+  header: { width: number; framed: boolean; corner: boolean },
+  paneMap: Map<string, ResolvedPane>,
+  getPaneTitle: (pane: ResolvedPane) => string,
+  getPaneQuickSettings: (paneId: string) => ReadonlyArray<Pick<PaneHeaderQuickSetting, "icon">>,
+): string | null {
+  const titles = stack.map((id) => {
+    const pane = paneMap.get(id);
+    return pane ? getPaneTitle(pane) : id;
+  });
+  const trailing = terminalHeaderTrailingWidth(getPaneQuickSettings(shown), paneMap.get(shown)?.instance.locked === true, true);
+  const titleWidth = terminalHeaderTitleWidth(header.width, { framed: header.framed, corner: header.corner, trailing });
+  const span = stackTabSpans(titles, stack.indexOf(shown), titleWidth)
+    .find((candidate) => x >= candidate.start && x < candidate.start + displayWidth(candidate.text));
+  return span ? stack[span.index]! : null;
 }
 
 function sortedFloatingPanes(visibleFloatingPanes: VisibleFloatingPane[]): VisibleFloatingPane[] {
@@ -80,12 +119,15 @@ export function useShellTerminalPointerRuntime({
   menuState,
   openPaneMenu,
   openPaneDocs,
+  getPaneTitle,
+  getPaneQuickSettings,
   paneMap,
   selectWindowModePane,
   setHoveredMenuItemId,
   setMenuState,
   transientFocusActive,
   visibleFloatingPanes,
+  floatingOrder,
   width,
   windowMode,
 }: UseShellTerminalPointerRuntimeOptions) {
@@ -243,15 +285,25 @@ export function useShellTerminalPointerRuntime({
           return;
         }
         if (relativeY === 0) {
+          // A press on a tab of a floating stack pulls that tab out; the rest
+          // of the bar moves the stack. A floating title bar is always framed.
+          const stack = floatingStacks(visibleFloatingPanes.map((entry) => entry.pane.floating!), floatingOrder).get(paneId);
+          const tabId = stack
+            ? stackTabAt(stack, paneId, relativeX - paneHeaderTitleStart(true), {
+              width: rect.width,
+              framed: true,
+              corner: true,
+            }, paneMap, getPaneTitle, getPaneQuickSettings)
+            : null;
           startDrag({
             type: "pane-drag",
-            paneId,
-            mode: "floating",
+            paneId: tabId ?? paneId,
+            mode: tabId ? "tab" : "floating",
             startX: preciseX,
             startY: preciseShellY,
             origRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
           });
-          updateDragFloatingRect({ paneId, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } });
+          if (!tabId) updateDragFloatingRect({ paneId, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } });
           event.stopPropagation();
           event.preventDefault();
           return;
@@ -331,9 +383,19 @@ export function useShellTerminalPointerRuntime({
           return;
         }
         if (relativeY === 0) {
+          // A press on one of a stack's tabs moves that pane; the release
+          // shows it if the pointer did not move.
+          const framed = isFocused || transientFocusActive;
+          const tabId = leaf.stack
+            ? stackTabAt(leaf.stack, leaf.instanceId, relativeX - paneHeaderTitleStart(framed), {
+              width: leaf.rect.width,
+              framed,
+              corner: transientFocusActive,
+            }, paneMap, getPaneTitle, getPaneQuickSettings)
+            : null;
           startDrag({
             type: "pane-drag",
-            paneId: leaf.instanceId,
+            paneId: tabId ?? leaf.instanceId,
             mode: "docked",
             startX: preciseX,
             startY: preciseShellY,
@@ -357,7 +419,10 @@ export function useShellTerminalPointerRuntime({
     dockDividerLayouts,
     dockLeafLayouts,
     focusPane,
+    floatingOrder,
     focusedPaneId,
+    getPaneQuickSettings,
+    getPaneTitle,
     handleActiveDrag,
     handleFloatingClose,
     live,

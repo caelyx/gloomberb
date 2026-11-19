@@ -39,6 +39,7 @@ import {
 import { loadViewSource, type LoadedView } from "./loader";
 import {
   applyViewProjection,
+  EXAMPLE_VIEW_SPEC,
   formatViewValue,
   growViewColumnDecimals,
   parseViewSpecOr,
@@ -91,6 +92,9 @@ function columnsFor(spec: ViewSpec, loaded: LoadedView | null): Column[] {
   });
 }
 
+/** What an empty view says: ask for one, or open one from a spec that works as typed. */
+const EMPTY_VIEW_MESSAGE = `Ask Gloom: "make a view of the top S&P movers", or open one from a spec: VIEW ${EXAMPLE_VIEW_SPEC}`;
+
 export function CustomViewPane({ focused, width, height }: PaneProps) {
   const instance = usePaneInstance();
   const config = usePaneAppConfig();
@@ -114,7 +118,7 @@ export function CustomViewPane({ focused, width, height }: PaneProps) {
     const controller = new AbortController();
     return loadViewSource(spec, config, controller.signal);
   }, [config, spec, specError]);
-  const { data, loading, error, reload, updatedAt } = useAsyncResource(spec ? loader : null);
+  const { data, loading, error, reload, reloadAndWait, updatedAt } = useAsyncResource(spec ? loader : null);
   useAutoRefresh(updatedAt, reload);
 
   useEffect(() => {
@@ -253,7 +257,7 @@ export function CustomViewPane({ focused, width, height }: PaneProps) {
           });
           teamViewsStore.upsert(published);
           notify({ body: `Published ${published.name} r${published.revision}.`, type: "success" });
-          void reload();
+          reload();
         } catch (error) {
           if (!(error instanceof TeamRevisionConflictError)) throw error;
           const choice = await dialog.prompt<string>({
@@ -278,7 +282,7 @@ export function CustomViewPane({ focused, width, height }: PaneProps) {
             teamViewsStore.upsert(published);
             notify({ body: `Published ${published.name} r${published.revision}.`, type: "success" });
           }
-          void reload();
+          reload();
         }
         return;
       }
@@ -341,7 +345,7 @@ export function CustomViewPane({ focused, width, height }: PaneProps) {
     if (!focused) return;
     if (event.name === "r" && !event.ctrl && !event.meta) {
       event.preventDefault?.();
-      void reload();
+      reload();
     } else if (isPlainKey(event, "t") && spec) {
       event.preventDefault?.();
       void publishToTeam();
@@ -360,7 +364,7 @@ export function CustomViewPane({ focused, width, height }: PaneProps) {
   if (!spec) {
     return specError
       ? <PaneStatusBody error={specError} errorTitle="This view's spec is invalid." />
-      : <PaneStatusBody empty emptyTitle="This view is empty." emptyMessage={'Ask Gloom: "make a view of the top S&P movers"'} />;
+      : <PaneStatusBody empty emptyTitle="This view is empty." emptyMessage={EMPTY_VIEW_MESSAGE} />;
   }
 
   if (loading && !data) {
@@ -371,7 +375,7 @@ export function CustomViewPane({ focused, width, height }: PaneProps) {
       <PaneStatusBody
         error={error}
         errorTitle="This view could not load."
-        retry={{ onRetry: reload }}
+        retry={{ onRetry: reloadAndWait }}
       />
     );
   }

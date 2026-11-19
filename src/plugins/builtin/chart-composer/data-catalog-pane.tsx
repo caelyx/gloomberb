@@ -242,6 +242,7 @@ export function DataCatalogPane({ focused, width, height }: PaneProps) {
     }
   }, []);
 
+
   usePaneStatusLinkFooter({
     registrationId: DATA_CATALOG_PANE_ID,
     focused,
@@ -308,6 +309,8 @@ export function DataCatalogPane({ focused, width, height }: PaneProps) {
       getItemKey={(row) => row.id}
       onActivate={chartSelected}
       renderCell={renderCell}
+      // A series' limitation is its row's, under the table while it is selected; the footer is the catalog's.
+      rowNote={(row) => row.limitation ? `${row.label}: ${row.limitation}` : null}
       selectedTextOverridesCellColor
       emptyStateTitle={emptyCopy.title}
       emptyStateHint={emptyCopy.hint}

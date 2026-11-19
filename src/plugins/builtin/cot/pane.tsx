@@ -1,21 +1,23 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { ChartTableHeader, CompositeChart, DataTableStackView, spanDigits, DataTableView, PaneStatusBody, QueryBar, usePaneFooter, usePaneNoticeFooter, usePaneStatusFooter, usePaneTabs, useQueryBarSearch, type ChartTableChart, type DataTableColumn, type SelectControl } from "../../../components";
 import { useAsyncResource, usePluginPaneState, useShortcut } from "../../../public/react";
 import { usePaneInstance } from "../../../state/app/context";
+import { COMMODITIES_ENERGY_PANE_ID } from "../commodities-energy/view-state";
+import { useCommandValue } from "../shared/command-tab";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
 import type { ResolvedSeries } from "../../../time-series/types";
 import type { CompositeAxisDomain } from "../../../components/chart/composite/types";
-import type { CotBoardRow, CotClass, CotClassSummary, CotFamily } from "../../../api-client/cot";
+import type { CotBoardRow, CotClass, CotClassSummary, CotFamily, CotPositions } from "../../../api-client/cot";
 import { isAccessDenied } from "../../../api-client/errors";
 import { Box } from "../../../ui";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { compareSortValues, nextHeaderSort, type SortPreference } from "../../../utils/sort-values";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
-import { cachedCotBoard, loadCotBoard, loadCotDetail } from "./client";
-import { COT_CLASSES, COT_MAJOR_CODES, COT_SCOPES, cotChartSeries, cotClass, cotContractUnitText, cotInteger, cotLegendValue, cotMarketName, cotScope, type CotScope } from "./model";
+import { cachedCotBoard, loadCotBoard, loadCotDetail, loadCotPriceUnit } from "./client";
+import { COT_CLASSES, COT_FAMILIES, COT_MAJOR_CODES, COT_POSITIONS, COT_SCOPES, cotChartSeries, cotClass, cotContractUnitText, cotFamily, cotInteger, cotLegendValue, cotMarketName, cotPositions, cotPositionsText, cotScope, type CotScope } from "./model";
 
-const FAMILIES = [{ value: "legacy", label: "Legacy" }, { value: "disaggregated", label: "Disaggregated" }];
 const BOARD_COLUMNS: DataTableColumn[] = [
   { id: "name", label: "MARKET", width: 30, align: "left", flexGrow: 1 },
   { id: "code", label: "CODE", width: 7, align: "left" },
@@ -23,6 +25,7 @@ const BOARD_COLUMNS: DataTableColumn[] = [
   { id: "change", label: "1W Δ", width: 11, align: "right" },
   { id: "one", label: "PCTL 1Y", width: 8, align: "right" },
   { id: "three", label: "PCTL 3Y", width: 8, align: "right" },
+  { id: "all", label: "PCTL ALL", width: 9, align: "right" },
   { id: "asOf", label: "AS OF", width: 10, align: "left" },
 ];
 const POSITION_COLUMNS: DataTableColumn[] = [
@@ -33,19 +36,25 @@ const POSITION_COLUMNS: DataTableColumn[] = [
   { id: "change", label: "1W Δ", width: 10, align: "right" },
   { id: "one", label: "PCTL 1Y", width: 8, align: "right" },
   { id: "three", label: "PCTL 3Y", width: 8, align: "right" },
+  { id: "all", label: "PCTL ALL", width: 9, align: "right" },
 ];
 /** Net positioning is the subject: two parts of the plot to the front price's one. */
 const NET_PRICE_PANELS = [{ id: "net", height: 2 }, { id: "price", height: 1 }];
 const NET_PANEL = [{ id: "net" }];
 /** Legend, four net rows, two price rows and the axis; a shorter band keeps the net alone. */
 const PRICE_PANEL_MIN_ROWS = 8;
-const rank = (value: number | null) => value == null ? "--" : value.toFixed(0);
+const rank = (value: number | null | undefined) => value == null ? MISSING_VALUE : value.toFixed(0);
+/** A class's rank in a percentile column: 1Y, 3Y, or against every stored report (`all`). */
+const columnRank = (row: CotClassSummary, column: string) =>
+  (column === "one" ? row.percentile1Y : column === "three" ? row.percentile3Y : row.percentileAll)?.value ?? null;
 const cotDetailTitle = (name: string | undefined, code: string | null) => name ? cotMarketName(name) : code ?? undefined;
 
 export function CotPane(props: PaneProps) {
   const pane = usePaneInstance();
-  const [family, setFamily] = usePluginPaneState<CotFamily>("report", pane?.settings?.report === "disaggregated" ? "disaggregated" : "legacy");
-  const { strip: tabStrip, rows: tabRows } = usePaneTabs({ tabs: FAMILIES, activeValue: family, onSelect: (value) => setFamily(value as CotFamily), focused: props.focused, dense: true });
+  const [storedFamily, setFamily] = useCommandValue<CotFamily>(COMMODITIES_ENERGY_PANE_ID, "report",
+    (params) => params.tab === "positioning" && params.cotReport ? cotFamily(params.cotReport) : null, cotFamily(pane?.settings?.report));
+  const family = cotFamily(storedFamily);
+  const { strip: tabStrip, rows: tabRows } = usePaneTabs({ tabs: [...COT_FAMILIES], activeValue: family, onSelect: (value) => setFamily(value as CotFamily), focused: props.focused, dense: true });
   return <Box width={props.width} height={props.height} flexDirection="column">
     {tabStrip}
     <CotBoard key={family} {...props} height={Math.max(3, props.height - tabRows)} family={family} initialCode={pane?.params?.code ?? null} />
@@ -56,28 +65,35 @@ function CotBoard({ width, height, focused, family, initialCode }: PaneProps & {
   const session = useResearchCloudSession();
   const [storedClass, setClass] = usePluginPaneState<CotClass>("class", COT_CLASSES[family][0]!.value);
   const traderClass = cotClass(family, storedClass);
-  const [selected, setSelected] = usePluginPaneState<string | null>("selected", initialCode);
+  const [selected, setSelected] = useCommandValue<string | null>(COMMODITIES_ENERGY_PANE_ID, "selected",
+    (params) => params.tab === "positioning" ? params.code ?? null : null, initialCode);
   // A closed detail is stored as "": pane state reads null as unset, so Back
   // would fall through to the deep-linked code and reopen it.
-  const [storedOpen, setOpen] = usePluginPaneState<string>("open", initialCode ?? "");
+  const [storedOpen, setOpen] = useCommandValue<string>(COMMODITIES_ENERGY_PANE_ID, "open",
+    (params) => params.tab === "positioning" ? params.code ?? null : null, initialCode ?? "");
   const open = storedOpen || null;
   const [storedScope, setScope] = usePluginPaneState<CotScope>("scope", "major");
   const scope = cotScope(storedScope);
+  // Futures only, as the pane always read, unless futures and options combined is picked.
+  const [storedPositions, setPositions] = usePluginPaneState<CotPositions>("positions", "futures-only");
+  const positions = cotPositions(storedPositions);
   const [query, setQuery] = useState("");
   const { active: searching, focus: focusSearch, searchProps } = useQueryBarSearch();
   const [sort, setSort] = useState<SortPreference<string>>({ columnId: null, direction: "desc" });
   const control = useRef<SelectControl>(null);
   const scopeControl = useRef<SelectControl>(null);
-  const loader = useCallback((force: boolean) => loadCotBoard(family, traderClass, force), [family, traderClass, session.requestKey]);
-  const resource = useAsyncResource(loader, { initialData: () => cachedCotBoard(family, traderClass), clearOnError: isAccessDenied });
-  const data = resource.data?.traderClass === traderClass ? resource.data : null;
+  const positionsControl = useRef<SelectControl>(null);
+  const loader = useCallback((force: boolean) => loadCotBoard(family, traderClass, force, positions), [family, traderClass, positions, session.requestKey]);
+  const resource = useAsyncResource(loader, { initialData: () => cachedCotBoard(family, traderClass, positions), clearOnError: isAccessDenied });
+  const data = resource.data?.traderClass === traderClass && resource.data.scope === positions ? resource.data : null;
   const rows = useMemo(() => {
     // A typed query searches every market; the scope only shapes the unsearched board.
     const result = (data?.rows ?? []).filter((row) => query ? `${row.marketName} ${row.contractCode}`.toLowerCase().includes(query.toLowerCase())
       : scope === "all" || COT_MAJOR_CODES.has(row.contractCode));
     if (!sort.columnId) return result;
     const value = (row: CotBoardRow) => ({ name: cotMarketName(row.marketName), code: row.contractCode, net: row.position.net, change: row.position.weeklyChange,
-      one: row.position.percentile1Y.value, three: row.position.percentile3Y.value, asOf: row.reportDate })[sort.columnId as "name"];
+      one: row.position.percentile1Y.value, three: row.position.percentile3Y.value, all: row.position.percentileAll?.value ?? null,
+      asOf: row.reportDate })[sort.columnId as "name"];
     return [...result].sort((a, b) => compareSortValues(value(a), value(b), sort.direction));
   }, [data, query, scope, sort]);
   useAutoRefresh(resource.updatedAt, resource.load);
@@ -86,19 +102,21 @@ function CotBoard({ width, height, focused, family, initialCode }: PaneProps & {
   const boardShown = !open;
   useShortcut((event) => {
     if (!focused || open || event.targetEditable || event.ctrl || event.meta || event.alt || event.super) return;
-    if (event.name === "r") { event.preventDefault(); void resource.reload(); }
+    if (event.name === "r") { event.preventDefault(); resource.reload(); }
     if (!boardShown) return;
     if (event.name === "c") { event.preventDefault(); control.current?.open(); }
     if (event.name === "s") { event.preventDefault(); scopeControl.current?.open(); }
+    if (event.name === "p") { event.preventDefault(); positionsControl.current?.open(); }
   });
   usePaneFooter("cot:actions", () => ({ hints: boardShown ? [
     { id: "class", key: "c", label: "class", onPress: () => control.current?.open() },
     { id: "scope", key: "s", label: "cope", onPress: () => scopeControl.current?.open() },
+    { id: "positions", key: "p", label: "ositions", onPress: () => positionsControl.current?.open() },
     { id: "search", key: "/", label: "search", onPress: focusSearch },
   ] : [] }), [boardShown, focusSearch]);
   usePaneNoticeFooter({ registrationId: "cot:board-notices", focused, enabled: !open, notices: data?.gaps ?? [] });
   usePaneStatusFooter({ registrationId: "cot:board", enabled: !open, loading: resource.loading, error: resource.error,
-    info: data ? [{ id: "as-of", parts: [{ text: `CFTC futures only · ${data.asOf ?? "--"} · contracts`, tone: "muted" }] }] : [] });
+    info: data ? [{ id: "as-of", parts: [{ text: `${cotPositionsText(positions)} · as of ${data.asOf ?? MISSING_VALUE} · contracts`, tone: "muted" }] }] : [] });
   // A class change reloads under the query bar, which stays.
   return <DataTableStackView<CotBoardRow> columns={BOARD_COLUMNS} items={rows} focused={focused && !searching}
     status={data ? undefined : { loading: resource.loading, error: resource.error, empty: !resource.loading && !resource.error, subject: "COT history" }}
@@ -110,19 +128,20 @@ function CotBoard({ width, height, focused, family, initialCode }: PaneProps & {
       if (column.id === "code") return { text: row.contractCode, color: colors.textMuted };
       if (column.id === "net") return { text: cotInteger(row.position.net, true) };
       if (column.id === "change") return { text: cotInteger(row.position.weeklyChange, true) };
-      if (column.id === "one" || column.id === "three") return { text: rank(column.id === "one" ? row.position.percentile1Y.value : row.position.percentile3Y.value), color: colors.warning };
+      if (column.id === "one" || column.id === "three" || column.id === "all") return { text: rank(columnRank(row.position, column.id)), color: colors.warning };
       return { text: row.reportDate, color: colors.textMuted };
     }}
     rootBefore={<QueryBar width={width}
-      search={{ value: query, onChange: setQuery, placeholder: "market or CFTC code", focused, ...searchProps }}
+      search={{ value: query, onChange: setQuery, placeholder: "market or COT code", focused, ...searchProps }}
       filters={[
         { id: "class", label: "Class", value: traderClass, options: COT_CLASSES[family], onChange: setClass, controlRef: control },
         { id: "scope", label: "Scope", value: scope, defaultValue: "major", options: [...COT_SCOPES], onChange: setScope, controlRef: scopeControl },
+        { id: "positions", label: "Positions", value: positions, defaultValue: "futures-only", options: [...COT_POSITIONS], onChange: setPositions, controlRef: positionsControl },
       ]} />}
     emptyStateTitle={data ? query ? "No matching COT markets." : "No major markets in this report; switch the scope to all markets." : ""} detailOpen={!!open} onBack={() => setOpen("")}
     detailTitle={cotDetailTitle(data?.rows.find((row) => row.contractCode === open)?.marketName, open)}
-    detailContent={open ? <CotDetail key={`${family}:${open}`} width={width} height={Math.max(3, height - 1)} focused={focused}
-      code={open} family={family} traderClass={traderClass} onClassChange={setClass} /> : null} />;
+    detailContent={open ? <CotDetail key={`${family}:${positions}:${open}`} width={width} height={Math.max(3, height - 1)} focused={focused}
+      code={open} family={family} positions={positions} traderClass={traderClass} onClassChange={setClass} /> : null} />;
 }
 
 /**
@@ -147,15 +166,19 @@ function CotChart({ series, width, height }: { series: ResolvedSeries[]; width: 
     remoteKind="cot-history" />;
 }
 
-function CotDetail({ width, height, focused, code, family, traderClass, onClassChange }: Pick<PaneProps, "width" | "height" | "focused"> & { code: string; family: CotFamily; traderClass: CotClass; onClassChange: (value: CotClass) => void }) {
+function CotDetail({ width, height, focused, code, family, positions, traderClass, onClassChange }: Pick<PaneProps, "width" | "height" | "focused"> & { code: string; family: CotFamily; positions: CotPositions; traderClass: CotClass; onClassChange: (value: CotClass) => void }) {
   const colors = useThemeColors();
   const session = useResearchCloudSession();
-  const loader = useCallback(() => loadCotDetail(code, family), [code, family, session.requestKey]);
+  const loader = useCallback(() => loadCotDetail(code, family, undefined, positions), [code, family, positions, session.requestKey]);
   const resource = useAsyncResource(loader, { clearOnError: isAccessDenied });
+  // The front price's unit joins the legend once the contract terms answer, or
+  // the catalog's after a short wait: the chart draws without waiting for it.
+  const unitLoader = useCallback(() => loadCotPriceUnit(code), [code]);
+  const priceUnit = useAsyncResource(unitLoader).data ?? null;
   const data = resource.data;
   const payload = data?.payload;
   const current = payload?.positions.find((row) => row.id === traderClass);
-  const series = useMemo(() => data ? cotChartSeries(data.payload, traderClass, data.price, colors) : [], [data, traderClass, colors]);
+  const series = useMemo(() => data ? cotChartSeries(data.payload, traderClass, data.price, colors, priceUnit) : [], [data, traderClass, colors, priceUnit]);
   // The selected class row already carries the net and both ranks, and the
   // legend names the class it charts, so the detail opens on the chart. A rank
   // over a short history is a limitation, so it sits behind the warning.
@@ -172,21 +195,22 @@ function CotDetail({ width, height, focused, code, family, traderClass, onClassC
   useAutoRefresh(resource.updatedAt, resource.load);
   useShortcut((event) => {
     if (focused && !event.targetEditable && !event.ctrl && !event.meta && !event.alt && !event.super && event.name === "r") {
-      event.preventDefault(); void resource.reload();
+      event.preventDefault(); resource.reload();
     }
   });
   usePaneNoticeFooter({ registrationId: "cot:detail-notices", focused, notices: [...(payload?.gaps ?? []), ...(data?.priceWarning ? [data.priceWarning] : []), ...partialRanks] });
   usePaneStatusFooter({ registrationId: "cot:detail", loading: resource.loading, error: resource.error,
     // The unit the net is counted in, as `fn COT` titles it: what one contract is, where the report says.
-    info: payload ? [{ id: "as-of", parts: [{ text: `CFTC ${payload.asOf ?? "--"} · ${cotContractUnitText(payload.contract?.contractUnits) ?? "contracts"}${data?.priceAsOf ? ` · ${data.priceSymbol} ${data.priceAsOf}` : ""}`, tone: "muted" }] }] : [] });
+    // Futures and options combined says so; futures only reads as it always has.
+    info: payload ? [{ id: "as-of", parts: [{ text: `${positions === "combined" ? `${cotPositionsText(positions)} · ` : ""}as of ${payload.asOf ?? MISSING_VALUE} · ${cotContractUnitText(payload.contract?.contractUnits) ?? "contracts"}${data?.priceAsOf ? ` · ${data.priceSymbol} ${data.priceAsOf}` : ""}`, tone: "muted" }] }] : [] });
   return <PaneStatusBody loading={resource.loading && !data} error={!data ? resource.error : null} empty={!!payload && !payload.contract} subject="COT contract">
     {payload && data ? <DataTableView columns={POSITION_COLUMNS} items={payload.positions} focused={focused} rootWidth={width} rootHeight={height}
       rootBefore={<ChartTableHeader width={width} height={height} tableRows={payload.positions.length} chart={chart}
         tableColumns={POSITION_COLUMNS} />}
       selection={{ kind: "id", selectedId: traderClass, getId: (row) => row.id, onChange: (id) => onClassChange(id as CotClass) }}
       onActivate={(row) => onClassChange(row.id)} getItemKey={(row) => row.id} sortColumnId={null} sortDirection="asc"
-      renderCell={(row: CotClassSummary, column) => ({ text: column.id === "name" ? row.label : column.id === "one" ? rank(row.percentile1Y.value)
-        : column.id === "three" ? rank(row.percentile3Y.value) : cotInteger(column.id === "change" ? row.weeklyChange : row[column.id as "long" | "short" | "net"], column.id === "net" || column.id === "change") })}
+      renderCell={(row: CotClassSummary, column) => ({ text: column.id === "name" ? row.label
+        : column.id === "one" || column.id === "three" || column.id === "all" ? rank(columnRank(row, column.id)) : cotInteger(column.id === "change" ? row.weeklyChange : row[column.id as "long" | "short" | "net"], column.id === "net" || column.id === "change") })}
       emptyStateTitle="Position classes unavailable." /> : null}
   </PaneStatusBody>;
 }

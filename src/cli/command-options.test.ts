@@ -54,6 +54,18 @@ test("an undeclared option fails with the command's options, a close match and i
   );
 });
 
+test("--currency and --xlsx, which no command takes, name what does, as the command was typed", () => {
+  const quote: BuiltinCliCommandDef = { ...history, name: "quote", unknownOptionHint: undefined, help: { options: [{ flags: "--exchange <code>", description: "" }] } };
+  expect(failure(() => check(quote, ["SBLK", "--currency", "EUR"])).details).toStartWith(
+    "Prices are in each listing's own currency. To convert an amount, use fx: gloom fx 100 USD/EUR.");
+  expect(failure(() => check(quote, ["SBLK", "--ccy=gbp"])).details).toContain("gloom fx 100 USD/GBP");
+  const exports = "Exports are --csv (opens in Excel and Google Sheets), --json or --ndjson: ";
+  expect(failure(() => check(quote, ["^VIX", "BA:LSE", "--xlsx"])).details).toStartWith(`${exports}gloom quote "^VIX" BA:LSE --csv --output quote.csv.`);
+  // The file the flag named keeps its name, as a CSV.
+  expect(failure(() => check(history, ["^TNX", "--range", "1Y", "--xlsx=rates.xlsx"])).details)
+    .toStartWith(`${exports}gloom history "^TNX" --range 1Y --csv --output rates.csv.`);
+});
+
 test("financials --quarterly points at the functions that list quarters, with the symbol typed", () => {
   const financials = marketDataCliCommands.find((command) => command.name === "financials")!;
   const hint = "financials lists fiscal years. For quarters: gloom fn GF WFC --period quarterly --periods 40 (one metric at a time), "
@@ -85,8 +97,8 @@ test("every built-in command's own examples pass its option check", async () => 
   for (const { name, aliases, options, examples } of commands) {
     const command: BuiltinCliCommandDef = { name, description: "", help: { options }, execute: () => {} };
     for (const example of examples) {
-      // Quoted arguments are values, never options.
-      const [token, ...args] = example.replace(/"[^"]*"/g, "VALUE").split(/\s+/).filter((part) => part !== ">" && !part.endsWith(".csv"));
+      // Quoted arguments are values, never options; a redirect is the shell's.
+      const [token, ...args] = example.replace(/"[^"]*"/g, "VALUE").replace(/\s>\s*\S+/g, "").split(/\s+/);
       // `help` shows `quote --help`, another command's example.
       if (![name, ...aliases].includes(token!)) continue;
       expect(() => check(command, args)).not.toThrow();

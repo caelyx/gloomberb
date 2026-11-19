@@ -34,13 +34,13 @@ function chain(expiration: number): OptionsChain {
 
 const curve = [{ maturity: "1M", maturityYears: 1 / 12, yield: 4, asOf: "2026-09-21" }, { maturity: "1Y", maturityYears: 1, yield: 4, asOf: "2026-09-21" }];
 
-async function load(options: Record<string, string | number>) {
+async function load(options: Record<string, string | number>, apiClient: Partial<HeadlessPaneApiClient> = {}) {
   const args = createTestHeadlessArgs({ rawArgument: "AAPL", argument: "AAPL", symbols: ["AAPL"],
     options: { tab: "surface", ivSource: "recomputed", priceSide: "mid", axis: "spot", tenors: "listed", limit: 18, ...options } });
   const result = await volSurfaceHeadless.load(args, createTestHeadlessContext({
     marketData: createTestDataProvider({ id: "ovdv-test", getQuote: async () => createTestQuote({ price: 100, lastUpdated: now }),
       getOptionsChain: async (_symbol, _exchange, expiration) => chain(expiration ?? listed[0]!) }),
-    apiClient: { getCloudYieldCurve: async () => curve } as unknown as HeadlessPaneApiClient,
+    apiClient: { getCloudYieldCurve: async () => curve, ...apiClient } as unknown as HeadlessPaneApiClient,
   })) as HeadlessBundleResult;
   const titles = result.sections.map((section) => section.title).filter((title) => title !== "Warnings");
   const table = (title: string) => result.sections.find((section) => section.title === title) as Extract<HeadlessBundleResult["sections"][number], { rows: unknown[] }>;
@@ -94,6 +94,32 @@ describe("OVDV report", () => {
   });
 });
 
+test("the term tab reads the next FOMC off the expiries either side of it, with MDAY's move beside it", async () => {
+  // An FOMC decision tomorrow, before the first expiry (in three days): read from now, against the forward vol past it.
+  const ratePath = {
+    meetings: [{ date: "2026-09-23", impliedRate: null, targetMidpoint: null, changeBps: null, percentile: null, samples: 0, asOf: null,
+      probabilities: [], method: null, reason: null }],
+    fedFunds: [], sofr: [], ghosts: [], gaps: [], current: { effr: {}, targetLower: {}, targetUpper: {} }, dotPlot: { points: [] }, schedule: {},
+    asOf: null, fetchedAt: "2026-09-22T00:00:00Z", stale: false, status: "available",
+  };
+  const { titles, table, cell, result, text } = await load({ tab: "term" }, {
+    getCloudRatePath: async () => ratePath as never,
+    getCloudCpiBoard: async () => { throw new Error("offline"); },
+  } as Partial<HeadlessPaneApiClient>);
+  expect(titles).toEqual(["Term structure", "Scheduled releases"]);
+  const first = new Date(listed[0]! * 1000).toISOString().slice(0, 10);
+  // The first expiry past the decision names it.
+  expect(table("Term structure").rows[0]).toMatchObject({ expiry: first, event: "FOMC 09-23" });
+  expect(table("Scheduled releases").rows[0]).toMatchObject({ event: "FOMC 09-23", between: `now to ${first}` });
+  // 50% for three days against 14.6% the week after it: the decision prices a move of about 3.5%, read as approximate.
+  expect(cell("Scheduled releases", "impliedMove", 0)).toMatch(/^≈3\.\d\d%$/);
+  expect(cell("Scheduled releases", "forwardVol", 0)).toBe("50.00%");
+  // The CPI date could not be read: said in the notes, with what the move is.
+  expect(result.notes).toEqual(expect.arrayContaining([expect.stringContaining("The next CPI date could not be read"),
+    expect.stringContaining("Implied |move| is approximate (≈)")]));
+  expect(text).toContain("Scheduled releases");
+});
+
 describe("OVDV --date", () => {
   const sessionDate = "2026-09-22";
   /** The report on a stored close: the live board fitted once is what a close capture stores. */
@@ -131,4 +157,36 @@ describe("OVDV --date", () => {
     await expect(stored({ date: sessionDate }, { surface: false, dates: [sessionDate] }))
       .rejects.toThrow(`The AAPL ${sessionDate} close capture is not shown yet: without real-time data a capture shows 15 minutes after it is taken.`);
   });
+
+  test("a coin has no stored closes yet: it says so and names the live surface, asking nothing", async () => {
+    const paths: string[] = [];
+    const args = createTestHeadlessArgs({ rawArgument: "BTC-USD", argument: "BTC-USD", symbols: ["BTC-USD"],
+      options: { tab: "surface", ivSource: "recomputed", priceSide: "mid", axis: "spot", tenors: "listed", limit: 18, date: "2026-11-10" } });
+    await expect(volSurfaceHeadless.load(args, createTestHeadlessContext({
+      apiClient: { impliedVolatility: async (path: string) => { paths.push(path); throw new Error("not asked"); } } as unknown as HeadlessPaneApiClient,
+      marketData: createTestDataProvider({ id: "ovdv-test" }),
+    }))).rejects.toThrow("Stored surfaces are not kept for coins yet, so BTC-USD has none for 2026-11-10. The live surface: gloom fn OVDV BTC-USD");
+    expect(paths).toEqual([]);
+  });
+});
+
+test("outside the options session a chain with nothing fitted says when the surface fills, with IV30 at the last close", async () => {
+  // Sat 26 Sep 2026: the delayed chain carries Friday's quotes, zeroed.
+  setSystemTime(Date.UTC(2026, 8, 26, 12));
+  const zeroed = (expiration: number): OptionsChain => {
+    const quoted = chain(expiration);
+    const zero = (contract: OptionContract) => ({ ...contract, bid: 0, ask: 0 });
+    return { ...quoted, calls: quoted.calls.map(zero), puts: quoted.puts.map(zero) };
+  };
+  const args = createTestHeadlessArgs({ rawArgument: "AAPL", argument: "AAPL", symbols: ["AAPL"],
+    options: { tab: "surface", ivSource: "recomputed", priceSide: "mid", axis: "spot", tenors: "listed", limit: 18 } });
+  const result = await volSurfaceHeadless.load(args, createTestHeadlessContext({
+    marketData: createTestDataProvider({ id: "ovdv-closed", getQuote: async () => createTestQuote({ price: 100, lastUpdated: now }),
+      getOptionsChain: async (_symbol, _exchange, expiration) => zeroed(expiration ?? listed[0]!) }),
+    apiClient: { getCloudYieldCurve: async () => curve, impliedVolatility: async (path: string) => path.startsWith("surface-dates")
+      ? { version: 1, symbol: "AAPL", dates: ["2026-09-25", "2026-09-24"] }
+      : { stats: { iv30: { value: 0.2815, date: "2026-09-25", method: "trade-close" }, iv90: null } } } as unknown as HeadlessPaneApiClient,
+  })) as HeadlessBundleResult;
+  expect(result.notes?.[0]).toBe("Options closed until Mon 13:30 UTC, 09:30 ET. The surface fills at the open. IV30 at the 2026-09-25 close: 28.15%."
+    + " The 2026-09-25 close surface: gloom fn OVDV AAPL --date 2026-09-25.");
 });

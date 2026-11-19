@@ -1,10 +1,21 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { describe, expect, test } from "bun:test";
 import type { EarningsCalendarReport, EarningsHistoryPayload } from "../../../api-client/earnings";
 import { colors } from "../../../theme/colors";
+import { notMeaningfulColor } from "../../../components/ui/not-meaningful";
 import type { Quote } from "../../../types/financials";
-import { boardReport, reportMove, type BoardRow } from "./board-model";
-import { boardColumns, boardHasActuals, renderBoardCell, type BoardCellContext, type BoardColumn } from "./board-table";
-import { historyRows } from "./history-model";
+import { boardReport, boardRowOf, newYorkToday, reportMove, type BoardRow } from "./board-model";
+import { boardColumns, boardHasActuals, boardHasCurrencies, boardSymbolWidth, renderBoardCell, type BoardCellContext, type BoardColumn } from "./board-table";
+import { historyFigures, historyRows } from "./history-model";
+
+test("the next-report figure retains a rounded consensus independently of dropped narrow table columns", () => {
+  const rows = historyRows({ asOf: `${TODAY}T15:00:00Z`, symbol: "CRWV", name: null, reports: [
+    { ...calendarReport({ symbol: "CRWV", date: "2026-11-18", fiscalPeriod: "2026-10", epsEstimate: 1.6374, dateStatus: "confirmed" }), revenueActual: null },
+  ] }, "2026-11-15", null);
+  const next = historyFigures(rows, "2026-11-15").find((figure) => figure.id === "next")!;
+  expect(next.detail).toStartWith("EPS est 1.64");
+  expect(next.detailVariants).toEqual(["EPS est 1.64"]);
+});
 import { historyColumns, renderHistoryCell } from "./history-table";
 
 const TODAY = "2026-10-16";
@@ -37,14 +48,34 @@ describe("EVTS rows", () => {
     expect(cell(TRV, "basis")).toEqual({ text: "adj", color: colors.textMuted });
   });
 
-  test("EPS ACT, EPS SURP and BASIS show -- with nothing to show, as ERN does", () => {
-    for (const id of ["epsActual", "epsSurprise", "basis"] as const) expect(cell(LADR, id)).toEqual({ text: "--", color: colors.textDim });
+  test("pending EPS ACT, EPS SURP and BASIS wait for the report without hiding a reported basis", () => {
+    for (const id of ["epsActual", "epsSurprise", "basis"] as const) expect(cell(LADR, id)).toEqual({ text: MISSING_VALUE, color: colors.textDim });
+    expect(column("basis").mayBeBlank).toBe(true);
+    expect(cell(TRV, "basis").text).toBe("adj");
+  });
+
+  test("a report out with no actual yet says pending, and keeps EPS ACT on a narrow board", () => {
+    // Disney this morning: out before the open, the calendar's figure due tomorrow, its release unproven.
+    const today = newYorkToday();
+    const DIS = boardReport(calendarReport({ symbol: "DIS", date: today, reportedAt: `${today}T10:45:00.000Z`, epsEstimate: 1.06, epsAnalysts: 17, dateStatus: "reported" }), new Map());
+    expect(cell(DIS, "epsActual")).toEqual({ text: "pending", color: colors.textDim });
+    // Still to come, it waits with a dash.
+    expect(cell(LADR, "epsActual").text).toBe(MISSING_VALUE);
+    expect(boardHasActuals([row(LADR), row(DIS)])).toBe(true);
+    expect(boardColumns(88, { actuals: true }).map((entry) => entry.id)).toContain("epsActual");
+    // A listing abroad's figures come from its own documents, with Gloom Pro: one out without them is waiting on nothing.
+    const FN = boardReport(calendarReport({ symbol: "F99:SGX", currency: "SGD", dateStatus: "reported" }), new Map());
+    expect(cell(FN, "epsActual").text).toBe(MISSING_VALUE);
+    expect(boardHasActuals([row(LADR), row(FN)])).toBe(false);
+    // Past the week the calendar reads a date for, none is coming: the dash again.
+    const OLD = boardReport(calendarReport({ symbol: "OXY", date: "2026-10-01", dateStatus: "reported" }), new Map());
+    expect(cell(OLD, "epsActual").text).toBe(MISSING_VALUE);
   });
 
   test("MOVE is the move on a report out today, beside the implied move", () => {
     expect(cell(TRV, "move", { move: () => 0.0123 })).toEqual({ text: "+1.2%", color: colors.positive });
     expect(cell(TRV, "move", { move: () => "loading" })).toEqual({ text: "…", color: colors.textDim });
-    expect(cell(LADR, "move")).toEqual({ text: "--", color: colors.textDim });
+    expect(cell(LADR, "move")).toEqual({ text: MISSING_VALUE, color: colors.textDim });
     const ids = boardColumns(2000).map((entry) => entry.id);
     expect(ids.slice(ids.indexOf("implied"), ids.indexOf("implied") + 3)).toEqual(["implied", "move", "average"]);
   });
@@ -55,11 +86,11 @@ describe("EVTS rows", () => {
     // The move on the report stays beside the implied move and its average.
     expect(narrow).toEqual(expect.arrayContaining(["implied", "move", "average"]));
     expect(cell(TRV, "when", { statusShown: false })).toEqual({ text: "BMO ✓", color: colors.textDim });
-    expect(cell(HDB, "when", { statusShown: false })).toEqual({ text: "--", color: colors.textMuted });
+    expect(cell(HDB, "when", { statusShown: false })).toEqual({ text: MISSING_VALUE, color: colors.textMuted });
     expect(cell(LADR, "when", { statusShown: false })).toEqual({ text: "BMO", color: colors.textDim });
     // With STATUS on screen WHEN is the time alone.
     expect(cell(TRV, "when")).toEqual({ text: "BMO", color: colors.textDim });
-    expect(cell(HDB, "when")).toEqual({ text: "--", color: colors.textDim });
+    expect(cell(HDB, "when")).toEqual({ text: MISSING_VALUE, color: colors.textDim });
   });
 });
 
@@ -87,6 +118,64 @@ describe("EVTS when narrow", () => {
     }
     // Wide enough, every column shows either way.
     expect(ids(2000, true)).toEqual(ids(2000));
+  });
+});
+
+describe("EVTS with listings abroad", () => {
+  // Tencent's confirmed Q3 as the board serves it: its figures in CNY, its value in dollars, no time of day.
+  const TENCENT = boardReport(calendarReport({
+    symbol: "0700:HKEX", name: "Tencent Holdings Limited", date: "2026-11-18", timing: null, timingSource: null, marketCap: 459.65e9,
+    epsEstimate: 7.21, epsAnalysts: 12, revenueEstimate: 210.24e9, dateStatus: "confirmed", currency: "CNY", listings: ["0700:HKEX"],
+  }), new Map());
+  // Alibaba the day it reports as BABA and as 9988:HKEX: the board's BABA row carries the listing's lines.
+  const BABA = boardReport(calendarReport({ symbol: "BABA", epsEstimate: 2.12, listings: ["9988:HKEX"] }), new Map());
+  const CCB = boardReport(calendarReport({ symbol: "601939:SSE", currency: "CNY", listings: ["601939:SSE", "0939:HKEX"] }), new Map());
+  const ids = (width: number, currencies: boolean, actuals = false) =>
+    boardColumns(width, { currencies, actuals }).map((entry) => entry.id);
+
+  test("a board with a report in another currency shows CCY before the figures it is the currency of, and says its cap is in dollars", () => {
+    expect(boardHasCurrencies([row(LADR), row(BABA)])).toBe(false);
+    expect(boardHasCurrencies([row(LADR), row(TENCENT)])).toBe(true);
+    const wide = boardColumns(2000, { currencies: true });
+    const at = wide.map((entry) => entry.id);
+    expect(at.slice(at.indexOf("ccy"), at.indexOf("ccy") + 2)).toEqual(["ccy", "epsEstimate"]);
+    expect(wide.find((entry) => entry.id === "cap")).toMatchObject({ label: "MKT CAP $", width: 9 });
+    // A board of US reports looks as it always has.
+    expect(ids(2000, false)).not.toContain("ccy");
+    expect(boardColumns(2000).find((entry) => entry.id === "cap")).toMatchObject({ label: "MKT CAP", width: 8 });
+    const ccy = wide.find((entry) => entry.id === "ccy")!;
+    const context: BoardCellContext = { statusShown: true, move: () => null };
+    expect(renderBoardCell(row(TENCENT), ccy, context)).toEqual({ text: "CNY", color: colors.textDim });
+    expect(renderBoardCell(row(LADR), ccy, context)).toEqual({ text: "USD", color: colors.textDim });
+    expect(cell(TENCENT, "cap")).toEqual({ text: "459.65B", color: colors.textDim });
+    expect(cell(TENCENT, "when")).toEqual({ text: MISSING_VALUE, color: colors.textDim });
+  });
+
+  test("TICKER fits the longest listing abroad's key on the board, a US board's stays as it was", () => {
+    expect(boardSymbolWidth([row(LADR), row(TENCENT)])).toBe(9);
+    expect(boardSymbolWidth([row(LADR), row(CCB)])).toBe(10);
+    expect(boardSymbolWidth([row(LADR), row(BABA)])).toBe(6);
+    expect(boardColumns(2000, { symbolWidth: 10 }).find((entry) => entry.id === "symbol")?.width).toBe(10);
+  });
+
+  test("narrow, CCY stays while any EPS or sales figure does, and goes with the last", () => {
+    for (const actuals of [false, true]) {
+      for (let width = 40; width <= 200; width += 1) {
+        const shown = new Set(ids(width, true, actuals));
+        const figures = (["epsEstimate", "epsActual", "revenueEstimate"] as const).some((id) => shown.has(id));
+        expect([width, actuals, shown.has("ccy")]).toEqual([width, actuals, figures]);
+      }
+    }
+  });
+
+  test("a listing is found as typed, by another of its company's lines, or as the US line shown for it; a US ticker only as itself", () => {
+    expect(boardRowOf(TENCENT, "0700.HK")).toBe(true);
+    expect(boardRowOf(TENCENT, "700:HKEX")).toBe(true);
+    expect(boardRowOf(CCB, "0939.HK")).toBe(true);
+    expect(boardRowOf(BABA, "9988.HK")).toBe(true);
+    expect(boardRowOf(BABA, "BABA")).toBe(true);
+    expect(boardRowOf(TENCENT, "TCEHY")).toBe(false);
+    expect(boardRowOf(LADR, "0700.HK")).toBe(false);
   });
 });
 
@@ -136,6 +225,16 @@ describe("ERN rows", () => {
   const columns = historyColumns(2000, rows);
   const draw = (index: number, id: string) => renderHistoryCell(rows[index]!, columns.find((entry) => entry.id === id)!);
 
+  test("BASIS waits for reported EPS, and a reported basis survives beside pending rows", () => {
+    const pending = historyRows({ asOf: `${TODAY}T15:00:00Z`, symbol: "TFC", name: null,
+      reports: [report({ date: "2027-01-15", dateStatus: "projected" })] }, TODAY, null);
+    expect(historyColumns(2000, pending).some((column) => column.id === "basis")).toBe(false);
+    const mixed = [...pending, ...rows];
+    const basis = historyColumns(2000, mixed).find((column) => column.id === "basis")!;
+    expect(basis.mayBeBlank).toBe(true);
+    expect(mixed.map((row) => renderHistoryCell(row, basis).text)).toEqual([MISSING_VALUE, "adj", "adj"]);
+  });
+
   test("mark the press release's EPS and sales quieter, as EVTS does", () => {
     expect(draw(0, "epsActual")).toEqual({ text: "1.16", color: colors.textMuted });
     expect(draw(0, "revenueActual")).toEqual({ text: "5.31B", color: colors.textMuted });
@@ -149,9 +248,87 @@ describe("ERN rows", () => {
     expect(renderHistoryCell(rows[0]!, move, () => 0.017)).toEqual({ text: "+1.7%", color: colors.positive });
     expect(renderHistoryCell(rows[0]!, move, () => "loading")).toEqual({ text: "…", color: colors.textDim });
     // The ratio waits for the settled move.
-    expect(renderHistoryCell(rows[0]!, ratio, () => 0.017)).toEqual({ text: "--", color: colors.textDim });
+    expect(renderHistoryCell(rows[0]!, ratio, () => 0.017)).toEqual({ text: MISSING_VALUE, color: colors.textDim });
     // A settled move is the row's own, whatever the quote says.
     const settled = { ...rows[0]!, move: -0.021 };
     expect(renderHistoryCell(settled, move, () => 0.017)).toEqual({ text: "-2.1%", color: colors.negative });
+  });
+});
+
+describe("surprises against a loss or zero estimate", () => {
+  type Report = EarningsHistoryPayload["reports"][number];
+  const report = (fields: Partial<Report> & Pick<Report, "date">): Report => ({
+    symbol: "CRWV", name: "CoreWeave", timing: "amc", timingSource: "filing", reportedAt: null, fiscalPeriod: "2026-06",
+    marketCap: null, epsEstimate: null, epsActual: null, epsAnalysts: null, revenueEstimate: null, revenueAnalysts: null,
+    implied: null, realized: null, revenueActual: null, dateStatus: "reported", ...fields,
+  });
+
+  test("read N/M in EVTS and ERN, in N/M's colour as every pane draws it, and still count a narrower loss as a beat", () => {
+    const loss = boardReport(calendarReport({ symbol: "CRWV", epsEstimate: -1.47, epsActual: -1.14, epsActualSource: "calendar", dateStatus: "reported" }), new Map());
+    expect(loss.epsSurprise).toBe("not-meaningful");
+    expect(cell(loss, "epsSurprise")).toEqual({ text: "N/M", color: notMeaningfulColor() });
+    expect(cell(PEP, "epsSurprise").text).toBe("+1.3%");
+    const rows = historyRows({ asOf: `${TODAY}T15:00:00Z`, symbol: "CRWV", name: null, reports: [
+      report({ date: "2026-08-11", epsEstimate: -1.47, epsActual: -1.14, revenueEstimate: 0, revenueActual: 2.1e9 }),
+      report({ date: "2026-05-07", fiscalPeriod: "2026-03", epsEstimate: -1.17, epsActual: -1.38, revenueEstimate: 1.9e9, revenueActual: 2e9 }),
+      report({ date: "2026-02-26", fiscalPeriod: "2025-12", epsEstimate: 0.2, epsActual: 0.25 }),
+      report({ date: "2025-11-10", fiscalPeriod: "2025-09", epsEstimate: 0.3, epsActual: 0.25 }),
+    ] }, TODAY, null);
+    const columns = historyColumns(2000, rows);
+    const draw = (index: number, id: string) => renderHistoryCell(rows[index]!, columns.find((entry) => entry.id === id)!);
+    expect(draw(0, "epsSurprise")).toEqual({ text: "N/M", color: notMeaningfulColor() });
+    // Sales against a zero estimate: N/M too.
+    expect(draw(0, "revenueSurprise")).toEqual({ text: "N/M", color: notMeaningfulColor() });
+    expect(draw(1, "revenueSurprise").text).toBe("+5.3%");
+    expect(draw(2, "epsSurprise")).toEqual({ text: "+25.0%", color: colors.positive });
+    // Two of four beat: the narrower loss and the profit above its estimate.
+    expect(historyFigures(rows, TODAY).find((figure) => figure.id === "beats")?.value).toBe("2 of 4");
+  });
+});
+
+describe("ERN for a Hong Kong listing", () => {
+  type Report = EarningsHistoryPayload["reports"][number];
+  const quarter = (fields: Partial<Report> & Pick<Report, "date">): Report => ({
+    symbol: "0700:HKEX", name: "Tencent", timing: null, timingSource: null, reportedAt: null, fiscalPeriod: "2026-06",
+    marketCap: null, epsEstimate: 7.23544, epsActual: 7.433, epsAnalysts: null, revenueEstimate: null, revenueAnalysts: null,
+    implied: null, realized: null, revenueActual: null, currency: "CNY", dateStatus: "reported", fiscalYear: 2026, fiscalQuarter: 2, ...fields,
+  });
+  const payload = (reports: Report[]): EarningsHistoryPayload => ({
+    asOf: `${TODAY}T15:00:00Z`, symbol: "0700:HKEX", name: "Tencent",
+    fiscalAnchor: { fiscalPeriod: "2025-12", fiscalYear: 2025, fiscalQuarter: 4 }, reports,
+  });
+
+  test("names its period column PERIOD whether its rows are quarters only or hold a half, and a US listing's stays QTR", () => {
+    const label = (reports: Report[], abroad: boolean) =>
+      historyColumns(2000, historyRows(payload(reports), TODAY, null, { abroad }), { abroad }).find((column) => column.id === "period")?.label;
+    const quarters = [quarter({ date: "2026-08-12" })];
+    const withHalf = [...quarters, quarter({ date: "2026-08-13", periodKind: "half", periodMonths: 6, fiscalQuarter: null, fiscalHalf: 1,
+      epsEstimate: null, epsActual: 12.1, epsActualSource: "filing" })];
+    expect([label(quarters, true), label(withHalf, true)]).toEqual(["PERIOD", "PERIOD"]);
+    expect(label([quarter({ date: "2026-08-12", currency: undefined })], false)).toBe("QTR");
+  });
+
+  test("leaves out a column blank in every row: WHEN where the exchange gave no time, ESTS where no count is served", () => {
+    const ids = (reports: Report[]) =>
+      historyColumns(2000, historyRows(payload(reports), TODAY, null, { abroad: true }), { abroad: true }).map((column) => column.id);
+    const untimed = [quarter({ date: "2026-08-12" }), quarter({ date: "2026-05-13", fiscalPeriod: "2026-03", fiscalQuarter: 1 })];
+    expect(ids(untimed)).not.toContain("when");
+    expect(ids(untimed)).not.toContain("analysts");
+    expect(ids(untimed)).toContain("epsEstimate");
+    // One row with a time, or a count of estimates, keeps the column.
+    const timed = [quarter({ date: "2026-08-12", timing: "amc", timingSource: "filing", epsAnalysts: 12 }), untimed[1]!];
+    expect(ids(timed)).toContain("when");
+    expect(ids(timed)).toContain("analysts");
+  });
+
+  test("names the calendar's next quarter by its fiscal year from the company's year end, as its past quarters are", () => {
+    const rows = historyRows(payload([quarter({ date: "2026-08-12" })]), TODAY, {
+      symbol: "0700:HKEX", name: "Tencent", earningsDate: new Date("2026-11-18T08:10:00Z"), isDateEstimate: false, timing: "",
+      epsEstimate: 7.22, epsActual: null, revenueEstimate: null, revenueActual: null, surprise: null,
+      estimateBasis: { epsEstimate: { source: "earningsTrend", sourceValue: 7.22, period: "0q", periodEndDate: "2026-09-30", currency: "CNY" } },
+    }, { abroad: true });
+    const columns = historyColumns(2000, rows, { abroad: true });
+    const period = columns.find((column) => column.id === "period")!;
+    expect(rows.map((row) => renderHistoryCell(row, period).text)).toEqual(["Q3 FY26", "Q2 FY26"]);
   });
 });

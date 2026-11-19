@@ -1,4 +1,5 @@
 import { logFailure } from "../utils/log-failure";
+import { servedFromSavedCopy } from "../data/saved-copies";
 import { hasValidQuoteObservationTime } from "../market-data/quotes/freshness";
 import { delistingLabel } from "../market-data/quotes/delisting";
 import { financialPeriodCoverage, financialPeriodCoverageWarnings, limitSeriesObservations } from "./financial-period-coverage";
@@ -7,8 +8,10 @@ import { historyRetentionNotice, historyStartNotice } from "../sources/history-r
 import type { BrokerContractRef } from "../types/instrument";
 import { FINANCIAL_VINTAGE_NOTICE, SEC_EPS_BASIS_NOTICE } from "../utils/financial-statements";
 import { subtractTimeRange } from "./date-window";
+import { hiddenOnLogScale, logScaleHiddenWarning } from "./log-scale";
 import {
   CHART_RESOLUTION_STEP_MS,
+  chartBarSizeName,
   chartBarSizeSource,
   clampTimeRangeToMaxRange,
   DEFAULT_CHART_RESOLUTION_SUPPORT,
@@ -23,8 +26,10 @@ import {
 import { aggregatePriceBars, futuresOpenMinuteOf, withBuiltBarSize } from "./bar-aggregation";
 import { TIME_RANGES, type TimeRange } from "./range";
 import type { DataProvider } from "../types/data-provider";
-import type { EarningsAction, Quote, TickerFinancials } from "../types/financials";
+import type { CorporateActionsData, EarningsAction, Quote, TickerFinancials } from "../types/financials";
 import { mergeQuoteMetadata, quoteMetadataFromQuote, quoteMetadataMatchesTarget } from "../market-data/quotes/metadata";
+import { getSharedMarketDataCoordinator } from "../market-data/coordinator";
+import { resolveEntryData } from "../market-data/selectors";
 import type { FredSeriesRequest } from "../sources/gloomberb-cloud/fred-series";
 import { fredCreditCoverageNotice } from "./economic";
 import {
@@ -42,17 +47,26 @@ import { FORWARD_PE_BASIS_NOTICE, REALIZED_NTM_PE_BASIS_NOTICE } from "./forward
 import { valuationPriceWarning } from "./valuation-price";
 import { VALUATION_CURRENCY_WARNING_PREFIX } from "./valuation-currency";
 import { chartPriceHistoryIntegrityNotices } from "./market";
-import { maxStudyWarmupPoints, resolveStudies } from "./studies";
+import { maxStudyWarmupPoints, resolveStudies } from "./studies/resolve";
+import { isFormulaNextMonth, withFormulaNextMonths, withoutFormulaNextMonths } from "./formula-months";
+import { formulaContractNote } from "./studies/formula";
 import { clipSeriesToWindow } from "./alignment";
+import { totalReturnSeries } from "./total-return";
+import { currencySeries } from "./currency-conversion";
 import {
   bufferPriceComparison,
   clipPriceComparison,
+  comparisonSplitNotice,
+  observationDate,
   priceComparisonBoundsForSeries,
   priceComparisonSeriesIds,
   resolvePriceComparison,
+  priceLevelsNotice,
+  type PriceComparison,
 } from "./price-comparison";
 import { chartQuoteOverrideKeyForSource } from "./live-quotes";
-import { chartSeriesSourceKey } from "../capabilities/chart-series";
+import { coinLegsAtSessionClose } from "./coin-session-close";
+import { chartSeriesSourceKey, uncoveredCapabilityMessage } from "../capabilities/chart-series";
 import { rememberSeedListingFacts } from "./parsed-history-cache";
 import {
   canonicalExchange,
@@ -99,6 +113,7 @@ import {
   followLatestMarketObservation,
   capabilityRequestBounds,
   endAtNewestObservation,
+  startAtOldestObservation,
   latestSessionView,
 } from "./chart-bounds";
 import {
@@ -120,6 +135,7 @@ import {
   latestQuote,
   mergeHistory,
   baseSecuritySeries,
+  withPriorClose,
   baseEconomicSeries,
   baseCapabilitySeries,
   staleFredWarning,
@@ -227,6 +243,16 @@ export async function resolveChartSpecData(
   cache = new ChartResolveCache(),
   options: ChartResolveOptions = {},
 ): Promise<ChartResolutionResult> {
+  // A formula priced in one delivery month reads its legs' next months too, as hidden inputs of its own.
+  return withoutFormulaNextMonths(await resolveChartSpecWindow(withFormulaNextMonths(spec), sources, cache, options));
+}
+
+async function resolveChartSpecWindow(
+  spec: ChartSpec,
+  sources: ChartResolveSources,
+  cache: ChartResolveCache,
+  options: ChartResolveOptions,
+): Promise<ChartResolutionResult> {
   if (!canFitShortHistory(spec, options)) return resolveChartSpecPass(spec, sources, cache, options);
   // Captured inputs belong to the chart that is returned.
   type Capture = Parameters<NonNullable<ChartResolveSources["onSecurityData"]>>;
@@ -266,6 +292,39 @@ export async function resolveChartSpecData(
   return result;
 }
 
+/**
+ * The splits a comparison's listings took inside their windows, read from
+ * each listing's corporate actions (once per chart, as total returns read
+ * them), and any jump of a leg's closes no split-adjusted series makes
+ * (comparisonSplitNotice). A listing whose actions cannot be read names no
+ * split; its jumps are still named.
+ */
+async function comparedSplitNotice(
+  spec: ChartSpec,
+  comparison: PriceComparison,
+  series: readonly ResolvedSeries[],
+  loadActions: (source: Extract<ChartSeriesSpec["source"], { kind: "security" }>) => Promise<CorporateActionsData | null>,
+  now: number,
+): Promise<string | null> {
+  const legs = await Promise.all(Object.keys(comparison.legs ?? {}).map(async (id) => {
+    const source = spec.series.find((entry) => entry.id === id)?.source;
+    if (source?.kind !== "security") return null;
+    const actions = await loadActions(source).catch((error: unknown) => {
+      logFailure("time-series-resolve", "Loading splits for a comparison failed")(error);
+      return null;
+    });
+    return { id, label: source.instrument.symbol, splits: actions?.splits ?? [], points: series.find((entry) => entry.id === id)?.points };
+  }));
+  return comparisonSplitNotice(comparison, legs.filter((leg) => leg !== null), now);
+}
+
+/** The price fields whose returns a distribution adds to. */
+function totalReturnFieldId(fieldId: string): boolean {
+  const canonical = getTimeSeriesField(fieldId)?.id ?? fieldId;
+  return canonical === "market.ohlcv" || canonical === "market.close" || canonical === "market.open"
+    || canonical === "market.high" || canonical === "market.low";
+}
+
 async function resolveChartSpecPass(
   spec: ChartSpec,
   sources: ChartResolveSources,
@@ -277,7 +336,13 @@ async function resolveChartSpecPass(
     && entry.source.kind === "security" && isFundamentalFieldId(entry.source.fieldId))
     ? [FINANCIAL_VINTAGE_NOTICE] : [];
   const priorityWarnings: string[] = [];
+  const coverageNotices: string[] = [];
   const delistings = new Map<string, { symbol: string; label: string; notice: string }>();
+  // A formula's hidden next month (RB2 beside RB=F) adds no message of its own: the formula's note says where its legs' months differ.
+  const quietSeriesIds = new Set(spec.series.flatMap((entry) => isFormulaNextMonth(entry.id) ? [entry.id] : []));
+  const shownInstruments = new Set(spec.series.flatMap((entry) => (
+    !quietSeriesIds.has(entry.id) && entry.source.kind === "security" ? [instrumentKey(entry.source)] : [])));
+  const messages = { warnings, errors, priorityWarnings, coverageNotices };
   const baseSeriesIds = new Set(spec.series.map((entry) => entry.id));
   const visibleSeriesIds = new Set(spec.series
     .filter((entry) => entry.visible !== false)
@@ -357,9 +422,39 @@ async function resolveChartSpecPass(
     }
     return pending;
   };
+  // Total returns reinvest the cash a listing paid; each listing's history is read once per chart.
+  const loadDistributions = (source: Extract<ChartSeriesSpec["source"], { kind: "security" }>) => {
+    const key = instrumentKey(source);
+    let pending = cache.distributionsByInstrument.get(key);
+    if (!pending) {
+      pending = (async (): Promise<CorporateActionsData | null> => {
+        const read = sources.dataProvider?.getCorporateActions;
+        if (!read) return null;
+        try {
+          return await read.call(sources.dataProvider, source.instrument.symbol, source.instrument.exchange, requestContext(source));
+        } catch (error) {
+          cache.distributionsByInstrument.delete(key);
+          throw error;
+        }
+      })();
+      cache.distributionsByInstrument.set(key, pending);
+      cache.revision += 1;
+    }
+    return pending;
+  };
   const loadQuoteMetadata = (source: Extract<ChartSeriesSpec["source"], { kind: "security" }>) => {
     const key = instrumentKey(source);
     let pending = cache.quoteMetadataByInstrument.get(key);
+    // The pane showing this listing has usually just read its quote: its
+    // currency and type answer without asking the server for the quote again.
+    const held = resolveEntryData(getSharedMarketDataCoordinator()?.getQuoteEntry(source.instrument));
+    const heldMetadata = held ? quoteMetadataFromQuote(held) : null;
+    if (!pending && heldMetadata?.currency && heldMetadata.instrumentType
+      && quoteMetadataMatchesTarget(heldMetadata, source.instrument.symbol, source.instrument.exchange)) {
+      pending = Promise.resolve(heldMetadata);
+      cache.quoteMetadataByInstrument.set(key, pending);
+      cache.revision += 1;
+    }
     if (!pending) {
       const provider = sources.dataProvider!;
       pending = Promise.resolve().then(() => provider.getQuoteMetadata
@@ -522,11 +617,18 @@ async function resolveChartSpecPass(
     source: Extract<ChartSeriesSpec["source"], { kind: "security" }>,
     all = false,
   ) => {
+    const notices = quietSeriesIds.size && !shownInstruments.has(instrumentKey(source)) ? [] as string[] : priorityWarnings;
     const support = await loadResolutionSupport(source, priceOnly);
     const dailyValuation = source.period === "daily" && source.fieldId.startsWith("valuation.");
     const sourceResolution = dailyValuation ? "1d" : initialResolution;
     const maxRange = getSupportMaxRange(support, sourceResolution);
     const ahead = movedWindow ? barsAhead(requestVisibleBounds, maxRange, referenceNow.getTime()) : 0;
+    // Bars ahead that reach the present end wherever the clock is on this pass.
+    // Such a window is named by its start and the present, so every pass shares
+    // one acquisition and the stale-copy refresh below keeps it current. Named
+    // by the clock, each live pass fetched and kept another copy of the history.
+    const toPresent = ahead > 0 && requestVisibleBounds.end !== null
+      && requestVisibleBounds.end + ahead >= referenceNow.getTime();
     const durationEnd = rangeDurationBounds(spec, initialCalculationBounds).end;
     const historyBounds = clampHistoryBoundsToSupport(
       ahead > 0 && initialCalculationBounds.end !== null
@@ -560,7 +662,9 @@ async function resolveChartSpecPass(
       request.allowProviderDefaultFallback ? "auto" : "manual",
       isMarketFieldId(source.fieldId) ? source.period ?? "auto" : "auto",
       ...(request.explicitWindow
-        ? [request.bounds.start ?? "open", request.bounds.end ?? "open"]
+        ? toPresent
+          ? [initialCalculationBounds.start ?? "open", "present"]
+          : [request.bounds.start ?? "open", request.bounds.end ?? "open"]
         : []),
       // A moved view can chart retained bars that the same authored dates cannot.
       ...(request.explicitWindow && !request.authoredWindow && !request.allowProviderDefaultFallback ? ["moved"] : []),
@@ -645,24 +749,24 @@ async function resolveChartSpecPass(
         const previousDeadline = cache.priceHistoryRefreshAfter.get(key) ?? 0;
         cache.priceHistoryRefreshAfter.set(key, previousDeadline > Date.now() ? previousDeadline : Date.now() + 30_000);
         const notice = behindHistoryNotice(source, loaded.points, now());
-        if (notice) priorityWarnings.push(notice);
+        if (notice) notices.push(notice);
       }
     }
     if (!behind) cache.priceHistoryRefreshAfter.delete(key);
     const history = loaded.points;
     const coverageNotice = historyCoverageNotice(loaded.coverageStart, request.visibleBounds.start);
-    if (coverageNotice) priorityWarnings.push(coverageNotice);
+    if (coverageNotice) notices.push(coverageNotice);
     // A listing that no longer trades is named so beside its bars, which end on its last session.
     if (loaded.delisting) {
       const symbol = parsePublicTickerKey(source.instrument.symbol).symbol;
       const label = delistingLabel(loaded.delisting);
       const notice = `${symbol}: ${label}`;
-      priorityWarnings.push(notice);
+      notices.push(notice);
       if (!delistings.has(notice)) delistings.set(notice, { symbol, label, notice });
     }
     // Read per request: one recovered window answers every visible window that shares its acquisition.
     if (loaded.recovery && request.visibleBounds.start !== null && request.visibleBounds.start < loaded.recovery.start) {
-      priorityWarnings.push(historyRetentionNotice(loaded.recovery.retention, builtBarSize ?? loaded.resolution ?? request.resolution,
+      notices.push(historyRetentionNotice(loaded.recovery.retention, builtBarSize ?? loaded.resolution ?? request.resolution,
         listingTimeZone(source.instrument.symbol, source.instrument.exchange)));
       retainedHistoryOnly = true;
     }
@@ -705,7 +809,7 @@ async function resolveChartSpecPass(
     // A source that answered a panned view short, and then had nothing older, starts there.
     if (combined.historyStart !== undefined && !loaded.recovery && !combined.coverageStart && request.visibleBounds.start !== null
       && request.visibleBounds.start < combined.historyStart && combined.resolution) {
-      priorityWarnings.push(historyStartNotice(combined.historyStart, builtBarSize ?? combined.resolution,
+      notices.push(historyStartNotice(combined.historyStart, builtBarSize ?? combined.resolution,
         listingTimeZone(source.instrument.symbol, source.instrument.exchange), referenceNow.getTime()));
     }
     if (accumulationKey && loaded.resolution && isIntradayResolution(loaded.resolution)
@@ -765,10 +869,12 @@ async function resolveChartSpecPass(
   const historicalPriceSeries = new Map<string, ResolvedSeries>();
   const loaded = await Promise.all(spec.series.map(async (seriesSpec, index) => {
     if (!calculationSeriesIds.has(seriesSpec.id)) return null;
+    const { warnings, errors, priorityWarnings, coverageNotices } = quietSeriesIds.has(seriesSpec.id)
+      ? { warnings: [] as string[], errors: [] as string[], priorityWarnings: [] as string[], coverageNotices: [] as string[] } : messages;
     try {
       if (seriesSpec.source.kind === "capability") {
         if (!sources.resolveCapabilitySeries) {
-          throw new Error(`Chart series capability "${seriesSpec.source.capabilityId}" is unavailable. Enable its plugin or provider.`);
+          throw new Error(uncoveredCapabilityMessage(seriesSpec.source.capabilityId, seriesSpec.source.seriesId));
         }
         const capabilityBounds = capabilityRequestBounds(requestVisibleBounds, initialVisibleBounds, movedWindow);
         const capabilityViewport: ChartSpec["viewport"] = {
@@ -789,7 +895,7 @@ async function resolveChartSpecPass(
           cache.capabilitySeriesByRequest.set(key, pending);
           cache.revision += 1;
         }
-        return baseCapabilitySeries(seriesSpec, await pending, index);
+        return asSavedCopy(baseCapabilitySeries(seriesSpec, await pending, index));
       }
       if (seriesSpec.source.kind === "economic") {
         const request: FredSeriesRequest = {
@@ -803,7 +909,12 @@ async function resolveChartSpecPass(
         const result = baseEconomicSeries(seriesSpec, fred, index);
         const coverageNotice = fredCreditCoverageNotice(seriesSpec.source.seriesId, fred.data.info,
           requestVisibleBounds.start, fred.data.observations);
-        if (result && coverageNotice) priorityWarnings.push(`${result.label}: ${coverageNotice}`);
+        if (result && coverageNotice) {
+          priorityWarnings.push(`${result.label}: ${coverageNotice}`);
+          coverageNotices.push(`${result.label}: ${coverageNotice}`);
+        }
+        // A saved copy that answered for a failed refresh is dated in the footer, as every pane's is.
+        if (result && fred.source === "stale-fallback") return asSavedCopy({ ...result, savedAt: fred.fetchedAt });
         const freshnessWarning = staleFredWarning(fred);
         if (result && freshnessWarning) priorityWarnings.push(`${result.label}: ${freshnessWarning}`);
         return result;
@@ -821,8 +932,9 @@ async function resolveChartSpecPass(
       const needsFinancials = !isPriceOnlyMarketFieldId(source.fieldId)
         || !source.instrument.exchange?.trim();
       const financialsPromise = needsFinancials ? loadFinancials(source) : Promise.resolve(null);
-      // A continuous future (HO=F) is known by its symbol: its terms load beside its history.
-      void loadPriceUnit(source, undefined);
+      // A continuous future (HO=F) is known by its symbol: its terms load beside its
+      // history and are read below. A failed read already answers null.
+      loadPriceUnit(source, undefined).catch(logFailure("time-series-resolve", "Starting a futures price unit read failed"));
       let resolvedSource = source;
       let financials: TickerFinancials | null;
       let history: LoadedPriceHistory | null;
@@ -881,7 +993,7 @@ async function resolveChartSpecPass(
       if (marketField) {
         // Same precedence as baseSecuritySeries: the quote's own facts first.
         const listingFacts = mergeQuoteMetadata(merged.quote ? quoteMetadataFromQuote(merged.quote) : undefined, quoteMetadata);
-        if (listingFacts?.currency || listingFacts?.instrumentType) rememberSeedListingFacts(source.instrument, { quoteMetadata: listingFacts });
+        rememberSeedListingFacts(source.instrument, { quoteMetadata: listingFacts ?? null });
         if (contractUnit) rememberSeedListingFacts(source.instrument, { contractUnit });
       }
       if (history) {
@@ -925,9 +1037,26 @@ async function resolveChartSpecPass(
         history?.resolution,
         quoteMetadata,
         contractUnit,
+        { extendedHours: history?.extendedHours === true },
       );
       if (!base) throw new Error(`Unknown field ${source.fieldId}.`);
-      const result = builtBars ? withBuiltBarSize(base, builtBars) : base;
+      let result = builtBars ? withBuiltBarSize(base, builtBars) : base;
+      if (spec.viewport.totalReturn === true && totalReturnFieldId(source.fieldId)) {
+        const outcome = await totalReturnSeries(result, () => loadDistributions(resolvedSource),
+          merged.quote?.currency || quoteMetadata?.currency, referenceNow);
+        result = outcome.series;
+        if (outcome.notice) warnings.push(`${instrumentLabel(resolvedSource)}: ${outcome.notice}`);
+      }
+      // A chart in one currency converts each price at its day's FX close, after any distributions are reinvested in the listing's own.
+      const targetCurrency = spec.viewport.currency;
+      if (targetCurrency && totalReturnFieldId(source.fieldId)) {
+        const converted = await currencySeries(result, {
+          target: targetCurrency, priceCurrency: merged.quote?.currency || quoteMetadata?.currency,
+          loadCloses: sources.loadFxCloses, dayOf: (point) => observationDate(point.date.getTime(), result),
+        });
+        result = converted.series;
+        if (converted.notice) warnings.push(`${instrumentLabel(resolvedSource)}: ${converted.notice}`);
+      }
       if (marketField && history?.historyStart !== undefined && Number.isFinite(history.historyStart)) {
         result.historyStart = new Date(history.historyStart);
       }
@@ -963,7 +1092,32 @@ async function resolveChartSpecPass(
     }
   }));
 
-  const rawSeries = loaded.filter((entry): entry is ResolvedSeries => !!entry);
+  let rawSeries = loaded.filter((entry): entry is ResolvedSeries => !!entry);
+  const statementTarget = spec.viewport.currency;
+  if (statementTarget && sources.loadStatementCurrency) {
+    const statements = new Set(spec.series.filter(({ source }) => source.kind === "security" && source.fieldId.startsWith("fundamental.")).map(({ id }) => id));
+    const group = (series: ResolvedSeries) => /^(currency-total|per-share)(?::|$)/.exec(series.unitGroup)?.[1];
+    const nativeCurrency = (series: ResolvedSeries) => series.unitGroup.split(":")[1] ?? "";
+    const monetary = rawSeries.filter((series) => statements.has(series.id) && group(series) && series.points.length);
+    if (monetary.length) {
+      const { rates, note, rateNotes, failures } = await sources.loadStatementCurrency(statementTarget, monetary.map(nativeCurrency).filter(Boolean));
+      if (note) { coverageNotices.push(note); warnings.push(...rateNotes ?? [note]); }
+      warnings.push(...failures);
+      rawSeries = rawSeries.map((series) => {
+        const currency = nativeCurrency(series);
+        if (!monetary.includes(series) || currency === statementTarget) return series;
+        const rate = rates.get(currency);
+        return {
+          ...series, unit: group(series) === "per-share" ? `${statementTarget}/share` : statementTarget, unitGroup: `${group(series)}:${statementTarget}`,
+          ...(rate == null ? { warning: `No ${currency || "reporting currency"}/${statementTarget} rate` } : {}),
+          points: rate == null ? [] : series.points.map((point) => ({ ...point,
+            ...(point.value == null ? {} : { nativeAmount: { value: point.value, currency: series.unit } }),
+            value: point.value == null ? null : point.value * rate,
+          })),
+        };
+      });
+    }
+  }
   const marketTimelineSeries = primaryMarketSeries?.visible === false
     ? rawSeries.filter((entry) => entry.id === primaryMarketSeries.id)
     : [];
@@ -992,24 +1146,48 @@ async function resolveChartSpecPass(
       : latestDaily - 7 * CHART_RESOLUTION_STEP_MS["1d"],
     end: latestDaily,
   };
+  // A chart of published series alone (FRED, Gloom Cloud datasets) opens where they start, not on blank years.
+  const publishedOnly = spec.series.length > 0 && spec.series.every(({ source }) => source.kind !== "security");
+  const presetBounds = isDatasetChart(spec)
+    ? endAtNewestObservation(initialVisibleBounds, rawSeries)
+    : followLatestMarketObservation(initialVisibleBounds, rawSeries);
   const bounds = hasExplicitWindow
     ? requestVisibleBounds
-    : dailyBounds ?? sessionView?.bounds ?? (isDatasetChart(spec)
-      ? endAtNewestObservation(initialVisibleBounds, rawSeries)
-      : followLatestMarketObservation(initialVisibleBounds, rawSeries));
+    : dailyBounds ?? sessionView?.bounds ?? (publishedOnly ? startAtOldestObservation(presetBounds, rawSeries) : presetBounds);
   if (sessionView?.priorClose != null && primaryRaw?.transform === "raw"
     && primaryRaw.unitGroup.startsWith("price") && primaryRaw.unitGroup !== "price:unknown") {
     const index = rawSeries.indexOf(primaryRaw);
-    rawSeries[index] = { ...primaryRaw, priorClose: sessionView.priorClose };
+    rawSeries[index] = withPriorClose(primaryRaw, sessionView.priorClose);
   }
   const servedCadences = new Set(rawSeries.filter((entry) => entry.observationKind === "market" && entry.points.length > 0)
     .map((entry) => entry.historyResolution));
   const commonCadence = servedCadences.size === 1 ? [...servedCadences][0] : undefined;
+  // A series served in other bars than the chart's (a source that did not answer for 5-minute bars, then
+  // answered daily ones) says so, so its line is not read in the bars the others are in.
+  if (servedCadences.size > 1) {
+    const chartBars = builtBarSize ?? initialResolution;
+    for (const entry of rawSeries) {
+      const served = entry.barSize ?? entry.historyResolution;
+      if (!visibleSeriesIds.has(entry.id) || entry.observationKind !== "market" || !entry.points.length || !served || served === chartBars) continue;
+      warnings.push(`${entry.label}: ${chartBarSizeName(served)} bars, not the chart's ${chartBarSizeName(chartBars)} bars.`);
+    }
+  }
   const resolution = commonCadence ?? undefined;
   const comparisonResolution = resolution ?? "auto";
-  const priceComparison = resolvePriceComparison(spec, rawSeries, bounds, comparisonResolution, requestBounds ? null : spec.viewport.dateWindow,
-    { preset: hasExplicitWindow ? null : spec.viewport.range, now: referenceNow.getTime() + Math.max(0, Date.now() - resolutionStartedAt) });
-  const displayBounds = comparisonDisplayBounds(bounds, priceComparison);
+  const comparisonOptions = { preset: hasExplicitWindow ? null : spec.viewport.range, now: referenceNow.getTime() + Math.max(0, Date.now() - resolutionStartedAt) };
+  let priceComparison = resolvePriceComparison(spec, rawSeries, bounds, comparisonResolution, requestBounds ? null : spec.viewport.dateWindow, comparisonOptions);
+  // A coin compared in daily closes with a listing that closes each day is measured at that close when its hourly bars reach.
+  const timed = sources.dataProvider && comparisonResolution === "1d"
+    ? await coinLegsAtSessionClose(priceComparison, rawSeries, sources.dataProvider, comparisonOptions.now) : null;
+  if (timed?.timing.atSessionClose.size) {
+    rawSeries.splice(0, rawSeries.length, ...timed.series);
+    priceComparison = resolvePriceComparison(spec, rawSeries, bounds, comparisonResolution, requestBounds ? null : spec.viewport.dateWindow,
+      { ...comparisonOptions, atSessionClose: timed.timing.atSessionClose, closedEnds: timed.timing.closedEnds });
+  }
+  const splitNotice = priceComparison?.legs ? await comparedSplitNotice(spec, priceComparison, rawSeries, loadDistributions, comparisonOptions.now) : null;
+  const comparedBounds = comparisonDisplayBounds(bounds, priceComparison);
+  const displayBounds = spec.viewport.dateWindow?.endAtLatestObservation && !requestBounds
+    ? endAtNewestObservation(comparedBounds, rawSeries) : comparedBounds;
   const comparisonBounds = priceComparison && priceComparison.start !== null
     ? priceComparison : bounds;
   const baseSeries = rawSeries
@@ -1068,11 +1246,20 @@ async function resolveChartSpecPass(
     return { ...entry, valuationPriceIssues: issues.length ? issues : undefined,
       warning: [entry.warning, valuationPriceWarning(issues)].filter(Boolean).join(" ") || undefined };
   });
+  // A futures formula's caveat is about the dates in view: their legs' months.
+  resolved = resolved.map((entry) => {
+    const note = entry.formulaLegs ? formulaContractNote(entry) : null;
+    return note ? { ...entry, warning: [entry.warning, note].filter(Boolean).join(" ") } : entry;
+  });
   const priceHistoryIntegrity = resolvePriceHistoryIntegrity(
     spec, rawSeries, resolved,
     bounds, comparisonResolution, requestBounds ? null : spec.viewport.dateWindow ?? null,
   );
   if (priceComparison) warnings.push(priceComparison.notice);
+  if (splitNotice) warnings.push(splitNotice);
+  // A raw-price chart of total returns is no comparison, and its levels say what they are instead.
+  const returnBasisNotice = priceComparison ? null : priceLevelsNotice(spec, rawSeries);
+  if (returnBasisNotice) warnings.push(returnBasisNotice);
   warnings.push(...chartPriceHistoryIntegrityNotices(priceHistoryIntegrity));
   warnings.push(...financialPeriodCoverageWarnings(financialPeriodCoverage(spec, resolved)));
   const resolvedById = new Map(resolved.map((entry) => [entry.id, entry] as const));
@@ -1091,20 +1278,20 @@ async function resolveChartSpecPass(
     if (entry.warning) warnings.push(`${entry.label}: ${entry.warning}`);
     if (entry.points.length === 0 && entry.unreportedPeriod) {
       warnings.push(`${entry.label}: no ${entry.unreportedPeriod} figures are reported; annual figures are available.`);
-    } else if (entry.points.length === 0 && !entry.warning?.startsWith(VALUATION_CURRENCY_WARNING_PREFIX)) {
-      // A currency mismatch already explains an empty valuation series.
+    } else if (entry.points.length === 0 && !entry.notMeaningful && !entry.warning?.startsWith(VALUATION_CURRENCY_WARNING_PREFIX)) {
+      // A currency mismatch or an N/M already explains an empty valuation series.
       warnings.push(`${entry.label}: no observations in the selected date range.`);
     }
   }
   for (const panel of spec.panels) {
     if (panel.scale !== "log") continue;
-    const isHidden = (point: TimeSeriesPoint) => typeof point.value === "number" && Number.isFinite(point.value) && point.value <= 0;
+    const isHidden = (point: TimeSeriesPoint) => hiddenOnLogScale(point.value);
     const affected = resolved.filter((entry) => entry.panelId === panel.id && entry.points.some(isHidden));
     const hiddenCount = affected.reduce((total, entry) => total + entry.points.filter(isHidden).length, 0);
     if (hiddenCount > 0) {
       // A panel without a title is named by the series it holds, never by its id (`main`).
       const name = panel.label ?? [...new Set(affected.map((entry) => entry.label))].join(", ");
-      warnings.push(`${name}: ${hiddenCount} non-positive observation${hiddenCount === 1 ? " is" : "s are"} hidden on the logarithmic scale.`);
+      warnings.push(logScaleHiddenWarning(name, hiddenCount));
     }
   }
 
@@ -1130,9 +1317,28 @@ async function resolveChartSpecPass(
     loading: false,
     errors,
     warnings: [...new Set([...priorityWarnings, ...warnings])],
+    ...savedCopyOf(rawSeries.filter((entry) => visibleSeriesIds.has(entry.id))),
+    ...(coverageNotices.length ? { coverageNotices: [...new Set(coverageNotices)] } : {}),
+    ...(returnBasisNotice ? { returnBasisNotice } : {}),
+    ...(splitNotice ? { splitNotice } : {}),
     ...(delistings.size ? { delistings: [...delistings.values()] } : {}),
     viewport,
     resolution,
     ...(builtBarSize && rawSeries.some((entry) => entry.barSize === builtBarSize) ? { barSize: builtBarSize } : {}),
   };
+}
+
+/**
+ * A series drawn from a copy a failed refresh left answering (`savedAt`),
+ * marked as one, so a command charting it ends with "couldn't refresh; saved
+ * copy from …" as the app's footer says.
+ */
+function asSavedCopy(series: ResolvedSeries): ResolvedSeries {
+  return series.savedAt != null ? servedFromSavedCopy(series, series.savedAt) : series;
+}
+
+/** The oldest saved copy among `series` that answered for a failed refresh, which the chart's footer dates. */
+function savedCopyOf(series: readonly ResolvedSeries[]): { savedAt?: number } {
+  const saved = series.flatMap((entry) => entry.savedAt != null && Number.isFinite(entry.savedAt) ? [entry.savedAt] : []);
+  return saved.length ? { savedAt: Math.min(...saved) } : {};
 }

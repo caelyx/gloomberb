@@ -2,10 +2,11 @@ import { useThemeColors } from "../../theme/theme-context";
 import { Box, ScrollBox, Text, useUiHost } from "../../ui";
 import { useCallback, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { TextAttributes, type ScrollBoxRenderable } from "../../ui";
-import { hoverBg } from "../../theme/colors";
+import { hoverBg, inactiveSelectedText } from "../../theme/colors";
+import { useSelectionFill } from "./selection-fill";
 import { t } from "../../i18n";
-import { useRemoteUiNode } from "../../remote/semantic-tree";
-import { resolveRemoteItemIndex } from "../../remote/semantic-helpers";
+import { useRemoteUiNode, useRemoteUiScope } from "../../remote/semantic-tree";
+import { resolveRemoteListIndex } from "../../remote/semantic-helpers";
 import { observeScrollBoxContentSize, observeScrollBoxViewportSize } from "../../renderers/opentui/scrollbox-layout";
 import { isPlainKey, type KeyboardModifierEventLike } from "../../utils/keyboard";
 
@@ -15,6 +16,7 @@ export interface ListViewItem {
   description?: string;
   detail?: string;
   category?: string;
+  /** `heading` draws a muted group label; pair it with `disabled: true`. */
   kind?: string;
   right?: string;
   checked?: boolean;
@@ -67,12 +69,19 @@ export interface ListViewProps {
   height?: number;
   flexGrow?: number;
   scrollable?: boolean;
+  /**
+   * Terminal: false scrolls without a scrollbar, so each row runs to the
+   * list's edge and a press on its last column picks it, as in a short
+   * suggestion drawer. The wheel and the keys still scroll it.
+   */
+  scrollbar?: boolean;
   selectOnHover?: boolean;
   autoScrollToIndex?: boolean;
   /**
-   * The rows are checkboxes (ToggleList). A focused desktop row toggles on
-   * Space and leaves Enter to the surface around the list, the way a checkbox
-   * leaves Enter to its dialog's default button.
+   * The rows are checkboxes (ToggleList), or choices a dialog asks beside its
+   * buttons. A focused desktop row toggles or picks on Space and leaves Enter
+   * to the surface around the list, the way a checkbox leaves Enter to its
+   * dialog's default button.
    */
   checkboxRows?: boolean;
   onMouseScroll?: (event: any) => void;
@@ -143,11 +152,16 @@ export function listCursorMove(event: KeyboardModifierEventLike, pageSize: numbe
 function DefaultRow({
   item,
   selected,
+  lit,
 }: {
   item: ListViewItem;
   selected: boolean;
+  /** The selection is the one the keys move (`useSelectionFill`); off, the row's colours are lifted to read on the quieter fill. */
+  lit: boolean;
 }) {
   const colors = useThemeColors();
+  const ink = (color: string) => (selected && !lit ? inactiveSelectedText(color, colors) : color);
+  if (item.kind === "heading") return <Text fg={colors.textMuted}>{t(item.label)}</Text>;
   // The label gives way to the detail: a long label is cut with an ellipsis
   // instead of wrapping under the row or running into the right column.
   return (
@@ -157,7 +171,7 @@ function DefaultRow({
           {selected ? "\u25b8 " : "  "}
         </Text>
         <Text
-          fg={item.color ?? (selected ? colors.text : colors.textDim)}
+          fg={ink(item.color ?? (selected ? colors.text : colors.textDim))}
           attributes={selected ? TextAttributes.BOLD : 0}
           wrapMode="none"
           truncate
@@ -169,7 +183,7 @@ function DefaultRow({
       </Box>
       {item.detail && (
         <Box flexShrink={0} paddingLeft={1}>
-          <Text fg={colors.textMuted}>{t(item.detail)}</Text>
+          <Text fg={ink(colors.textMuted)}>{t(item.detail)}</Text>
         </Box>
       )}
     </Box>
@@ -197,6 +211,7 @@ export function ListView({
   height,
   flexGrow,
   scrollable = false,
+  scrollbar = true,
   selectOnHover = false,
   autoScrollToIndex = true,
   checkboxRows,
@@ -209,16 +224,19 @@ export function ListView({
   remoteMetadata,
 }: ListViewProps) {
   const colors = useThemeColors();
+  const selectionFill = useSelectionFill();
+  // Drawn inside a prompt (a dialog that lists a prompt's answers), it carries the prompt's scope.
+  const contextScope = useRemoteUiScope();
   useRemoteUiNode({
     role: remoteRole,
     label: remoteLabel ?? emptyMessage,
     actions: {
       select: (input) => {
-        const index = resolveListIndex(input, items);
+        const index = resolveRemoteListIndex(input, items);
         if (index >= 0 && !items[index]?.disabled) onSelect?.(index);
       },
       activate: (input) => {
-        const index = resolveListIndex(input, items);
+        const index = resolveRemoteListIndex(input, items);
         const item = index >= 0 ? items[index] : undefined;
         if (item && !item.disabled) {
           onSelect?.(index);
@@ -228,7 +246,7 @@ export function ListView({
     },
     metadata: {
       ...remoteMetadata,
-      scope: remoteScope,
+      scope: remoteScope ?? contextScope ?? undefined,
       selectedIndex,
       items: items.map((item, index) => ({
         index,
@@ -285,10 +303,11 @@ export function ListView({
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const scrollRef = useRef<ScrollBoxRenderable>(null);
   const baseBg = bgColor ?? colors.bg;
-  const activeBg = selectedBgColor ?? colors.selected;
+  const activeBg = selectedBgColor ?? selectionFill.bg;
   const rowHoverBg = hoverBgColor ?? hoverBg(colors);
   const selectedItem = selectedIndex >= 0 ? items[selectedIndex] : undefined;
   const activeScrollIndex = scrollIndex ?? selectedIndex;
+  const headingAboveSelection = items[activeScrollIndex - 1]?.kind === "heading";
   const terminalRowHeight = rowHeight ?? 1;
   const terminalRowGap = rowGap ?? 0;
   const rowStride = terminalRowHeight + terminalRowGap;
@@ -299,13 +318,14 @@ export function ListView({
     if (!sb) return;
     const safeIndex = Math.min(activeScrollIndex, items.length - 1);
     const viewportH = Math.max(sb.viewport?.height ?? 1, 1);
-    const rowTop = safeIndex * rowStride;
+    const rowTop = Math.max(0, safeIndex - (headingAboveSelection ? 1 : 0)) * rowStride;
+    const rowBottom = safeIndex * rowStride + terminalRowHeight;
     if (rowTop < sb.scrollTop) {
       sb.scrollTo(rowTop);
-    } else if (rowTop + terminalRowHeight > sb.scrollTop + viewportH) {
-      sb.scrollTo(rowTop + terminalRowHeight - viewportH);
+    } else if (rowBottom > sb.scrollTop + viewportH) {
+      sb.scrollTo(rowBottom - viewportH);
     }
-  }, [activeScrollIndex, autoScrollToIndex, items.length, rowStride, scrollable, terminalRowHeight]);
+  }, [activeScrollIndex, autoScrollToIndex, headingAboveSelection, items.length, rowStride, scrollable, terminalRowHeight]);
   useEffect(revealActiveRow, [revealActiveRow]);
   // A list that opens on a row past the fold has nothing to scroll until its
   // first computed layout sizes the viewport and the rows.
@@ -359,7 +379,7 @@ export function ListView({
       >
         {renderRow
           ? renderRow(item, state, index)
-          : <DefaultRow item={item} selected={selected} />}
+          : <DefaultRow item={item} selected={selected} lit={selectionFill.lit || selectedBgColor !== undefined} />}
       </Box>
     );
   });
@@ -373,6 +393,7 @@ export function ListView({
           flexGrow={flexGrow}
           scrollY
           focusable={false}
+          {...(scrollbar ? {} : { verticalScrollbarOptions: { visible: false } })}
           {...(onMouseScroll ? { onMouseScroll } : {})}
         >
           <Box flexDirection="column" gap={terminalRowGap}>{rows}</Box>
@@ -389,11 +410,4 @@ export function ListView({
       )}
     </Box>
   );
-}
-
-function resolveListIndex(input: unknown, items: ListViewItem[]): number {
-  return resolveRemoteItemIndex(input, items, {
-    id: (item) => item.id,
-    label: (item) => item.label,
-  });
 }

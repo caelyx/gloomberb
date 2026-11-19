@@ -1,10 +1,12 @@
+import type { CompanyFrom } from "../types/company-from"
 import { listingAbroad, type IssuerListingParams } from "./paths";
 
 type QuoteMatchMode = "exact" | "whitespace" | "nfkc_whitespace";
 
 type KpiBasis = "reported" | "adjusted" | "constant_currency" | "organic"
 export type KpiUnit = "currency" | "currency_per_share" | "currency_per_unit" | "percent" | "basis_points" | "count" | "ratio" | "volume"
-type KpiSourceKind = "press_release" | "filing" | "transcript" | "opendart" | "ir" | "esef" | "edinet"
+/** Known kinds; the server may add more (KPIS reads them as text). */
+type KpiSourceKind = "press_release" | "filing" | "transcript" | "opendart" | "ir" | "esef" | "edinet" | "exchange" | (string & {})
 type GuidanceDirection = "raised" | "cut" | "reiterated" | "mixed" | "initiated" | "withdrawn" | "not_comparable"
 type GuidanceHedge = "exact" | "approximately" | "at_least" | "at_most" | "greater_than" | "less_than" | "qualitative" | "withdrawn"
 
@@ -132,6 +134,8 @@ export interface KpiSeries {
 }
 export interface KpisPayload {
   symbol: string
+  /** The company's home line the data is read from, when not the listing asked (a receipt, a foreign line). */
+  companyFrom?: CompanyFrom
   status: "available" | "unavailable"
   asOf: string | null
   coverage: KpiCoverage

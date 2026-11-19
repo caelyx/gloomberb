@@ -84,6 +84,17 @@ export interface ViewSpecValidationResult {
   warnings: ViewSpecIssue[];
 }
 
+/**
+ * A spec that works as typed, signed out too: Europe's indices from WEI's
+ * board, their names, last and move. The catalog's example and the empty
+ * view's both show it.
+ */
+export const EXAMPLE_VIEW_SPEC = JSON.stringify({
+  version: VIEW_SPEC_VERSION,
+  source: { kind: "inline", pane: "WEI" },
+  projection: { columns: ["name", "price", "changePercent"], filters: [{ key: "region", op: "eq", value: "europe" }] },
+});
+
 const TRANSFORMS = new Set<ViewTransform>(["raw", "percent", "compact", "abs", "index100"]);
 const FILTER_OPS = new Set<ViewFilterOp>(["eq", "neq", "gt", "gte", "lt", "lte", "contains", "in", "exists"]);
 const KEY_PATTERN = /^[A-Za-z0-9_.\-:]{1,80}$/;
@@ -295,6 +306,34 @@ export function parseViewSpecOr(value: unknown): { spec: ViewSpec; result: ViewS
   const result = validateViewSpec(spec);
   if (!result.valid) return { error: result.errors.map((entry) => `${entry.path}: ${entry.message}`).join(" ") };
   return { spec, result };
+}
+
+/** Where a spec names a row key. */
+export type ViewKeyPlace = "column" | "filter" | "sort" | "symbolKey";
+
+export interface UnknownViewKey {
+  key: string;
+  place: ViewKeyPlace;
+}
+
+/**
+ * The row keys the spec's columns, filters, sort and symbol key name that are
+ * not in `known`, once per place, in the spec's order. A key no row carries
+ * leaves a column blank, and a filter or sort on it drops or scrambles every row.
+ */
+export function unknownViewKeys(spec: ViewSpec, known: ReadonlySet<string>): UnknownViewKey[] {
+  const unknown: UnknownViewKey[] = [];
+  const seen = new Set<string>();
+  const check = (key: string, place: ViewKeyPlace) => {
+    if (known.has(key) || seen.has(`${place}:${key}`)) return;
+    seen.add(`${place}:${key}`);
+    unknown.push({ key, place });
+  };
+  for (const column of spec.projection.columns) check(column.key, "column");
+  for (const filter of spec.projection.filters) check(filter.key, "filter");
+  if (spec.projection.sort) check(spec.projection.sort.by, "sort");
+  if (spec.presentation.symbolKey) check(spec.presentation.symbolKey, "symbolKey");
+  return unknown;
 }
 
 export function serializeViewSpec(spec: ViewSpec): string {

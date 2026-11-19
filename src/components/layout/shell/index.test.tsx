@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import type { ReactNode } from "react";
-import { act, useReducer, useState } from "react";
+import { act, useEffect, useReducer, useState } from "react";
 import type { PluginRegistry } from "../../../plugins/registry";
 import { createOpenTuiTestHarness, TestDialogProvider, type TestKeyEvent } from "../../../renderers/opentui/test-utils";
 import { openTuiUiHost } from "../../../renderers/opentui/ui-host";
@@ -13,6 +13,7 @@ import {
 } from "../../../state/app/context";
 import { createStaticAppStore } from "../../../test-support/app-store";
 import { TICKER_RESEARCH_PANE_ID, cloneLayout, createDefaultConfig, type LayoutConfig } from "../../../types/config";
+import { buildDockStack } from "../../../layout/pane-manager/dock-stack";
 import type { DesktopWindowBridge } from "../../../types/desktop-window";
 import type { PaneProps } from "../../../types/plugin";
 import { Text, Textarea } from "../../../ui";
@@ -25,9 +26,11 @@ import {
   resolvePaneManagementShortcut,
 } from "./index";
 import { inputCaptureAllowsPaneManagementShortcut } from "./shortcuts";
+import { TERMINAL_MAGNET_REST_MS } from "./drag/magnets";
 import { ONE_SHOT_COOLDOWN_MS } from "../../../utils/one-shot";
 import { registerPaneDocsHandler } from "../../../docs/requests";
 import { registerAskGloomPaneHandler, type AskGloomPaneAttachment } from "../../../ask-gloom/pane-request";
+import { holdPaneUnsentWork } from "../../../state/pane-unsent-work";
 
 const tui = createOpenTuiTestHarness();
 
@@ -404,7 +407,7 @@ describe("Shell", () => {
     await renderShell(createShellStateWithLayout(config, floatingOnlyLayout, "ticker-detail:main"), { width: 40, height: 10 });
 
     const frame = await openPaneMenu();
-    expect(frame).toContain("Dock Pane");
+    expect(frame).toContain("Return to Layout");
     expect(frame).not.toContain("Layout Actions");
   });
 
@@ -433,7 +436,7 @@ describe("Shell", () => {
       { width: 100, height: 30 },
     );
     frame = await openPaneMenu();
-    expect(frame).toContain("Dock Pane");
+    expect(frame).toContain("Return to Layout");
     expect(frame).toContain("Move to New Layout");
 
     await renderShell(createShellStateWithLayout(config, singleDockedPaneLayout(config)), { width: 60, height: 30 });
@@ -681,7 +684,8 @@ describe("Shell", () => {
     const config = createDefaultConfig("/tmp/gloomberb-shell-live-floating-drag-test");
     const floatingLayout = cloneLayout(config.layout);
     floatingLayout.dockRoot = { kind: "pane", instanceId: "portfolio-list:main" };
-    floatingLayout.floating = [{ instanceId: "ticker-detail:main", x: 8, y: 2, width: 32, height: 10, zIndex: 75 }];
+    // Short enough that the move ends clear of the edges its magnets would catch.
+    floatingLayout.floating = [{ instanceId: "ticker-detail:main", x: 8, y: 2, width: 32, height: 8, zIndex: 75 }];
     // Every pane's chrome reads its quick settings when it renders.
     const chromeRenders: string[] = [];
     const registry = createShellPluginRegistry();
@@ -719,6 +723,325 @@ describe("Shell", () => {
       await tui.setup().mockMouse.release(16, 6);
       await tui.setup().renderOnce();
     });
+  });
+
+  test("terminal: a stack's header names each tab, a click on one shows it and a drag takes it out", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-stack-test");
+    const layout: LayoutConfig = {
+      dockRoot: buildDockStack(["portfolio-list:main", "ticker-detail:main"], "portfolio-list:main"),
+      instances: [{ ...requireLayoutInstance(config, "portfolio-list:main") }, { ...requireLayoutInstance(config, "ticker-detail:main") }],
+      floating: [],
+      detached: [],
+    };
+    const { actions } = await renderShell(createShellStateWithLayout(config, layout, "portfolio-list:main"), { width: 80, height: 18 });
+
+    // Ticker Research follows the portfolio, so it takes its name.
+    const header = tui.frame().split("\n")[0]!;
+    expect(header).toContain(":: Main Portfolio │ Main Portfolio─");
+    expect(tui.frame()).toContain("Portfolio Body");
+    const tab = header.indexOf(" │ ") + 3;
+
+    await act(async () => {
+      await tui.setup().mockMouse.click(tab + 2, 1);
+      await tui.setup().renderOnce();
+    });
+    expect(actions.filter((action) => action.type === "FOCUS_PANE").at(-1)).toEqual({ type: "FOCUS_PANE", paneId: "ticker-detail:main" });
+    expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
+
+    // Out over the body, its edges clear of the pane's: it floats there.
+    await act(async () => {
+      await tui.setup().mockMouse.pressDown(tab + 2, 1);
+      await tui.setup().renderOnce();
+      for (const [x, y] of [[tab, 2], [36, 3], [40, 4]] as const) {
+        await tui.setup().mockMouse.moveTo(x, y);
+        await tui.setup().renderOnce();
+      }
+      await tui.setup().mockMouse.release(40, 4);
+      await tui.setup().renderOnce();
+    });
+    const moved = actions.filter((action) => action.type === "UPDATE_LAYOUT").at(-1)?.layout as LayoutConfig | undefined;
+    expect(moved?.dockRoot).toEqual({ kind: "pane", instanceId: "portfolio-list:main" });
+    expect(moved?.floating.map((entry) => entry.instanceId)).toEqual(["ticker-detail:main"]);
+  });
+
+  // Tab passes the tabs a stack hides: the tab keys step through them, round,
+  // and a header too narrow for every name counts the rest, which a click
+  // shows one after another.
+  test("terminal: the tab keys and a narrow header's count reach every tab of a stack", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-stack-keys-test");
+    const detail = requireLayoutInstance(config, "ticker-detail:main");
+    const layout: LayoutConfig = {
+      dockRoot: buildDockStack(["portfolio-list:main", "ticker-detail:main", "ticker-detail:two"], "portfolio-list:main"),
+      instances: [{ ...requireLayoutInstance(config, "portfolio-list:main") }, { ...detail }, { ...detail, instanceId: "ticker-detail:two" }],
+      floating: [],
+      detached: [],
+    };
+    const { actions } = await renderShell(createShellStateWithLayout(config, layout, "portfolio-list:main"), { width: 40, height: 14 });
+    const focused = () => actions.filter((action) => action.type === "FOCUS_PANE").at(-1)?.paneId;
+
+    await emitKeypress({ name: "pagedown", ctrl: true });
+    expect(focused()).toBe("ticker-detail:main");
+    await emitKeypress({ name: "pageup", ctrl: true });
+    expect(focused()).toBe("ticker-detail:two");
+
+    const header = tui.frame().split("\n")[0]!;
+    expect(header).toMatch(/^┌─:: Main Portfolio │ \S+ \+1/);
+    await act(async () => {
+      await tui.setup().mockMouse.click(header.indexOf("+1"), 1);
+      await tui.setup().renderOnce();
+    });
+    expect(focused()).toBe("ticker-detail:two");
+    expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
+  });
+
+  // The terminal's own way to the same targets as the desktop's: drawn in
+  // cells while a pane moves, and a release on one does what it shows.
+  test.each([
+    ["the centre of a pane's target makes it a tab there", "[█]", "tab"],
+    ["a side of a pane's target splits that pane on that side", "[▌]", "split"],
+    ["the strip along the window's edge puts it along that whole edge", "strip", "edge"],
+    ["anywhere else it floats where it is let go", "off", "float"],
+  ] as const)("terminal: a floating pane let go over %s", async (_name, target, landed) => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-drop-target-test");
+    const main = requireLayoutInstance(config, "portfolio-list:main");
+    const detail = requireLayoutInstance(config, "ticker-detail:main");
+    const layout: LayoutConfig = {
+      dockRoot: { kind: "split", axis: "vertical", ratio: 0.5, first: { kind: "pane", instanceId: main.instanceId }, second: { kind: "pane", instanceId: detail.instanceId } },
+      instances: [{ ...main }, { ...detail }, { ...detail, instanceId: "ticker-detail:float" }],
+      floating: [{ instanceId: "ticker-detail:float", x: 40, y: 2, width: 30, height: 6 }],
+      detached: [],
+    };
+    const { actions } = await renderShell(createShellStateWithLayout(config, layout, "ticker-detail:float"));
+    const rows = tui.frame().split("\n");
+    // The pointer's rows count from the top bar, which the shell leaves out here.
+    const float = rows.findIndex((row) => row.includes("┌─::")) + 1;
+    const lower = rows.findIndex((row, index) => index > 2 && row.startsWith("::"));
+    const middle = Math.floor((lower + rows.length) / 2);
+    await act(async () => {
+      const mouse = tui.setup().mockMouse;
+      await mouse.pressDown(48, float);
+      for (let y = float + 1; y <= middle + 1; y += 1) {
+        await mouse.moveTo(48, y);
+        await tui.setup().renderOnce();
+      }
+    });
+    // Over the lower pane: its target is drawn on it, nothing lit yet.
+    const over = tui.frame().split("\n");
+    const centre = over.findIndex((row) => row.includes("[█]"));
+    expect(centre).toBeGreaterThan(lower);
+    expect(over[centre - 1]).toContain("[▀]");
+    expect(over[centre]).toContain("[▌] [█] [▐]");
+    expect(over[centre + 1]).toContain("[▄]");
+    const [x, y] = target === "strip"
+      ? [0, middle]
+      : target === "off"
+        ? [8, middle]
+        : [over[centre]!.indexOf(target) + 1, centre];
+    await act(async () => {
+      const mouse = tui.setup().mockMouse;
+      await mouse.moveTo(x, y + 1);
+      await tui.setup().renderOnce();
+      await mouse.release(x, y + 1);
+      await tui.setup().renderOnce();
+    });
+    const released = actions.filter((action) => action.type === "UPDATE_LAYOUT").at(-1)?.layout as LayoutConfig | undefined;
+    const dock = released?.dockRoot;
+    if (landed === "tab") {
+      expect(dock).toMatchObject({ first: { instanceId: main.instanceId }, second: { tabs: { active: "ticker-detail:float" } } });
+    } else if (landed === "split") {
+      expect(dock).toMatchObject({
+        first: { instanceId: main.instanceId },
+        second: { axis: "horizontal", first: { instanceId: "ticker-detail:float" }, second: { instanceId: detail.instanceId } },
+      });
+    } else if (landed === "edge") {
+      expect(dock).toMatchObject({ axis: "horizontal", first: { instanceId: "ticker-detail:float" }, second: { axis: "vertical" } });
+    } else {
+      expect(dock).toEqual(layout.dockRoot);
+      expect(released?.floating.map((entry) => entry.instanceId)).toEqual(["ticker-detail:float"]);
+    }
+    if (landed !== "float") expect(released?.floating ?? []).toEqual([]);
+  });
+
+  // The targets follow a move, not a press: a click on a title bar (to focus,
+  // or to pick a tab) must leave every cell as it was.
+  test("terminal: a press on a title bar that does not move draws no targets", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-drop-target-press-test");
+    const main = requireLayoutInstance(config, "portfolio-list:main");
+    const detail = requireLayoutInstance(config, "ticker-detail:main");
+    const layout: LayoutConfig = {
+      dockRoot: { kind: "split", axis: "vertical", ratio: 0.5, first: { kind: "pane", instanceId: main.instanceId }, second: { kind: "pane", instanceId: detail.instanceId } },
+      instances: [{ ...main }, { ...detail }, { ...detail, instanceId: "ticker-detail:float" }],
+      floating: [{ instanceId: "ticker-detail:float", x: 40, y: 2, width: 30, height: 6 }],
+      detached: [],
+    };
+    await renderShell(createShellStateWithLayout(config, layout, "ticker-detail:float"));
+    const rest = () => JSON.stringify(tui.setup().captureSpans());
+    const before = rest();
+    // The pointer's rows count from the top bar, which the shell leaves out here.
+    const float = tui.frame().split("\n").findIndex((row) => row.includes("┌─::")) + 1;
+    const lower = tui.frame().split("\n").findIndex((row, index) => index > 2 && row.startsWith("::")) + 1;
+    const mouse = tui.setup().mockMouse;
+    for (const [x, y] of [[48, float], [4, lower]] as const) {
+      await act(async () => {
+        await mouse.pressDown(x, y);
+        await tui.setup().renderOnce();
+      });
+      expect(rest()).toBe(before);
+      expect(tui.frame()).not.toContain("[█]");
+      await act(async () => {
+        await mouse.release(x, y);
+        await tui.setup().renderOnce();
+      });
+    }
+    // Let go where it was pressed, the focused floating pane draws as before.
+    await act(async () => {
+      await mouse.pressDown(48, float);
+      await mouse.release(48, float);
+      await tui.setup().renderOnce();
+    });
+    expect(rest()).toBe(before);
+  });
+
+  // A floating stack's other tabs wait where it started, under the one it
+  // shows: their edges must not hold it there.
+  test("terminal: a floating stack moved by a cell is not held back by its own tabs", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-stack-magnet-test");
+    const main = requireLayoutInstance(config, "portfolio-list:main");
+    const detail = requireLayoutInstance(config, "ticker-detail:main");
+    const layout: LayoutConfig = {
+      dockRoot: { kind: "pane", instanceId: main.instanceId },
+      instances: [{ ...main }, { ...detail }, { ...detail, instanceId: "ticker-detail:two" }],
+      floating: [
+        { instanceId: detail.instanceId, x: 40, y: 4, width: 30, height: 8, zIndex: 50, stack: "s" },
+        { instanceId: "ticker-detail:two", x: 40, y: 4, width: 30, height: 8, zIndex: 51, stack: "s" },
+      ],
+      detached: [],
+    };
+    const { actions } = await renderShell(createShellStateWithLayout(config, layout, "ticker-detail:two"));
+    const rows = tui.frame().split("\n");
+    const row = rows.findIndex((line) => line.includes("┌─::"));
+    // On its grip, which moves the stack whole; the pointer's rows count from the top bar.
+    const [x, y] = [rows[row]!.indexOf("┌─::") + 2, row + 1];
+    await act(async () => {
+      const mouse = tui.setup().mockMouse;
+      await mouse.pressDown(x, y);
+      for (const [dx, dy] of [[0, 1], [1, 2]] as const) {
+        await mouse.moveTo(x + dx, y + dy);
+        await tui.setup().renderOnce();
+      }
+      await mouse.release(x + 1, y + 2);
+      await tui.setup().renderOnce();
+    });
+    const moved = actions.filter((action) => action.type === "UPDATE_LAYOUT").at(-1)?.layout as LayoutConfig | undefined;
+    expect(moved?.floating.map(({ instanceId, x: left, y: top, stack }) => ({ instanceId, x: left, y: top, stack }))).toEqual([
+      { instanceId: detail.instanceId, x: 41, y: 6, stack: "s" },
+      { instanceId: "ticker-detail:two", x: 41, y: 6, stack: "s" },
+    ]);
+  });
+
+  // At a hand's pace a magnet that drew its catch held the window for three
+  // cells on each edge it crossed, then jumped it: a drag that lagged.
+  test("terminal: a window dragged at a hand's pace follows the pointer past an edge, and catches it once the pointer rests", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-magnet-pace-test");
+    const main = requireLayoutInstance(config, "portfolio-list:main");
+    const detail = requireLayoutInstance(config, "ticker-detail:main");
+    const layout: LayoutConfig = {
+      dockRoot: { kind: "pane", instanceId: main.instanceId },
+      instances: [{ ...main }, { ...detail }, { ...detail, instanceId: "ticker-detail:two" }],
+      floating: [
+        { instanceId: detail.instanceId, x: 8, y: 2, width: 32, height: 8, zIndex: 50 },
+        { instanceId: "ticker-detail:two", x: 50, y: 2, width: 20, height: 8, zIndex: 51 },
+      ],
+      detached: [],
+    };
+    const { actions } = await renderShell(createShellStateWithLayout(config, layout, detail.instanceId), { width: 80, height: 18 });
+    // The window's top row: where its left corner is drawn. The pointer's rows count from the top bar.
+    const left = () => tui.frame().split("\n")[2]!.indexOf("┌");
+    expect(left()).toBe(8);
+    const mouse = tui.setup().mockMouse;
+    const drawn: number[] = [];
+    await act(async () => {
+      await mouse.pressDown(10, 3);
+      await tui.setup().renderOnce();
+    });
+    // Twenty cells a second, its right edge from 42 across the other
+    // window's at 50 to 54, then back to 49.
+    for (const dx of [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 13, 12, 11, 10, 9]) {
+      await act(async () => {
+        await Bun.sleep(50);
+        await mouse.moveTo(10 + dx, 3);
+        await tui.setup().renderOnce();
+      });
+      drawn.push(left());
+    }
+    expect(drawn).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 21, 20, 19, 18, 17]);
+    // Still: a cell off the other window's edge, it steps onto it.
+    await act(async () => {
+      await Bun.sleep(TERMINAL_MAGNET_REST_MS * 2);
+      await tui.setup().renderOnce();
+    });
+    expect(left()).toBe(18);
+    await act(async () => {
+      await mouse.release(19, 3);
+      await tui.setup().renderOnce();
+    });
+    const moved = actions.filter((action) => action.type === "UPDATE_LAYOUT").at(-1)?.layout as LayoutConfig | undefined;
+    expect(moved?.floating.find((entry) => entry.instanceId === detail.instanceId)).toMatchObject({ x: 18, y: 2 });
+  });
+
+  test("each tab of a stack keeps its own state as the tabs switch, never another tab's", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-stack-state-test");
+    const main = requireLayoutInstance(config, "portfolio-list:main");
+    const other = { ...main, instanceId: "portfolio-list:other" };
+    const layout: LayoutConfig = {
+      dockRoot: buildDockStack([main.instanceId, other.instanceId], main.instanceId),
+      instances: [{ ...main }, other],
+      floating: [],
+      detached: [],
+    };
+    // The same pane type in both tabs: local state set when it mounted.
+    const mounts: string[] = [];
+    const Remember = ({ paneId }: PaneProps) => {
+      const [mountedAs] = useState(paneId);
+      useEffect(() => { mounts.push(paneId); }, []);
+      return <Text>{`${mountedAs} showing ${paneId}`}</Text>;
+    };
+    const controls: {
+      dispatch?: (action: ShellTestAction) => void;
+      state?: ReturnType<typeof createInitialState>;
+      transientLayout: TransientLayoutState | null;
+    } = { transientLayout: null };
+    await tui.render(
+      <ShellTransientHarness
+        initialState={createShellStateWithLayout(config, layout, main.instanceId)}
+        registry={createShellPluginRegistry({ portfolioListComponent: Remember })}
+        controls={controls}
+      />,
+      { width: 80, height: 18 },
+    );
+    await act(async () => {
+      await tui.setup().renderOnce();
+    });
+    expect(tui.frame()).toContain("portfolio-list:main showing portfolio-list:main");
+
+    const show = async (paneId: string) => {
+      await act(async () => {
+        controls.dispatch!({ type: "FOCUS_PANE", paneId });
+        await tui.setup().renderOnce();
+      });
+      await act(async () => {
+        await tui.setup().renderOnce();
+      });
+    };
+    await show(other.instanceId);
+    expect(tui.frame()).toContain("portfolio-list:other showing portfolio-list:other");
+    expect(tui.frame()).not.toContain("portfolio-list:main showing");
+    await show(main.instanceId);
+    expect(tui.frame()).toContain("portfolio-list:main showing portfolio-list:main");
+    expect(tui.frame()).not.toContain("portfolio-list:other showing");
+    // Each mounted once: a switch shows the other tab's own tree, it neither
+    // reuses this one nor starts that one over.
+    expect(mounts.sort()).toEqual(["portfolio-list:main", "portfolio-list:other"]);
   });
 
   test("keeps the focused textarea cursor visible when it is not covered", async () => {
@@ -779,6 +1102,20 @@ describe("Shell", () => {
     await tui.setup().renderOnce();
 
     expect(tui.setup().renderer.getCursorState().visible).toBe(false);
+  });
+
+  test("terminal: focus moves off a docked pane a floating window covers whole, to the window, and stays on one only partly covered", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-covered-focus-test");
+    const covering = { ...floatingOverDockLayout(config, [{ instanceId: "ticker-detail:main", x: 0, y: 0 }]) };
+    // A restored session at phone width: the window fills the terminal, and focus was left on the pane under it.
+    const filled = { ...covering, floating: [{ instanceId: "ticker-detail:main", x: 0, y: 0, width: 60, height: 30, zIndex: 60 }] };
+    const { actions } = await renderShell(createShellStateWithLayout(config, filled, "portfolio-list:main"), { width: 55, height: 24 });
+    await tui.setup().renderOnce();
+    expect(actions.filter((action) => action.type === "FOCUS_PANE").at(-1)).toEqual({ type: "FOCUS_PANE", paneId: "ticker-detail:main" });
+
+    const partly = await renderShell(createShellStateWithLayout(config, covering, "portfolio-list:main"), { width: 80, height: 24 });
+    await tui.setup().renderOnce();
+    expect(partly.actions.filter((action) => action.type === "FOCUS_PANE")).toEqual([]);
   });
 
   test("keeps focused pane local detail state when maximizing a floating pane", async () => {
@@ -1136,7 +1473,7 @@ describe("Shell", () => {
     expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
   });
 
-  test("moves a floating pane in window mode and commits once", async () => {
+  test("moves a floating pane in window mode, and Enter commits once and leaves the mode", async () => {
     const config = createDefaultConfig("/tmp/gloomberb-shell-window-mode-test");
     const floatingLayout = cloneLayout(config.layout);
     floatingLayout.dockRoot = { kind: "pane", instanceId: "portfolio-list:main" };
@@ -1153,7 +1490,8 @@ describe("Shell", () => {
       await tui.setup().renderOnce();
     });
 
-    expect(tui.frame()).toContain("Committed");
+    expect(tui.frame()).not.toContain("WINDOW MOVE");
+    expect(actions.at(-1)).toEqual({ type: "FOCUS_PANE", paneId: "ticker-detail:main" });
     const updateLayout = findUpdateLayout(actions);
     expect(actions.filter((action) => action.type === "PUSH_LAYOUT_HISTORY")).toHaveLength(1);
     expect(updateLayout?.layout.floating.find((entry: any) => entry.instanceId === "ticker-detail:main")).toEqual(expect.objectContaining({
@@ -1162,7 +1500,7 @@ describe("Shell", () => {
     }));
   });
 
-  test("returns to window selection after commit for editing another window", async () => {
+  test("Tab picks another window in move mode, and Enter moves it and raises it above the rest", async () => {
     const config = createDefaultConfig("/tmp/gloomberb-shell-window-mode-repeat-test");
     const floatingLayout = cloneLayout(config.layout);
     floatingLayout.dockRoot = null;
@@ -1175,31 +1513,16 @@ describe("Shell", () => {
     );
 
     await emitKeypress({ name: "m", ctrl: true, shift: true });
-    await emitKeypress({ name: "right" });
-    await emitKeypress({ name: "enter" });
-
-    expect(tui.frame()).toContain("WINDOW MOVE");
-
     await emitKeypress({ name: "tab" });
     await emitKeypress({ name: "right" });
     await emitKeypress({ name: "enter" });
 
     const updates = actions.filter((action) => action.type === "UPDATE_LAYOUT");
-    expect(updates).toHaveLength(2);
-    expect(updates[0]?.layout.floating.find((entry: any) => entry.instanceId === "ticker-detail:main")).toEqual(expect.objectContaining({
-      x: 10,
-      y: 2,
-    }));
-    expect(updates[1]?.layout.floating.find((entry: any) => entry.instanceId === "ticker-detail:main")).toEqual(expect.objectContaining({
-      x: 10,
-      y: 2,
-    }));
-    expect(updates[1]?.layout.floating.find((entry: any) => entry.instanceId === "portfolio-list:main")).toEqual(expect.objectContaining({
-      x: 4,
-      y: 1,
-    }));
-    const movedPortfolio = updates[1]?.layout.floating.find((entry: any) => entry.instanceId === "portfolio-list:main");
-    const movedTicker = updates[1]?.layout.floating.find((entry: any) => entry.instanceId === "ticker-detail:main");
+    expect(updates).toHaveLength(1);
+    const movedPortfolio = updates[0]?.layout.floating.find((entry: any) => entry.instanceId === "portfolio-list:main");
+    const movedTicker = updates[0]?.layout.floating.find((entry: any) => entry.instanceId === "ticker-detail:main");
+    expect(movedPortfolio).toEqual(expect.objectContaining({ x: 4, y: 1 }));
+    expect(movedTicker).toEqual(expect.objectContaining({ x: 8, y: 2 }));
     expect(movedPortfolio?.zIndex).toBeGreaterThan(movedTicker?.zIndex ?? 0);
   });
 
@@ -1224,31 +1547,31 @@ describe("Shell", () => {
     }));
   });
 
-  test("toggles the selected window between docked and floating in window move mode", async () => {
+  test.each([
+    ["docked", false],
+    ["floating", true],
+  ] as const)("d in window move mode toggles a %s window between docked and floating", async (_name, floating) => {
     const config = createDefaultConfig("/tmp/gloomberb-shell-window-mode-dock-toggle-test");
     const mainPane = requireLayoutInstance(config, "portfolio-list:main");
-    const dockedLayout = {
-      dockRoot: { kind: "pane" as const, instanceId: "portfolio-list:main" },
+    const layout = {
+      dockRoot: floating ? null : { kind: "pane" as const, instanceId: "portfolio-list:main" },
       instances: [{ ...mainPane }],
-      floating: [],
+      floating: floating ? [{ instanceId: "portfolio-list:main", x: 4, y: 2, width: 32, height: 10, zIndex: 50 }] : [],
     };
     const { actions } = await renderShell(
-      createShellStateWithLayout(config, dockedLayout, "portfolio-list:main"),
+      createShellStateWithLayout(config, layout, "portfolio-list:main"),
     );
 
     await emitKeypress({ name: "m", ctrl: true, shift: true });
-    expect(tui.frame()).toContain("d float");
+    expect(tui.frame()).toContain("WINDOW MOVE");
 
-    await emitKeypress({ name: "d" });
-    await emitKeypress({ name: "enter" });
     await emitKeypress({ name: "d" });
     await emitKeypress({ name: "enter" });
 
     const updates = actions.filter((action) => action.type === "UPDATE_LAYOUT");
-    expect(updates).toHaveLength(2);
-    expect(updates[0]?.layout.floating.some((entry: any) => entry.instanceId === "portfolio-list:main")).toBe(true);
-    expect(updates[1]?.layout.floating.some((entry: any) => entry.instanceId === "portfolio-list:main")).toBe(false);
-    expect(updates[1]?.layout.dockRoot).toEqual({ kind: "pane", instanceId: "portfolio-list:main" });
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.layout.floating.some((entry: any) => entry.instanceId === "portfolio-list:main")).toBe(!floating);
+    expect(updates[0]?.layout.dockRoot).toEqual(floating ? { kind: "pane", instanceId: "portfolio-list:main" } : null);
   });
 
   test("previews a directional docked window move before committing it", async () => {
@@ -1369,6 +1692,82 @@ describe("Shell", () => {
     expect(updateLayout?.layout.instances).toEqual([]);
     expect(updateLayout?.layout.floating).toEqual([]);
     expect(updateLayout?.layout.dockRoot).toBeNull();
+  });
+
+  test("double Escape closes the focused floating pane and focuses the next floating one", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-test");
+    const layout = floatingOverDockLayout(config, [
+      { instanceId: "ticker-detail:main", x: 4, y: 2 },
+      { instanceId: "ticker-detail:secondary", x: 8, y: 3 },
+    ]);
+    // Focus came from the docked pane, where Ctrl+W would hand it back.
+    const { actions } = await renderShell(
+      { ...createShellStateWithLayout(config, layout, "ticker-detail:secondary"), previousFocusedPaneId: "portfolio-list:main" },
+      { width: 40, height: 12 },
+    );
+
+    await emitKeypress({ name: "escape", sequence: "\u001b" });
+    await emitKeypress({ name: "escape", sequence: "\u001b" });
+
+    const updateLayout = actions.find((action) => action.type === "UPDATE_LAYOUT");
+    expect(updateLayout?.layout.floating.map((entry: { instanceId: string }) => entry.instanceId)).toEqual(["ticker-detail:main"]);
+    expect(updateLayout?.focusedPaneId).toBe("ticker-detail:main");
+  });
+
+  // A ticker opened from a list floats over it: one Esc puts it away and the
+  // list has the keys again, as a dialog does. Esc Esc, the old way, still
+  // closes that one window and not the list as well.
+  test("one Esc closes the focused floating pane and focus goes back where it was", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-test");
+    const layout = floatingOverDockLayout(config, [{ instanceId: "ticker-detail:main", x: 4, y: 2 }]);
+    const { actions } = await renderShell(
+      { ...createShellStateWithLayout(config, layout, "ticker-detail:main"), previousFocusedPaneId: "portfolio-list:main" },
+      { width: 40, height: 12 },
+    );
+
+    await emitKeypress({ name: "escape", sequence: "\u001b" });
+    const updates = actions.filter((action) => action.type === "UPDATE_LAYOUT");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.layout.floating).toEqual([]);
+    expect(updates[0]?.focusedPaneId).toBe("portfolio-list:main");
+
+    await emitKeypress({ name: "escape", sequence: "\u001b" });
+    await emitKeypress({ name: "escape", sequence: "\u001b" });
+    expect(actions.filter((action) => action.type === "UPDATE_LAYOUT")).toHaveLength(1);
+  });
+
+  // Ask Gloom's draft goes with its pane: the Esc that leaves the composer,
+  // and any after it, never close the window over it. Ctrl+W still does.
+  test("no Esc closes a floating pane that holds unsent work", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-test");
+    const layout = floatingOverDockLayout(config, [{ instanceId: "ticker-detail:main", x: 4, y: 2 }]);
+    const release = holdPaneUnsentWork("ticker-detail:main");
+    try {
+      const { actions } = await renderShell(
+        { ...createShellStateWithLayout(config, layout, "ticker-detail:main"), previousFocusedPaneId: "portfolio-list:main" },
+        { width: 40, height: 12 },
+      );
+
+      await emitKeypress({ name: "escape", sequence: "\u001b" });
+      await emitKeypress({ name: "escape", sequence: "\u001b" });
+      expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
+
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      await emitKeypress({ name: "escape", sequence: "\u001b" });
+      expect(actions.find((action) => action.type === "UPDATE_LAYOUT")?.layout.floating).toEqual([]);
+    } finally {
+      release();
+    }
+  });
+
+  test("one Esc leaves a locked floating pane and a docked one open", async () => {
+    const config = createDefaultConfig("/tmp/gloomberb-shell-test");
+    const layout = floatingOverDockLayout(config, [{ instanceId: "ticker-detail:main", x: 4, y: 2, locked: true }]);
+    const { actions } = await renderShell(createShellStateWithLayout(config, layout, "ticker-detail:main"), { width: 40, height: 12 });
+
+    await emitKeypress({ name: "escape", sequence: "\u001b" });
+    expect(actions.some((action) => action.type === "UPDATE_LAYOUT")).toBe(false);
   });
 
   test("closes the focused floating pane with Ctrl+W", async () => {

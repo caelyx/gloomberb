@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { CrowdingRow, TickerHolderRow } from "./signals";
 import { formatMoneyCompact } from "./format";
 import { formatSplitRatio } from "./model";
@@ -31,7 +32,7 @@ export function isOptionType(type: unknown): boolean {
 
 /** A position type as the text report prints it: `CALL*` for an option, which `OPTION_ROWS_NOTE` explains. */
 export function markedPositionType(type: unknown): string {
-  const text = typeof type === "string" && type ? type : "--";
+  const text = typeof type === "string" && type ? type : MISSING_VALUE;
   return isOptionType(type) ? `${text}${OPTION_MARK}` : text;
 }
 
@@ -140,27 +141,66 @@ export function splitAdjustedText(lines: readonly (SplitLine & { ratio: number }
   return `${prefix}: ${listedLines(lines, (line) => `${lineName(line)} ${formatSplitRatio(line.ratio)}`)} (split between the filings, as the corporate actions show)`;
 }
 
-/** "No Est P&L: XYZ (shares and value per share moved as across a split, and the corporate actions could not be read to tell)": lines left without a figure, `leftOut` opening it. */
-export function splitUnreadText(lines: readonly SplitLine[], leftOut: string): string {
-  return `${leftOut}: ${listedLines(lines, lineName)} (shares and value per share moved as across a split, and the corporate actions could not be read to tell)`;
+/** Why lines that moved as across a split have no figure: their corporate actions could not be read, or the time to read them ran out. */
+function unreadReason(lines: readonly (SplitLine & { late?: boolean })[]): string {
+  const late = lines.filter((line) => line.late).length;
+  const failed = lines.length - late;
+  if (late === 0) return "the corporate actions could not be read to tell";
+  if (failed === 0) return "the report ran out of time before reading their corporate actions";
+  return `the report ran out of time before reading the corporate actions of ${count(late)}; those of ${count(failed)} could not be read`;
 }
 
+/** "4.2%" of a book, or "under 0.1%". */
+function bookShareText(share: number): string {
+  return share < 0.001 ? "under 0.1%" : `${(share * 100).toFixed(1)}%`;
+}
+
+/**
+ * "No Est P&L: XYZ (shares and value per share moved as across a split, and the corporate actions could not be
+ * read to tell)": lines left without a figure, in the order given (largest first), `leftOut` opening it, and with
+ * `bookShare` what they weighed in the book at the quarter's start.
+ */
+export function splitUnreadText(lines: readonly (SplitLine & { late?: boolean })[], leftOut: string, bookShare?: number | null): string {
+  const share = bookShare != null && bookShare > 0 ? `, ${bookShareText(bookShare)} of the book at the quarter's start` : "";
+  return `${leftOut}${share}: ${listedLines(lines, lineName)} (shares and value per share moved as across a split, and ${unreadReason(lines)})`;
+}
+
+type UnreadRow = SplitLine & { splitUnread?: boolean; splitLate?: boolean };
+
 /** The note for the lines of a Holdings table left without an Est P&L because their split could not be confirmed: a data limitation, the pane's notice as well as the report's. */
-export function holdingUnreadNotes(rows: readonly (SplitLine & { splitUnread?: boolean })[]): string[] {
-  const unread = rows.filter((row) => row.splitUnread);
+export function holdingUnreadNotes(rows: readonly UnreadRow[]): string[] {
+  const unread = rows.filter((row) => row.splitUnread).map((row) => ({ ...row, late: row.splitLate }));
   return unread.length ? [splitUnreadText(unread, "No Est P&L")] : [];
 }
 
 /** What a Holdings report says of its lines that moved as across a split: the ones priced split-adjusted (method, so a report's note only), and the ones left without a figure. */
-export function holdingSplitNotes(rows: readonly (SplitLine & { splitRatio?: number; splitUnread?: boolean })[]): string[] {
-  const adjusted = rows.flatMap((row) => row.splitRatio ? [{ ...row, ratio: row.splitRatio }] : []);
-  return [...(adjusted.length ? [splitAdjustedText(adjusted, "Est P&L split-adjusted")] : []), ...holdingUnreadNotes(rows)];
+export function holdingSplitNotes(rows: readonly (UnreadRow & { splitRatio?: number; cusipChange?: { previousCusip: string; confirmedBy: "sec-list" | "split" } })[]): string[] {
+  const adjusted = rows.flatMap((row) => row.splitRatio && !row.cusipChange ? [{ ...row, ratio: row.splitRatio }] : []);
+  // A split that moved the shares to a new CUSIP: the share counts fit it, and the SEC's list or the split record confirms it.
+  const moved = rows.flatMap((row) => row.splitRatio && row.cusipChange ? [{ ...row, ratio: row.splitRatio, ...row.cusipChange }] : []);
+  const confirmed = (line: (typeof moved)[number]) => line.confirmedBy === "sec-list" ? "per the SEC's 13(f) list" : "per the split record";
+  return [
+    ...(adjusted.length ? [splitAdjustedText(adjusted, "Est P&L split-adjusted")] : []),
+    ...(moved.length ? [`New CUSIP across a split: ${listedLines(moved, (line) => `${lineName(line)} ${formatSplitRatio(line.ratio)}, was ${line.previousCusip} (${confirmed(line)})`)}; Est P&L on split-adjusted shares`] : []),
+    ...holdingUnreadNotes(rows),
+  ];
 }
 
 /** "Q2 2026" for the quarter ending 30 Jun 2026. */
 function quarterText(period: string): string {
   const day = calendarDay(period);
   return day ? `Q${Math.floor(day.getUTCMonth() / 3) + 1} ${day.getUTCFullYear()}` : period;
+}
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
+
+/** "Q3 2026" and "due Mon 16 Nov 2026": when the fund's next 13F is due, the weekday shown since the deadline moves off a weekend. */
+export function nextFilingText(next: { period: string; due: string }): { quarter: string; due: string } {
+  const day = calendarDay(next.due);
+  return {
+    quarter: quarterText(next.period),
+    due: `due ${day ? `${WEEKDAYS[day.getUTCDay()]} ` : ""}${filingDayText(next.due)}`,
+  };
 }
 
 /** The fund to open for a manager: its CIK, else its quoted name. */

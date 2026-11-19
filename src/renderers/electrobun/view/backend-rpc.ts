@@ -11,14 +11,15 @@ import {
   type ElectrobunBackendInit,
   type RemoteControlRequestMessage,
   type ElectrobunDesktopRpcSchema,
-  type WindowIntentRequestMessage,
 } from "../shared/protocol";
 import { decodeRpcResponse, decodeRpcValue, encodeRpcValue } from "../shared/rpc-codec";
 import { subscribeCapability, type CapabilitySubscriptionOptions } from "./capability-subscription";
-import { RpcTimeoutError } from "../../../utils/rpc-timeout-error";
+import { connectionHealth, DESKTOP_BRIDGE_CONNECTION_ID } from "../../../core/connection-health";
+import { createBridgeHealth, createHostRoute } from "./host-route";
 import { nameRpcTimeout, RPC_MAX_REQUEST_TIME_MS } from "./rpc-timeout";
 import type { RemoteControlRequest, RemoteControlResponse } from "../../../remote/types";
-import type { DesktopWindowIntent, DesktopWindowIntentResult } from "../../../types/desktop-window";
+import type { StallEvent } from "../../../utils/main-thread-stall";
+import { publishPluginSeedProgress } from "../../../plugins/seed-progress";
 
 type BackendMessages = ElectrobunDesktopRpcSchema["webview"]["messages"];
 type BackendMessageName = keyof BackendMessages;
@@ -26,11 +27,9 @@ type BackendMessageName = keyof BackendMessages;
 type KeyedBackendMessageName = "context-menu.select" | "capability.event" | "http.stream.chunk";
 type BackendMessageListener<K extends BackendMessageName> = (message: BackendMessages[K]) => void;
 type RemoteControlRequestHandler = (request: RemoteControlRequest) => Promise<RemoteControlResponse>;
-type WindowIntentHandler = (windowId: string, intent: DesktopWindowIntent) => DesktopWindowIntentResult;
 
 let initSnapshot: ElectrobunBackendInit | null = null;
 let remoteControlRequestHandler: RemoteControlRequestHandler | null = null;
-let windowIntentHandler: WindowIntentHandler | null = null;
 const messageListeners = new Map<string, Set<(message: unknown) => void>>();
 const pendingDesktopDeepLinks: DesktopDeepLinkMessage[] = [];
 
@@ -64,19 +63,8 @@ const rpc = Electroview.defineRPC<ElectrobunDesktopRpcSchema>({
         const decoded = decodeRpcValue<RemoteControlRequest>(message.request);
         return encodeRpcValue(await remoteControlRequestHandler(decoded)) as RemoteControlResponse;
       },
-      "window.intent": async (message: WindowIntentRequestMessage) => {
-        // Only the main window applies changes; anywhere else, or before it is ready, they are dropped.
-        if (!windowIntentHandler || typeof message?.windowId !== "string") return { applied: false };
-        return windowIntentHandler(message.windowId, decodeRpcValue<DesktopWindowIntent>(message.intent));
-      },
     },
     messages: {
-      "desktop.activeWindow": (message) => {
-        emit("desktop.activeWindow", { windowKey: typeof message?.windowKey === "string" ? message.windowKey : null });
-      },
-      "desktop.focusPane": (message) => {
-        if (typeof message?.paneId === "string") emit("desktop.focusPane", { paneId: message.paneId });
-      },
       "context-menu.select": (message) => {
         emit("context-menu.select", message, message.requestId);
       },
@@ -99,6 +87,24 @@ const rpc = Electroview.defineRPC<ElectrobunDesktopRpcSchema>({
       "desktop.themePreview": (message) => {
         emit("desktop.themePreview", { preview: decodeRpcValue<DesktopThemePreviewMessage["preview"]>(message.preview) });
       },
+      "desktop.windows": (message) => {
+        if (!Array.isArray(message?.windows)) return;
+        emit("desktop.windows", { windows: message.windows });
+      },
+      "desktop.otherWindowTabs": (message) => {
+        const tabs = decodeRpcValue<unknown>(message?.tabs);
+        if (Array.isArray(tabs)) emit("desktop.otherWindowTabs", { tabs });
+      },
+      "desktop.focusPane": (message) => {
+        if (typeof message?.paneId !== "string" || !message.paneId) return;
+        emit("desktop.focusPane", { paneId: message.paneId });
+      },
+      "desktop.windowVisibility": (message) => {
+        emit("desktop.windowVisibility", { visible: message?.visible !== false });
+      },
+      "desktop.saveFailed": () => {
+        emit("desktop.saveFailed", {});
+      },
       "update.progress": (message) => {
         emit("update.progress", { progress: decodeRpcValue(message.progress) });
       },
@@ -106,6 +112,12 @@ const rpc = Electroview.defineRPC<ElectrobunDesktopRpcSchema>({
         if (!Array.isArray(message?.directories)) return;
         const directories = message.directories.filter((directory): directory is string => typeof directory === "string");
         emit("plugins.updated", { directories });
+      },
+      // Kept, not handed to a listener: it can arrive before the app is up,
+      // and the app reads the latest whenever it looks.
+      "plugins.seedProgress": (message) => {
+        if (typeof message?.seed?.seq !== "number" || !Array.isArray(message.seed.plugins)) return;
+        publishPluginSeedProgress(message.seed);
       },
       "capability.event": (message) => {
         emit("capability.event", {
@@ -123,21 +135,14 @@ const rpc = Electroview.defineRPC<ElectrobunDesktopRpcSchema>({
 
 const electroview = new Electroview({ rpc });
 
-const BRIDGE_READY_LIMIT_MS = 5_000;
-
-async function waitForBridgeReady(): Promise<void> {
-  const start = Date.now();
-  while (Date.now() - start < BRIDGE_READY_LIMIT_MS) {
-    if (electroview.bunSocket?.readyState === WebSocket.OPEN) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  throw new RpcTimeoutError("Electrobun RPC socket did not open in time.", {
-    elapsedMs: Date.now() - start,
-    limitMs: BRIDGE_READY_LIMIT_MS,
-  });
-}
+// The socket is the fast way to the Bun process, not the only one: a request
+// goes whenever Electroview can deliver it (see `createHostRoute`).
+const hostRoute = createHostRoute({
+  socket: () => electroview.hostSocket,
+  nativeBridge: () => !!window.__electrobunHostBridge,
+});
+// What failed for want of an answer is asked again once the bridge answers.
+const bridgeHealth = createBridgeHealth(() => connectionHealth.reportRecovery(DESKTOP_BRIDGE_CONNECTION_ID));
 
 export function backendRequest<T = unknown>(
   method: "capability.invoke",
@@ -151,21 +156,26 @@ export async function backendRequest(
   method: DesktopBackendRequestMethod,
   payload: unknown = null,
 ): Promise<unknown> {
-  await waitForBridgeReady();
-  const result = await nameRpcTimeout(method, payload, () => rpc.request["backend.request"]({
-    method,
-    payload: encodeRpcValue(payload),
-  }));
+  const encoded = encodeRpcValue(payload);
+  const result = await bridgeHealth.track(async () => {
+    await hostRoute.ready(method);
+    return nameRpcTimeout(method, payload, () => rpc.request["backend.request"]({ method, payload: encoded }));
+  });
   return decodeRpcResponse(result);
 }
 
-export async function initElectrobunBackend(payload?: { kind?: "main" | "detached" | "window"; paneId?: string; windowId?: string }): Promise<ElectrobunBackendInit> {
+export async function initElectrobunBackend(payload?: { kind?: "main" | "detached"; paneId?: string }): Promise<ElectrobunBackendInit> {
   initSnapshot = await backendRequest("init", payload ?? {});
   return initSnapshot;
 }
 
 export function requestElectrobunRestart(message: DesktopRestartMessage = {}): void {
   rpc.send["host.restart"](message);
+}
+
+/** The Bun process keeps the stall log and sends its report. */
+export function sendElectrobunStall(event: StallEvent): void {
+  rpc.send["runtime.stall"](event);
 }
 
 export function getElectrobunBackendInitSnapshot(): ElectrobunBackendInit | null {
@@ -180,14 +190,6 @@ export function getElectrobunBackendInitSnapshot(): ElectrobunBackendInit | null
 export function replaceElectrobunCapabilityManifests(manifests: ElectrobunBackendInit["capabilityManifests"]): void {
   if (!initSnapshot) return;
   initSnapshot = { ...initSnapshot, capabilityManifests: manifests };
-}
-
-/** The main window's handler for changes secondary windows send it. */
-export function setElectrobunWindowIntentHandler(handler: WindowIntentHandler): () => void {
-  windowIntentHandler = handler;
-  return () => {
-    if (windowIntentHandler === handler) windowIntentHandler = null;
-  };
 }
 
 export function setElectrobunRemoteRequestHandler(handler: RemoteControlRequestHandler | null): () => void {

@@ -1,13 +1,15 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ChartTableHeader, CurveSurface, curveGhostColors, DataTableView, formatBpAxis, formatPercentAxis, Notice, PaneFooterScope,
-  PaneStatusBody, QueryBar, useChartTableSelection, usePaneNoticeFooter, usePaneTabs, type DataTableColumn, type QueryBarFilter,
+  ChartTableHeader, CurveSurface, curveGhostColors, DataTableView, formatPercentAxis, Notice, PaneFooterScope,
+  PaneStatusBody, QueryBar, spanAxisFormatter, useChartTableSelection, usePaneNoticeFooter, usePaneTabs, type DataTableColumn, type QueryBarFilter,
   type StatItem,
 } from "../../../components";
 import { curveStrip, curveSurfaceMinRows } from "../../../components/chart/curve";
 import { curveLookbackLabel } from "../../../components/chart/curve/model";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { useAsyncResource } from "../../../react/async-resource";
+import { isPermanentClientError } from "../../../api-client/errors";
 import { usePaneSettingValue } from "../../../state/app/context";
 import { usePluginPaneState } from "../../../public/react";
 import { priceColor } from "../../../theme/colors";
@@ -18,7 +20,7 @@ import type { PluginModule } from "../plugin-module";
 import { GOVERNMENT_BOND_SERIES, TREASURY_SERIES } from "./series";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { usePaneStatusFooter } from "../../../components/layout/pane/status-footer";
-import { formatPercentileRank } from "../../../utils/format";
+import { savedCopyFooterSegment, type PaneFooterSegment } from "../../../components/layout/pane/footer";
 import { SERIES_COLORS } from "../../../theme/series-colors";
 import type { CurveSeries } from "../../../components/chart/curve";
 import { yieldCurveHeadless } from "./headless";
@@ -27,20 +29,29 @@ import {
   type YieldTenorRow,
 } from "./chart";
 import {
-  compareDate, curveCutoff, curveIdOf, CURVE_OPTIONS, curveSpreadFigures, curveTenorMove, loadComparePoints, loadCurveData,
+  compareDate, curveCutoff, curveIdOf, CURVE_OPTIONS, curveSpreadFigures, curveSpreadText, curveTenorMove, loadComparePoints,
   parseCompareInput, parseCurveArgument, type CurveId,
 } from "./curves";
 import { formatMoveRank, MOVE_HORIZONS } from "../shared/move-rank";
 import { forwardCurve, type CurveBasis } from "./forward";
 import { loadYieldCurveLookbacks, yieldCurveDate } from "./history";
 import { curveAsOf, isYieldObservationDate, type YieldPoint, yieldCurveErrors } from "./treasury-data";
-import { loadWorldRows, type WorldRow } from "./world";
+import type { WorldRow } from "./world";
 import { SwapsTab } from "./swaps";
-import { swapCurveCache } from "./client";
+import {
+  cachedCurve, cachedWorldRows, curveViewCache, loadSavedCurve, loadSavedWorldRows, swapCurveCache, worldCurvesCache,
+} from "./client";
+import { usBondMarketClosedNote } from "../../../market-data/us-bond-market";
 
 type GcTab = "curve" | "world" | "swaps";
 const TABS = [{ label: "Curve", value: "curve" }, { label: "World", value: "world" }, { label: "Swaps", value: "swaps" }];
 const EMPTY_POINTS: YieldPoint[] = [];
+
+/** A tab showing the copy an earlier read saved, its refresh having failed, says when that copy is from. */
+function useSavedCopyInfo(savedAt: number | null | undefined): PaneFooterSegment[] | undefined {
+  return useMemo(() => savedAt != null ? [savedCopyFooterSegment("saved-copy", savedAt)] : undefined, [savedAt]);
+}
+
 /** Axis word for the loaded curve's basis. */
 const BASIS_LABEL: Record<CurveBasis, string> = {
   par: "Par yield",
@@ -71,6 +82,8 @@ const formatBp = (value: number) => {
   const bp = Math.round(value);
   return `${bp > 0 ? "+" : ""}${bp === 0 ? 0 : bp}bp`;
 };
+/** The difference chart's axis: yields are quoted to the bp, so a tag reads whole bp as the table does. */
+const formatBpDifferenceAxis = spanAxisFormatter((value, digits) => `${value.toFixed(digits)}bp`, 0);
 
 /** "1D", "1D and 1W", "1D, 1W and 1M". */
 function andList(items: readonly string[]): string {
@@ -165,12 +178,18 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
   const compareField = useDraftField(compareInput);
   const editing = dateField.active || compareField.active;
 
-  const loadCurve = useCallback(async () => loadCurveData(curve, requestedDate), [curve, requestedDate]);
-  const { data, loading, error, updatedAt: lastUpdated, load } = useAsyncResource(loadCurve);
+  // The saved copy paints first and answers when a refresh fails; a failed refresh never empties the tab, unless
+  // asking again cannot help (access denied), which is said instead.
+  const loadCurve = useCallback(async () => loadSavedCurve(curve, requestedDate), [curve, requestedDate]);
+  const { data: answer, loading, error, updatedAt: lastUpdated, load } = useAsyncResource(loadCurve, {
+    initialData: () => cachedCurve(curve, requestedDate), clearOnError: isPermanentClientError,
+  });
+  const data = answer?.data ?? null;
+  const savedInfo = useSavedCopyInfo(answer?.savedAt);
   // A pending curve or date change must never relabel the previous curve as the new one.
   const current = data?.curve === curve && data.requestedDate === requestedDate ? data : null;
   const points = current?.points ?? EMPTY_POINTS;
-  const refreshLatest = useCallback(() => { if (!requestedDate) void load(); }, [requestedDate, load]);
+  const refreshLatest = useCallback(() => { if (!requestedDate) load(); }, [requestedDate, load]);
   useAutoRefresh(lastUpdated, refreshLatest);
   const session = curveSession(points);
 
@@ -209,7 +228,7 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
       dateField.setDraft(nextDate);
       setFieldError(null);
       dateField.leave();
-      if (nextDate === requestedDate) void load();
+      if (nextDate === requestedDate) load();
     } catch (failure) {
       setFieldError(failure instanceof Error ? failure.message : String(failure));
     }
@@ -221,7 +240,7 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
       compareField.setDraft(next);
       setFieldError(null);
       compareField.leave();
-      if (next && next === compareInput) void compareResource.load();
+      if (next && next === compareInput) compareResource.load();
     } catch (failure) {
       setFieldError(failure instanceof Error ? failure.message : String(failure));
     }
@@ -229,10 +248,10 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
 
   // The [d]ate, [v]s and [c]urrent hints bind their own keys; Esc in a field is the query bar's.
   usePaneRefreshKey(() => {
-    void load();
-    if (compareKey) void compareResource.load();
+    load();
+    if (compareKey) compareResource.load();
     // A manual refresh also retries look-backs that failed; good ones are kept.
-    if (fredSession && (lookbackResource.error || fredLookbacks?.some((lookback) => !lookback.points))) void lookbackResource.load();
+    if (fredSession && (lookbackResource.error || fredLookbacks?.some((lookback) => !lookback.points))) lookbackResource.load();
   }, { focused, enabled: !editing });
 
   const asOf = curveAsOf(points);
@@ -243,9 +262,13 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
   // Both look-backs share one request per tenor, so they usually fail together.
   const lookbackFailures = [...new Set((fredLookbacks ?? []).flatMap((lookback) => lookback.points ? [] : [lookback.error]))]
     .map((message) => `${andList((fredLookbacks ?? []).filter((lookback) => lookback.error === message).map((lookback) => lookback.id))} look-back unavailable: ${message}`);
+  // A Treasury curve asked for a day the bond market was shut (Veterans Day) says so, and which day it shows.
+  const closedDay = requestedDate && asOf && (curve === "us" || curve === "us-real" || curve === "us-breakeven")
+    ? usBondMarketClosedNote(requestedDate, asOf) : null;
   usePaneNoticeFooter({
     registrationId: "yield-curve:notices",
     notices: [
+      closedDay ? `${closedDay}.` : null,
       !asOf && points.some((point) => point.yield != null) ? "The tenors carry mixed or unknown observation dates, so the curve is not one session." : null,
       missingTenors.length ? `Unavailable tenors: ${missingTenors.join(", ")}.` : null,
       points.some((point) => point.stale) ? "Some tenors are cached values because their refresh failed." : null,
@@ -260,6 +283,7 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
     registrationId: "yield-curve",
     loading: loading || (compareKey != null && compareResource.loading && !comparePoints),
     error: error || sourceError || null,
+    info: savedInfo,
     hints: [
       { id: "date", key: "d", label: "ate", onPress: dateField.focus },
       { id: "compare", key: "v", label: "s", title: "Compare with a date", onPress: compareField.focus },
@@ -274,11 +298,9 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
   // last year; an inverted one is the warning the curve's shape gives. Then the
   // selected tenor's 1D and 1W moves, ranked by size against its whole history.
   const figures = useMemo<StatItem[]>(() => [
-    ...curveSpreadFigures(current, lookbackCurves).map(({ id, value, change1d, percentile1y }): StatItem => ({
-      id, label: id, value: value == null ? "--" : formatYieldChange(value),
-      detail: [`${change1d == null ? "--" : formatYieldChange(change1d)} 1D`,
-        ...(percentile1y == null ? [] : [formatPercentileRank(percentile1y, "1Y")])].join(" · "),
-      tone: value != null && Math.round(value * 100) < 0 ? "warning" : undefined,
+    ...curveSpreadFigures(current, lookbackCurves).map((figure): StatItem => ({
+      id: figure.id, label: figure.id, ...curveSpreadText(figure),
+      tone: figure.value != null && Math.round(figure.value * 100) < 0 ? "warning" : undefined,
     })),
     ...(selectedId ? MOVE_HORIZONS : []).flatMap((horizon): StatItem[] => {
       const move = curveTenorMove(current, selectedId!, horizon);
@@ -317,9 +339,9 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
   const strip = curveStrip(series, formatValue, { caption: differenceView ? "Change" : level ? `${level} %` : "Yield %", selectedPointId: selectedId });
   const renderCell = useCallback((row: YieldTenorRow, column: DataTableColumn) => {
     if (column.id === "tenor") return { text: row.id };
-    if (column.id === "asOf") return { text: row.asOf ?? "--", color: colors.textMuted };
+    if (column.id === "asOf") return { text: row.asOf ?? MISSING_VALUE, color: colors.textMuted };
     const value = row[column.id as "yield" | "compare" | "forward" | "change1d" | "change1w" | "change1m" | "changeCompare"];
-    if (value == null) return { text: "--", color: colors.textMuted };
+    if (value == null) return { text: MISSING_VALUE, color: colors.textMuted };
     if (column.id === "yield" || column.id === "compare" || column.id === "forward") return { text: formatYield(value) };
     // Colour follows the shown basis points, so a move that rounds to 0bp stays neutral.
     return { text: formatYieldChange(value), color: priceColor(Math.round(value * 100), colors) };
@@ -377,7 +399,7 @@ function CurveTab({ curve, onCurveChange, focused, width, height }: {
             chart={strip ? {
               render: (size) => <CurveSurface series={series} width={size.width} height={size.height} display="chart"
                 caption={caption} xScale={differenceView ? "even" : "log"} formatValue={formatValue} formatChange={formatYieldChange}
-                formatAxisValue={differenceView ? formatBpAxis : formatPercentAxis} selectedPointId={selectedId}
+                formatAxisValue={differenceView ? formatBpDifferenceAxis : formatPercentAxis} selectedPointId={selectedId}
                 onSelectedPointChange={(id) => setSelectedTenor(id)} />,
               minRows: curveSurfaceMinRows({ series, width, caption }),
               strip,
@@ -401,8 +423,8 @@ const WORLD_COLUMNS: DataTableColumn[] = [
   { id: "asOf", label: "As of", width: 10, align: "left" },
 ];
 const worldKey = (row: WorldRow) => row.id;
-/** Palette slots far enough apart that six curves on one axis read apart (skips the orange beside yellow). */
-const MARKET_COLOR_SLOTS = [0, 1, 2, 3, 4, 7] as const;
+/** Palette slots far enough apart that the markets' curves on one axis read apart; the orange and green come last. */
+const MARKET_COLOR_SLOTS = [0, 1, 2, 3, 4, 7, 5, 8] as const;
 
 /** One row per market, each on the session its publisher last printed. */
 function WorldTab({ onOpen, focused, width, height }: {
@@ -413,11 +435,14 @@ function WorldTab({ onOpen, focused, width, height }: {
 }) {
   const colors = useThemeColors();
   const [selected, setSelected] = usePluginPaneState<string | null>("yield-curve:market", null);
-  const loadWorld = useCallback(() => loadWorldRows(), []);
-  const { data, loading, error, updatedAt, load } = useAsyncResource(loadWorld);
+  const loadWorld = useCallback(() => loadSavedWorldRows(), []);
+  const { data: answer, loading, error, updatedAt, load } = useAsyncResource(loadWorld, {
+    initialData: cachedWorldRows, clearOnError: isPermanentClientError,
+  });
+  const data = answer?.data ?? null;
   useAutoRefresh(updatedAt, load);
-  usePaneRefreshKey(() => void load(), { focused });
-  usePaneStatusFooter({ registrationId: "yield-curve:world", loading, error: error || null });
+  usePaneRefreshKey(() => load(), { focused });
+  usePaneStatusFooter({ registrationId: "yield-curve:world", loading, error: error || null, info: useSavedCopyInfo(answer?.savedAt) });
   const rows = data ?? [];
   const selectedId = rows.some((row) => row.id === selected) ? selected! : rows[0]?.id ?? null;
   // Every market's latest curve, each in its own colour; the selected row is
@@ -435,7 +460,7 @@ function WorldTab({ onOpen, focused, width, height }: {
     if (column.id === "asOf") return { text: row.asOf, color: colors.textMuted };
     const value = row[column.id as "twoYear" | "tenYear" | "thirtyYear" | "twosTens" | "twoYearChange" | "tenYearChange"
       | "thirtyYearChange" | "twosTensChange"];
-    if (value == null) return { text: "--", color: colors.textMuted };
+    if (value == null) return { text: MISSING_VALUE, color: colors.textMuted };
     if (column.id === "twoYear" || column.id === "tenYear" || column.id === "thirtyYear") return { text: formatYield(value) };
     const text = formatYieldChange(value);
     // The curve spread is a level in basis points; the day moves carry their sign's colour.
@@ -447,7 +472,8 @@ function WorldTab({ onOpen, focused, width, height }: {
     <PaneStatusBody loading={loading && !data} error={!data ? error : null} loadingLabel="Loading world curves..." subject="world curves">
       <DataTableView<WorldRow>
         focused={focused} rootWidth={width} rootHeight={height}
-        columns={WORLD_COLUMNS} items={rows} getItemKey={worldKey} renderCell={renderCell}
+        // Maturities in order, each beside its own change.
+        columns={WORLD_COLUMNS} columnReorder={false} items={rows} getItemKey={worldKey} renderCell={renderCell}
         selection={{ kind: "id", selectedId, getId: worldKey, onChange: (id) => setSelected(id) }}
         onActivate={(row) => onOpen(row.id)} sortColumnId={null} sortDirection="asc"
         emptyStateTitle="No curves yet."
@@ -465,8 +491,12 @@ function WorldTab({ onOpen, focused, width, height }: {
 }
 
 export const yieldCurveModule: PluginModule = {
-  setup(ctx) { swapCurveCache.attach(ctx.persistence); },
-  dispose() { swapCurveCache.reset(); },
+  setup(ctx) {
+    for (const cache of [swapCurveCache, curveViewCache, worldCurvesCache]) cache.attach(ctx.persistence);
+  },
+  dispose() {
+    for (const cache of [swapCurveCache, curveViewCache, worldCurvesCache]) cache.reset();
+  },
   series: [...TREASURY_SERIES, ...GOVERNMENT_BOND_SERIES],
   panes: [{
     id: "yield-curve",
@@ -482,8 +512,8 @@ export const yieldCurveModule: PluginModule = {
     paneId: "yield-curve",
     label: "Yield Curve",
     description: "Government bond curves, a world grid, and USD SOFR swap rates, swap spreads and tenor history.",
-    keywords: ["yield", "curve", "treasury", "bonds", "rates", "gc", "interest", "tips", "breakeven", "bund", "gilt", "jgb",
-      "sovereign", "world", "forward", "swaps", "sofr", "ois", "swap spread"],
+    keywords: ["yield", "curve", "treasury", "bonds", "rates", "gc", "interest", "tips", "breakeven", "bund", "bunds", "germany", "german", "gilt", "jgb",
+      "mbono", "cetes", "prefixado", "sovereign", "world", "forward", "swaps", "sofr", "ois", "swap spread", "2s10s", "steepener", "flattener"],
     shortcut: { prefix: "GC", argPlaceholder: "[curve] [date]", argKind: "text", argOptional: true },
     headless: yieldCurveHeadless,
     createInstance: (_context, options) => {

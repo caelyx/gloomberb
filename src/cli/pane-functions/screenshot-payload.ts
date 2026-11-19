@@ -11,10 +11,15 @@ import type { ChartPaneModel } from "../../plugins/builtin/chart-composer/headle
 import { buildHeadlessPaneLoadArgs, loadResolvedHeadlessPaneModel, type LoadedHeadlessPaneModel } from "./headless";
 import { resolve } from "path";
 import type { PaneRuntimeState } from "../../core/state/app/state";
-import { CHART_COMPOSER_PANE_ID, type AppConfig } from "../../types/config";
-import type { OptionsChain, TickerFinancials } from "../../types/financials";
+import { CHART_COMPOSER_PANE_ID, TICKER_RESEARCH_PANE_ID, type AppConfig } from "../../types/config";
+import type { OptionsChain, PricePoint, TickerFinancials } from "../../types/financials";
+import type { InstrumentRef } from "../../market-data/request-types";
+import { fetchHistoryResult } from "../../sources/history-result";
+import { calendarMonthReturnsRequest, trailingDailyClosesRequest } from "../../time-series/calendar-month-returns";
 import type { TickerRecord } from "../../types/ticker";
 import { slugifyName } from "../../utils/slugify";
+import { LIST_FINANCIALS_CONCURRENCY, mapWithConcurrency } from "../../utils/concurrency";
+import { errorMessage } from "../../utils/errors";
 import { requireThemeId } from "../commands/themes";
 import type { DesktopPaneShotIntradayHistory, DesktopPaneShotPayload } from "../desktop-pane-shot";
 import { optionPaneState, SHOT_SIZE_LIMITS, type ShotSizeClamp } from "./options";
@@ -27,11 +32,12 @@ import { defaultValuationSeriesLoader, requiredSeries as valuationRequiredSeries
 import type { DatedObservation } from "../../plugins/builtin/market-valuation/series";
 import { defaultStatLoader } from "../../plugins/builtin/econ-statistics/client";
 import { STATS } from "../../plugins/builtin/econ-statistics/stats";
-import { parsePublicTickerKey, publicTickerKey } from "../../utils/exchanges";
+import { canonicalExchange, parsePublicTickerKey, publicTickerKey } from "../../utils/exchanges";
 import { collectExternalPluginBundles } from "../../renderers/electrobun/bun/external-plugins";
 import { getQuoteMonitorPaneSettings } from "../../plugins/builtin/ticker-detail/settings";
 import { isNotATickerMessage } from "../not-a-ticker";
 import { HISTORY_DEFAULT_RANGE } from "../../plugins/builtin/ticker-detail/data-panes/history-bars";
+import { priceReturnDailyWindow } from "../../market-data/performance";
 import { findCollection } from "../../plugins/builtin/portfolio-list/cli/render";
 import { peekCachedBrokerAccounts } from "../../plugins/builtin/portfolio-list/cached-account";
 import { paneScreenshotEvidenceHook } from "./screenshot-evidence";
@@ -152,6 +158,43 @@ function givenOptionKeys(capability: ResolvedPaneFunction["capability"], options
   return new Set(Object.keys(options).flatMap((key) => findCapabilityOption(capability, key)?.key ?? []));
 }
 
+/** What one row of a capture adds to its payload. */
+interface ShotSymbolCapture {
+  ticker: TickerRecord;
+  financials?: [string, TickerFinancials];
+  /** The row's read failed (refused, timed out): it shows without figures, and the capture names it with the source's reason. */
+  unread?: { symbol: string; reason: string };
+  tape?: TapeCapture;
+  chain?: [string, OptionsChain];
+  /** More than one cadence the pane reads for the row, each answering only its own requests. */
+  historyVariants?: NonNullable<SnapshotMarketData["historyVariants"]>;
+}
+
+/**
+ * PEB reads every week on record and, for the years they are served, the
+ * daily closes that price each figure on its day; DES's overview charts the
+ * weeks and measures its Price Return strip on five years of daily closes.
+ * Captured history answers every request, so the weekly bars would stand in
+ * for the daily ones and the capture read the week around each figure's day
+ * (or each period's start): each cadence is its own, under the listing the
+ * pane asks for. Without daily closes the weekly bars stand alone, as in the app.
+ */
+async function weeklyAndDailyHistoryVariants(
+  context: MarketContext, ticker: TickerRecord, exchange: string, weekly: TickerFinancials["priceHistory"],
+  /** DES's window (priceReturnDailyWindow), which it asks for by its dates; PEB's is the 5Y range. */
+  window?: { start: Date; end: Date },
+): Promise<NonNullable<SnapshotMarketData["historyVariants"]>> {
+  const target = { symbol: ticker.metadata.ticker, exchange: ticker.metadata.exchange ?? "" };
+  const provider = context.dataProvider;
+  const read = window
+    ? provider.getDetailedPriceHistoryWithMetadata?.(target.symbol, exchange, window.start, window.end, "1d", toMarketDataContext(target))
+      .then((result) => result.points)
+      ?? provider.getDetailedPriceHistory?.(target.symbol, exchange, window.start, window.end, "1d", toMarketDataContext(target))
+    : provider.getPriceHistoryForResolution?.(target.symbol, exchange, "5Y", "1d", toMarketDataContext(target));
+  const daily = await (read ?? Promise.resolve([])).catch(logFailure("cli.pane-functions.screenshot-payload", "Read daily closes for a capture failed", []));
+  return [{ target, resolution: "1wk", points: weekly ?? [] }, ...(daily.length ? [{ target, resolution: "1d" as const, points: daily }] : [])];
+}
+
 export async function buildDesktopShotPayload(
   resolved: ResolvedPaneFunction,
   context: MarketContext,
@@ -186,6 +229,9 @@ export async function buildDesktopShotPayload(
   if (isFinancialAnalysisFunction(resolved) && !initialPaneState.activeTabId) {
     initialPaneState.activeTabId = "financials";
   }
+  // A capture of a ratio tab shows each ratio's inputs (NOPAT, invested capital), as the report lists them; the
+  // pane opens them collapsed for a reader who opens the one they want.
+  if (shotRatioTab(resolved)) initialPaneState.financialRatiosExpanded = true;
   // The pane opens on what the report found (13F: the fund a name resolved to, on its view's tab).
   const opened = resolved.headless?.shotState
     ? await resolved.headless.shotState(
@@ -234,6 +280,9 @@ export async function buildDesktopShotPayload(
   });
 
   const tickers: TickerRecord[] = [];
+  /** Rows of a list whose read failed (refused, timed out): shown without figures, and named under the picture. */
+  const unreadRows: string[] = [];
+  const unreadReasons: Record<string, string> = {};
   const financials: Array<[string, TickerFinancials]> = [];
   const intradayHistories: DesktopPaneShotIntradayHistory[] = [];
   let instrumentFinancials: SnapshotMarketData["instrumentFinancials"];
@@ -245,6 +294,105 @@ export async function buildDesktopShotPayload(
     collectShotStatSeries(resolved),
   ]);
   const includeOptionsChains = resolved.pane.id === OPTIONS_PANE_ID || resolved.template?.paneId === OPTIONS_PANE_ID;
+  /** One row's data, or null for an argument the report reads as words rather than a ticker. */
+  const captureShotSymbol = async (symbol: string): Promise<ShotSymbolCapture | null> => {
+    let entry: Awaited<ReturnType<typeof fetchTickerFinancials>>;
+    try {
+      entry = await fetchTickerFinancials(context, symbol);
+    } catch (error) {
+      // A report that reads its own argument (CDS's issuer name) renders it with no ticker data, as `fn` does.
+      if (resolved.headless?.argument.kind === "free-text" && isNotATickerMessage(error instanceof Error ? error.message : null)) return null;
+      if (!COLLECTION_PANE_IDS.has(resolved.pane.id)) throw error;
+      // The pane values a holding no quote covers, such as an option contract,
+      // at the broker's mark. It has no financials to capture.
+      const holding = await loadBrokerMarkedHolding(context, symbol);
+      if (holding) return { ticker: holding };
+      // Any other row whose read failed (an over-the-counter name no source
+      // carries, a read refused or timed out) is still a row of the list: it
+      // shows without a price, and the capture names it rather than failing.
+      const stored = await loadStoredShotTicker(context, symbol);
+      if (!stored) throw error;
+      return {
+        ticker: stored,
+        financials: [symbol, { annualStatements: [], quarterlyStatements: [], priceHistory: [] }],
+        ...(!isNoSourceAnswer(error) ? { unread: { symbol, reason: errorMessage(error).replace(/\.+$/, "") } } : {}),
+      };
+    }
+    const requestedRange = shotPriceHistoryRange(resolved);
+    let data = entry.financials;
+    const exchange = entry.instrument.exchange
+      ?? entry.tickerFile?.metadata.exchange
+      ?? data.quote?.listingExchangeName
+      ?? data.quote?.exchangeName
+      ?? "";
+    const fiveYearsDaily = resolved.pane.id === "realized-vol" || resolved.pane.id === "iv-history" || resolved.pane.id === "macro-day";
+    // KELLY's History tab reads monthly returns off the daily closes its own request names, from the month-end
+    // before the window, as the KELLY report does; a source with no dated history, its trailing range.
+    const kellyHistory = resolved.pane.id === "kelly-sizer"
+      ? await loadKellyShotHistory(context, entry.instrument, exchange, kellyShotYears(resolved)) : null;
+    if (kellyHistory) {
+      data = { ...data, priceHistory: kellyHistory };
+    } else if (fiveYearsDaily || resolved.pane.id === "kelly-sizer" || resolved.pane.id === "iv-screen" || resolved.pane.id === "short-watch"
+      || resolved.pane.id === "backtest" || resolved.pane.id === OPTIONS_PANE_ID) {
+      // Generic 5Y snapshots can contain weekly bars. The snapshot provider
+      // treats captured history as authoritative, even for a later 1d request.
+      // Preserve the pane's daily buffer and warmup before the renderer clips it.
+      if (!context.dataProvider.getPriceHistoryForResolution) {
+        throw new Error("Daily-history screenshots require daily history resolution support.");
+      }
+      const priceHistory = await context.dataProvider.getPriceHistoryForResolution(
+        entry.instrument.symbol, exchange,
+        resolved.pane.id === "kelly-sizer" ? trailingDailyClosesRequest(entry.instrument, kellyShotYears(resolved)).bufferRange
+          : fiveYearsDaily ? "5Y" : resolved.pane.id === "backtest" ? "ALL" : "1Y",
+        "1d", toMarketDataContext(entry.instrument),
+      );
+      data = { ...data, priceHistory };
+    } else if (shotRatioTab(resolved)?.key === "valuation") {
+      data = await withShotPeriodEndHistory(context, entry.instrument, exchange, resolved, data);
+    } else if (resolved.pane.id === "seasonality") {
+      data = await withShotSeasonalityHistory(context, entry.instrument, resolved, data);
+    } else if (resolved.pane.id === "returns") {
+      data = await withShotReturnHistory(context, entry.instrument, exchange, resolved, data);
+    } else if (requestedRange && readsDailyReturns(resolved)) {
+      data = await withShotDailyReturns(context, entry.instrument, exchange, requestedRange, data);
+    } else if (requestedRange) {
+      try {
+        const priceHistory = await context.dataProvider.getPriceHistory(entry.instrument.symbol, exchange, requestedRange);
+        data = { ...data, priceHistory: clipPriceHistoryToRange(priceHistory, requestedRange) };
+      } catch {
+        data = await withShotPriceHistory(context, symbol, entry.tickerFile, data);
+      }
+    } else {
+      // The cloud's financials carry no price history. The snapshot provider
+      // treats a captured dataset as authoritative, so an empty history here
+      // left the overview chart and quote monitor sparklines blank instead of
+      // letting the pane fetch them.
+      data = await withShotPriceHistory(context, symbol, entry.tickerFile, data);
+    }
+    const capture: ShotSymbolCapture = {
+      ticker: entry.tickerFile ?? await createFallbackTicker(symbol, data, context),
+      financials: [symbol, data],
+    };
+    if (resolved.pane.id === "time-sales") {
+      capture.tape = [entry.instrument.symbol, exchange, await fetchTape(entry.instrument.symbol, exchange)];
+    }
+    // DES (the research pane's overview, not its financials or the ADR pair) measures returns on daily closes.
+    const overview = resolved.pane.id === TICKER_RESEARCH_PANE_ID && resolved.template?.id !== "adr-pair-pane" && !isFinancialAnalysisFunction(resolved);
+    if (resolved.pane.id === "pe-band" || overview) {
+      capture.historyVariants = await weeklyAndDailyHistoryVariants(context, capture.ticker, exchange, data.priceHistory,
+        overview ? priceReturnDailyWindow() : undefined);
+    }
+    if (includeOptionsChains && context.dataProvider.getOptionsChain) {
+      // A future with no chain of its own is the pane's to explain (the listed alternative), not a failed shot.
+      const chain = await context.dataProvider.getOptionsChain(entry.instrument.symbol, exchange, undefined,
+        context.refresh ? { cacheMode: "refresh" } : undefined).catch((error: unknown) => {
+        if (isOptionsUnavailableError(error)) return null;
+        throw error;
+      });
+      if (chain) capture.chain = [symbol, chain];
+    }
+    return capture;
+  };
   let chartModel: ChartPaneModel | undefined;
   const evidenceHook = paneScreenshotEvidenceHook(resolved);
   if (evidenceHook?.prepare) {
@@ -252,7 +400,8 @@ export async function buildDesktopShotPayload(
     shotInstance = { ...shotInstance, settings: { ...shotInstance.settings, ...prepared.settings } };
     for (const [symbol, data] of prepared.financials ?? []) {
       financials.push([symbol, data]);
-      tickers.push(await createFallbackTicker(symbol, data, context));
+      // A listing the user saved keeps its company's name (0700 on HKEX is Tencent Holdings), as the app shows it.
+      tickers.push(withSavedName(await createFallbackTicker(symbol, data, context), await savedListing(context, symbol)));
     }
   } else if (resolved.pane.id === "analytics") {
     const loaded = await loadModel();
@@ -289,92 +438,34 @@ export async function buildDesktopShotPayload(
     intradayHistories.push(...chartModel.snapshot.intradayHistories.map((history) => ({
       ...history, start: history.start?.toISOString() ?? null, end: history.end?.toISOString() ?? null,
     })));
-  } else for (const symbol of await collectShotSymbolsWithCollections(resolved, context, rawArg)) {
-    let entry: Awaited<ReturnType<typeof fetchTickerFinancials>>;
-    try {
-      entry = await fetchTickerFinancials(context, symbol);
-    } catch (error) {
-      // A report that reads its own argument (CDS's issuer name) renders it with no ticker data, as `fn` does.
-      if (resolved.headless?.argument.kind === "free-text" && isNotATickerMessage(error instanceof Error ? error.message : null)) continue;
-      if (!COLLECTION_PANE_IDS.has(resolved.pane.id)) throw error;
-      // The pane values a holding no quote covers, such as an option contract,
-      // at the broker's mark. It has no financials to capture.
-      const holding = await loadBrokerMarkedHolding(context, symbol);
-      if (holding) {
-        tickers.push(holding);
-        continue;
+  } else {
+    // Each row is read at once, a few at a time, and kept in the list's order;
+    // the first row in that order whose read fails the capture fails it.
+    const captures = await mapWithConcurrency(
+      await collectShotSymbolsWithCollections(resolved, context, rawArg),
+      // As many at once as portfolio show reads them.
+      LIST_FINANCIALS_CONCURRENCY,
+      (symbol) => captureShotSymbol(symbol).then((capture) => ({ capture }), (error: unknown) => ({ error })),
+    );
+    for (const result of captures) {
+      if ("error" in result) throw result.error;
+      const { capture } = result;
+      if (!capture) continue;
+      tickers.push(capture.ticker);
+      if (capture.financials) financials.push(capture.financials);
+      if (capture.unread) {
+        unreadRows.push(capture.unread.symbol);
+        unreadReasons[capture.unread.symbol] = capture.unread.reason;
       }
-      // Any other holding no source quotes (an over-the-counter name none
-      // carries) is still a row of the list: it shows without a price, and the
-      // capture names it under "No data for" rather than failing. A read that
-      // was refused, rate limited or timed out fails the capture, to be taken again.
-      if (!isNoSourceAnswer(error)) throw error;
-      const stored = await loadStoredShotTicker(context, symbol);
-      if (!stored) throw error;
-      tickers.push(stored);
-      financials.push([symbol, { annualStatements: [], quarterlyStatements: [], priceHistory: [] }]);
-      continue;
+      if (capture.tape) tapeSnapshots.push(capture.tape);
+      if (capture.chain) optionsChains.push(capture.chain);
+      if (capture.historyVariants?.length) historyVariants = [...historyVariants ?? [], ...capture.historyVariants];
     }
-    const requestedRange = shotPriceHistoryRange(resolved);
-    let data = entry.financials;
-    const exchange = entry.instrument.exchange
-      ?? entry.tickerFile?.metadata.exchange
-      ?? data.quote?.listingExchangeName
-      ?? data.quote?.exchangeName
-      ?? "";
-    const fiveYearsDaily = resolved.pane.id === "realized-vol" || resolved.pane.id === "iv-history" || resolved.pane.id === "macro-day"
-      // KELLY's History tab reads monthly returns off five years of daily closes.
-      || resolved.pane.id === "kelly-sizer";
-    if (fiveYearsDaily || resolved.pane.id === "iv-screen" || resolved.pane.id === "short-watch"
-      || resolved.pane.id === "backtest" || resolved.pane.id === OPTIONS_PANE_ID) {
-      // Generic 5Y snapshots can contain weekly bars. The snapshot provider
-      // treats captured history as authoritative, even for a later 1d request.
-      // Preserve the pane's daily buffer and warmup before the renderer clips it.
-      if (!context.dataProvider.getPriceHistoryForResolution) {
-        throw new Error("Daily-history screenshots require daily history resolution support.");
-      }
-      const priceHistory = await context.dataProvider.getPriceHistoryForResolution(
-        entry.instrument.symbol, exchange,
-        fiveYearsDaily ? "5Y" : resolved.pane.id === "backtest" ? "ALL" : "1Y",
-        "1d", toMarketDataContext(entry.instrument),
-      );
-      data = { ...data, priceHistory };
-    } else if (shotRatioTab(resolved)?.key === "valuation") {
-      data = await withShotPeriodEndHistory(context, entry.instrument, exchange, resolved, data);
-    } else if (resolved.pane.id === "seasonality") {
-      data = await withShotSeasonalityHistory(context, entry.instrument, resolved, data);
-    } else if (resolved.pane.id === "returns") {
-      data = await withShotReturnHistory(context, entry.instrument, exchange, resolved, data);
-    } else if (requestedRange && readsDailyReturns(resolved)) {
-      data = await withShotDailyReturns(context, entry.instrument, exchange, requestedRange, data);
-    } else if (requestedRange) {
-      try {
-        const priceHistory = await context.dataProvider.getPriceHistory(entry.instrument.symbol, exchange, requestedRange);
-        data = { ...data, priceHistory: clipPriceHistoryToRange(priceHistory, requestedRange) };
-      } catch {
-        data = await withShotPriceHistory(context, symbol, entry.tickerFile, data);
-      }
-    } else {
-      // The cloud's financials carry no price history. The snapshot provider
-      // treats a captured dataset as authoritative, so an empty history here
-      // left the overview chart and quote monitor sparklines blank instead of
-      // letting the pane fetch them.
-      data = await withShotPriceHistory(context, symbol, entry.tickerFile, data);
-    }
-    tickers.push(entry.tickerFile ?? await createFallbackTicker(symbol, data, context));
-    financials.push([symbol, data]);
-    if (resolved.pane.id === "time-sales") {
-      tapeSnapshots.push([entry.instrument.symbol, exchange, await fetchTape(entry.instrument.symbol, exchange)]);
-    }
-    if (includeOptionsChains && context.dataProvider.getOptionsChain) {
-      // A future with no chain of its own is the pane's to explain (the listed alternative), not a failed shot.
-      const chain = await context.dataProvider.getOptionsChain(entry.instrument.symbol, exchange, undefined,
-        context.refresh ? { cacheMode: "refresh" } : undefined).catch((error: unknown) => {
-        if (isOptionsUnavailableError(error)) return null;
-        throw error;
-      });
-      if (chain) optionsChains.push([symbol, chain]);
-    }
+  }
+  // PF over a period draws the report's P&L between the two closes: the page reads no history of its own.
+  if (resolved.pane.id === "portfolio-list" && typeof resolved.options.from === "string" && resolved.options.from) {
+    const loaded = await loadModel();
+    shotInstance = { ...shotInstance, settings: { ...shotInstance.settings, periodPnlSnapshot: loaded.result.metadata?.periodPnl ?? null } };
   }
   // A scanner pane reads one answer from the capture's own session: the page's socket is refused (see createSnapshotScannerClient).
   const scannerKind = SCANNER_PANE_KINDS[resolved.pane.id];
@@ -406,6 +497,7 @@ export async function buildDesktopShotPayload(
     optionsChains,
     ...(tapeSnapshots.length ? { tapeSnapshots } : {}),
     ...(scannerSnapshots.length ? { scannerSnapshots } : {}),
+    ...(unreadRows.length ? { unreadRows, unreadReasons } : {}),
     valuationSeries,
     statSeries,
     paneState,
@@ -418,6 +510,43 @@ export async function buildDesktopShotPayload(
 /** Panes that render the user's portfolio or watchlist rather than an argument. */
 export const COLLECTION_PANE_IDS = new Set(["portfolio-list", "analytics", "kelly-sizer", "earnings-calendar"]);
 
+/** The row saved for a listing key (0700:HKEX), under that key or bare on its venue; null when none is. */
+/** KELLY's lookback: `--years` (checked against the function's bounds when read), else the function's default. */
+function kellyShotYears(resolved: ResolvedPaneFunction): number {
+  return Number(resolved.options.years ?? findCapabilityOption(resolved.capability, "years")?.defaultValue ?? 5);
+}
+
+/**
+ * The daily closes KELLY's History tab asks for (`calendarMonthReturnsRequest`), from
+ * the month-end before its window. Captured history answers every request, so
+ * the trailing five years stood in for that window and gave 59 returns where
+ * the KELLY report reads 60. Null when the source answers no dated history:
+ * the trailing range is captured instead, as the pane falls back to it.
+ */
+async function loadKellyShotHistory(
+  context: MarketContext, instrument: InstrumentRef, exchange: string, years: number,
+): Promise<PricePoint[] | null> {
+  const request = calendarMonthReturnsRequest({ symbol: instrument.symbol, exchange }, years);
+  const result = await fetchHistoryResult(context.dataProvider, instrument.symbol, exchange,
+    { kind: "detail", start: request.startDate!, end: request.endDate!, interval: request.barSize! }, toMarketDataContext(instrument))
+    .catch(logFailure("cli.pane-functions-screenshot-payload", "Read KELLY's dated daily closes failed", null));
+  return result?.points.length ? result.points : null;
+}
+
+async function savedListing(context: MarketContext, key: string): Promise<TickerRecord | null> {
+  const { symbol, exchange } = parsePublicTickerKey(key);
+  const row = await context.store.loadTicker(key) ?? (exchange ? await context.store.loadTicker(symbol) : null);
+  return row && (!exchange || canonicalExchange(row.metadata.exchange) === canonicalExchange(exchange)) ? row : null;
+}
+
+/** A capture's ticker with the saved row's name, when the capture has only the code. */
+function withSavedName(ticker: TickerRecord, saved: TickerRecord | null): TickerRecord {
+  const name = saved?.metadata.name?.trim();
+  return name && ticker.metadata.name === parsePublicTickerKey(ticker.metadata.ticker).symbol
+    ? { ...ticker, metadata: { ...ticker.metadata, name } }
+    : ticker;
+}
+
 /**
  * The page only knows the tickers the payload carries, so a collection pane
  * captured with just the argument symbol showed an empty portfolio. Portfolio
@@ -429,10 +558,13 @@ async function collectShotSymbolsWithCollections(
   rawArg: string,
 ): Promise<string[]> {
   if (!COLLECTION_PANE_IDS.has(resolved.pane.id)) return collectShotSymbols(resolved, rawArg);
-  // `shot PF Retirement` names a portfolio, not a ticker to fetch.
-  const symbols = rawArg.trim() && findCollection(context.config, rawArg) ? [] : collectShotSymbols(resolved, rawArg);
+  // `shot PF Retirement` names a portfolio, not a ticker to fetch: its rows alone are read, never another list's.
+  const named = rawArg.trim() ? findCollection(context.config, rawArg) : null;
+  const symbols = named ? [] : collectShotSymbols(resolved, rawArg);
   const members = (await context.store.loadAllTickers())
-    .filter(({ metadata }) => metadata.portfolios.length > 0 || metadata.watchlists.length > 0)
+    .filter(({ metadata }) => named
+      ? (named.kind === "portfolio" ? metadata.portfolios : metadata.watchlists).includes(named.id)
+      : metadata.portfolios.length > 0 || metadata.watchlists.length > 0)
     .map(({ metadata }) => metadata.ticker);
   return [...new Set([...symbols, ...members])];
 }

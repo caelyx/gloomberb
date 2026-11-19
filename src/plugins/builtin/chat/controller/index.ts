@@ -74,6 +74,7 @@ import { ChatControllerMessageLoading } from "./message-loading";
 import { ChatMentionCandidates } from "./mention-candidates";
 import { ChatControllerStorage } from "./storage";
 import { listUnreadInboxItems } from "../unread-inbox";
+import { ChatStatusPreview } from "../status-preview";
 import type { ChatConversationList } from "../conversations";
 import {
   conversationActivityAt,
@@ -118,6 +119,8 @@ export class ChatController {
   );
   private notifyFn: (notification: AppNotificationRequest) => AppNotificationDelivery | void = () => {};
   private openMessageFn: ((channelId: string, messageId: string) => void) | undefined;
+  /** A DM, mention or reply that shows in the status bar on arrival; the status bar widget draws it. */
+  readonly statusPreview = new ChatStatusPreview();
   private readonly alerts = new ChatNotificationAlerts({
     getAppActive: () => this.appActive,
     ensureChannelState: (channelId) => this.ensureChannelState(channelId),
@@ -125,6 +128,7 @@ export class ChatController {
     getChannel: (channelId) => this.channelCatalog.getChannels().find((channel) => channel.id === channelId),
     getNotify: () => this.notifyFn,
     getOpenMessage: () => this.openMessageFn,
+    statusPreview: this.statusPreview,
   });
 
   private readonly storage = new ChatControllerStorage({
@@ -271,7 +275,7 @@ export class ChatController {
    * Keeps who sent each channel's unread messages (`unreadPeople` in the
    * snapshot) current until the returned stop is called, reading what the
    * device does not hold. Nothing is read, and the snapshot leaves it empty,
-   * unless something tracks it: only the app badge needs it.
+   * unless something tracks it: the app badge and the status bar widget.
    */
   trackUnreadPeople(): () => void {
     return this.unreadPeople.track();
@@ -349,12 +353,18 @@ export class ChatController {
   }
 
   /** Single-flight: every open chat pane calls this on mount. */
-  async refreshSession(): Promise<void> {
+  /**
+   * Reads the signed-in user again. `reuseCheckWithinMs` accepts a session
+   * check the app made that recently instead: the web app checks its session
+   * before the first paint, and the status bar opening right after has
+   * nothing new to learn from a second request.
+   */
+  async refreshSession(options: { reuseCheckWithinMs?: number } = {}): Promise<void> {
     if (this.sessionRefreshPromise) return this.sessionRefreshPromise;
     this.realtime.stopSessionRetry();
     const generation = this.sessionRefreshGeneration;
     const isCurrent = () => generation === this.sessionRefreshGeneration;
-    const request = this.runSessionRefresh(isCurrent)
+    const request = this.runSessionRefresh(isCurrent, options.reuseCheckWithinMs)
       .catch((error) => {
         if (isCurrent()) this.realtime.scheduleSessionRetry();
         throw error;
@@ -375,9 +385,10 @@ export class ChatController {
     this.sessionRefreshPromise = null;
   }
 
-  private async runSessionRefresh(isCurrent: () => boolean): Promise<void> {
+  private async runSessionRefresh(isCurrent: () => boolean, reuseCheckWithinMs?: number): Promise<void> {
     return refreshChatControllerSession({
       isCurrent,
+      reuseCheckWithinMs,
       applySignedOut: () => this.applySignedOutSession(),
       channelStates: this.storage.channelStates,
       emit: () => this.emit(),
@@ -912,7 +923,7 @@ export class ChatController {
     const channel = this.ensureChannelState(channelId);
     mergeChatMessages({
       channel,
-      currentUserId: this.session.user?.id,
+      currentUser: this.session.user,
       messages,
       options,
       viewActive: this.appActive && channel.focusedViewCount > 0,

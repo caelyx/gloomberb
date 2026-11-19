@@ -1,12 +1,15 @@
 import type { GloomPlugin } from "../../../types/plugin";
 import { DEFAULT_LEAD_DAYS, isResearchAlertKind, MACRO_ALERT_EVENTS, normalizeResearchRule, readResearchRule, RESEARCH_ALERT_FORMS, type IvLevelMetric, type MacroAlertEvent, type ResearchAlertKind } from "./research-rules";
 import type { EventAlertRule } from "./events";
+import { isLiveOptionExpiry, parseOptionExpiration } from "../../../utils/option-expiry";
+import { proRuleFormNote } from "./pro-rules";
+import { occContractExample } from "./option-contract";
 
 /** What a macro event is called in a rule, a list and a notification. */
 export const MACRO_EVENT_NAMES: Record<MacroAlertEvent, string> = { cpi: "CPI release", fomc: "FOMC decision" };
 /** CPI and FOMC and any other calendar release are one kind of alert to the reader, whichever list keeps the rule. */
 export const RESEARCH_LABELS: Record<ResearchAlertKind, string> = {
-  perps_threshold: "Perpetual threshold", earnings_date: "Earnings date", macro_event: "Macro event", calendar_event: "Macro event", filing_type: "SEC filing", news_keyword: "News keyword", analyst_change: "Analyst change", fifty_two_week: "52-week range", unusual_volume: "Unusual volume", short_interest_change: "Short interest", insider_trade: "Insider trade", iv_spike: "IV spike", iv_level: "IV level", options_flow: "Options flow", hiring_move: "Hiring move",
+  perps_threshold: "Perpetual threshold", earnings_date: "Earnings date", macro_event: "Macro event", calendar_event: "Macro event", ipo: "IPO", filing_type: "SEC filing", news_keyword: "News keyword", analyst_change: "Analyst change", fifty_two_week: "52-week range", unusual_volume: "Unusual volume", short_interest_change: "Short interest", insider_trade: "Insider trade", iv_spike: "IV spike", iv_level: "IV level", options_flow: "Options flow", hiring_move: "Hiring move",
 };
 /** What an IV level rule follows, as the form, a list and a notification name it. */
 export const IV_LEVEL_NAMES: Record<IvLevelMetric, string> = { atm: "30d ATM IV", rr: "30d 25D RR" };
@@ -14,16 +17,6 @@ export const IV_LEVEL_NAMES: Record<IvLevelMetric, string> = { atm: "30d ATM IV"
 export function formatIvLevel(metric: IvLevelMetric, value: number): string {
   const rounded = Number(value.toFixed(2));
   return metric === "atm" ? `${rounded}%` : `${rounded > 0 ? "+" : ""}${rounded} pts`;
-}
-/**
- * An OCC contract that has not expired, for the IV spike form's example: an
- * AAPL call on the monthly expiry (the third Friday) two months from `now`.
- */
-function occContractExample(now = new Date()): string {
-  const month = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 2, 1));
-  const thirdFriday = 1 + ((5 - month.getUTCDay() + 7) % 7) + 14;
-  const two = (value: number) => String(value).padStart(2, "0");
-  return `AAPL${two(month.getUTCFullYear() % 100)}${two(month.getUTCMonth() + 1)}${two(thirdFriday)}C00300000`;
 }
 type Command = Parameters<Parameters<NonNullable<GloomPlugin["setup"]>>[0]["registerCommand"]>[0];
 type Field = NonNullable<Command["wizard"]>[number];
@@ -46,6 +39,8 @@ export const researchWizardFields: Field[] = RESEARCH_FORM_KINDS.flatMap(kind =>
     : kind === "macro_event" ? [{key:"event", label:"Release", type:"select", defaultValue:"cpi", options:MACRO_ALERT_EVENTS.map((value) => ({value, label:MACRO_EVENT_NAMES[value]}))}]
     // HIRE covers listings worldwide; a non-US one is written with its venue.
     : kind === "hiring_move" ? [{key:"symbol", label:"Symbol", type:"text", placeholder:"RIVN or ADYEN:AMS", required:true}]
+    // A deal on the IPO calendar has no listing to name yet: it is followed by its name.
+    : kind === "ipo" ? [{key:"keyword", label:"Company or keyword", type:"text", placeholder:"Stripe", required:true}]
     : [{key:"symbol",label:kind === "news_keyword" ? "Symbol (optional)" : kind === "options_flow" ? "Symbol (blank: portfolio and watchlists)" : "Symbol",type:"text",placeholder:"AAPL", required:kind !== "news_keyword" && kind !== "options_flow"},
       {key:"exchange",label:"US exchange",type:"select",defaultValue:"US",options:choices(["US","NASDAQ","NYSE","ARCA","AMEX","BATS","OTC"])}];
   if (kind === "earnings_date") {
@@ -65,6 +60,9 @@ export const researchWizardFields: Field[] = RESEARCH_FORM_KINDS.flatMap(kind =>
   }
   if (kind === "iv_level") fields.push({key:"threshold",label:"Level (IV %, RR vol pts)",type:"number",placeholder:"35",required:true});
   if (kind === "unusual_volume" || kind === "short_interest_change" || kind === "iv_spike") fields.push({key:"threshold",label:kind === "unusual_volume" ? "Volume / prior 20-session average" : kind === "iv_spike" ? "IV rise (percentage points)" : "Settlement change (%)",type:"number",defaultValue:kind === "unusual_volume" ? "2" : kind === "iv_spike" ? "5" : "10"});
+  // A Pro kind says so under its first field, before anything is saved: a free account saves it, and nothing checks it.
+  const proNote = proRuleFormNote(kind);
+  if (proNote && fields[0]) fields[0] = { ...fields[0], body: [proNote] };
   return fields.map(field => ({...field, key:`${kind}:${field.key}`, dependsOn: kind === "earnings_date" && field.key === "leadDays"
     // The lead time is for an alert before the date, not one waiting for results.
     ? [{key:"event",value:kind}, {key:"earnings_date:when",value:"before"}]
@@ -89,15 +87,27 @@ export function createResearchAlert(kind: string, values: Record<string,string>,
     else if (value.trim()) input[field] = field === "threshold" || field === "leadDays" ? parseAmount(value) : value;
   }
   const value = normalizeResearchRule(kind,input);
+  // A contract past its last session trades no more: it is refused as a ticker nothing quotes is, never followed.
+  const expired = kind === "iv_spike" && value ? expiredContract(readResearchRule(kind, value)!.contract!, now) : null;
+  if (expired) throw new Error(`Not a live contract: ${expired.contract} expired on ${expired.expiry}. Its underlying's live expiries: gloom options ${expired.root}.`);
   if (!value) throw new Error(kind === "options_flow"
     ? "Check the symbol and US exchange. The minimum premium is $50,000."
     : kind === "hiring_move" ? "Check the symbol. Write a non-US listing with its exchange, as ADYEN:AMS."
+    : kind === "ipo" ? "Name a company or keyword of 2 to 80 characters, such as Stripe."
     : kind === "iv_level"
       ? "Check the symbol and US exchange. An ATM IV level is 1 to 500 (%), a risk reversal -50 to 50 (vol pts)."
       : kind === "iv_spike"
         ? `Use a valid OCC contract, such as ${occContractExample()}.`
         : "Check the symbol, US exchange and event fields.");
   return {id:crypto.randomUUID(),kind,target:"rule",value,createdAt:now,status:"active"};
+}
+/** An OCC contract whose expiry's last session has closed, with its expiry and underlying; null for a live one. */
+function expiredContract(contract: string, now: number): { contract: string; expiry: string; root: string } | null {
+  const match = /^([A-Z.]{1,6})(\d{2})(\d{2})(\d{2})[CP]\d{8}$/.exec(contract);
+  if (!match) return null;
+  const expiry = `20${match[2]}-${match[3]}-${match[4]}`;
+  const expiration = parseOptionExpiration(expiry);
+  return expiration != null && !isLiveOptionExpiry(expiration, now) ? { contract, expiry, root: match[1]! } : null;
 }
 /** "2.5", "1,000,000", "$250k" and "1.5m" all read as numbers; anything else is NaN. */
 export function parseAmount(value: string): number {
@@ -142,6 +152,7 @@ export function researchAlertDescription(rule: EventAlertRule): string {
     case "news_keyword": return `${symbol} · ${config.keyword}`;
     case "analyst_change": case "insider_trade": return `${symbol} · ${config.direction}`;
     case "hiring_move": return `${symbol} · ${config.direction === "either" ? "accelerating or slowing" : config.direction}`;
+    case "ipo": return config.keyword ?? "";
     case "fifty_two_week": return `${symbol} · 52w ${config.direction}`;
     case "unusual_volume": return `${symbol} · ≥${config.threshold}× 20d`;
     case "short_interest_change": return `${symbol} · ${config.direction} ≥${config.threshold}%`;

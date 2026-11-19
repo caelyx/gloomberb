@@ -1,13 +1,17 @@
+import { portfolioSectorReport } from "./risk-sectors";
 import { loadPortfolioOptionBook } from "./risk-options";
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
-import { fetchPortfolioRiskMarket, RISK_HISTORY_LIMIT } from "./risk-client";
+import { fetchPortfolioRiskMarket, riskInstrumentOf, RISK_HISTORY_LIMIT } from "./risk-client";
 import { parsePortfolioRiskEvidence } from "./risk-evidence";
+import { cloudEpisodeReader, fetchRiskEpisodeHistory, onceEpisodeReader, riskEpisodeTargets } from "./risk-episodes";
 import { describeCollections } from "../../../portfolio/collection-name";
+import { shellWord } from "../../../utils/shell-word";
 import { formatShocks, parseAssetShifts, parseFxShifts, riskCashLines } from "./risk-book";
 import {
   BASKET_VIEWS,
   BOOK_TOTAL_ROW_ID,
   buildPortfolioRisk,
+  isShockRow,
   portfolioRiskRequests,
   portfolioRiskTickers,
   riskCoverageLine,
@@ -26,6 +30,9 @@ import {
   type RiskDisplayRow,
   type RiskView,
 } from "./risk-model";
+
+/** Holdings up to which a report's episode closes are read with its recent ones, not after them. */
+const EPISODE_WARM_LIMIT = 30;
 
 const RISK_COLUMNS = [
   { key: "label", header: "Metric" },
@@ -46,6 +53,64 @@ function reportPortfolioName(metadata: Record<string, unknown> | undefined): str
   const compact = metadata?.portfolio as { name?: unknown } | undefined;
   const name = model?.portfolio?.name ?? compact?.name;
   return typeof name === "string" ? name : undefined;
+}
+
+/**
+ * What a portfolio with nothing to estimate says, as one line: the commands
+ * that fill it. Risk is read from lots, so a symbol listed without shares
+ * (`portfolio add`) is no holding yet; `portfolio position set` gives it
+ * shares, and adds the symbol too when it is not listed.
+ */
+function emptyPortfolioHint(name: string, listed: readonly string[]): string {
+  const portfolio = shellWord(name);
+  if (listed.length > 0) {
+    return `${name} lists ${listed.slice(0, 3).join(", ")}${listed.length > 3 ? ` and ${listed.length - 3} more` : ""} but holds no shares: `
+      + `gloom portfolio position set ${portfolio} ${shellWord(listed[0]!)} 10 150.`;
+  }
+  return `No holdings in ${name}. Add symbols with gloom portfolio add ${portfolio} AAPL,MSFT, `
+    + `then their shares with gloom portfolio position set ${portfolio} AAPL 10 150.`;
+}
+
+/**
+ * Why a view of PORT has no rows, in one line, as its section says it in
+ * place of a bare "No data.": what it needs, and where P&L is answered instead.
+ */
+function riskSectionEmpty(
+  view: RiskView,
+  { name, brokerLinked, unvaluedOptions, failedHistories }: {
+    name: string; brokerLinked: boolean; unvaluedOptions: boolean;
+    /** Holdings whose daily closes did not load: the reason a view of returns is empty, not what the book holds. */
+    failedHistories: readonly string[];
+  },
+): string {
+  if (failedHistories.length > 0 && !RISK_OWN_DATA_VIEWS.has(view)) return failedClosesText(failedHistories);
+  switch (view) {
+    case "performance":
+      return `No account history${brokerLinked ? " from its broker" : ""} (daily values and flows) to measure. `
+        + `For P&L over a period: gloom portfolio show ${shellWord(name)} --from <date>.`;
+    case "attribution":
+      return "No sector weights and returns for this account and its benchmark; import them with --evidence.";
+    case "greeks":
+      return unvaluedOptions ? "No option position in this portfolio could be valued." : "No option positions in this portfolio.";
+    case "correlation":
+      return "Needs two holdings with 60 daily returns each.";
+    default:
+      return "No holding has the daily closes this view needs.";
+  }
+}
+
+/** Views read from the account's own records or option positions, not from its holdings' daily closes. */
+const RISK_OWN_DATA_VIEWS: ReadonlySet<RiskView> = new Set(["performance", "attribution", "greeks"]);
+
+/** The holdings whose daily closes did not load, for an empty view's reason. */
+function failedHistories(coverage: RiskCoverage | undefined): string[] {
+  return (coverage?.leftOut ?? []).filter((line) => line.historyFailed).map((line) => line.symbol);
+}
+
+/** "Daily closes did not load for US02, US03 and 4 more; try again in a moment." */
+function failedClosesText(symbols: readonly string[]): string {
+  const more = symbols.length > 3 ? ` and ${symbols.length - 3} more` : "";
+  return `Daily closes did not load for ${symbols.slice(0, 3).join(", ")}${more}; try again in a moment.`;
 }
 
 /** Rows of one view in the compact result; the pane and reports keep every row. */
@@ -104,7 +169,11 @@ function coverageSummary(coverage: RiskCoverage, limit = Infinity) {
 function coverageLine(coverage: RiskCoverage | undefined): { error?: string; note?: string } {
   const shortfall = riskCoverageShortfall(coverage);
   // No estimate at all is a failure; an estimate that leaves holdings out is a caveat.
-  if (shortfall) return { error: `Basket estimates unavailable: ${shortfall.title} ${shortfall.message}`.trim() };
+  if (shortfall) {
+    // Closes that did not load are why, which asked again may not be.
+    const failed = failedHistories(coverage);
+    return { error: [`Basket estimates unavailable: ${shortfall.title} ${shortfall.message}`.trim(), ...failed.length ? [failedClosesText(failed)] : []].join(" ") };
+  }
   const line = coverage?.leftOut.length ? riskCoverageLine(coverage) : null;
   return line ? { note: `${line[0]!.toUpperCase()}${line.slice(1)}; metadata.coverage lists each with its reason.` } : {};
 }
@@ -154,6 +223,7 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
       `Fixed-current-weight equity basket over the holdings that qualify, largest ${RISK_HISTORY_LIMIT} by value, in the account's currency; foreign listings convert to USD at daily FX closes, and a non-USD account's returns then convert into its currency at its own daily FX closes; metadata.coverage states the covered share of the book (cash included) and each holding and currency's cash left out.`,
       "--since filed buys the 13F's own weights at the filing-date close and holds them (--weights current holds today's weights fixed instead).",
       "--fx-shift and --asset-shift reprice every holding and the cash at once; the index, 10Y and VIX shifts are separate basket regressions.",
+      "The stress view also replays four past selloffs on today's basket at its current weights, from daily closes (Covid 19 Feb to 23 Mar 2020, rate shock 3 Jan to 12 Oct 2022, carry unwind 31 Jul to 5 Aug 2024, tariffs 2 Apr to 8 Apr 2025); a holding with no closes over a window moves by its trailing beta to SPY, named in the row with its share of the book.",
       "No account performance inferred.",
       "ETF price-return factor proxies.",
       "Historical percentiles need 20 rolling samples.",
@@ -165,8 +235,8 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
       type: "enum",
       settingKey: "riskView",
       // No default: left out, the report prints every view.
-      values: RISK_VIEWS.map((value) => ({ value })),
-      description: "One portfolio risk view; every view when left out.",
+      values: [...RISK_VIEWS, "sectors"].map((value) => ({ value })),
+      description: "One portfolio risk view; sectors compares direct company sector weights, cash and unclassified holdings against SPY (S&P 500) in percentage points. Every standard risk view when left out.",
     },
     {
       key: "since",
@@ -239,6 +309,7 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
   describe: (args, result) =>
     `Portfolio risk | ${reportPortfolioName(result?.metadata) || args.rawArgument || "local portfolio"}`,
   async load(args, ctx) {
+    if (args.options.view === "sectors") return portfolioSectorReport(args, ctx);
     // The host reads the argument by id or name, in any case; everything after goes by the configured id.
     const requested = args.rawArgument.trim() || ctx.config.portfolios[0]?.id;
     if (!requested || !ctx.resolvePortfolio)
@@ -260,11 +331,35 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
       throw new Error(
         "Imported evidence belongs to a different portfolio or currency",
       );
+    // A portfolio with no holdings and no cash has nothing to estimate: say how to fill it, not a table of dashes.
+    if (tickers.length === 0 && cash.length === 0 && !evidence) {
+      const listed = local.tickers.filter((ticker) => ticker.metadata.portfolios.includes(id)).map((ticker) => ticker.metadata.ticker);
+      return {
+        sections: [],
+        complete: false,
+        empty: emptyPortfolioHint(local.portfolio.name, listed),
+        metadata: { portfolio: { id, name: local.portfolio.name, currency: local.portfolio.currency } },
+      };
+    }
     const requestedView = isRiskView(args.options.view) ? args.options.view : null;
     const view: string = requestedView ?? "risk";
     const localOnly =
       ["performance", "attribution", "greeks"].includes(view) &&
       evidence != null;
+    // The episodes read years-old closes of each holding, so only a report that prints Stress loads them.
+    const wantsEpisodes = !localOnly && (!requestedView || requestedView === "stress");
+    const episodeReader = onceEpisodeReader(cloudEpisodeReader(ctx.apiClient));
+    // A small book's are read alongside its recent closes rather than after them; those the basket leaves out
+    // go unused. A bigger book waits for the basket, so it reads no closes it does not replay.
+    const warming = wantsEpisodes && tickers.length <= EPISODE_WARM_LIMIT
+      ? fetchRiskEpisodeHistory(
+          // With the currency each is saved in, so the FX closes the replay converts at are read alongside, not after.
+          tickers.map((ticker) => ({ instrument: riskInstrumentOf(ticker), currency: ticker.metadata.currency || null })),
+          local.portfolio.currency, episodeReader, ctx.signal,
+        ).catch(() => {
+          // Intentional ignore: the replayed load below reads the same closes and reports their failures.
+        })
+      : undefined;
     const [prices, brokerOptions] = await Promise.all([
       localOnly
         ? Promise.resolve({
@@ -275,7 +370,7 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
             fetchedAt: new Date().toISOString(),
           })
         : fetchPortfolioRiskMarket(
-            portfolioRiskRequests(tickers, id),
+            portfolioRiskRequests(tickers, id, !(local.portfolio.brokerId || local.portfolio.brokerInstanceId || local.portfolio.brokerAccountId)),
             ctx.apiClient,
             new Date(),
             ctx.signal,
@@ -286,7 +381,14 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
         ? Promise.resolve(undefined)
         : loadPortfolioOptionBook(tickers, local.portfolio),
     ]);
-    const market = { ...prices, brokerOptions };
+    const episodeTargets = wantsEpisodes
+      ? riskEpisodeTargets(prices, tickers.map(riskInstrumentOf))
+      : [];
+    const episodes = episodeTargets.length
+      ? await fetchRiskEpisodeHistory(episodeTargets, local.portfolio.currency, episodeReader, ctx.signal)
+      : undefined;
+    void warming;
+    const market = { ...prices, brokerOptions, ...(episodes ? { episodes } : {}) };
     if (ctx.signal.aborted) throw new Error("Portfolio risk load cancelled");
     const model = buildPortfolioRisk(
       local.portfolio,
@@ -324,7 +426,7 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
     const covered = !riskHoldingsLeftOut(model.coverage);
     const complete =
       view === "performance"
-        ? model.performance != null
+        ? model.performance != null || model.performanceEstimate?.complete === true
         : view === "attribution"
           ? model.attribution != null
           : view === "greeks"
@@ -333,19 +435,34 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
               ? model.book != null && covered
               : view === "factors"
                 ? covered && model.factors.every((row) => row.value != null)
-                : model.complete;
-    // A basket view with too little covered shows no estimate, and the report says why rather than leaving dashes.
+                : view === "stress"
+                  // Every basket scenario has a value and no episode stands in a proxy for closes that failed to load.
+                  ? model.complete
+                    && model.rows.stress.every((row) => isShockRow(row) || row.value != null)
+                    && !(model.episodes ?? []).some((row) => row.proxied.some((proxy) => proxy.failed))
+                  : model.complete;
+    // A basket view with too little covered shows no estimate. The report opens with why, and leaves out
+    // the tables it would have filled with dashes; what does not need the basket (holdings, the given shocks) stays.
     const shortfall = BASKET_VIEWS.has(view as RiskView) ? coverageLine(model.coverage).error : undefined;
+    const views = (requestedView ? [requestedView] : RISK_VIEWS).map((view) => ({ view, rows: model.rows[view] }));
+    const shown = (shortfall
+      ? views.map(({ view, rows }) => ({ view, rows: view === "holdings" ? rows : rows.filter((row) => row.value != null) }))
+        .filter(({ rows }) => rows.length > 0)
+      : views).map(({ view, rows }) => ({ view, rows: rows.map(displayRow) }));
     return {
       complete,
-      errors: [...(shortfall ? [shortfall] : []), ...model.warnings],
-      notes: [...riskCoverageNotices(model.coverage), ...model.notes.filter((note) => note !== fallback)],
-      sections: (requestedView ? [requestedView] : RISK_VIEWS).map((view) => ({
-        title: view,
-        columns: RISK_COLUMNS,
-        rows: model.rows[view].map(displayRow),
-      })),
-      metadata: { coverage: coverageSummary(model.coverage), model, benchmark: model.benchmark, window: model.window, notices },
+      errors: requestedView === "performance" && model.performanceEstimate ? [] : model.warnings,
+      notes: [...(requestedView === "performance" && model.performanceEstimate ? [] : riskCoverageNotices(model.coverage)), ...model.notes.filter((note) => note !== fallback),
+        ...(!requestedView || requestedView === "performance" ? model.performanceEstimate?.warnings ?? [] : [])],
+      // A view with nothing to show says why in one line.
+      sections: shown.map(({ view, rows }) => ({ title: view, columns: RISK_COLUMNS, rows, ...(rows.length === 0 ? { empty: riskSectionEmpty(view, {
+        name: local.portfolio.name,
+        brokerLinked: !!(local.portfolio.brokerId || local.portfolio.brokerInstanceId),
+        unvaluedOptions: (model.greeks?.warnings.length ?? 0) > 0,
+        failedHistories: failedHistories(model.coverage),
+      }) } : {}) })),
+      metadata: { coverage: coverageSummary(model.coverage), model, benchmark: model.benchmark, window: model.window,
+        notices: [...(shortfall ? [shortfall] : []), ...notices] },
     };
   },
   compact(result, args) {
@@ -363,7 +480,11 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
       complete: result.complete,
       ...(errors.length ? { errors } : {}),
       ...(notes.length ? { notes } : {}),
-      sections: [{ title: view, columns: RISK_COLUMNS, rows: rows.map(displayRow) }],
+      sections: [{ title: view, columns: RISK_COLUMNS, rows: rows.map(displayRow), ...(rows.length === 0 ? { empty: riskSectionEmpty(view, {
+        name: model.portfolio.name, brokerLinked: !!(model.portfolio.brokerId || model.portfolio.brokerInstanceId),
+        unvaluedOptions: (model.greeks?.warnings.length ?? 0) > 0,
+        failedHistories: failedHistories(model.coverage),
+      }) } : {}) }],
       metadata: {
         portfolio: {
           id: model.portfolio.id,
@@ -371,6 +492,13 @@ export const portfolioRiskHeadless: HeadlessPaneDefinition<"bundle"> = {
           currency: model.portfolio.currency,
         },
         view,
+        ...(view === "performance" && model.performanceEstimate ? { performanceEstimate: {
+          kind: model.performanceEstimate.kind,
+          label: model.performanceEstimate.label,
+          currency: model.performanceEstimate.currency,
+          startDate: model.performanceEstimate.points[0]?.date ?? null,
+          endDate: model.performanceEstimate.points.at(-1)?.date ?? null,
+        } } : {}),
         benchmark: model.benchmark,
         window: model.window,
         ...(basketView && model.coverage

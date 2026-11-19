@@ -3,7 +3,8 @@ import { Box, Text, useUiCapabilities } from "../../../ui";
 import { usePaneAppConfig, usePaneSettingValue, usePaneTicker, useUpdatePaneSettings } from "../../../state/app/context";
 import { colors, priceColor } from "../../../theme/colors";
 import { isPlainKey } from "../../../utils/keyboard";
-import { formatCompact, formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatPercentRaw } from "../../../utils/format";
+import { formatShortDate } from "../../../utils/datetime-format";
 import { formatMarketPrice, formatSignedMarketPrice, liveQuoteFormatOptions } from "../../../market-data/market/format";
 import { getRegularSessionDisplay } from "../../../market-data/market/status";
 import { chainOptionContract, formatExpDate, formatStrikeLabel, optionContractName, resolveOptionsTarget } from "../../../utils/options";
@@ -16,6 +17,7 @@ import {
   COIN_OPTIONS_HINT, isCoinWithoutOptions, isOptionsUnavailableError, listedOptionsAlternative, optionsUnavailableTitle,
 } from "../../../market-data/options-alternatives";
 import { useChartQueries, useOptionsQuery, useResolvedEntryValue, useTickerFinancials } from "../../../market-data/hooks";
+import { savedCopyEntryAt } from "../../../market-data/coordinator";
 import {
   Button,
   DataTableView,
@@ -32,6 +34,8 @@ import {
   type QueryBarFilter,
   type DataTableVisibleRange,
 } from "../../../components";
+import { createDataTableCsv } from "../../../components/data-table/export";
+import { statGridWithin } from "../../../components/ui/stat-grid";
 import { useShortcut } from "../../../react/input";
 import { useOptionalDialog, type AlertContext } from "../../../ui/dialog";
 import { useLiveQuoteEntries, useQuoteUpdates } from "../../../state/hooks/quote-streaming";
@@ -44,11 +48,13 @@ import type { OptionContract } from "../../../types/financials";
 import { OPTIONS_CALCULATOR_TEMPLATE_ID } from "../options-calculator/model";
 import { buildChainCalcParams, resolveCalcSide } from "./calc-seed";
 import { useOptionsCatalogue } from "./expiry-catalogue";
-import { calculateOptionGreeks, calculateOptionsSummary, solveChainVolatilities, type OptionsSummary } from "./analytics";
+import { calculateOptionGreeks, calculateOptionsSummary, IV_FILLED_DETAIL, IV_FILLED_NOTE, IV_FILLED_SHORT, solveChainVolatilities, type OptionsSummary } from "./analytics";
 import {
   DEFAULT_OPTION_FIELD_IDS,
+  OPTION_FIELD_DEFS,
   buildStrikeList,
   createOptionColumns,
+  fitOptionFieldIds,
   findNearestStrikeIndex,
   formatIv,
   optionColumnColor,
@@ -71,7 +77,7 @@ import { signedPositionDirection } from "../../../portfolio/position-metrics";
 import { optionMarketReference } from "./market-reference";
 import { useOptionsEnrichment } from "./enrichment";
 import type { OptionsEnrichmentSnapshot } from "./enrichment-model";
-import { optionMid, type OptionSide } from "../shared/volatility";
+import { optionMid, withQuotesUnderIntrinsicMarked, type OptionSide } from "../shared/volatility";
 import type { TickerRecord } from "../../../types/ticker";
 import type { TickerFinancials } from "../../../types/financials";
 import type { IvStats } from "../iv-history/client";
@@ -96,6 +102,7 @@ import {
   strikeWindowShortLabel,
   strikeWindowValue,
 } from "./strike-window";
+import { logFailure } from "../../../utils/log-failure";
 
 /** The summary strip and analytics recompute from live quotes at most this often. */
 const OPTIONS_SUMMARY_THROTTLE_MS = 1_000;
@@ -110,7 +117,7 @@ function sentenceCase(text: string): string {
 }
 
 function formatRatio(value: number | null | undefined): string {
-  return value == null || !Number.isFinite(value) ? "--" : value.toFixed(2);
+  return value == null || !Number.isFinite(value) ? MISSING_VALUE : value.toFixed(2);
 }
 
 /** The minimal record the chain needs for a symbol that is bound but not saved in any list. */
@@ -131,7 +138,7 @@ function spotItem(
   modelSpot: OptionModelSpot | null,
 ): StatItem {
   const quote = underlying?.quote;
-  if (!quote || !Number.isFinite(quote.price)) return { id: "spot", label: "Spot", value: "--" };
+  if (!quote || !Number.isFinite(quote.price)) return { id: "spot", label: "Spot", value: MISSING_VALUE };
   const options = liveQuoteFormatOptions(quote, quote.currency, assetCategory, underlying?.quoteMetadata?.instrumentType);
   const stamp = modelSpot ? modelSpotStamp(modelSpot) : null;
   if (modelSpot && stamp) {
@@ -168,11 +175,11 @@ function optionsSummaryItems({ spot, summary, enrichment, currency, ivRank }: {
   ivRank?: { stats: IvStats | null } | null;
 }): StatItem[] {
   // The chain columns draw an empty IV as a dash; a summary figure reads "--" like its neighbours.
-  const iv = (value: number | null | undefined) => value == null || !(value > 0) ? "--" : formatIv(value);
-  const whole = (value: number | null | undefined) => value == null ? "--" : String(Math.round(value));
+  const iv = (value: number | null | undefined) => value == null || !(value > 0) ? MISSING_VALUE : formatIv(value);
+  const whole = (value: number | null | undefined) => value == null ? MISSING_VALUE : String(Math.round(value));
   const rank = ivRank?.stats ?? null;
   const move = (amount: number | null | undefined, percent: number | null | undefined): Pick<StatItem, "value" | "detail"> =>
-    amount == null || percent == null ? { value: "--" } : { value: `${amount.toFixed(2)} ${currency}`.trim(), detail: `${percent.toFixed(2)}%` };
+    amount == null || percent == null ? { value: MISSING_VALUE } : { value: `${amount.toFixed(2)} ${currency}`.trim(), detail: `${percent.toFixed(2)}%` };
   const points = (value: number | null | undefined) => value == null ? null : `${value >= 0 ? "+" : ""}${(value * 100).toFixed(2)}`;
   const skew = points(enrichment?.skew25);
   const slope = points(enrichment?.termSlope);
@@ -186,13 +193,13 @@ function optionsSummaryItems({ spot, summary, enrichment, currency, ivRank }: {
     { id: "iv-hv", label: "IV/HV", value: formatRatio(summary?.impliedHistoricalRatio) },
     ...(ivRank ? [{
       id: "ivr", label: "IVR", value: whole(rank?.rank),
-      detail: rank ? `pctl ${whole(rank.percentile)} · ${rank.date.slice(5)}` : undefined,
+      detail: rank ? `pctl ${whole(rank.percentile)} · ${formatShortDate(rank.date, { year: false, utc: true })}` : undefined,
     }] : []),
     { id: "straddle", label: "Straddle", ...move(enrichment?.expectedMove.straddle, enrichment?.expectedMove.straddlePercent) },
     { id: "sigma", label: "1σ fit", ...move(enrichment?.expectedMove.sigma, enrichment?.expectedMove.sigmaPercent) },
-    { id: "skew", label: "Skew", value: skew == null ? "--" : `${skew} pp`, detail: "25d P-C" },
-    { id: "slope", label: "Slope", value: slope == null ? "--" : `${slope} ${slopeAnnualized ? "pp/y" : "pp"}`, detail: slopeTo },
-    { id: "volume", label: "Volume", value: summary?.expirationVolume == null ? "--" : formatCompact(summary.expirationVolume, { fixedDecimals: true }) },
+    { id: "skew", label: "Skew", value: skew == null ? MISSING_VALUE : `${skew} pp`, detail: "25d P-C" },
+    { id: "slope", label: "Slope", value: slope == null ? MISSING_VALUE : `${slope} ${slopeAnnualized ? "pp/y" : "pp"}`, detail: slopeTo },
+    { id: "volume", label: "Volume", value: summary?.expirationVolume == null ? MISSING_VALUE : formatCompact(summary.expirationVolume, { fixedDecimals: true }) },
     { id: "pc-volume", label: "P/C vol", value: formatRatio(summary?.putCallVolumeRatio) },
     { id: "pc-oi", label: "P/C OI", value: formatRatio(summary?.putCallOpenInterestRatio) },
   ];
@@ -264,8 +271,14 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
   const dailyHistoryEntry = dailyHistoryRequest ? historyEntries.get(buildChartKey(dailyHistoryRequest)) ?? null : null;
   const dailyHistory = useResolvedEntryValue(dailyHistoryEntry);
   const [chainRefreshMinutes] = usePaneSettingValue<string>("chainRefreshMinutes", "");
+  const { nativePaneChrome } = useUiCapabilities();
   const [storedOptionFieldIds] = usePaneSettingValue<OptionFieldId[]>("optionColumnIds", DEFAULT_OPTION_FIELD_IDS);
   const optionFieldIds = useMemo(() => resolveOptionFieldIds(storedOptionFieldIds), [storedOptionFieldIds]);
+  // The terminal chain keeps both sides on screen, giving up fields to fit (the
+  // table's width less its scrollbar); the desktop's table scrolls as it did.
+  const chainWidth = Math.max(1, width - 3);
+  const shownFieldIds = useMemo(() => nativePaneChrome ? optionFieldIds : fitOptionFieldIds(optionFieldIds, chainWidth),
+    [chainWidth, nativePaneChrome, optionFieldIds]);
   const [storedStrikeWindow] = usePaneSettingValue<unknown>(STRIKE_WINDOW_SETTING, ALL_STRIKES);
   const strikeWindow = useMemo(() => resolveStrikeWindow(storedStrikeWindow), [storedStrikeWindow]);
   const strikeWindowText = strikeWindowValue(strikeWindow);
@@ -333,7 +346,6 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
   // tab list asks the web host to reveal the active tab and can move the date
   // being clicked before mouse-up, cancelling selection of an offscreen expiry.
   const expirationPickRef = useRef<(value: string) => void>(() => {});
-  const { nativePaneChrome } = useUiCapabilities();
   const selectedExpirationIndex = selectedExpiration == null ? -1 : expirationDates.indexOf(selectedExpiration);
   const strikeWindowOptions = useMemo(() => {
     const presets = STRIKE_WINDOW_PRESETS.map(({ value, label, short, description }) => ({ value, label, short, description }));
@@ -356,6 +368,7 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
     id: "expiration",
     label: "Exp",
     inline: true,
+    scrolls: true,
     value: String(selectedExpiration),
     // The dates either side name the key that steps to them: a terminal
     // label prefix, a desktop tooltip.
@@ -378,8 +391,15 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
   // The body names the dates nearest the one asked for; the footer only flags it.
   const unavailableExpiry = expirationUnavailable && selectedExpiration != null
     ? sentenceCase(missingExpiryText(selectedExpiration, availableExpirations)) : null;
+  // A chain kept because the refresh could not get through (offline, a timeout) is a saved copy the footer dates,
+  // not an error; any other failure stays the error beside the old chain.
+  const initialSavedAt = savedCopyEntryAt(initialChainEntry);
+  const expirationSavedAt = savedCopyEntryAt(expirationChainEntry);
+  const chainSavedAt = initialSavedAt == null ? expirationSavedAt
+    : expirationSavedAt == null ? initialSavedAt : Math.min(initialSavedAt, expirationSavedAt);
   const error = (expirationUnavailable ? `Expiry ${expiryIsoDate(selectedExpiration!)} unavailable` : null)
-    ?? initialChainEntry?.error?.message ?? expirationChainEntry?.error?.message
+    ?? (initialSavedAt == null ? initialChainEntry?.error?.message : null)
+    ?? (expirationSavedAt == null ? expirationChainEntry?.error?.message : null)
     ?? (initialChainEntry?.phase === "error" || expirationChainEntry?.phase === "error"
       ? "Failed to load options" : null);
 
@@ -549,14 +569,6 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
     () => strikeChain ? overlayOptionChainQuotes(strikeChain, optionQuoteEntries, optionQuoteFreshness, optionQuoteBroker).chain : null,
     [optionQuoteEntries, optionQuoteFreshness, strikeChain, optionQuoteBroker],
   );
-  const callsByStrike = useMemo(
-    () => new Map(liveChain?.calls.map((c) => [c.strike, c]) ?? []),
-    [liveChain],
-  );
-  const putsByStrike = useMemo(
-    () => new Map(liveChain?.puts.map((p) => [p.strike, p]) ?? []),
-    [liveChain],
-  );
   // IV and the Greeks are valued at one spot and instant, which the footer
   // names: the close a chain from the close was quoted against, else the
   // latest price (docs/research-data.md#greeks-spot-and-time).
@@ -564,6 +576,16 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
   const modelSpot = useMemo(() => liveChain ? optionModelSpot(underlyingQuote, liveChain, Date.now(), effectiveExchange) : null,
     [liveChain, underlyingQuote, effectiveExchange]);
   const greeksSpot = modelSpot?.price;
+  // A quote under intrinsic at that spot is shown stale, as the server marks one from before the session.
+  const pricedChain = useMemo(() => liveChain ? withQuotesUnderIntrinsicMarked(liveChain, greeksSpot) : null, [greeksSpot, liveChain]);
+  const callsByStrike = useMemo(
+    () => new Map(pricedChain?.calls.map((c) => [c.strike, c]) ?? []),
+    [pricedChain],
+  );
+  const putsByStrike = useMemo(
+    () => new Map(pricedChain?.puts.map((p) => [p.strike, p]) ?? []),
+    [pricedChain],
+  );
   // One solve per applied batch: a streamed contract's IV comes from its live
   // midpoint, the rest from the snapshot, all against the same forward.
   const volatilities = useMemo(
@@ -578,6 +600,7 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
       call,
       put,
       impliedVolatility: volatilities?.byStrike.get(strike),
+      impliedVolatilityFilled: volatilities?.filled.has(strike) ?? false,
       callGreeks: volatilities ? calculateOptionGreeks(call, "call", greeksSpot, dividendYield, volatilities) : undefined,
       putGreeks: volatilities ? calculateOptionGreeks(put, "put", greeksSpot, dividendYield, volatilities) : undefined,
       callExtrinsicPerYear: call && volatilities ? optionCarry(call, "call", greeksSpot, volatilities.valuationTime)?.extrinsicPerYear ?? null : null,
@@ -612,19 +635,53 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
     label: "Open interest as of",
     getMetadata: () => ({ text: openInterestAsOfLabel(openInterestAsOf), key: "openInterestAsOf", value: openInterestAsOf?.date ?? null }),
   } : null);
-  // What IV and the Greeks are valued at, and the open interest's date. In a
-  // crowded footer it shortens, then gives way to the contract under the cursor.
-  // A stamped spot (a close, an extended print) is already the Spot figure's.
+  // What IV and the Greeks are valued at. In a crowded footer it shortens,
+  // then gives way to the contract under the cursor. A stamped spot (a close,
+  // an extended print) is already the Spot figure's.
   const footerSpot = modelSpot && !modelSpotStamp(modelSpot) ? modelSpot : null;
-  const basisText = [footerSpot ? `spot ${formatModelSpotPrice(footerSpot.price)} ${modelSpotLabel(footerSpot)}` : null,
-    strikeChain && !listedOpenInterest.loading ? openInterestAsOfLabel(openInterestAsOf) : null].filter(Boolean).join(" · ");
-  const shortBasisText = [footerSpot ? `${formatModelSpotPrice(footerSpot.price)} last `
-    + `${new Date(footerSpot.observedAt).toISOString().slice(11, 16)} UTC` : null,
-  strikeChain && !listedOpenInterest.loading ? openInterestAsOf?.date ? `OI ${openInterestAsOf.date.slice(5)}` : "OI undated" : null]
-    .filter(Boolean).join(" · ");
-  usePaneFooter("options-basis", () => ({ info: basisText ? [{ id: "greeks-basis",
-    parts: [{ text: basisText, tone: "muted" as const }],
-    variants: [[{ text: shortBasisText, tone: "muted" as const }], []] }] : [] }), [basisText, shortBasisText]);
+  const basisText = footerSpot ? `spot ${formatModelSpotPrice(footerSpot.price)} ${modelSpotLabel(footerSpot)}` : "";
+  const shortBasisText = footerSpot ? `${formatModelSpotPrice(footerSpot.price)} last ${new Date(footerSpot.observedAt).toISOString().slice(11, 16)} UTC` : "";
+  // The open interest's date, which its counts cannot be read without: while the chain shows OI it shortens but
+  // stays, before the spot and the contract under the cursor give way, and a picture of the pane keeps it.
+  const openInterestShown = shownFieldIds.includes("openInterest");
+  const openInterestDateText = strikeChain && !listedOpenInterest.loading ? openInterestAsOfLabel(openInterestAsOf) : "";
+  const openInterestShortText = openInterestAsOf?.date ? `OI ${openInterestAsOf.date.slice(5)}` : "OI undated";
+  // How IV was solved is said while the chain shows a figure that was not: a strike with no two-sided
+  // out-of-the-money quote has its IV read off the neighbouring strikes, and its cell leads with "~".
+  const ivFilledShown = shownFieldIds.includes("iv") && rows.some((row) => row.impliedVolatilityFilled && row.impliedVolatility != null);
+  // A report of the pane (`gloom fn OMON`) says it too.
+  useRemoteUiNode(ivFilledShown ? {
+    role: "report-notice",
+    label: "IV filled",
+    getMetadata: () => ({ text: IV_FILLED_NOTE, key: "ivFilled", value: true }),
+  } : null);
+  usePaneFooter("options-oi-date", () => ({ order: -1, info: openInterestDateText ? [{
+    id: "oi-as-of", capture: openInterestShown, holdsPlace: openInterestShown, parts: [{ text: openInterestDateText, tone: "muted" as const }],
+    variants: openInterestShown ? [[{ text: openInterestShortText, tone: "muted" as const }]] : [[{ text: openInterestShortText, tone: "muted" as const }], []],
+  }] : [] }), [openInterestDateText, openInterestShortText, openInterestShown]);
+  usePaneFooter("options-basis", () => ({ info: [
+    ...(basisText ? [{ id: "greeks-basis", parts: [{ text: basisText, tone: "muted" as const }],
+      variants: [[{ text: shortBasisText, tone: "muted" as const }], []] }] : []),
+    ...(ivFilledShown ? [{ id: "iv-filled", parts: [{ text: IV_FILLED_NOTE, tone: "muted" as const }],
+      title: IV_FILLED_DETAIL, variants: [[{ text: IV_FILLED_SHORT, tone: "muted" as const }]] }] : []),
+  ] }), [basisText, shortBasisText, ivFilledShown]);
+  // Fields the terminal chain gave up for width, counted so a narrow chain does
+  // not read as all there is; hover names them. It leads the footer and holds
+  // its place beside the open interest's date, so a crowded row gives up the
+  // contract under the cursor before either.
+  const hiddenFields = OPTION_FIELD_DEFS.filter((field) => optionFieldIds.includes(field.id) && !shownFieldIds.includes(field.id))
+    .map((field) => field.label).join(", ");
+  usePaneFooter("options-fit", () => {
+    const count = hiddenFields ? hiddenFields.split(", ").length : 0;
+    return { order: -1, info: count ? [{
+      id: "options-hidden-fields",
+      capture: true,
+      holdsPlace: true,
+      parts: [{ text: `${count} ${count === 1 ? "field" : "fields"} hidden`, tone: "muted" as const }],
+      title: `Too narrow for ${hiddenFields}: a wider pane shows them, and Export CSV keeps them.`,
+      variants: [[{ text: `${count} hidden`, tone: "muted" as const }]],
+    }] : [] };
+  }, [hiddenFields]);
   // Figures that summarise the whole expiry move at most once a second, so a
   // busy stream reads as a steady strip rather than flicker.
   // A new expiry, a refreshed snapshot or the underlying price arriving or
@@ -661,7 +718,7 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
     void dialog.alert({
       closeOnClickOutside: true,
       content: (ctx: AlertContext) => <AnalyticsAsOfDialog {...ctx} rows={rows} />,
-    }).catch(() => {});
+    }).catch(logFailure("options.view", "Open analytics as-of dialog failed"));
   }, [dialog, enrichment]);
   usePaneFooter("options-enrichment", () => ({ info: [
     ...(enrichmentState.loading ? [{ id: "enrichment-loading", parts: [{ text: "loading analytics", tone: "muted" as const }] }] : []),
@@ -677,10 +734,10 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
     ),
     [optionQuoteEntries, optionQuoteFreshness, optionQuoteTargets],
   );
-  const optionColumns = useMemo<OptionColumn[]>(() => createOptionColumns(optionFieldIds).map((column) => ({
+  const optionColumns = useMemo<OptionColumn[]>(() => createOptionColumns(shownFieldIds).map((column) => ({
     ...column,
     headerColor: optionColumnColor(column, colors.panel),
-  })), [optionFieldIds]);
+  })), [shownFieldIds]);
 
   const selectedRow = rows[selectedStrikeIdx] ?? null;
   const selectedContractAvailable = !selectedContract || (selectedContract.side === "call"
@@ -844,7 +901,8 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
     loading,
     quoteCoverage: optionQuoteCoverage,
     reference: selectedReference,
-    spreadColumnVisible: optionFieldIds.includes("spread"),
+    savedAt: chainSavedAt,
+    spreadColumnVisible: shownFieldIds.includes("spread"),
   });
 
   useEffect(() => {
@@ -960,17 +1018,19 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
   // cell wide enough for all of it, and otherwise takes a row of its own so no
   // figure is squeezed. Sized for four-digit days, so the band does not
   // reflow as the chain's as-of arrives or the expiry steps.
-  const expiryItem: StatItem = { id: "expiry", label: "Expiry", value: expiryDate, detail: `(${expiryDays})` };
+  // Dated as the expiry strip dates it ("13 Nov '26"), never the ISO day a report carries.
+  const expiryLabel = selectedExpiration == null ? "" : formatExpDate(selectedExpiration);
+  const expiryItem: StatItem = { id: "expiry", label: "Expiry", value: expiryLabel, detail: `(${expiryDays})` };
   const cellColumns = Math.max(figureColumns, Math.ceil((figures.length + 1) / statRowBudget));
   const expiryCells = Math.max(...figures.map((item) => item.label.length), expiryItem.label.length) + 1
-    + expiryDate.length + 2 + "(9999d)".length;
+    + expiryLabel.length + 2 + "(9999d)".length;
   const expiryInline = Math.floor((statWidth - 2 * (cellColumns - 1)) / cellColumns) >= expiryCells;
   const statColumns = expiryInline ? cellColumns : figureColumns;
   const statItems = [expiryInline ? expiryItem : { ...expiryItem, wide: true }, ...figures];
-  const summaryRowCount = Math.min(statGridRows(statItems, statWidth, statColumns), Math.max(0, height - 6));
-  // A short band gives up figures from the end; the expiry stays.
-  const shownStatItems = summaryRowCount === 0 ? []
-    : [statItems[0]!, ...figures.slice(0, summaryRowCount * statColumns - (expiryInline ? 1 : statColumns))];
+  // A short band gives up figures from the end, by lines: a row that wraps
+  // takes two. The expiry leads, so it stays.
+  const summaryLines = Math.min(statGridRows(statItems, statWidth, statColumns), Math.max(0, height - 6));
+  const { items: shownStatItems, lines: summaryRowCount } = statGridWithin(statItems, statWidth, summaryLines, statColumns);
   // No term here follows the selection or the load, so an empty cold-expiry
   // response cannot resize the table: growing it during loading would turn a
   // clamped scroll into apparent user navigation.
@@ -984,7 +1044,7 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
       <QueryBar width={Math.max(1, width - 2)} filters={queryFilters} />
 
       {summaryRowCount > 0 && (
-        <StatGrid items={shownStatItems} width={statWidth} columns={statColumns} />
+        <StatGrid items={shownStatItems} width={statWidth} columns={statColumns} maxLines={summaryLines} />
       )}
 
       {isOpt && parsed && (
@@ -1014,6 +1074,12 @@ export function OptionsView({ width, height, focused, nestedInTabs = false, ivRa
         headerScrollId="options-table-header-scroll"
         bodyScrollId="options-table-body-scroll"
         columns={optionColumns}
+        // A field the terminal gave up for width is still in the export.
+        exportCsv={shownFieldIds.length < optionFieldIds.length
+          ? () => createDataTableCsv({ columns: createOptionColumns(optionFieldIds), items: rows, renderCell })
+          : undefined}
+        // Calls and puts mirror each other around the strike; Settings orders their fields.
+        columnReorder={false}
         items={rows}
         sortColumnId={null}
         sortDirection="asc"

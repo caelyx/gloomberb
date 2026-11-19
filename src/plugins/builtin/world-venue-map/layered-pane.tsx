@@ -1,3 +1,4 @@
+import { formatShortDate } from "../../../utils/datetime-format";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CloudWorldVenuePayload } from "../../../api-client";
 import type {
@@ -9,6 +10,7 @@ import type {
 } from "../../../api-client/geo";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import {
+  Button,
   DataTableStackView,
   EmptyState,
   getPaneSidebarWidth,
@@ -26,6 +28,8 @@ import {
   type DataTableCell,
   type PageRequest,
   type PaneHint,
+  type QueryBarFilter,
+  TickerBadgeList,
 } from "../../../components";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import {
@@ -36,13 +40,17 @@ import {
   usePluginPaneState,
 } from "../../../public/react";
 import { relativeLuminance } from "../../../theme/color-utils";
+import { displayWidth } from "../../../utils/format";
+import { truncateWithEllipsis } from "../../../utils/text-wrap";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
 import { Box, Text, TextAttributes, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { formatGeoSeriesExpression } from "../chart-composer/series-expression";
 import { CLOUD_PLAN_KEY, useCloudUpgradeAction } from "../shared/cloud-upgrade";
 import { useOpenDescription } from "../shared/open-description";
-import { ENTITY_PAGE_SIZE, loadEntityDetail, loadEntityPage, loadWorldVenues } from "./client";
+import { ENTITY_PAGE_SIZE, loadEntityDetail, loadEntityPage, loadWorldVenues, scopedGeoRequest } from "./client";
+import { isLocalGeoLayer } from "./local-layers";
+import { useLinkedGeoScope } from "./scope";
 import { EntityDetail } from "./entity-detail";
 import { useWorldMapEvidence } from "./evidence";
 import { entityCellText, entityColumns, TICKER_COLUMN_ID, type EntityColumn } from "./entity-table";
@@ -52,6 +60,7 @@ import { WORLD_VENUE_MAP_PANE_ID } from "./ids";
 import {
   entityOpenZoom,
   entityTableBbox,
+  framePlaces,
   featureAnchor,
   formatGeoValue,
   formatTickerLinks,
@@ -70,6 +79,7 @@ import { usesClassTones } from "./map-symbols";
 import { filterWorldVenues, WORLD_MAP_HEIGHT_RATIO } from "./model";
 import { useGeoLayerFeed } from "./use-geo";
 import { SelectedVenueHeader } from "./venue-header";
+import { initialMapFocus, mapPlaceBbox, nearestPlaces, type MapStart } from "./place";
 
 interface LayeredMapViewProps extends PaneProps {
   /** The layers on, already capped. */
@@ -78,6 +88,7 @@ interface LayeredMapViewProps extends PaneProps {
   tokens: readonly string[];
   /** A plain MAP: venues show unless the pane turned them off. */
   plain?: boolean;
+  start: MapStart;
 }
 
 interface OpenEntity {
@@ -119,7 +130,7 @@ function layerFreshness(state: GeoLayerState, now: number): { text: string; tone
   if (state.layer.cadence === "daily" && asOf) {
     const date = new Date(Date.parse(asOf));
     if (!Number.isFinite(date.getTime())) return null;
-    return { text: `as of ${date.toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" })}`, tone: "muted" };
+    return { text: `as of ${formatShortDate(date, { year: false, utc: true })}`, tone: "muted" };
   }
   return null;
 }
@@ -162,7 +173,7 @@ const SelectedEntityHeader = memo(function SelectedEntityHeader({
   return (
     <Box flexDirection="column" height={2} width={width} paddingX={1}>
       <Box flexDirection="row" justifyContent="space-between" width="100%">
-        <Text fg={colors.textBright} attributes={TextAttributes.BOLD}>{row.label}</Text>
+        <Text fg={colors.textBright} attributes={TextAttributes.BOLD}>{truncateWithEllipsis(row.label, Math.max(1, width - 3 - displayWidth(layer.name)))}</Text>
         <Text fg={color}>{layer.name}</Text>
       </Box>
       <Text fg={colors.textMuted}>{meta}</Text>
@@ -170,7 +181,7 @@ const SelectedEntityHeader = memo(function SelectedEntityHeader({
   );
 });
 
-export function LayeredMapView({ focused, width, height, layers, tokens, plain = false }: LayeredMapViewProps) {
+export function LayeredMapView({ focused, width, height, layers, tokens, plain = false, start }: LayeredMapViewProps) {
   const colors = useThemeColors();
   const dark = relativeLuminance(colors.text) > relativeLuminance(colors.bg);
   const { nativePaneChrome } = useUiCapabilities();
@@ -193,7 +204,11 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
     setView((current) => sameGeoView(current, next) ? current : next);
   }, []);
   const canAccess = useCallback((layer: GeoLayerInfo) => layer.access !== "pro" || hasProAccess, [hasProAccess]);
-  const states = useGeoLayerFeed(layers, view, visible, { canAccess });
+  // A linked map narrows the app's own layers to what its source pane selects.
+  const linkedScope = useLinkedGeoScope(layers.some((layer) => isLocalGeoLayer(layer.id)));
+  const scope = linkedScope.scope;
+  const request = useMemo(() => scopedGeoRequest(scope?.key ?? null), [scope?.key]);
+  const states = useGeoLayerFeed(layers, view, visible, { canAccess, request });
 
   // A layer coloured by class (ships) takes the first colour, so its own never meets the class colours.
   const colorOrder = useMemo(
@@ -219,9 +234,9 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
   const [open, setOpen] = usePluginPaneState<OpenEntity | null>("map:open", null);
   const [selectedMic, setSelectedMic] = useState<string | null>(null);
   const [headerSubject, setHeaderSubject] = useState<"entity" | "venue">("entity");
-  const [focus, setFocus] = useState<WorldMapFocus | null>(null);
   // Kept per pane, so docking, undocking, popping out or reloading reopens the map where it was.
   const [savedViewport, setSavedViewport] = usePluginPaneState<unknown>("map:viewport", null);
+  const [focus, setFocus] = useState<WorldMapFocus | null>(() => initialMapFocus(start.place, savedViewport, start.home));
   const { active: searchFocused, focus: focusSearch, searchProps } = useQueryBarSearch();
   const mapKeys = useMapKeyboard(searchFocused);
   const scrollRef = useRef<ScrollBoxRenderable>(null);
@@ -236,7 +251,7 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
     const timer = setTimeout(() => setTableView(view), TABLE_VIEW_SETTLE_MS);
     return () => clearTimeout(timer);
   }, [tableView, view]);
-  const tableBbox = entityTableBbox(tableLayer, tableView);
+  const tableBbox = !nativePaneChrome && start.place ? mapPlaceBbox(start.place) : entityTableBbox(tableLayer, tableView);
   const tableBboxKey = tableBbox?.join(",") ?? "";
   const loadPage = useCallback(async ({ offset, signal }: PageRequest) => {
     const page = await loadEntityPage(tableLayer.id, {
@@ -244,7 +259,7 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
       ...(sort.key ? { sort: sort.key, dir: sort.dir } : {}),
       ...(tableBbox ? { bbox: tableBbox } : {}),
       offset,
-    }, signal);
+    }, signal, request);
     const rows = page.rows ?? [];
     const total = typeof page.total === "number" ? page.total : null;
     return {
@@ -252,18 +267,29 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
       rows,
       hasMore: rows.length >= ENTITY_PAGE_SIZE && (total === null || offset + rows.length < total),
       nextOffset: offset + rows.length,
+      scopeKey: scope?.key ?? null,
     };
-  }, [query, sort.dir, sort.key, tableBboxKey, tableLayer.id]);
+  }, [query, request, scope?.key, sort.dir, sort.key, tableBboxKey, tableLayer.id]);
   const pages = usePagedRows(tableReadable ? loadPage : null, { getId: (row) => row.id });
-  const rows = pages.rows;
+  const rows = useMemo(() => !sort.key ? nearestPlaces(pages.rows, start.place, (row) => ({ longitude: row.lon, latitude: row.lat })) : pages.rows,
+    [pages.rows, sort.key, start.place]);
+  // A linked map frames the places of each company or theme it moves to, once.
+  const framedScopeRef = useRef<string | null>(null);
+  const firstPage = pages.pages[0];
+  useEffect(() => {
+    if (!firstPage?.scopeKey || !isLocalGeoLayer(tableLayer.id) || framedScopeRef.current === firstPage.scopeKey) return;
+    framedScopeRef.current = firstPage.scopeKey;
+    const frame = framePlaces(firstPage.rows);
+    if (frame) setFocus({ key: `scope:${firstPage.scopeKey}`, ...frame, exact: true });
+  }, [firstPage, tableLayer.id]);
   useWorldMapEvidence(tokens, states, rows.length, pages.loading);
   const refresh = useCallback(() => pages.reload(), [pages.reload]);
   usePaneRefreshKey(refresh, { focused: focused && !searchFocused });
 
   const detailOpen = !!open && open.layer === tableLayer.id;
   const detailLoader = useMemo(
-    () => (detailOpen && open ? () => loadEntityDetail(open.layer, open.id) : null),
-    [detailOpen, open?.id, open?.layer],
+    () => (detailOpen && open ? () => loadEntityDetail(open.layer, open.id, undefined, request) : null),
+    [detailOpen, open?.id, open?.layer, request],
   );
   const detail = useAsyncResource(detailLoader);
   const openRow = detailOpen
@@ -362,9 +388,10 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
       ...(freshness ? [{ id: "fresh", parts: [{ text: freshness.text, tone: freshness.tone }] }] : []),
       ...(zoomLayers.length ? [{ id: "zoom", parts: [{ text: `zoom in for ${zoomLayers.map((state) => state.layer.name).join(", ")}`, tone: "muted" as const }] }] : []),
       ...(pages.error && rows.length ? [{ id: "error", parts: [{ text: pages.error.message, tone: "warning" as const }] }] : []),
+      ...(start.note ? [{ id: "place", parts: [{ text: start.note, tone: "warning" as const }] }] : []),
     ],
     hints,
-  }), [detail.data, detail.loading, detailOpen, freshness?.text, freshness?.tone, hints.map((hint) => hint.id).join(","), loadingLayers.length, pages.error, pages.loading, pages.loadingMore, rows.length, zoomLayers.map((state) => state.layer.id).join(",")]);
+  }), [detail.data, detail.loading, detailOpen, freshness?.text, freshness?.tone, hints.map((hint) => hint.id).join(","), loadingLayers.length, pages.error, pages.loading, pages.loadingMore, rows.length, start.note, zoomLayers.map((state) => state.layer.id).join(",")]);
   // The table's own layer says it cannot serve in the body; the footer warns about the others.
   const notices = layerNotices(states.filter((state) => state.layer.id !== tableLayer.id || (state.phase !== "unavailable" && state.phase !== "locked")));
   usePaneNoticeFooter({ registrationId: `${WORLD_VENUE_MAP_PANE_ID}:notices`, focused, notices, enabled: !detailOpen });
@@ -412,9 +439,29 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
 
   const onScroll = useTableLoadMore(scrollRef, pages.hasMore && !detailOpen, pages.loadMore);
   // A layer that cannot serve has nothing to search and, alone, nothing to switch to: no bar at all.
+  // What a linked map shows, before the search: a switch between the company and its theme when the
+  // source has both, else the one it has.
+  const scoped = !!scope && isLocalGeoLayer(tableLayer.id);
+  const { company: scopeCompany, theme: scopeTheme } = linkedScope;
+  const scopeFilter: QueryBarFilter | null = scoped && scopeCompany && scopeTheme ? {
+    id: "scope",
+    label: "Show",
+    inline: true,
+    value: linkedScope.mode,
+    options: [
+      { value: "company", label: scopeCompany.label },
+      { value: "theme", label: "Theme", description: scopeTheme.label },
+    ],
+    onChange: linkedScope.setMode,
+  } : null;
+  const scopeLeading = !scoped || scopeFilter ? undefined
+    : scopeCompany ? <TickerBadgeList symbols={[scopeCompany.label]} width={displayWidth(scopeCompany.label) + 2} listed />
+      : <Text fg={colors.textDim}>{truncateWithEllipsis(scope.label, Math.max(8, Math.floor(listWidth / 3)))}</Text>;
   const queryBar = !tableReadable && layers.length < 2 ? undefined : (
     <QueryBar
       width={listWidth}
+      leading={scopeLeading}
+      filters={scopeFilter ? [scopeFilter] : undefined}
       search={tableReadable ? {
         value: query,
         onChange: setQuery,
@@ -449,7 +496,10 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
   const emptyHint = tableLocked ? undefined
     : !tableReadable || pageStatus === "unavailable" ? unavailableNote
       : pages.error && !rows.length ? pages.error.message
-        : coverage ?? (query.trim() ? "Clear search." : undefined);
+        : coverage ?? undefined;
+  // A search that leaves nothing is cleared from the empty table itself.
+  const clearSearch = !tableLocked && tableReadable && pageStatus !== "unavailable" && !(pages.error && !rows.length) && query.trim()
+    ? <Button label="Clear search" onPress={() => setQuery("")} /> : undefined;
 
   const table = (
     <DataTableStackView<GeoEntityRow, EntityColumn>
@@ -515,6 +565,7 @@ export function LayeredMapView({ focused, width, height, layers, tokens, plain =
       ) : null}
       emptyStateTitle={pages.loading && !rows.length && tableReadable ? "Loading..." : emptyTitle}
       emptyStateHint={pages.loading && !rows.length ? undefined : emptyHint}
+      emptyStateActions={pages.loading && !rows.length ? undefined : clearSearch}
     />
   );
 

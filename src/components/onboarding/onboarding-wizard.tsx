@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { recordResearchActivity, type ResearchActivity } from "../../api-client/research-activity";
 import type { AppBrokerImportRuntime } from "../../app/runtime/broker-import";
 import { type AppConfig, findPaneInstance, type OnboardingStage } from "../../types/config";
-import { useViewport } from "../../react/input";
+import { useBeforeShortcut, useViewport } from "../../react/input";
 import { useKeybindings } from "../../app/keybindings";
 import { useAppDispatch, useAppSelector, useAppStateRef } from "../../state/app/context";
 import {
@@ -20,9 +20,10 @@ import { t, tf } from "../../i18n";
 import { useAppLanguage } from "../../i18n/react";
 import type { PluginRegistry } from "../../plugins/registry";
 import { formatCloudPrice, monthsFreeYearly } from "../../account/billing";
-import { proStepCopy, proStepRealtimeTitle } from "../../account/upgrade-dialog";
-import { Button, SegmentedControl, terminalButtonColumns } from "../ui";
+import { proStepCopy } from "../../account/upgrade-dialog";
+import { Button, Prose, SegmentedControl, terminalButtonColumns } from "../ui";
 import { AccountStep, PortfolioStep } from "./onboarding-steps";
+import { tuiPositionsPanelRows } from "./portfolio-step/positions-panel";
 import {
   ONBOARDING_DESKTOP,
   OnboardingActions,
@@ -37,11 +38,14 @@ import {
   type OnboardingSectionId,
 } from "./onboarding-frame";
 import { planProStep } from "./pro-step-layout";
+import { wrapTextLines } from "../../utils/text-wrap";
 import { useOnboardingAccount } from "./wizard-account";
 import { useOnboardingBrokerSync } from "./wizard-broker-sync";
 import { useOnboardingPositions } from "./wizard-positions";
 import { DesksStep, toggleDeskChoice } from "./desks-step";
-import { getOnboardingProgress } from "./wizard-model";
+import { TickersStep } from "./tickers-step";
+import { useOnboardingTickers } from "./wizard-tickers";
+import { getOnboardingProgress, isOnboardingWorkspaceBuilt, previousOnboardingStage } from "./wizard-model";
 import {
   useOnboardingKeyboard,
   SKIP_SETUP_KEY,
@@ -49,6 +53,12 @@ import {
   CONNECT_BROKER_KEY,
   BROWSER_SIGN_IN_KEY,
   SKIP_DESKS_KEY,
+  SKIP_TICKERS_KEY,
+  SKIP_PORTFOLIO_KEY,
+  SKIP_KEY,
+  CONTINUE_KEY,
+  BACK_KEY,
+  type PositionsButton,
 } from "./onboarding-keyboard";
 import { useOnboardingBrokerFields, useOnboardingBrokerForm } from "./use-onboarding-broker-form";
 import { useOnboardingProgress, useOnboardingWorkspace, useOnboardingCompletion } from "./use-onboarding-progress";
@@ -62,6 +72,10 @@ interface OnboardingWizardProps {
   onComplete: (config: AppConfig) => void | Promise<void>;
 }
 
+/** The Desks card's terminal width; a narrower window clamps it, and the rows fit what is left. */
+const DESKS_CARD_WIDTH = 68;
+/** "Which tickers do you follow?" is the Desks card with a search field over its list. */
+const TICKERS_CARD_HEIGHT = 20;
 /** One funnel milestone per stage the user reaches; the account step reports sign-in itself. */
 const STAGE_ACTIVITY: Partial<Record<OnboardingStage, ResearchActivity>> = {
   portfolio: "onboarding_started",
@@ -76,21 +90,43 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
   const rendererHost = useRendererHost();
   const commandBarShortcut = useCommandBarShortcut();
   const notificationActionShortcut = useActionShortcut("notification-action");
-  const notificationDismissShortcut = useActionShortcut("notification-dismiss");
   const keybindings = useKeybindings();
   const dialogOpen = useDialogState((dialog) => dialog.isOpen);
   const commandBarOpen = useAppSelector((state) => state.commandBarOpen);
+  // A pane holding the keyboard (a chat composer, a ticker search): the card's keys are its.
+  const inputCaptured = useAppSelector((state) => state.inputCaptured);
+  // Whether the last key went to a field: there the card shows no keys, since they type.
+  const [typingInField, setTypingInField] = useState(false);
+  useBeforeShortcut((event) => setTypingInField(event.targetEditable === true));
   const { width: viewportWidth, height: viewportHeight } = useViewport();
   const dispatch = useAppDispatch();
   const stateRef = useAppStateRef();
   const config = useAppSelector((state) => state.config);
   const progress = getOnboardingProgress(config);
   const stage = progress.stage;
+  // A step that closes takes its field with it ("Which tickers do you follow?" closes from its search).
+  useEffect(() => setTypingInField(false), [stage]);
+  const workspaceBuilt = isOnboardingWorkspaceBuilt(progress);
+  /** Opened again from Settings: any step can be left, and the first-run funnel is not told. */
+  const rerun = progress.rerun === true;
   const researchOpenedRef = useRef<string | null>(null);
+  /** The stages the user came through, oldest first, for Back to retrace. */
+  const visitedRef = useRef<OnboardingStage[]>([]);
+  const shownStageRef = useRef(stage);
+  const backTargetRef = useRef<OnboardingStage | null>(null);
+  useEffect(() => {
+    const left = shownStageRef.current;
+    if (left === stage) return;
+    shownStageRef.current = stage;
+    const back = backTargetRef.current === stage;
+    backTargetRef.current = null;
+    if (!back) visitedRef.current = [...visitedRef.current, left];
+  }, [stage]);
   const [editingField, setEditingField] = useState(false);
   /** The added position the keyboard acts on once no field is being typed in. */
   const [positionCursorSymbol, setPositionCursorSymbol] = useState<string | null>(null);
   const inputRef = useRef<InputRenderable>(null);
+  const tickersInputRef = useRef<InputRenderable>(null);
   const {
     portfolioSub, setPortfolioSub, portfolioOptionIdx, setPortfolioOptionIdx, brokerValues, setBrokerValues,
     selectedBrokerId, setSelectedBrokerId, brokerFieldIdx, setBrokerFieldIdx, brokerSelectIdx,
@@ -109,7 +145,7 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
   // bar, so an unread inbox never stalls the first session.
   const account = useOnboardingAccount({
     nextStep: () => {
-      recordResearchActivity("onboarding_signed_in");
+      if (!rerun) recordResearchActivity("onboarding_signed_in");
       saveProgressInBackground({ stage: "upgrade", accountStatus: "signed-in" });
     },
     setEditingField,
@@ -127,12 +163,12 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
 
   useEffect(() => {
     const activity = STAGE_ACTIVITY[stage];
-    if (activity) recordResearchActivity(activity);
-  }, [stage]);
+    if (activity && !rerun) recordResearchActivity(activity);
+  }, [rerun, stage]);
 
   useEffect(() => {
-    if (stage === "portfolio" && positionCount > 0) recordResearchActivity("onboarding_position_added");
-  }, [positionCount, stage]);
+    if (stage === "portfolio" && positionCount > 0 && !rerun) recordResearchActivity("onboarding_position_added");
+  }, [positionCount, rerun, stage]);
 
   // The portfolio step opens straight into the ticker field.
   useEffect(() => {
@@ -140,11 +176,12 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
   }, [portfolioSub, stage]);
   const {
     chosenDesks, setChosenDesks, deskCursor, setDeskCursor, buildingDesks, continueFromPositions,
-    finishDesks, handleBrokerSynced,
+    skipPositions, finishDesks, finishTickers, handleBrokerSynced,
   } = useOnboardingWorkspace({
-    stateRef, pluginRegistry, dispatch, positions, setEditingField, saveProgressInBackground,
+    stateRef, pluginRegistry, dispatch, positions, setEditingField, saveProgressInBackground, persistProgress,
     setPersistenceError, finishingRef, brokerOptions, selectedBrokerId, setPortfolioSub,
   });
+  const tickers = useOnboardingTickers({ pluginRegistry, desks: stage === "tickers" ? progress.desks : undefined });
 
   const {
     isBrokerSyncing,
@@ -166,11 +203,15 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
     setEditingField,
     setPortfolioSub,
   });
+  const notifySetupSaveFailure = useCallback(() => {
+    pluginRegistry.notify({ type: "error", body: t("Could not save your setup.") });
+  }, [pluginRegistry]);
   const {
     finish, skipSetup,
   } = useOnboardingCompletion({
     finishingRef, resetBrokerSync, setIsFinishing, setPersistenceError, progressSaveQueueRef, stateRef,
     dispatch, onComplete,
+    onSaveFailure: notifySetupSaveFailure,
   });
   const {
     setBrokerFieldValue, chooseBroker, openBrokerConnect, submitBrokerField, continuePortfolio,
@@ -183,11 +224,33 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
     brokerSyncError, rendererHost,
   });
 
+  /** The portfolio step's button Tab put the keyboard on, from its fields; none once a field is typed in again. */
+  const [positionsButton, setPositionsButton] = useState<PositionsButton | null>(null);
+  useEffect(() => {
+    if (editingField || stage !== "portfolio" || portfolioSub !== "positions") setPositionsButton(null);
+  }, [editingField, portfolioSub, stage]);
+  /** Its buttons that can be pressed now, as they are drawn. */
+  const positionsButtons = useMemo((): PositionsButton[] => {
+    if (positions.submitting) return [];
+    return [
+      ...(brokerOptions.length > 0 && positionCount > 0 ? ["broker" as const] : []),
+      ...(positionCount === 0 ? ["skip" as const] : []),
+      ...(positionCount > 0 || positions.hasDraft ? ["continue" as const] : []),
+    ];
+  }, [brokerOptions.length, positionCount, positions.hasDraft, positions.submitting]);
+
   useEffect(() => {
     if (!editingField) return;
     const timer = setTimeout(() => inputRef.current?.focus?.(), 10);
     return () => clearTimeout(timer);
   }, [account.accountFieldIdx, account.accountSub, brokerFieldIdx, editingField, portfolioSub, positions.fieldIdx]);
+
+  // "Which tickers do you follow?" opens with the cursor in its search.
+  useEffect(() => {
+    if (stage !== "tickers") return;
+    const timer = setTimeout(() => tickersInputRef.current?.focus?.(), 10);
+    return () => clearTimeout(timer);
+  }, [stage]);
 
   useEffect(() => {
     if (stage !== "account") return;
@@ -197,8 +260,8 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
   useEffect(() => {
     if (stage !== "research" || !progress.tickerSymbol || researchOpenedRef.current === progress.tickerSymbol) return;
     researchOpenedRef.current = progress.tickerSymbol;
-    recordResearchActivity("ticker_saved");
-  }, [stage, progress.tickerSymbol]);
+    if (!rerun) recordResearchActivity("ticker_saved");
+  }, [rerun, stage, progress.tickerSymbol]);
   const movePositionCursor = useCallback((delta: number) => {
     if (positionCursorIndex < 0) return;
     const next = Math.max(0, Math.min(positionCount - 1, positionCursorIndex + delta));
@@ -238,17 +301,21 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
     ? findPaneInstance(config.layout, focusedPaneId)
     : null;
   const helpFocused = focusedInstance?.paneId === "help";
+  // The command bar its "Ctrl+P adds more" opens is the card's own next step:
+  // the card steps aside while it is open, as for a pane opened after it.
+  const coachAside = useCoachStepsAside(config, stage) || (stage === "research" && commandBarOpen);
   const {
-    offer, pricing, billingInterval, setBillingInterval, planAccess, primaryUpgradeAction, continueFree, personalTickers,
+    offer, pricing, billingInterval, setBillingInterval, planAccess, primaryUpgradeAction, continueFree,
   } = useOnboardingUpgrade({
     stage, progress, saveProgressInBackground, persistProgress,
-    shown: !helpFocused && !dialogOpen && !commandBarOpen,
   });
 
   const goToSection = useCallback((section: OnboardingSectionId) => {
     if (finishingRef.current || isBrokerCommitting) return;
     setEditingField(false);
     if (section === "portfolio") {
+      // Done for good once the workspace is built: picking it again would build it twice.
+      if (workspaceBuilt) return;
       setPortfolioSub("positions");
       saveProgressInBackground({ stage: "portfolio" });
       return;
@@ -260,13 +327,27 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
     if (planAccess.signedIn) {
       saveProgressInBackground({ stage: "upgrade", accountStatus: "signed-in" });
     }
-  }, [isBrokerCommitting, planAccess.signedIn, saveProgressInBackground]);
+  }, [isBrokerCommitting, planAccess.signedIn, saveProgressInBackground, workspaceBuilt]);
+
+  /** Back and Esc: to the step the user came from, never one that is done for good. */
+  const goBack = useCallback(() => {
+    if (finishingRef.current || isBrokerCommitting) return;
+    const back = previousOnboardingStage(progress, visitedRef.current, { pro: planAccess.hasProAccess });
+    if (!back) return;
+    visitedRef.current = back.visited;
+    backTargetRef.current = back.stage;
+    setEditingField(false);
+    if (back.stage === "portfolio") setPortfolioSub("positions");
+    saveProgressInBackground({ stage: back.stage });
+  }, [isBrokerCommitting, planAccess.hasProAccess, progress, saveProgressInBackground]);
 
   const sectionAvailability: Partial<Record<OnboardingSectionId, boolean>> = {
-    portfolio: !isBrokerCommitting,
-    // The workspace is built when the desks are picked, so that step comes first.
-    cloud: !isBrokerCommitting && stage !== "desks" && (stage === "account" || stage === "upgrade" || stage === "ready" || !!progress.tickerSymbol),
-    pro: !isBrokerCommitting && planAccess.signedIn && (
+    portfolio: !isBrokerCommitting && !workspaceBuilt,
+    // The workspace is built when the desks (and the tickers after them) are picked, so those steps come first.
+    cloud: !isBrokerCommitting && stage !== "desks" && stage !== "tickers"
+      && (stage === "account" || stage === "upgrade" || stage === "ready" || !!progress.tickerSymbol),
+    // Never from "Which tickers do you follow?": the workspace is built once it closes.
+    pro: !isBrokerCommitting && stage !== "tickers" && planAccess.signedIn && (
       stage === "upgrade"
       || stage === "ready"
       || progress.accountStatus === "signed-in"
@@ -278,42 +359,84 @@ function useOnboardingWizard({ pluginRegistry, importBrokerPositions, onComplete
   useOnboardingKeyboard({
     stage, progress, account, helpFocused, editingField, isBrokerCommitting, planAccess, continueFree,
     finish, sectionAvailability, goToSection, portfolioSub, positions, setEditingField, positionCount,
-    continueFromPositions, openBrokerConnect, movePositionCursor, removePositionAtCursor, submitBrokerField,
+    continueFromPositions, skipPositions, openBrokerConnect, movePositionCursor, removePositionAtCursor, submitBrokerField,
     submitAccountField, backPortfolio, continuePortfolio, setPortfolioOptionIdx, activeBrokerFields,
     brokerFieldIdx, setBrokerSelectIdx, brokerChoices, openBrokerGuide, chosenDesks, finishDesks,
     setDeskCursor, deskCursor, setChosenDesks, continueAccount, skipSetup, primaryUpgradeAction,
-    setBillingInterval, keybindings, dialogOpen, commandBarOpen, saveProgressInBackground,
+    setBillingInterval, keybindings, dialogOpen, commandBarOpen, saveProgressInBackground, goBack, coachAside,
+    inputCaptured, positionsButtons, positionsButton, setPositionsButton, tickers, finishTickers,
+    buildingWorkspace: buildingDesks,
   });
 
   return {
-    helpFocused, stage, progress, notificationDismissShortcut, finish, notificationActionShortcut,
+    coachAside,
+    coachKeysHidden: inputCaptured || typingInField,
+    helpFocused, stage, progress, finish, notificationActionShortcut,
     saveProgressInBackground, colors, commandBarShortcut, selectedBrokerId, brokerOptions, portfolioSub,
     sectionAvailability, goToSection, skipSetup, isFinishing, isBrokerCommitting, desktop, positions,
     inputRef, editingField, selectedPositionSymbol, brokerChoices, portfolioOptionIdx, setPortfolioOptionIdx,
     chooseBroker, activeBrokerFields, brokerFieldIdx, brokerSelectIdx, setBrokerSelectIdx, brokerValues,
     setBrokerFieldValue, isBrokerSyncing, brokerSyncError, persistenceError, positionCount,
-    openBrokerConnect, continueFromPositions, backPortfolio, continuePortfolio, chosenDesks, deskCursor,
+    openBrokerConnect, continueFromPositions, skipPositions, backPortfolio, continuePortfolio, chosenDesks, deskCursor,
     setDeskCursor, setChosenDesks, buildingDesks, finishDesks, account, viewportWidth, viewportHeight, continueAccount,
     offer, planAccess, pricing, billingInterval, setBillingInterval, continueFree, primaryUpgradeAction,
-    personalTickers,
+    goBack, rerun, positionsButton: editingField ? null : positionsButton, tickers, tickersInputRef, finishTickers,
   };
+}
+
+/**
+ * A card button's letter key, shown only while no field is being typed in: in
+ * a field the letter is typed (the Skip button's `s` went into the Ticker
+ * field), and it acts on the card once Esc leaves the field.
+ */
+export function cardKey(key: string, editingField: boolean): string | undefined {
+  return editingField && key.length === 1 ? undefined : key;
+}
+
+/** Every pane of every desk, by instance id. */
+function paneIdsOf(config: AppConfig): Set<string> {
+  return new Set([config.layout, ...config.layouts.map((saved) => saved.layout)]
+    .flatMap((layout) => layout.instances.map((instance) => instance.instanceId)));
+}
+
+/**
+ * Whether the workspace coach steps aside: while a pane opened after it is
+ * open, as it does while Help has focus. It floats above the whole shell, so
+ * it would otherwise cover a pane the user opened under it (a floating 13F
+ * pane at the top right), and its keys would compete with that pane's.
+ */
+export function coachStepsAside(shownWith: ReadonlySet<string> | null, config: AppConfig): boolean {
+  if (!shownWith) return false;
+  for (const id of paneIdsOf(config)) if (!shownWith.has(id)) return true;
+  return false;
+}
+
+function useCoachStepsAside(config: AppConfig, stage: OnboardingStage): boolean {
+  // The panes the coach came up with: the workspace it was built around.
+  const [shownWith, setShownWith] = useState<ReadonlySet<string> | null>(null);
+  useEffect(() => {
+    if (stage !== "research") setShownWith(null);
+    else setShownWith((current) => current ?? paneIdsOf(config));
+  }, [config, stage]);
+  return stage === "research" && coachStepsAside(shownWith, config);
 }
 
 export function OnboardingWizard(props: OnboardingWizardProps) {
   const {
-    helpFocused, stage, progress, notificationDismissShortcut, finish, notificationActionShortcut,
+    coachAside, coachKeysHidden,
+    helpFocused, stage, progress, finish, notificationActionShortcut,
     saveProgressInBackground, colors, commandBarShortcut, selectedBrokerId, brokerOptions, portfolioSub,
     sectionAvailability, goToSection, skipSetup, isFinishing, isBrokerCommitting, desktop, positions,
     inputRef, editingField, selectedPositionSymbol, brokerChoices, portfolioOptionIdx, setPortfolioOptionIdx,
     chooseBroker, activeBrokerFields, brokerFieldIdx, brokerSelectIdx, setBrokerSelectIdx, brokerValues,
     setBrokerFieldValue, isBrokerSyncing, brokerSyncError, persistenceError, positionCount,
-    openBrokerConnect, continueFromPositions, backPortfolio, continuePortfolio, chosenDesks, deskCursor,
+    openBrokerConnect, continueFromPositions, skipPositions, backPortfolio, continuePortfolio, chosenDesks, deskCursor,
     setDeskCursor, setChosenDesks, buildingDesks, finishDesks, account, viewportWidth, viewportHeight, continueAccount,
     offer, planAccess, pricing, billingInterval, setBillingInterval, continueFree, primaryUpgradeAction,
-    personalTickers,
+    goBack, rerun, positionsButton, tickers, tickersInputRef, finishTickers,
   } = useOnboardingWizard(props);
 
-  if (helpFocused) {
+  if (helpFocused || coachAside) {
     return null;
   }
 
@@ -322,37 +445,55 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
     return <OnboardingCoach step={t("YOUR WORKSPACE")}
       title={tf("Built around {ticker}", { ticker })}
       actions={<>
-        {/* The card has no room for both keys: like a toast, the dismiss key
-            is in the desktop tooltip. F10 also dismisses it. */}
+        {/* Each button shows its key, as Connect shows Alt+Enter; in the
+            terminal the second wraps under the first where the row is short.
+            The desktop card has no room for both: its dismiss key is in the
+            tooltip. Esc puts it away as it closes any card; the notification
+            dismiss key and F10 do too. In a field, or with a pane holding the
+            keyboard, the keys are the field's: the card shows none. */}
         <OnboardingButton
           label="Keep exploring"
           variant="ghost"
-          title={notificationDismissShortcut ? `${t("Keep exploring")} (${notificationDismissShortcut})` : undefined}
+          shortcut={!desktop && !coachKeysHidden ? "Esc" : undefined}
+          title={desktop ? `${t("Keep exploring")} (Esc)` : undefined}
           onPress={() => { void finish(); }}
         />
         <OnboardingButton
           label="Connect free Cloud"
           variant="primary"
-          shortcut={notificationActionShortcut || undefined}
+          shortcut={!coachKeysHidden && notificationActionShortcut || undefined}
           onPress={() => saveProgressInBackground({ stage: "account" })}
         />
       </>}>
-      <Text fg={colors.textDim} wrapText>{tf(progress.desks?.length
-        ? "Your holdings as a heatmap, a watchlist, and {ticker} charted. Your desks are tabs at the bottom; {shortcut} adds more."
-        : "Your holdings as a heatmap, a watchlist, and {ticker} charted. Every pane moves; {shortcut} adds more.", {
+      {/* A skipped "What do you hold?" leaves no holdings to draw: the card names what is there. */}
+      <Text fg={colors.textDim} wrapText>{tf(progress.positionsImported === 0
+        ? progress.desks?.length
+          ? "A watchlist, the top news, and {ticker} charted. Your desks are tabs at the bottom; {shortcut} adds more."
+          : "A watchlist, the top news, and {ticker} charted. Every pane moves; {shortcut} adds more."
+        : progress.desks?.length
+          ? "Your holdings as a heatmap, a watchlist, and {ticker} charted. Your desks are tabs at the bottom; {shortcut} adds more."
+          : "Your holdings as a heatmap, a watchlist, and {ticker} charted. Every pane moves; {shortcut} adds more.", {
         ticker,
         shortcut: commandBarShortcut,
       })}</Text>
     </OnboardingCoach>;
   }
 
+  // A save error under a card, wrapped in the terminal at the words its height counted, so the card holds it.
+  const savedError = (columns: number) => !persistenceError ? null : desktop ? (
+    <Text fg={colors.negative} wrapText style={{ marginTop: 10 }}>{persistenceError}</Text>
+  ) : <Prose text={persistenceError} width={columns} figures={false} color={colors.negative} />;
+
   if (stage === "portfolio") {
     const selectedBroker = selectedBrokerId
       ? brokerOptions.find((option) => option.id === selectedBrokerId)
       : null;
     const selectedBrokerName = selectedBroker?.name;
+    // What do you hold? is as tall as what it holds: the fields, the rows listed so far and an error, never rows kept empty for later ones.
+    const positionsColumns = terminalCardSize({ width: viewportWidth, height: viewportHeight }, 76, 22).width - TERMINAL_CARD_INSET.columns;
     const portfolioModalHeight = portfolioSub === "positions"
-      ? 22
+      ? TERMINAL_CARD_INSET.rows + 4 + tuiPositionsPanelRows(positions, editingField, positionsColumns)
+        + (persistenceError ? wrapTextLines(persistenceError, Math.max(8, positionsColumns)).length : 0)
       : portfolioSub === "choose"
         ? 16
         : portfolioSub === "broker-setup"
@@ -384,7 +525,8 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
           onDismiss={skipSetup}
           dismissing={isFinishing}
           dismissDisabled={isBrokerCommitting}
-          showDismiss={false}
+          // The first run needs a holding; a run from Settings can be left as it was.
+          showDismiss={rerun}
         />
         <OnboardingTitle
           step={desktop ? undefined : t("PORTFOLIO")}
@@ -399,6 +541,7 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
             positionsEditing={editingField}
             selectedPositionSymbol={selectedPositionSymbol}
             commandBarShortcut={commandBarShortcut}
+            positionsColumns={positionsColumns}
             choices={brokerChoices}
             optionIdx={portfolioOptionIdx}
             onOptionSelect={setPortfolioOptionIdx}
@@ -416,31 +559,54 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
             brokerSyncError={brokerSyncError}
           />
         </Box>
-        {persistenceError ? (
-          <Text fg={colors.negative} wrapText style={desktop ? { marginTop: 10 } : undefined}>
-            {persistenceError}
-          </Text>
-        ) : null}
-        <OnboardingActions hint={portfolioSub === "positions" && desktop ? tf("Later: {shortcut}, then AP.", { shortcut: commandBarShortcut }) : undefined}>
+        {savedError(positionsColumns)}
+        <OnboardingActions hint={portfolioSub === "positions" && desktop
+          // The step needs one ticker; once it has one, more can be added later.
+          ? positionCount === 0 ? t("Add one ticker to continue.") : tf("Later: {shortcut}, then AP.", { shortcut: commandBarShortcut })
+          : undefined}>
           {portfolioSub === "positions" ? (
             <>
               {brokerOptions.length > 0 && positionCount > 0 ? (
-                <OnboardingButton label="Connect a broker" variant="ghost" shortcut={CONNECT_BROKER_KEY} onPress={openBrokerConnect} />
+                <OnboardingButton
+                  label="Connect a broker"
+                  variant="ghost"
+                  shortcut={cardKey(CONNECT_BROKER_KEY, editingField)}
+                  active={positionsButton === "broker"}
+                  onPress={openBrokerConnect}
+                />
+              ) : null}
+              {/* Holding nothing yet, the step can be left as the Desks step can. */}
+              {positionCount === 0 ? (
+                <OnboardingButton
+                  label="Skip"
+                  variant="ghost"
+                  // The terminal's first run: Skip is F10 on every step, in the Ticker field or not (s still skips
+                  // outside it). From Settings F10 leaves setup, so in the field Skip shows no key (Tab reaches it).
+                  // On a Mac's keyboard F10 is a media key: the desktop's Skip is pressed by its letter or a click.
+                  shortcut={rerun || desktop ? (editingField ? (rerun ? undefined : SKIP_KEY) : SKIP_PORTFOLIO_KEY) : SKIP_KEY}
+                  active={positionsButton === "skip"}
+                  disabled={positions.submitting}
+                  onPress={skipPositions}
+                />
               ) : null}
               <OnboardingButton
                 label="Continue"
                 variant="primary"
-                disabled={positionCount === 0 || positions.submitting}
+                shortcut={CONTINUE_KEY}
+                active={positionsButton === "continue"}
+                // A typed ticker is added on the way: Continue never does nothing beside a filled row.
+                disabled={(positionCount === 0 && !positions.hasDraft) || positions.submitting}
                 onPress={continueFromPositions}
               />
             </>
           ) : (
             <>
-              <OnboardingButton label="Back" variant="ghost" disabled={isBrokerCommitting} onPress={backPortfolio} />
+              <OnboardingButton label="Back" variant="ghost" shortcut={BACK_KEY} disabled={isBrokerCommitting} onPress={backPortfolio} />
               {!desktop || portfolioSub !== "choose" ? (
                 <OnboardingButton
                   label={portfolioSub === "broker-sync" ? (isBrokerSyncing ? t("Importing...") : t("Retry")) : t("Continue")}
                   variant="primary"
+                  shortcut={CONTINUE_KEY}
                   disabled={isBrokerSyncing}
                   onPress={continuePortfolio}
                 />
@@ -453,20 +619,25 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
   }
 
   if (stage === "desks") {
+    const desksColumns = terminalCardSize({ width: viewportWidth, height: viewportHeight }, DESKS_CARD_WIDTH, 18).width - TERMINAL_CARD_INSET.columns;
+    // A save error names the file, so it usually takes two rows; the card grows by what it wraps to.
+    const errorRows = persistenceError ? wrapTextLines(persistenceError, Math.max(8, desksColumns)).length : 0;
     return (
-      <OnboardingModal width={68} height={18 + (persistenceError ? 1 : 0)}>
+      <OnboardingModal width={DESKS_CARD_WIDTH} height={18 + errorRows}>
         <OnboardingHeader
           active="portfolio"
           available={sectionAvailability}
           onNavigate={goToSection}
           onDismiss={skipSetup}
           dismissing={isFinishing}
-          showDismiss={false}
+          dismissDisabled={buildingDesks}
+          showDismiss={rerun}
         />
         <OnboardingTitle
           step={desktop ? undefined : t("DESKS")}
-          title={t("What do you trade?")}
-          description={t("Each one adds a ready-made desk as a tab.")}
+          title={t("What do you trade most?")}
+          // A line of its own: the picks guide the workspace, they do not limit it.
+          description={`${t("Pick up to 3; each adds a ready-made tab.")}\n${t("Everything else is one search away.")}`}
         />
         {/* Not allowed to shrink: on a short window the card scrolls instead of the list running under the buttons. */}
         <DesksStep
@@ -474,7 +645,49 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
           cursor={deskCursor}
           onCursor={setDeskCursor}
           onToggle={(key) => setChosenDesks((current) => toggleDeskChoice(current, key))}
+          width={desksColumns}
         />
+        {savedError(desksColumns)}
+        <OnboardingActions>
+          <OnboardingButton
+            label="Skip"
+            variant="ghost"
+            shortcut={rerun || desktop ? SKIP_DESKS_KEY : SKIP_KEY}
+            disabled={buildingDesks}
+            onPress={() => finishDesks([])}
+          />
+          <OnboardingButton
+            label="Continue"
+            variant="primary"
+            shortcut={CONTINUE_KEY}
+            disabled={chosenDesks.length === 0 || buildingDesks}
+            onPress={() => finishDesks(chosenDesks)}
+          />
+        </OnboardingActions>
+      </OnboardingModal>
+    );
+  }
+
+  if (stage === "tickers") {
+    const tickersColumns = terminalCardSize({ width: viewportWidth, height: viewportHeight }, DESKS_CARD_WIDTH, TICKERS_CARD_HEIGHT).width - TERMINAL_CARD_INSET.columns;
+    const errorRows = persistenceError ? wrapTextLines(persistenceError, Math.max(1, tickersColumns)).length : 0;
+    return (
+      <OnboardingModal width={DESKS_CARD_WIDTH} height={TICKERS_CARD_HEIGHT + errorRows}>
+        <OnboardingHeader
+          active="portfolio"
+          available={sectionAvailability}
+          onNavigate={goToSection}
+          onDismiss={skipSetup}
+          dismissing={isFinishing}
+          dismissDisabled={buildingDesks}
+          showDismiss={rerun}
+        />
+        <OnboardingTitle
+          step={desktop ? undefined : t("TICKERS")}
+          title={t("Which tickers do you follow?")}
+          description={t("Pick up to 3 for your watchlist.")}
+        />
+        <TickersStep state={tickers} inputRef={tickersInputRef} width={tickersColumns} />
         {persistenceError ? (
           <Text fg={colors.negative} wrapText style={desktop ? { marginTop: 10 } : undefined}>
             {persistenceError}
@@ -484,15 +697,16 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
           <OnboardingButton
             label="Skip"
             variant="ghost"
-            shortcut={SKIP_DESKS_KEY}
+            shortcut={SKIP_TICKERS_KEY}
             disabled={buildingDesks}
-            onPress={() => finishDesks([])}
+            onPress={() => finishTickers([], true)}
           />
           <OnboardingButton
             label="Continue"
             variant="primary"
-            disabled={chosenDesks.length === 0 || buildingDesks}
-            onPress={() => finishDesks(chosenDesks)}
+            shortcut={CONTINUE_KEY}
+            disabled={tickers.picks.length === 0 || buildingDesks}
+            onPress={() => finishTickers(tickers.picks, false)}
           />
         </OnboardingActions>
       </OnboardingModal>
@@ -543,7 +757,7 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
           available={sectionAvailability}
           onNavigate={goToSection}
           onDismiss={skipSetup}
-          dismissShortcut={SKIP_SETUP_KEY}
+          dismissShortcut={cardKey(SKIP_SETUP_KEY, editingField)}
           dismissing={isFinishing}
         />
         <OnboardingTitle
@@ -577,23 +791,27 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
         ) : null}
         {!desktop && browserSignIn ? (
           <Box height={1}>
-            <Text fg={colors.textMuted}>{t("b: sign in with the browser instead")}</Text>
+            <Text fg={colors.textMuted}>{editingField
+              ? t("Esc, then b: sign in with the browser instead")
+              : t("b: sign in with the browser instead")}</Text>
           </Box>
         ) : null}
         <OnboardingActions
           hint={desktop && browserSignIn ? (
-            <Button label="Sign in with the browser instead" variant="plain" compact shortcut={BROWSER_SIGN_IN_KEY} onPress={account.beginQrSignIn} />
+            <Button label="Sign in with the browser instead" variant="plain" compact shortcut={cardKey(BROWSER_SIGN_IN_KEY, editingField)} onPress={account.beginQrSignIn} />
           ) : undefined}
         >
           <OnboardingButton
             label="Back"
             variant="ghost"
-            onPress={account.accountSub === "qr" || account.accountSub === "login" ? account.returnToAccountForm : () => goToSection("portfolio")}
+            shortcut={BACK_KEY}
+            onPress={account.accountSub === "qr" || account.accountSub === "login" ? account.returnToAccountForm : goBack}
           />
           {account.accountSub !== "qr" ? (
             <OnboardingButton
               label={accountActionLabel}
               variant="primary"
+              shortcut={CONTINUE_KEY}
               disabled={account.accountSubmitting}
               onPress={continueAccount}
             />
@@ -615,7 +833,7 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
       : proCopy.note;
     // Ranked: the data itself first, then what reads it.
     const features = [
-      { title: proStepRealtimeTitle(personalTickers), description: t("Free is 15 minutes behind on quotes and 12 hours on news.") },
+      { title: t("Real-time market data"), description: t("Free is 15 minutes behind on quotes and 12 hours on news.") },
       { title: t("MCP server"), description: t("Claude Code, Codex or Cursor call Gloom's research tools.") },
       { title: t("Ask Gloom"), description: t("Answers cite filings, calls and news.") },
       { title: t("Earnings calls"), description: t("Transcripts, summaries, guidance and scores.") },
@@ -633,7 +851,7 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
       error: persistenceError,
       actions: [
         ...(planAccess.hasProAccess ? [] : [terminalButtonColumns({ label: "Keep Free for now", shortcut: KEEP_FREE_KEY })]),
-        terminalButtonColumns({ label: primaryLabel }),
+        terminalButtonColumns({ label: primaryLabel, shortcut: CONTINUE_KEY }),
       ],
       descriptions: features.map((feature) => feature.description),
     });
@@ -690,6 +908,7 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
           <OnboardingButton
             label={primaryLabel}
             variant="primary"
+            shortcut={CONTINUE_KEY}
             onPress={primaryUpgradeAction}
           />
         </OnboardingActions>
@@ -728,11 +947,13 @@ export function OnboardingWizard(props: OnboardingWizardProps) {
         <OnboardingButton
           label="Back"
           variant="ghost"
-          onPress={() => goToSection(progress.accountStatus === "signed-in" ? "pro" : "cloud")}
+          shortcut={BACK_KEY}
+          onPress={goBack}
         />
         <OnboardingButton
           label={isFinishing ? "Opening workspace..." : "Start exploring"}
           variant="primary"
+          shortcut={CONTINUE_KEY}
           disabled={isFinishing}
           onPress={() => { void finish(); }}
         />

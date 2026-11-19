@@ -1,9 +1,10 @@
 import { expect, test } from "bun:test";
 import { parseFxArgs, parseFxRequest } from "./fx-pair";
 
-test("a pair typed without its slash is answered with the slash form, and only when both halves are currencies", () => {
-  expect(parseFxRequest("eurusd", "USD")).toEqual({ error: "EURUSD is not a currency code; write the pair as EUR/USD." });
-  expect(parseFxRequest("EUR/USD", "USD")).toEqual({ currency: "EUR", baseCurrency: "USD" });
+test("a pair is read in every spelling quote takes, and only when both halves are currencies", () => {
+  const eurUsd = { currency: "EUR", baseCurrency: "USD" };
+  for (const typed of ["eurusd", "EUR/USD", "eur-usd", "EURUSD=X", "eurusd:ccy"]) expect(parseFxRequest(typed, "GBP"), typed).toEqual(eurUsd);
+  expect(parseFxRequest("JPY=X", "GBP")).toEqual({ currency: "USD", baseCurrency: "JPY" });
   // Six letters that are not two codes (SHE, LLS) get the plain error, not a made-up pair.
   expect(parseFxRequest("SHELLS", "USD")).toEqual({ error: "SHELLS is not a currency code; use three letters such as NGN." });
 });
@@ -16,8 +17,11 @@ test("an amount in front converts from the first currency to the second, read wi
   expect(parseFxArgs(["1.234,5", "EUR/USD"], "GBP")).toEqual({ request: eurUsd, amount: 1234.5 });
   // One currency after an amount converts to USD, not the base currency, and says so.
   expect(parseFxArgs(["1234.5", "EUR"], "GBP")).toEqual({ request: eurUsd, amount: 1234.5, toUsdByDefault: true });
-  // The amount is in the currency converted from: thousands in euros, either reading in dinars.
-  expect(parseFxArgs(["1.234", "EUR/USD"], "USD")).toEqual({ request: eurUsd, amount: 1234 });
+  // A lone dot and three digits asks too: a dot-decimal reader's 1.234 is never converted as 1234.
+  expect(parseFxArgs(["1.234", "EUR/USD"], "USD")).toEqual({
+    error: "The amount 1.234 could be 1234 (thousands) or 1.234 (decimal point); type 1234 or 1.2340.",
+  });
+  expect(parseFxArgs(["1.5", "EUR/USD"], "USD")).toEqual({ request: eurUsd, amount: 1.5 });
   expect(parseFxArgs(["1,234", "KWD", "USD"], "USD")).toEqual({
     error: "The amount 1,234 could be 1234 (thousands) or 1.234 (decimal comma), and KWD has 3 decimals; type 1234 or 1.2340.",
   });
@@ -29,6 +33,11 @@ test("an amount in front converts from the first currency to the second, read wi
     error: "The amount 1,234 could be 1234 (thousands) or 1.234 (decimal comma); type 1234 or 1.2340.",
   });
   expect(parseFxArgs(["81000", "EUR/USD"], "USD")).toEqual({ request: eurUsd, amount: 81000 });
+  // An amount as reports print it: thousands, millions, billions.
+  const usdEur = { currency: "USD", baseCurrency: "EUR" };
+  expect(parseFxArgs(["959.81M", "USD/EUR"], "USD")).toEqual({ request: usdEur, amount: 959_810_000 });
+  expect(parseFxArgs(["25k", "USD", "EUR"], "USD")).toEqual({ request: usdEur, amount: 25_000 });
+  expect(parseFxArgs(["1,2B", "USD/EUR"], "USD")).toEqual({ request: usdEur, amount: 1_200_000_000 });
   expect(parseFxArgs(["EUR/USD", "100"], "USD")).toEqual({ error: "Put the amount first: fx 100 EUR/USD." });
   // Two codes are never two answers; the error writes them as one pair, with the amount form beside it.
   expect(parseFxArgs(["NGN", "ZAR"], "USD")).toEqual({
@@ -68,3 +77,28 @@ test("a currency's name reads as its code, and a name several currencies share l
   expect(parseFxArgs(["hong", "kong", "dollar"], "USD")).toMatchObject({ request: { currency: "HKD" } });
   expect(parseFxArgs(["100", "swiss", "franc"], "GBP")).toMatchObject({ request: { currency: "CHF", baseCurrency: "USD" }, amount: 100, toUsdByDefault: true });
 });
+
+test("a minor unit reads as a fraction of its major currency, pence only in their own case", () => {
+  expect(parseFxRequest("ZAc/USD", "USD")).toEqual({ currency: "ZAR", baseCurrency: "USD", units: { currency: { code: "ZAc", divisor: 100 } } });
+  expect(parseFxRequest("ila", "USD")).toEqual({ currency: "ILS", baseCurrency: "USD", units: { currency: { code: "ILA", divisor: 100 } } });
+  expect(parseFxRequest("USD/GBp", "USD")).toEqual({ currency: "USD", baseCurrency: "GBP", units: { baseCurrency: { code: "GBp", divisor: 100 } } });
+  expect(parseFxRequest("gbp/USD", "USD")).toEqual({ currency: "GBP", baseCurrency: "USD" });
+  expect(parseFxArgs(["100", "ZAc", "USD"], "GBP")).toMatchObject({ request: { currency: "ZAR", units: { currency: { code: "ZAc" } } }, amount: 100 });
+  // `fx GBp-USD` and `fx GBpUSD` quoted pounds: a pair spelled without its slash keeps its unit as typed.
+  const pence = { currency: "GBP", baseCurrency: "USD", units: { currency: { code: "GBp", divisor: 100 } } };
+  expect(parseFxRequest("GBp-USD", "EUR")).toEqual(pence);
+  expect(parseFxRequest("GBpUSD", "EUR")).toEqual(pence);
+  expect(parseFxRequest("zacusd", "EUR")).toEqual({ currency: "ZAR", baseCurrency: "USD", units: { currency: { code: "ZAc", divisor: 100 } } });
+  expect(parseFxRequest("USD-ILA", "EUR")).toEqual({ currency: "USD", baseCurrency: "ILS", units: { baseCurrency: { code: "ILA", divisor: 100 } } });
+  expect(parseFxArgs(["100", "GBpUSD"], "EUR")).toEqual({ request: pence, amount: 100 });
+  expect(parseFxRequest("GBPUSD", "EUR")).toEqual({ currency: "GBP", baseCurrency: "USD" });
+  expect(parseFxRequest("gbp-usd", "EUR")).toEqual({ currency: "GBP", baseCurrency: "USD" });
+});
+
+test("words pasted as one argument read as typed apart", () => {
+  const eurUsd = { currency: "EUR", baseCurrency: "USD" };
+  expect(parseFxArgs(["1234.5 eur/usd "], "GBP")).toEqual({ request: eurUsd, amount: 1234.5 });
+  expect(parseFxArgs(["1234.5 EUR / USD"], "GBP")).toEqual({ request: eurUsd, amount: 1234.5 });
+  expect(parseFxArgs(["959.81 M", "USD/EUR"], "GBP")).toEqual({ request: { currency: "USD", baseCurrency: "EUR" }, amount: 959_810_000 });
+});
+

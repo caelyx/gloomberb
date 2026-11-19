@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DataTableStackView,
   PageStackView,
-  PaneStatusBody,
   QueryBar,
   usePaneFooter,
   usePaneMenuItems,
@@ -11,6 +10,7 @@ import {
   type QueryBarFilter,
   type QueryBarView,
 } from "../../../components";
+import { ageFooterSegment } from "../../../components/layout/pane/footer";
 import { handleRefreshKey, usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { openFormModal } from "../../../components/form-modal";
 import { FILL_REST } from "../../../components/ui/fill";
@@ -18,6 +18,9 @@ import type { EarningsCalendarQuery } from "../../../api-client/earnings";
 import { useAppSelector, usePaneAppConfig, usePaneSettingValue } from "../../../state/app/context";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
 import { useAsyncResource, useAutoRefresh, usePluginPaneState, useUpdatedAgo } from "../../../public/react";
+import { useUtcDay } from "../../../react/auto-refresh";
+import { reportFooterSegment } from "../shared/source-footer";
+import { earningsBoardHeadless } from "./headless";
 import type { EarningsEvent } from "../../../types/data-provider";
 import { getSharedRegistry } from "../../registry/shared";
 import { Box, useUiCapabilities } from "../../../ui";
@@ -25,20 +28,25 @@ import { useAssetData, usePluginAppActions, usePluginTickerActions } from "../..
 import { earningsResultsAlertValues } from "../alerts/research-builder";
 import { cachedMembers, loadMembers } from "../members/client";
 import { isBoardRowLoading, useQuoteBoard } from "../shared/use-quote-board";
+import { usePlanAccess } from "../../../api-client/plan-access";
+import { useResearchCloudSession } from "../shared/research-cloud-session";
+import { loadEarningsHighlight } from "./highlight";
 import {
   addDays,
+  boardKey,
   boardReport,
+  boardRowOf,
   boardRows,
   fallbackReport,
   newYorkToday,
   ownershipBySymbol,
   relativeDays,
-  reportMove,
+  boardMove,
   type BoardReport,
   type BoardRow,
   type BoardSort,
 } from "./board-model";
-import { boardColumns, boardHasActuals, renderBoardCell, renderBoardSection, SORTABLE, type BoardCellContext, type BoardColumn } from "./board-table";
+import { boardColumns, boardHasActuals, boardHasCurrencies, boardSymbolWidth, renderBoardCell, renderBoardSection, SORTABLE, type BoardCellContext, type BoardColumn } from "./board-table";
 import { EarningsCalendarView, CALENDAR_GROUP_ROWS, calendarSlotsPerRow } from "./calendar";
 import {
   boardRangeDays,
@@ -62,8 +70,7 @@ import {
   earningsScopeOptions,
   MINE_SCOPE,
   readEarningsScope,
-  SECTOR_HOLDINGS_FUND,
-  sectorSymbols,
+  fundSymbols,
   type EarningsScope,
 } from "./scope";
 
@@ -78,9 +85,8 @@ const MARKET_PER_DAY = 200;
 const MAX_SYMBOLS = 200;
 
 const MARKET_SCOPE: EarningsScope = { kind: "all" };
-const loadSectorHoldings = (force: boolean) => loadMembers(SECTOR_HOLDINGS_FUND, force);
-/** A sector fund's companies the board reads, its largest first. */
-const sectorNames = (...args: Parameters<typeof sectorSymbols>) => sectorSymbols(...args).slice(0, MAX_SYMBOLS);
+/** A fund's companies the board reads, its largest first. */
+const fundNames = (members: Parameters<typeof fundSymbols>[0]) => fundSymbols(members).slice(0, MAX_SYMBOLS);
 
 type Order = "cap" | "mine";
 type BoardView = "table" | "calendar";
@@ -93,6 +99,8 @@ interface BoardData {
   /** The query read, by `earningsCalendarKey`: kept data from another week is not this week's. */
   queryKey: string;
   reports: BoardReport[];
+  /** When the service built the calendar read, which dates the board; null without one. */
+  asOf: string | null;
   stale: boolean;
   refreshError: string | null;
 }
@@ -100,8 +108,10 @@ interface BoardData {
 /**
  * ERN without a ticker: the market's report days, largest companies first,
  * with the implied move and each company's average move. With tickers, or the
- * Names filter (Mine, a portfolio, a watchlist or a sector fund's holdings),
- * the upcoming reports of those companies instead.
+ * Names filter (Mine, a portfolio, a watchlist or a fund's holdings),
+ * the upcoming reports of those companies instead. Every board reads the Hong
+ * Kong, China A and Singapore top 100's reports too, ranked by their value in
+ * dollars beside US companies, each with the currency of its figures (CCY).
  */
 export function EarningsBoard({ focused, width, height, scopedSymbols, highlight = null }: {
   focused: boolean;
@@ -109,7 +119,7 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
   height: number;
   /** Named on the command bar; empty for the market board. */
   scopedSymbols: readonly string[];
-  /** `EVTS <ticker>`: the row to select when that company reports in these days. */
+  /** `EVTS <ticker>`: open on this company's report and select its row. */
   highlight?: string | null;
 }) {
   const dataProvider = useAssetData();
@@ -143,7 +153,7 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
   // range for both views: the table draws its days, the calendar its week (this week for the days ahead).
   const [requestedDate] = usePaneSettingValue<string>("date", "");
   const [requestedWeek] = usePaneSettingValue<string>("week", "");
-  const [range, setRange] = usePluginPaneState<BoardRange>("range", requestedBoardRange(requestedDate, requestedWeek));
+  const [chosenRange, setRange] = usePluginPaneState<BoardRange | null>("range", null);
   // The calendar's groups opened past their "+N more" slot, by `calendarGroupKey`.
   const [expanded, setExpanded] = useState(NONE_EXPANDED);
   const desktop = useUiCapabilities().nativePaneChrome === true;
@@ -152,9 +162,7 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
     () => earningsScopeOptions({ portfolios: config.portfolios, watchlists: config.watchlists }),
     [config.portfolios, config.watchlists],
   );
-  const chosenScope = readEarningsScope(savedScope ?? (mineOnly ? MINE_SCOPE : ALL_SCOPE), scopeOptions);
-  // The terminal keeps its Mine toggle, so a choice only the desktop offers reads as the market there.
-  const scopeOption = desktop || chosenScope.value === MINE_SCOPE ? chosenScope : scopeOptions[0]!;
+  const scopeOption = readEarningsScope(savedScope ?? (mineOnly ? MINE_SCOPE : ALL_SCOPE), scopeOptions);
   const scoped = scopedSymbols.length > 0;
   const scope = scoped ? MARKET_SCOPE : scopeOption.scope;
   const view: BoardView = !desktop ? "table"
@@ -165,6 +173,12 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
 
   const today = newYorkToday();
   const market = !scoped && scope.kind === "all";
+  const access = usePlanAccess();
+  const session = useResearchCloudSession();
+  const accessKey = `${session.requestKey}:${access.hasProAccess ? "pro" : "free"}`;
+  const highlightLoader = useCallback((force: boolean) => loadEarningsHighlight(highlight!, today, dataProvider, force, accessKey), [accessKey, dataProvider, highlight, today]);
+  const highlightedReport = useAsyncResource(market && highlight ? highlightLoader : null);
+  const range = chosenRange ?? (requestedBoardRange(requestedDate, requestedWeek) || highlightedReport.data?.report.date || "");
   // Keyed by content: ticker records change for many reasons, the board reloads only when the list's names do.
   const collectionKey = useMemo(() => {
     if (scope.kind !== "portfolio" && scope.kind !== "watchlist") return "";
@@ -174,35 +188,41 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
       .sort()
       .join(",");
   }, [scope, tickers]);
-  const sector = scope.kind === "sector" ? scope : null;
-  // A sector fund's companies come with its holdings, which the loader reads; the others are known here.
+  const fund = scope.kind === "fund" ? scope : null;
+  // A fund's companies come with its holdings, which the loader reads; the others are known here.
   const named = useMemo(() => {
     const names = scoped ? [...scopedSymbols]
       : scope.kind === "portfolio" || scope.kind === "watchlist" ? (collectionKey ? collectionKey.split(",") : [])
-        : scope.kind === "sector" ? [] : [...owned.keys()];
+        : scope.kind === "fund" ? [] : [...owned.keys()];
     return names.slice(0, MAX_SYMBOLS);
   }, [collectionKey, owned, scope.kind, scoped, scopedSymbols]);
   // Named companies also go to the per-ticker calendar, which covers listings the stored one does not;
-  // a sector fund's are S&P 500 companies, all in the stored one.
-  const perTicker = !market && !sector;
+  // fund scopes use the stored calendar, including members outside the S&P 500.
+  const perTicker = !market && !fund;
   // The days ahead by default; a chosen week or day, past or ahead, for the market and for named companies alike.
   const days = useMemo(() => (market || range ? boardRangeDays(range, today) : relativeDays(today)), [market, range, today]);
   const weekOffset = boardRangeWeek(range, today);
   const week = useMemo(() => calendarWeekDates(today, weekOffset), [today, weekOffset]);
-  // The calendar reads its week, reported days included; the table its days.
-  const query = useMemo<EarningsCalendarQuery>(() => calendar
-    ? { from: week[0]!, to: week.at(-1)!, perDay: market ? MARKET_PER_DAY : 0, symbols: named }
-    : market || range
-      ? { from: days[0]!.from, to: days.at(-1)!.to, perDay: market ? MARKET_PER_DAY : 0, symbols: named }
-      : { from: today, to: addDays(today, HORIZON_DAYS), perDay: 0, symbols: named },
-  [calendar, days, market, named, range, today, week]);
-  // A sector fund's read is named by the fund: its companies are known once its holdings are.
-  const queryKey = sector ? `${sector.etf}|${earningsCalendarKey(query)}` : earningsCalendarKey(query);
+  // EVTS 0700.HK names its listing, which the market board then keeps whatever the day's cut.
+  const highlightListing = market && highlight ? boardKey(highlight) : null;
+  // The calendar reads its week, reported days included; the table its days. Each report says its currency
+  // (CCY), so every board reads the listings abroad too.
+  const query = useMemo<EarningsCalendarQuery>(() => {
+    const symbols = highlightListing && !named.includes(highlightListing) ? [...named, highlightListing] : named;
+    return calendar
+      ? { from: week[0]!, to: week.at(-1)!, perDay: market ? MARKET_PER_DAY : 0, symbols, markets: "all" }
+      : market || range
+        ? { from: days[0]!.from, to: days.at(-1)!.to, perDay: market ? MARKET_PER_DAY : 0, symbols, markets: "all" }
+        : { from: today, to: addDays(today, HORIZON_DAYS), perDay: 0, symbols, markets: "all" };
+  }, [calendar, days, highlightListing, market, named, range, today, week]);
+  // A fund's read is named by the fund: its companies are known once its holdings are.
+  const queryKey = fund ? `${fund.etf}|${earningsCalendarKey(query)}` : earningsCalendarKey(query);
 
   const loader = useCallback(async (force: boolean): Promise<BoardData> => {
-    const names = sector ? sectorNames((await loadSectorHoldings(force)).payload.members, sector.sectors) : named;
-    if (!market && names.length === 0) return { queryKey, reports: [], stale: false, refreshError: null };
-    const read = sector ? { ...query, symbols: names } : query;
+    const holdings = fund ? await loadMembers(fund.etf, force) : null;
+    const names = holdings ? fundNames(holdings.payload.members) : named;
+    if (!market && names.length === 0) return { queryKey, reports: [], asOf: null, stale: !!holdings && (holdings.stale || holdings.payload.stale), refreshError: holdings?.refreshError ?? null };
+    const read = fund ? { ...query, symbols: names } : query;
     const [cloud, fallback] = await Promise.allSettled([
       loadEarningsBoard(read, force),
       !perTicker ? Promise.resolve([] as EarningsEvent[]) : loadEarningsCalendar(dataProvider, names, { force }).then((result) => result.events
@@ -211,31 +231,37 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
     ]);
     if (cloud.status === "rejected" && (!perTicker || fallback.status === "rejected")) throw cloud.reason;
     const reports = cloud.status === "fulfilled" ? cloud.value.payload.reports.map((report) => boardReport(report, owned)) : [];
-    const covered = new Set(reports.map((report) => report.symbol));
+    // A listing abroad named by another of its company's lines (0939.HK) is covered by its row.
+    const covered = new Set(reports.flatMap((report) => [report.symbol, ...report.listings ?? []]));
     const extra = fallback.status === "fulfilled"
       ? fallback.value.filter((event) => !covered.has(event.symbol)).map((event) => fallbackReport(event, owned, today))
       : [];
+    const target = highlightedReport.data?.report;
+    if (target && target.date >= read.from && target.date <= read.to && ![...reports, ...extra].some((report) => boardRowOf(report, target.symbol))) {
+      extra.push({ ...target, owned: owned.get(target.symbol) ?? null });
+    }
     return {
       queryKey,
       reports: [...reports, ...extra],
-      stale: cloud.status === "fulfilled" && cloud.value.stale,
+      asOf: cloud.status === "fulfilled" ? cloud.value.payload.asOf : null,
+      stale: (!!holdings && (holdings.stale || holdings.payload.stale)) || (cloud.status === "fulfilled" && cloud.value.stale),
       refreshError: cloud.status === "rejected"
         ? (cloud.reason instanceof Error ? cloud.reason.message : String(cloud.reason))
-        : cloud.value.refreshError,
+        : holdings?.refreshError ?? cloud.value.refreshError,
     };
-  }, [calendar, dataProvider, market, named, owned, perTicker, query, queryKey, range, sector, today]);
-  const resource = useAsyncResource(loader, {
+  }, [calendar, dataProvider, highlightedReport.data, market, named, owned, perTicker, query, queryKey, range, fund, today]);
+  const resource = useAsyncResource(highlightedReport.loading ? null : loader, {
     keepPreviousData: true,
     initialData: () => {
-      const holdings = sector ? cachedMembers(SECTOR_HOLDINGS_FUND) : null;
-      if (sector && !holdings) return null;
-      const cached = cachedEarningsCalendar(sector && holdings ? { ...query, symbols: sectorNames(holdings.payload.members, sector.sectors) } : query);
-      return cached ? { queryKey, reports: cached.payload.reports.map((report) => boardReport(report, owned)), stale: false, refreshError: null } : null;
+      const holdings = fund ? cachedMembers(fund.etf) : null;
+      if (fund && !holdings) return null;
+      const cached = cachedEarningsCalendar(holdings ? { ...query, symbols: fundNames(holdings.payload.members) } : query);
+      return cached ? { queryKey, reports: cached.payload.reports.map((report) => boardReport(report, owned)), asOf: cached.payload.asOf, stale: !!holdings?.payload.stale, refreshError: null } : null;
     },
   });
-  const data = resource.data;
-  // The week on screen is only the one read for it, never the last week's kept while this one loads or after it failed.
-  const weekData = data?.queryKey === queryKey ? data : null;
+  // A new fund or range never shows the previous scope while its holdings load or fail.
+  const data = resource.data?.queryKey === queryKey ? resource.data : null;
+  const weekData = data;
   const rows = useMemo(() => boardRows(data?.reports ?? [], days, sort, order === "mine"), [data, days, order, sort]);
   const reportRows = useMemo(() => rows.filter((row): row is BoardRow & { kind: "report" } => row.kind === "report"), [rows]);
   const slotsPerRow = calendarSlotsPerRow(width);
@@ -251,9 +277,13 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
   const selected = reportRows.find((row) => row.key === selectedKey) ?? reportRows[0] ?? null;
   const open = reportRows.find((row) => row.key === openKey)?.report
     ?? (openKey ? data?.reports.find((report) => report.key === openKey) : undefined) ?? null;
-  // A board with an actual keeps EPS ACT and EPS SURP when narrow; keyed by the flag, so the columns hold between renders.
+  // A board with an actual keeps EPS ACT and EPS SURP when narrow, and one with a listing abroad's report shows CCY;
+  // keyed by the flags, so the columns hold between renders.
   const actuals = boardHasActuals(rows);
-  const columns = useMemo(() => boardColumns(width, { actuals }), [actuals, width]);
+  const currencies = boardHasCurrencies(rows);
+  // TICKER fits a listing abroad's key (601939:SSE) when the board has one.
+  const symbolWidth = boardSymbolWidth(rows);
+  const columns = useMemo(() => boardColumns(width, { actuals, currencies, symbolWidth }), [actuals, currencies, symbolWidth, width]);
   // The move on each report out today, beside its implied move, from the quotes every board reads.
   // Keyed by content: the rows are rebuilt on renders that change nothing, and the quote board reloads on a new list.
   const reportedKey = [...new Set(reportRows.filter((row) => row.report.dateStatus === "reported" && row.report.date === today)
@@ -272,7 +302,7 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
       logos,
       move: (report) => {
         const state = quotesRef.current.get(report.symbol);
-        const move = reportMove(report, state?.quote, today);
+        const move = boardMove(report, state?.quote, today);
         return move == null && report.dateStatus === "reported" && report.date === today && isBoardRowLoading(state) ? "loading" : move;
       },
     };
@@ -295,7 +325,8 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
 
   useEffect(() => {
     if (!highlight || highlighted.current === highlight) return;
-    const row = reportRows.find((candidate) => candidate.report.symbol === highlight);
+    // 0700.HK as typed is the board's 0700:HKEX; 0939.HK is CCB's row under its A share.
+    const row = reportRows.find((candidate) => boardRowOf(candidate.report, highlight));
     if (!row) return;
     highlighted.current = highlight;
     setSelectedKey(row.key);
@@ -303,13 +334,26 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
 
   useAutoRefresh(resource.updatedAt, resource.load);
   const updatedAgo = useUpdatedAgo(resource.updatedAt);
+  const utcDay = useUtcDay();
+  // Its source and when the calendar was read, as `fn EVTS` ends; how long ago it loaded goes first on a narrow row.
+  const highlightMissing = market && highlight && !resource.loading && !highlightedReport.loading && !data?.reports.some((report) => boardRowOf(report, highlight));
+  const footerInfo = useMemo(() => [
+    ...(highlightMissing ? [{ id: "highlight", capture: true, parts: [{
+      text: highlightedReport.error ? `${highlight}: report date unavailable`
+        : highlightedReport.data ? `${highlight} reports on ${highlightedReport.data.report.date}; not in this range`
+          : `No report date for ${highlight}.`,
+      tone: "warning" as const,
+    }] }] : []),
+    ...(data ? [reportFooterSegment(earningsBoardHeadless, { rows: [], metadata: { asOf: data.asOf } }),
+      ...(updatedAgo ? [ageFooterSegment(updatedAgo)] : [])] : []),
+  ], [data, highlight, highlightedReport.data, highlightedReport.error, highlightMissing, updatedAgo, utcDay]);
   usePaneStatusFooter({
     registrationId: "earnings-board",
     enabled: !open,
-    loading: resource.loading,
-    error: resource.error ?? data?.refreshError ?? null,
-    stale: !!data?.stale,
-    info: data && updatedAgo ? [{ id: "updated", parts: [{ text: updatedAgo, tone: "muted" as const }] }] : [],
+    loading: resource.loading || highlightedReport.loading,
+    error: resource.error ?? highlightedReport.error ?? data?.refreshError ?? highlightedReport.data?.refreshError ?? null,
+    stale: !!data?.stale || !!highlightedReport.data?.stale,
+    info: footerInfo,
   });
   const symbol = open?.symbol ?? selectedReport?.symbol ?? null;
   // The desktop and the web only: the terminal's footer stays as it was.
@@ -332,20 +376,17 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
   }), [alerts, createPaneFromTemplate, navigateTicker, notify, symbol]);
 
   // t, e, c, a and n are footer hints, which bind their own keys.
-  const handleKeyDown = useCallback((event: DataTableKeyEvent) => handleRefreshKey(event, () => void resource.reload()), [resource.reload]);
-  usePaneRefreshKey(() => void resource.reload(), { focused, enabled: calendar && !open });
+  const refresh = useCallback(() => { highlightedReport.reload(); resource.reload(); }, [highlightedReport.reload, resource.reload]);
+  const handleKeyDown = useCallback((event: DataTableKeyEvent) => handleRefreshKey(event, refresh), [refresh]);
+  usePaneRefreshKey(refresh, { focused, enabled: calendar && !open });
 
   const sortColumn = (Object.entries(SORTABLE).find(([, value]) => value === sort.column)?.[0]) ?? null;
-  const mineFilter: QueryBarFilter[] = scoped ? [] : [
-    { id: "mine", kind: "toggle", label: "Mine", value: scope.kind === "mine", defaultValue: false, onChange: (mine: boolean) => setScope(mine ? MINE_SCOPE : ALL_SCOPE) },
-  ];
-  // The desktop's Mine is one choice of the Names filter, beside each portfolio, watchlist and sector fund.
   const namesFilter: QueryBarFilter[] = scoped ? [] : [{
     id: "names",
     label: "Names",
     value: scopeOption.value,
     defaultValue: ALL_SCOPE,
-    options: scopeOptions.map(({ value, label, description }) => ({ value, label, description })),
+    options: scopeOptions.map(({ value, label, description, group, scope }) => ({ value, label, description, group, short: !desktop && scope.kind === "fund" ? scope.etf : undefined })),
     onChange: (value: string) => setScope(value),
   }];
   const orderView: QueryBarView<Order> = { value: order, options: ORDER_OPTIONS, onChange: setOrder };
@@ -371,7 +412,7 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
       onChange: (value: string) => { setRange(value); setSelectedKey(null); },
     };
   // On the desktop the view picks the table or the week, and the order is a filter beside the names and the Range.
-  const queryBar = !desktop ? <QueryBar width={width} filters={[...mineFilter, rangeFilter]} view={orderView} /> : (
+  const queryBar = !desktop ? <QueryBar width={width} filters={[...namesFilter, rangeFilter]} view={orderView} /> : (
     <QueryBar
       width={width}
       filters={[
@@ -431,41 +472,40 @@ export function EarningsBoard({ focused, width, height, scopedSymbols, highlight
   }
 
   return (
-    <PaneStatusBody loading={resource.loading && !data} error={!data ? resource.error : null} subject="the earnings calendar">
-      <DataTableStackView<BoardRow, BoardColumn>
-        focused={focused}
-        rootWidth={width}
-        rootHeight={height}
-        rootBefore={queryBar}
-        columns={columns}
-        items={rows}
-        getItemKey={(row) => row.key}
-        isNavigable={(row) => row.kind === "report"}
-        renderSectionHeader={renderBoardSection}
-        renderCell={renderCell}
-        getRowVersion={rowVersion}
-        selectedTextOverridesCellColor
-        sortColumnId={sortColumn}
-        sortDirection={sort.direction}
-        onHeaderClick={(columnId) => {
-          const column = SORTABLE[columnId as BoardColumn["id"]];
-          if (!column) return;
-          setSort((current) => ({ column, direction: current.column === column && current.direction === "desc" ? "asc" : column === "symbol" ? "asc" : "desc" }));
-        }}
-        selection={{
-          kind: "index",
-          selectedIndex: selected ? rows.indexOf(selected) : -1,
-          onChange: (_index, row) => { if (row.kind === "report") setSelectedKey(row.key); },
-        }}
-        onActivate={(row) => { if (row.kind === "report") setOpenKey(row.key); }}
-        onRootKeyDown={handleKeyDown}
-        detailOpen={!!open}
-        onBack={() => setOpenKey(null)}
-        detailTitle={open ? `${open.symbol} · ${open.name}` : undefined}
-        detailContent={history}
-        emptyStateTitle={emptyStateTitle}
-      />
-    </PaneStatusBody>
+    <DataTableStackView<BoardRow, BoardColumn>
+      focused={focused}
+      rootWidth={width}
+      rootHeight={height}
+      rootBefore={queryBar}
+      status={{ loading: (resource.loading || highlightedReport.loading) && !data, error: !data ? resource.error : null, subject: "the earnings calendar" }}
+      columns={columns}
+      items={rows}
+      getItemKey={(row) => row.key}
+      isNavigable={(row) => row.kind === "report"}
+      renderSectionHeader={renderBoardSection}
+      renderCell={renderCell}
+      getRowVersion={rowVersion}
+      selectedTextOverridesCellColor
+      sortColumnId={sortColumn}
+      sortDirection={sort.direction}
+      onHeaderClick={(columnId) => {
+        const column = SORTABLE[columnId as BoardColumn["id"]];
+        if (!column) return;
+        setSort((current) => ({ column, direction: current.column === column && current.direction === "desc" ? "asc" : column === "symbol" ? "asc" : "desc" }));
+      }}
+      selection={{
+        kind: "index",
+        selectedIndex: selected ? rows.indexOf(selected) : -1,
+        onChange: (_index, row) => { if (row.kind === "report") setSelectedKey(row.key); },
+      }}
+      onActivate={(row) => { if (row.kind === "report") setOpenKey(row.key); }}
+      onRootKeyDown={handleKeyDown}
+      detailOpen={!!open}
+      onBack={() => setOpenKey(null)}
+      detailTitle={open ? `${open.symbol} · ${open.name}` : undefined}
+      detailContent={history}
+      emptyStateTitle={emptyStateTitle}
+    />
   );
 }
 

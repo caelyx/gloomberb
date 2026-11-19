@@ -5,7 +5,9 @@ import type {
   SovrBoardPayload,
 } from "../../../api-client/credit-boards";
 import { createPluginCache } from "../../../data/plugin-cache";
+import { createTtlCache } from "../../../data/ttl-cache";
 import type { PricePoint } from "../../../types/financials";
+import { logFailure } from "../../../utils/log-failure";
 import { cachedCloudResource, loadCloudResource, unavailableOnServer } from "../shared/cloud-resource";
 import { currencyMoveFromHistory, currencyPair } from "./model";
 
@@ -61,6 +63,11 @@ type BoardClient = Pick<typeof apiClient, "getCloudCdxBoard" | "getCloudSovrBoar
 /** Days of history the server serves at most, for a history export. */
 export const CDX_MAX_DAYS = 1100;
 
+/** The publisher a board's payload names, spelled out: `DTCC PPD` is DTCC's public price dissemination. */
+export function boardPublisher(source: string | null | undefined): string | undefined {
+  return source?.trim().replace(/\bPPD\b/, "Public Price Dissemination") || undefined;
+}
+
 export async function fetchCdxBoard(client: BoardClient = apiClient, days = BOARD_DAYS): Promise<CdxBoardPayload> {
   try { return validateCdxBoard(await client.getCloudCdxBoard({ days })); }
   catch (error) { throw unavailableOnServer(error, "Index CDS levels are not available yet."); }
@@ -69,6 +76,14 @@ export async function fetchCdxBoard(client: BoardClient = apiClient, days = BOAR
 export async function fetchSovrBoard(client: BoardClient = apiClient): Promise<SovrBoardPayload> {
   try { return validateSovrBoard(await client.getCloudSovrBoard({ days: BOARD_DAYS })); }
   catch (error) { throw unavailableOnServer(error, "Sovereign CDS levels are not available yet."); }
+}
+
+/** Daily levels: the full history a chart reaches back for stays good for an hour. */
+export const fullCdxHistory = createTtlCache<CdxBoardPayload>({ ttlMs: 60 * 60_000 });
+
+/** Every day of index history the server keeps, for a chart that reaches back past the board's year. */
+export function loadFullCdxHistory(client: BoardClient = apiClient): Promise<CdxBoardPayload> {
+  return fullCdxHistory.load("all", () => fetchCdxBoard(client, CDX_MAX_DAYS));
 }
 
 export const getCachedCdxBoard = () => cachedCloudResource(cdxBoardCache, "5y", validateCdxBoard);
@@ -82,29 +97,28 @@ export type PriceHistoryLoader = (symbol: string) => Promise<PricePoint[]>;
 
 /** Closes a month back are yesterday's news for half an hour. */
 const FX_HISTORY_TTL_MS = 30 * 60_000;
-/** Twenty-odd currencies at once; a few requests at a time keep the feed from refusing them. */
+/** Twenty-odd currencies, a few at a time from a source that takes them one by one. */
 const FX_HISTORY_CONCURRENCY = 4;
-const fxMoves = new Map<string, { at: number; move: Promise<number | null> }>();
+/** All at once from a source that batches them: the API client sends them sixteen a request. */
+const FX_HISTORY_BATCHED_CONCURRENCY = 32;
+const fxMoves = createTtlCache<number | null>({ ttlMs: FX_HISTORY_TTL_MS });
 
+/** A load that fails reads as unknown for everyone waiting on it and is asked again next time, never remembered as unknown. */
 function currencyMove(symbol: string, dollarsPerUnit: boolean, loadHistory: PriceHistoryLoader): Promise<number | null> {
-  const cached = fxMoves.get(symbol);
-  if (cached && Date.now() - cached.at <= FX_HISTORY_TTL_MS) return cached.move;
-  const move = loadHistory(symbol).then((history) => currencyMoveFromHistory(history, dollarsPerUnit));
-  fxMoves.set(symbol, { at: Date.now(), move });
-  // A failed load is retried next time rather than remembered as unknown.
-  return move.catch(() => {
-    fxMoves.delete(symbol);
-    return null;
-  });
+  return fxMoves.load(symbol, async () => currencyMoveFromHistory(await loadHistory(symbol), dollarsPerUnit))
+    .catch(logFailure("credit-boards", "Read a currency's price history failed", null));
 }
 
 /**
  * Each currency's 1M move against the dollar from its daily closes, shared
  * across panes. A currency with no pair or no history reads as unknown.
+ * `batched`: `loadHistory` asks a source that batches them
+ * (`DataProvider.batchesReads`) with `batch`, so they are all asked at once.
  */
 export async function loadCurrencyMoves(
   currencies: readonly string[],
   loadHistory: PriceHistoryLoader,
+  batched = false,
 ): Promise<Map<string, number | null>> {
   const queue = [...new Set(currencies)];
   const moves = new Map<string, number | null>();
@@ -114,6 +128,6 @@ export async function loadCurrencyMoves(
       moves.set(currency, pair ? await currencyMove(pair.symbol, pair.dollarsPerUnit, loadHistory) : null);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(FX_HISTORY_CONCURRENCY, queue.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(batched ? FX_HISTORY_BATCHED_CONCURRENCY : FX_HISTORY_CONCURRENCY, queue.length) }, worker));
   return moves;
 }

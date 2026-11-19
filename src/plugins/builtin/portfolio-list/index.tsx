@@ -1,7 +1,6 @@
 import type { PaneTemplateContext, PaneTemplateInstanceConfig, ShortcutArgError } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
 import { unknownCollectionArgError } from "../../../portfolio/collection-name";
-import { PortfolioListPane } from "./pane";
 import {
   buildPortfolioPaneSettingsDef,
   getPortfolioPaneSettings,
@@ -31,7 +30,7 @@ function resolveCollectionIdForKind(context: PaneTemplateContext, kind: "portfol
 
 /** `PF Nope`: no portfolio or watchlist has that name or id, so the bar names those that do. */
 function unknownCollectionArg(arg: string, context: PaneTemplateContext): ShortcutArgError | null {
-  return unknownCollectionArgError(arg, [...context.config.portfolios, ...context.config.watchlists], "portfolio or watchlist");
+  return unknownCollectionArgError(arg, [...context.config.portfolios, ...context.config.watchlists], "portfolio or watchlist", undefined, { prefix: true });
 }
 
 function createCollectionPaneInstance(
@@ -39,11 +38,12 @@ function createCollectionPaneInstance(
   kind?: "portfolio" | "watchlist",
   argument?: string,
 ): PaneTemplateInstanceConfig | null {
-  // `PF Retirement` (or `shot PF Retirement`) opens the collection it names.
-  const named = argument?.trim() ? findCollection(context.config, argument) : null;
+  // `PF Retirement` (or `shot PF Retirement`) opens the collection it names, or the one whose name starts so (`PF ret`).
+  const named = argument?.trim() ? findCollection(context.config, argument, { prefix: true }) : null;
   const collectionId = named && (!kind || named.kind === kind)
     ? named.id
-    : kind ? resolveCollectionIdForKind(context, kind) : resolveCollectionPaneId(context);
+    // PF alone is the portfolio: the one in view, else the first, and a watchlist only where there is no portfolio.
+    : resolveCollectionIdForKind(context, kind ?? "portfolio") ?? (kind ? null : resolveCollectionPaneId(context));
   return collectionId ? { params: { collectionId } } : null;
 }
 
@@ -54,7 +54,7 @@ export const portfolioListModule: PluginModule = {
       reportFreshness: { source: "Local portfolio and Gloom Cloud" },
       name: "Portfolio",
       icon: "P",
-      component: PortfolioListPane,
+      get component(): typeof import("./pane").PortfolioListPane { const { PortfolioListPane } = require("./pane"); return PortfolioListPane; },
       defaultPosition: "left",
       defaultMode: "floating",
       defaultWidth: "40%",
@@ -90,14 +90,14 @@ export const portfolioListModule: PluginModule = {
     {
       id: "new-collection-pane",
       paneId: "portfolio-list",
-      label: "Collection Pane",
+      label: "Portfolio",
       description: "Holdings, weights and P&L of a portfolio or watchlist; set target weights to see drift and the trades that rebalance",
       // Phrases rather than bare words, so `fn rebalance` and `fn target` keep resolving where they did.
       keywords: [
         "portfolio", "watchlist", "collection", "pane", "list",
         "portfolio rebalance", "allocation drift", "target weights", "asset allocation", "cash balance",
       ],
-      // The argument is the report's: `PF Book` opens Book, by name or id in any case.
+      // The argument is the report's: `PF Book` opens Book, by name or id in any case, or the start of one name.
       shortcut: { prefix: "PF", argError: unknownCollectionArg },
       headless: collectionHoldingsHeadless,
       canCreate: (context) => resolveCollectionPaneId(context) !== null,

@@ -1,6 +1,7 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { describe, expect, test } from "bun:test";
 import type { AnalystRatingRecord, AnalystResearchData, Quote } from "../../../types/financials";
-import { analystReferenceMetadata, analystReferencePrice, analystTargetCurrency, analystUpside, buildAnalystFooterInfo, buildAnalystStatusSegments, buildAnalystTargetHistory, buildMeanTargetHistory, buildRatingColumns, formatAnalystPrice, formatAnalystReference, formatRatingTarget, formatRecommendationMix, latestRecommendation, ratingSplit, ratingTargetDelta, recommendationMix, recommendationTotal, sortRatingRows, targetUpside, type RatingSortPreference } from "./analyst-model";
+import { analystReferenceMetadata, analystReferencePrice, analystTargetCurrency, analystUpside, buildAnalystFooterInfo, buildAnalystStatusSegments, buildAnalystTargetHistory, buildMeanTargetHistory, buildRatingColumns, formatAnalystPrice, formatAnalystReference, formatRatingTarget, formatRecommendationMix, latestRecommendation, ratingReason, ratingReasonSource, ratingSplit, ratingTargetDelta, recommendationMix, recommendationTotal, sortRatingRows, targetUpside, type RatingSortPreference } from "./analyst-model";
 const data: AnalystResearchData = { symbol: "FIX", recommendations: [], ratings: [], earningsEstimates: [], revenueEstimates: [] };
 const complete = { period: "current month", strongBuy: 2, buy: 3, hold: 4, sell: 0, strongSell: 0 };
 
@@ -8,7 +9,7 @@ test("unknown and explicit minor units format without a currency or scale guess"
   expect(formatAnalystPrice(0, undefined)).toBe("0.00 (ccy?)");
   expect(formatAnalystPrice(125, "GBp")).toBe("£1.25");
   expect(formatAnalystPrice(1.25, "GBP")).toBe("£1.25");
-  expect(formatAnalystPrice(Infinity, "USD")).toBe("-");
+  expect(formatAnalystPrice(Infinity, "USD")).toBe(MISSING_VALUE);
   expect(analystTargetCurrency({ ...data, currency: " GBP ", priceTarget: { currency: " " } })).toBe("GBP");
   expect(analystTargetCurrency({ ...data, currency: "USD", priceTarget: { currency: " EUR " } })).toBe("EUR");
   expect(targetUpside({ average: 0, current: 2 })).toBe(-1);
@@ -21,7 +22,7 @@ test("consensus total requires every finite nonnegative integer bucket", () => {
     const incomplete = { ...data, recommendations: [{ ...complete, strongSell }] };
     expect(recommendationTotal(incomplete)).toBeNull();
     expect(recommendationMix(incomplete)?.strongSell).toBeNull();
-    expect(formatRecommendationMix(incomplete)).toBe("SB 2  B 3  H 4  S -");
+    expect(formatRecommendationMix(incomplete)).toBe(`2 Strong Buy · 3 Buy · 4 Hold · ${MISSING_VALUE} Sell`);
   }
   expect(recommendationTotal({ ...data, recommendations: [{ ...complete, strongBuy: 0, buy: 0, hold: 0 }] })).toBe(0);
 });
@@ -298,5 +299,35 @@ describe("analyst rating columns", () => {
     const first: AnalystRatingRecord = { date: "2026-08-04", firm: "China Renaissance", currentPriceTarget: 280, priorPriceTarget: 0 };
     expect(formatRatingTarget(first, "USD")).toBe(" $280");
     expect(ratingTargetDelta(first)).toBeNull();
+  });
+});
+
+/**
+ * A reason is the line public coverage of the action quotes, with the
+ * article. The table only grows a column for it when some action has one.
+ */
+describe("analyst action reasons", () => {
+  const plain: AnalystRatingRecord = { date: "2026-10-29", firm: "TD Cowen", action: "Lowers", current: "Buy", currentPriceTarget: 140, priorPriceTarget: 160 };
+  const reasoned: AnalystRatingRecord = {
+    ...plain,
+    reason: { text: "on weak guidance", url: "https://www.investing.com/news/analyst-ratings/td-cowen-lowers-boot-barn-93CH-1", source: "Investing.com" },
+  };
+
+  test("a history with no reason keeps the columns it had", () => {
+    expect(buildRatingColumns([plain], "USD").map((column) => column.id)).toEqual(["date", "firm", "action", "current", "target", "prior"]);
+    const columns = buildRatingColumns([plain, reasoned], "USD");
+    expect(columns.map((column) => column.id)).toEqual(["date", "firm", "action", "current", "target", "prior", "reason"]);
+    expect(columns.at(-1)).toMatchObject({ label: "REASON", flexGrow: 1 });
+  });
+
+  test("a reason without its line or its article is no reason", () => {
+    expect(ratingReason(reasoned)?.text).toBe("on weak guidance");
+    expect(ratingReason({ ...plain, reason: { text: " ", url: "https://example.com/a" } })).toBeNull();
+    expect(ratingReason({ ...plain, reason: { text: "on weak guidance", url: "" } })).toBeNull();
+  });
+
+  test("the source is the publisher, else the article's site", () => {
+    expect(ratingReasonSource(reasoned.reason!)).toBe("Investing.com");
+    expect(ratingReasonSource({ text: "on weak guidance", url: "https://www.example.com/story" })).toBe("example.com");
   });
 });

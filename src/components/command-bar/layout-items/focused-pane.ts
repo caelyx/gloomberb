@@ -9,8 +9,28 @@ import { resolveTickerForPane } from "../../../state/app/context";
 import { findPaneInstance } from "../../../types/config";
 import { tf } from "../../../i18n";
 import type { ResultItem } from "../list/model";
-import type { LayoutItemsContext } from "./types";
 import { WINDOW_MODE_COMMAND_OPTIONS } from "./window-mode";
+import { getDesktopWindows, windowMoveTargets } from "../../../state/desktop-windows";
+import { fireAndForget } from "../../../utils/fire-and-forget";
+import type { CloseAll, LayoutItemsContext } from "./types";
+
+/** The desktop app's other windows, and a new one, where the focused pane can go. */
+function focusedPaneWindowMoves(paneId: string, closeAll: CloseAll): ResultItem[] {
+  const windows = getDesktopWindows();
+  if (!windows) return [];
+  return windowMoveTargets(windows, { prefix: "pane" }).map((move) => ({
+    id: `layout-move-to-window:${move.key}`,
+    label: move.label,
+    detail: move.detail ?? "Open a window for the focused pane",
+    searchText: "screen monitor display",
+    category: "Focused Pane",
+    kind: "action" as const,
+    action: () => {
+      closeAll({ revertThemePreview: false });
+      fireAndForget(windows.movePane(paneId, move.target), "desktop.movePaneToWindow");
+    },
+  }));
+}
 
 export function buildFocusedPaneLayoutItems({
   closeAll,
@@ -51,8 +71,8 @@ export function buildFocusedPaneLayoutItems({
   return [
     {
       id: "layout-toggle-mode",
-      label: focusedFloating ? "Dock Pane" : "Float Pane",
-      detail: focusedFloating ? "Return the focused window to the layout" : "Detach the focused pane into a floating window",
+      label: focusedFloating ? "Return to Layout" : "Float Pane",
+      detail: focusedFloating ? "Return the focused window to the layout" : "Take the focused pane out of the layout into a floating window",
       category: "Focused Pane",
       kind: "action",
       action: () => {
@@ -68,6 +88,9 @@ export function buildFocusedPaneLayoutItems({
       id: "layout-fullscreen",
       label: "Fullscreen Pane",
       detail: "Fill the window with the focused pane, or restore it",
+      // What other apps call it: maximize a window, zoom a pane.
+      searchText: "maximize maximise maximized zoom full screen expand",
+      commandWords: ["fullscreen", "full", "screen", "maximize", "maximise", "maximized", "zoom", "expand"],
       category: "Focused Pane",
       kind: "action",
       action: () => {
@@ -95,7 +118,7 @@ export function buildFocusedPaneLayoutItems({
       label: tf("Move Back to {layout}", { layout: moveBack.name }),
       detail: moveBack.original
         ? "Return the focused pane to the layout it came from"
-        : "The layout it came from is gone, so it docks in this one instead",
+        : "The layout it came from is gone, so it goes into this one instead",
       category: "Focused Pane",
       kind: "action" as const,
       action: () => {
@@ -103,6 +126,7 @@ export function buildFocusedPaneLayoutItems({
         pluginRegistry.movePaneBack(focusedPane.instanceId);
       },
     }] : []),
+    ...focusedPaneWindowMoves(focusedPane.instanceId, closeAll),
     ...WINDOW_MODE_COMMAND_OPTIONS.map((option) => ({
       id: `layout-window-mode:${option.mode}`,
       label: option.label,
@@ -136,8 +160,8 @@ export function buildFocusedPaneLayoutItems({
             return {
               id: paneId,
               label: instance.title || pluginRegistry.panes.get(instance.paneId)?.name || instance.paneId,
-              detail: isFloating ? "Floating window" : "Docked pane",
-              description: isFloating ? "Floating window" : "Docked pane",
+              detail: isFloating ? "Floating window" : "In the layout",
+              description: isFloating ? "Floating window" : "In the layout",
             };
           });
         if (pickerOptions.length === 0) return;

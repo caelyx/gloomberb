@@ -1,6 +1,7 @@
+import { logFailure } from "../../../../utils/log-failure";
 import { PerpEquityRow } from "../../perps/equity-row";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, useUiCapabilities } from "../../../../ui";
+import { Box, useRendererHost, useUiCapabilities } from "../../../../ui";
 import type { PaneProps } from "../../../../types/plugin";
 import { TICKER_RESEARCH_PANE_ID } from "../../../../types/config";
 import type { QuoteSubscriptionTarget } from "../../../../types/data-provider";
@@ -19,10 +20,31 @@ import { getQuoteMonitorPaneSettings } from "../settings";
 import { useShortcut, type KeyEventLike } from "../../../../react/input";
 import { isPlainKey } from "../../../../utils/keyboard";
 import { QuoteMonitorCard } from "./card";
+import { displayTickerKey, parsePublicTickerKey, publicTickerKey } from "../../../../utils/exchanges";
+import { listingAbroadVenue } from "../../../../utils/sec";
 import { useLiveStreamingSetting } from "../../../../state/hooks/live-streaming";
+import { registerPaneTableExporter } from "../../../../state/pane-table-export-registry";
+import { quoteMonitorCsv } from "./export";
+import { getSharedRegistry } from "../../../registry";
+
+/**
+ * One label form across a board: a listing abroad with its venue (8058:JPX),
+ * whether it was typed so or added from a row saved under its bare code, and a
+ * US listing, an index or a pair as its symbol. A board of Tokyo names read
+ * "8058" on one card and "8031:JPX" on the rest (9 Nov 2026).
+ */
+export function quoteMonitorLabel(symbol: string, ticker: TickerRecord | null): string {
+  // By the venue's own code (9992:HKEX), as titles and the CLI name it; the card stays bound to the key as saved.
+  if (parsePublicTickerKey(symbol).exchange) return displayTickerKey(symbol);
+  if (/^\^|=|-USD$/i.test(symbol)) return symbol;
+  const exchange = ticker?.metadata.exchange;
+  return exchange && listingAbroadVenue(publicTickerKey(symbol, exchange)) ? displayTickerKey(publicTickerKey(symbol, exchange)) : symbol;
+}
 
 interface BoardEntry {
   symbol: string;
+  /** What the card is headed with (quoteMonitorLabel). */
+  label: string;
   ticker: TickerRecord | null;
   instrument: InstrumentRef | null;
   chartRequest: ChartRequest | null;
@@ -138,6 +160,7 @@ export function QuoteMonitorPane({ paneId, focused, width, height }: PaneProps) 
       : null;
     return {
       symbol,
+      label: quoteMonitorLabel(symbol, ticker),
       ticker,
       instrument,
       chartRequest,
@@ -173,8 +196,24 @@ export function QuoteMonitorPane({ paneId, focused, width, height }: PaneProps) 
   useEffect(() => {
     const coordinator = getSharedMarketDataCoordinator();
     if (!coordinator || !liveStreaming || boardInstruments.length === 0) return;
-    void coordinator.loadQuotesBatch(boardInstruments).catch(() => {});
+    void coordinator.loadQuotesBatch(boardInstruments).catch(logFailure("ticker-detail.quote-monitor", "Warm quote monitor board failed"));
   }, [boardInstrumentKey, liveStreaming]);
+  // Export CSV writes the board's quotes as `fn QQ --csv` does, each card its own as-of and session.
+  const renderer = useRendererHost();
+  const exportCsvRef = useRef<() => string>(() => "");
+  exportCsvRef.current = () => quoteMonitorCsv(boardEntries.map((entry) => ({
+    symbol: entry.symbol,
+    instrument: entry.instrument,
+    quote: (entry.quoteKey ? resolveEntryData(quoteEntries.get(entry.quoteKey)) : null) ?? financialsBySymbol.get(entry.symbol)?.quote,
+  })), Date.now(), (providerId) => getSharedRegistry()?.getBrokerAdapter(providerId)?.name);
+  useEffect(() => {
+    if (!renderer.saveTextFile) return;
+    return registerPaneTableExporter(paneId, (filename) => renderer.saveTextFile!({
+      name: filename,
+      text: exportCsvRef.current(),
+      mimeType: "text/csv;charset=utf-8",
+    }));
+  }, [paneId, renderer]);
   const { pinTicker } = usePluginTickerActions();
   const { openPaneSettings } = usePluginAppActions();
   const { nativePaneChrome } = useUiCapabilities();
@@ -246,11 +285,14 @@ export function QuoteMonitorPane({ paneId, focused, width, height }: PaneProps) 
       <Box
         flexGrow={1}
         backgroundColor={colors.bg}
-        overflow="hidden"
         style={{
           display: "grid",
           gridTemplateColumns: `repeat(${desktopColumns}, minmax(0, 1fr))`,
-          gridAutoRows: "minmax(66px, 1fr)",
+          // The rows share the board, each at least as tall as its cards' lines: a board too short for every card
+          // scrolls rather than draw a card's lines over one another.
+          gridAutoRows: "minmax(min-content, 1fr)",
+          overflowX: "hidden",
+          overflowY: "auto",
           alignItems: "stretch",
           alignContent: "stretch",
           width: "100%",
@@ -261,6 +303,7 @@ export function QuoteMonitorPane({ paneId, focused, width, height }: PaneProps) 
           <QuoteMonitorCard
             key={entry.symbol}
             symbol={entry.symbol}
+            label={entry.label}
             ticker={entry.ticker}
             cachedFinancials={financialsBySymbol.get(entry.symbol) ?? null}
             quoteEntry={entry.quoteKey ? quoteEntries.get(entry.quoteKey) ?? null : null}
@@ -296,6 +339,7 @@ export function QuoteMonitorPane({ paneId, focused, width, height }: PaneProps) 
             <QuoteMonitorCard
               key={entry.symbol}
               symbol={entry.symbol}
+              label={entry.label}
               ticker={entry.ticker}
               cachedFinancials={financialsBySymbol.get(entry.symbol) ?? null}
               quoteEntry={entry.quoteKey ? quoteEntries.get(entry.quoteKey) ?? null : null}

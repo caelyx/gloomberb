@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Quote } from "../types/financials";
-import { compareDepositaryPair, listingDepositaryPair, pairPriceInput, pesoImpliedRates, premiumText, type PairPriceInput } from "./depositary-pair";
+import { cedearRatioText, compareDepositaryPair, depositaryPairText, listingCedearRatio, listingDepositaryPair, pairPriceInput, pesoImpliedRates, premiumText, type PairPriceInput } from "./depositary-pair";
 
 const FRI_CLOSE = Date.UTC(2026, 9, 23, 20, 0);
 
@@ -51,6 +51,16 @@ test("the pair is read from the quote, else the fundamentals, and only when it i
   expect(listingDepositaryPair({ quote: quote({ depositaryPair: { ...pair, ordinary: [] } }) })).toBeNull();
 });
 
+test("a CEDEAR states its ratio in its company's shares, from its quote or fundamentals when whole", () => {
+  const apple = { listing: "AAPL:BYMA", receipts: 20, shares: 1, company: "Apple Inc.", underlying: "AAPL", listedAt: "2026-09-16" };
+  expect(cedearRatioText(listingCedearRatio({ quote: quote({ cedearRatio: apple }) })!)).toBe("20 AAPL:BYMA = 1 Apple Inc. share");
+  // 9 BABA CEDEARs are one BABA receipt, which holds 8 Alibaba shares.
+  const alibaba = { ...apple, listing: "BABA:BYMA", receipts: 9, shares: 8, company: "Alibaba Group Holding Limited", underlying: "BABA" };
+  expect(cedearRatioText(listingCedearRatio({ fundamentals: { cedearRatio: alibaba } })!)).toBe("9 BABA:BYMA = 8 Alibaba Group Holding Limited shares");
+  expect(listingCedearRatio({ quote: quote({ cedearRatio: { ...apple, shares: 0 } }) })).toBeNull();
+  expect(listingCedearRatio({ quote: quote({}) })).toBeNull();
+});
+
 test("the peso's CCL comes from the receipt and the C line, its MEP from the D line, each with its formula", () => {
   const home = input("GGAL.BA", 6260, "ARS", FRI_CLOSE);
   const rates = pesoImpliedRates(10, {
@@ -67,4 +77,19 @@ test("the peso's CCL comes from the receipt and the C line, its MEP from the D l
   // Without a ratio on record the receipt's rate is left out, not guessed; a peso price priced otherwise is no peso rate.
   expect(pesoImpliedRates(null, { home, receipt: input("GGAL", 37.91, "USD", FRI_CLOSE), ccl: null, mep: null })).toEqual([]);
   expect(pesoImpliedRates(10, { home: { ...home, currency: "USD" }, receipt: input("GGAL", 37.91, "USD", FRI_CLOSE), ccl: null, mep: null })).toEqual([]);
+});
+
+test("a home line names its receipt's ratio in shares, one share included", () => {
+  expect(depositaryPairText({ receipt: "RWEOY", ratio: 1, ordinary: ["RWE.DE"] }, false)).toBe("1 RWEOY ADR = 1 of these shares");
+  expect(depositaryPairText({ receipt: "GGAL", ratio: 10, ordinary: ["GGAL.BA"] }, false)).toBe("1 GGAL ADR = 10 of these shares");
+  expect(depositaryPairText({ receipt: "RIO", ratio: 1, ordinary: ["RIO.L"] }, true)).toBe("1 ADR = 1 share of RIO.L");
+});
+
+test("a receipt names its home line's class: preferred on B3, units and CPOs on the BMV", () => {
+  expect(depositaryPairText({ receipt: "PBR.A", ratio: 2, ordinary: ["PETR4.SA"] }, true)).toBe("1 ADR = 2 preferred shares of PETR4.SA");
+  expect(depositaryPairText({ receipt: "ITUB", ratio: 1, ordinary: ["ITUB4.SA"] }, true)).toBe("1 ADR = 1 preferred share of ITUB4.SA");
+  expect(depositaryPairText({ receipt: "PBR", ratio: 2, ordinary: ["PETR3.SA"] }, true)).toBe("1 ADR = 2 ordinary shares of PETR3.SA");
+  expect(depositaryPairText({ receipt: "FMX", ratio: 10, ordinary: ["FEMSAUBD.MX"] }, true)).toBe("1 ADR = 10 units of FEMSAUBD.MX");
+  expect(depositaryPairText({ receipt: "TV", ratio: 5, ordinary: ["TLEVISACPO.MX"] }, true)).toBe("1 ADR = 5 CPOs of TLEVISACPO.MX");
+  expect(depositaryPairText({ receipt: "WMMVY", ratio: 10, ordinary: ["WALMEX.MX"] }, true)).toBe("1 ADR = 10 ordinary shares of WALMEX.MX");
 });

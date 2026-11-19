@@ -9,7 +9,8 @@ const GITHUB_ISSUE_URL = "https://github.com/gloom-sh/gloomberb/issues/new/choos
 
 export type ElectrobunApplicationMenuCommand =
   | DesktopApplicationMenuCommand
-  | { type: "open-devtools" };
+  | { type: "open-devtools" }
+  | { type: "new-window" };
 
 /**
  * The command rides in the item's action string, not its `data`: Electrobun
@@ -57,6 +58,8 @@ function buildApplicationMenu(keybindings: ResolvedKeybindings): ApplicationMenu
     {
       label: "File",
       submenu: [
+        commandItem("New Window", { type: "new-window" }),
+        { type: "divider" },
         openCommandBar("Search Ticker...", "DES ", accelerator("ticker-search")),
         { type: "divider" },
         commandItem("New Portfolio...", { type: "open-builtin-workflow", actionId: "new-portfolio" }),

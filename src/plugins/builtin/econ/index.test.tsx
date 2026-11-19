@@ -12,6 +12,8 @@ import { economicCalendarModule } from "./index";
 import { createTestPaneConfig, TestPaneProvider } from "../../../test-support/pane";
 import { PaneInViewProvider } from "../../../state/app/activity";
 import { apiClient, type CloudEconEventPayload } from "../../../api-client";
+import { createRemoteUiRegistry, RemoteUiRegistryProvider, type RemoteUiRegistry } from "../../../remote/semantic-tree";
+import { renderedReportNotices } from "../../../cli/pane-functions/report-notices";
 
 const EconPane = economicCalendarModule.panes![0]!.component as (props: {
   paneId: string;
@@ -66,25 +68,28 @@ afterEach(() => {
  * `impactFilter` is the filter saved with the pane; without one it opens on its default. `params` are a command's
  * (`ECO MX,BR`), `timezone` the reader's `config set timezone`.
  */
-async function renderPane(width: number, impactFilter: string | null = "all", inView = true, params?: Record<string, string>, timezone?: string) {
+async function renderPane(width: number, impactFilter: string | null = "all", inView = true, params?: Record<string, string>, timezone?: string,
+  registry: RemoteUiRegistry = createRemoteUiRegistry()) {
   const config = params
     ? createTestPaneConfig("/tmp/gloomberb-econ-test", { instanceId: "econ-calendar", paneId: "econ-calendar", params })
     : createDefaultConfig("/tmp/gloomberb-econ-test");
   const state = createInitialState(timezone ? { ...config, timezone } : config);
   if (impactFilter) state.paneState["econ-calendar"] = { pluginState: { econ: { impactFilter } } };
   await tui.render(
-    <TestPaneProvider state={state} paneId="econ-calendar" runtime={{} as unknown as PluginRuntimeAccess} pluginId="econ">
-      <PaneFooterProvider>
-        {(footer) => (
-          <Box width={width} height={25} flexDirection="column">
-            <PaneInViewProvider value={inView}>
-              <EconPane paneId="econ-calendar" paneType="econ-calendar" focused width={width} height={24} />
-            </PaneInViewProvider>
-            <PaneFooterBar footer={footer} width={width} focused />
-          </Box>
-        )}
-      </PaneFooterProvider>
-    </TestPaneProvider>,
+    <RemoteUiRegistryProvider registry={registry}>
+      <TestPaneProvider state={state} paneId="econ-calendar" runtime={{} as unknown as PluginRuntimeAccess} pluginId="econ">
+        <PaneFooterProvider>
+          {(footer) => (
+            <Box width={width} height={25} flexDirection="column">
+              <PaneInViewProvider value={inView}>
+                <EconPane paneId="econ-calendar" paneType="econ-calendar" focused width={width} height={24} />
+              </PaneInViewProvider>
+              <PaneFooterBar footer={footer} width={width} focused />
+            </Box>
+          )}
+        </PaneFooterProvider>
+      </TestPaneProvider>
+    </RemoteUiRegistryProvider>,
     { width, height: 25 },
   );
   await act(async () => {
@@ -165,7 +170,7 @@ describe("EconCalendarPane", () => {
     expect(frame).toContain("Release 39 m/m");
     expect(frame).not.toContain("Release 0 m/m");
     // Nothing is listed ahead, which the footer says rather than leaving a quiet week.
-    expect(frame).toMatch(/No events listed after \w{3} \w{3} \d+/);
+    expect(frame).toMatch(/No events listed after \w{3} \d+ \w{3}/);
   });
 
   // NOW a few rows down would leave Friday's last releases on top of a Saturday.
@@ -200,7 +205,7 @@ describe("EconCalendarPane", () => {
     const localClock = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
     const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    const separator = `TODAY · ${days[at.getUTCDay()]} ${months[at.getUTCMonth()]} ${at.getUTCDate()}`;
+    const separator = `TODAY · ${days[at.getUTCDay()]} ${at.getUTCDate()} ${months[at.getUTCMonth()]}`;
 
     const persistence = new MemoryPluginPersistence();
     persistence.seedResource("calendar", "global", [{
@@ -217,7 +222,7 @@ describe("EconCalendarPane", () => {
     attachEconCalendarPersistence(persistence);
     const frame = await renderPane(110);
 
-    expect(frame).toContain("TIME (UTC)");
+    expect(frame).toMatch(/\bUTC\s+IMPACT|\bUTC\s+IMP\b/);
     expect(frame).toContain("23:30");
     if (localClock !== "23:30") expect(frame).not.toContain(localClock);
     expect(frame).toContain(separator);
@@ -234,7 +239,7 @@ describe("EconCalendarPane", () => {
     ], { sourceKey: "gloomberb-cloud", schemaVersion: 1 });
     attachEconCalendarPersistence(persistence);
     const frame = await renderPane(110, "all", true, undefined, "America/New_York");
-    expect(frame).toMatch(/TIME \(UTC\)\s+NEW YORK/);
+    expect(frame).toMatch(/\bUTC\s+NEW YORK/);
     expect(frame).toMatch(/12:00\s+08:00\s+.*IPCA-15 Mid-Month CPI m\/m\s+0\.32%\s+0\.43%\s+0\.70%/);
     expect(frame).toMatch(/01:30\s+Fri 21:30\s+/);
 
@@ -264,12 +269,70 @@ describe("EconCalendarPane", () => {
     expect(frame).toContain("39.50%");
     // The decision's row has no time: its line holds the flag, the country and the event, nothing in the time column.
     expect(frame.split("\n").find((line) => line.includes("CBRT Interest Rate Decision"))).not.toMatch(/\d\d:\d\d/);
+    // a dash, as the CLI prints, and on the row in hand the footer says why, as the CLI does under its table.
+    expect(frame.split("\n").find((line) => line.includes("CBRT Interest Rate Decision"))!.trimStart()).toStartWith("—");
+    const wide = await renderPane(170, "all", true, { country: "MX,TR", tabAt: "3" });
+    expect(wide).toContain("no time stated");
+    // With the reader's clock beside UTC, the decision has the same dash there: no time on any clock.
+    const zoned = await renderPane(140, "all", true, { country: "MX,TR", tabAt: "4" }, "America/New_York");
+    expect(zoned).toMatch(/12:00\s+08:00\s+HIGH\s+MX\s+Mid-Month CPI/);
+    expect(zoned).toMatch(/—\s+—\s+HIGH\s+TR\s+CBRT Interest Rate Decision/);
     expect(frame).not.toContain("Core PCE");
     expect(frame).toContain("next CBRT Interest Rate Decision Sat");
     expect(frame).not.toMatch(/CBRT Interest Rate Decision in \d/);
 
     const quiet = await renderPane(110, "all", true, { country: "ZA", tabAt: "2" });
     expect(quiet).toContain("No scheduled releases for ZA in this window");
+  });
+
+  // Past the listing Gloom Cloud lists each bank's next decision, marked so; the footer and the report say where the
+  // releases end, as the CLI does under its table.
+  test("says where the releases end when the rows shown run past it to a bank's next decision", async () => {
+    const persistence = new MemoryPluginPersistence();
+    persistence.seedResource("calendar", "global", [
+      { id: "mx", date: "2026-08-24T12:00:00.000Z", time: "12:00", country: "MX", event: "Mid-Month CPI y/y",
+        impact: "high", actual: null, forecast: null, prior: "3.42%" },
+      { id: "cb-tr", date: "2026-09-17T11:00:00.000Z", time: "11:00", country: "TR", event: "CBRT Interest Rate Decision",
+        impact: "high", actual: null, forecast: null, prior: "39.50%", kind: "central-bank-decision", localTime: "14:00",
+        timeZone: "Europe/Istanbul", pastListing: true, listedThrough: "2026-09-04" },
+    ], { sourceKey: "gloomberb-cloud", schemaVersion: 1 });
+    attachEconCalendarPersistence(persistence);
+    const registry = createRemoteUiRegistry();
+    const frame = await renderPane(160, "all", true, { country: "MX,TR", tabAt: "5" }, undefined, registry);
+    expect(frame).toContain("releases listed through Fri 4 Sep, then each bank's next decision");
+    expect(frame).not.toContain("No events listed after");
+    expect(renderedReportNotices(registry.snapshot())).toMatchObject({
+      notices: expect.arrayContaining(["No releases listed after 2026-09-04; the rows after it are each central bank's next decision."]),
+      facts: { releasesListedThrough: "2026-09-04" },
+    });
+    // Rows that stay within the listing say nothing about its end.
+    const within = createRemoteUiRegistry();
+    const mexico = await renderPane(160, "all", true, { country: "MX", tabAt: "6" }, undefined, within);
+    expect(mexico).not.toContain("releases listed through");
+    expect(renderedReportNotices(within.snapshot()).facts).not.toHaveProperty("releasesListedThrough");
+  });
+
+  test("names the Fed's rate for its upper bound, and explains a missing forecast on the row in hand", async () => {
+    const day = Date.UTC(2026, 7, 21);
+    const seed = (fedHour: number, fedActual: string | null) => {
+      const persistence = new MemoryPluginPersistence();
+      persistence.seedResource("calendar", "global", [
+        { id: "fed", date: new Date(day + fedHour * 3_600_000).toISOString(), time: `${fedHour}:00`, country: "US", event: "Federal Funds Rate",
+          impact: "high", actual: fedActual, forecast: "4.00%", prior: "4.00%" },
+        { id: "nfp", date: new Date(day + 3 * 86_400_000 + 12.5 * 3_600_000).toISOString(), time: "12:30", country: "US",
+          event: "Non Farm Payrolls", impact: "high", actual: null, forecast: null, prior: "29K" },
+      ], { sourceKey: "gloomberb-cloud", schemaVersion: 1 });
+      attachEconCalendarPersistence(persistence);
+    };
+    // It opens on the next release, the decision, whose forecast is in.
+    seed(18, null);
+    const decision = await renderPane(140, "all");
+    expect(decision).toContain("Federal Funds Rate (upper bound)");
+    expect(decision).toContain("next Federal Funds Rate (upper bound)");
+    expect(decision).not.toContain("no consensus yet");
+    // Once it is out, the pane opens on the payrolls, which have a prior and no forecast yet: the footer says what the dash is.
+    seed(10, "4.00%");
+    expect(await renderPane(140, "all")).toContain("— forecast = no consensus yet");
   });
 
   // A plenum or an election takes its day: "All day", never 00:00 UTC or the evening before on the reader's clock.

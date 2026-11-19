@@ -1,23 +1,36 @@
-import { FINANCIAL_VINTAGE_NOTICE, filledPeriodsNote, stalePeriodNote, statementHistoryNotes } from "../../../utils/financial-statements";
+import {
+  FINANCIAL_VINTAGE_NOTICE, fillDate, filledPeriodPublications, filledPeriodsNote, hasOlderStatements, reportsHalfYearly, stalePeriodNote,
+  statementHistoryNotes, statementPeriodMonths,
+} from "../../../utils/financial-statements";
+import { canonicalExchange } from "../../../utils/exchanges";
 import { hasValidQuoteObservationTime } from "../../../market-data/quotes/freshness";
-import { EXTENDED_SESSION_LABELS, getQuoteSessionFields, quoteHeadlineTime, type ExtendedSession } from "../../../market-data/market/status";
-import type { HeadlessPaneColumn, HeadlessPaneDefinition, HeadlessPaneFreshness, HeadlessPaneOptionValues } from "../../../types/headless";
+import { quoteMonitorColumns, quoteMonitorRow, QUOTE_MONITOR_BASE_COLUMNS, QUOTE_MONITOR_ROW_KEYS } from "./quote-monitor/rows";
+import type {
+  HeadlessPaneColumn, HeadlessPaneContext, HeadlessPaneDefinition, HeadlessPaneFreshness, HeadlessPaneOptionValues, HeadlessRowsResult,
+} from "../../../types/headless";
 import type { TimeRange } from "../../../time-series/range";
-import { formatNumber, formatPercentRaw } from "../../../utils/format";
-import { formatMarketPrice, formatMarketPriceWithCurrency, formatPriceObservation, quoteFormatOptions, withCurrencyMinorDigits, type MarketFormatOptions } from "../../../market-data/market/format";
+import { MISSING_VALUE, formatNumber } from "../../../utils/format";
+import { formatPriceObservation, penceFigure, quoteFormatOptions } from "../../../market-data/market/format";
 import {
-  MISSING_VOLUME_TEXT, missingVolumeCount, missingVolumeNotice, pricePointValues, priceHistoryIntegrityNotice,
+  MISSING_VOLUME_TEXT, missingVolumeCount, missingVolumeNotice, pricePointOpenWithheld, pricePointWickFlags, priceHistoryIntegrityNotice,
+  priceHistoryOpenNotice, priceHistoryRescaleNotice, priceHistoryWickNotice,
 } from "../../../utils/price-history-integrity";
+import { indexBarVolume } from "../../../market-data/market/index-level";
 import {
-  buildFinancialTableModel, financialStatementCurrency, financialStatementDateNotice, financialStatementLimitations,
-  financialStatementPeriods, financialSubTabFields, formatFinancialHeader, isPerShareFinancialRow, receiptShareCountLabel,
+  buildFinancialTableModel, financialColumnLabel, financialStatementCurrency, financialStatementDateNotice, financialStatementLimitations,
+  financialReportHeader, financialStatementPeriods, financialSubTabFields, formatFinancialAmount, isPerShareFinancialRow, receiptShareCountLabel,
 } from "./financials/model";
+import { fiscalYearEndMonth } from "../../../utils/fiscal-period";
+import type { FinancialStatement } from "../../../types/financials";
 import { adrRatioText } from "../../../utils/depositary-receipt";
 import { paneSchemas } from "./headless-schema";
 import { loadPeriodEndHistory } from "./financials/period-end-history";
+import { loadExchangeResultsNotes } from "./financials/exchange-results";
 import { latestBalanceSheetDate, loadOfferingNote } from "./financials/offerings";
-import { reportsShortTermTotal, runwayMethod } from "../../../utils/cash-runway";
+import { formatRunwayMonths, reportsShortTermTotal, runwayMethod } from "../../../utils/cash-runway";
+import { formatPerShareNumber } from "../../../utils/reported-money";
 import { logFailure } from "../../../utils/log-failure";
+import { loadStatementCurrency } from "../shared/statement-currency";
 import {
   RATIO_GAP_TEXT,
   findRatioTab,
@@ -34,19 +47,24 @@ import {
 import {
   loadHeadlessFinancials, loadHeadlessPriceHistory, loadHeadlessSymbols, resolveHeadlessInstrument,
 } from "../shared/headless-market-data";
-import { barHistoryFreshness, quoteFreshnessFields, REPORTED_DATA } from "../shared/report-freshness";
+import { barHistoryFreshness, REPORTED_DATA } from "../shared/report-freshness";
 import {
-  BAR_INTERVAL_LABELS, barPriceDecimals, cleanFloat32Price, formatBarPrice, historyAllStart, historyAllStartNote, historyMissingPeriodsNote, historyPriceDecimals,
+  BAR_INTERVAL_LABELS, barPriceDecimals, cleanBarPrice, cleanFloat32Price, formatBarPrice, historyAllStart, historyAllStartNote, historyBarFlags,
+  historyBarValues, historyExportUnit, historyMissingPeriodsNote, historyPriceDecimals, historyUnit, priceTableIntegrityNotice, quotedPriceDivisor,
 } from "../../../cli/history-rows";
 import { formatUtcTime } from "../../../utils/utc-time";
-import { maxDrawdown, maxDrawdownText } from "../../../utils/max-drawdown";
-import { isPastPriceWindow, loadPriceWindowHistory, priceWindowText, readPriceWindow, type PriceWindow } from "../../../utils/price-window";
+import { closeMoves } from "../../../utils/max-drawdown";
+import { isYieldIndexSymbol } from "../../../tickers/index-roots";
+import { parsePublicTickerKey } from "../../../utils/exchanges";
+import { isPastPriceWindow, loadPriceWindowHistory, priceWindowInterval, priceWindowText, readPriceWindow, type PriceWindow } from "../../../utils/price-window";
 import { historyCoverageNotice } from "../../../sources/history-coverage";
 import { getChartResolutionLabel, isIntradayResolution, RANGE_HISTORY_RESOLUTION, type ManualChartResolution } from "../../../time-series/resolution";
-import { DAY_SO_FAR_TEXT, withSessionBar } from "../../../time-series/session-bar";
-import { buildReturnRows, closedMarketNote, isTodayReturnRow, returnBaseCloseDay, type ReturnRange } from "./data-panes/returns-model";
+import { DAY_SO_FAR_TEXT, requestedSessionBarSize, withSessionBar } from "../../../time-series/session-bar";
+import { buildReturnRows, closedMarketNote, defaultReturnInterval, isTodayReturnRow, returnBaseCloseDay, type ReturnRange } from "./data-panes/returns-model";
+import { barCloseSession } from "../../../market-data/market/bar-period";
 import { periodBaseText } from "../../../market-data/market/period-return";
 import { loadReturnSeries } from "./data-panes/returns-history";
+import { CLOSING_PRINT_PENDING_TEXT } from "../../../time-series/official-close";
 import {
   closedHistoryBarDay, formingHistoryBar, HISTORY_DEFAULT_RANGE, historyBarDate, historyBarSize, historyBarSizeWord, historyDateHeader, isDailyOrLongerBar,
   type HistoryBarSize,
@@ -70,6 +88,22 @@ function reportWindowText(options: HeadlessPaneOptionValues): string | null {
   }
 }
 
+/**
+ * What a listing's bars are priced in, as `history` exports it in `currency_or_unit` (`GBP`, `JPY per USD`, `index
+ * points`): by its quote, else by the listing facts research reads, as `history` falls back to them. Null when neither says.
+ */
+async function barPriceUnit(
+  ctx: Pick<HeadlessContext, "marketData">,
+  key: string,
+  listing: string,
+  exchange: string | undefined,
+  quote: { currency?: string; instrumentType?: string } | null,
+): Promise<string | null> {
+  const listed = quote?.currency ? quote
+    : await ctx.marketData.getQuoteMetadata?.(listing, exchange ?? "").catch(logFailure("ticker-detail.headless", "Read listing facts for a bar unit failed", null));
+  return historyExportUnit(historyUnit(key, listed ?? quote));
+}
+
 /** Bars of a window that closed before today: the history asked for, which no later bar makes stale. */
 function pastWindowFreshness(window: PriceWindow, size: HistoryBarSize, observedKey: string): HeadlessPaneFreshness {
   return { status: "not-a-feed", basis: `${historyBarSizeWord(size)} bars, ${priceWindowText(window)}`, observedKey, oldest: null };
@@ -78,12 +112,200 @@ function pastWindowFreshness(window: PriceWindow, size: HistoryBarSize, observed
 export const financialStatementsHeadless: HeadlessPaneDefinition<"rows"> = {
   ...paneSchemas["financial-analysis-pane"],
   shape: "rows",
-  // Dated by the latest reported period; earlier periods are the statement's history.
-  freshness: { ...REPORTED_DATA, basis: "financial statements", observedKey: "date", oldest: null },
-  description: "Annual or quarterly financial statement rows for one ticker: the income statement, balance sheet, cash flow, or a ratio table.",
-  describe: ({ symbols, options }) => `Financial Statements | ${symbols[0]} | ${options.period} | ${options.statement}`,
+  // Dated by the latest reported period (each row's `periodEnd`); earlier periods are the statement's history.
+  freshness: { ...REPORTED_DATA, basis: "financial statements", observedKey: "periodEnd", oldest: null, retrievedToo: true },
+  description: "Annual or quarterly financial statement rows for one ticker, or several in one long table: the income statement, balance sheet, cash flow, or a ratio table.",
+  describe: ({ symbols, options }) => `Financial Statements | ${symbols.join(", ")} | ${options.period} | ${options.statement}`,
   async load({ symbols, options }, ctx) {
-    const symbol = symbols[0]!;
+    if (financialReportLayout(symbols, options) === "long") return loadLongFinancialReport(symbols, options, ctx);
+    return loadFinancialReport(symbols[0]!, options, ctx);
+  },
+};
+
+/**
+ * Wide, one column per period, for one ticker; long, a row per ticker, period and metric, for several or when
+ * `--layout long` asks for it. Several tickers have no shared columns, so they are never laid out wide.
+ */
+function financialReportLayout(symbols: readonly string[], options: HeadlessPaneOptionValues): "wide" | "long" {
+  if (options.layout === "wide" && (symbols.length > 1 || options.currency)) {
+    throw new Error("--layout wide shows one ticker in its reporting currency. Leave --layout out for converted figures or multiple tickers.");
+  }
+  return options.layout === "long" || symbols.length > 1 || options.currency ? "long" : "wide";
+}
+
+/** How a figure of an FA row reads: the kind of number it is, which names its unit and draws it. */
+type FigureFormat = "money" | "count" | "perShare" | "percent" | "multiple" | "days" | "months";
+
+const DIVISOR_WORDS: Record<number, string> = { 1e3: "k", 1e6: "mn", 1e9: "bn", 1e12: "tn" };
+
+/** The unit a figure of this kind is in, as exports name it in `currency_or_unit`: `USD bn`, `%`, `USD per share`, `bn shares`. */
+function figureUnit(format: FigureFormat, currency: string | null, divisor: number, shares = "shares"): string {
+  const scale = DIVISOR_WORDS[divisor] ?? "";
+  switch (format) {
+    case "money": return [currency, scale].filter(Boolean).join(" ");
+    case "count": return [scale, shares].filter(Boolean).join(" ");
+    case "perShare": return currency ? `${currency} per ${shares === "shares" ? "share" : "ADR"}` : "per share";
+    case "percent": return "%";
+    case "multiple": return "x";
+    case "days": return "days";
+    case "months": return "months";
+  }
+}
+
+/** A figure as FA's table draws it, from the row's kind and unit: what the text prints and an export reads the scale of. */
+function drawFigure(format: FigureFormat, value: number, divisor: number, ratio = false): string {
+  if (format === "percent") return ratio ? formatRatioValue("percent", value) : `${formatNumber(value * 100, 1)}%`;
+  if (format === "perShare") return formatPerShareNumber(value);
+  if (format === "money" || format === "count") return ratio ? formatRatioInput("money", value, divisor) : formatFinancialAmount(value, divisor);
+  return format === "days" && !ratio ? formatNumber(value, 1) : formatRatioValue(format, value);
+}
+
+/** A statement row's kind of figure. */
+function statementFigure(row: { format: "compact" | "eps" | "percent"; moneyUnit: string | null }): FigureFormat {
+  return row.format === "percent" ? "percent" : row.format === "eps" ? "perShare" : row.moneyUnit == null ? "count" : "money";
+}
+
+/**
+ * A period column of a wide FA table: the cell as the table drew it, its growth beside it in text. The figure is
+ * drawn from the value it is handed, so an export reads its scale, and a reason drawn in place of a missing one
+ * (`needs prior period`, `N/M`) goes to the `status` column rather than into a column of numbers.
+ */
+function financialPeriodColumn(date: string, header: string, index: number, withGrowth: boolean): HeadlessPaneColumn {
+  type Cell = { formatted: string; growthFormatted?: string };
+  const cellOf = (row: Record<string, unknown>) => (row.cells as Cell[] | undefined)?.[index];
+  const draw = (value: unknown, row: Record<string, unknown>) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return cellOf(row)?.formatted ?? MISSING_VALUE;
+    const format = row.figure as FigureFormat | undefined;
+    return format ? drawFigure(format, value, Number(row.divisor) || 1, row.kind === "ratio" || row.kind === "input") : value.toFixed(2);
+  };
+  return {
+    key: date, header, align: "right",
+    // Exports write the amount alone, every digit; its growth (or N/M) is in the JSON and on the text table.
+    format: draw,
+    ...withGrowth ? {
+      textFormat: (value: unknown, row: Record<string, unknown>) => [draw(value, row), cellOf(row)?.growthFormatted].filter(Boolean).join(" "),
+    } : {},
+  };
+}
+
+/** The newest period end of a table's columns, which dates every row of it. */
+function newestPeriodEnd(columns: ReadonlyArray<{ periodEnd: string }>): string | null {
+  return columns.map(({ periodEnd }) => periodEnd).filter(Boolean).sort().at(-1) ?? null;
+}
+
+/** A figure of the long layout as the text prints it: the number in the row's unit, which the Unit column names. */
+function drawLongFigure(format: FigureFormat, value: number, divisor: number): string {
+  switch (format) {
+    case "percent": return formatNumber(value * 100, 1);
+    case "money": case "count": return formatFinancialAmount(value, divisor);
+    case "perShare": return formatPerShareNumber(value);
+    case "multiple": return formatNumber(value, Math.abs(value) < 10 ? 2 : 1);
+    case "days": return formatNumber(value, 1);
+    case "months": return formatRunwayMonths(value, "");
+  }
+}
+
+/** The figure in its long-layout unit: a percent as percent, money and share counts in their unit, the rest as they are. */
+function longFigureValue(format: FigureFormat, value: number, divisor: number): number {
+  return format === "percent" ? value * 100 : format === "money" || format === "count" ? value / divisor : value;
+}
+
+const mostCommon = (values: readonly number[]): number | undefined => {
+  const counts = new Map<number, number>();
+  for (const value of values) counts.set(value, (counts.get(value) ?? 0) + 1);
+  return [...counts].sort((left, right) => right[1] - left[1] || right[0] - left[0])[0]?.[0];
+};
+
+/**
+ * Text columns of the long layout. The export keeps Ticker to Value: each row's unit is its `currency_or_unit`,
+ * its period end its `as_of`, and a reason a figure is missing its `status`.
+ */
+const LONG_FINANCIAL_COLUMNS: HeadlessPaneColumn[] = [
+  { key: "ticker", header: "Ticker" },
+  { key: "period", header: "Period" },
+  { key: "periodEnd", header: "Period End" },
+  { key: "metric", header: "Metric" },
+  { key: "value", header: "Value", align: "right", unitKey: "unit",
+    format: (value, row) => typeof value === "number" && Number.isFinite(value) ? String(row.formatted) : String(row.gap ?? MISSING_VALUE) },
+];
+
+/**
+ * FA for several tickers, or one with `--layout long`: a row per ticker, fiscal period and metric (Ticker, Period,
+ * Period End, Metric, Value, Unit), each ticker's table as `fn FA <ticker>` reads it. Money is in the one unit most
+ * of the tables' money rows take, so a figure pasted beside another ticker's needs no conversion; a ratio's input
+ * that several ratios share (Net Income under ROE, ROA and Net Margin) is one row.
+ */
+async function loadLongFinancialReport(symbols: string[], options: HeadlessPaneOptionValues, ctx: HeadlessPaneContext): Promise<HeadlessRowsResult> {
+  const loaded = await loadHeadlessSymbols(symbols, ctx, (symbol) => loadFinancialReport(symbol, options, ctx));
+  type WideRow = { kind: string; label: string; figure: FigureFormat; divisor: number;
+    cells: Array<{ value: number | null; formatted: string; gap?: string | null }> };
+  type WideColumn = { period: string; periodEnd: string; currency: string | null };
+  const tables = loaded.entries.map(({ symbol, data }) => ({
+    symbol, data, rows: data.rows as unknown as WideRow[], columns: (data.metadata?.columns ?? []) as WideColumn[],
+  }));
+  const divisor = mostCommon(tables.flatMap(({ rows }) => rows.filter((row) => row.figure === "money").map((row) => row.divisor))) ?? 1;
+  const target = typeof options.currency === "string" ? options.currency : null;
+  const fx = target ? await loadStatementCurrency(target, tables.flatMap(({ columns }) => columns.flatMap(({ currency }) => currency ? [currency] : [])), ctx) : null;
+  const rows = tables.flatMap(({ symbol, rows: wide, columns }) => {
+    const said = new Set<string>();
+    return wide.flatMap((row) => {
+      // An input is named without the operator that joins it to its ratio, and once.
+      const metric = row.kind === "input" ? row.label.replace(/^[÷+−-]\s*/, "") : row.label;
+      if (said.has(metric)) return [];
+      said.add(metric);
+      const rowDivisor = row.figure === "money" ? divisor : row.divisor;
+      return columns.map((column, index) => {
+        const cell = row.cells[index];
+        const native = typeof cell?.value === "number" && Number.isFinite(cell.value) ? cell.value : null;
+        const monetary = row.figure === "money" || row.figure === "perShare";
+        const rate = fx && monetary ? fx.rates.get(column.currency ?? "") : 1;
+        const value = native != null && rate != null ? native * rate : null;
+        const nativeUnit = figureUnit(row.figure, column.currency, rowDivisor);
+        return {
+          ticker: symbol, period: column.period, periodEnd: column.periodEnd, metric,
+          value: value == null ? null : longFigureValue(row.figure, value, rowDivisor),
+          unit: figureUnit(row.figure, monetary && target ? target : column.currency, rowDivisor),
+          formatted: value == null ? null : drawLongFigure(row.figure, value, rowDivisor),
+          gap: native != null && rate == null ? "No FX rate" : value == null ? cell?.gap ?? (cell?.formatted && cell.formatted !== MISSING_VALUE ? cell.formatted : null) : null,
+          ...(fx && monetary && native != null ? { nativeValue: longFigureValue(row.figure, native, rowDivisor), nativeUnit,
+            nativeFormatted: `${drawLongFigure(row.figure, native, rowDivisor)} ${nativeUnit}` } : {}),
+        };
+      });
+    });
+  });
+  // A note every table makes is said once; one only some make names the ticker. The headers' date sources are
+  // not in this layout's columns, so neither is what they mean.
+  const kept = (note: string) => note !== SEC_DATE_NOTE && note !== PROVIDER_DATE_NOTE;
+  for (const table of tables) table.data = { ...table.data, notes: (table.data.notes ?? []).filter(kept) };
+  const notes = tables.flatMap(({ data }) => data.notes ?? []);
+  const shared = (note: string) => tables.every(({ data }) => (data.notes ?? []).includes(note));
+  const ownNotes = tables.flatMap(({ symbol, data }) => (data.notes ?? []).filter((note) => !shared(note)).map((note) => `${symbol}: ${note}`));
+  const empty = tables.filter(({ rows: wide }) => wide.length === 0);
+  const first = tables[0]?.data.metadata ?? {};
+  const nativeColumn: HeadlessPaneColumn = { key: "nativeValue", header: "Native", align: "right", unitKey: "nativeUnit",
+    format: (_value, row) => String(row.nativeFormatted ?? "") };
+  return {
+    rows,
+    columns: fx ? [...LONG_FINANCIAL_COLUMNS, nativeColumn] : LONG_FINANCIAL_COLUMNS,
+    textColumns: [...LONG_FINANCIAL_COLUMNS, { key: "unit", header: "Unit" }, ...(fx ? [nativeColumn] : [])],
+    rowUnitKey: "unit", rowSymbolKey: "ticker", rowAsOfKey: "periodEnd",
+    interval: options.period === "quarterly" ? "quarterly" : "annual",
+    unavailableSymbols: [...loaded.unavailableSymbols, ...empty.flatMap(({ data }) => data.unavailableSymbols ?? [])],
+    errors: [...loaded.errors, ...tables.flatMap(({ symbol, data }) => (data.errors ?? []).map((error) => error.startsWith(symbol) ? error : `${symbol}: ${error}`))],
+    notes: [...new Set([...notes.filter(shared), ...ownNotes, ...(fx?.note ? [fx.note] : []), ...fx?.failures ?? []])],
+    metadata: {
+      symbols, layout: "long", statement: first.statement ?? options.statement, statementLabel: first.statementLabel ?? null,
+      period: options.period === "quarterly" ? "quarterly" : "annual",
+      ...(fx ? { currency: target, conversions: fx.conversions } : {}),
+      notices: [...new Set(tables.flatMap(({ data }) => (data.metadata?.notices ?? []) as string[]))],
+      limitations: [...new Set(tables.flatMap(({ data }) => (data.metadata?.limitations ?? []) as string[]))],
+    },
+  };
+}
+
+/** One ticker's statement or ratio table, its periods as columns. */
+async function loadFinancialReport(symbol: string, options: HeadlessPaneOptionValues, ctx: HeadlessPaneContext): Promise<HeadlessRowsResult> {
+  {
     const financials = await loadHeadlessFinancials(ctx, symbol);
     const requestedPeriod = options.period === "quarterly" ? "quarterly" : "annual";
     const hasRequestedStatements = (requestedPeriod === "quarterly"
@@ -104,18 +326,29 @@ export const financialStatementsHeadless: HeadlessPaneDefinition<"rows"> = {
     const receiptPeriods = table?.statements.filter(({ shareBasis }) => shareBasis === "depositary_receipt").map(({ date }) => date) ?? [];
     const allReceipts = receiptPeriods.length > 0 && receiptPeriods.length === table?.statements.length;
     const shareBases = new Set(table?.statements.map(({ shareBasis }) => shareBasis ?? null));
-    const ratio = adrRatioText(financials.fundamentals?.adrRatio ?? financials.quote?.adrRatio);
+    const ratio = adrRatioText(financials.fundamentals?.adrRatio ?? financials.quote?.adrRatio,
+      (financials.fundamentals?.depositaryPair ?? financials.quote?.depositaryPair)?.ordinary[0]);
     const shareBasisNotice = receiptPeriods.length === 0 || !table?.rows.some(isPerShareFinancialRow) ? null
       : allReceipts
         ? `Share counts are in ADRs and EPS is per ADR${ratio ? `; ${ratio}` : ""}.`
         : `Share counts are in ADRs and EPS is per ADR for ${receiptPeriods.join(", ")}${ratio ? ` (${ratio})` : ""}; other periods as reported.`;
-    const dates = table?.statements.map(({ date, currency, dateSource, providerDate, dateEvidence, availableAt, fieldAvailability, fieldSources, unavailableFields, epsBasis, unavailableEarnings, aggregation, shareBasis, filledFrom }) => ({
+    const yearEndMonth = fiscalYearEndMonth(financials.annualStatements);
+    // The list a column comes from: a comparative column is dated by the row a year on in it.
+    const listRows = requestedPeriod === "quarterly" ? financials.quarterlyStatements : financials.annualStatements;
+    const dates = table?.statements.map((statement) => {
+      const { date, currency, dateSource, providerDate, dateEvidence, availableAt, fieldAvailability, fieldSources, unavailableFields, epsBasis, unavailableEarnings, aggregation, shareBasis, filledFrom } = statement;
+      const filled = date === "TTM" || filledFrom?.source !== "results" ? null : fillDate(statement, listRows);
+      return {
       date, currency: currency ?? statementCurrency ?? null,
       shareBasis: shareBasis ?? null,
       availableAt: availableAt ?? null,
       fieldAvailability: fieldAvailability ? { ...fieldAvailability } : null,
       ...(fieldSources ? { fieldSources } : {}),
       ...(filledFrom ? { filledFrom } : {}),
+      // The day the company's results announcement published the period's filled lines, or, for a later
+      // period's comparative column, that period's first announcement.
+      ...(filled?.label === "published" && filled.date ? { announced: filled.date } : {}),
+      ...(filled?.label === "comparative" ? { comparativeIn: filled.date } : {}),
       ...(unavailableFields ? { unavailableFields } : {}),
       ...(epsBasis ? { epsBasis } : {}),
       ...(unavailableEarnings ? { unavailableEarnings } : {}),
@@ -123,53 +356,140 @@ export const financialStatementsHeadless: HeadlessPaneDefinition<"rows"> = {
       dateSource: date === "TTM" ? "derived" : dateSource ?? "provider",
       providerDate: date === "TTM" ? null : providerDate ?? null,
       dateEvidence: date === "TTM" || dateSource !== "sec" ? null : dateEvidence ?? null,
-      // Rows in the shared money unit no longer name it, so the header does.
-      label: formatFinancialHeader(date, [currency ?? statementCurrency, table.unit].filter(Boolean).join(" ") || undefined, dateSource, false, aggregation?.periodEnd).trim(),
-    })) ?? [];
-    const rows = table?.rows.map((row) => ({
-      id: row.id, kind: row.kind, metric: allReceipts ? receiptShareCountLabel(row) : row.unitLabel,
-      cells: row.cells.map((cell, index) => ({
-        date: dates[index]?.date ?? "", value: cell.value ?? null,
-        growth: cell.growth ?? null, formatted: cell.valueText.trim(), growthFormatted: cell.growthText.trim(),
-      })),
-      ...Object.fromEntries(row.cells.map((cell, index) => [dates[index]!.date, cell.value ?? null])),
-    })) ?? [];
+      // The fiscal period as the pane names it, and the day it ends, which the long layout and exports date it by.
+      period: financialColumnLabel(statement, requestedPeriod, yearEndMonth),
+      periodEnd: ratioPeriodEnd(statement),
+      // Rows in the table's one money unit do not name it, so the header does.
+      label: financialReportHeader(statement, [currency ?? statementCurrency, table.unit].filter(Boolean).join(" ") || undefined, requestedPeriod, yearEndMonth, listRows),
+      };
+    }) ?? [];
+    const asOf = newestPeriodEnd(dates);
+    const rows = table?.rows.map((row) => {
+      const figure = statementFigure(row);
+      return {
+        id: row.id, kind: row.kind, metric: allReceipts ? receiptShareCountLabel(row) : row.unitLabel, label: row.label,
+        // What the figures are in, which exports name in `currency_or_unit`, and the newest period they run to.
+        figure, divisor: row.divisor, unit: figureUnit(figure, statementCurrency ?? null, row.divisor, allReceipts ? "ADRs" : "shares"), periodEnd: asOf,
+        cells: row.cells.map((cell, index) => ({
+          date: dates[index]?.date ?? "", value: cell.value ?? null,
+          growth: cell.growth ?? null, formatted: cell.valueText.trim(), growthFormatted: cell.growthText.trim(),
+        })),
+        ...Object.fromEntries(row.cells.map((cell, index) => [dates[index]!.date, cell.value ?? null])),
+      };
+    }) ?? [];
     const columns: HeadlessPaneColumn[] = [
       { key: "metric", header: "Metric" },
-      ...dates.map(({ date, label }, index) => ({
-        key: date, header: label, align: "right" as const,
-        format: (_value: unknown, row: Record<string, unknown>) => {
-          const cell = (row.cells as Array<{ formatted: string; growthFormatted: string }>)[index]!;
-          return [cell.formatted, cell.growthFormatted].filter(Boolean).join(" ");
-        },
-      })),
+      ...dates.map(({ date, label }, index) => financialPeriodColumn(date, label, index, true)),
     ];
     // The balance sheet's cash, when an offering since is not in it yet.
     const offering = table?.subTab.key === "balance" ? await reportOfferingNote(ctx, symbol, financials) : null;
-    // A latest period over 15 months old says how old it is.
+    // A latest period over 15 months old says how old it is; an HKEX company's, the announcement its results came in.
     const stale = table ? stalePeriodNote(financialStatementPeriods(table.statements, table.subTab)) : null;
-    // Years filled from the listing's exchange, with the lines this table shows.
-    const filled = table ? filledPeriodsNote(table.statements, financialSubTabFields(table.subTab)) : null;
+    // Years filled from the listing's exchange, with the lines this table shows; an announcement that dates one is not
+    // said again in the results line.
+    const shownFields = table ? financialSubTabFields(table.subTab) : undefined;
+    const filled = table ? filledPeriodsNote(table.statements, shownFields) : null;
+    const announced = table ? await reportExchangeResults(ctx, symbol, financials, filledPeriodPublications(table.statements, shownFields)) : [];
+    const periodDates = dates.map(({ date }) => date);
+    const missing = rows.length ? null : await missingPeriodsError(ctx, symbol, financials, requestedPeriod, hasRequestedStatements, options.statement);
     return {
       rows, columns, unavailableSymbols: rows.length ? [] : [symbol],
-      ...(!hasRequestedStatements ? { errors: [`${symbol}: No ${requestedPeriod} financial statement coverage.`] } : {}),
+      ...(missing ? { errors: [missing] } : {}),
+      // Each exported row names its unit, the statements' period and the newest period end it runs to.
+      rowUnitKey: "unit", rowAsOfKey: "periodEnd", interval: requestedPeriod,
       // The report closes with how old its latest period is, how far back its periods go, and how to read further.
-      notes: [...stale ? [stale] : [], ...filled ? [filled] : [], ...offering ? [offering] : [], ...statementHistoryNotes(requestedPeriod, dates.map(({ date }) => date), symbol)],
+      notes: [...announced, ...stale ? [stale] : [], ...filled ? [filled] : [], ...offering ? [offering] : [],
+        ...statementHistoryNotes(requestedPeriod, periodDates, symbol, await reportOlderStatements(ctx, symbol, requestedPeriod, periodDates)),
+        ...table?.subTab.key === "cashflow" ? [CASH_FLOW_NOTE] : [], ...dateSourceNotes(dates)],
       metadata: {
         symbol, name: financials.quote?.name ?? symbol, currency: statementCurrency ?? null, unit: table?.unit ?? null, quoteCurrency: financials.quote?.currency ?? null,
         statement: table?.subTab.key ?? options.statement, statementLabel: table?.subTab.name ?? null,
         period: requestedPeriod, growthBasis: requestedPeriod === "quarterly" ? "QoQ" : "YoY", columns: dates,
         shareBasis: shareBases.size === 1 ? [...shareBases][0] ?? null : null,
         ...(receiptPeriods.length > 0 ? { adrRatio: financials.fundamentals?.adrRatio ?? financials.quote?.adrRatio ?? null } : {}),
-        notices: rows.length ? [FINANCIAL_VINTAGE_NOTICE, ...(shareBasisNotice ? [shareBasisNotice] : [])] : [],
+        // A quarter's change is against the quarter before it, which a reader of a table of quarters must be told.
+        notices: rows.length ? [FINANCIAL_VINTAGE_NOTICE, ...requestedPeriod === "quarterly" ? [quarterlyGrowthNotice(table?.statements ?? [])] : [],
+          ...(shareBasisNotice ? [shareBasisNotice] : [])] : [],
         limitations: financialStatementLimitations(financials),
         dateProvenance: financialStatementDateNotice(table?.statements ?? []),
       },
     };
-  },
-};
+  }
+}
 
 const reportAmount = (amount: RatioAmount) => (typeof amount === "number" ? amount : null);
+
+/** What the profitability tab's figures are, said under it, as docs/financial-ratios.md defines them. */
+const PROFITABILITY_NOTES = [
+  "ROIC is NOPAT / average (equity + total debt), cash not netted; ROIC ex Cash takes cash and short-term investments out of that capital.",
+  "NOPAT is operating income x (1 - tax provision / pretax income), the rate held between 0% and 100%; a pretax loss pays no tax.",
+  "Margins and NOPAT are GAAP, as the income statement reports them, not the company's adjusted (non-GAAP) figures.",
+];
+
+const NEEDS_OPENING_NOTE = "needs prior period: an average of the opening and closing balance has no opening balance sheet on file, the period before the column's (the prior year end for a year, the prior quarter end for a quarter, the quarter a year earlier for TTM), as for the oldest column or a year whose prior year is missing.";
+
+/** What the cash flow table works out of its own lines. */
+const CASH_FLOW_NOTE = "CapEx / Revenue is capex over revenue; Reinvestment Rate is capex plus acquisitions less D&A, over NOPAT.";
+
+const SEC_DATE_NOTE = "SEC date: the period end the company's 10-K or 10-Q states.";
+const PROVIDER_DATE_NOTE = "provider date: the period end as the statements source dates it, which can be a few days off the company's own.";
+
+/** What a column header's `(SEC date)` and `(provider date)` mean, for the ones the table has. */
+function dateSourceNotes(columns: ReadonlyArray<{ dateSource: string }>): string[] {
+  return [
+    ...columns.some(({ dateSource }) => dateSource === "sec") ? [SEC_DATE_NOTE] : [],
+    ...columns.some(({ dateSource }) => dateSource === "provider") ? [PROVIDER_DATE_NOTE] : [],
+  ];
+}
+
+/**
+ * What a table of quarters says its growth is measured against; a half filled
+ * from a results announcement is measured against the same half a year earlier.
+ */
+function quarterlyGrowthNotice(statements: readonly FinancialStatement[]): string {
+  return statements.some((statement) => statement.date !== "TTM" && (statementPeriodMonths(statement) ?? 3) > 3)
+    ? "Growth is vs prior quarter; a half's is vs the same half a year earlier."
+    : "Growth is vs prior quarter.";
+}
+
+type HeadlessContext = Parameters<typeof financialStatementsHeadless.load>[1];
+
+/** Whether GF, reading the listing's extended statement history, goes back further than the report (statementHistoryNotes). */
+function reportOlderStatements(ctx: HeadlessContext, symbol: string, period: "annual" | "quarterly", dates: readonly string[]) {
+  return hasOlderStatements(async () => {
+    const { symbol: bare, exchange } = await resolveHeadlessInstrument(ctx, symbol);
+    return ctx.marketData.getTickerFinancials(bare, exchange ?? "", { statementHistory: "extended" });
+  }, period, dates);
+}
+
+/**
+ * Why a statements report has no rows, and what to read instead: a listing
+ * with years but no quarters names its years, and says so of a company that
+ * reports half-yearly (Qantas on ASX); one with quarters but no full year
+ * reported (O8A:FWB2) names its quarters. Null when it has years and
+ * quarters, whatever this table lacks.
+ */
+async function missingPeriodsError(
+  ctx: HeadlessContext,
+  symbol: string,
+  financials: Awaited<ReturnType<typeof loadHeadlessFinancials>>,
+  period: "annual" | "quarterly",
+  hasRequestedStatements: boolean,
+  statement: unknown,
+): Promise<string | null> {
+  const hasYears = financials.annualStatements.length > 0;
+  const tab = typeof statement === "string" && statement && statement !== "income" ? ` --statement ${statement}` : "";
+  if (period === "annual" && !hasRequestedStatements && financials.quarterlyStatements.length > 0) {
+    return `${symbol}: No annual financial statement coverage. For its quarters: gloom fn FA ${symbol} --period quarterly${tab}`;
+  }
+  if (period === "annual" || !hasYears) return hasRequestedStatements ? null : `${symbol}: No ${period} financial statement coverage.`;
+  const exchange = await resolveHeadlessInstrument(ctx, symbol).then(({ exchange }) => canonicalExchange(exchange ?? ""))
+    .catch(logFailure("ticker-detail.headless", "Resolving the listing of a statements report failed", ""));
+  const halfYearly = reportsHalfYearly(exchange, financials.quarterlyStatements, financials.annualStatements);
+  if (hasRequestedStatements && !halfYearly) return null;
+  const years = `For its years: gloom fn FA ${symbol} --period annual${tab}`;
+  return halfYearly ? `${symbol} reports half-yearly, not quarterly. ${years}` : `${symbol}: No quarterly financial statement coverage. ${years}`;
+}
 
 /** The note that an offering filed after the latest balance sheet is not in its cash yet; a failed read leaves it out. */
 async function reportOfferingNote(
@@ -182,6 +502,18 @@ async function reportOfferingNote(
   return resolveHeadlessInstrument(ctx, symbol)
     .then((listing) => loadOfferingNote(ctx.apiClient, listing, periodEnd, ctx.signal))
     .catch(logFailure("ticker-detail.headless", "Reading the offering filings failed", null));
+}
+
+/** An HKEX company's latest period and its results announcement (exchangeResultsNotes); a failed read leaves them out. */
+async function reportExchangeResults(
+  ctx: Parameters<typeof financialStatementsHeadless.load>[1],
+  symbol: string,
+  financials: Awaited<ReturnType<typeof loadHeadlessFinancials>>,
+  dated: ReturnType<typeof filledPeriodPublications>,
+): Promise<string[]> {
+  return resolveHeadlessInstrument(ctx, symbol)
+    .then((listing) => loadExchangeResultsNotes(ctx.apiClient, listing, latestBalanceSheetDate(financials), dated))
+    .catch(logFailure("ticker-detail.headless", "Reading the HKEXnews results announcements failed", [] as string[]));
 }
 
 /** A ratio tab as a report: each ratio, then its inputs, per period. */
@@ -197,18 +529,24 @@ async function loadRatioReport(
   const history = oldest && tab.key === "valuation"
     ? await resolveHeadlessInstrument(ctx, symbol)
       .then(({ symbol: bare, exchange }) => loadPeriodEndHistory(ctx.marketData, bare, exchange ?? "", oldest))
-      .catch(() => null)
+      .catch(logFailure("ticker-detail.headless", "Load valuation price history failed", null))
     : null;
   const table = hasRequestedStatements ? ratioTableForFinancials(financials, tab, period, history) : null;
   const statementCurrency = financialStatementCurrency(financials, [
     ...financials.annualStatements, ...financials.quarterlyStatements,
   ]);
+  const yearEndMonth = fiscalYearEndMonth(financials.annualStatements);
   const dates = table?.periods.map(({ statement }) => ({
     date: statement.date,
+    // The fiscal period as the pane names it, and the day it ends.
+    period: financialColumnLabel(statement, period, yearEndMonth),
     periodEnd: ratioPeriodEnd(statement),
     currency: statement.currency ?? statementCurrency ?? null,
-    label: formatFinancialHeader(statement.date, statement.currency ?? statementCurrency, statement.dateSource, false, statement.aggregation?.periodEnd).trim(),
+    dateSource: statement.date === "TTM" ? "derived" : statement.dateSource ?? "provider",
+    label: financialReportHeader(statement, statement.currency ?? statementCurrency, period, yearEndMonth,
+      period === "quarterly" ? financials.quarterlyStatements : financials.annualStatements),
   })) ?? [];
+  const asOf = newestPeriodEnd(dates);
   const rows = table?.rows.map((row) => {
     const cells = table.cells.get(row.def.id)!.map((cell, index) => {
       const amount = row.kind === "ratio" ? cell.value : cell.inputs[row.index]!;
@@ -221,34 +559,45 @@ async function loadRatioReport(
           : formatRatioInput(row.def.inputs[row.index]!.format, amount, row.divisor),
       };
     });
+    const figure: FigureFormat = row.kind === "ratio" ? row.def.format : row.def.inputs[row.index]!.format;
+    const divisor = row.kind === "ratio" ? 1 : row.divisor;
     return {
       id: row.id, kind: row.kind, metric: row.kind === "ratio" ? row.label : row.unitLabel,
+      label: row.kind === "ratio" ? row.label : row.unitLabel.replace(/ \([a-z]+\)$/, ""),
+      // What the figures are in, which exports name in `currency_or_unit`, and the newest period they run to.
+      figure, divisor, unit: figureUnit(figure, statementCurrency ?? null, divisor), periodEnd: asOf,
       cells,
       ...Object.fromEntries(cells.map((cell) => [cell.date, cell.value])),
     };
   }) ?? [];
   const columns: HeadlessPaneColumn[] = [
     { key: "metric", header: "Ratio" },
-    ...dates.map(({ date, label }, index) => ({
-      key: date, header: label, align: "right" as const,
-      format: (_value: unknown, row: Record<string, unknown>) => (row.cells as Array<{ formatted: string }>)[index]!.formatted,
-    })),
+    ...dates.map(({ date, label }, index) => financialPeriodColumn(date, label, index, false)),
   ];
+  // An average with no opening balance sheet on file (the oldest column, a year after a missing one, TTM) says what it needs.
+  const needsOpening = rows.some((row) => row.cells.some((cell) => cell.gap === RATIO_GAP_TEXT["no-opening"]));
   // Liquidity's runway says how it counts months, and that the cash predates an offering since.
   const liquidity = tab.key === "liquidity" && table;
   const runwayShown = liquidity && table.ratios.some((def) => def.format === "months"
     && table.cells.get(def.id)!.some((cell) => typeof cell.value === "number"));
   const offering = liquidity ? await reportOfferingNote(ctx, symbol, financials) : null;
+  const periodDates = dates.map(({ date }) => date);
+  const missing = rows.length ? null : await missingPeriodsError(ctx, symbol, financials, period, hasRequestedStatements, tab.key);
   return {
     rows, columns, unavailableSymbols: rows.length ? [] : [symbol],
-    ...(!hasRequestedStatements ? { errors: [`${symbol}: No ${period} financial statement coverage.`] } : {}),
+    ...(missing ? { errors: [missing] } : {}),
     ...(tab.key === "valuation" && hasRequestedStatements && !history?.length ? { complete: false } : {}),
+    // Each exported row names its unit, the statements' period and the newest period end it runs to.
+    rowUnitKey: "unit", rowAsOfKey: "periodEnd", interval: period,
     notes: [
       ...[stalePeriodNote(dates.map(({ periodEnd }) => ({ date: periodEnd, lead: true })))].filter((note): note is string => !!note),
       ...[filledPeriodsNote(table?.periods.map(({ statement }) => statement) ?? [])].filter((note): note is string => !!note),
       ...offering ? [offering] : [],
       ...runwayShown ? [runwayMethod(reportsShortTermTotal([...financials.quarterlyStatements, ...financials.annualStatements]))] : [],
-      ...statementHistoryNotes(period, dates.map(({ date }) => date), symbol),
+      ...statementHistoryNotes(period, periodDates, symbol, await reportOlderStatements(ctx, symbol, period, periodDates)),
+      ...tab.key === "profitability" && rows.length ? PROFITABILITY_NOTES : [],
+      ...needsOpening ? [NEEDS_OPENING_NOTE] : [],
+      ...dateSourceNotes(dates),
     ],
     metadata: {
       symbol, name: financials.quote?.name ?? symbol, currency: statementCurrency ?? null,
@@ -260,74 +609,34 @@ async function loadRatioReport(
   };
 }
 
-function quoteAmount(value: unknown, row: Record<string, unknown>, signed = false): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
-  const currency = typeof row.currency === "string" && row.currency.trim() ? row.currency : undefined;
-  const base: MarketFormatOptions = { assetCategory: typeof row.instrumentType === "string" ? row.instrumentType : undefined,
-    priceBasis: row.priceBasis === "per-unit" || row.priceBasis === "percent-of-par" ? row.priceBasis : undefined };
-  // Par quotes keep two decimals; money pads to its currency's minor unit (none for JPY).
-  const options = base.priceBasis === "percent-of-par" ? { ...base, minimumFractionDigits: 2 } : withCurrencyMinorDigits(base, currency);
-  const amount = currency
-    ? formatMarketPriceWithCurrency(value, currency, options)
-    : formatMarketPrice(value, options);
-  return amount === "—" ? amount : `${signed && value >= 0 ? "+" : ""}${amount}`;
-}
-
-function percentCell(value: unknown): string {
-  return formatPercentRaw(typeof value === "number" && Number.isFinite(value) ? value : undefined);
-}
-
-const QUOTE_MONITOR_COLUMNS: HeadlessPaneColumn[] = [
-  { key: "symbol", header: "Ticker" },
-  { key: "name", header: "Name" },
-  { key: "price", header: "Last", align: "right", format: (value, row) => quoteAmount(value, row) },
-  { key: "change", header: "Change", align: "right", format: (value, row) => quoteAmount(value, row, true) },
-  { key: "changePercent", header: "Change %", align: "right", format: percentCell },
-];
-
-/** The pre-market, after-hours or overnight print and its move from the regular close, for the rows that have one. */
-function extendedSessionColumn(session: ExtendedSession): HeadlessPaneColumn {
-  return {
-    key: "extendedPrice", header: EXTENDED_SESSION_LABELS[session], align: "right",
-    format: (value, row) => row.extendedSession === session
-      ? `${quoteAmount(value, row)} ${percentCell(row.extendedChangePercent)}`
-      : "—",
-  };
-}
-
 export const quoteComparisonHeadless: HeadlessPaneDefinition<"rows"> = {
   ...paneSchemas["quote-monitor-pane"],
   shape: "rows",
   description: "Current quotes for one or more tickers: name, the regular session's last price, change and percent change, and any pre-market or after-hours print.",
   describe: ({ symbols }) => `Quote Monitor | ${symbols.join(", ")}`,
-  columns: QUOTE_MONITOR_COLUMNS,
+  columns: QUOTE_MONITOR_BASE_COLUMNS,
+  // A board across markets (Hong Kong beside New York) dates each market's session and says when each opens.
+  freshness: { datesEachVenue: true },
   async load({ symbols }, ctx) {
     const loaded = await loadHeadlessSymbols(symbols, ctx, async (key) => {
       const { symbol, exchange } = await resolveHeadlessInstrument(ctx, key);
-      const quote = await ctx.marketData.getQuote(symbol, exchange);
+      // Each move is printed with the close it is from, so the close is checked against its date first.
+      const quote = await ctx.marketData.getQuote(symbol, exchange, { datesChangeBasis: true });
       if (!quote) throw new Error(`Quote is unavailable for ${key}`);
       if (!hasValidQuoteObservationTime(quote)) throw new Error(`Quote observation time is unavailable for ${key}`);
       return quote;
     });
-    const rows = loaded.entries.map(({ symbol, data: quote }) => {
-      // As the pane's cards show them: the regular session, then any extended print from its close.
-      const { price, change, changePercent, ...extended } = getQuoteSessionFields(quote);
-      return {
-        symbol, name: quote.name ?? "", price, currency: quote.currency,
-        ...(quote.instrumentType ? { instrumentType: quote.instrumentType } : {}),
-        ...(quote.priceBasis ? { priceBasis: quote.priceBasis } : {}),
-        change, changePercent, ...extended,
-        marketCap: quote.marketCap ?? null, updatedAt: quoteHeadlineTime(quote),
-        ...quoteFreshnessFields(quote),
-      };
-    });
-    // An extended column only when a row has a print for it, so a closed board stays as narrow as before.
-    const extendedColumns = (["PRE", "POST", "OVERNIGHT"] as const)
-      .filter((session) => rows.some((row) => row.extendedSession === session))
-      .map(extendedSessionColumn);
+    const now = Date.now();
+    // A broker's quote names the broker as its source.
+    const brokerName = (providerId: string) => ctx.resolveBroker?.(providerId)?.name;
+    const rows = loaded.entries.map(({ symbol, data: quote }) => quoteMonitorRow(symbol, quote, now, brokerName));
+    const columns = quoteMonitorColumns(rows);
     return {
       rows,
-      ...(extendedColumns.length > 0 ? { columns: [...QUOTE_MONITOR_COLUMNS, ...extendedColumns] } : {}),
+      // An extended column or Chg bp only when a row has one, so a closed board stays as narrow as before.
+      ...(columns.length > QUOTE_MONITOR_BASE_COLUMNS.length ? { columns } : {}),
+      // Each exported row names its ticker, its unit, its source and when its own price was observed.
+      ...QUOTE_MONITOR_ROW_KEYS,
       unavailableSymbols: loaded.unavailableSymbols, errors: loaded.errors,
     };
   },
@@ -339,12 +648,16 @@ export const quoteComparisonHeadless: HeadlessPaneDefinition<"rows"> = {
  * report declares before it has bars keep every digit the source sent. A bar without
  * volume in a history that reports it (`volumeMissing`) prints it as missing, never as 0.
  */
-const historyPriceColumns = (volumeMissing: boolean, decimals?: number): HeadlessPaneColumn[] => ["open", "high", "low", "close", "volume"].map((key) => ({
+const historyPriceColumns = (volumeMissing: boolean, decimals?: number, pence?: (close: number) => string | null): HeadlessPaneColumn[] => ["open", "high", "low", "close", "volume"].map((key) => ({
   key, header: key, align: "right" as const,
-  format: (value: unknown) => value == null || !Number.isFinite(Number(value)) ? key === "volume" && volumeMissing ? MISSING_VOLUME_TEXT : "-"
-    : key === "volume" ? formatNumber(Number(value), 0)
-    : decimals == null ? formatPriceObservation(Number(value), { minimumFractionDigits: 2 })
-    : formatBarPrice(Number(value), decimals),
+  format: (value: unknown) => {
+    if (value == null || !Number.isFinite(Number(value))) return key === "volume" && volumeMissing ? MISSING_VOLUME_TEXT : MISSING_VALUE;
+    if (key === "volume") return formatNumber(Number(value), 0);
+    if (decimals == null) return formatPriceObservation(Number(value), { minimumFractionDigits: 2 });
+    // A London line's close also reads in pence, as the pane's close notes it: 6.385 638.5p.
+    const note = key === "close" ? pence?.(Number(value)) : null;
+    return `${formatBarPrice(Number(value), decimals)}${note ? ` ${note}` : ""}`;
+  },
 }));
 
 /**
@@ -353,7 +666,16 @@ const historyPriceColumns = (volumeMissing: boolean, decimals?: number): Headles
  * whose period runs on (`2026-10 MTD`); the export keeps each bar's own date
  * and adds a `Partial` column when one is.
  */
-function historyColumns(size: HistoryBarSize, partial: boolean, text: boolean, volumeMissing = false, decimals?: number): HeadlessPaneColumn[] {
+function historyColumns(
+  size: HistoryBarSize,
+  partial: boolean,
+  text: boolean,
+  volumeMissing = false,
+  decimals?: number,
+  pence?: (close: number) => string | null,
+  /** A bar is flagged (`high<close`, `low<close/2`): the Flag column says how, as `history`'s does. */
+  flagged = false,
+): HeadlessPaneColumn[] {
   const daily = isDailyOrLongerBar(size);
   const date: HeadlessPaneColumn = {
     key: "date",
@@ -365,12 +687,14 @@ function historyColumns(size: HistoryBarSize, partial: boolean, text: boolean, v
   const marked: HeadlessPaneColumn[] = partial && !text
     ? [{ key: "partial", header: "Partial", format: (value) => value === true ? "true" : "" }]
     : [];
-  return [date, ...historyPriceColumns(volumeMissing, decimals), ...marked];
+  const flag: HeadlessPaneColumn[] = flagged ? [{ key: "flag", header: "Flag", format: (value) => typeof value === "string" ? value : "" }] : [];
+  return [date, ...historyPriceColumns(volumeMissing, decimals, text ? pence : undefined), ...flag, ...marked];
 }
 
 export const historicalPricesHeadless: HeadlessPaneDefinition<"rows"> = {
   ...paneSchemas["historical-prices-pane"],
   shape: "rows",
+  currencyPairs: true,
   description: "OHLCV bars (date, open, high, low, close, volume) for one ticker over a range: daily to start, weekly for 5Y and monthly for ALL. The newest bar is marked partial while its day, week or month runs on; a day's bar then comes from the live quote.",
   describe: ({ symbols, options }) => `Historical Prices | ${symbols[0]} | ${reportWindowText(options) ?? options.range ?? HISTORY_DEFAULT_RANGE}`,
   columns: historyColumns("1d", false, false),
@@ -386,28 +710,37 @@ export const historicalPricesHeadless: HeadlessPaneDefinition<"rows"> = {
       window ? loadPriceWindowHistory(ctx.marketData, listing, exchange ?? "", window).then((result) => result.points)
         : loadHeadlessPriceHistory(ctx, symbol, range),
       pastWindow || (!window && isIntradayResolution(RANGE_HISTORY_RESOLUTION[range])) ? null
-        : ctx.marketData.getQuote(listing, exchange ?? "").catch(() => null),
+        : ctx.marketData.getQuote(listing, exchange ?? "").catch(logFailure("ticker-detail.headless", "Load historical prices quote failed", null)),
     ]);
     // The venue whose sessions say whether a day, week or month is still running: the key's, or for a bare symbol its quote's.
     const venue = exchange || quote?.listingExchangeName || quote?.exchangeName || undefined;
     const now = Date.now();
-    const points = withSessionBar(loaded, quote, { now, venue });
-    // Providers serve float32 prices (4013.39990234 for 4013.4): the rows hold the decimal each is, as `history` does.
-    const clean = (value: number | null) => value == null ? null : cleanFloat32Price(value);
+    // The bars the range or window asks for: a thin listing's daily bars a week or two apart are still daily.
+    const requested = window ? priceWindowInterval(window) : RANGE_HISTORY_RESOLUTION[range];
+    const points = withSessionBar(loaded, quote, { now, venue, ...requestedSessionBarSize(loaded, requested) });
+    // Providers serve float32 prices (4013.39990234 for 4013.4): the rows hold the decimal each is, as `history` does,
+    // a London line's cleaned in the pence it was priced in.
+    const priceDivisor = quotedPriceDivisor(quote);
+    const clean = (value: number | null) => value == null ? null : cleanBarPrice(value, priceDivisor);
+    // A monthly bar whose prices contradict each other keeps its close, flagged, as `history` keeps it.
+    const monthly = historyBarSize(points.map((point) => new Date(point.date).getTime()), requested) === "1mo";
     const rows = points.map((point) => {
       const date = new Date(point.date);
-      const values = pricePointValues(point);
+      const values = historyBarValues(point, monthly);
+      const flags = historyBarFlags(point);
       return {
         date: Number.isFinite(date.getTime()) ? date.toISOString() : String(point.date),
-        open: clean(values.open), high: clean(values.high), low: clean(values.low), close: clean(values.close), volume: values.volume,
+        open: clean(values.open), high: clean(values.high), low: clean(values.low), close: clean(values.close),
+        volume: indexBarVolume(values.volume, quote?.instrumentType),
+        ...(flags.length ? { flag: flags.join(",") } : {}),
         ...(values.integrity ? { integrity: values.integrity } : {}),
         ...(point.partial ? { partial: true } : {}),
         // A coin's day Gloom Cloud rebuilt from hourly bars has no volume of its own, as `history` marks it.
         ...(point.filled ? { filled: true } : {}),
       };
     }).sort((left, right) => left.date.localeCompare(right.date));
-    const notice = priceHistoryIntegrityNotice(rows.filter((row) => row.integrity).length);
-    const size = historyBarSize(rows.map((row) => Date.parse(row.date)));
+    const notice = priceTableIntegrityNotice(rows);
+    const size = historyBarSize(rows.map((row) => Date.parse(row.date)), requested);
     // A weekly or monthly bar whose period runs on is dated by how far it runs, as `history` dates it.
     const forming = formingHistoryBar(size, rows.at(-1)?.date, venue, now);
     // A complete one is dated by the day its last session closed, the day its close is from.
@@ -417,7 +750,7 @@ export const historicalPricesHeadless: HeadlessPaneDefinition<"rows"> = {
       && quote.lastUpdated >= Date.parse(`${rows.at(-1)!.date.slice(0, 10)}T00:00:00Z`) ? new Date(quote.lastUpdated).toISOString() : null;
     const shown = forming ? [...rows.slice(0, -1), { ...rows.at(-1)!, partial: true }] : rows;
     // One decimal count for the table, by the instrument's display rules when the quote names its kind.
-    const decimals = barPriceDecimals(rows, quoteFormatOptions(quote).assetCategory);
+    const decimals = barPriceDecimals(rows, quoteFormatOptions(quote).assetCategory, priceDivisor);
     const marked = shown.some((row) => row.partial === true);
     const volumeMissing = missingVolumeCount(shown);
     const volumeNote = missingVolumeNotice(volumeMissing, shown.length);
@@ -435,21 +768,34 @@ export const historicalPricesHeadless: HeadlessPaneDefinition<"rows"> = {
       ...(forming ? { periodToDate: forming } : closedDay ? { asOf: closedDay } : quotedAt ? { asOf: quotedAt } : {}),
       ...(dayToDate ? { basis: "daily bars", note: `the newest bar is ${DAY_SO_FAR_TEXT}`, ...(quote ? { asOf: new Date(quote.lastUpdated).toISOString() } : {}) } : {}),
     };
-    // The largest fall from a close to a later one in the bars shown, said under the title.
-    const drawdown = maxDrawdown(shown);
-    const drawdownLine = drawdown ? maxDrawdownText(drawdown, { basis: `${historyBarSizeWord(size)} closes`, price: (value) => formatBarPrice(value, decimals),
-      date: (value) => isDailyOrLongerBar(size) ? value.slice(0, 10) : formatUtcTime(value) }) : null;
-    const reportNotices = [drawdownLine, notice].filter((line): line is string => line != null);
+    // The largest fall from a close to a later one in the bars shown, said under the title; a yield's in bp, with its largest rise.
+    // A week's or month's close is dated by its last session, not the 1st its bar is dated by.
+    const closes = shown.map((row) => ({ date: isDailyOrLongerBar(size) ? barCloseSession(size, row.date, venue, now) : row.date, close: row.close }));
+    // A window's last week can close after the dates asked for: the fall is measured to its end.
+    const { drawdown, runUp, lines: moveLines } = closeMoves(closes, drawdownScaleOf(symbol), { basis: `${historyBarSizeWord(size)} closes`,
+      price: (value) => formatBarPrice(value, decimals), date: (value) => isDailyOrLongerBar(size) ? value.slice(0, 10) : formatUtcTime(value) }, window?.to);
+    // A wick left out of the range is said, though the bar's close still counts.
+    const wickNotice = priceHistoryWickNotice(points.filter((point) => pricePointWickFlags(point).length > 0).length);
+    // As are bars the source served in the wrong unit, shown scaled back.
+    const openNotice = priceHistoryOpenNotice(points.filter(pricePointOpenWithheld).length);
+    const reportNotices = [...moveLines, notice, openNotice, wickNotice, priceHistoryRescaleNotice(points)].filter((line): line is string => line != null);
+    const flagged = rows.some((row) => row.flag);
+    // Every exported bar names what it is priced in and its size, as `history --csv` does.
+    const unit = await barPriceUnit(ctx, symbol, listing, exchange, quote);
+    const barInterval = size === "intraday" ? isIntradayResolution(requested) ? requested : null : size;
     return {
       rows: shown,
-      columns: historyColumns(size, marked, false, false, decimals),
-      textColumns: historyColumns(size, marked, true, volumeMissing > 0, decimals),
+      ...(unit ? { unit } : {}),
+      ...(barInterval ? { interval: barInterval } : {}),
+      columns: historyColumns(size, marked, false, false, decimals, undefined, flagged),
+      textColumns: historyColumns(size, marked, true, volumeMissing > 0, decimals,
+        (close) => penceFigure(Number(close.toFixed(Math.min(20, decimals))), quote, decimals), flagged),
       freshness,
       ...(notes.length > 0 ? { notes } : {}),
       ...(notice ? { complete: false } : {}),
       unavailableSymbols: rows.some((row) => row.close !== null) ? [] : [symbol],
       metadata: { symbol, range: window ? null : range, ...(window ? { requestedWindow: window } : {}), ...(size === "intraday" ? {} : { interval: size }),
-        ...(allStart ? { sourceStart: allStart } : {}), maxDrawdown: drawdown,
+        ...(allStart ? { sourceStart: allStart } : {}), maxDrawdown: drawdown, ...(runUp ? { maxRunUp: runUp } : {}),
         ...(reportNotices.length ? { notices: reportNotices } : {}) },
     };
   },
@@ -457,7 +803,7 @@ export const historicalPricesHeadless: HeadlessPaneDefinition<"rows"> = {
 
 /** A percent with its sign, two decimals: `+0.63%`; a dash for a gap. */
 function signedPercentCell(value: unknown): string {
-  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  if (typeof value !== "number" || !Number.isFinite(value)) return MISSING_VALUE;
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
@@ -465,16 +811,18 @@ export const returnsHeadless: HeadlessPaneDefinition<"rows"> = {
   ...paneSchemas["returns-pane"],
   shape: "rows",
   description: "Interval and cumulative price returns of one ticker's bars over a range: each bar's close, its move from the bar before, and its move from the bar before the window.",
-  describe: ({ symbols, options }) => `Returns | ${symbols[0]} | ${reportWindowText(options) ?? options.range ?? "5D"} | ${options.interval ?? "1h"}`,
+  describe: ({ symbols, options }) => `Returns | ${symbols[0]} | ${reportWindowText(options) ?? options.range ?? "5D"} | ${
+    options.interval ?? defaultReturnInterval((options.range ?? "5D") as ReturnRange, readReportWindow(options))}`,
   async load({ symbols, options }, ctx) {
     const key = symbols[0]!;
     const { symbol, exchange } = await resolveHeadlessInstrument(ctx, key);
     const range = (options.range ?? "5D") as ReturnRange;
-    const requested = (options.interval ?? "1h") as ManualChartResolution;
     // --from 2007 --to 2009 measures those dates' returns in place of the range.
     const window = readReportWindow(options);
+    // No --interval: the bars grow with the range, daily to 1Y.
+    const requested = (options.interval ?? defaultReturnInterval(range, window)) as ManualChartResolution;
     const pastWindow = !!window && isPastPriceWindow(window);
-    const support = await Promise.resolve(ctx.marketData.getChartResolutionSupport?.(symbol, exchange ?? "") ?? []).catch(() => []);
+    const support = await Promise.resolve(ctx.marketData.getChartResolutionSupport?.(symbol, exchange ?? "") ?? []).catch(logFailure("ticker-detail.headless", "Read return interval support failed", []));
     const now = Date.now();
     const series = await loadReturnSeries(ctx.marketData, {
       symbol, exchange: exchange ?? "", range, resolution: requested, support, now, forceRefresh: ctx.refresh, window,
@@ -505,11 +853,13 @@ export const returnsHeadless: HeadlessPaneDefinition<"rows"> = {
     // Today's daily bar is the session still trading, not a close: marked partial (DTD), as `history` marks it.
     const dayToDate = isTodayReturnRow(returns.at(-1), series.resolution, venue, now);
     const rows = forming || dayToDate ? [...unmarked.slice(0, -1), { ...unmarked.at(-1)!, partial: true }] : unmarked;
-    const price = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value.toFixed(decimals) : "-";
-    // The largest fall from a close to a later one in the window, said under the title.
-    const drawdown = maxDrawdown(unmarked.map((row) => ({ date: row.time, close: row.close })));
-    const maxDrawdownLine = drawdown ? maxDrawdownText(drawdown, { basis: `${BAR_INTERVAL_LABELS[series.resolution]} closes`, price,
-      date: (value) => intraday ? formatUtcTime(value) : value.slice(0, 10) }) : null;
+    const price = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? value.toFixed(decimals) : MISSING_VALUE;
+    // The largest fall from a close to a later one in the window, said under the title; a yield's in bp, with its largest rise.
+    // A week's or month's close is dated by its last session, not the 1st its bar is dated by ("peak 35.70 on 2026-03-31").
+    const closes = unmarked.map((row) => ({ date: intraday ? row.time : barCloseSession(series.resolution, row.time, venue, now), close: row.close }));
+    // A week still forming runs to today, and a window's last week can close after the dates asked for: the fall is measured to their end.
+    const { drawdown, runUp, lines: moveLines } = closeMoves(closes, drawdownScaleOf(symbol),
+      { basis: `${BAR_INTERVAL_LABELS[series.resolution]} closes`, price, date: (value) => intraday ? formatUtcTime(value) : value.slice(0, 10) }, window?.to);
     const figures: HeadlessPaneColumn[] = [
       { key: "close", header: "Price", align: "right", format: price },
       { key: "intervalChange", header: "Int $", align: "right", format: price },
@@ -530,10 +880,15 @@ export const returnsHeadless: HeadlessPaneDefinition<"rows"> = {
       ...figures,
       ...forming || dayToDate ? [{ key: "partial", header: "Partial", format: (value: unknown) => value === true ? "true" : "" }] : [],
     ];
-    const textColumns: HeadlessPaneColumn[] = [timeColumn(true), ...figures];
+    // A narrow table drops the dollar moves, the interval's first, rather than putting Total % on a line under every row.
+    const textFigures = figures.map((column) => column.key === "intervalChange" ? { ...column, optional: true, dropPriority: 2 }
+      : column.key === "totalChange" ? { ...column, optional: true, dropPriority: 1 } : column);
+    const textColumns: HeadlessPaneColumn[] = [timeColumn(true), ...textFigures];
+    // Every exported row names what its prices are in and the bars' size, as `history --csv` does.
+    const unit = rows.length ? await barPriceUnit(ctx, key, symbol, exchange, null) : null;
     // An interval the range is too long for is served in the nearest longer bar; say so rather than switch silently.
     const notices = [
-      maxDrawdownLine,
+      ...moveLines,
       baseDay ? `Totals ${periodBaseText(baseDay, now)}.` : null,
       series.resolution !== requested
         ? `${getChartResolutionLabel(requested)} bars do not ${window ? `cover ${priceWindowText(window)}` : `reach back ${range}`}; these are ${getChartResolutionLabel(series.resolution)} bars.`
@@ -545,6 +900,8 @@ export const returnsHeadless: HeadlessPaneDefinition<"rows"> = {
       rows,
       columns,
       textColumns,
+      ...(unit ? { unit } : {}),
+      interval: series.resolution,
       unavailableSymbols: rows.length ? [] : [key],
       ...(rows.length ? {} : { errors: [`${key}: No bars in this window.`] }),
       freshness: pastWindow ? pastWindowFreshness(window, series.resolution, "time") : {
@@ -553,8 +910,12 @@ export const returnsHeadless: HeadlessPaneDefinition<"rows"> = {
         oldest: null,
         ...(forming ? { periodToDate: forming } : closedDay ? { asOf: closedDay } : {}),
         ...(series.venue ? { cadenceExchange: series.venue } : {}),
-        // The window ends at the last session while the market is shut, which the status line says.
-        ...(series.lastSession ? { note: closedMarketNote(series.lastSession, series.visibleTo) } : {}),
+        // The window ends at the last session while the market is shut, which the status line says, and whether its
+        // last bar ends on the official close yet.
+        ...(series.lastSession || series.closingPrintPending ? { note: [
+          series.lastSession ? closedMarketNote(series.lastSession, series.visibleTo) : null,
+          series.closingPrintPending ? CLOSING_PRINT_PENDING_TEXT : null,
+        ].filter(Boolean).join(", ") } : {}),
         ...(dayToDate ? { basis: "daily bars", note: `the newest bar is ${DAY_SO_FAR_TEXT}` } : {}),
       },
       metadata: {
@@ -569,8 +930,12 @@ export const returnsHeadless: HeadlessPaneDefinition<"rows"> = {
         ...(series.lastSession ? { marketClosed: true, lastSession: series.lastSession } : {}),
         basis: "Price returns of bar closes; dividends are not included",
         maxDrawdown: drawdown,
+        ...(runUp ? { maxRunUp: runUp } : {}),
         ...(notices.length ? { notices } : {}),
       },
     };
   },
 };
+
+/** A Cboe yield index (^TNX) moves by its level, in bp; anything else by its return. */
+const drawdownScaleOf = (symbol: string) => isYieldIndexSymbol(parsePublicTickerKey(symbol).symbol) ? "yield" as const : "return" as const;

@@ -28,8 +28,8 @@ function riskHistory(): PricePoint[] {
   return Array.from({ length: 21 }, (_, index) => ({ date: new Date(Date.UTC(2026, 7, 21 + index)), close: 740 + index + index % 2 }));
 }
 
-// A reported SPY bar whose open lies above its high.
-const rejectedSpy = { date: new Date("2026-09-10"), open: 764.08, high: 758.555, low: 757.57, close: 758.15, volume: 3461376 };
+// A SPY bar whose open and close lie above its high: an open alone would only be withheld.
+const rejectedSpy = { date: new Date("2026-09-10"), open: 764.08, high: 758.555, low: 757.57, close: 759.9, volume: 3461376 };
 
 test("a rejected benchmark suppresses beta while the independent basket Sharpe remains available", () => {
   const request = buildPortfolioChartTargets([riskTicker("SPY")])[0]!.request!;
@@ -37,10 +37,10 @@ test("a rejected benchmark suppresses beta while the independent basket Sharpe r
   const entries = new Map([[buildChartKey(request), { data: history }]]);
   const result = buildBenchmarkReturnSeries(request, entries);
   expect(result.returns).toEqual([]);
-  expect(result.integrity?.sourcePoints[0]).toMatchObject({ open: 764.08, high: 758.555, close: 758.15 });
+  expect(result.integrity?.sourcePoints[0]).toMatchObject({ open: 764.08, high: 758.555, close: 759.9 });
   const rows = buildAnalyticsRiskRows({ sharpe: 1.75, beta: 1.2, benchmarkIntegrity: result.integrity });
   expect(rows[0]?.value).toBe("1.75");
-  expect(rows[1]).toMatchObject({ value: "—", detail: "SPY benchmark: inconsistent OHLC history" });
+  expect(rows[1]).toMatchObject({ value: "—", detail: "SPY benchmark: contradictory prices in its history" });
   entries.set(buildChartKey(request), { data: riskHistory() });
   expect(buildBenchmarkReturnSeries(request, entries)).toMatchObject({ integrity: null });
   expect(buildBenchmarkReturnSeries(request, entries).returns).toHaveLength(20);
@@ -58,7 +58,7 @@ test("a corrupt holding cannot be silently dropped from estimated portfolio risk
   expect(result).toMatchObject({ returns: null, coverage: 0.5, missingCount: 1 });
   expect(result.historyIntegrity[0]).toMatchObject({ symbol: "SPY", integrity: { sourcePoints: [{ ...rejectedSpy, date: "2026-09-10T00:00:00.000Z" }] } });
   const rows = buildAnalyticsRiskRows({ ...result, sharpe: 2, beta: 1 });
-  expect(rows.every((row) => row.value === "—" && row.detail === "Inconsistent OHLC history: SPY")).toBe(true);
+  expect(rows.every((row) => row.value === "—" && row.detail === "Contradictory prices in the history: SPY")).toBe(true);
   chartEntries.set(buildChartKey(targets[0]!.request!), { data: riskHistory() });
   expect(buildPortfolioReturnSeries(input).returns).toHaveLength(20);
   expect(buildPortfolioReturnSeries(input).historyIntegrity).toEqual([]);
@@ -85,13 +85,13 @@ test("converts every account balance while keeping leverage independent of displ
   expect(rows(1).get("margin-leverage")).toBe("1.5x");
   const converted = rows(1.2);
   expect(converted.get("margin-leverage")).toBe("1.5x");
-  expect(converted.get("net-liquidation")).toBe("120.0k");
-  expect(converted.get("total-value")).toBe("180.0k");
-  expect(converted.get("cash")).toBe("-60.0k");
-  expect(converted.get("settled-cash")).toBe("-48.0k");
-  expect(converted.get("available-funds")).toBe("36.0k");
-  expect(converted.get("excess-liquidity")).toBe("24.0k");
-  expect(converted.get("buying-power")).toBe("72.0k");
+  expect(converted.get("net-liquidation")).toBe("120,000");
+  expect(converted.get("total-value")).toBe("180,000");
+  expect(converted.get("cash")).toBe("-60,000");
+  expect(converted.get("settled-cash")).toBe("-48,000");
+  expect(converted.get("available-funds")).toBe("36,000");
+  expect(converted.get("excess-liquidity")).toBe("24,000");
+  expect(converted.get("buying-power")).toBe("72,000");
 
   accountState.account.netLiquidation = 0;
   expect(rows(1).has("margin-leverage")).toBe(false);
@@ -109,16 +109,16 @@ describe("a margin account's summary", () => {
 
   test("states the equity, the gross and the leverage between them", () => {
     const summary = rows(createMarginAccount());
-    expect(summary.get("net-liquidation")).toBe("Net Liq 1.00M");
-    expect(summary.get("total-value")).toBe("Gross 1.60M");
+    expect(summary.get("net-liquidation")).toBe("Net Liq 1,000,000");
+    expect(summary.get("total-value")).toBe("Gross 1,600,000");
     expect(summary.get("margin-leverage")).toBe("Margin Lev 1.6x");
-    expect(summary.get("cash")).toBe("Cash -600.0k");
+    expect(summary.get("cash")).toBe("Cash -600,000");
   });
 
   test("without its account the gross is never shown as the value", () => {
     const summary = rows(null);
     expect(summary.get("net-liquidation")).toBe("Net Liq —");
-    expect(summary.get("total-value")).toBe("Gross 1.60M");
+    expect(summary.get("total-value")).toBe("Gross 1,600,000");
   });
 });
 

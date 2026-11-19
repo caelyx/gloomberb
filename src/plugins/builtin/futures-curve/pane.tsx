@@ -10,14 +10,15 @@ import { usePaneInstance, usePaneTitle } from "../../../state/app/context";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
 import { Box, type InputRenderable } from "../../../ui";
-import { formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentRaw } from "../../../utils/format";
 import { nextHeaderSort, type SortDirection } from "../../../utils/sort-values";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { futuresSessionRefreshInterval } from "../shared/futures-session";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
 import { useQuoteBoard } from "../shared/use-quote-board";
-import { getCachedFuturesCurve, loadCurveSpotBars, loadFuturesCurve, loadFuturesCurveAsOf } from "./client";
-import { BASIS_CONVENTION, basisSpotSymbol, blankBasisNote, curveAsOfDate, curveAxisPrice, curveBasisPercent, curveBasisRows, curveChangeText, curveContractChanges, curveContractCode, curvePrice, curveRank, curveSpot, curveSpotLabel, curveSpotSource, curveSpreadBasis, curveSpreadLabel, curveTimestamp, curveTitle, curveUnitLabel, DEFAULT_CURVE_HORIZON, futuresCurveSeries, newestQuote, noTradeChangeNote, normalizeCurveRoot, paneCurveRoot, shortDatedBasis, shortDatedBasisNote, sortCurveContracts, thinSpreadNotice, unsupportedCurveRootMessage, type CurveContractChanges, type CurveSpot } from "./model";
+import { useRemoteUiNode } from "../../../remote/semantic-tree";
+import { getCachedFuturesCurve, loadCurveSpotBars, loadCurveSpotCloses, loadFuturesCurve, loadFuturesCurveAsOf } from "./client";
+import { curveFreshnessObservations, curveReportFreshness, BASIS_CONVENTION, basisSpotSymbol, blankBasisNote, curveAsOfDate, curveAxisGrid, curveAxisPrice, curveBasisPercent, curveBasisRows, curveCache, curveChangeText, curveContractChanges, curveContractCode, curvePrice, curveRank, curveSessionNote, curveSettleShown, curveSpot, curveSpotBars, curveSpotLabel, curveSpotPremium, curveSpotSource, curveSpreadBasis, curveSpreadLabel, curveTimestamp, curveStandIn, curveTitle, curveUnitLabel, DEFAULT_CURVE_HORIZON, futuresCurveSeries, newestQuote, noTradeChangeNote, normalizeCurveRoot, paneCurveRoot, shortDatedBasis, shortDatedBasisNote, skippedSpreadNotice, sortCurveContracts, spotIndexSymbol, thinSpreadNotice, unsupportedCurveRootMessage, type CurveContractChanges, type CurveSpot } from "./model";
 
 const TABS = [{ value: "curve", label: "Curve" }, { value: "contracts", label: "Contracts" }];
 // One column order for every root. SETTLE is the exchange settlement for the
@@ -66,8 +67,8 @@ const SHORT_DATED_DROP_ORDER = BASIS_DROP_ORDER.filter((id) => id !== "vsSpot");
 const NO_SYMBOLS: string[] = [];
 /** The spot's age is judged against the clock, so a quote that stops moving still goes stale on screen. */
 const SPOT_CLOCK_MS = 30_000;
-const signedPercent = (value: number | null) => value == null ? "--" : formatPercentRaw(value);
-const integer = (value: number | null) => value == null ? "--" : value.toLocaleString("en-US");
+const signedPercent = (value: number | null) => value == null ? MISSING_VALUE : formatPercentRaw(value);
+const integer = (value: number | null) => value == null ? MISSING_VALUE : value.toLocaleString("en-US");
 const contractKey = (row: FuturesContract) => row.symbol;
 // Left and Right step along the expiries, the way the curve reads.
 const contractDate = (row: FuturesContract) => new Date(row.expiration);
@@ -87,14 +88,16 @@ function spotSegment(spot: CurveSpot, root: string, clock: number): PaneFooterSe
 export function FuturesCurvePane(props: PaneProps) {
   const pane = usePaneInstance();
   const requested = paneCurveRoot(pane);
-  const root = normalizeCurveRoot(requested);
+  // ICE's Brent (B) opens CME's BZ, saying so.
+  const standIn = normalizeCurveRoot(requested) ? null : curveStandIn(requested);
+  const root = normalizeCurveRoot(requested) ?? standIn?.root ?? null;
   // Inside the Commodities & Energy workspace the workspace titles the window, by the tab it shows.
   const ownsTitle = pane?.paneId === "futures-curve";
-  return root ? <FuturesCurveView key={root} {...props} root={root} ownsTitle={ownsTitle} />
+  return root ? <FuturesCurveView key={root} {...props} root={root} ownsTitle={ownsTitle} standInNote={standIn?.note ?? null} />
     : <PaneStatusBody error={unsupportedCurveRootMessage(requested)} subject="futures curve" />;
 }
 
-function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps & { root: string; ownsTitle: boolean }) {
+function FuturesCurveView({ width, height, focused, root, ownsTitle, standInNote }: PaneProps & { root: string; ownsTitle: boolean; standInNote: string | null }) {
   const colors = useThemeColors();
   const session = useResearchCloudSession();
   // A past date shows the curve as the settlement archive held it that day.
@@ -140,18 +143,25 @@ function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps
     ? (force: boolean) => loadCurveSpotBars(spotSymbol, assetData, force) : null,
   [assetData, basisActive, spotSymbol, resource.updatedAt]);
   const spotBars = useAsyncResource(barsLoader, { keepPreviousData: true });
+  // VX reads its front settlement against spot VIX's close on the same session, re-read whenever the curve is.
+  const indexSymbol = requestedDate ? null : spotIndexSymbol(root);
+  const closesLoader = useMemo(() => indexSymbol && assetData
+    ? (force: boolean) => loadCurveSpotCloses(indexSymbol, assetData, force) : null,
+  [assetData, indexSymbol, resource.updatedAt]);
+  const spotCloses = useAsyncResource(closesLoader, { keepPreviousData: true });
   // Until the first answer there is nothing to say: no reason, only blank cells.
   const spot = useMemo(() => !basisActive || !spotSymbol || !spotState || spotState.loading && !spotState.quote ? null
     : curveSpot(spotSymbol, spotState.quote, clock), [basisActive, clock, spotState, spotSymbol]);
   const staleCount = data?.contracts.filter((row) => row.stale).length ?? 0;
   const newest = data ? newestQuote(data.contracts) : null;
   // A past curve is named by the session it holds: a weekend or holiday date shows the session before it.
-  const curves = useMemo(() => data ? futuresCurveSeries(data, { current: colors.positive, ghosts: curveGhostColors(colors) }, horizon,
+  const curves = useMemo(() => data ? futuresCurveSeries(data, { current: colors.positive, settle: colors.text, ghosts: curveGhostColors(colors) }, horizon,
     requestedDate ? Date.parse(`${requestedDate}T00:00:00Z`) : Date.now(), requestedDate ? data.asOf ?? requestedDate : undefined) : [],
   [data, colors, horizon, requestedDate]);
   const changes = useMemo<CurveContractChanges>(() => data ? curveContractChanges(data) : new Map(), [data]);
   // Until the bars first answer there is nothing to say: no reason, only blank cells.
-  const bars = basisActive ? spotBars.data : null;
+  // The server's spot in each print's own minute fills what the bars a delayed reader gets do not reach yet.
+  const bars = useMemo(() => basisActive ? curveSpotBars(spotBars.data ?? null, data?.contracts ?? []) : null, [basisActive, spotBars.data, data]);
   const basis = useMemo(() => curveBasisRows(basisActive ? data?.contracts ?? [] : [], bars), [basisActive, bars, data]);
   const rows = useMemo(() => sortCurveContracts(data?.contracts ?? [], sort.columnId, sort.direction, changes, basis), [data, sort, changes, basis]);
   // The curve tab lists the contracts the chart plots; Contracts keeps every one.
@@ -171,13 +181,24 @@ function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps
   const thin = data?.slope.state === "thin";
   const spreadRank = data && !thin ? curveRank(data.slope.percentile, data.slope.samples) : null;
   const thinSpread = data ? thinSpreadNotice(data) : null;
+  const skippedSpread = data ? skippedSpreadNotice(data) : null;
+  // Until the closes first answer there is nothing to say.
+  const spotPremium = useMemo(() => data && indexSymbol && spotCloses.data ? curveSpotPremium(data, spotCloses.data) : null,
+    [data, indexSymbol, spotCloses.data]);
   const statItems: StatItem[] = data ? [
     { id: "roll", label: "Ann. roll yield", value: signedPercent(data.slope.annualizedRollYield),
       ...thin ? { tone: "warning" as const } : { detail: curveRank(data.slope.rollPercentile, data.slope.samples) } },
     // Named by the contracts it subtracts: the front is the first month the market trades, not always the first row.
-    { id: "spread", label: curveSpreadLabel(data.slope), value: data.slope.value == null ? "--" : curvePrice(data.slope.value, root),
+    { id: "spread", label: curveSpreadLabel(data.slope), value: data.slope.value == null ? MISSING_VALUE : curvePrice(data.slope.value, root),
       ...thin ? { tone: "warning" as const } : {},
       detail: [data.slope.state, spreadBasis, spreadRank, slopeDate].filter(Boolean).join(" · ") },
+    ...spotPremium ? [
+      { id: "spot", label: spotPremium.label, value: spotPremium.close == null ? MISSING_VALUE : spotPremium.close.toFixed(2),
+        detail: spotPremium.date ? `${spotPremium.date.slice(5)} close` : undefined },
+      { id: "premium", label: "Front premium", value: curveChangeText(spotPremium.premium, root),
+        ...spotPremium.premium == null ? { tone: "warning" as const, detail: spotPremium.reason ?? undefined }
+          : { detail: spotPremium.frontSymbol ? `${curveContractCode(spotPremium.frontSymbol)} settle` : undefined } },
+    ] : [],
     ...data.spec ? [{ id: "contract", label: "Contract", value: data.spec.size, detail: `tick ${futuresTickText(data.spec)}` }] : [],
   ] : [];
   const { strip: tabStrip, rows: tabRows } = usePaneTabs({ tabs: TABS, activeValue: tab, onSelect: setTab, focused, dense: true, queryBarWidth: width });
@@ -213,7 +234,7 @@ function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps
   });
   useShortcut((event) => {
     if (focused && !dateActive && !event.targetEditable && !event.ctrl && !event.meta && event.name === "r") {
-      event.preventDefault(); void resource.reload();
+      event.preventDefault(); resource.reload();
     }
   });
   const selectDate = (value: string) => {
@@ -226,15 +247,17 @@ function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps
       if (dateInput.current?.setCursorOffset) dateInput.current.setCursorOffset(0);
       else if (dateInput.current) dateInput.current.cursorOffset = 0;
       dateInput.current?.blur?.();
-      if (nextDate === requestedDate) void resource.reload();
+      if (nextDate === requestedDate) resource.reload();
     } catch (error) {
       setDateError(error instanceof Error ? error.message : String(error));
     }
   };
   // A past date with no archived curve says why in the body, not behind the warning.
   const emptyPast = !!requestedDate && !!data && !data.contracts.length;
+  // A past date with no settle of its own (a weekend, today before the archive has it) says which session is shown.
+  const sessionNote = requestedDate && data ? curveSessionNote(requestedDate, data.asOf, data.root) : null;
   // The basis notes the report prints under its table: the convention, why a cell is blank, and which rates spot noise swamps.
-  const basisNotes = basisActive && bars ? [BASIS_CONVENTION, blankBasisNote(tableRows, basis), shortDatedBasisNote(tableRows, basis)]
+  const basisNotes = basisActive && bars ? [BASIS_CONVENTION, blankBasisNote(tableRows, basis, data ? curveCache(data, clock) : null), shortDatedBasisNote(tableRows, basis)]
     .filter((note): note is string => !!note) : [];
   // A long in these can be assigned delivery: the hedge a trader rolls before first notice.
   const delivering = data?.contracts.filter((row) => row.inDelivery).map((row) => curveContractCode(row.symbol)) ?? [];
@@ -242,9 +265,15 @@ function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps
   const untraded = data && !requestedDate && columns.some((entry) => entry.id === "change")
     ? noTradeChangeNote(tableRows, data, { count: true }) : null;
   usePaneNoticeFooter({ registrationId: "futures-curve:notices", focused,
-    notices: emptyPast ? [] : [...data?.gaps ?? [], ...thinSpread ? [thinSpread] : [], ...basisNotes, ...untraded ? [untraded] : [],
+    notices: emptyPast ? [] : [...standInNote ? [standInNote] : [], ...sessionNote ? [sessionNote] : [], ...data?.gaps ?? [], ...data?.notes ?? [], ...thinSpread ? [thinSpread] : [], ...skippedSpread ? [skippedSpread] : [], ...basisNotes, ...untraded ? [untraded] : [],
       ...delivering.length ? [`${delivering.join(", ")} ${delivering.length === 1 ? "is" : "are"} past first notice.`] : []] });
   const delay = Math.max(0, ...(data?.contracts.map((row) => row.delayMinutes ?? 0) ?? []));
+  // A capture dates the curve as `fn CTM` does, from the contracts' quotes and the delay their source states, not the spot beside them.
+  useRemoteUiNode(data && !emptyPast ? {
+    role: "report-freshness",
+    label: "Curve freshness",
+    getMetadata: () => ({ ...curveReportFreshness(data, requestedDate), ...requestedDate ? {} : { observations: curveFreshnessObservations(data.contracts) } }),
+  } : null);
   usePaneStatusFooter({ registrationId: "futures-curve", loading: resource.loading, error: resource.error,
     hints: [
       { id: "date", key: "d", label: "ate", onPress: () => { setDateActive(true); setDateFocusToken((token) => token + 1); } },
@@ -260,7 +289,7 @@ function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps
   const chart = strip ? {
     render: (size: { width: number; height: number }) => <CurveSurface series={curves} width={size.width} height={size.height} display="chart"
       caption={caption} xScale="linear" formatValue={formatValue} formatChange={formatChange}
-      formatAxisValue={(value, domain) => curveAxisPrice(value, domain, root)}
+      formatAxisValue={(value, domain) => curveAxisPrice(value, domain, root)} valueGrid={curveAxisGrid(root)}
       selectedPointId={selectedId} onSelectedPointChange={setSelected} />,
     minRows: curveSurfaceMinRows({ series: curves, width, caption }),
     strip,
@@ -269,7 +298,7 @@ function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps
     // A contract past first notice can be assigned delivery.
     if (column.id === "symbol") return { text: row.symbol, color: row.inDelivery ? colors.warning : undefined };
     if (column.id === "expiry") return { text: row.lastTrade ?? row.expiration, color: colors.textMuted };
-    if (column.id === "notice") return { text: row.firstNotice ?? "--", color: row.inDelivery ? colors.warning : colors.textMuted };
+    if (column.id === "notice") return { text: row.firstNotice ?? MISSING_VALUE, color: row.inDelivery ? colors.warning : colors.textMuted };
     if (column.id === "settle") return { text: curvePrice(row.settlement ?? null, root) };
     // A past curve's settled row has no separate last trade: its price is the settlement.
     if (column.id === "price") {
@@ -292,13 +321,16 @@ function FuturesCurveView({ width, height, focused, root, ownsTitle }: PaneProps
       // The figure to read is in the text colour, the other greyed: the annualised rate, until a week before
       // expiry, where spot noise swings it by whole points and Vs Spot leads.
       const lead = column.id === "vsSpot" ? shortDatedBasis(cell) : !shortDatedBasis(cell);
-      return { text, color: lead && text !== "--" ? undefined : colors.textMuted };
+      return { text, color: lead && text !== MISSING_VALUE ? undefined : colors.textMuted };
     }
-    if (column.id === "percentile") return { text: row.samples < 2 || row.percentile == null ? "--" : row.percentile.toFixed(0) };
+    if (column.id === "percentile") return { text: row.samples < 2 || row.percentile == null ? MISSING_VALUE : row.percentile.toFixed(0) };
     if (column.id === "oi") return { text: integer(row.openInterest) };
     if (column.id === "volume") return { text: integer(row.volume) };
+    // A month with no trade since the settlement it shows is dated by that settlement, as the curve marks it.
+    const settled = data && !requestedDate ? curveSettleShown(row, data) : null;
+    if (settled) return { text: `settle ${settled}`, color: colors.textMuted };
     return { text: curveTimestamp(row.asOf), color: row.stale ? colors.warning : colors.textMuted };
-  }, [basis, changes, colors, curveTab, requestedDate, root]);
+  }, [basis, changes, colors, curveTab, data, requestedDate, root]);
   return <Box width={width} height={height} flexDirection="column">
     {tabStrip}
     <QueryBar width={width} filters={[{

@@ -1,13 +1,14 @@
-import { indexRootSuggestion } from "../../../tickers/index-roots";
+import { indexRootSuggestion, uncarriedIndexFor, uncarriedIndexLine } from "../../../tickers/index-roots";
 import type { Dispatch } from "react";
 import type { AppAction, AppState } from "../../../state/app/context";
 import type { AppTickerRepositoryPort } from "../../../core/app-service-ports";
 import type { PluginRegistry } from "../../../plugins/registry";
 import { isManualPortfolio } from "../../../portfolio/mutations";
+import { findNamedCollection, readWatchlistArgument, watchlistMemberSymbol } from "../../../portfolio/collection-name";
 import type { DataProvider } from "../../../types/data-provider";
 import type { Portfolio, TickerRecord, Watchlist } from "../../../types/ticker";
 import { AmbiguousTickerError, resolveTickerSearch, upsertTickerFromSearchResult } from "../../../tickers/search";
-import { parseTickerListInput } from "../../../tickers/list";
+import { MAX_TICKER_LIST_SIZE, parseTickerListInput } from "../../../tickers/list";
 import { resolveTickerOpenTarget, type TickerOpenTarget } from "../../../tickers/open-target";
 import { settleTypedListingKey } from "../../../tickers/listing-venues";
 import { tickerHasListingSuffix } from "../../../sources/listing-symbols";
@@ -152,6 +153,8 @@ export async function resolveTickerInput(
   let resolvedTicker;
   try {
     let query = rawInput?.trim() || activeTicker || "";
+    // An index no source carries (TOPIX) is no fund that tracks it: interactive callers open ticker search, which lists them.
+    if (uncarriedIndexFor(query)) return null;
     if (options.preserveListingKey) {
       // 7203:TSE is the venue its symbol trades on among those TSE names, kept as 7203:JPX would be.
       query = await settleTypedListingKey(query, {
@@ -205,7 +208,9 @@ export async function resolveTickerInputOrThrow(
   const resolved = await resolveTickerInput(rawInput, activeTicker, collectionId, deps, { ...options, throwUnresolved: true });
   if (!resolved) {
     const typed = rawInput ?? activeTicker ?? "";
-    // A bare index root (VIX) is quoted as ^VIX, which the message offers.
+    // An index no source carries (TOPIX) says so and names its funds; a bare index root (VIX) is quoted as ^VIX.
+    const index = uncarriedIndexFor(typed);
+    if (index) throw new Error(uncarriedIndexLine(index));
     const suggestion = indexRootSuggestion(typed.trim());
     throw new Error(`No ticker match found for "${typed}".${suggestion ? ` ${suggestion}` : ""}`);
   }
@@ -260,13 +265,33 @@ export async function applyCollectionMembershipChange(
   return result;
 }
 
+/** How a function reads a list argument that names a watchlist: at most `maximum` symbols, its note pushed to `notes`. */
+export interface TickerListReading {
+  maximum?: number;
+  notes?: string[];
+}
+
 export async function resolveTickerListInput(
   rawInput: string,
   collectionId: string | null,
   deps: SharedWorkflowDeps,
   keepToken?: (token: string) => boolean,
+  reading?: TickerListReading,
 ): Promise<string[]> {
-  const tokens = parseTickerListInput(rawInput);
+  // A watchlist's name stands for its symbols, as `fn` reads it (`SIW HY3`), with the note saying so.
+  const state = deps.getState();
+  const watchlist = /[,;\n]/.test(rawInput) ? null : findNamedCollection(state.config.watchlists, rawInput);
+  const members = watchlist
+    ? [...state.tickers.values()].filter((ticker) => ticker.metadata.watchlists.includes(watchlist.id)).map((ticker) => watchlistMemberSymbol(ticker.metadata))
+    : [];
+  if (watchlist && members.length > 0) {
+    const read = readWatchlistArgument(rawInput, watchlist, members, reading?.maximum);
+    reading?.notes?.push(read.note);
+    return read.symbols;
+  }
+
+  // A function that takes more than ten (QQ) reads its own cap, as `fn` does.
+  const tokens = parseTickerListInput(rawInput, reading?.maximum ?? MAX_TICKER_LIST_SIZE);
   const symbols: string[] = [];
   const seen = new Set<string>();
 

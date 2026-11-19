@@ -461,3 +461,86 @@ test("an external selection and scroll request cannot be reversed by the previou
   expect(body.scrollTop).toBe(500 - Math.floor(body.viewport.height / 2));
   expect(tui.frame()).toContain("Row 500");
 });
+
+// Help's wrapped rows: pressing a row's second line did nothing, since that line is not a row the cursor stops on.
+test("pressing a line that goes on from the row above selects that row", async () => {
+  type Line = { id: string; owner: string; text: string; continued: boolean };
+  const lines: Line[] = [
+    { id: "a", owner: "Alpha", text: "Alpha says", continued: false },
+    { id: "a~1", owner: "Alpha", text: "more of alpha", continued: true },
+    { id: "b", owner: "Beta", text: "Beta says", continued: false },
+    { id: "b~1", owner: "Beta", text: "more of beta", continued: true },
+  ];
+  function WrappedHarness() {
+    const [selected, setSelected] = useState("a");
+    const state = createInitialState(createDefaultConfig("/tmp/gloomberb-data-table-view-wrapped-test"));
+    return (
+      <AppContext value={createStaticAppStore(state)}>
+        <PaneInstanceProvider paneId="data-table-view-wrapped-test">
+          <DataTableView<Line, Column>
+            focused
+            isNavigable={(line) => !line.continued}
+            continuesRowAbove={(line) => line.continued}
+            selection={{ kind: "id", selectedId: selected, getId: (line) => line.id, onChange: (id) => setSelected(String(id)) }}
+            columns={columns}
+            items={lines}
+            sortColumnId={null}
+            sortDirection="asc"
+            getItemKey={(line) => line.id}
+            renderCell={(line): DataTableCell => ({ text: line.text })}
+            emptyStateTitle="No rows"
+            rootAfter={<Box height={1}><Text>{`selected=${selected}`}</Text></Box>}
+          />
+        </PaneInstanceProvider>
+      </AppContext>
+    );
+  }
+  await act(async () => {
+    await tui.render(<WrappedHarness />, { width: 40, height: 10 });
+  });
+  await renderSettled();
+  expect(tui.frame()).toContain("selected=a");
+  await tui.clickFrameText("more of beta");
+  await renderSettled();
+  expect(tui.frame()).toContain("selected=b");
+  expect(tui.frame()).not.toContain("selected=b~1");
+});
+
+// CSP, EXPO and RV put a note about one row in the pane's footer, where it reads as the pane's.
+test("a row's note is said under the table while that row is selected, and follows the selection", async () => {
+  const notes: Record<string, string> = { second: "Second: no current price for the underlying." };
+  function NotedHarness() {
+    const [selected, setSelected] = useState("first");
+    const state = createInitialState(createDefaultConfig("/tmp/gloomberb-data-table-view-row-note-test"));
+    return (
+      <AppContext value={createStaticAppStore(state)}>
+        <PaneInstanceProvider paneId="data-table-view-row-note-test">
+          <DataTableView<Row, Column>
+            focused
+            isNavigable={(row) => row.type === "row"}
+            selection={{ kind: "id", selectedId: selected, getId: (row) => row.id, onChange: (id) => setSelected(String(id)) }}
+            columns={columns}
+            items={rows}
+            sortColumnId={null}
+            sortDirection="asc"
+            getItemKey={(row) => row.id}
+            renderCell={(row): DataTableCell => ({ text: row.title })}
+            rowNote={(row) => notes[row.id] ?? null}
+            emptyStateTitle="No rows"
+          />
+        </PaneInstanceProvider>
+      </AppContext>
+    );
+  }
+  await act(async () => {
+    await tui.render(<NotedHarness />, { width: 60, height: 10 });
+  });
+  await renderSettled();
+  expect(tui.frame()).not.toContain("no current price");
+  await tui.clickFrameText("Second row");
+  await renderSettled();
+  expect(tui.frame()).toContain("Second: no current price for the underlying.");
+  await tui.clickFrameText("Third row");
+  await renderSettled();
+  expect(tui.frame()).not.toContain("no current price");
+});

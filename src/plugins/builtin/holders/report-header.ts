@@ -2,6 +2,7 @@ import type { HolderData } from "../../../types/financials";
 import { currencyUnitLabel, resolveCurrencyUnit } from "../../../utils/currency-units";
 import { adrRatioText } from "../../../utils/depositary-receipt";
 import { canonicalExchange, isUsListingExchange, resolveExchangeTimeZone } from "../../../utils/exchanges";
+import { isNoSourceAnswer } from "../../../sources/provider-errors";
 
 /**
  * The lines above a holder table in text reports (`holders`, `insider`,
@@ -139,10 +140,10 @@ export function holderShareBasisMarker(row: { shareBasis?: unknown }): string {
  * line are positions in the receipts, or that a receipt line's rows all are.
  */
 export function holderShareBasisNote(
-  data: Pick<HolderData, "shareBasis" | "adrRatio">,
+  data: Pick<HolderData, "shareBasis" | "adrRatio" | "depositaryPair">,
   rows: ReadonlyArray<{ shareBasis?: unknown }>,
 ): string | null {
-  const ratio = adrRatioText(data.adrRatio);
+  const ratio = adrRatioText(data.adrRatio, data.depositaryPair?.ordinary[0]);
   const each = ratio ? ` (${ratio})` : "";
   if (rows.some((row) => holderShareBasisMarker(row))) return `ADR: shares held as depositary receipts${each}.`;
   if (rows.length > 0 && data.shareBasis === "depositary_receipt") return `Shares are depositary receipts${each}.`;
@@ -158,14 +159,37 @@ function isNonUsHolderListing(exchange?: string | null, currency?: string | null
 }
 
 /**
- * Holder lists are institutions' quarterly filings, mostly US 13F. On a
- * listing outside the US they are not that market's share register, which a
- * reader would otherwise assume.
+ * Holder lists are quarterly SEC 13F filings, by the managers that file them
+ * wherever they are. On a listing outside the US they are not that market's
+ * share register, which a reader would otherwise assume, so the list says
+ * plainly what it is.
  */
 export function nonUsHolderCaveat(exchange?: string | null, currency?: string | null): string | null {
   if (!isNonUsHolderListing(exchange, currency)) return null;
   const canonical = canonicalExchange(exchange ?? "");
   const venue = resolveExchangeTimeZone(canonical) ? canonical : "local";
   // Few filers report a line abroad, so a small position can lead the list.
-  return `Positions come from institutional filings (mostly US 13F), not the ${venue} share register, so the line's largest holders may be missing.`;
+  return `SEC 13F filings only, not the ${venue} share register: the line's largest holders may be missing.`;
+}
+
+/**
+ * What a listing no holder source has rows for reads, in place of the
+ * source's bare NO_DATA. Abroad it says which filings were read, in the
+ * caveat's words: a Shanghai or Shenzhen line no 13F filer reports holding
+ * is not one with no shareholders.
+ */
+export function noHoldersText(symbol: string, exchange?: string | null, currency?: string | null): string {
+  if (!isNonUsHolderListing(exchange, currency)) return `No holders on record for ${symbol}.`;
+  const canonical = canonicalExchange(exchange ?? "");
+  const venue = resolveExchangeTimeZone(canonical) ? canonical : "local";
+  return `No holders on record for ${symbol}: no SEC 13F filing reports it, and the ${venue} share register is not read.`;
+}
+
+/**
+ * A holder read the source answered with nothing: a miss, or one that
+ * crossed the desktop or screenshot bridge, which carries only its message,
+ * the source's bare NO_DATA.
+ */
+export function isNoHoldersAnswer(error: unknown): boolean {
+  return isNoSourceAnswer(error) || (error instanceof Error && error.message.trim() === "NO_DATA");
 }

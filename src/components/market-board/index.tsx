@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../utils/format";
 import { useMemo, useState, type ReactNode } from "react";
 import { useThemeColors } from "../../theme/theme-context";
 import type { PricePoint } from "../../types/financials";
@@ -84,17 +85,25 @@ export interface MarketBoardStackProps<T extends MarketBoardRow> {
    */
   rootBefore?: ReactNode | ((board: { columns: readonly DataTableColumn[] }) => ReactNode);
   emptyTitle?: string;
+  /** What concerns one row (it has no figure, its figure is old), under the board while it is selected (DataTableView `rowNote`). */
+  rowNote?: (row: T) => string | null;
 }
 
 /**
  * What a board gives up, in order, when the pane is too narrow for it: the
- * second label, the sparkline, the as-of year, then the change date and the
- * percentile. Shortening dates costs less than losing a column, so it comes
- * before the data columns.
+ * second label, the sparkline, the as-of year, then the change date, the
+ * percentile, the pane's own extra columns and the change. Shortening dates
+ * costs less than losing a column, so it comes before the data columns. The
+ * value and its date are never given up: a narrow board read as names alone
+ * (SOVR without its 5Y) or without the date of its figures (CBR without AS OF).
  */
-const FIT_STEPS = ["labelDetail", "history", "shortAsOf", "changeAsOf", "percentile"] as const;
+const FIT_STEPS = ["labelDetail", "history", "shortAsOf", "changeAsOf", "percentile", "extra", "change"] as const;
 /** The narrowest the name column gives way to in a board too narrow for every column. */
 const MIN_GROW_WIDTH = 10;
+/** Narrower still, once only the name, the value and its date are left, so those two stay whole. */
+const MIN_LABEL_WIDTH = 6;
+/** The columns a board always has; any other is a pane's extra one. */
+const BOARD_COLUMN_IDS = new Set(["label", "labelDetail", "value", "change", "changeAsOf", "percentile", "history", "asOf"]);
 /** An as-of date without its year ("09-17"). */
 const SHORT_AS_OF_WIDTH = 5;
 /** The word a stale or partial row's date carries, with its space: "2026-09-17 stale", "2026-10-19 so far". */
@@ -116,6 +125,8 @@ function fitBoardColumns(candidates: DataTableColumn[], width: number, wordWidth
     if (step === "shortAsOf") {
       shortAsOf = true;
       columns = withAsOfWidth(columns, SHORT_AS_OF_WIDTH + wordWidth);
+    } else if (step === "extra") {
+      columns = columns.filter((column) => BOARD_COLUMN_IDS.has(column.id));
     } else {
       columns = columns.filter((column) => column.id !== step);
     }
@@ -130,9 +141,10 @@ function fitBoardColumns(candidates: DataTableColumn[], width: number, wordWidth
   // that gives way when the board is still too wide, so the date and its word are never cut.
   const growId = columns.some((column) => column.id === "labelDetail") ? "labelDetail" : "label";
   const excess = Math.max(0, getTableWidth(columns) - width);
+  const floor = columns.length <= 3 ? MIN_LABEL_WIDTH : MIN_GROW_WIDTH;
   return {
     columns: columns.map((column) => column.id === growId
-      ? { ...column, width: Math.max(MIN_GROW_WIDTH, column.width - excess), flexGrow: 1 } : column),
+      ? { ...column, width: Math.max(Math.min(floor, column.width), column.width - excess), flexGrow: 1 } : column),
     shortAsOf,
   };
 }
@@ -142,7 +154,7 @@ function fitBoardColumns(candidates: DataTableColumn[], width: number, wordWidth
 export function MarketBoardStack<T extends MarketBoardRow>({ rows, width, height, focused,
   selectedId, onSelectedIdChange, openId, onOpenIdChange, renderDetail, changeLabel = "1D", valueWidth = 12,
   labelWidth = 18, labelHeader = "INSTRUMENT", labelDetailHeader = "DETAIL", labelDetailWidth = 22, valueLabel = "LEVEL", percentileLabel = "PCTL 1Y", asOfWidth = 10, signedChange = false, extraColumns,
-  rootBefore, emptyTitle = "No observations." }: MarketBoardStackProps<T>) {
+  rootBefore, emptyTitle = "No observations.", rowNote }: MarketBoardStackProps<T>) {
   const colors = useThemeColors();
   // A board of countries leads each name with its flag where one is drawn.
   const flagged = useUiCapabilities().nativePaneChrome === true && rows.some((row) => row.country !== undefined);
@@ -177,10 +189,10 @@ export function MarketBoardStack<T extends MarketBoardRow>({ rows, width, height
     if (column.id === "value") return { text: row.valueText, color: muted };
     if (column.id === "change") return { text: row.changeText,
       color: signedChange ? signedMoveColor(row.change, row.adverseMove, colors) : colors.textMuted };
-    if (column.id === "changeAsOf") return { text: row.changeAsOf ?? "--", color: colors.textDim };
-    if (column.id === "percentile") return { text: row.percentileText ?? row.percentile?.toFixed(0) ?? "--", color: row.percentile != null && (row.percentile <= 10 || row.percentile >= 90) ? colors.warning : colors.textMuted };
+    if (column.id === "changeAsOf") return { text: row.changeAsOf ?? MISSING_VALUE, color: colors.textDim };
+    if (column.id === "percentile") return { text: row.percentileText ?? row.percentile?.toFixed(0) ?? MISSING_VALUE, color: row.percentile != null && (row.percentile <= 10 || row.percentile >= 90) ? colors.warning : colors.textMuted };
     if (column.id === "history") return { text: "", content: <PriceSparkline priceHistory={row.history} width={column.width} period="1Y" trend="neutral" /> };
-    const asOf = row.asOfText ?? row.asOf ?? "--";
+    const asOf = row.asOfText ?? row.asOf ?? MISSING_VALUE;
     const asOfText = shortAsOf ? shortIsoDate(asOf) : asOf;
     // A narrow board drops the year; the export keeps the full date. The word
     // stays with the color, so a stale row is not color alone.
@@ -196,7 +208,7 @@ export function MarketBoardStack<T extends MarketBoardRow>({ rows, width, height
     sortColumnId={sort.columnId} sortDirection={sort.direction} onHeaderClick={(id) => {
       if (id !== "history") setSort((current) => nextHeaderSort(current, id));
     }} rootWidth={width} rootHeight={Math.max(3, height)} rootBefore={typeof rootBefore === "function" ? rootBefore({ columns }) : rootBefore}
-    freezeFirstColumn emptyStateTitle={emptyTitle} />;
+    freezeFirstColumn emptyStateTitle={emptyTitle} {...(rowNote ? { rowNote: (row: T) => rowNote(row) } : {})} />;
 }
 
 export interface StatChartDetailProps {
@@ -215,9 +227,10 @@ export interface StatChartDetailProps {
 export function StatChartDetail({ items, width, height, empty, emptySubject, emptyTitle, renderChart }: StatChartDetailProps) {
   return (
     <Box flexDirection="column" width={width} height={height}>
-      <StatGrid items={items} width={width} />
+      {/* A figure wraps only into rows the chart's least leaves, so the detail never spills. */}
+      <StatGrid items={items} width={width} maxLines={height - 3} />
       <PaneStatusBody empty={empty} subject={emptySubject} emptyTitle={emptyTitle}>
-        {renderChart(Math.max(3, height - statGridRows(items, width)))}
+        {renderChart(Math.max(3, height - statGridRows(items, width, undefined, { maxLines: height - 3 })))}
       </PaneStatusBody>
     </Box>
   );

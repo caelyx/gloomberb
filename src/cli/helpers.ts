@@ -5,8 +5,8 @@ import {
   formatNumber,
   formatPercentRaw,
 } from "../utils/format";
-import { formatMarketChangeWithCurrency, formatMarketPriceWithCurrency, type MarketFormatOptions } from "../market-data/market/format";
-import { changeBasisLabel, changeBasisNote, quoteChangeBasis } from "../market-data/market/change-basis";
+import { formatMarketChangeWithCurrency, formatMarketPriceRange, formatMarketPriceWithCurrency, type MarketFormatOptions } from "../market-data/market/format";
+import { changeBasisLabel, changeBasisNote, printPredatesChangeBasis, quoteChangeBasis } from "../market-data/market/change-basis";
 import type { FuturesContractTermsPayload } from "../api-client/futures-curve";
 import type { ActiveQuoteDisplay } from "../market-data/market/status";
 import type { Quote } from "../types/financials";
@@ -39,11 +39,13 @@ export function quoteChangeText(
 ): string {
   // A listing that no longer trades: its last close moves no more.
   if (quote.delisting) return "—";
+  const basis = quoteChangeBasis(quote, { terms });
+  // A print older than what its move is from (a coin's before 00:00 UTC) has no move as of now, as `quote` says.
+  if (printPredatesChangeBasis(quote, basis, now)) return "—";
   const move = colorBySign(
     `${formatMarketChangeWithCurrency(session.change, quote.currency ?? "USD", options, session.price)} (${formatPercentRaw(session.changePercent)})`,
     session.change,
   );
-  const basis = quoteChangeBasis(quote, { terms });
   if (!basis) return move;
   const note = changeBasisNote(basis, now);
   return `${move} ${cliStyles.muted(changeBasisLabel(basis, now))}${note ? `\n${cliStyles.muted(note)}` : ""}`;
@@ -98,12 +100,8 @@ export function dryRunNote(dryRun: boolean): string {
   return dryRun ? cliStyles.muted(" (dry run, nothing saved)") : "";
 }
 
-function fractionDigits(text: string): number {
-  return /\.(\d+)/.exec(text)?.[1]?.length ?? 0;
-}
-
-/** Low and high of a range. A sub-unit quote (pence shown in pounds) varies in decimals,
- * so its pair shares one count: £35.1000 - £35.4871, not £35.10 - £35.4871. */
+/** Low and high of a range, both to one number of decimals (formatMarketPriceRange): £35.1000 - £35.4871 for pence
+ * shown in pounds, not £35.10 - £35.4871, and a coin's at its price's decimals. */
 export function formatPriceRange(
   low: number | undefined,
   high: number | undefined,
@@ -111,15 +109,11 @@ export function formatPriceRange(
   options: MarketFormatOptions,
   separator = " - ",
 ): string {
-  const format = (value: number | undefined, extra: MarketFormatOptions = {}) => (
-    value == null ? "—" : formatMarketPriceWithCurrency(value, currency, { ...options, ...extra })
-  );
-  const lowText = format(low);
-  const highText = format(high);
-  if (!options.quotedUnitDivisor || low == null || high == null) return `${lowText}${separator}${highText}`;
-  const digits = Math.max(fractionDigits(lowText), fractionDigits(highText));
-  if (fractionDigits(lowText) === digits && fractionDigits(highText) === digits) return `${lowText}${separator}${highText}`;
-  return `${format(low, { fixedFractionDigits: digits })}${separator}${format(high, { fixedFractionDigits: digits })}`;
+  if (low == null || high == null) {
+    const format = (value: number | undefined) => value == null ? "—" : formatMarketPriceWithCurrency(value, currency, options);
+    return `${format(low)}${separator}${format(high)}`;
+  }
+  return formatMarketPriceRange(low, high, options, currency).join(separator);
 }
 
 /** A timestamp in CLI text: UTC with the zone named, the same on every machine. */

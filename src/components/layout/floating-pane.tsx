@@ -3,7 +3,7 @@ import type { ReactNode, RefObject } from "react";
 import { colors, floatingPaneBg } from "../../theme/colors";
 import { useThemeColors } from "../../theme/theme-context";
 import { PaneBodyFrame, getPaneWindowAttributes } from "./pane/frame";
-import { PaneHeader, type PaneHeaderQuickSetting } from "./pane/header";
+import { PaneHeader, type PaneHeaderQuickSetting, type PaneHeaderStack } from "./pane/header";
 import { PaneHeaderTabsProvider, usePaneHeaderTabsHost } from "./pane/header-tabs";
 import { hasPaneFooterContent, PaneFooterBar, type CombinedPaneFooter } from "./pane/footer";
 import { resolvePaneBodyFrame, shouldReservePaneFooter } from "./pane/sizing";
@@ -11,6 +11,12 @@ import { resolvePaneBodyFrame, shouldReservePaneFooter } from "./pane/sizing";
 interface FloatingPaneWrapperProps {
   paneId?: string;
   title: string;
+  /**
+   * Desktop and web: the ticker the title shows, drawn as a control that opens ticker search for
+   * the pane (`onTitleTickerPress`).
+   */
+  titleTicker?: string | null;
+  onTitleTickerPress?: () => void;
   x: number;
   y: number;
   width: number;
@@ -43,22 +49,30 @@ interface FloatingPaneWrapperProps {
   footer?: CombinedPaneFooter | null;
   /** The pane's frame, which a desktop resize sizes outside React; its header, body and footer stretch with it. */
   frameRef?: RefObject<BoxRenderable | null>;
+  /** Windows stacked as tabs here: their tabs replace the title. */
+  stack?: PaneHeaderStack | null;
   children: ReactNode;
 }
 
-function TerminalFloatingPaneBorder({ width, height }: { width: number; height: number }) {
+/**
+ * The window's sides, between its title bar and footer, which draw the top
+ * and bottom of the frame. Focused or not, so what is under the window never
+ * runs into it; focus draws them in the focus colour, as it does the rest.
+ */
+function TerminalFloatingPaneBorder({ width, height, focused }: { width: number; height: number; focused: boolean }) {
   const borderWidth = Math.max(0, Math.floor(width));
   const borderHeight = Math.max(0, Math.floor(height));
   const bodyHeight = Math.max(0, borderHeight - 2);
   if (borderWidth < 2 || bodyHeight <= 0) return null;
+  const color = focused ? colors.borderFocused : colors.border;
 
   return (
     <>
       <Box position="absolute" top={1} left={0} width={1} height={bodyHeight}>
-        <Text fg={colors.border} selectable={false}>{"│".repeat(bodyHeight)}</Text>
+        <Text fg={color} selectable={false}>{"│".repeat(bodyHeight)}</Text>
       </Box>
       <Box position="absolute" top={1} left={borderWidth - 1} width={1} height={bodyHeight}>
-        <Text fg={colors.border} selectable={false}>{"│".repeat(bodyHeight)}</Text>
+        <Text fg={color} selectable={false}>{"│".repeat(bodyHeight)}</Text>
       </Box>
     </>
   );
@@ -68,6 +82,8 @@ function TerminalFloatingPaneBorder({ width, height }: { width: number; height: 
 export function FloatingPaneWrapper({
   paneId,
   title,
+  titleTicker = null,
+  onTitleTickerPress,
   x,
   y,
   width,
@@ -97,6 +113,7 @@ export function FloatingPaneWrapper({
   onResizeMouseDragEnd,
   footer,
   frameRef,
+  stack = null,
   children,
 }: FloatingPaneWrapperProps) {
   const { nativePaneChrome } = useUiCapabilities();
@@ -135,6 +152,8 @@ export function FloatingPaneWrapper({
     >
       <PaneHeader
         title={title}
+        titleTicker={titleTicker}
+        onTitleTickerPress={onTitleTickerPress}
         width={width}
         focused={focused}
         windowModeSelected={windowModeSelected}
@@ -143,6 +162,7 @@ export function FloatingPaneWrapper({
         showActions={showActions}
         quickSettings={quickSettings}
         tabs={headerTabs}
+        stack={stack}
         bodyBackground={bg}
         topRule
         onHeaderMouseMove={onHeaderMouseMove}
@@ -172,7 +192,7 @@ export function FloatingPaneWrapper({
         />
       )}
 
-      {!nativePaneChrome && !focused && <TerminalFloatingPaneBorder width={width} height={height} />}
+      {!nativePaneChrome && <TerminalFloatingPaneBorder width={width} height={height} focused={focused || windowModeSelected} />}
 
       {nativePaneChrome ? (
         <Box

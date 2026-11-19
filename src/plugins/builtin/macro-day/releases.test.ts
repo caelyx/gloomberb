@@ -20,11 +20,36 @@ describe("macro release list", () => {
     expect(merged.coveredThrough).toBe("2026-10-09");
     expect(merged.releases).toEqual([...floor.releases, { kind: "jobs", date: "2026-10-02" }]);
 
-    // Older, malformed or missing lists leave the floor as it is.
-    for (const payload of [served("2026-10-01", { jobs: ["2026-10-02"] }), served("2026-10-09", { jobs: ["10/02/2026"] }),
+    // Malformed or missing lists leave the floor as it is.
+    for (const payload of [served("2026-10-09", { jobs: ["10/02/2026"] }),
       { coveredThrough: "2026-10-09", releases: { cpi: [], jobs: ["2026-10-02"] } }, null]) {
       expect(mergeMacroReleases(floor, payload)).toBe(floor);
     }
+    // One that ends no later than the floor adds no day.
+    expect(mergeMacroReleases(floor, served("2026-10-01", { jobs: ["2026-10-02"] }))).toEqual(floor);
+  });
+
+  test("a day the floor carries keeps the figures the server has, whether or not the server reaches past the floor's end", () => {
+    const hold = { event: "Federal funds target range", actual: "3.75-4.00%", forecast: "3.75-4.00%", prior: "3.75-4.00%",
+      surprise: "in-line" as const, decision: "held" };
+    const bundled = bundledMacroReleases();
+    const day = bundled.releases.findLast((release) => release.kind === "fomc")!;
+    const figures = { fomc: { [day.date]: hold } };
+    // The server's list ends before the bundled one, on it, and past it: the day is the bundled one's each time, with its figures.
+    const shift = (days: number) => new Date(Date.parse(`${bundled.coveredThrough}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+    for (const through of [shift(-5), bundled.coveredThrough, shift(5)]) {
+      const merged = mergeMacroReleases(bundled, { ...served(through, { fomc: [day.date] }), figures, figuresFrom: "2026-01-02" });
+      expect(merged.releases.find((release) => release.kind === "fomc" && release.date === day.date)?.figures).toEqual(hold);
+      expect(merged.figuresFrom).toBe("2026-01-02");
+      expect(merged.coveredThrough).toBe(through > bundled.coveredThrough ? through : bundled.coveredThrough);
+    }
+
+    // So do the reason a floor day has none, and the IPCA days through the server's end.
+    const behind = mergeMacroReleases(floor, { ...served("2026-09-30", { ipca: ["2026-09-11", "2026-10-09"] }),
+      figureGaps: { jobs: { "2026-09-04": "the economic calendar has no Non Farm Payrolls row that day" } } });
+    expect(behind.coveredThrough).toBe(floor.coveredThrough);
+    expect(behind.releases).toEqual([{ kind: "jobs", date: "2026-09-04", figuresMissing: "the economic calendar has no Non Farm Payrolls row that day" },
+      { kind: "ipca", date: "2026-09-11" }, { kind: "fomc", date: "2026-09-16" }]);
   });
 
   test("takes the served IPCA days through the list's end, and every day's figures the server has", () => {
@@ -49,6 +74,43 @@ describe("macro release list", () => {
     // A server without IPCA, or with a broken list of it, still extends the US days.
     expect(mergeMacroReleases(floor, served("2026-10-23", { cpi: ["2026-10-14"], ipca: ["9 Oct"] } as never)).releases)
       .toEqual([...floor.releases, { kind: "cpi", date: "2026-10-14" }]);
+  });
+
+  test("a policy decision's move and the reason a covered day has no figures come with the days", () => {
+    const merged = mergeMacroReleases(floor, {
+      ...served("2026-11-06", { jobs: ["2026-11-06"], fomc: ["2026-10-28"] }), figuresFrom: "2026-01-02",
+      figures: { fomc: { "2026-10-28": { event: "Federal funds target range", actual: "3.75-4.00%", forecast: "3.75-4.00%",
+        prior: "3.75-4.00%", surprise: "in-line", decision: "held" } } },
+      figureGaps: { jobs: { "2026-11-06": "the economic calendar has no Non Farm Payrolls row that day" } },
+    });
+    expect(merged.figuresFrom).toBe("2026-01-02");
+    expect(merged.releases.find((release) => release.date === "2026-10-28")?.figures?.decision).toBe("held");
+    expect(merged.releases.find((release) => release.date === "2026-11-06")).toEqual({ kind: "jobs", date: "2026-11-06",
+      figuresMissing: "the economic calendar has no Non Farm Payrolls row that day" });
+  });
+
+  test("the ECB's and BoJ's decision days come from the server with the rate, their next decisions, and a CPI actual computed from the index", () => {
+    const merged = mergeMacroReleases(floor, {
+      ...served("2026-11-11", { cpi: ["2026-11-10"], ecb: ["2026-09-10", "2026-10-29"], boj: ["2026-09-18", "2026-10-30"] }),
+      scheduled: { ecb: "2026-12-17", boj: "2026-12-18" },
+      figures: {
+        boj: { "2026-09-18": { event: "Policy rate", actual: "1.25%", forecast: "1.25%", prior: "1.00%", surprise: "in-line",
+          decision: "raised 25bp" } },
+        ecb: { "2026-09-10": { event: "ECB Interest Rate Decision", actual: "2.50%", forecast: null, prior: "2.25%", surprise: null,
+          decision: "raised 25bp" } },
+        cpi: { "2026-11-10": { event: "Inflation Rate YoY", actual: null, forecast: "3.9%", prior: "3.7%", surprise: null,
+          actualMissing: "the CPI index has no October 2025 level to compare against" } },
+      },
+    });
+    expect(merged.releases.filter((release) => release.kind === "ecb").map((release) => release.date)).toEqual(["2026-09-10", "2026-10-29"]);
+    expect(merged.releases.find((release) => release.date === "2026-09-10")?.figures).toMatchObject({ actual: "2.50%", prior: "2.25%",
+      decision: "raised 25bp" });
+    // The BoJ's days are its Tokyo days, kept as served beside the ECB's.
+    expect(merged.releases.filter((release) => release.kind === "boj").map((release) => release.date)).toEqual(["2026-09-18", "2026-10-30"]);
+    expect(merged.releases.find((release) => release.kind === "boj" && release.date === "2026-09-18")?.figures?.decision).toBe("raised 25bp");
+    expect(merged.scheduled).toEqual({ ecb: "2026-12-17", boj: "2026-12-18" });
+    expect(merged.releases.find((release) => release.date === "2026-11-10")?.figures?.actualMissing)
+      .toBe("the CPI index has no October 2025 level to compare against");
   });
 
   test("a failed read keeps the last list read, and the bundled one without any", async () => {

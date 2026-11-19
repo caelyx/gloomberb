@@ -1,10 +1,17 @@
-import type { ScreenCheckPayload, ScreenCriterion, ScreenDefinition } from "../../../api-client/equity-screener";
-import { canonicalExchange, parsePublicTickerKey } from "../../../utils/exchanges";
-import { criterionText, parseScreenDefinition, screenDefinitionKey, screenLabel } from "./model";
+import { MISSING_VALUE } from "../../../utils/format";
+import type { NumericField, ScreenCheckPayload, ScreenCriterion, ScreenDefinition } from "../../../api-client/equity-screener";
+import { parseListingArg } from "../../../cli/listing-arg";
+import { canonicalExchange } from "../../../utils/exchanges";
+import { criterionText, formatScreenValue, GRADE_DISPLAY_FIELDS, parseScreenDefinition, screenDefinitionKey, screenLabel } from "./model";
 
-/** One listing, with the same exchange aliases the rest of the app accepts. */
+/**
+ * One listing, read as `quote` reads it before it asks: 700:HKEX, 700.HK and
+ * 00700.HK are 0700:HKEX, GARAN.IS is GARAN:BIST, "VOD LN" VOD:LSE. A bare
+ * symbol stays bare, for the screen to pick its listing.
+ */
 export function screenCheckTicker(text: string): { symbol: string; exchange?: string } {
-  const ticker = parsePublicTickerKey(text.trim());
+  const listing = parseListingArg(text.trim(), null, { listingSuffix: true });
+  const ticker = listing.exchange ? { symbol: listing.symbol, exchange: listing.exchange } : { symbol: listing.symbol };
   if (!/^[A-Z0-9][A-Z0-9./-]{0,31}$/.test(ticker.symbol)
     || (ticker.exchange !== undefined && !/^[A-Z0-9_-]{1,24}$/.test(ticker.exchange)))
     throw new Error("Enter one ticker, such as NVDA or NVDA:NASDAQ.");
@@ -64,7 +71,8 @@ export function validateScreenCheck(
 
 const number = (value: number) => value.toLocaleString("en-US", { maximumSignificantDigits: 21 });
 function checkCriterionText(criterion: ScreenCriterion): string {
-  if (!("value" in criterion) || criterion.op === "in") return criterionText(criterion);
+  // A grade compares letters (`Value grade >= B+`), and the composite reads as the screen writes it.
+  if (!("value" in criterion) || criterion.op === "in" || GRADE_DISPLAY_FIELDS.has(criterion.field)) return criterionText(criterion);
   const operators = { gte: ">=", lte: "<=", gt: ">", lt: "<", eq: "=", between: "between" };
   const threshold = Array.isArray(criterion.value) ? criterion.value.map(number).join(", ") : number(criterion.value);
   return `${screenLabel(criterion.field)} ${operators[criterion.op]} ${threshold}`;
@@ -75,14 +83,38 @@ export function screenCheckSummary(data: ScreenCheckPayload): string {
   return data.matches === null ? "Not covered" : data.matches ? "Passes all criteria" : "Does not match";
 }
 
+/** The thresholds a criterion compares a value with: one, or a range's two ends. */
+function thresholds(criterion: ScreenCriterion): number[] {
+  if (!("value" in criterion)) return [];
+  const value = criterion.value as unknown;
+  return (Array.isArray(value) ? value : [value]).filter((entry): entry is number => typeof entry === "number");
+}
+
+/**
+ * A stored value as DVD writes its figures: two decimals (6.93%, 26.42 x), a
+ * whole number without them. A value that would round onto a threshold it is
+ * not (25.0001 against <= 25) keeps the decimals that tell it apart, so its
+ * Fail never reads as 25.00 failing <= 25.
+ */
+function checkValueText(value: number, unit: string, criterion: ScreenCriterion): string {
+  const limits = thresholds(criterion);
+  const whole = Number.isInteger(value) && unit !== "%";
+  let digits = whole ? 0 : 2;
+  while (digits < 15 && limits.some((limit) => limit !== value && Number(value.toFixed(digits)) === limit)) digits += 1;
+  const text = value.toLocaleString("en-US", { minimumFractionDigits: whole ? 0 : 2, maximumFractionDigits: digits });
+  return unit === "%" ? `${text}%` : `${text}${unit ? ` ${unit}` : ""}`;
+}
+
 export function checkRows(data: ScreenCheckPayload) {
   return data.criteria.map((entry, index) => ({
     id: String(index),
     criterion: checkCriterionText(entry.criterion),
     value: entry.state === "not-covered" ? "Not covered" : entry.value === null ? "Missing" : typeof entry.value === "number"
-      ? `${number(entry.value)}${entry.unit ? ` ${entry.unit}` : ""}` : entry.value,
+      ? GRADE_DISPLAY_FIELDS.has(entry.criterion.field) ? formatScreenValue(entry.criterion.field as NumericField, entry.value)
+        : checkValueText(entry.value, entry.unit, entry.criterion)
+      : entry.value,
     result: entry.passes === null ? "Not evaluated" : entry.passes ? "Pass" : "Fail",
-    asOf: entry.asOf?.slice(0, 10) ?? (entry.observedAt ? `${entry.observedAt.slice(0, 10)} (collected)` : "--"),
+    asOf: entry.asOf?.slice(0, 10) ?? (entry.observedAt ? `${entry.observedAt.slice(0, 10)} (collected)` : MISSING_VALUE),
     state: entry.state,
     reason: entry.reason,
     passes: entry.passes,

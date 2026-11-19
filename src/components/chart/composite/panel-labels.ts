@@ -1,6 +1,12 @@
 import type { ChartSurfaceProps } from "../../../ui";
 import type { NativeChartBitmap } from "../native/chart-rasterizer";
-import { compositeAxisTicks, formatCompositeCursorValue, type CompositeAxisValueFormatter } from "./format";
+import {
+  axisResultCache,
+  compositeAxisTagFormatter,
+  compositeAxisTicks,
+  formatCompositeAxisValue,
+  type CompositeAxisValueFormatter,
+} from "./format";
 import { projectCompositeValue, unprojectCompositeValue } from "./scene";
 import type { CompositeAxisDomain, CompositeChartScene, CompositePanelScene } from "./types";
 
@@ -70,8 +76,9 @@ export function resolveSeriesAxisTags(
       seriesLabel: source.label,
       side: source.axis,
       value: cursor.value,
-      label: (format ?? formatCompositeCursorValue)(cursor.value, domain),
-      color: source.color,
+      label: compositeAxisTagFormatter(format)(cursor.value, domain),
+      // A column below zero is drawn in its negative colour, and so is its tag.
+      color: cursor.value < 0 && source.negativeColor ? source.negativeColor : source.color,
       yRatio,
       carried: !!cursor.carried,
     }];
@@ -95,7 +102,7 @@ export function cursorAxisLabel(
   if (!domain || cursorYRatio === null) return null;
   const value = unprojectCompositeValue(cursorYRatio, domain);
   if (value === null) return null;
-  return format ? format(value, domain) : formatCompositeCursorValue(value, domain);
+  return compositeAxisTagFormatter(format)(value, domain);
 }
 
 export const MINIMUM_AXIS_LABEL_WIDTH = 3;
@@ -110,10 +117,23 @@ export function compositeAxisLabelWidth(
   includeCursor: boolean,
 ): number {
   if (!domain) return 0;
+  // With no formatter of its own the cursor reads in cursor precision, so
+  // the default formatter is not the same as no formatter.
+  const key = `${includeCursor ? "cursor" : ""}:${format ? "" : "default"}`;
+  return cachedLabelWidths(domain, format ?? formatCompositeAxisValue, key, () => axisLabelWidth(domain, format, includeCursor));
+}
+
+const cachedLabelWidths = axisResultCache<number>();
+
+function axisLabelWidth(
+  domain: CompositeAxisDomain,
+  format: CompositeAxisValueFormatter | undefined,
+  includeCursor: boolean,
+): number {
   const ticks = compositeAxisTicks(domain, format);
   const labels = ticks.map((tick) => tick.label);
   if (includeCursor) {
-    const cursorFormat = format ?? formatCompositeCursorValue;
+    const cursorFormat = compositeAxisTagFormatter(format);
     for (const { value } of ticks) {
       labels.push(cursorFormat(value, domain));
       // Totals use two decimals at their compact scale; prices can use four

@@ -1,8 +1,10 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { CryptoAssetKind, CryptoMarketAsset, CryptoPeg } from "../../../api-client/crypto-markets";
 import type { DataTableColumn } from "../../../components";
 import { getTableWidth } from "../../../components/ui/table-layout";
 import { buildQuoteKey, resolveEntryData } from "../../../market-data/selectors";
 import { delayedFeedLagMs } from "../../../market-data/market/freshness";
+import { quoteSourceName } from "../../../market-data/quotes/export-identity";
 import type { QueryEntry } from "../../../market-data/result-types";
 import type { PricePoint, Quote } from "../../../types/financials";
 import type { HeadlessPaneFreshness } from "../../../types/headless";
@@ -86,11 +88,16 @@ export interface CryptoRow extends CryptoRowSupply {
   live: boolean;
   /** The price is a quote from a delayed feed, held back from the market. A price read from the board is not. */
   delayed: boolean;
+  /**
+   * Where the price is from, as the row says it: the exchange whose own trade it is (`Coinbase`), `composite` for
+   * the board's price blended from several exchanges, or `15m delayed` for a composite held back.
+   */
+  priceVenueText: string;
   /** A stablecoin's peg; null for a coin, or a server that does not send it. */
   peg: CryptoPeg | null;
-  /** `USD`, `EUR 1.1242` (the target in dollars), `USD yield`; empty without a peg. */
+  /** `USD`, `EUR 1.1242` (the target in dollars), `USD yield`, `USD bond`; empty without a peg. */
   pegText: string;
-  /** How far the price is off its target, in basis points; null when it accrues yield or the target is unknown. */
+  /** How far the price is off its target, in basis points; null when it accrues (yield, a bond) or the target is unknown. */
   offPegBp: number | null;
   /** The 24-hour low and high, the price shown included, and when each traded (epoch ms). */
   low24h: number | null;
@@ -100,6 +107,50 @@ export interface CryptoRow extends CryptoRowSupply {
   /** The low and high at the price's decimals. */
   low24hText: string;
   high24hText: string;
+  /**
+   * Whose the low and high are, in plain words: `Coinbase only` when it alone of the exchanges read reached it,
+   * `Coinbase` when it was the only one read, `2 of 3`, `both` or `all 3` when more did, `other exchange` when none
+   * did (the composite's wick was an exchange not read), `checking` while the server still reads them, or a dash
+   * when no exchange was read. `+ Kraken` when the row's own price from that exchange lay outside the range and
+   * widened it.
+   */
+  low24hVenueText: string;
+  high24hVenueText: string;
+  /** The row's own exchange price lay outside the composite's range and is the low or the high, as `+ Kraken` says. */
+  low24hWidened: boolean;
+  high24hWidened: boolean;
+}
+
+/** The board's price that is no one exchange's: several blended by the source. */
+const COMPOSITE_PRICE_VENUE = "composite";
+/** An extreme whose exchanges' own candles the server is still reading: the board's refresh brings them. */
+const CHECKING_EXCHANGES = "checking";
+/** An extreme none of the exchanges read reached. */
+const OTHER_EXCHANGE = "other exchange";
+
+/**
+ * Whose an extreme is: the exchange that alone reached it among several read (`Coinbase only`), the one read when
+ * only one was, how many of those read did (`2 of 3`, `both`, `all 3`), and when none did, another exchange's. An
+ * exchange that could not be read is not among those counted. While the server is still reading them it says so,
+ * never that none was read. A price newer than the range that widened it is the row's own price venue's.
+ */
+function extremeVenueText(reached: readonly string[] | undefined, checked: readonly string[] | undefined, pending = false): string {
+  if (!checked?.length || !reached) return pending ? CHECKING_EXCHANGES : MISSING_VALUE;
+  // The composite blends exchanges not read here: an extreme none of those read reached was one of theirs.
+  if (reached.length === 0) return OTHER_EXCHANGE;
+  if (reached.length === 1) return checked.length > 1 ? `${reached[0]} only` : reached[0]!;
+  if (reached.length < checked.length) return `${reached.length} of ${checked.length}`;
+  return checked.length === 2 ? "both" : `all ${checked.length}`;
+}
+
+/**
+ * What a row says its price is: an exchange's own, a quote held back, the source of a live quote that names no
+ * exchange (Gloom Cloud), or the board's own composite.
+ */
+function priceVenueText(quote: Quote | null, delayed: boolean): string {
+  if (quote?.priceVenue) return quote.priceVenue;
+  if (delayed) return `${delayedFeedLagMs(CRYPTO_EXCHANGE) / 60_000}m delayed`;
+  return quote ? quoteSourceName(quote) || MISSING_VALUE : COMPOSITE_PRICE_VENUE;
 }
 
 export const cryptoQuoteKey = (asset: Pick<CryptoMarketAsset, "symbol">) =>
@@ -194,8 +245,9 @@ function buildCryptoRow(
   const updated = isFiniteNumber(updatedAt) ? updatedAt : null;
   const minimumDecimals = asset.kind === "stablecoin" ? 4 : 2;
   const range = asset.kind === "stablecoin"
-    ? dayRange(asset, price, updated)
-    : { low24h: null, low24hAt: null, high24h: null, high24hAt: null };
+    ? dayRange(asset, price, updated, quote?.priceVenue)
+    : NO_DAY_RANGE;
+  const delayed = quote?.dataSource === "delayed";
   return {
     asset,
     id: asset.symbol,
@@ -213,7 +265,8 @@ function buildCryptoRow(
     history,
     updatedAt: updated,
     live: !!quote && quote.delivery === "stream" && quote.stale !== true,
-    delayed: quote?.dataSource === "delayed",
+    delayed,
+    priceVenueText: priceVenueText(quote, delayed),
     peg,
     pegText: formatPegTarget(peg),
     offPegBp: offPegBasisPoints(price, peg),
@@ -227,17 +280,18 @@ function buildCryptoRow(
 /**
  * What a stablecoin's price is measured against: `USD`; a coin on another
  * currency by its target in dollars, `EUR 1.1242`, so EURC at 1.1234 does not
- * read as a 12% premium; a coin whose yield accrues into its price (USDY) is
- * marked so and has no par to be off.
+ * read as a 12% premium; a coin whose yield accrues into its price (USDY) or a
+ * bond token priced toward par at maturity (BUSD0) is marked by its kind and
+ * has no par to be off.
  */
 export function formatPegTarget(peg: CryptoPeg | null | undefined): string {
   if (!peg) return "";
-  if (peg.accrues) return `${peg.currency} yield`;
+  if (peg.accrues) return `${peg.currency} ${peg.kind === "bond" ? "bond" : "yield"}`;
   if (peg.currency === "USD") return "USD";
   return peg.price == null ? peg.currency : `${peg.currency} ${peg.price.toFixed(4)}`;
 }
 
-/** Basis points off the peg, to a tenth: (price / target - 1) x 10,000. Null when the coin accrues yield or the target is unknown. */
+/** Basis points off the peg, to a tenth: (price / target - 1) x 10,000. Null when the coin accrues (yield, a bond) or the target is unknown. */
 export function offPegBasisPoints(price: number, peg: CryptoPeg | null | undefined): number | null {
   if (!peg || peg.accrues || peg.price == null || !(peg.price > 0) || !(price > 0)) return null;
   return toBasisPoints((price / peg.price - 1) * 100, 1);
@@ -258,31 +312,49 @@ export function offPegSeverity(bp: number | null): "none" | "watch" | "broken" {
   return size >= OFF_PEG_BROKEN_BP ? "broken" : size >= OFF_PEG_WATCH_BP ? "watch" : "none";
 }
 
+const NO_DAY_RANGE = {
+  low24h: null, low24hAt: null, high24h: null, high24hAt: null,
+  low24hVenueText: MISSING_VALUE, high24hVenueText: MISSING_VALUE, low24hWidened: false, high24hWidened: false,
+};
+
 /**
  * The 24-hour low and high the board reported, widened by a newer price than
- * it had seen, so a live tick below the low is the low, at its time.
+ * it had seen, so a live tick below the low is the low, at its time. An
+ * exchange's own price outside the range widens it whenever it traded, as the
+ * quote service's range does (`rangeWidened`): the composite's range never
+ * took that exchange's trade in. The extreme then says whose (`+ Kraken`).
  */
-function dayRange(asset: CryptoMarketAsset, price: number, updatedAt: number | null) {
+function dayRange(asset: CryptoMarketAsset, price: number, updatedAt: number | null, priceVenue: string | undefined) {
   const range = asset.range24h;
-  if (!range) return { low24h: null, low24hAt: null, high24h: null, high24hAt: null };
+  if (!range) return NO_DAY_RANGE;
   let low24h = range.low;
   let low24hAt: number | null = Date.parse(range.lowAt);
   let high24h = range.high;
   let high24hAt: number | null = Date.parse(range.highAt);
-  const newer = updatedAt != null && updatedAt > Date.parse(range.end);
-  if (newer && price < low24h) [low24h, low24hAt] = [price, updatedAt];
-  if (newer && price > high24h) [high24h, high24hAt] = [price, updatedAt];
+  // The raw extremes stay; each says whose it is.
+  let low24hVenueText = extremeVenueText(range.lowVenues, range.venuesChecked, range.venuesPending === true);
+  let high24hVenueText = extremeVenueText(range.highVenues, range.venuesChecked, range.venuesPending === true);
+  const widens = !!priceVenue || (updatedAt != null && updatedAt > Date.parse(range.end));
+  const ownVenue = priceVenue ? `+ ${priceVenue}` : COMPOSITE_PRICE_VENUE;
+  const low24hWidened = widens && price < low24h;
+  const high24hWidened = widens && price > high24h;
+  if (low24hWidened) [low24h, low24hAt, low24hVenueText] = [price, updatedAt, ownVenue];
+  if (high24hWidened) [high24h, high24hAt, high24hVenueText] = [price, updatedAt, ownVenue];
   return {
     low24h,
     low24hAt: isFiniteNumber(low24hAt) ? low24hAt : null,
     high24h,
     high24hAt: isFiniteNumber(high24hAt) ? high24hAt : null,
+    low24hVenueText,
+    high24hVenueText,
+    low24hWidened: low24hWidened && !!priceVenue,
+    high24hWidened: high24hWidened && !!priceVenue,
   };
 }
 
 /** `Sat 11:30` UTC; a dash when unknown. */
 export function formatDayRangeTime(ms: number | null): string {
-  return ms == null ? "—" : formatUtcWeekdayTime(ms) || "—";
+  return ms == null ? MISSING_VALUE : formatUtcWeekdayTime(ms) || MISSING_VALUE;
 }
 
 const rowsByAsset = new WeakMap<CryptoMarketAsset, { quote: Quote | null; day: number; row: CryptoRow }>();
@@ -312,7 +384,10 @@ const suppliedRows = new WeakMap<CryptoRow, { supply: CryptoRowSupply; row: Cryp
 
 /**
  * Each row with its coin's supply, matched by code. A row keeps its identity
- * while its price and its supply hold, so the table still skips it.
+ * while its price and its supply hold, so the table still skips it. A row with
+ * a supply is valued on it: its market cap is its price times the supply it
+ * shows, so the row counts one supply (USDT's Supply 178.16B at 0.9984 read
+ * beside a market cap on another supply, 177.42B).
  */
 export function withCryptoSupply(rows: readonly CryptoRow[], supply: ReadonlyMap<string, CryptoRowSupply>): CryptoRow[] {
   if (supply.size === 0) return rows as CryptoRow[];
@@ -321,7 +396,7 @@ export function withCryptoSupply(rows: readonly CryptoRow[], supply: ReadonlyMap
     if (!own) return row;
     const cached = suppliedRows.get(row);
     if (cached && cached.supply === own) return cached.row;
-    const supplied = { ...row, ...own };
+    const supplied = { ...row, ...own, ...(own.supply != null && own.supply > 0 ? { marketCap: own.supply * row.price } : {}) };
     suppliedRows.set(row, { supply: own, row: supplied });
     return supplied;
   });
@@ -359,18 +434,26 @@ export function cryptoRowObservations(rows: readonly CryptoRow[]): CryptoRowObse
  * keeps its decimals.
  */
 export function formatCryptoPrice(value: number | null, minimumDecimals = 2, referencePrice?: number | null): string {
-  if (value == null || !Number.isFinite(value) || value <= 0) return "—";
+  if (value == null || !Number.isFinite(value) || value <= 0) return MISSING_VALUE;
   const magnitude = Math.floor(Math.log10(positive(referencePrice) ? referencePrice : value));
   const decimals = Math.min(12, Math.max(minimumDecimals, 3 - magnitude));
   return value.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }
 
 export function formatCryptoPercent(value: number | null): string {
-  if (value == null || !Number.isFinite(value)) return "—";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   const text = value.toFixed(2);
   // A move that rounds to zero carries no sign.
   if (Number(text) === 0) return "0.00%";
   return `${value > 0 ? "+" : ""}${text}%`;
+}
+
+/**
+ * "as of 2026-10-21 UTC close": a daily total's newest day, which is that UTC
+ * day's close. The DeFi and stablecoin tabs date theirs the same way.
+ */
+export function utcCloseAsOfText(asOf: string): string {
+  return `as of ${asOf} UTC close`;
 }
 
 // Sorting ---------------------------------------------------------------------
@@ -380,6 +463,7 @@ type CryptoColumnId =
   | "code"
   | "name"
   | "price"
+  | "priceVenueText"
   | "changePercent"
   | "return7d"
   | "return30d"
@@ -391,8 +475,10 @@ type CryptoColumnId =
   | "offPegBp"
   | "low24h"
   | "low24hAt"
+  | "low24hVenueText"
   | "high24h"
   | "high24hAt"
+  | "high24hVenueText"
   | "supply"
   | "supply7dPercent"
   | "supply7d"
@@ -409,7 +495,26 @@ export interface CryptoSortPreference {
 
 export const DEFAULT_CRYPTO_SORT: CryptoSortPreference = { columnId: null, direction: "asc" };
 
-const TEXT_COLUMNS = new Set<CryptoColumnId>(["rank", "code", "name", "pegText"]);
+/**
+ * `--sort` of `fn CRYP` and `shot CRYP` as the pane's header sorts it: the
+ * board's market-cap order, or off peg largest first, either side of par.
+ */
+export const CRYPTO_SORT_OPTIONS: Readonly<Record<string, CryptoSortPreference>> = {
+  mcap: DEFAULT_CRYPTO_SORT,
+  offpeg: { columnId: "offPegBp", direction: "desc" },
+};
+
+/** A saved sort as the pane reads it back; anything else is the board's order. */
+export function readCryptoSort(value: unknown): CryptoSortPreference {
+  if (!value || typeof value !== "object") return DEFAULT_CRYPTO_SORT;
+  const { columnId, direction } = value as Partial<CryptoSortPreference>;
+  return (columnId === null || (typeof columnId === "string" && SORTABLE_COLUMNS.has(columnId)))
+    && (direction === "asc" || direction === "desc")
+    ? { columnId: columnId as CryptoColumnId | null, direction }
+    : DEFAULT_CRYPTO_SORT;
+}
+
+const TEXT_COLUMNS = new Set<CryptoColumnId>(["rank", "code", "name", "pegText", "priceVenueText", "low24hVenueText", "high24hVenueText"]);
 
 /** Numbers open largest-first (top gainers, biggest caps); names open A-Z. */
 export function nextCryptoSort(current: CryptoSortPreference, columnId: string): CryptoSortPreference {
@@ -441,6 +546,7 @@ const COLUMN_SPECS: CryptoColumnSpec[] = [
   { id: "code", label: "COIN", width: 7, align: "left" },
   { id: "name", label: "NAME", width: 10, align: "left", optional: 1 },
   { id: "price", label: "PRICE", width: 13, align: "right" },
+  { id: "priceVenueText", label: "VENUE", title: "The exchange whose own trade the price is, or the composite of several", width: 11, align: "left", optional: 1.5 },
   { id: "changePercent", label: "CHG% UTC", title: "Change since 00:00 UTC", width: 8, align: "right" },
   { id: "return7d", label: "7D%", width: 8, align: "right" },
   { id: "return30d", label: "30D%", width: 8, align: "right", optional: 3 },
@@ -454,19 +560,23 @@ const COLUMN_SPECS: CryptoColumnSpec[] = [
  * A stablecoin is read by its peg: what it holds to, how far off it is, and
  * the 24-hour low and high with their times, before its returns. Narrowing,
  * the returns, the sparkline and the day change leave first, then volume, the
- * name and the high; the peg, the low and when it traded stay.
+ * name and the high, then whose the low and the price are (the footer then
+ * says a delay); the peg, the low and when it traded stay.
  */
 const STABLECOIN_COLUMN_SPECS: CryptoColumnSpec[] = [
   { id: "rank", label: "#", width: 3, align: "right" },
   { id: "code", label: "COIN", width: 7, align: "left" },
   { id: "name", label: "NAME", width: 10, align: "left", optional: 3 },
   { id: "price", label: "PRICE", width: 8, align: "right" },
+  { id: "priceVenueText", label: "VENUE", title: "The exchange whose own trade the price is, or the composite of several", width: 11, align: "left", optional: 0.4 },
   { id: "pegText", label: "PEG", width: 10, align: "left" },
   { id: "offPegBp", label: "OFF PEG", width: 8, align: "right" },
   { id: "low24h", label: "24H LOW", width: 8, align: "right" },
   { id: "low24hAt", label: "LOW UTC", width: 9, align: "left" },
+  { id: "low24hVenueText", label: "LOW VENUE", title: "The exchange that alone reached the low, how many of those read did, or another exchange; + an exchange whose price outside the range widened it", width: 14, align: "left", optional: 0.6 },
   { id: "high24h", label: "24H HIGH", width: 8, align: "right", optional: 1 },
   { id: "high24hAt", label: "HIGH UTC", width: 9, align: "left", optional: 2 },
+  { id: "high24hVenueText", label: "HIGH VENUE", title: "The exchange that alone reached the high, how many of those read did, or another exchange; + an exchange whose price outside the range widened it", width: 14, align: "left", optional: 2.5 },
   { id: "changePercent", label: "CHG% UTC", title: "Change since 00:00 UTC", width: 8, align: "right", optional: 5 },
   { id: "return7d", label: "7D%", width: 8, align: "right", optional: 6 },
   { id: "return30d", label: "30D%", width: 8, align: "right", optional: 8 },
@@ -491,6 +601,10 @@ const STABLECOIN_SUPPLY_COLUMN_SPECS: CryptoColumnSpec[] = [
   { id: "supply30d", label: "SUP 30D", width: 8, align: "right", optional: 4.8 },
   { id: "supplyShare", label: "SHARE", width: 7, align: "right", optional: 3.8 },
 ];
+
+/** Every column a header click sorts by: all but the sparkline. */
+const SORTABLE_COLUMNS = new Set<string>([...COLUMN_SPECS, ...STABLECOIN_COLUMN_SPECS, ...STABLECOIN_SUPPLY_COLUMN_SPECS]
+  .map((column) => column.id).filter((id) => id !== "trend"));
 
 const MAX_NAME_WIDTH = 24;
 

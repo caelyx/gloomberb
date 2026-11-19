@@ -1,5 +1,5 @@
 import type { SecFilingItem } from "../../../types/data-provider";
-import { formatCompact, formatCurrency } from "../../../utils/format";
+import { formatCompact, formatCurrencyCode } from "../../../utils/format";
 import { parseForm4Xml, parseForm4Disclosure, transactionTypeLabel, type InsiderTransaction, type InsiderFilingDisclosure, type InsiderReportingOwner } from "./insider-data";
 import { affectingInsiderAmendments, buildInsiderAmendmentScopes, isAmendedInsiderFiling } from "./amendments";
 import { formatInsiderName, isOpenMarketTrade, shortInsiderRole } from "./display";
@@ -94,12 +94,29 @@ export function matchesInsiderTypeFilter(entry: ParsedInsiderFiling, filter: Ins
   return true;
 }
 
-export function buildInsiderDisclosureText(entry: ParsedInsiderFiling): string {
+/** Heads the footnotes a transaction's own line does not cite, under the ones it does. */
+export const OTHER_FILING_NOTES_LABEL = "Other notes on this filing";
+
+/**
+ * A row's remarks and footnotes: the notes its own line cites first, in the
+ * order it cites them (a sale's weighted-average range and its 10b5-1 plan),
+ * then the filing's remarks, then the notes on its other lines under their own
+ * heading, so a sale never reads the tax withholding's note above its own.
+ */
+export function buildInsiderDisclosureText(entry: ParsedInsiderFiling, { byLine = true }: { byLine?: boolean } = {}): string {
   const disclosure = entry.disclosure;
   if (!disclosure) return "";
+  const byId = new Map(disclosure.footnotes.map((note) => [note.id, note]));
+  // `byLine: false` reads the filing as a whole (a 4/A's note under its rows): its remarks, then every note in order.
+  const own = byLine ? (entry.transaction?.footnoteIds ?? []).flatMap((id) => byId.get(id) ?? []) : [];
+  const ownIds = new Set(own.map((note) => note.id));
+  const others = disclosure.footnotes.filter((note) => !ownIds.has(note.id));
+  const line = (note: { id: string; text: string }) => `${note.id}: ${note.text}`;
   return [
+    ...own.map(line),
     disclosure.remarks ? `Remarks: ${disclosure.remarks}` : "",
-    ...disclosure.footnotes.map((note) => `${note.id}: ${note.text}`),
+    ...(own.length > 0 && others.length > 0 ? [OTHER_FILING_NOTES_LABEL] : []),
+    ...others.map(line),
   ].filter(Boolean).join("\n\n");
 }
 
@@ -116,9 +133,35 @@ export interface InsiderSummaryFigures {
   totals: InsiderSideTotal[];
   /** Some loaded filings could not be read into complete transactions. */
   incomplete: boolean;
+  /**
+   * The trade dates the totals count, as UTC days (YYYY-MM-DD): from the first
+   * day inside the 90 days to today. A total is by trade date, not filing date.
+   */
+  window: { from: string; to: string };
+  /** The loaded filings the totals were read from, each counted once. */
+  filings: number;
 }
 
-/** Totals of the loaded non-derivative buys and sales in the last 90 days, by security and side. */
+/** Words a filer adds or leaves out without naming another class: "Common Stock" and "Common" are one. */
+const SECURITY_FILLER_WORDS = new Set(["stock", "stocks", "share", "shares"]);
+
+/**
+ * One key for every spelling filers give the same class of security: "Common
+ * Stock", "Common", "COMMON STOCK, $0.001 PAR VALUE" and "Common Stock, par
+ * value $.01 per share" are one class, and so are "Class A Common Stock" and
+ * "Common Stock, Class A". Class A and Class B, common and preferred, Series A
+ * and Series B stay apart.
+ */
+export function securityClassKey(title: string): string {
+  const words = title.toLowerCase()
+    // A par or nominal value tail names the same shares: ", par value $0.0001 per share", "$.01 par value".
+    .replace(/(?:[$€£]?\s*\d*\.?\d+\s*)?\b(?:par(?:\s+value)?|nominal\s+value|stated\s+value)\b.*$/, " ")
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word && !SECURITY_FILLER_WORDS.has(word));
+  return words.length ? [...new Set(words)].sort().join(" ") : title.trim().toLowerCase();
+}
+
+/** Totals of the loaded non-derivative buys and sales in the last 90 days, by class of security and side. */
 export function buildInsiderSummaryFigures(parsed: readonly ParsedInsiderFiling[], now = Date.now(), context: readonly ParsedInsiderFiling[] = parsed): InsiderSummaryFigures | null {
   if (parsed.some(({ isLoading }) => isLoading)) return null;
   const amendments = buildInsiderAmendmentScopes(context);
@@ -127,8 +170,10 @@ export function buildInsiderSummaryFigures(parsed: readonly ParsedInsiderFiling[
     if (isInsiderDisclosureOnly(entry)) return false;
     return !transaction?.filingDate || transaction.shares == null || !transaction.transactionType || !transaction.securityTitle;
   });
-  const cutoff = now - NINETY_DAYS_MS;
+  const cutoff = insiderSummaryCutoff(now);
   const totals = new Map<string, InsiderSideTotal>();
+  // Shares under each spelling of a class, so a total is named the way most of its shares were filed.
+  const spellings = new Map<string, Map<string, number>>();
   for (const entry of parsed) {
     const { transaction } = entry;
     if (!transaction || transaction.isDerivative || transaction.shares == null || !transaction.securityTitle) continue;
@@ -136,15 +181,23 @@ export function buildInsiderSummaryFigures(parsed: readonly ParsedInsiderFiling[
     if (date == null || !Number.isFinite(date) || date < cutoff || date > now) continue;
     if (transaction.transactionType !== "P" && transaction.transactionType !== "S") continue;
     const security = transaction.securityTitle;
-    const key = `${security}:${transaction.transactionType}`;
+    const key = `${securityClassKey(security)}:${transaction.transactionType}`;
     const total = totals.get(key) ?? { security, side: transaction.transactionType, shares: 0, value: 0, knownValue: true, unreconciled: false };
     total.unreconciled ||= affectingInsiderAmendments(entry, amendments).length > 0;
     total.shares += transaction.shares;
     total.knownValue &&= transaction.totalValue != null;
     total.value += transaction.totalValue ?? 0;
     totals.set(key, total);
+    const filed = spellings.get(key) ?? new Map<string, number>();
+    filed.set(security, (filed.get(security) ?? 0) + transaction.shares);
+    spellings.set(key, filed);
   }
-  return { totals: [...totals.values()], incomplete };
+  for (const [key, total] of totals) {
+    const filed = [...spellings.get(key)!];
+    total.security = filed.reduce((best, entry) => (entry[1] > best[1] ? entry : best), filed[0]!)[0];
+  }
+  const filings = new Set(parsed.map(({ filing }) => filing.accessionNumber)).size;
+  return { totals: [...totals.values()], incomplete, window: insiderSummaryWindow(now), filings };
 }
 
 /** The oldest filing date that the 90-day totals need loaded before they cover the whole window. */
@@ -152,16 +205,29 @@ export function insiderSummaryCutoff(now = Date.now()): number {
   return now - NINETY_DAYS_MS;
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The trade dates the 90-day totals count, as UTC days: a trade is dated to
+ * its day's midnight, so the first day counted is the first whose midnight is
+ * inside the window, and the last is today.
+ */
+function insiderSummaryWindow(now = Date.now()): { from: string; to: string } {
+  const first = Math.ceil(insiderSummaryCutoff(now) / DAY_MS) * DAY_MS;
+  return { from: new Date(first).toISOString().slice(0, 10), to: new Date(now).toISOString().slice(0, 10) };
+}
+
 /** Summarize only loaded non-derivative buys/sales, grouped by security. */
 export function buildInsiderSummary(parsed: ParsedInsiderFiling[], now = Date.now(), context: readonly ParsedInsiderFiling[] = parsed): string | null {
   const figures = buildInsiderSummaryFigures(parsed, now, context);
   if (!figures) return null;
-  const prefix = "Loaded filings, last 90 days: ";
+  // What the totals count, said before them: the filings read, and the trade dates, not the filing dates.
+  const prefix = `${figures.filings} loaded ${figures.filings === 1 ? "filing" : "filings"}, trades dated ${figures.window.from} to ${figures.window.to}: `;
   const coverage = figures.incomplete ? " | Some transactions unavailable or incomplete." : "";
   if (figures.totals.length === 0) return `${prefix}no parsed non-derivative buys/sales.${coverage}`;
   return prefix + figures.totals.map((total) => total.unreconciled
     ? `${total.security}: ${total.side === "P" ? "Buy" : "Sale"} total unavailable (unreconciled amendment)`
-    : `${total.security}: ${total.side === "P" ? "Bought" : "Sold"} ${formatCompact(total.shares)} shares (${total.knownValue ? formatCurrency(total.value) : "value unavailable"})`).join(" | ") + coverage;
+    : `${total.security}: ${total.side === "P" ? "Bought" : "Sold"} ${formatCompact(total.shares)} shares (${total.knownValue ? formatCurrencyCode(total.value, "USD") : "value unavailable"})`).join(" | ") + coverage;
 }
 
 export function buildInsiderRows(parsed: readonly ParsedInsiderFiling[], context: readonly ParsedInsiderFiling[] = parsed) {

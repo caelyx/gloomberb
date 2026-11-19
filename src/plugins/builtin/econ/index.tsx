@@ -1,4 +1,4 @@
-import { Box, useUiCapabilities } from "../../../ui";
+import { Box, useShortcutLabel, useUiCapabilities } from "../../../ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { TextAttributes, type ScrollBoxRenderable } from "../../../ui";
 import { COUNTRY_FLAG_CELLS, withCountryFlag } from "../../../components/ui/country-flag";
@@ -36,10 +36,16 @@ import {
   FILTER_CYCLE,
   attachEconCalendarPersistence,
   actualColor,
+  actualMayBeBlank,
+  AWAITING_FIGURE_CELL,
+  awaitsConsensus,
+  figureGap,
+  figureGapText,
+  NO_FIGURE_CELL,
   calendarDisplayRows,
   CALENDAR_TIME_ZONE_LABEL,
-  dateKey,
   dayLabel,
+  econEventName,
   filteredEmptyTitle,
   formatStaleness,
   getCalendarCache,
@@ -50,8 +56,14 @@ import {
   eventCountry,
   matchesCountry,
   matchesImpact,
+  NO_CONSENSUS_NOTE,
+  countriesNotInCalendar,
   noScheduledReleasesMessage,
+  notInCalendarMessage,
+  noTimeNote as noTimeNoteText,
   parseCountryFilter,
+  listingEnd,
+  pastListingRows,
   resetEconCalendarPersistence,
   shortCalendarEnd,
   shortDayLabel,
@@ -63,6 +75,8 @@ import {
   type EconCalendarLoadResult,
   type ImpactFilter,
 } from "./calendar-model";
+import { figureWithCurrency } from "./figures";
+import { MISSING_VALUE } from "../../../utils/format";
 import { usePaneStatusFooter } from "../../../components/layout/pane/status-footer";
 import { handleRefreshKey } from "../../../components/data-table/table-pane";
 import { tableColumnWidth } from "../../../components/ui/table-layout";
@@ -76,6 +90,8 @@ const IMPACT_LABELS: Record<ImpactFilter, string> = {
 };
 
 const NO_EVENTS: EconEvent[] = [];
+/** The start (UTC) of a YYYY-MM-DD day, to label it. */
+const dayStart = (day: string) => new Date(`${day}T00:00:00Z`);
 const SPELLED_IMPACT = "IMPACT";
 const SPELLED_COUNTRY = "COUNTRY";
 /** Event names this wide still read; past it the headers spell themselves out. */
@@ -95,7 +111,7 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   useEffect(() => subscribeCalendar(() => setCacheVersion((version) => version + 1)), []);
   const cached = useMemo(() => getCalendarCache(), [cacheVersion]);
   const shown = cached && (!calendar.data || cached.fetchedAt > calendar.data.fetchedAt) ? cached : calendar.data;
-  const { loading } = calendar;
+  const loading = calendar.loading || (!shown && !calendar.error);
   const events = shown?.data ?? NO_EVENTS;
   const stale = shown?.stale ?? false;
   const fetchedAt = shown?.fetchedAt ?? null;
@@ -159,7 +175,14 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   const todayStart = Math.floor(now / 86_400_000) * 86_400_000;
   // A calendar that stops short of a week ahead says where it stops.
   const listedEnd = shortCalendarEnd(events, todayStart);
-  const listedAfter = listedEnd ? `No events listed after ${shortDayLabel(listedEnd)}` : null;
+  const listedAfter = listedEnd ? `No events listed after ${shortDayLabel(dayStart(listedEnd))}` : null;
+  // Past the listing's end Gloom Cloud lists each central bank's next decision and each country's next CPI release:
+  // where the rows shown run past it, the footer says where the releases end and what follows, as the CLI does under
+  // its table.
+  const releasesThrough = useMemo(() => listingEnd(events), [events]);
+  const pastRows = useMemo(() => pastListingRows(filtered, true), [filtered]);
+  const pastRowsInFull = useMemo(() => pastListingRows(filtered), [filtered]);
+  const showsPastListing = pastRows != null;
 
   // Map from eventIdx to flat row index (for scroll tracking)
   const eventIdxToRowIdx = new Map<number, number>();
@@ -247,7 +270,7 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   }, [forcedResult, returnToPresent, setSelectedKey]);
 
   const handleRootKeyDown = useCallback((event: DataTableKeyEvent) => (
-    handleRefreshKey(event, () => void calendar.reload(), { stopPropagation: true })
+    handleRefreshKey(event, () => calendar.reload(), { stopPropagation: true })
   ), [calendar.reload]);
 
   // The desktop and the web lead each country's code with its flag.
@@ -255,9 +278,10 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   // A reader who set a time zone (`config set timezone`) gets their clock in a column beside UTC.
   const readerZone = readerTimeZone(useAppConfig().timezone);
   const columns = useMemo<EconCalendarColumn[]>(() => {
-    // The header names the zone, so the column is as wide as the header needs.
-    const timeLabelText = `TIME (${CALENDAR_TIME_ZONE_LABEL})`;
-    const timeWidth = tableColumnWidth({ width: 6, label: timeLabelText });
+    // Named by its zone, as the reader's column is by its city: "TIME (UTC)" took 13
+    // cells over "07:00" while EVENT read "GDP Growth Ra…" (review, 12 Nov 2026).
+    const timeLabelText = CALENDAR_TIME_ZONE_LABEL;
+    const timeWidth = tableColumnWidth({ width: filtered.some(isAllDayEvent) ? "All day".length : 5, label: timeLabelText });
     const actualWidth = valueColumnWidth(filtered, "actual", 9);
     const forecastWidth = valueColumnWidth(filtered, "forecast", 10);
     const priorWidth = valueColumnWidth(filtered, "prior", 9);
@@ -302,10 +326,16 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   const separatorBg = blendHex(colors.bg, colors.border, 0.3);
   const staleness = fetchedAt ? formatStaleness(fetchedAt, now) : "";
   // The calendar has events and the filters hid them all: say which, with the way back.
-  // Countries named one by one with nothing in the calendar: a quiet window there, said plainly.
+  // Countries named one by one with nothing in the calendar: a quiet window there, or one the calendar does not cover
+  // (EG, NG), said plainly.
   const unscheduled = useMemo(() => countriesWithoutEvents(countryFilter, events), [countryFilter, events]);
+  const absent = useMemo(() => countriesNotInCalendar(countryFilter, events), [countryFilter, events]);
+  const quiet = unscheduled.filter((code) => !absent.includes(code));
   const filterEmptyTitle = events.length === 0 ? null
-    : unscheduled.length > 0 && unscheduled.length === countryFilter.split(",").length ? noScheduledReleasesMessage(unscheduled).replace(/\.$/, "")
+    : unscheduled.length > 0 && unscheduled.length === countryFilter.split(",").length
+      ? [absent.length > 0 ? notInCalendarMessage(absent) : null,
+        quiet.length > 0 ? noScheduledReleasesMessage(quiet, releasesThrough ? shortDayLabel(dayStart(releasesThrough)) : null) : null]
+        .filter(Boolean).join(" ").replace(/\.$/, "")
     : filteredEmptyTitle(impactFilter, countryFilter);
   const emptyStateHint = !loading && !error
     ? [
@@ -322,7 +352,7 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
     : formatCountdown(nextEvent.date.getTime() - now);
   // The countdown changes every tick, so it is footer status, not query bar
   // context; the footer ellipsizes a long event name.
-  const nextText = nextEvent && nextCountdown ? `next ${nextEvent.event} ${nextCountdown}` : null;
+  const nextText = nextEvent && nextCountdown ? `next ${econEventName(nextEvent)} ${nextCountdown}` : null;
   // The cached first paint is being replaced; its age only counts once a load has answered.
   const showStale = stale && (!loading || calendar.updatedAt !== null);
   // An empty list says it in its empty state instead.
@@ -330,25 +360,55 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   // What the High filter, where the calendar opens, leaves out, and the key that lists it (Shift+F steps back to All).
   const hiddenCount = useMemo(() => lowerImpactHidden(events, impactFilter, countryFilter), [countryFilter, events, impactFilter]);
   const hiddenStatus = hiddenCount > 0 && !detailEvent ? `${hiddenCount} lower-impact hidden` : null;
+  const allImpactKey = useShortcutLabel()("Shift+F");
+  // The dash under Forecast on the row in hand, while its consensus is not in yet.
+  const focusedEvent = detailEvent ?? filtered[selectedIdx];
+  const noConsensus = !!focusedEvent && awaitsConsensus(focusedEvent);
+  // The row in hand is past its time and its figure is not in yet: when it was due, or that the source has none.
+  const focusedGap = focusedEvent ? figureGap(focusedEvent, now, events) : null;
+  const awaitedFigure = focusedEvent && focusedGap ? figureGapText(focusedEvent, focusedGap) : null;
+  // The blank time on the row in hand, with why: a bank whose calendar gives the day and not the time.
+  const noTimeNote = focusedEvent && hasNoStatedTime(focusedEvent) ? noTimeNoteText(focusedEvent.timeNote!) : null;
+  const pastListingStatus = showsPastListing && releasesThrough && !detailEvent && !listedAfterStatus
+    ? `releases listed through ${shortDayLabel(dayStart(releasesThrough))}, then ${pastRows}` : null;
   const calendarStatus = useMemo<PaneFooterSegment[]>(() => [
     ...(hiddenStatus ? [{
       id: "hidden-impact",
       capture: true,
-      title: `${hiddenStatus}: Shift+F or Impact All lists them`,
+      title: `${hiddenStatus}: ${allImpactKey} or Impact All lists them`,
       // First and whole: the countdown and the update time give way before the key does.
-      parts: [{ text: `${hiddenStatus} (Shift+F)`, tone: "muted" as const }],
+      parts: [{ text: `${hiddenStatus} (${allImpactKey})`, tone: "muted" as const }],
     }] : []),
     ...(nextText && !detailEvent ? [{ id: "next", parts: [{ text: nextText, tone: "muted" as const }] }] : []),
     ...(listedAfterStatus ? [{ id: "listed-after", parts: [{ text: listedAfterStatus, tone: "warning" as const }] }] : []),
+    ...(pastListingStatus ? [{ id: "listed-through", parts: [{ text: pastListingStatus, tone: "muted" as const }],
+      variants: [[{ text: `releases through ${shortDayLabel(dayStart(releasesThrough!))}`, tone: "muted" as const }]] }] : []),
     ...(showStale ? [{ id: "stale", parts: [{ text: "STALE", tone: "warning" as const }] }] : []),
+    // Behind the warnings, so a narrow footer gives it up before them, and ahead of the update time, which goes first.
+    // The blank time first: of the row in hand's notes it is the one the row cannot say itself.
+    ...(noTimeNote ? [{ id: "no-time", parts: [{ text: noTimeNote, tone: "muted" as const }],
+      variants: [[{ text: "no time stated", tone: "muted" as const }]] }] : []),
+    ...(awaitedFigure ? [{ id: "awaiting-figure", parts: [{ text: awaitedFigure, tone: "warning" as const }],
+      variants: [[{ text: focusedGap === "none" ? "no figure" : "awaiting figure", tone: "warning" as const }]] }] : []),
+    ...(noConsensus ? [{ id: "no-consensus", parts: [{ text: NO_CONSENSUS_NOTE, tone: "muted" as const }],
+      variants: [[{ text: "no consensus yet", tone: "muted" as const }]] }] : []),
     ...(staleness ? [{ id: "updated", parts: [{ text: staleness, tone: "muted" as const }] }] : []),
-  ], [detailEvent, hiddenStatus, listedAfterStatus, nextText, showStale, staleness]);
+  ], [allImpactKey, awaitedFigure, detailEvent, focusedGap, hiddenStatus, listedAfterStatus, nextText, noConsensus, noTimeNote, pastListingStatus, releasesThrough, showStale, staleness]);
   // A report of the pane (`gloom fn ECO`) says it too.
-  const listedThrough = listedEnd ? dateKey(listedEnd) : null;
+  const listedThrough = listedEnd;
   useRemoteUiNode(listedAfter && listedThrough ? {
     role: "report-notice",
     label: "Listed through",
     getMetadata: () => ({ text: listedAfter, key: "listedThrough", value: listedThrough }),
+  } : null);
+  useRemoteUiNode(pastListingStatus && releasesThrough ? {
+    role: "report-notice",
+    label: "Releases listed through",
+    getMetadata: () => ({
+      text: `No releases listed after ${releasesThrough}; the rows after it are ${pastRowsInFull}.`,
+      key: "releasesListedThrough",
+      value: releasesThrough,
+    }),
   } : null);
   useRemoteUiNode(hiddenCount > 0 ? {
     role: "report-notice",
@@ -363,6 +423,7 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
     registrationId: "econ-calendar",
     loading,
     error,
+    emptyResult: !!shown && !rows.length && !detailEvent,
     info: calendarStatus,
   });
   // The filter keys step through the choices; Shift steps back. The pane menu
@@ -413,10 +474,15 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
     const ev = row.event;
     switch (column.id) {
       case "time":
-        // A bank that states no time has none here, and its detail says why; an all-day event (a plenum, an election) says so.
-        return { text: hasNoStatedTime(ev) ? "" : isAllDayEvent(ev) ? "All day" : timeLabel(ev.date), color: colors.textMuted };
+        // A bank that states no time has a dash here, and the footer and its detail say why; an all-day event (a plenum,
+        // an election) says so.
+        return { text: hasNoStatedTime(ev) ? MISSING_VALUE : isAllDayEvent(ev) ? "All day" : timeLabel(ev.date), color: colors.textMuted };
       case "readerTime":
-        return { text: hasNoReleaseTime(ev) || !readerZone ? "" : zonedClock(ev.date.getTime(), readerZone).label, color: colors.textMuted };
+        // The reader's clock has no time to give a bank that states none: the same dash as its time.
+        return {
+          text: !readerZone ? "" : hasNoStatedTime(ev) ? MISSING_VALUE : hasNoReleaseTime(ev) ? "" : zonedClock(ev.date.getTime(), readerZone).label,
+          color: colors.textMuted,
+        };
       case "impact": {
         const indicator = impactIndicator(ev.impact);
         return {
@@ -433,18 +499,24 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
         return withCountryFlag({ text: country, color: colors.textMuted }, country, flagged);
       }
       case "event":
-        return { text: ev.event, color: colors.text };
+        return { text: econEventName(ev), color: colors.text };
+      // An amount reads with its currency beside it (-556.5B JPY), where the server says it.
       case "actual":
+        // A release past its time whose figure is not in yet says so, or that the source has none; the footer says it whole.
+        const gap = figureGap(ev, now, events);
+        if (gap) return { text: gap === "none" ? NO_FIGURE_CELL : AWAITING_FIGURE_CELL, color: colors.warning, value: null };
         return {
-          text: ev.actual ?? "—",
+          text: figureWithCurrency(ev.actual, ev.currency) ?? MISSING_VALUE,
           color: actualColor(ev.actual, ev.forecast),
+          // A release still to come, or one with no figure to print: its dash is no figure lost.
+          ...(actualMayBeBlank(ev, now) ? { mayBeBlank: true } : {}),
         };
       case "forecast":
-        return { text: ev.forecast ?? "—", color: colors.textDim };
+        return { text: figureWithCurrency(ev.forecast, ev.currency) ?? MISSING_VALUE, color: colors.textDim };
       case "prior":
-        return { text: ev.prior ?? "—", color: colors.textDim };
+        return { text: figureWithCurrency(ev.prior, ev.currency) ?? MISSING_VALUE, color: colors.textDim };
     }
-  }, [flagged, readerZone]);
+  }, [events, flagged, now, readerZone]);
 
   const selectedEvent = filtered[selectedIdx];
   const filterControls = (
@@ -467,6 +539,7 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
   const detailContent = detailEvent ? (
     <EconDetailView
       event={detailEvent}
+      calendar={events}
       width={width}
       height={Math.max(height - 1, 1)}
       focused={focused}
@@ -480,7 +553,7 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
       focused={focused}
       detailOpen={!!detailEvent}
       onBack={() => setOpenKey(null)}
-      detailTitle={detailEvent?.event}
+      detailTitle={detailEvent ? econEventName(detailEvent) : undefined}
       detailContent={detailContent}
       rootWidth={width}
       rootHeight={Math.max(1, height - 1)}
@@ -512,12 +585,13 @@ function EconCalendarPane({ focused, width, height }: PaneProps) {
       renderSectionHeader={renderSectionHeader}
       renderCell={renderCell}
       selectedTextOverridesCellColor
+      status={{ loading: loading && !rows.length, error: !loading && !events.length ? error : null, subject: "economic events" }}
       emptyContent={filterEmptyTitle ? (
         <Box width="100%" paddingX={1} paddingY={1}>
           <EmptyState title={filterEmptyTitle} actions={<Button label="Show all" compact onPress={showAllEvents} />} />
         </Box>
       ) : undefined}
-      emptyStateTitle={loading ? "Loading economic events..." : listedAfter ?? "No events"}
+      emptyStateTitle={listedAfter ?? "No events"}
       emptyStateHint={emptyStateHint}
       showHorizontalScrollbar={false}
     />
@@ -532,6 +606,7 @@ export const economicCalendarModule: PluginModule = {
     id: "econ-calendar",
     reportFreshness: { status: "not-a-feed", basis: "calendar" },
     name: "Economic Calendar",
+    shareItem: { argument: true },
     icon: "E",
     component: EconCalendarPane,
     defaultPosition: "right",
@@ -576,7 +651,7 @@ export const economicCalendarModule: PluginModule = {
     description: "Upcoming economic events, releases, and indicators.",
     // "econ" stays a keyword so the old ECON prefix still finds this pane.
     keywords: ["econ", "economic", "calendar", "events", "macro", "releases", "fed", "cpi", "gdp", "rate decision", "ipca",
-      "brazil inflation", "pmi", "ism", "purchasing managers", "flash pmi"],
+      "brazil inflation", "pmi", "ism", "purchasing managers", "flash pmi", "jobs report", "nfp", "payrolls", "nonfarm"],
     // ECO MX,BR opens the calendar on those countries.
     shortcut: {
       prefix: "ECO",

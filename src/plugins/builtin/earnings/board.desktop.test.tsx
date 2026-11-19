@@ -1,5 +1,6 @@
 /** @jsxImportSource react */
 import { afterAll, beforeAll, beforeEach, expect, setSystemTime, spyOn, test } from "bun:test";
+import { outage } from "../../../test-support/outage";
 import { act, useCallback, useMemo, useState } from "react";
 import { apiClient } from "../../../api-client";
 import type { EarningsCalendarPayload, EarningsCalendarQuery, EarningsCalendarReport } from "../../../api-client/earnings";
@@ -37,7 +38,7 @@ const entry = (symbol: string, date: string, fields: Partial<EarningsCalendarRep
   implied: null, realized: null, averageMove: null, averageReports: 0, ...fields,
 });
 
-// Wed Oct 14 2026: the table reads today to Friday, the calendar Monday to Friday.
+// Wed 14 Oct 2026: the table reads today to Friday, the calendar Monday to Friday.
 const WEEK: EarningsCalendarReport[] = [
   entry("JPM", "2026-10-14", { marketCap: 700e9 }),
   entry("NFLX", "2026-10-15", { timing: "amc", marketCap: 400e9 }),
@@ -47,15 +48,17 @@ const WEEK: EarningsCalendarReport[] = [
 let nextWeek: Promise<EarningsCalendarReport[]> = Promise.resolve([]);
 
 const calendarRequests = spyOn(apiClient, "getCloudEarningsCalendar");
-// The S&P 500's holdings, two of them in Information Technology.
-const holdingsRequests = spyOn(apiClient, "getFundMembers").mockImplementation(async () => ({
-  ...ivv,
-  members: [
-    { ...member("MSFT", 0.4, 0.06), sector: "Information Technology" },
-    { ...member("JPM", 0.1, 0.03), sector: "Financials" },
-    { ...member("NVDA", 1.2, 0.08), sector: "Information Technology" },
-  ],
-}));
+const historyRequests = spyOn(apiClient, "getCloudEarningsHistory");
+const holdingsRequests = spyOn(apiClient, "getFundMembers");
+function serveHoldings() {
+  holdingsRequests.mockImplementation(async (fund: string) => ({
+    ...ivv,
+    fund: { ...ivv.fund, ticker: fund },
+    members: fund === "XLK" ? [member("MSFT", 0.4, 0.06), member("NVDA", 1.2, 0.08)]
+      : fund === "SOXX" ? [member("NVDA", 1.2, 0.08), member("A", 0.4, 0.06)]
+        : fund === "XBI" ? [member("B", 0.4, 0.06)] : [],
+  }));
+}
 beforeAll(() => {
   setSystemTime(new Date("2026-10-14T15:00:00Z"));
   setSharedRegistryForTests({ commands: new Map([["set-event-alert", {}]]) } as never);
@@ -64,6 +67,7 @@ afterAll(() => {
   setSystemTime();
   setSharedRegistryForTests(undefined);
   calendarRequests.mockRestore();
+  historyRequests.mockRestore();
   holdingsRequests.mockRestore();
   resetEarningsCloudCaches();
   fundMembersCache.reset();
@@ -73,6 +77,9 @@ beforeEach(() => {
   resetEarningsCloudCaches();
   fundMembersCache.reset();
   holdingsRequests.mockClear();
+  calendarRequests.mockClear();
+  historyRequests.mockImplementation(async (symbol) => ({ asOf: "2026-10-14T15:00:00Z", symbol, name: null, reports: [] }));
+  serveHoldings();
   serve();
 });
 
@@ -88,10 +95,10 @@ function serve() {
   });
 }
 
-function Harness() {
+function Harness({ highlight = null, settings = {} }: { highlight?: string | null; settings?: Record<string, unknown> } = {}) {
   const [paneState, setPaneState] = useState<AppState["paneState"]>({});
   const state = useMemo(() => {
-    const next = createInitialState(createTestPaneConfig("/tmp/gloomberb-ern-board-test", { paneId: "earnings-calendar", instanceId: PANE }));
+    const next = createInitialState(createTestPaneConfig("/tmp/gloomberb-ern-board-test", { paneId: "earnings-calendar", instanceId: PANE, settings }));
     next.paneState = paneState;
     next.focusedPaneId = PANE;
     next.tickers = new Map([
@@ -99,7 +106,7 @@ function Harness() {
       ["JPM", createTestTicker("JPM", "JPMorgan", { portfolios: ["main"] })],
     ]);
     return next;
-  }, [paneState]);
+  }, [paneState, settings]);
   dispatch = useCallback((action: AppAction) => setPaneState((current) => appReducer({ ...state, paneState: current }, action).paneState), [state]);
   // The desktop's own host, so the query bar is the one the app draws.
   const ui = useMemo(() => createDomUiHost("linux"), []);
@@ -110,7 +117,7 @@ function Harness() {
         <TestPaneProvider state={state} dispatch={dispatch} paneId={PANE} pluginId="earnings" runtime={runtime}>
           <PaneFooterProvider>{(value) => {
             footer = value;
-            return <EarningsBoard focused scopedSymbols={MARKET} width={80} height={40} />;
+            return <EarningsBoard focused scopedSymbols={MARKET} highlight={highlight} width={80} height={40} />;
           }}</PaneFooterProvider>
         </TestPaneProvider>
         </WebDialogHostProvider>
@@ -132,6 +139,84 @@ const viewOption = (root: HTMLElement, label: string) => [...root.querySelectorA
 const pick = (element: HTMLElement) => act(async () => { element.click(); });
 const setWeek = (week: number) => act(async () => {
   dispatch({ type: "UPDATE_PLUGIN_PANE_STATE", paneId: PANE, pluginId: "earnings", key: "range", value: String(week) });
+});
+
+for (const date of ["2027-01-28", "2026-07-30"]) {
+  test(`EVTS lands on AAPL's ${date} report outside the initial window and keeps the market board`, async () => {
+    historyRequests.mockImplementation(async (symbol) => ({
+      asOf: "2026-10-14T15:00:00Z", symbol, name: null,
+      reports: [{ ...entry(symbol, date), revenueActual: null }],
+    }));
+    calendarRequests.mockImplementation(async (query) => ({
+      asOf: "2026-10-14T15:00:00Z", from: query.from, to: query.to,
+      reports: [entry("AAPL", date), entry("MSFT", date)].filter((report) => report.date >= query.from && report.date <= query.to),
+    }));
+    const root = await dom.render(<Harness highlight="AAPL" />);
+    await settle();
+    await settle();
+    expect(rowKeys(root)).toEqual(expect.arrayContaining([`AAPL:${date}`, `MSFT:${date}`]));
+    expect(root.querySelector(`[data-gloom-row-key='AAPL:${date}']`)?.getAttribute("data-selected")).toBe("true");
+    expect(calendarRequests.mock.calls.at(-1)?.[0]).toMatchObject({ from: date, to: date, perDay: 200, symbols: expect.arrayContaining(["AAPL"]) });
+  });
+}
+
+test("EVTS says when the named company has no report date instead of silently ignoring it", async () => {
+  await dom.render(<Harness highlight="AAPL" />);
+  await settle();
+  expect(footer.info.flatMap((segment) => segment.parts.map((part) => part.text)).join(" ")).toContain("No report date for AAPL");
+  expect(footer.info.find((segment) => segment.id === "highlight")?.capture).toBe(true);
+});
+
+test("a report outside the stored board's horizon uses ERN's next date and figures without losing the other companies", async () => {
+  historyRequests.mockImplementation(async (symbol) => ({
+    asOf: "2026-10-14T15:00:00Z", symbol, name: "Apple Inc.", reports: [
+      { ...entry(symbol, "2027-04-29", { fiscalPeriod: "2027-03" }), revenueActual: null },
+      { ...entry(symbol, "2027-01-28", { fiscalPeriod: "2026-12", epsEstimate: 2.5 }), revenueActual: null },
+      { ...entry(symbol, "2026-07-30", { fiscalPeriod: "2026-06", epsActual: 1.5 }), revenueActual: null },
+    ],
+  }));
+  calendarRequests.mockImplementation(async (query) => ({
+    asOf: "2026-10-14T15:00:00Z", from: query.from, to: query.to, reports: [entry("MSFT", "2027-01-28")],
+  }));
+  const root = await dom.render(<Harness highlight="AAPL" />);
+  await settle();
+  await settle();
+  expect(rowKeys(root)).toEqual(expect.arrayContaining(["AAPL:2027-01-28", "MSFT:2027-01-28"]));
+  const row = root.querySelector("[data-gloom-row-key='AAPL:2027-01-28']");
+  expect(row?.getAttribute("data-selected")).toBe("true");
+  expect(row?.textContent).toContain("2.50");
+});
+
+test("an explicit range and a later user choice stay put and say where the highlighted company reports", async () => {
+  historyRequests.mockImplementation(async (symbol) => ({
+    asOf: "2026-10-14T15:00:00Z", symbol, name: null, reports: [{ ...entry(symbol, "2027-01-28"), revenueActual: null }],
+  }));
+  await dom.render(<Harness highlight="AAPL" settings={{ week: "last" }} />);
+  await settle();
+  await settle();
+  expect(calendarRequests.mock.calls.at(-1)?.[0]).toMatchObject({ from: "2026-10-05", to: "2026-10-09" });
+  expect(footer.info.flatMap((segment) => segment.parts.map((part) => part.text)).join(" ")).toContain("AAPL reports on 2027-01-28; not in this range");
+  await setWeek(0);
+  await settle();
+  expect(calendarRequests.mock.calls.at(-1)?.[0]).toMatchObject({ from: "2026-10-12", to: "2026-10-16" });
+});
+
+test("a failed history refresh keeps the highlighted report and marks its cached figures stale", async () => {
+  historyRequests.mockImplementation(async (symbol) => ({
+    asOf: "2026-10-14T15:00:00Z", symbol, name: null, reports: [{ ...entry(symbol, "2027-01-28"), revenueActual: null }],
+  }));
+  const root = await dom.render(<Harness highlight="AAPL" />);
+  await settle();
+  await settle();
+  expect(rowKeys(root)).toContain("AAPL:2027-01-28");
+  historyRequests.mockRejectedValue(outage("History refresh failed"));
+  await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "r", bubbles: true, cancelable: true })));
+  await settle();
+  await settle();
+  expect(rowKeys(root)).toContain("AAPL:2027-01-28");
+  const status = footer.info.flatMap((segment) => segment.parts.map((part) => part.text)).join(" ");
+  expect(status).toContain("History refresh failed");
+  expect(status).toContain("stale");
 });
 
 test("the table and the calendar share the cursor, and +N more opens its group in the calendar", async () => {
@@ -187,7 +272,7 @@ test("another week shows no reports of its own until it is read, and its failure
   nextWeek = Promise.resolve([]);
   await setWeek(2);
   await settle();
-  expect(root.textContent).toContain("No reports on the calendar in the week of Oct 26.");
+  expect(root.textContent).toContain("No reports on the calendar in the week of 26 Oct.");
 });
 
 test("the Names filter lists Mine, each portfolio and watchlist and the sector funds, and reads only the chosen one's companies", async () => {
@@ -212,11 +297,75 @@ test("the Names filter lists Mine, each portfolio and watchlist and the sector f
   expect(lastSymbols()).toEqual(["NFLX"]);
   expect(rowKeys(root)).toEqual(["NFLX:2026-10-15"]);
 
-  // A sector fund's companies are the S&P 500's holdings in its sector, largest first.
+  // Each fund reads its own holdings, including industry members outside the broad sector fund.
   await choose("Technology (XLK)");
-  expect(holdingsRequests).toHaveBeenCalledWith("IVV");
+  expect(holdingsRequests).toHaveBeenCalledWith("XLK");
   expect(lastSymbols()).toEqual(["NVDA", "MSFT"]);
+
+  await choose("Semiconductors (SOXX)");
+  expect(holdingsRequests).toHaveBeenLastCalledWith("SOXX");
+  expect(lastSymbols()).toEqual(["NVDA", "A"]);
+  expect(rowKeys(root)).toEqual(["A:2026-10-16"]);
+
+  await choose("Biotech (XBI)");
+  expect(holdingsRequests).toHaveBeenLastCalledWith("XBI");
+  expect(lastSymbols()).toEqual(["B"]);
+  expect(rowKeys(root)).toEqual(["B:2026-10-16"]);
+
+  // Reusing a fund must show its cached calendar, never the last industry's rows.
+  const reads = calendarRequests.mock.calls.length;
+  await choose("Technology (XLK)");
+  expect(calendarRequests.mock.calls.length).toBe(reads);
+  expect(rowKeys(root)).toEqual([]);
 
   await choose("Mine");
   expect([...lastSymbols()!].sort()).toEqual(["JPM", "NFLX"]);
+}, 15_000);
+
+
+test("failed or empty industry holdings never show the previous market or request an unfiltered calendar", async () => {
+  const pending = Promise.withResolvers<typeof ivv>();
+  holdingsRequests.mockImplementation(async () => pending.promise);
+  const root = await dom.render(<Harness />);
+  await settle();
+  expect(rowKeys(root)).toContain("NFLX:2026-10-15");
+  const calendarReads = calendarRequests.mock.calls.length;
+
+  await act(async () => dispatch({ type: "UPDATE_PLUGIN_PANE_STATE", paneId: PANE, pluginId: "earnings", key: "scope", value: "industry:SOXX" }));
+  await settle();
+  expect(rowKeys(root)).toEqual([]);
+  expect(root.textContent).toContain("Names");
+  expect(root.querySelector("[data-gloom-status=loading]")).not.toBeNull();
+
+  await act(async () => pending.reject(new Error("Holdings unavailable")));
+  await settle();
+  expect(rowKeys(root)).toEqual([]);
+  expect(root.querySelector("[data-gloom-status=error]")).not.toBeNull();
+  expect(root.textContent).toContain("Names");
+  expect(calendarRequests.mock.calls.length).toBe(calendarReads);
+
+  holdingsRequests.mockImplementation(async () => ({ ...ivv, members: [] }));
+  await act(async () => dispatch({ type: "UPDATE_PLUGIN_PANE_STATE", paneId: PANE, pluginId: "earnings", key: "scope", value: "industry:XBI" }));
+  await settle();
+  expect(rowKeys(root)).toEqual([]);
+  expect(root.querySelector("[data-gloom-status=error]")).toBeNull();
+  expect(calendarRequests.mock.calls.length).toBe(calendarReads);
+});
+
+test("a failed holdings refresh keeps the same industry's rows and marks its cached membership stale", async () => {
+  const root = await dom.render(<Harness />);
+  await settle();
+  await act(async () => dispatch({ type: "UPDATE_PLUGIN_PANE_STATE", paneId: PANE, pluginId: "earnings", key: "scope", value: "industry:XBI" }));
+  await settle();
+  expect(rowKeys(root)).toEqual(["B:2026-10-16"]);
+  const reads = holdingsRequests.mock.calls.length;
+
+  holdingsRequests.mockRejectedValueOnce(outage("Holdings refresh failed"));
+  await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "r", bubbles: true, cancelable: true })));
+  await settle();
+  expect(holdingsRequests.mock.calls.length).toBe(reads + 1);
+  expect(rowKeys(root)).toEqual(["B:2026-10-16"]);
+  const status = footer.info.flatMap((segment) => segment.parts.map((part) => part.text)).join(" ");
+  expect(status).toContain("Holdings refresh failed");
+  expect(status).toContain("stale");
 });

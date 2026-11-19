@@ -3,6 +3,7 @@ import { act, useState } from "react";
 import { apiClient } from "../../../api-client";
 import type { CotBoardPayload, CotBoardRow, CotClass, CotClassSummary, CotContractPayload } from "../../../api-client/cot";
 import { PaneFooterProvider } from "../../../components/layout/pane/footer";
+import { resetFuturesPriceUnits } from "../../../market-data/futures-contract";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { appReducer, createInitialState, type AppAction, type AppState } from "../../../state/app/context";
 import { createTestPaneConfig, TestPaneProvider } from "../../../test-support/pane";
@@ -69,25 +70,57 @@ const spies: Array<{ mockRestore(): void }> = [];
 
 beforeEach(() => {
   cotBoardCache.reset();
+  // The front price's unit is remembered for the session; each test asks for it afresh.
+  resetFuturesPriceUnits();
   spies.push(
     spyOn(apiClient, "getCloudCotBoard").mockImplementation(async () => board()),
     spyOn(apiClient, "getCloudCotContract").mockImplementation(async (code: string) => contract(code)),
     spyOn(apiClient, "getCloudHistory").mockRejectedValue(new Error("price history offline in tests")),
+    // The unit falls back to the futures catalog's, as with no terms on the server.
+    spyOn(apiClient, "getCloudFuturesContract").mockRejectedValue(new Error("contract terms offline in tests")),
   );
 });
 
 afterEach(() => {
   for (const spy of spies.splice(0)) spy.mockRestore();
   cotBoardCache.reset();
+  resetFuturesPriceUnits();
 });
 
 const paneRuntime = createTestPluginRuntime();
 
+test("a reused COT pane follows the ICE command over its stored legacy tab and closed detail", async () => {
+  const market = { contractCode: "ICE00B", marketName: "ICE Brent Crude Futures - ICE Futures Europe", exchangeCode: "ICEU", commodityCode: "B", contractUnits: "CONTRACTS OF 1,000 BARRELS" };
+  const money = position("managed-money", "Managed Money", 290089, 118486);
+  const common = { ...base, source: "ICE Futures Europe" as const, reportFamily: "disaggregated" as const, asOf: "2026-11-03", classes: [{ id: "managed-money" as const, label: "Managed Money" }] };
+  const asked: unknown[][] = [];
+  spies.push(spyOn(apiClient, "getCloudCotBoard").mockImplementation(async (family) => family === "legacy" ? board() : ({ ...common, gaps: [], traderClass: "managed-money", rows: [{ ...market, reportDate: "2026-11-03", openInterest: 2433965, position: money, status: "available" }] })));
+  spies.push(spyOn(apiClient, "getCloudCotContract").mockImplementation(async (...args) => {
+    asked.push(args);
+    return { ...common, gaps: [], contract: market, sourceUrl: null, openInterest: 2433965, positions: [money], history: [{ reportDate: "2026-11-03", openInterest: 2433965, positions: [money] }] };
+  }));
+  const previous = { [PANE_INSTANCE_ID]: { pluginState: { cot: { report: "legacy", open: "", selected: "067651" } } } };
+  let retarget!: (request: { report: string; code: string; requestAt: string }) => void;
+  function ReusedPane() {
+    const [request, setRequest] = useState({ report: "legacy", code: "067651", requestAt: "1" });
+    retarget = setRequest;
+    return <Harness workspace initialPaneState={previous} {...request} />;
+  }
+  await tui.render(<ReusedPane />, { width: 110, height: 28 });
+  await settle();
+  await act(async () => retarget({ report: "disaggregated", code: "ICE00B", requestAt: "2" }));
+  await settleDetail();
+  expect(asked[0]?.slice(0, 2)).toEqual(["ICE00B", "disaggregated"]);
+  expect(tui.frame()).toContain("Managed Money");
+  expect(tui.frame()).toContain("290,089");
+  expect((apiClient.getCloudHistory as unknown as { mock: { calls: unknown[][] } }).mock.calls[0]?.[0]).toBe("BZ=F");
+});
+
 /** A COT pane created by typing COT with CL active: the template puts the code in params. */
-function Harness({ width = 110, height = 28 }: { width?: number; height?: number }) {
-  const [paneState, setPaneState] = useState<AppState["paneState"]>({});
+function Harness({ width = 110, height = 28, report = "legacy", code = "067651", workspace = false, requestAt = "", initialPaneState = {} }: { width?: number; height?: number; report?: string; code?: string | null; workspace?: boolean; requestAt?: string; initialPaneState?: AppState["paneState"] }) {
+  const [paneState, setPaneState] = useState<AppState["paneState"]>(initialPaneState);
   const state = createInitialState(createTestPaneConfig("/tmp/gloomberb-cot-pane-test", {
-    paneId: "cot", instanceId: PANE_INSTANCE_ID, params: { code: "067651" }, settings: { report: "legacy" },
+    paneId: workspace ? "commodities-energy" : "cot", instanceId: PANE_INSTANCE_ID, params: code ? { code, cotReport: report, tab: "positioning", tabAt: requestAt } : undefined, settings: { report },
   }));
   state.paneState = paneState;
   const dispatch = (action: AppAction) => setPaneState(
@@ -107,6 +140,25 @@ async function settle(times = 6) {
       await tui.setup().renderOnce();
     });
   }
+}
+
+type AskedSpy = { mock: { results: Array<{ value: unknown }> } };
+
+/**
+ * Renders until the open detail has its answers: its contract, the front
+ * price's history and the contract terms the price's unit comes from, each
+ * asked for and settled. The chart draws once the contract and history are
+ * in; the unit joins its legend when the terms answer.
+ */
+async function settleDetail() {
+  const asked = { contract: apiClient.getCloudCotContract, history: apiClient.getCloudHistory, terms: apiClient.getCloudFuturesContract };
+  const unasked = () => Object.entries(asked).filter(([, spy]) => !(spy as unknown as AskedSpy).mock.results.length).map(([name]) => name);
+  for (let turn = 0; turn < 50 && unasked().length; turn += 1) await settle(1);
+  if (unasked().length) throw new Error(`The detail never asked for its ${unasked().join(", ")}`);
+  await act(async () => {
+    await Promise.allSettled(Object.values(asked).flatMap((spy) => (spy as unknown as AskedSpy).mock.results.map((result) => result.value)));
+  });
+  await settle();
 }
 
 async function press(name: string) {
@@ -170,7 +222,7 @@ test("the detail charts the selected class's net and the front price over every 
   useChartedContract();
   // The default floating size's body.
   await tui.render(<Harness width={104} height={28} />, { width: 104, height: 28 });
-  await settle();
+  await settleDetail();
 
   let lines = tui.frame().split("\n");
   const legend = lines.findIndex((line) => line.includes("• Noncommercial net +159,000"));
@@ -191,10 +243,73 @@ test("the detail charts the selected class's net and the front price over every 
 test("a short detail keeps the class rows and folds the chart into a strip", async () => {
   useChartedContract();
   await tui.render(<Harness width={60} height={10} />, { width: 60, height: 10 });
-  await settle();
+  await settleDetail();
 
   const lines = tui.frame().split("\n");
   expect(lines.some((line) => line.includes("● Noncommercial net") && line.includes("+159,000"))).toBe(true);
   expect(lines.some((line) => line.includes("Front price"))).toBe(false);
   expect(lines.filter((line) => /^ (Noncommercial|Commercial|Nonreportable) /.test(line))).toHaveLength(3);
+});
+
+test("the Financial (TFF) tab reads leveraged funds, and Positions switches the board and its detail to futures and options", async () => {
+  const boards = spyOn(apiClient, "getCloudCotBoard").mockImplementation(async (report, traderClass, positions = "futures-only") => ({
+    ...board(), reportFamily: report, scope: positions, traderClass,
+    classes: [{ id: "leveraged-funds", label: "Leveraged Funds" }],
+    rows: board().rows.map((row) => ({ ...row, position: position("leveraged-funds", "Leveraged Funds", positions === "combined" ? 40 : 10) })),
+  }));
+  const contracts = spyOn(apiClient, "getCloudCotContract").mockImplementation(async (code, report, positions = "futures-only") => ({
+    ...contract(code), reportFamily: report, scope: positions, classes: [{ id: "leveraged-funds", label: "Leveraged Funds" }],
+    positions: [position("leveraged-funds", "Leveraged Funds")],
+    history: [{ reportDate: "2026-09-15", openInterest: 200, positions: [{ id: "leveraged-funds", long: 10, short: 30, spreading: 0, net: -20, netPercentOfOpenInterest: -10 }] }],
+  }));
+  spies.push(boards, contracts);
+  await tui.render(<Harness report="tff" code={null} />, { width: 110, height: 28 });
+  await settle();
+
+  let frame = tui.frame();
+  expect(frame).toContain("Financial (TFF)");
+  expect(frame).toContain("Leveraged Funds");
+  expect(frame).toContain("Futures only");
+  expect(frame).toContain("-20");
+  expect(boards.mock.calls.at(-1)).toEqual(["tff", "leveraged-funds", "futures-only"]);
+
+  await press("p");
+  expect(tui.frame()).toContain("Futures + options");
+  await press("down");
+  await press("return");
+  frame = tui.frame();
+  expect(boards.mock.calls.at(-1)).toEqual(["tff", "leveraged-funds", "combined"]);
+  expect(frame).toContain("Positions Futures + options");
+  expect(frame).toContain("+10");
+  expect(frame).not.toContain("-20");
+
+  // A market opened from the combined board reads its combined history.
+  await press("return");
+  expect(contracts.mock.calls.at(-1)).toEqual(["13874A", "tff", "combined"]);
+  expect(tui.frame()).toContain("Leveraged Funds");
+});
+
+test("a slow answer for the contract terms leaves the chart drawn, and the price's unit joins its legend when it comes", async () => {
+  useChartedContract();
+  resetFuturesPriceUnits();
+  const terms = Promise.withResolvers<unknown>();
+  spies.push(spyOn(apiClient, "getCloudFuturesContract").mockImplementation(() => terms.promise as never));
+  await tui.render(<Harness width={104} height={28} />, { width: 104, height: 28 });
+  await settle();
+
+  // The contract and the price history are in, the terms are not: the chart and its legend draw, the price bare.
+  const lines = tui.frame().split("\n");
+  const legend = lines.findIndex((line) => line.includes("• Noncommercial net +159,000"));
+  expect(legend).toBeGreaterThan(0);
+  expect(lines[legend]).toContain("+ Front price 73.9");
+  expect(lines[legend]).not.toContain("$");
+  expect(lines.findIndex((line) => line.includes("CLASS"))).toBeGreaterThan(legend + 6);
+
+  await act(async () => {
+    terms.resolve({ symbol: "CL=F", root: "CL", name: "Crude Oil", contract: null, contractSymbol: null, deliveryMonth: null,
+      spec: { unit: "USD / barrel", size: "1,000 barrels", pointValue: 1_000, tick: 0.01, tickValue: 10, settlement: "physical" },
+      lastTrade: null, firstNotice: null, inDelivery: false, settlement: null });
+  });
+  await settle();
+  expect(tui.frame().split("\n").find((line) => line.includes("• Noncommercial net +159,000"))).toContain("+ Front price $73.9/bbl");
 });

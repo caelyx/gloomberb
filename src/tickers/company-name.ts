@@ -1,3 +1,5 @@
+import type { InstrumentSearchResult } from "../types/instrument";
+
 /**
  * Company names as venues spell them, compared and shortened for sentences.
  * One company's listings carry its name with different legal forms and share
@@ -5,24 +7,63 @@
  * they are compared by the words that say whose they are.
  */
 
+// Letters that do not decompose into a plain one and an accent: Sabancı is Sabanci as venues and search spell it.
+const UNDECOMPOSED_LETTERS: Readonly<Record<string, string>> = {
+  "ı": "i", "ø": "o", "Ø": "O", "ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "đ": "d", "Đ": "D", "ł": "l", "Ł": "L",
+};
+
+/**
+ * A name's letters without their accents, as search folds them: "Türk Hava
+ * Yolları" is "Turk Hava Yollari", "BİM Mağazalar" "BIM Magazalar".
+ */
+export function foldNameLetters(text: string): string {
+  return text.normalize("NFKD").replace(/\p{M}/gu, "").replace(/[ıøØßæÆœŒđĐłŁ]/g, (letter) => UNDECOMPOSED_LETTERS[letter] ?? letter);
+}
+
 // Words that differ between one company's listings: legal forms, and how a depositary receipt is named.
 const NAME_NOISE = new Set([
   "co", "company", "corp", "corporation", "inc", "incorporated", "ltd", "limited", "llc", "lp", "plc", "sa", "ag", "nv", "se",
   "spa", "ab", "as", "asa", "oyj", "bv", "gmbh", "kgaa", "bhd", "berhad", "pcl", "the", "adr", "ads", "cedear", "cedears",
-  "sponsored", "unsponsored", "cdr", "cdi",
+  "sponsored", "unsponsored", "cdr", "cdi", "aktiengesellschaft", "aktiebolag",
+  // A Japanese company's legal form, spelled out or short: Nippon Yusen Kabushiki Kaisha is Nippon Yusen K.K.
+  "kabushiki", "kaisha", "kk",
+  // A Turkish one: Türk Hava Yolları Anonim Ortaklığı is Türk Hava Yolları A.O., Türkiye Garanti Bankası A.Ş. and T.A.Ş.
+  "anonim", "sirketi", "ortakligi",
 ]);
+// Turkish legal forms short enough to open another company's name (AO Smith, AO World): a legal form only as its last word.
+// So is a partnership limited by shares (Hermès International SCA), whatever a venue spells out.
+const LAST_WORD_NOISE = new Set(["ao", "tas", "sca"]);
+// A legal form a venue spells out in words that are no legal form alone: Hermès International Société en commandite par actions.
+const SPELLED_SCA = /\bsociete en commandite par actions\b/g;
 // Words a venue adds to the share it lists ("Microsoft Corporation Common Stock"), never part of whose it is.
-const SHARE_NOISE = new Set(["common", "ordinary", "stock", "shares"]);
+const SHARE_NOISE = new Set(["common", "ordinary", "stock", "shares", "share"]);
+// A venue's short form of a share class word, read as the word: "Volkswagen AG Pref. Share" in Zurich is its "Preferred Stock".
+const SHARE_WORD_FORMS: Readonly<Record<string, string>> = { pref: "preferred", pfd: "preferred" };
 
 /** A company's name for comparing its listings: "Kotobuki Spirits Co., Ltd." is "kotobuki spirits". */
 function companyKey(name: string): string {
-  return name.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+  const words = foldNameLetters(name).toLowerCase()
     .replace(/\([^)]*\)/g, " ")
     .replace(/\b(?:(?:american|global) )?depositary (?:shares?|receipts?)\b/g, " ")
     .replace(/\./g, "")
+    .replace(SPELLED_SCA, "sca")
     .split(/[^\p{L}\p{N}]+/u)
-    .filter((word) => word && !NAME_NOISE.has(word))
-    .join(" ");
+    .map((word) => SHARE_WORD_FORMS[word] ?? word)
+    .filter((word) => word && !NAME_NOISE.has(word));
+  // The last word before any share wording, never a name's only one.
+  let last = words.length - 1;
+  while (last > 0 && SHARE_NOISE.has(words[last]!)) last--;
+  if (last > 0 && LAST_WORD_NOISE.has(words[last]!)) words.splice(last, 1);
+  return words.join(" ");
+}
+
+/**
+ * The words `name` adds to `base`, in order, as `companyLines` compares them:
+ * ["heavy", "ind"] for "MITSUBISHI HEAVY IND. LTD." on "Mitsubishi Corporation".
+ */
+export function addedCompanyWords(name: string | null | undefined, base: string | null | undefined): string[] {
+  const own = companyWords(base);
+  return companyKey(name ?? "").split(" ").filter((word) => word && !SHARE_NOISE.has(word) && !own.has(word));
 }
 
 function companyWords(name: string | null | undefined): Set<string> {
@@ -41,6 +82,69 @@ export function sameCompany(left: string | null | undefined, right: string | nul
   if (a.size === 0 || b.size === 0) return false;
   const [fewer, more] = a.size <= b.size ? [a, b] : [b, a];
   return [...fewer].every((word) => more.has(word));
+}
+
+/**
+ * Whether two names are one company's name however each venue writes the legal
+ * form and the share wording: "Deutsche Post AG" and "Deutsche Post" are, "DHL
+ * Express" and "DHL" are not (`sameCompany` would read them as one, since one
+ * name's words are all in the other's). For a name the data service gives a
+ * company besides its own (a former name, a trade name), which a line is told
+ * by only when it is exactly that name. An empty name matches none.
+ */
+export function sameCompanyName(left: string | null | undefined, right: string | null | undefined): boolean {
+  const a = companyKey(left ?? "");
+  return a !== "" && a === companyKey(right ?? "");
+}
+
+// Words that tell one class of a company's shares from another ("Berkshire Hathaway Inc. Class B"), never its business.
+const SHARE_CLASS_WORD = /^(?:class|series|[a-z]|\d+)$/;
+
+/** Whether two names differ only in how they name a class of shares, so they are one company's whatever the venue. */
+function sameBusinessWords(left: Set<string>, right: Set<string>): boolean {
+  const differ = [...left].filter((word) => !right.has(word)).concat([...right].filter((word) => !left.has(word)));
+  return differ.every((word) => SHARE_CLASS_WORD.test(word));
+}
+
+/** A company line as `companyLines` weighs it. */
+export interface CompanyLineFacts {
+  name: string | null | undefined;
+  /** The line's canonical venue. */
+  exchange: string;
+  /** A depositary receipt, whose name says whose shares it holds rather than whose it is. */
+  receipt: boolean;
+  /** The service marks it as its company's home line (`homeListing`). */
+  home: boolean;
+}
+
+/**
+ * The lines among `lines` that are `lead`'s company's own (`sameCompany`),
+ * less those under a name that adds words for another business, though one
+ * name's words are all in the other's: Siemens Energy AG and Siemens
+ * Healthineers AG are not Siemens AG, nor Sony Financial Group Sony Group. A
+ * name is another business's where a venue lists a line under it beside a
+ * line under the lead's own name (both on XETRA, both in Tokyo), or where it
+ * and a line under the lead's name are each marked as a home line, since a
+ * company has one (Siemens Ltd. on NSE beside Siemens AG on XETRA). Receipts
+ * are named for the shares they hold, so they never tell two businesses
+ * apart, and nor do words that name a class of shares (Class B). A name with
+ * more words on no shared venue stays the company's (Deutsche Lufthansa AG on
+ * XETRA for LUFTHANSA on Budapest). `lead` is always one of them.
+ */
+export function companyLines<T>(lead: T, lines: readonly T[], facts: (line: T) => CompanyLineFacts): T[] {
+  const own = facts(lead);
+  const ownWords = companyWords(own.name);
+  const ownName = (line: CompanyLineFacts) => sameBusinessWords(companyWords(line.name), ownWords);
+  const candidates = lines.filter((line) => line === lead || sameCompany(own.name, facts(line).name));
+  const read = candidates.map((line) => ({ line, facts: facts(line), words: companyWords(facts(line).name) }));
+  const ownShares = read.filter((entry) => !entry.facts.receipt && ownName(entry.facts));
+  const ownVenues = new Set(ownShares.map((entry) => entry.facts.exchange).filter(Boolean));
+  const ownHome = ownShares.some((entry) => entry.facts.home);
+  // A name another business goes by, once one of its share lines gives it away: all its lines are that business's.
+  const others = read.filter((entry) => !entry.facts.receipt && !ownName(entry.facts)
+    && ((!!entry.facts.exchange && ownVenues.has(entry.facts.exchange)) || (entry.facts.home && ownHome)));
+  const otherBusiness = (words: Set<string>) => others.some((other) => sameBusinessWords(other.words, words));
+  return read.filter((entry) => entry.line === lead || ownName(entry.facts) || !otherBusiness(entry.words)).map((entry) => entry.line);
 }
 
 /**
@@ -99,27 +203,93 @@ export function companyNameMatch(typed: string, name: string | null | undefined)
   return { extra: words.size - matched.size, abbreviated };
 }
 
-/** Items grouped by the company their names are, in the order each company first appears. Unnamed items are left out. */
-export function groupByCompany<T>(items: readonly T[], nameOf: (item: T) => string | null | undefined): T[][] {
+// Words one fund's venues name it with or without: "iShares MSCI Japan Index Fund" in New York is "iShares MSCI Japan ETF" in Mexico.
+const FUND_NOISE = new Set(["etf", "etfs", "fund", "funds", "index", "trust", "ucits"]);
+
+function instrumentWords(name: string | null | undefined): Set<string> {
+  return new Set([...companyWords(name)].filter((word) => !FUND_NOISE.has(word)));
+}
+
+/**
+ * Whether two venues' names can be one instrument's: one company's
+ * (`sameCompany`), or one fund's however a venue words it, with or without
+ * "ETF", "Index Fund" or "Trust" ("Technology Select Sector SPDR Fund" in
+ * Buenos Aires is State Street's ETF in New York). Two names that are not are
+ * another company's or another fund's ("W.A.G Payment Solutions" is not the
+ * iShares fund, nor "UBS MSCI India" iShares' India fund). An empty name
+ * matches none.
+ */
+export function sameListedName(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (sameCompany(left, right)) return true;
+  const a = instrumentWords(left);
+  const b = instrumentWords(right);
+  if (a.size === 0 || b.size === 0) return false;
+  const [fewer, more] = a.size <= b.size ? [a, b] : [b, a];
+  return [...fewer].every((word) => more.has(word));
+}
+
+/**
+ * Whether a venue names its line a depositary receipt ("Toyota Motor
+ * Corporation CEDEAR", "SS SPDR S&P 500 ETF Trust - CEDEAR"): a receipt of a
+ * line elsewhere, whose short form of that line's name says little of whose it is.
+ */
+export function namesDepositaryReceipt(name: string | null | undefined): boolean {
+  return /\b(?:cedears?|adrs?|ads|cdrs?|cdis?|depositary)\b/i.test(name ?? "");
+}
+
+/**
+ * Items grouped by the company their names are (`same`, `sameCompany` unless
+ * given), in the order each company first appears. Unnamed items are left out.
+ */
+export function groupByCompany<T>(
+  items: readonly T[],
+  nameOf: (item: T) => string | null | undefined,
+  same: (left: string | null | undefined, right: string | null | undefined) => boolean = sameCompany,
+): T[][] {
   const groups: T[][] = [];
   for (const item of items) {
     if (companyWords(nameOf(item)).size === 0) continue;
-    const group = groups.find((members) => members.some((member) => sameCompany(nameOf(member), nameOf(item))));
+    const group = groups.find((members) => members.some((member) => same(nameOf(member), nameOf(item))));
     if (group) group.push(item);
     else groups.push([item]);
   }
   return groups;
 }
 
-/** A company's name without its legal form, for sentences: "Avis Budget Group, Inc." is "Avis Budget Group". */
+/**
+ * A one-letter code a venue pads onto the end of a name after a run of
+ * spaces: the `R` of "Americold Realty Trust Inc.   R". A longer word there
+ * (`AG`, `ASA`) is the name's own.
+ */
+const STRAY_NAME_TAIL = /\s{2,}[A-Za-z0-9]$/;
+
+/**
+ * A listing's name as a venue's file writes it, without the stray fragment a
+ * fixed-width file leaves after a run of spaces ("Americold Realty Trust
+ * Inc.   R" on Hanover is "Americold Realty Trust Inc."), and with its spaces
+ * single. A name that is only the fragment keeps it.
+ */
+export function cleanListingName(name: string): string {
+  const trimmed = name.trim();
+  const cut = trimmed.replace(STRAY_NAME_TAIL, "");
+  return (cut || trimmed).replace(/\s+/g, " ");
+}
+
+/**
+ * A company's name without its legal form, for sentences: "Avis Budget Group,
+ * Inc." is "Avis Budget Group", and "Wells Fargo & Company" is "Wells Fargo",
+ * never cut at its "&".
+ */
 export function shortCompanyName(name: string): string {
   const words = name.trim().split(/\s+/).filter(Boolean);
   const legal = (word: string) => {
-    const plain = word.normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+    const plain = foldNameLetters(word).toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
     // "Public Limited Company" is a legal form too, though "Public" alone can be a name.
-    return NAME_NOISE.has(plain) || SHARE_NOISE.has(plain) || (plain === "public" && words.length > 2);
+    return NAME_NOISE.has(plain) || LAST_WORD_NOISE.has(plain) || SHARE_NOISE.has(plain)
+      || (plain === "public" && words.length > 2);
   };
-  while (words.length > 1 && legal(words[words.length - 1]!)) words.pop();
+  const joining = (word: string) => word === "&" || word.toLowerCase() === "and";
+  while (words.length > 1 && (legal(words[words.length - 1]!) || joining(words[words.length - 1]!))) words.pop();
   if (words.length > 1 && words[0]!.toLowerCase() === "the") words.shift();
   return words.join(" ").replace(/[,;]+$/, "");
 }
@@ -168,16 +338,35 @@ function nameWord(word: string, opening: boolean, domain: boolean): string {
 }
 
 /**
+ * The name a company is introduced by beside its lines on other venues
+ * ("Prudential plc trades on HKEX as 2378:HKEX", "HSBC Holdings plc also
+ * lists 0005:HKEX"): the name its home line is listed under, which tells
+ * Prudential plc from Prudential Financial, else its issuer's, cased. Without
+ * the comma or the full stop a listing's name can carry beside its legal form:
+ * "HSBC Holdings, plc." is HSBC Holdings plc.
+ */
+export function companyLinesName(listedName: string | null | undefined, issuerName: string): string {
+  return (listedName?.trim() || companyNameCase(issuerName))
+    .replace(/,\s*(?=(?:plc|inc|ltd|limited|corp|sa|ag|nv|se)\b)/i, " ")
+    .replace(/\.$/, "");
+}
+
+/**
  * A company name a source writes in capitals (an ETF's holdings file: "APPLE INC", "MERCK & CO INC") as it is
  * normally written: "Apple Inc", "Merck & Co Inc". Legal forms and short words take their usual case, initials
  * inside a name stay capitals ("GE Aerospace", "AT&T", "L3Harris"). A name with any lower case letter is written
  * the way its source means it and comes back as it is.
  */
 export function companyNameCase(name: string): string {
-  if (!/\p{Lu}/u.test(name) || name !== name.toUpperCase()) return name;
+  // A brand that opens in lower case before capitals (aTYR, iROBOT) is still a name in capitals: aTyr, iRobot.
+  const brand = /^\p{Ll}(?=\p{Lu}{2})/u;
+  const capitals = name.split(/\s+/).map((word) => word.replace(brand, "")).join(" ");
+  if (!/\p{Lu}/u.test(name) || capitals !== capitals.toUpperCase()) return name;
   let words = 0;
   return name.replace(/\S+/g, (token) => {
     const opening = words++ === 0;
+    const lead = brand.exec(token)?.[0];
+    if (lead) return `${lead}${token.charAt(1)}${token.slice(2).toLowerCase()}`;
     // A separator inside a word (Coca-Cola, AT&T, Amazon.com, McDonald's) cuts it into words of its own.
     return token.split(/([-/.&,'\u2019]+)/).map((part, index, parts) => {
       if (index % 2 === 1) return part;
@@ -187,4 +376,16 @@ export function companyNameCase(name: string): string {
       return part.split(/(\d+)/).map((run, at) => at % 2 === 1 ? run : nameWord(run, opening && index === 0 && at === 0, before === ".")).join("");
     }).join("");
   });
+}
+
+/** Letters and digits only, in capitals: "JP Morgan" and "JPMorgan" are JPMORGAN. */
+export function runTogether(text: string): string {
+  return foldNameLetters(text).toUpperCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+/** Whether the service marked the row with the name as typed: the company it means by it. */
+export function namedByService(typed: string, result: Pick<InstrumentSearchResult, "searchAliases">): boolean {
+  const wanted = runTogether(typed);
+  return !!wanted && Array.isArray(result.searchAliases)
+    && result.searchAliases.some((alias) => typeof alias === "string" && runTogether(alias) === wanted);
 }

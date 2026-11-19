@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import type { CloudNewsListResponse } from "../../api-client";
 import type { NewsQuery } from "../../news/types";
-import { cloudNewsReadArticles, readCloudNews } from "./news";
+import { cloudNewsAccess, cloudNewsReadArticles, readCloudNews } from "./news";
 
 function story(id: string, tickers: string[] = []) {
   const at = "2026-10-20T21:41:38.000Z";
@@ -53,6 +53,38 @@ test("a coin pair with no story filed under it reads the stories that mention th
   expect(other.searches).toEqual([["hyperliquid", 20]]);
 });
 
+test("a future with no story filed under it reads the stories that mention its commodity, as `news` does", async () => {
+  // The CC=F pane's news read "No news for CC=F" while `news CC=F` listed cocoa's stories.
+  for (const [ticker, exchange, searched] of [["CC=F", "NYB", "cocoa"], ["KC=F", undefined, "coffee"], ["ZW=F", "CBT", "wheat"]] as const) {
+    const { client, searches } = cloud();
+    const read = await readCloudNews(client as never, { feed: "ticker", ticker, exchange, limit: 20 });
+    expect(searches).toEqual([[searched, 20]]);
+    expect(read.searchedFor).toBe(searched);
+  }
+  // A future with no commodity name, and a stock that shares a board code (CC is Chemours), keep the empty feed.
+  for (const query of [{ ticker: "ES=F", exchange: "CME" }, { ticker: "CC", exchange: "NYSE" }]) {
+    const { client, searches } = cloud();
+    expect((await readCloudNews(client as never, { feed: "ticker", limit: 20, ...query })).searchedFor).toBeUndefined();
+    expect(searches).toEqual([]);
+  }
+});
+
+test("a currency pair with no story filed under it reads the stories that write the pair, as coins and futures do", async () => {
+  // `news EURUSD=X` read "No news" while EUR/USD stories were filed under no ticker.
+  for (const [ticker, exchange] of [["EURUSD=X", "CCY"], ["JPY=X", undefined], ["EURUSD", "CCY"]] as const) {
+    const { client, searches } = cloud();
+    const read = await readCloudNews(client as never, { feed: "ticker", ticker, exchange, limit: 20 });
+    expect(searches, ticker).toEqual([[ticker === "JPY=X" ? "USD/JPY" : "EUR/USD", 20]]);
+    expect(read.searchedFor).toBe(ticker === "JPY=X" ? "USD/JPY" : "EUR/USD");
+  }
+  // Spot gold is no currency pair, and six letters off the currency venue are a ticker.
+  for (const query of [{ ticker: "XAUUSD=X", exchange: "CCY" }, { ticker: "EURUSD", exchange: "NASDAQ" }]) {
+    const { client, searches } = cloud();
+    expect((await readCloudNews(client as never, { feed: "ticker", limit: 20, ...query })).searchedFor).toBeUndefined();
+    expect(searches).toEqual([]);
+  }
+});
+
 test("only an empty first page of a coin pair's feed falls back, and a failed search keeps the empty answer", async () => {
   const cases: Array<[string, NewsQuery, Parameters<typeof cloud>[0]]> = [
     ["a company", { feed: "ticker", ticker: "AAPL", exchange: "NASDAQ", limit: 20 }, {}],
@@ -72,5 +104,24 @@ test("only an empty first page of a coin pair's feed falls back, and a failed se
   const failing = cloud({ searchFails: true });
   const read = await readCloudNews(failing.client as never, tickerQuery("BTC-USD"));
   expect(failing.searches).toEqual([["bitcoin", 20]]);
-  expect(read).toEqual({ items: [], nextCursor: null });
+  expect(read).toEqual({ items: [], nextCursor: null, access: null });
+});
+
+test("an answer is held back when no session went with it, and live only when it holds a story too recent to hold back", async () => {
+  const now = Date.parse("2026-10-26T17:00:00.000Z");
+  const seen = (hoursAgo: number) => ({ ...story(`seen-${hoursAgo}h`), lastSeenAt: new Date(now - hoursAgo * 3_600_000).toISOString() });
+  // No session: the service holds news back for anyone it cannot name.
+  expect(cloudNewsAccess({ items: [seen(1)] }, false, now)).toBe("delayed");
+  // A session and a story seen an hour ago: only the live wire carries it.
+  expect(cloudNewsAccess({ items: [seen(13), seen(1)] }, true, now)).toBe("realtime");
+  // Nothing newer than the delay, or within the hour left for the clocks to disagree: a quiet live feed looks the same as a held-back one.
+  expect(cloudNewsAccess({ items: [seen(13)] }, true, now)).toBeNull();
+  expect(cloudNewsAccess({ items: [seen(11.5)] }, true, now)).toBeNull();
+  expect(cloudNewsAccess({ items: [] }, true, now)).toBeNull();
+  // What the service says wins.
+  expect(cloudNewsAccess({ items: [seen(1)], access: "delayed" }, true, now)).toBe("delayed");
+
+  // A read asks the client whether a session goes with the request.
+  const signedOut = { ...cloud({ filed: [story("filed")] }).client, hasSessionCredential: () => false };
+  expect((await readCloudNews(signedOut as never, { feed: "top", limit: 20 })).access).toBe("delayed");
 });

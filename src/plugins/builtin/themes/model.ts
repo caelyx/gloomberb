@@ -1,6 +1,7 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { THEME_PERIODS, type ThemeAggregate, type ThemeMember, type ThemePeriod, type ThemeSummary } from "../../../api-client/themes";
 import type { DataTableColumn } from "../../../components";
-import { dropColumnsToFit, getTableWidth } from "../../../components/ui/table-layout";
+import { dropColumnsToFit, getTableWidth, TABLE_COLUMN_GAP } from "../../../components/ui/table-layout";
 import { extendedSessionStateLabel, type ExtendedSession } from "../../../market-data/market/status";
 import { yearToDateBaseLabel } from "../../../market-data/market/year-to-date";
 import { compareSortValues, type SortDirection } from "../../../utils/sort-values";
@@ -17,27 +18,34 @@ export function boardYtdBase(payload: { asOf?: unknown; regularSessionDate?: unk
 }
 
 /**
- * A period's header. YTD names its base close, as long as `room` allows:
- * `YTD vs 31 Dec close`, `YTD vs 31 Dec`, then `YTD 31 Dec`.
+ * A period's header. YTD says what it is, a return against the close it is
+ * measured from, as long as `room` allows: `YTD vs 31 Dec close`, `YTD vs 31
+ * Dec`, then `YTD`.
  */
 export function periodLabel(period: ThemePeriod, ytdBase: string | null, room = Infinity): string {
   if (period !== "returnYtdPercent" || !ytdBase) return PERIOD_LABELS[period];
-  const labels = [`YTD vs ${ytdBase} close`, `YTD vs ${ytdBase}`, `YTD ${ytdBase}`];
+  const labels = [`YTD vs ${ytdBase} close`, `YTD vs ${ytdBase}`, "YTD"];
   return labels.find((label) => label.length <= room) ?? labels.at(-1)!;
 }
+
 export interface ThemeSort { columnId: string; direction: SortDirection }
 export const DEFAULT_SORT: ThemeSort = { columnId: "changePercent", direction: "desc" };
 export function percent(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) return "--";
+  if (value === null || !Number.isFinite(value)) return MISSING_VALUE;
   const rounded = Number(value.toFixed(2));
   return `${rounded > 0 ? "+" : ""}${rounded.toFixed(2)}%`;
 }
+/** How many of a theme's names a figure is drawn from, when not all of them: `7 of 8`. Empty when every name is in it. */
+export function coverageText(metric: ThemeAggregate): string {
+  return metric.covered < metric.total ? `${metric.covered} of ${metric.total}` : "";
+}
 export function aggregateText(metric: ThemeAggregate, breadth = false): string {
   const value = breadth && metric.value !== null ? `${Math.round(metric.value)}%` : percent(metric.value);
-  return `${value}${metric.covered < metric.total ? ` ${metric.covered}/${metric.total}` : ""}`;
+  const coverage = coverageText(metric);
+  return `${value}${coverage ? ` ${coverage}` : ""}`;
 }
-export const memberPrice = (value: number | null) => value === null ? "--" : value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-export const coverageWidth = (metrics: readonly ThemeAggregate[]) => Math.max(0, ...metrics.map((metric) => metric.covered < metric.total ? `${metric.covered}/${metric.total}`.length + 1 : 0));
+export const memberPrice = (value: number | null) => value === null ? MISSING_VALUE : value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+export const coverageWidth = (metrics: readonly ThemeAggregate[]) => Math.max(0, ...metrics.map((metric) => coverageText(metric) ? coverageText(metric).length + 1 : 0));
 export function sortThemes(rows: readonly ThemeSummary[], sort: ThemeSort): ThemeSummary[] {
   const value = (row: ThemeSummary) => {
     if (sort.columnId === "name") return row.name;
@@ -140,6 +148,7 @@ export function matchTheme(rows: readonly ThemeSummary[], input: string): ThemeS
 }
 
 const column = (id: string, label: string, width: number, align: "left" | "right" = "right"): DataTableColumn => ({ id, label, width, align });
+export const THEME_LISTING_SCOPE = "US-listed";
 /** Room a header has in its column: the sort indicator takes two cells. */
 const HEADER_ROOM = 2;
 /**
@@ -152,9 +161,11 @@ export function themeColumns(width: number, rows: readonly ThemeSummary[], ytdBa
   const metricWidth = (period: ThemePeriod) => Math.max(8, ...rows.map((row) => percent(row.returns[period].value).length)) + suffixWidth(period);
   // The same trailing space is reserved in every cell and its header. A note
   // occupies that space without moving the number away from its label.
-  const label = (period: ThemePeriod, room?: number) => periodLabel(period, ytdBase, room) + " ".repeat(suffixWidth(period));
-  const columns = [column("name", "Theme", 26, "left"), column("memberCount", "N", 3),
-    ...THEME_PERIODS.map((period) => column(period, label(period, 0), Math.max(metricWidth(period), label(period, 0).length + HEADER_ROOM))),
+  const label = (period: ThemePeriod, room: number) => periodLabel(period, ytdBase, room) + " ".repeat(suffixWidth(period));
+  // The board always keeps room for `YTD vs 31 Dec`, so even a narrow one says what its YTD is measured against.
+  const leastRoom = ytdBase ? `YTD vs ${ytdBase}`.length : 0;
+  const columns = [column("name", `Theme · ${THEME_LISTING_SCOPE}`, 26, "left"), column("memberCount", "N", 3),
+    ...THEME_PERIODS.map((period) => column(period, label(period, leastRoom), Math.max(metricWidth(period), label(period, leastRoom).length + HEADER_ROOM))),
     column("breadth", "Breadth" + " ".repeat(coverageWidth(rows.map((row) => row.breadth))), 7 + coverageWidth(rows.map((row) => row.breadth))),
     column("best", "Best 1D", 15), column("worst", "Worst 1D", 15)];
   const fitted = fitColumns(columns, width, ["worst", "best", "return3MPercent", "returnYtdPercent", "return1MPercent", "return1WPercent", "memberCount"]);
@@ -165,15 +176,17 @@ export function themeColumns(width: number, rows: readonly ThemeSummary[], ytdBa
 /**
  * The member table at `width`. Price and 1D are the regular session's; a
  * PRE-MKT or AFTER-HRS column, named as BI and MOST name it, follows 1D for
- * each session in `extendedSessions`. A narrow pane gives up the longer
- * windows first, then that column, then the name.
+ * each session in `extendedSessions`. Longer windows give way first, then
+ * extended sessions; the name shortens when the daily columns need the room.
  */
 export function memberColumns(width: number, extendedSessions: readonly ExtendedSession[] = [], ytdBase: string | null = null): DataTableColumn[] {
   const extended = extendedSessions.map((session) => column(session === "PRE" ? "preMarket" : "afterHours", extendedSessionStateLabel(session), 9));
   const [day, ...windows] = THEME_PERIODS.map((period) => column(period, periodLabel(period, ytdBase, 0), Math.max(9, periodLabel(period, ytdBase, 0).length + HEADER_ROOM)));
-  const fitted = fitColumns([column("symbol", "Ticker", 7, "left"), column("name", "Name", 24, "left"), column("price", "Price $", 10),
-    day!, ...extended, ...windows], width,
-  ["return3MPercent", "returnYtdPercent", "return1MPercent", "return1WPercent", "preMarket", "afterHours", "name", "price"]);
+  const symbol = column("symbol", "Ticker", 7, "left");
+  const price = column("price", "Price $", 10);
+  const nameWidth = Math.max(8, Math.min(24, width - getTableWidth([symbol, price, day!]) - TABLE_COLUMN_GAP));
+  const fitted = fitColumns([symbol, column("name", "Name", nameWidth, "left"), price, day!, ...extended, ...windows], width,
+    ["return3MPercent", "returnYtdPercent", "return1MPercent", "return1WPercent", "preMarket", "afterHours"]);
   const ytd = fitted.find((col) => col.id === "returnYtdPercent");
   if (ytd) ytd.label = periodLabel("returnYtdPercent", ytdBase, ytd.width - HEADER_ROOM);
   return fitted;
@@ -183,7 +196,7 @@ function fitColumns(columns: DataTableColumn[], width: number, drop: string[]): 
   const used = () => getTableWidth(columns);
   const name = columns.find((col) => col.id === "name") ?? columns[0]!;
   const spare = width - used();
-  name.width = Math.max(8, name.width + Math.min(spare, Math.max(0, 36 - name.width)));
+  name.width += Math.min(Math.max(0, spare), Math.max(0, 36 - name.width));
   name.flexGrow = 1;
   // Wide boards share room across the figures instead of separating every name
   // from its daily move with an almost pane-wide blank name column.

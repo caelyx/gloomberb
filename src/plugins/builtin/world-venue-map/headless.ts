@@ -1,14 +1,17 @@
+import { MISSING_VALUE } from "../../../utils/format";
 /**
  * `gloom fn MAP`: the venue list, or with a layer (`MAP ships`,
  * `--layer vessels`) that layer's entity table with plain values and the
  * linked tickers, for JSON and CSV.
  */
-import { getGeoEntities, loadGeoCatalog, type GeoLayerInfo, type GeoRequest } from "../../../api-client/geo";
+import { getGeoEntities, loadGeoCatalog, type GeoColumn, type GeoEntitiesPayload, type GeoLayerInfo, type GeoRequest } from "../../../api-client/geo";
 import type { HeadlessPaneColumn, HeadlessPaneContext, HeadlessPaneDefinition, HeadlessPaneFreshness, HeadlessPaneRow, HeadlessRowsResult } from "../../../types/headless";
+import { formatUtcDayTime } from "../../../utils/utc-time";
 import { REFERENCE_DATA } from "../shared/report-freshness";
-import { columnValue, layerCoverageNote, parseLayerTokens, plainGeoValue, resolveActiveLayers, tickerLinkKey } from "./layers";
-import { filterWorldVenues, formatVenueLocalTime } from "./model";
+import { columnValue, formatGeoValue, isChangeColumn, layerCoverageNote, parseLayerTokens, parseMapPreset, plainGeoValue, resolveActiveLayers, tickerLinkKey } from "./layers";
+import { filterWorldVenues, formatVenueLocalTime, venueSession } from "./model";
 import { REPORT_FILTER, REPORT_ROWS } from "../shared/headless-options";
+import { mapHomeArea, mapPlaceBbox, nearestPlaces, resolveMapPlace, type MapStart } from "./place";
 
 /**
  * A layer's status from its own cadence, as the pane's footer shows it. The
@@ -25,16 +28,17 @@ function layerFreshness(layer: GeoLayerInfo): HeadlessPaneFreshness | undefined 
   return { ...REFERENCE_DATA, ...cited };
 }
 
-function contextRequest(context: HeadlessPaneContext): GeoRequest {
+/** Map requests through the report's own client and signal. */
+export function contextGeoRequest(context: HeadlessPaneContext): GeoRequest {
   return <T>(path: string, init?: RequestInit) => context.apiClient.geo<T>(path, { ...init, signal: init?.signal ?? context.signal });
 }
 
-function tokensFor(args: { argument: unknown; options: Record<string, unknown> }, settings: Record<string, unknown> | undefined): string[] {
+function tokensFor(args: { argument: unknown; options: Record<string, unknown> }, settings: Record<string, unknown> | undefined, catalog: readonly GeoLayerInfo[]): string[] {
   const fromOption = parseLayerTokens(args.options.layer);
   if (fromOption.length) return fromOption;
   const fromSettings = parseLayerTokens(settings?.layers);
   if (fromSettings.length) return fromSettings;
-  return parseLayerTokens(typeof args.argument === "string" ? args.argument : "");
+  return parseMapPreset(typeof args.argument === "string" ? args.argument : "", catalog)?.layers ?? [];
 }
 
 const VENUE_COLUMNS: HeadlessPaneColumn[] = [
@@ -42,38 +46,53 @@ const VENUE_COLUMNS: HeadlessPaneColumn[] = [
   { key: "name", header: "Venue" },
   { key: "city", header: "City" },
   { key: "country", header: "Country" },
-  { key: "open", header: "Open", format: (value) => (value ? "open" : "closed") },
+  // The state by the exchange's calendar: a holiday, or a US venue's pre-market and after-hours around its core session.
+  { key: "session", header: "Session" },
   { key: "localTime", header: "Local" },
 ];
 
-async function venueRows(context: HeadlessPaneContext, query: string): Promise<HeadlessRowsResult> {
+async function venueRows(context: HeadlessPaneContext, query: string, start: MapStart): Promise<HeadlessRowsResult> {
   const response = await context.apiClient.getCloudWorldVenues();
   if (!response.data) throw new Error(response.reasonCode ?? "World venue data unavailable");
   const now = Date.now();
   return {
     columns: VENUE_COLUMNS,
-    rows: filterWorldVenues(response.data.venues, query).map((venue) => ({
+    rows: nearestPlaces(filterWorldVenues(response.data.venues, query), start.place, (venue) => venue).map((venue) => ({
       mic: venue.mic,
       name: venue.title,
       city: venue.city,
       country: venue.country,
+      session: venueSession(venue),
       open: venue.isOpen,
       localTime: formatVenueLocalTime(venue.timezone, now),
       lon: venue.longitude,
       lat: venue.latitude,
     })),
     freshness: REFERENCE_DATA,
-    metadata: { layer: "venues", stale: response.stale === true },
+    errors: start.note ? [start.note] : [],
+    metadata: { layer: "venues", stale: response.stale === true, ...(start.place ? { place: start.place } : {}) },
   };
 }
 
+/** Formats whose figures the text report writes as the pane's table does: 1,234 calls, +12.5%. */
+const FIGURE_FORMATS = new Set<GeoColumn["format"]>(["int", "decimal1", "percent1", "knots", "km"]);
+
+/**
+ * The layer's columns. A figure reads in the text report as the pane's table
+ * writes it, a change signed and with its %; exports keep the bare number,
+ * so a percent column names its unit in its header.
+ */
 function layerColumns(layer: GeoLayerInfo): HeadlessPaneColumn[] {
-  const columns = layer.columns.length ? layer.columns : [{ key: "label", label: "Name" }];
+  const columns: GeoColumn[] = layer.columns.length ? layer.columns : [{ key: "label", label: "Name" }];
   return [
     ...columns.map((column): HeadlessPaneColumn => ({
       key: column.key,
-      header: column.label,
+      header: column.format === "percent1" && !column.label.includes("%") ? `${column.label} (%)` : column.label,
+      ...(column.format === "percent1" ? { textHeader: column.label } : {}),
       ...(column.align === "right" ? { align: "right" as const } : {}),
+      ...(FIGURE_FORMATS.has(column.format) ? {
+        textFormat: (value: unknown) => (typeof value === "number" ? formatGeoValue(value, column.format, Date.now(), isChangeColumn(column)) : MISSING_VALUE),
+      } : {}),
     })),
     { key: "ticker", header: "Ticker" },
     { key: "lon", header: "Lon", align: "right" },
@@ -81,18 +100,43 @@ function layerColumns(layer: GeoLayerInfo): HeadlessPaneColumn[] {
   ];
 }
 
+/** Whether the layer's figures are sums over the 7 days to its date (the ports' calls and tonnes). */
+function weeklyLayer(columns: readonly GeoColumn[]): boolean {
+  return columns.some((column) => /\b7D\b/.test(column.label));
+}
+
+/**
+ * The text report's last row: the server's totals over every row the query
+ * found, not only the rows listed, named for the country a country's name
+ * was read as. Exports keep the entities alone; JSON has the totals in its metadata.
+ */
+function totalRow(page: Pick<GeoEntitiesPayload, "totals" | "total" | "matched">, columns: readonly GeoColumn[], rows: readonly HeadlessPaneRow[], noun: string): HeadlessPaneRow | null {
+  if (!page.totals || page.total <= 1) return null;
+  const [first] = columns;
+  const country = page.matched === "country" && typeof rows[0]?.country === "string" ? rows[0].country : null;
+  return {
+    id: "total",
+    ...Object.fromEntries(columns.map((column) => [column.key, plainGeoValue(page.totals?.[column.key])])),
+    [first?.key ?? "label"]: `Total, ${page.total} ${noun}`,
+    ...(country ? { country } : {}),
+    ticker: null,
+    lon: null,
+    lat: null,
+  };
+}
+
 /**
  * What a search that finds nothing says. A search outside a one-country layer
  * finds nothing because the layer has nothing there; ships are found by name,
- * not by the ticker of the company that runs them, so a ticker that links no
- * fleet (or a server that links none) gets a name to try.
+ * or by the name or ticker of an operator whose fleet is linked, so anything
+ * else (or a server that links no fleet) gets a name to try.
  */
 function emptySearchNote(layer: GeoLayerInfo, query: string): string | null {
   const typed = query.trim();
   if (!typed) return null;
   const coverage = layerCoverageNote(layer);
   if (coverage) return `No ${layer.name.toLowerCase()} match "${typed}". ${coverage}`;
-  if (layer.id === "vessels") return `No ${layer.name.toLowerCase()} match "${typed}"; try a ship-name prefix, such as --query Norwegian.`;
+  if (layer.id === "vessels") return `No ${layer.name.toLowerCase()} match "${typed}"; try a ship-name prefix or an operator, such as --query Norwegian or --query "Royal Caribbean".`;
   return null;
 }
 
@@ -101,9 +145,9 @@ export const mapHeadless = {
   description: "Trading venues with open status and local time, or one map layer's entities (ships, chokepoints, ports, airports, pipelines, fields, terminals) with their fields and linked tickers.",
   argument: {
     kind: "free-text",
-    placeholder: "layers",
+    placeholder: "layers [place or lat,lon]",
     optional: true,
-    description: "A layer group (ships, ports, energy, air) or a layer id; venues when empty.",
+    description: "Layers (ships, ports, energy, air), then an optional place or latitude,longitude; home area when no place is given.",
   },
   options: [
     { key: "layer", aliases: ["layers"], settingKey: "layers", description: "Layer id or group to list, such as vessels or energy.", type: "string" },
@@ -115,16 +159,28 @@ export const mapHeadless = {
     aliases: ["world map", "venue map", "ship map", "vessel map", "chokepoints", "ports map", "pipelines map", "airports map"],
     screenshotReadiness: "ready",
   },
-  describe: (args) => {
-    const tokens = parseLayerTokens(args.options.layer || args.argument || "");
-    return tokens.length ? `World Map | ${tokens.join(", ")}` : "World Map | venues";
+  describe: (args, result) => {
+    const tokens = parseLayerTokens(args.options.layer).length ? parseLayerTokens(args.options.layer) : parseMapPreset(typeof args.argument === "string" ? args.argument : "")?.layers ?? [];
+    const place = result?.metadata?.place as { label?: string } | undefined;
+    const near = place?.label ? ` | near ${place.label}` : "";
+    if (!tokens.length) return `World Map | venues${near}`;
+    // A layer of 7-day sums names the week they end on, which its source line dates without saying so.
+    const weekEnding = typeof result?.metadata?.weekEnding === "string" ? ` | week ending ${formatUtcDayTime({ time: Date.parse(result.metadata.weekEnding), dateOnly: true })}` : "";
+    return `World Map | ${tokens.join(", ")}${near}${weekEnding}`;
   },
   async load(args, context) {
     const query = typeof args.options.query === "string" ? args.options.query : "";
-    const tokens = tokensFor(args, context.settings);
-    if (!tokens.length) return venueRows(context, query);
-    const request = contextRequest(context);
+    const request = contextGeoRequest(context);
     const catalog = await loadGeoCatalog(request, { signal: context.signal });
+    const tokens = tokensFor(args, context.settings, catalog?.layers ?? []);
+    const typedPlace = parseMapPreset(typeof args.argument === "string" ? args.argument : "", catalog?.layers)?.place
+      ?? (typeof context.settings?.place === "string" ? context.settings.place : mapHomeArea(context.config));
+    const start = await resolveMapPlace(typedPlace, {
+      request,
+      signal: context.signal,
+      venues: async () => (await context.apiClient.getCloudWorldVenues()).data?.venues ?? [],
+    });
+    if (!tokens.length) return venueRows(context, query, start);
     const layers = resolveActiveLayers(tokens, catalog?.layers);
     const layer = layers[0];
     if (!layer) {
@@ -134,9 +190,9 @@ export const mapHeadless = {
     const limit = typeof args.options.limit === "number" ? args.options.limit : 100;
     const page = layer.status === "unavailable"
       ? { rows: [], total: 0, asOf: null, columns: layer.columns }
-      : await getGeoEntities(request, layer.id, { q: query, limit }, context.signal);
+      : await getGeoEntities(request, layer.id, { q: query, limit, ...(start.place ? { bbox: mapPlaceBbox(start.place) } : {}) }, context.signal);
     const columns = page.columns?.length ? page.columns : layer.columns;
-    const rows: HeadlessPaneRow[] = page.rows.map((row) => ({
+    const rows: HeadlessPaneRow[] = nearestPlaces(page.rows, start.place, (row) => ({ longitude: row.lon, latitude: row.lat })).map((row) => ({
       id: row.id,
       ...Object.fromEntries(columns.map((column) => [column.key, plainGeoValue(columnValue(row, column))])),
       ticker: row.tickers?.[0] ? tickerLinkKey(row.tickers[0]) : null,
@@ -145,20 +201,28 @@ export const mapHeadless = {
       lat: row.lat,
     }));
     const empty = emptySearchNote(layer, query);
+    const total = "totals" in page ? totalRow(page, columns, rows, layer.name.toLowerCase()) : null;
+    const asOf = page.asOf ?? layer.asOf;
+    const weekEnding = asOf && rows.length && weeklyLayer(columns) ? asOf.slice(0, 10) : null;
     return {
       columns: layerColumns({ ...layer, columns }),
       rows,
+      ...(total ? { textRows: [...rows, total] } : {}),
       ...(empty ? { empty } : {}),
       freshness: layerFreshness(layer),
       complete: layer.status === "ok",
-      errors: layer.status === "unavailable" ? [`${layer.name}: ${layer.statusNote ?? "unavailable"}`] : [],
+      errors: [...(start.note ? [start.note] : []), ...(layer.status === "unavailable" ? [`${layer.name}: ${layer.statusNote ?? "unavailable"}`] : [])],
       metadata: {
         layer: layer.id,
         name: layer.name,
         cadence: layer.cadence,
         status: layer.status,
-        asOf: page.asOf ?? layer.asOf,
+        asOf,
         total: page.total ?? null,
+        ...(start.place ? { place: start.place, bbox: mapPlaceBbox(start.place) } : {}),
+        ...("totals" in page && page.totals ? { totals: page.totals } : {}),
+        ...("matched" in page && page.matched ? { matched: page.matched } : {}),
+        ...(weekEnding ? { weekEnding } : {}),
         ...(layers.length > 1 ? { otherLayers: layers.slice(1).map((entry) => entry.id) } : {}),
       },
     };

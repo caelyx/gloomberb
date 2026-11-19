@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, jest, spyOn, test } from "bun:test";
+import { outage } from "../../../test-support/outage";
 import { apiClient } from "../../../api-client";
 import { MemoryPluginPersistence } from "../../../test-support/plugin-persistence";
 import {
@@ -206,7 +207,7 @@ describe("fetchScreener", () => {
       async getMarketMovers() {
         calls += 1;
         if (calls === 1) return response();
-        throw new Error("upstream down");
+        throw outage("upstream down");
       },
     };
 
@@ -256,13 +257,14 @@ test("mover prices keep the currency's minor unit and a sub-cent coin's digits",
   expect(formatMoverPrice(1.2, "USD", moverReferencePrice({ price: 1.2, change: 0.4 }))).toBe("$1.2000");
 });
 
-test("backend stale snapshots remain stale after persistence and cannot mask a refresh failure", async () => {
+/** `fn MOST` ended "Wed 11 Nov 2026 00:00": the footer took a row's time (the day's stored snapshot) for the list's. */
+test("backend stale snapshots remain stale after persistence, cannot mask a refresh failure, and keep the list's own time", async () => {
   const persistence = new MemoryPluginPersistence();
   attachMarketMoversPersistence(persistence);
   let calls = 0;
   const api: MarketScreenerApi = { getMarketMovers: async () => {
     calls++;
-    if (calls > 1) throw new Error("Unavailable");
+    if (calls > 1) throw outage("Unavailable");
     const value = response();
     return { ...value, stale: true };
   } };
@@ -273,4 +275,5 @@ test("backend stale snapshots remain stale after persistence and cannot mask a r
   expect(hydrated.stale).toBe(true);
   expect(hydrated.data.map(row => row.symbol)).toEqual(["AAPL", "MSFT"]);
   expect(calls).toBe(2);
+  expect(hydrated.asOf).toBe(Date.parse("2026-08-14"));
 });

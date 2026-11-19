@@ -1,5 +1,6 @@
 import { cloneLayout, createBlankLayout, getPlacedPaneInstanceIds, type SavedLayout } from "../../../types/config";
 import { movePaneBack, movePaneToOwnLayout, paneMoveBackTarget } from "../../../layout/pane-layout-move";
+import { relinkPinnedResearchPanes } from "../../../layout/pane-follow";
 import {
   clonePaneStateMap,
   cloneSavedLayout,
@@ -9,6 +10,7 @@ import {
   removeHistoryIndex,
   resolveTickerForPane,
   setHistoryForIndex,
+  settleOpeningPaneHistory,
   syncConfigActiveLayoutState,
   withFocusedPane,
 } from "./layout";
@@ -41,6 +43,12 @@ export function reduceLayoutAction(state: AppState, action: AppAction): AppState
         ...state,
         layoutHistory: setHistoryForIndex(state.layoutHistory, currentIndex, entry),
       };
+    }
+
+    case "SETTLE_OPENING_PANE": {
+      const currentIndex = state.config.activeLayoutIndex;
+      const entry = settleOpeningPaneHistory(historyForIndex(state.layoutHistory, currentIndex), state.config.layout, action.settlement);
+      return { ...state, layoutHistory: setHistoryForIndex(state.layoutHistory, currentIndex, entry) };
     }
 
     case "UNDO_LAYOUT": {
@@ -78,7 +86,8 @@ export function reduceLayoutAction(state: AppState, action: AppAction): AppState
     case "UPDATE_LAYOUT":
       return withFocusedPane(
         state,
-        { ...state.config, layout: action.layout },
+        // A research pane the app unlinked follows again when the change gives it a source back.
+        { ...state.config, layout: relinkPinnedResearchPanes(action.layout, state.config.layout) },
         Object.prototype.hasOwnProperty.call(action, "focusedPaneId")
           ? { focusedPaneId: action.focusedPaneId ?? null }
           : {},
@@ -93,7 +102,8 @@ export function reduceLayoutAction(state: AppState, action: AppAction): AppState
         state.focusedPaneId,
       );
       const target = currentConfig.layouts[action.index]!;
-      return withFocusedPane(state, {
+      // A desk opens as it was saved: nothing on it was chosen in this session yet (pane-choices.ts).
+      return withFocusedPane({ ...state, paneChoices: undefined }, {
         ...currentConfig,
         layout: cloneLayout(target.layout),
         activeLayoutIndex: action.index,

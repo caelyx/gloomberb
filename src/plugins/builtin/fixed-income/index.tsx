@@ -1,17 +1,17 @@
 import type { PluginModule } from "../plugin-module";
 import { treasuryAuctionsSettings } from "../treasury-auctions";
 import { FIXED_INCOME_PANE_ID } from "./model";
-import { FixedIncomePane } from "./pane";
 
 export const fixedIncomeModule: PluginModule = {
   panes: [{
     id: FIXED_INCOME_PANE_ID,
     name: "Fixed Income",
     icon: "B",
-    component: FixedIncomePane,
+    get component(): typeof import("./pane").FixedIncomePane { const { FixedIncomePane } = require("./pane"); return FixedIncomePane; },
     defaultPosition: "right",
     defaultMode: "floating",
     defaultFloatingSize: { width: 116, height: 32 },
+    shareItem: { ticker: true },
     tickerFollower: true,
     tableExport: true,
     settings: {
@@ -25,6 +25,8 @@ export const fixedIncomeModule: PluginModule = {
             { value: "all", label: "All" },
             { value: "us", label: "US" },
             { value: "euro", label: "Euro" },
+            { value: "em", label: "Emerging markets" },
+            { value: "asia", label: "Asia" },
           ],
         },
         ...treasuryAuctionsSettings().fields,

@@ -20,10 +20,12 @@
  * `&float=board`, `&float=beside`, `&float=overlay` or `&float=under` one of
  * the charts that sit inside a pane's own layout), `nested` (the first four
  * docked), `stacked` (the chart under a table docked beside a chart),
+ * `research` (research panes whose title-bar strips scroll, docked and
+ * floating, see researchLayout),
  * `narrow` (floating panes either side of the width a header keeps Ask Gloom
  * at), `chat` (the chat view over an invented channel, see chat-fixture.tsx),
  * `cmp` (one chart composer pane on invented 30-minute bars, see
- * createInventedChartSource: `&chart=readout` three listings on two venues,
+ * createInventedChartSource (`&style=` an OHLC style for its price): `&chart=readout` three listings on two venues,
  * volume and two studies, `pan` one listing with years of bars, `edge` one
  * whose bars start 150 sessions back, `percent` three listings rebased;
  * `&linked=1` adds a daily chart composer under it, `&linked=mixed` IV
@@ -34,9 +36,12 @@
  * over an invented company, see DesPane), `header` (the app's top bar in
  * each update state, see header-fixture.tsx; `&host=browser` draws it as the
  * web app does), `tab-sweep` (what the layout sweep's tab visits are checked
- * against, tab-sweep-fixture.tsx), or `kit` (the kit page: every design-system family in every
+ * against, tab-sweep-fixture.tsx), `badge-ink` (the chips badge-ink.ts
+ * measures, badge-ink-fixture.tsx), `query-bar` (one query bar per row in
+ * the shapes the panes give it, see query-bar-fixture.tsx), or `kit` (the kit page: every design-system family in every
  * state, see kit-fixture.tsx; `&family=<id>` shows one, `&theme=paper` and
- * `&font=` as everywhere).
+ * `&font=` as everywhere). `&titlebar=1` leaves the top bar's room above the
+ * shell, as the app does, for checks that drop on an exact spot.
  */
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ThemePicker, type ThemePickerHandle } from "../../src/components/command-bar/theme-picker";
@@ -67,6 +72,7 @@ import { usePaneTabs } from "../../src/components/layout/pane/pane-tabs";
 import { usePaneFooter } from "../../src/components/layout/pane/footer/registration";
 import { delayedFooterSegment } from "../../src/components/layout/pane/footer/model";
 import { Shell } from "../../src/components/layout/shell";
+import { TITLEBAR_OVERLAY_HEIGHT_PX } from "../../src/components/layout/titlebar-overlay";
 import { Header } from "../../src/components/layout/header";
 import { StatusBar } from "../../src/components/layout/status-bar";
 import type { NewsArticle } from "../../src/news/types";
@@ -93,10 +99,12 @@ import { AxisFixturePane } from "./axis-fixture";
 import { chatLatencyLayouts, ChatLatencySync } from "./chat-latency-fixture";
 import { useAppGlobalShortcuts } from "../../src/app/global-shortcuts";
 import { HeaderFixture, installHeaderClock, installHeaderMarketData, installHeaderPlatform, type HeaderFixtureHandle } from "./header-fixture";
+import { QueryBarFixture } from "./query-bar-fixture";
 import { browserUiHost } from "../../src/renderers/browser/ui-host";
 import { LAYOUT_PANES, installLayoutFetches, layoutLayout } from "./layout-fixture";
 import { KitPage } from "./kit-fixture";
 import { TabSweepFixture } from "./tab-sweep-fixture";
+import { BadgeInkFixture } from "./badge-ink-fixture";
 // A namespace import: the frame budget builds this file against the base branch's
 // sources too, which may not have every capture yet.
 import * as domScreenshot from "../../src/utils/dom-screenshot";
@@ -187,6 +195,23 @@ function TabsPane(_props: PaneProps) {
     <Box flexDirection="column">
       {strip}
       <Text>{`Showing ${TAB_LABELS[active]}`}</Text>
+    </Box>
+  );
+}
+
+/** Ticker Research's top strip, its eleven groups: wider than a narrow pane. */
+const RESEARCH_TABS = ["Overview", "Chart", "Financials", "Analysts", "Options", "Events", "Filings", "Ownership", "People", "Buzz", "Notes"]
+  .map((label) => ({ value: label.toLowerCase(), label }));
+
+/** A research pane on Options, as Ticker Research draws it: a dense strip that scrolls, and a query bar at the top of the body. */
+function ResearchPane({ focused, width }: PaneProps) {
+  const [active, setActive] = useState("options");
+  const { strip } = usePaneTabs({ tabs: RESEARCH_TABS, activeValue: active, onSelect: setActive, focused, dense: true });
+  return (
+    <Box flexDirection="column">
+      {strip}
+      <QueryBar width={width} meta="Invented chain" />
+      <Text>{`Showing ${RESEARCH_TABS.find((tab) => tab.value === active)?.label}`}</Text>
     </Box>
   );
 }
@@ -1151,6 +1176,9 @@ function chartComposerSpec(kind: string): ChartSpec {
     spec = appendChartSeries(spec, { kind: "security", symbol: "CHRL", exchange: "XETR", fieldId: "market.close" }).spec;
     spec = setBuiltinStudies(spec, ["volume", "sma20", "rsi14"]);
   }
+  // `&style=hollow` (or any OHLC style) draws the price series that way.
+  const style = params.get("style") as ChartSpec["series"][number]["style"] | null;
+  if (style) spec = { ...spec, series: spec.series.map((entry, index) => index === 0 ? { ...entry, style } : entry) };
   return { ...spec, viewport: { ...spec.viewport, range: "3M", resolution: "30m" } };
 }
 
@@ -1162,6 +1190,7 @@ const PANES = {
   paint: { name: "Research", component: PaintPane },
   plain: { name: "Plain", component: PlainPane },
   tabs: { name: "Tabbed", component: TabsPane },
+  research: { name: "AAPL", component: ResearchPane },
   broken: { name: "Broken", component: BrokenPane },
   table: { name: "Table", component: TablePane },
   "fear-greed": { name: "Fear & Greed", component: FearGreedPane },
@@ -1308,6 +1337,33 @@ function narrowLayout(): LayoutConfig {
   };
 }
 
+/** Panes stacked in one window, more than its title bar shows. */
+const RESEARCH_STACK = Array.from({ length: 6 }, (_, index) => `plain:s${index + 1}`);
+
+/**
+ * Title-bar strips that scroll, in title bars a fraction of a pixel off the
+ * grid, as a split or a moved window leaves them: research:dock under a chart
+ * (`&ratio=` the chart's share of the height) beside a table, research:float
+ * floating over the table (`&at=x,y` in cells), and six plain panes stacked
+ * as tabs in one narrow window over the chart, plain:s6 in front.
+ */
+function researchLayout(): LayoutConfig {
+  const ratio = Number(params.get("ratio") ?? "0.37");
+  const [x, y] = (params.get("at") ?? "70,12.3").split(",").map(Number) as [number, number];
+  return {
+    dockRoot: {
+      kind: "split", axis: "vertical", ratio, first: leaf("chart:dock"),
+      second: { kind: "split", axis: "horizontal", ratio: 0.3, first: leaf("research:dock"), second: leaf("table:dock") },
+    },
+    instances: ["chart:dock", "research:dock", "table:dock", "research:float", ...RESEARCH_STACK].map(instance),
+    floating: [
+      { instanceId: "research:float", x, y, width: 46, height: 14, zIndex: 60 },
+      ...RESEARCH_STACK.map((instanceId, index) => ({ instanceId, x: 8, y: y - 9, width: 36, height: 8, zIndex: 61 + index, stack: "plain" })),
+    ],
+    detached: [],
+  };
+}
+
 /** The charts that sit inside a pane's own layout, docked: chart-bar:dock | beside:dock over board:dock | overlay:dock. */
 function nestedLayout(): LayoutConfig {
   return {
@@ -1376,7 +1432,8 @@ function chartComposerLayout(): LayoutConfig {
   }
   return {
     dockRoot: leaf(instanceId),
-    instances: [{ ...instance(instanceId), settings: { chartSpec: spec } }],
+    // `&candles=change` draws rising candles in the theme's gain colour.
+    instances: [{ ...instance(instanceId), settings: { chartSpec: spec, ...(params.get("candles") ? { chartCandleColours: params.get("candles") } : {}) } }],
     floating: [],
     detached: [],
   };
@@ -1407,6 +1464,7 @@ function config() {
     : scenario === "chat" ? chatLayout()
     : scenario === "des" ? desLayout()
     : scenario === "nested" ? nestedLayout()
+    : scenario === "research" ? researchLayout()
     : scenario === "stacked" ? stackedLayout()
     : scenario === "axis" ? axisLayout()
     : scenario === "cmp" ? chartComposerLayout()
@@ -1416,7 +1474,9 @@ function config() {
   const layouts = scenario === "chat" ? chatLatencyLayouts(layout) : [{ name: "Fixture", layout: cloneLayout(layout) }];
   if (scenario === "theme") layouts.push({ name: "Alternate", layout: cloneLayout(layout) });
   const fontSize = Number(params.get("font")) || base.fontSize;
-  return { ...base, theme: params.get("theme") ?? base.theme, fontSize, layout, layouts, activeLayoutIndex: 0 };
+  // The header follows a named benchmark rather than the zone of the machine the page runs on.
+  const headerMarket = { benchmark: params.get("market") ?? "sp500" };
+  return { ...base, theme: params.get("theme") ?? base.theme, fontSize, layout, layouts, activeLayoutIndex: 0, headerMarket };
 }
 
 const paneRegistry = registry();
@@ -1458,7 +1518,7 @@ window.__paneChrome = {
   clipboardImages: [],
   externalOpens: [],
   detachedCloses: 0,
-  header: { show: ignore, fullscreen: ignore, commandBar: ignore, helpOpens: 0, restarts: 0 },
+  header: { show: ignore, fullscreen: ignore, commandBar: ignore, fontSize: ignore, helpOpens: 0, restarts: 0 },
   capturePane: async (paneId) => `data:image/png;base64,${(await domScreenshot.capturePaneScreenshotPngBase64(paneId)).pngBase64}`,
   captureForAssistant: async (paneId, scale, maxBytes, minWidth) => {
     try {
@@ -1506,11 +1566,18 @@ createRoot(root).render(
         ? <DetachedPaneShell pluginRegistry={paneRegistry} desktopWindowBridge={detachedBridge} />
         : scenario === "header" ? <HeaderFixture handle={window.__paneChrome.header} />
         : scenario === "kit" ? <KitPage family={params.get("family")} />
+        : scenario === "query-bar" ? <QueryBarFixture />
         : scenario === "tab-sweep" ? <TabSweepFixture />
+        : scenario === "badge-ink" ? <BadgeInkFixture />
         : scenario === "theme" || params.get("layoutReturn") === "1" ? <Box flexDirection="column" width="100%" height="100%">
           {scenario === "theme" && <Box data-theme-chrome="header"><Header /></Box>}
           <Shell pluginRegistry={paneRegistry} />
           <Box data-theme-chrome="status"><StatusBar /></Box>
+        </Box> : params.get("titlebar") === "1" ? <Box flexDirection="column" width="100%" height="100%">
+          {/* Where the app's top bar sits, which the shell lays itself out
+              below: the shell then reads the pointer where it draws. */}
+          <Box flexShrink={0} style={{ height: TITLEBAR_OVERLAY_HEIGHT_PX }} />
+          <Shell pluginRegistry={paneRegistry} />
         </Box> : <Shell pluginRegistry={paneRegistry} />}
       {(scenario.startsWith("theme") || scenario === "paint") && <ThemeControls />}
       {scenario === "paint" && <PaneAdder />}

@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { logFailure } from "../../../utils/log-failure";
 import { useCallback, useMemo } from "react";
 import type { CarbonBoard, PowerPriceRow } from "../../../api-client/europe-energy";
@@ -24,7 +25,7 @@ const PANELS = [{ id: "main" }];
 const DAY_MS = 86_400_000;
 /** The board's chart: the selected market's year, as the 1Y figures read. */
 const CHART_DAYS = 366;
-const formatAxis = spanAxisFormatter((value, digits) => value.toFixed(digits));
+const formatAxis = spanAxisFormatter((value, digits) => value.toFixed(digits), 2);
 
 interface PriceBoardRow extends MarketBoardRow { price: PowerPriceRow }
 
@@ -33,7 +34,7 @@ function boardRow(row: PowerPriceRow): PriceBoardRow {
   return {
     id: row.code, label: row.name, value: row.price, valueText: formatPowerPrice(row.price),
     change: row.change, changeText: formatPowerChange(row.change),
-    percentile: position, percentileText: position == null ? "--" : `${position}%`,
+    percentile: position, percentileText: position == null ? MISSING_VALUE : `${position}%`,
     asOf: row.date, status: row.price == null ? "unavailable" : "available",
     history: row.trail.map((point) => ({ date: new Date(`${point.date}T00:00:00Z`), close: point.value })),
     price: row,
@@ -170,7 +171,7 @@ function PowerPriceBoard({ width, height, focused }: { width: number; height: nu
   usePowerPricesEvidence(board, carbon, useMemo(() => rows.map((row) => row.id), [rows]), resource.loading || history.loading || carbonResource.loading, snapshot?.carbonError);
   useAutoRefresh(resource.updatedAt, resource.load);
   useAutoRefresh(carbonResource.updatedAt, carbonResource.load);
-  usePaneRefreshKey(() => { void resource.reload(); void history.reload(); void carbonResource.reload(); }, { focused });
+  usePaneRefreshKey(() => { resource.reload(); history.reload(); carbonResource.reload(); }, { focused });
   const notAvailable = !board && resource.error === POWER_PRICES_NOT_AVAILABLE;
   const open = rows.find((row) => row.id === openId);
   const charted = carbonCharted ? carbon!.row : selected?.price;

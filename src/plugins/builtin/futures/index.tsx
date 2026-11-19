@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Button,
   DataTableView,
   PaneStatusBody,
   QueryBar,
@@ -14,7 +15,7 @@ import {
 import { handleRefreshKey } from "../../../components/data-table/table-pane";
 import { useRemoteUiNode } from "../../../remote/semantic-tree";
 import { usePaneVisible } from "../../../state/app/activity";
-import { usePaneInstance } from "../../../state/app/context";
+import { useOptionalPaneSettingUpdater, usePaneInstance, usePaneSettingValue } from "../../../state/app/context";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
 import type { PaneProps } from "../../../types/plugin";
 import { isPlainKey } from "../../../utils/keyboard";
@@ -25,9 +26,11 @@ import type { PluginModule } from "../plugin-module";
 import { FUTURES_SERIES } from "./series";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
 import { quoteObservation } from "../shared/report-freshness";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
 import {
   boardErrorMessage,
   boardHeadlineQuote,
+  boardQuotes,
   quoteBoardFooterInfo,
   quoteBoardStatus,
   useQuoteBoard,
@@ -35,7 +38,7 @@ import {
   type BoardQuoteMap,
 } from "../shared/use-quote-board";
 import {
-  FUTURES_CONTRACTS,
+  FUTURES_BOARD_ROWS,
   FUTURES_SECTOR_LABELS,
   futuresBoardContract,
   getContractsBySector,
@@ -46,14 +49,20 @@ import {
   DEFAULT_FUTURES_SORT,
   effectiveCollapsedSectors,
   FUTURES_RETURN_COLUMNS,
+  futuresBoardQuotes,
+  futuresNoMatchFailure,
+  futuresReturnBaseText,
   futuresRowId,
+  futuresSessionQuote,
   type FuturesColumnId,
   type FuturesSortPreference,
   type FuturesTableRow,
 } from "./model";
 import {
   createFuturesColumns,
+  DEFAULT_FUTURES_COLUMN_IDS,
   FUTURES_COLUMN_DEFS,
+  FUTURES_REPORT_COLUMNS,
   renderFuturesCell,
   resolveFuturesColumnIds,
   usesSessionText,
@@ -61,12 +70,15 @@ import {
 } from "./table";
 import { useFuturesBoardTerms } from "./use-board-terms";
 import { useFrontContractReturns } from "./use-front-returns";
+import { COMMODITIES_ENERGY_PANE_ID } from "../commodities-energy/view-state";
 
 const FUTURES_PANE_ID = "futures";
 
-const FUTURES_SYMBOLS = FUTURES_CONTRACTS.map((contract) => contract.symbol);
+const FUTURES_SYMBOLS = FUTURES_BOARD_ROWS.map((contract) => contract.symbol);
 
 const alwaysNavigable = () => true;
+/** How long the cursor rests on a row before the workspace's Curve tab follows it. */
+const CURVE_FOLLOW_MS = 150;
 const NO_BOARD_QUOTES: BoardQuoteMap = new Map();
 /** Columns whose order moves with every tick; the others keep a fixed order. */
 const LIVE_SORT_COLUMNS = new Set<string>([
@@ -77,6 +89,7 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
   const { pinTicker } = usePluginTickerActions();
   const dataProvider = useAssetData();
   const paneInstance = usePaneInstance();
+  const updateColumnIds = useOptionalPaneSettingUpdater(paneInstance?.instanceId ?? null, "columnIds");
   const liveStreaming = useLiveStreamingSetting();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [sortPreference, setSortPreference] = useState<FuturesSortPreference>(DEFAULT_FUTURES_SORT);
@@ -121,7 +134,7 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
     [listedSymbols, quotes],
   );
   const listedContracts = useMemo(
-    () => FUTURES_CONTRACTS.filter((contract) => listedSymbols.has(contract.symbol)),
+    () => FUTURES_BOARD_ROWS.filter((contract) => listedSymbols.has(contract.symbol)),
     [listedSymbols],
   );
   const visibleColumnIds = useMemo(
@@ -135,47 +148,75 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
   const paneVisible = usePaneVisible();
   const showsReturns = columns.some((column) => FUTURES_RETURN_COLUMNS[column.id]);
   const returns = useFrontContractReturns(listedContracts, quotes, dataProvider, showsReturns && paneVisible);
+  // What each drawn return runs from (`1M from Mon 5 Oct close`): the report says it, the desktop header's hover too.
+  const returnBases = useMemo(() => new Map(columns.flatMap((column) => {
+    const horizon = FUTURES_RETURN_COLUMNS[column.id];
+    const text = horizon ? futuresReturnBaseText(horizon, returns) : null;
+    return text ? [[column.id, text] as const] : [];
+  })), [columns, returns]);
+  const titledColumns = useMemo(() => returnBases.size === 0 ? columns
+    : columns.map((column) => returnBases.has(column.id) ? { ...column, title: returnBases.get(column.id) } : column), [columns, returnBases]);
+  // A header dragged to a new place rewrites the Columns setting; back in the default order, the setting goes, so
+  // columns later added to the defaults still show. The session mark and the symbol name the row and stay first.
+  const anchoredColumns = columns.findIndex((column) => column.id !== "status" && column.id !== "code");
+  const columnReorder = useMemo(() => ({
+    anchored: anchoredColumns > 0 ? anchoredColumns : undefined,
+    control: {
+      order: visibleColumnIds,
+      defaultOrder: DEFAULT_FUTURES_COLUMN_IDS,
+      onChange: (ids: string[] | undefined) => updateColumnIds(() => ids),
+    },
+  }), [anchoredColumns, updateColumnIds, visibleColumnIds]);
+  useRemoteUiNode(returnBases.size > 0 ? {
+    role: "report-notice",
+    label: "Return base dates",
+    getMetadata: () => ({ text: `Returns: ${[...returnBases.values()].join("; ")}.` }),
+  } : null);
   // The unit a price counts and the month a symbol rolled past, as `quote` reads them.
   const terms = useFuturesBoardTerms(listedContracts, !!dataProvider && paneVisible);
+  // Each move measured as `quote` measures it with the row's terms, so a row never flips between references at the reopen.
+  const shownQuotes = useMemo(() => futuresBoardQuotes(quotes, terms), [quotes, terms]);
 
   const visibleCollapsed = effectiveCollapsedSectors(collapsedSectors, searchQuery);
   const rows = useMemo(
-    () => buildFuturesRows(contractsBySector, sortPreference, quotes, {
+    () => buildFuturesRows(contractsBySector, sortPreference, shownQuotes, {
       query: searchQuery,
       collapsed: collapsedSectors,
       returns,
       terms,
     }),
-    [collapsedSectors, contractsBySector, quotes, returns, searchQuery, sortPreference, terms],
+    [collapsedSectors, contractsBySector, returns, searchQuery, shownQuotes, sortPreference, terms],
   );
 
   const sessionText = usesSessionText(width);
-  const quotesRef = useRef(quotes);
+  const quotesRef = useRef(shownQuotes);
   const returnsRef = useRef(returns);
   const termsRef = useRef(terms);
-  quotesRef.current = quotes;
+  quotesRef.current = shownQuotes;
   returnsRef.current = returns;
   termsRef.current = terms;
   const renderCell = useCallback((
     row: FuturesTableRow,
     column: FuturesColumn,
-  ) => renderFuturesCell(row, column, quotesRef.current, { sessionText, returns: returnsRef.current, terms: termsRef.current }), [sessionText]);
+  ) => renderFuturesCell(row, column, quotesRef.current, { sessionText, returns: returnsRef.current, terms: termsRef.current, now: Date.now() }),
+  [sessionText]);
   // Everything a cell reads: the headline figures the board shows, the quote's
   // other fields, whether the last good quote is held over, and the returns.
   const getRowVersion = useCallback((row: FuturesTableRow) => {
     if (row.type !== "row") return row.sector;
-    const state = quotes.get(row.contract.symbol);
+    const state = shownQuotes.get(row.contract.symbol);
     const quote = state?.quote ? boardHeadlineQuote(state.quote) : null;
     const values = returns.get(row.contract.symbol);
     const contract = terms.get(row.contract.symbol);
     return [
       state?.loading, state?.stale,
-      quote?.price, quote?.change, quote?.changePercent, quote?.previousClose, quote?.volume, quote?.lastUpdated, quote?.marketState, quote?.symbol, quote?.name,
-      values?.loading, values?.values["1W"], values?.values["1M"], values?.values.YTD,
+      quote?.price, quote?.change, quote?.changePercent, quote?.previousClose, quote?.volume, quote?.lastUpdated, quote?.symbol, quote?.name,
+      futuresSessionQuote(row.contract, quote)?.marketState,
+      values?.loading, ...Object.values(values?.values ?? {}),
       contract?.loading, contract?.terms?.spec?.unit, contract?.terms?.deliveryMonth, contract?.terms?.nearest?.contract,
-      contract?.terms?.nearest?.lastTrade, contract?.terms?.mostActive?.contract,
+      contract?.terms?.nearest?.lastTrade,
     ].join(":");
-  }, [quotes, returns, terms]);
+  }, [returns, shownQuotes, terms]);
 
   const toggleSector = useCallback((sector: FuturesSector) => {
     setCollapsedSectors((current) => {
@@ -221,6 +262,21 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
     setSelectedId(firstNavigable ? futuresRowId(firstNavigable) : null);
   }, [rows, selectedId]);
 
+  // In the Commodities & Energy workspace the Curve tab shows the market in view here: the row picked, or the one a
+  // search left at the top (`FUT cocoa` opened Curve on ES). The first row an unsearched board selects by itself moves
+  // nothing, so `CTM CC` keeps CC when Markets is opened beside it.
+  const [picked, setPicked] = useState(false);
+  const [, setCurveRoot] = usePaneSettingValue<string | undefined>("root", undefined);
+  const selectedRow = rows.find((row) => row.type === "row" && futuresRowId(row) === selectedId);
+  const marketInView = paneInstance?.paneId === COMMODITIES_ENERGY_PANE_ID && (picked || searchQuery.trim()) && selectedRow?.type === "row"
+    ? selectedRow.contract.code : null;
+  useEffect(() => {
+    if (!marketInView) return;
+    // Arrowing down the board writes the row it stops on, not every row it passes.
+    const timer = setTimeout(() => setCurveRoot(marketInView), CURVE_FOLLOW_MS);
+    return () => clearTimeout(timer);
+  }, [marketInView, setCurveRoot]);
+
   // The footer binds the `/` search hint.
   const handlePaneKey = useCallback((event: DataTableKeyEvent): boolean => {
     if (handleRefreshKey(event, refresh, { stopPropagation: true })) return true;
@@ -255,15 +311,26 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
     },
   } : null);
 
+  // `fn FUT natgas` with no contract to list fails with what to type instead, not the board's empty labels.
+  const noMatch = !!dataProvider && !!searchQuery.trim() && !rows.some((row) => row.type === "row");
+  useRemoteUiNode(noMatch ? {
+    role: "report-failure",
+    label: "No matching contracts",
+    getMetadata: () => futuresNoMatchFailure(searchQuery),
+  } : null);
+
   const status = quoteBoardStatus(listedQuotes);
   const errorMessage = boardErrorMessage(listedQuotes);
   // Every load came back empty: a board of dashes reads as broken, so the
   // body says so once and offers a retry. One quote is enough to keep rows.
   const noQuotes = !!dataProvider && listedQuotes.size > 0 && status.unavailable === listedQuotes.size;
+  // Signed out or free, the contracts' quotes are delayed ones.
+  const quoteDelay = useQuoteDelayFooter(boardQuotes(listedQuotes), "futures-delay");
   usePaneFooter(FUTURES_PANE_ID, () => {
     if (noQuotes) return { info: [], hints: [] };
     const info: PaneFooterSegment[] = quoteBoardFooterInfo(status);
     if (errorMessage) info.push({ id: "reason", parts: [{ text: errorMessage, tone: "warning" }] });
+    if (quoteDelay) info.push(quoteDelay);
     return {
       info,
       hints: [{ id: "search", key: "/", label: "search", onPress: focusSearch }],
@@ -272,6 +339,7 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
     errorMessage,
     focusSearch,
     noQuotes,
+    quoteDelay,
     status.latestTs,
     status.loading,
     status.savedAt,
@@ -298,7 +366,10 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
         kind: "id",
         selectedId,
         getId: (row) => futuresRowId(row),
-        onChange: (id) => setSelectedId(id),
+        onChange: (id) => {
+          setSelectedId(id);
+          setPicked(true);
+        },
       }}
       isNavigable={alwaysNavigable}
       onActivate={(row) => {
@@ -310,7 +381,8 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
       }}
       rootWidth={width}
       rootHeight={height}
-      columns={columns}
+      columns={titledColumns}
+      columnReorder={columnReorder}
       items={dataProvider ? rows : []}
       sortable
       sortColumnId={sortPreference.columnId}
@@ -327,10 +399,11 @@ export function FuturesPane({ focused, width, height }: PaneProps) {
       getRowVersion={getRowVersion}
       selectedTextOverridesCellColor
       reportEveryRow
+      reportColumns={showsReturns ? FUTURES_REPORT_COLUMNS : undefined}
       emptyStateTitle={searchQuery.trim()
         ? "No matching contracts."
         : "No market data provider connected."}
-      emptyStateHint={searchQuery.trim() ? "Clear search." : undefined}
+      emptyStateActions={searchQuery.trim() ? <Button label="Clear search" onPress={() => setSearchQuery("")} /> : undefined}
       rootBefore={(
         <QueryBar
           width={width}
@@ -389,7 +462,7 @@ export const futuresModule: PluginModule = {
       paneId: FUTURES_PANE_ID,
       label: "Futures Board",
       description:
-        "Each root's front futures contract (until its stated roll date) and the day's most active month across equity index, equity sectors, rates, energy, metals, agriculture, livestock, and FX with last price, unit, session change, search, and collapsible sectors.",
+        "Each root's front futures contract (until its stated roll date) across equity index, equity sectors, rates, energy, metals, agriculture, livestock, and FX with last price, unit, session change, search, and collapsible sectors.",
       keywords: [
         "futures",
         "commodities",

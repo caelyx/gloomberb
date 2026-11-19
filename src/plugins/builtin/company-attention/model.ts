@@ -3,7 +3,7 @@ import { scalarPoint, staticSeries } from "../../../components/chart/static/seri
 import type { HiringBoard, HiringPayload, HiringSummary } from "../../../api-client/hiring";
 import type { AppAttentionPayload, AppCompany } from "../../../api-client/app-attention";
 import { humanLabel } from "../shared/research-cells";
-import { formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatNumber } from "../../../utils/format";
 import { countOf, freePreviewNote } from "../shared/free-preview";
 import { countryName, postingPlace, postingTitle } from "../shared/job-posting";
 import { formatShortDate } from "../../../utils/datetime-format";
@@ -83,7 +83,7 @@ export function attentionSectionTitle(kind: AttentionKind, tab: AttentionTab, sy
 
 const HIRING_MIX_TITLES: Record<string, string> = { functions: "Role family", seniority: "Seniority", countries: "Countries", locations: "Locations", signals: "Signals" };
 
-export const count = (value: number | null | undefined) => value == null ? "--" : value.toLocaleString("en-US", { maximumFractionDigits: 0 });
+export const count = (value: number | null | undefined) => value == null ? MISSING_VALUE : value.toLocaleString("en-US", { maximumFractionDigits: 0 });
 /** Decimals per column: percentages and scores to one place, ratings and z-scores to two, counts and remote shares whole. */
 const DECIMALS: Record<string, number> = { score: 1, remote: 0, share: 1, confidence: 0, velocity: 2, rating: 2, drift: 2, z: 2, change: 1 };
 export const SIGNED_COLUMNS = new Set(["net", "change", "velocity", "drift", "growth"]);
@@ -99,7 +99,7 @@ export function remoteText(percentRemote: number | null | undefined, known: numb
   if (percentRemote == null) return null;
   return `${formatNumber(percentRemote, 0)}% of ${known == null ? "" : `${formatNumber(known, 0)} `}known`;
 }
-const signed = (value: number | null | undefined, decimals = 0) => value == null ? "--" : `${value > 0 ? "+" : ""}${value.toLocaleString("en-US", { maximumFractionDigits: decimals })}`;
+const signed = (value: number | null | undefined, decimals = 0) => value == null ? MISSING_VALUE : `${value > 0 ? "+" : ""}${value.toLocaleString("en-US", { maximumFractionDigits: decimals })}`;
 /** A date in words ("Oct 22, 2026"), for a capture's ISO timestamp. */
 const day = (value: string | null | undefined) => value ? formatShortDate(value.slice(0, 10), { utc: true, fallback: "" }) || null : null;
 /** The facts that have a value, in order. */
@@ -171,7 +171,8 @@ export function hiringModel(data: HiringBoard | HiringPayload, mix = "functions"
     preview: data.preview,
     locked: typeof data.locked === "number" ? data.locked : Object.values(data.locked).reduce((a, b) => a + b, 0),
     // How counts compare is methodology (docs/hiring-app-attention.md); the footer keeps only what is wrong with this capture.
-    notices: detail ? [...(latest?.completeness !== "complete" ? ["The latest capture has incomplete or unknown coverage."] : []), ...(detail.status === "stale" ? ["The latest hiring capture is stale."] : [])] : [],
+    // A board that covers part of the company (one country, one unit) says which, beside counts that are only that part's.
+    notices: detail ? [...(detail.coverage.boardScope ? [detail.coverage.boardScope] : []), ...(latest?.completeness !== "complete" ? ["The latest capture has incomplete or unknown coverage."] : []), ...(detail.status === "stale" ? ["The latest hiring capture is stale."] : [])] : [],
     partial: !!detail && (latest?.completeness !== "complete" || detail.status === "stale"),
     // A figure the first capture cannot give yet (a weekly change, a z-score) is left out, not shown as a dash.
     figures: latest ? [
@@ -251,7 +252,7 @@ export function appsModel(data: AppAttentionPayload, mix = "countries", filtered
     ...(unmapped ? { unmapped } : {}),
     // Seven-day figures appear once a week of captures can give them.
     figures: [
-      { label: "Attention score", value: data.summary.attentionScore?.toFixed(1) ?? "--", detail: "/ 100" },
+      { label: "Attention score", value: data.summary.attentionScore?.toFixed(1) ?? MISSING_VALUE, detail: "/ 100" },
       ...(data.summary.rankVelocity7d != null ? [{ label: "Rank velocity", value: signed(data.summary.rankVelocity7d, 2), detail: "places / day" }]
         : [{ label: "Apps", value: count(data.summary.appCount), detail: `${count(data.summary.countryCount)} countries` }]),
       ...(data.summary.ratingChange7d != null ? [{ label: "Rating drift", value: signed(data.summary.ratingChange7d, 2), detail: "7D / 5" }] : []),

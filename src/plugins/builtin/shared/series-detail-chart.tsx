@@ -80,6 +80,7 @@ export function SeriesDetailChart({
   reference,
   resetKey,
   formatValue,
+  formatAxisValue,
   aboveChartRows = 0,
   aboveChart,
   belowChartRows = 0,
@@ -102,6 +103,7 @@ export function SeriesDetailChart({
   /** A new key drops the user's zoom and pan. */
   resetKey: string;
   formatValue: (value: number) => string;
+  formatAxisValue?: (value: number) => string;
   /** Rows kept for `aboveChart`, drawn between the figures and a drawable chart. */
   aboveChartRows?: number;
   aboveChart?: (chartWidth: number) => ReactNode;
@@ -111,7 +113,9 @@ export function SeriesDetailChart({
 }) {
   const [userViewport, setUserViewport] = useState<{ start: Date; end: Date } | null>(null);
   const chartWidth = Math.max(24, width);
-  const statRows = statGridRows(stats, width);
+  // A figure wraps only into rows the chart's least leaves, so the pane never spills.
+  const statMaxLines = height - MIN_CHART_ROWS - aboveChartRows - belowChartRows;
+  const statRows = statGridRows(stats, width, undefined, { maxLines: statMaxLines });
   const chartHeight = Math.max(MIN_CHART_ROWS, height - statRows - aboveChartRows - belowChartRows);
   const { unit, unitGroup, nativeFrequency } = axis;
 
@@ -139,7 +143,7 @@ export function SeriesDetailChart({
 
   return (
     <Box flexDirection="column" width={width}>
-      <StatGrid items={stats} width={width} />
+      <StatGrid items={stats} width={width} maxLines={statMaxLines} />
       {drawable ? (
         <>
           {aboveChart?.(chartWidth)}
@@ -157,6 +161,7 @@ export function SeriesDetailChart({
             viewportResetKey={resetKey}
             onViewportChange={setUserViewport}
             formatValue={(value) => formatValue(value)}
+            formatAxisValue={formatAxisValue}
             emptyMessage="Not enough chart data"
           />
         </>

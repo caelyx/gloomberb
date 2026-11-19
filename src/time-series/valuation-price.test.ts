@@ -4,7 +4,7 @@ import { createTestDataProvider } from "../test-support/data-provider";
 import { createDefaultConfig } from "../types/config";
 import { loadChartPaneModel } from "../plugins/builtin/chart-composer/headless";
 import { extractFundamentalSeries, valuationPriceIssues } from "./fundamentals";
-import { resolveStudies } from "./studies";
+import { resolveStudies } from "./studies/resolve";
 import { resolveChartSpecData } from "./resolve";
 import { chartQuoteOverrideKeyForSource, getLiveChartQuoteTargets, observeLiveChartQuotes } from "./live-quotes";
 import { createQuoteStoreFixture } from "../test-support/quote-store";
@@ -55,14 +55,14 @@ test("invalid current quote price or timestamp never borrows the historical clos
 
 test("a latest contradictory historical bar leaves a diagnostic gap instead of using its close or an older bar", () => {
   const data = fixture(); data.quote!.stale = true;
-  data.priceHistory[1]!.open = 70;
+  data.priceHistory[1]!.open = 70; data.priceHistory[1]!.low = 57;
   const original = JSON.stringify(data.priceHistory);
   for (const field of fields) {
     const points = extractFundamentalSeries(data, source(field));
     expect(points).toHaveLength(1);
     expect(points[0]?.value).toBeNull();
     expect(points[0]?.observedAt.toISOString()).toBe("2025-12-31T00:00:00.000Z");
-    expect(points[0]?.provenance?.priceHistoryIntegrity?.sourcePoints[0]).toMatchObject({ open: 70, high: 56, close: 55 });
+    expect(points[0]?.provenance?.priceHistoryIntegrity?.sourcePoints[0]).toMatchObject({ open: 70, high: 56, low: 57, close: 55 });
   }
   expect(JSON.stringify(data.priceHistory)).toBe(original);
   // A valid close-only row at the same time cannot erase contradictory evidence.
@@ -159,7 +159,7 @@ test("future Current quote times retain invalid-time provenance without changing
 });
 
 test("actual resolver/export count a null corrupt valuation as unavailable and retain the original candle", async () => {
-  const data = fixture(); data.quote!.stale = true; data.priceHistory[1]!.open = 70;
+  const data = fixture(); data.quote!.stale = true; data.priceHistory[1]!.open = 70; data.priceHistory[1]!.low = 57;
   const model = await load(data);
   expect(model.complete).toBe(false);
   expect(model.unavailableSymbols).toEqual(["TEST:XNYS"]);
@@ -167,7 +167,7 @@ test("actual resolver/export count a null corrupt valuation as unavailable and r
     expect.objectContaining({ seriesId: "pe", integrity: expect.objectContaining({ sourcePoints: [expect.objectContaining({ open: 70, high: 56 })] }) }),
   ]));
   expect(model.metadata?.summaries).toEqual(expect.arrayContaining([expect.objectContaining({ endValue: null })]));
-  expect(model.metadata?.warnings).toEqual(expect.arrayContaining([expect.stringContaining("inconsistent OHLC")]));
+  expect(model.metadata?.warnings).toEqual(expect.arrayContaining([expect.stringContaining("contradictory prices")]));
 });
 
 test("historical date windows and period limits do not inherit excluded current or older price failures", async () => {
@@ -190,7 +190,7 @@ test("historical date windows and period limits do not inherit excluded current 
 });
 
 test("all-missing requested periods retain their price evidence and remain unavailable", async () => {
-  const data = fixture(); data.quote!.stale = true; data.priceHistory[1]!.open = 70;
+  const data = fixture(); data.quote!.stale = true; data.priceHistory[1]!.open = 70; data.priceHistory[1]!.low = 57;
   const model = await load(data, { maxPoints: 1 });
   expect(model.series[0]?.points.map((point) => point.value)).toEqual([null]);
   expect(model.complete).toBe(false);
@@ -218,7 +218,7 @@ test("invalid non-OHLC prices interrupt studies and retain the reason during lat
     expect.objectContaining({ seriesId: "sma", issues: [expect.objectContaining({ kind: "history", reason: "invalid-price", point: expect.objectContaining({ close: 0 }) })] }),
   ]));
   expect(warmup.chart.warnings.some((warning) => warning.includes("Historical valuation unavailable"))).toBe(true);
-  expect(warmup.chart.warnings.some((warning) => warning.includes("inconsistent OHLC"))).toBe(false);
+  expect(warmup.chart.warnings.some((warning) => warning.includes("contradictory prices"))).toBe(false);
 });
 
 test.each(["NaN", "future"] as const)("actual live quote status and %s timestamp recovery recompute Current valuations", async invalidKind => {

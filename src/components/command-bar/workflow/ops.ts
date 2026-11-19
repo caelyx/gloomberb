@@ -14,7 +14,6 @@ import { PluginOffError } from "../../../plugins/plugin-off";
 import { formatTickerListInput } from "../../../tickers/list";
 import { PANE_LOCK_SETTING_KEY, setPaneLocked, updatePaneInstance, setPaneSettings } from "../../../pane-settings";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
-import { findPaneLocation } from "../../../layout/pane-manager";
 import { cleanPortfolioPaneSettings, resolvePortfolioPaneCollectionId } from "../../../plugins/builtin/portfolio-list/settings";
 import {
   DEFAULT_RELATIONSHIP_SECOND_SYMBOL,
@@ -28,6 +27,7 @@ import { attentionActionForPane, captureAttentionAction } from "../../../telemet
 import { publicTickerKey } from "../../../utils/exchanges";
 import { keysClearedByChange } from "./fields";
 import { findReusablePaneInstance, retargetPaneInstance, withFreeTickerInstanceId } from "./pane-reuse";
+import { optionPaneState, optionSettings } from "../../../cli/pane-functions/options";
 import {
   resolveTickerInputOrThrow,
   resolveTickerListInput,
@@ -129,10 +129,13 @@ async function resolvePaneTemplateOptions(
   // nothing is named and no ticker is active; with one active it opens on it.
   const tickerNamed = !!(resolvedOptions?.symbol?.trim() || resolvedOptions?.arg?.trim() || resolvedOptions?.ticker);
   const opensWithoutTicker = !!template.shortcut?.argOptional || (!!template.shortcut?.openWithoutArg && !baseContext.activeTicker);
-  const resolvesTicker = template.shortcut?.argPlaceholder === "ticker" && (tickerNamed || !opensWithoutTicker);
+  // A ticker function that also takes several (INS MO,PM,LMT) opens on the list as given; one of them is its ticker.
+  const listed = resolvedOptions?.symbols?.length ?? 0;
+  const resolvesTicker = template.shortcut?.argPlaceholder === "ticker" && listed <= 1 && (tickerNamed || !opensWithoutTicker);
+  const named = resolvedOptions?.symbol ?? (listed === 1 ? resolvedOptions?.symbols?.[0] : undefined) ?? resolvedOptions?.arg;
   if (resolvesTicker) {
     if (resolvedOptions?.instrument === null && !resolvedOptions.ticker) {
-      const publicQuery = resolvedOptions.symbol ?? resolvedOptions.arg ?? baseContext.activeTicker ?? "";
+      const publicQuery = named ?? baseContext.activeTicker ?? "";
       const publicTarget = await resolveTickerOpenTarget({ query: publicQuery,
         tickers: state.tickers, tickerRepository: deps.tickerRepository, dataProvider: deps.dataProvider, publicOnly: true });
       if (!publicTarget) throw new Error(tickerOpenFailureMessage(publicQuery.trim().toUpperCase()));
@@ -140,14 +143,14 @@ async function resolvePaneTemplateOptions(
       if (publicTarget.created) deps.pluginRegistry.events.emit("ticker:added", { symbol: publicTarget.symbol, ticker: publicTarget.ticker });
       resolvedOptions = { ...resolvedOptions, symbol: publicTarget.symbol, ticker: publicTarget.ticker, listing: resolvedOptions.listing ?? publicTarget.listing };
     }
-    const requested = resolvedOptions?.symbol ?? resolvedOptions?.arg;
+    const requested = named;
     const activeTicker = baseContext.activeTicker && baseContext.activeInstrument !== undefined
       && (!requested || requested === baseContext.activeTicker) ? state.tickers.get(baseContext.activeTicker) : undefined;
     const resolvedTicker: Pick<ResolvedTickerInput, "symbol" | "ticker" | "instrument" | "listing"> = resolvedOptions?.ticker && resolvedOptions.ticker.metadata.ticker === resolvedOptions.symbol
       ? { symbol: resolvedOptions.symbol, ticker: resolvedOptions.ticker }
       : activeTicker ? { symbol: activeTicker.metadata.ticker, ticker: activeTicker }
       : await resolveTickerInputOrThrow(
-      resolvedOptions?.symbol ?? resolvedOptions?.arg,
+      named,
       baseContext.activeTicker,
       baseContext.activeCollectionId,
       deps,
@@ -171,7 +174,8 @@ async function resolvePaneTemplateOptions(
     const rawInput = resolvedOptions?.arg ?? resolvedOptions?.values?.tickers ?? "";
     const symbols = !String(rawInput).trim() && template.shortcut?.openWithoutArg
       ? []
-      : await resolveTickerListInput(rawInput, baseContext.activeCollectionId, deps, template.shortcut?.keepArgToken);
+      : await resolveTickerListInput(rawInput, baseContext.activeCollectionId, deps, template.shortcut?.keepArgToken,
+        { maximum: template.headless?.argument.maximum });
     resolvedOptions = {
       ...resolvedOptions,
       arg: rawInput,
@@ -251,6 +255,17 @@ export async function createPaneTemplateOrThrow(
     return;
   }
   let spec = createInstanceResult ?? {};
+  // A word's preset options over what the template opens with, as `fn` applies them:
+  // `PDUFA` sets CATL's type, `runway` the FA statement its view state names. An
+  // option that names view state sets only that, so the open FA window on the ticker is the one used.
+  const preset = resolvedOptions?.preset ?? {};
+  const presetState = optionPaneState(preset);
+  const presetSettings = optionSettings(Object.fromEntries(Object.entries(preset)
+    .filter(([key, value]) => Object.keys(optionPaneState({ [key]: value })).length === 0)));
+  if (Object.keys(presetSettings).length > 0) spec = { ...spec, settings: { ...spec.settings, ...presetSettings } };
+  const applyPresetState = (instanceId: string) => {
+    if (Object.keys(presetState).length > 0) deps.dispatch({ type: "UPDATE_PANE_STATE", paneId: instanceId, patch: presetState });
+  };
   if (spec.binding?.kind === "fixed" && spec.binding.symbol === context.activeTicker && context.activeInstrument !== undefined) {
     const instrument = spec.binding.instrument !== undefined ? spec.binding.instrument : context.activeInstrument;
     const listing = spec.binding.listing ?? context.activeListing;
@@ -287,14 +302,7 @@ export async function createPaneTemplateOrThrow(
     template,
     deps.pluginRegistry.paneTemplates,
     spec,
-    {
-      focusedPaneId: deps.getState().focusedPaneId,
-      paneDef: deps.pluginRegistry.panes.get(template.paneId),
-      // In a secondary window this layout is its view: "main" there is its own grid.
-      preferPaneIds: new Set(instances
-        .filter((entry) => findPaneLocation(deps.getState().config.layout, entry.instanceId)?.window === "main")
-        .map((entry) => entry.instanceId)),
-    },
+    { focusedPaneId: deps.getState().focusedPaneId, paneDef: deps.pluginRegistry.panes.get(template.paneId) },
   );
   if (existing) {
     const retargeted = retargetPaneInstance(existing, spec);
@@ -304,6 +312,7 @@ export async function createPaneTemplateOrThrow(
         () => retargeted,
       ) : undefined;
     if (nextLayout) deps.pluginRegistry.updateLayout(nextLayout);
+    applyPresetState(existing.instanceId);
     // React can batch the layout update and focus. Bringing a floating pane to
     // the front must use its retargeted settings, not the preceding render.
     deps.pluginRegistry.focusPane(existing.instanceId, nextLayout);
@@ -324,6 +333,7 @@ export async function createPaneTemplateOrThrow(
     throw new Error("Open a matching ticker or collection context first.");
   }
 
+  applyPresetState(instance.instanceId);
   deps.placePaneInstance(instance, paneDef, spec);
   if (openedByUser) countTemplateOpen(template, pluginId, deps);
   countAttention();

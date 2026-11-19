@@ -51,6 +51,8 @@ const LISTINGS: Array<[typed: string, key: string, readAs: boolean]> = [
 ];
 
 let requested: string[] = [];
+/** Depositary pairs the home line's quote names, set by the tests that read one. */
+const PAIRS: Record<string, { receipt: string; ratio: number; ordinary: string[] }> = {};
 /** Symbols search leaves out, so a shared code is read from the listing's own quotes. */
 const UNSEARCHED = new Set<string>();
 
@@ -62,7 +64,9 @@ function listingQuote(symbol: string, exchange: string) {
   const board = !listing && asked === "KRX" ? LISTED[bare!]?.find(([listed]) => listed === "KOSDAQ") : undefined;
   if (board) return createTestQuote({ symbol: bare!, name: board[1], currency: "KRW", listingExchangeName: "KRX", tradingExchangeName: "KOSDAQ" });
   if (!listing) throw new Error(`No quote for ${symbol}`);
-  return createTestQuote({ symbol: bare!, name: listing[1], currency: "USD", listingExchangeName: listing[0] });
+  const pair = PAIRS[bare!];
+  return createTestQuote({ symbol: bare!, name: listing[1], currency: "USD", listingExchangeName: listing[0],
+    ...pair ? { depositaryPair: pair, isDepositaryReceipt: pair.receipt === bare } : {} });
 }
 
 const dataProvider = createTestDataProvider({
@@ -183,6 +187,21 @@ test("every command, fn function, the command bar, links and chat read a listing
   }
 });
 
+test("a listing written venue first, as spreadsheets write it, reads as its listing in commands and the command bar, said once", async () => {
+  for (const [typed, key, said] of [
+    ["TYO:7203", "7203:JPX", "Read TYO:7203 as 7203:JPX."],
+    ["TSE:7203", "7203:JPX", "Read TSE:7203 as 7203:JPX: TSE is Toronto Stock Exchange (TSX) or Tokyo Stock Exchange (JPX), and 7203 trades on JPX."],
+    ["LON:VOD", "VOD:LSE", "Read LON:VOD as VOD:LSE."],
+  ] as const) {
+    for (const [reader, read] of Object.entries(READERS)) {
+      const reading = await read(typed);
+      expect(reading.listing, `${reader} ${typed}`).toBe(key);
+      expect(reading.warnings.filter((warning) => warning.startsWith("Read ")), `${reader} ${typed}`).toEqual([said]);
+    }
+    expect((await openInCommandBar(typed)).listing, `command bar ${typed}`).toBe(key);
+  }
+});
+
 test("a code search leaves out is read from the listing's own quotes, not from a board Gloom Cloud answered for it", async () => {
   // Gloom Cloud answers 247540:KRX from KOSDAQ under the KRX name: that is no KRX line.
   UNSEARCHED.add("247540");
@@ -231,10 +250,11 @@ test("a function whose data covers US listings only names the company's US listi
   const minuteBars = (key: string) => `No second or tick bars; 1-minute bars: fn GIP ${key}; trades exist for US listings only.`;
   const refused = (token: string, typed: string, ...options: string[]) => runFunction(token, typed, ...options)
     .then(() => null, (error: { message: string; details?: string }) => [error.message, error.details]);
-  for (const token of ["TAS", "QR"]) {
+  // QR names itself as its report does: the NBBO view of the same tape.
+  for (const [token, title] of [["TAS", "Time and sales"], ["QR", "Quote recap"]] as const) {
     for (const typed of [["SAN:EPA"], ["SAN", "--exchange", "EPA"]]) {
       expect(await refused(token, typed[0]!, ...typed.slice(1))).toEqual([
-        "Time and sales covers US listings only, and SAN:EPA is Sanofi on Euronext Paris (EPA).",
+        `${title} covers US listings only, and SAN:EPA is Sanofi on Euronext Paris (EPA).`,
         `Sanofi's US listing: SNY (try: gloom fn ${token} SNY)\n${minuteBars("SAN:EPA")}`,
       ]);
     }
@@ -246,6 +266,45 @@ test("a function whose data covers US listings only names the company's US listi
   expect(list.warnings).toEqual([
     "FINRA short interest covers US listings only, and SAN:EPA is Sanofi on Euronext Paris (EPA). Sanofi's US listing: SNY (try: gloom fn SIW SNY)",
   ]);
+});
+
+test("a listing abroad whose US line is a receipt over the counter is offered it only where the data covers OTC securities", async () => {
+  // As Gloom Cloud quoted them on 12 Nov 2026: 0700:HKEX names its receipt, which trades on OTC Markets' Pink tier.
+  // Search by the name lists Tencent's warrants and its SGX receipt, no US line (none here), so the quote's pair finds it.
+  LISTED.TCEHY = [["OTC MARKETS OTCPK", "Tencent Holdings Limited"]];
+  const pair = { receipt: "TCEHY", ratio: 1, ordinary: ["0700.HK"] };
+  PAIRS["0700"] = pair;
+  PAIRS.TCEHY = pair;
+  const refused = (token: string, typed: string) => runFunction(token, typed)
+    .then(() => null, (error: { message: string; details?: string }) => [error.message, error.details?.split("\n")[0]]);
+  try {
+    // FINRA short interest, its watch, the SEC's fails, FINRA's weekly volume and release-day closes all have TCEHY.
+    for (const [token, what] of [["SI", "FINRA short interest"], ["SIW", "FINRA short interest"], ["FTD", "SEC fails to deliver"],
+      ["ATS", "FINRA weekly off-exchange volume"], ["MDAY", "Macro release day data"]] as const) {
+      expect(await refused(token, "0700:HKEX"), token).toEqual([
+        `${what} covers US listings only, and 0700:HKEX is Tencent Holdings on Hong Kong Stock Exchange (HKEX).`,
+        `Tencent Holdings's US listing: TCEHY, over the counter (try: gloom fn ${token} TCEHY)`,
+      ]);
+    }
+    // Trades, quotes, FINRA's daily short volume and options cover exchange listings: TCEHY is named, never offered.
+    for (const [token, what] of [["TAS", "Time and sales"], ["QR", "Quote recap"], ["SIV", "FINRA short volume"],
+      ["HIVG", "Implied volatility history"]] as const) {
+      expect(await refused(token, "0700:HKEX"), token).toEqual([
+        `${what} covers US listings only, and 0700:HKEX is Tencent Holdings on Hong Kong Stock Exchange (HKEX).`,
+        "Tencent Holdings has no US exchange listing; its US line TCEHY trades over the counter, which this data does not cover.",
+      ]);
+    }
+    // A receipt on a US exchange is every function's: the pair names it before search would.
+    PAIRS["0700"] = { ...pair, receipt: "AAPL" };
+    expect(await refused("TAS", "0700:HKEX")).toEqual([
+      "Time and sales covers US listings only, and 0700:HKEX is Tencent Holdings on Hong Kong Stock Exchange (HKEX).",
+      "Tencent Holdings's US listing: AAPL (try: gloom fn TAS AAPL)",
+    ]);
+  } finally {
+    delete LISTED.TCEHY;
+    delete PAIRS["0700"];
+    delete PAIRS.TCEHY;
+  }
 });
 
 test("a list function reads a pasted list split by semicolons, quote marks dropped, and names a separator left on its end", async () => {

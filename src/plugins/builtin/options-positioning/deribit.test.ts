@@ -8,6 +8,8 @@ import { optionsPositioningHeadless } from "./headless";
 import { expiryWithTimeLabel, formatContracts, formatPositioningSpot, positioningSpotDetail, settlementTime, wallsByExpiry } from "./model";
 
 // Deribit's BTC book as Gloom Cloud serves it: live OI in coins, expiries settling at 08:00 UTC.
+// Read a minute after its spot and OI time, so the fixture never ages into "stale".
+const READ_AT = Date.parse("2026-10-22T22:49:34.592Z");
 const expiry = (date: string, days: number, maxPain: number) => ({
   date, days, callOI: 87_461.9, putOI: 49_016.5, putCallRatio: 0.56, maxPain, callChange: null, putChange: null,
   expiresAt: `${date}T08:00:00.000Z`,
@@ -36,8 +38,8 @@ test("a Deribit expiry is labelled with its 08:00 UTC settlement, a US one by it
   expect(settlementTime("2026-10-30T08:00:00.000Z")).toBe("08:00 UTC");
   expect(settlementTime(undefined)).toBeNull();
   expect(settlementTime("2026-10-30T00:00:00.000Z")).toBeNull();
-  expect(expiryWithTimeLabel({ date: "2026-10-30", expiresAt: "2026-10-30T08:00:00.000Z" })).toBe("Oct 30 '26 08:00 UTC");
-  expect(expiryWithTimeLabel({ date: "2026-10-30" })).toBe("Oct 30 '26");
+  expect(expiryWithTimeLabel({ date: "2026-10-30", expiresAt: "2026-10-30T08:00:00.000Z" })).toBe("30 Oct '26 08:00 UTC");
+  expect(expiryWithTimeLabel({ date: "2026-10-30" })).toBe("30 Oct '26");
 });
 
 test("coin open interest keeps its tenths, and the spot is the venue's index with no US session", () => {
@@ -60,7 +62,7 @@ test("OPX BTC-USD reports max pain and walls per expiry, settling at 08:00 UTC, 
     optionsPositioning: async (path: string) => path.startsWith("open-interest") ? openInterest : gamma,
   } as never;
   const result = await definition.load(args, createTestHeadlessContext({ apiClient })) as HeadlessBundleResult;
-  const freshness = deriveHeadlessFreshness(definition, result);
+  const freshness = deriveHeadlessFreshness(definition, result, READ_AT);
   const tables = headlessReportTables(definition, result, args, "OPX", freshness, { complete: true, unavailableSymbols: [] });
   const expiries = tables.tables.find((table) => table.title?.startsWith("Expiries"))!;
   expect(expiries.columns).toEqual(expect.arrayContaining(["Settles", "Call OI (BTC)", "Max pain", "Call wall", "Put wall"]));
@@ -73,7 +75,7 @@ test("OPX BTC-USD reports max pain and walls per expiry, settling at 08:00 UTC, 
   const text = renderHeadlessPaneText(definition, result, args, "OPX", freshness);
   expect(text).toContain("Venue                Deribit");
   expect(text).toContain("1 BTC; OI counts BTC");
-  expect(text).toContain("Strikes · Oct 30 '26 08:00 UTC");
+  expect(text).toContain("Strikes · 30 Oct '26 08:00 UTC");
   expect(text).toContain("87,461.9");
   // The book is read live, not a day-old OI session.
   expect(freshness.status).toBe("live");

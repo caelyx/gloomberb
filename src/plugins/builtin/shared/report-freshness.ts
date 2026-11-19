@@ -1,12 +1,14 @@
+import { logFailure } from "../../../utils/log-failure";
 import type { HeadlessPaneFreshness } from "../../../types/headless";
 import type { Quote, QuoteIndexSession } from "../../../types/financials";
 import { isQuoteBeforeLatestSession, isQuoteStaleForCurrentSession } from "../../../market-data/quotes/freshness";
 import { delayedFeedLagMs, readIndexSession } from "../../../market-data/market/freshness";
 import { quoteHeadlineTime } from "../../../market-data/market/status";
+import { indexLevelMarketState } from "../../../market-data/market/index-level";
 import { barSizeFromGap, medianBarGap } from "../../../time-series/bar-spacing";
 import { apiClient } from "../../../api-client";
 import { isPerpetualExchange } from "../../../tickers/perpetual-listing";
-import { CLOUD_NEWS_DELAY_HOURS, hasProAccess } from "../../../api-client/plan-rules";
+import { hasProAccess } from "../../../api-client/plan-rules";
 import { savedCopyMark } from "../../../data/saved-copies";
 
 /**
@@ -47,6 +49,14 @@ export function barResolutionFromDates(dates: readonly (string | number | Date)[
 export const SEC_FILINGS: HeadlessPaneFreshness = { source: "SEC EDGAR", status: "not-a-feed", basis: "filed data", oldest: null };
 
 /**
+ * A list of filings, dated by its newest one's filing date and by when it was
+ * read: `newest filing Tue 27 Oct 2026 · retrieved Wed 28 Oct 2026 19:07 UTC`.
+ */
+export const SEC_FILING_ROWS: HeadlessPaneFreshness = {
+  ...SEC_FILINGS, observedKey: "filingDate", asOfLabel: "newest filing", retrievedToo: true,
+};
+
+/**
  * What a filings view opened inside a pane that hosts others (Issuer Debt in
  * Fixed Income) declares as its template's `reportFreshness`, so a capture
  * dates the filings rather than the issuer's stock quote.
@@ -64,7 +74,7 @@ export const REFERENCE_DATA: HeadlessPaneFreshness = { status: "not-a-feed", bas
 export const REPORTED_DATA: HeadlessPaneFreshness = { status: "not-a-feed", basis: "reported data" };
 
 /** What a news list's as-of is: its newest story, not the time it was read. */
-export const NEWEST_STORY = "newest story";
+const NEWEST_STORY = "newest story";
 
 /** Gloom Cloud's delayed quotes run behind each venue by a lag the app knows (`delayedFeedLagMs`). */
 const CLOUD_QUOTE_PROVIDER_ID = "gloomberb-cloud";
@@ -72,6 +82,8 @@ const CLOUD_QUOTE_PROVIDER_ID = "gloomberb-cloud";
 interface QuoteFreshnessFields {
   dataSource?: "live" | "delayed";
   stale?: boolean;
+  /** At its venue's nominal price, nothing having traded (Quote.nominalPrice): reports count it apart from stale rows. */
+  nominal?: true;
   /** How far a delayed Gloom Cloud quote runs behind its venue's trades. */
   delayMinutes?: number;
   /** The venue whose sessions the quote follows, so the report can say whether its market is open. */
@@ -95,16 +107,19 @@ export function quoteFreshnessFields(
   // A perpetual's venue is read about once a minute, not held back by a feed lag.
   const delayed = quote.dataSource === "delayed" && quote.providerId === CLOUD_QUOTE_PROVIDER_ID && !isPerpetualExchange(exchange);
   const sessionCalendar = readIndexSession(quote.indexSession);
-  // A print older than its venue's latest session says nothing of where that market stands now (no "markets open" beside it).
-  const session = !isQuoteBeforeLatestSession(quote, now);
+  // A print older than its venue's latest session says nothing of where that market stands now (no "markets open" beside it);
+  // a nominal price is that session's, its last trade older.
+  const session = !!quote.nominalPrice || !isQuoteBeforeLatestSession(quote, now);
   return {
     // A quote served from its saved copy, its refresh having failed, marks the row drawn from it.
     ...savedCopyMark(quote),
     ...(quote.dataSource === "live" || quote.dataSource === "delayed" ? { dataSource: quote.dataSource } : {}),
     stale: isQuoteStaleForCurrentSession(quote, now),
+    ...(quote.nominalPrice ? { nominal: true as const } : {}),
     ...(delayed ? { delayMinutes: delayedFeedLagMs(exchange) / 60_000 } : {}),
     ...(exchange && session ? { sessionExchange: exchange } : {}),
-    ...(quote.marketState && session ? { marketState: quote.marketState } : {}),
+    // An index's final close reads as a close, not after hours.
+    ...(quote.marketState && session ? { marketState: indexLevelMarketState(quote) } : {}),
     ...(sessionCalendar && session ? { sessionCalendar } : {}),
   };
 }
@@ -113,11 +128,16 @@ export function quoteFreshnessFields(
  * One quote as a report reads it among the observations behind a view: its
  * freshness fields and when the price it headlines was observed
  * (quoteHeadlineTime: in a pre-market nothing has traded in, the close it
- * stands at). A board publishes one per quote it shows, so `fn` and `shot`
- * date it as `quote` dates the same quotes.
+ * stands at). A nominal price is dated by the session it is the venue's price
+ * for (`asOfDate`), not by the older last trade. A board publishes one per
+ * quote it shows, so `fn` and `shot` date it as `quote` dates the same quotes.
  */
-export function quoteObservation(quote: Quote, now = Date.now()): QuoteFreshnessFields & { updatedAt: number } {
-  return { ...quoteFreshnessFields(quote, now), updatedAt: quoteHeadlineTime(quote) };
+export function quoteObservation(quote: Quote, now = Date.now()): QuoteFreshnessFields & { updatedAt: number; asOfDate?: string } {
+  return {
+    ...quoteFreshnessFields(quote, now),
+    updatedAt: quoteHeadlineTime(quote),
+    ...(quote.nominalPrice ? { asOfDate: quote.nominalPrice.session } : {}),
+  };
 }
 
 /**
@@ -129,8 +149,8 @@ export async function cloudRealtimeAccess(): Promise<boolean | null> {
   if (!apiClient.isSignedIn()) return false;
   try {
     return hasProAccess(apiClient.getCurrentUser() ?? await apiClient.getSession());
-  } catch {
-    return null;
+  } catch (error) {
+    return logFailure("shared.report-freshness", "Read Cloud plan for report freshness failed", null)(error);
   }
 }
 
@@ -143,6 +163,5 @@ export async function cloudRealtimeAccess(): Promise<boolean | null> {
 export function cloudNewsFreshness(realtime: boolean | null): HeadlessPaneFreshness {
   const stories: HeadlessPaneFreshness = { observedKey: "publishedAt", oldest: null, asOfLabel: NEWEST_STORY };
   if (realtime === true) return { ...stories, status: "live" };
-  if (realtime === false) return { ...stories, status: "delayed", delayMinutes: CLOUD_NEWS_DELAY_HOURS * 60 };
   return { ...stories, status: "not-a-feed", basis: "published stories" };
 }

@@ -8,10 +8,11 @@ import { ChatBotIcon } from "./person-icons";
 import { CHAT_PERSON_ICON_WIDTH } from "../people";
 import { ChatMessageActions, ChatMessageHeader } from "./header";
 import { Button } from "../../../../components/ui";
+import { useSelectionFill } from "../../../../components/ui/selection-fill";
 import { canReactToMessage } from "../reactions";
 import { TerminalChatReactions } from "./reactions";
 import { TerminalChatMessageRow } from "./inline-tokens";
-import { TerminalChatPaneChip } from "./pane-chip";
+import { TerminalChatPaneChipRow } from "./pane-chip";
 import { chatMessagePaneLinks } from "../pane-links/model";
 import { useSlowPendingSend } from "./pending-send";
 import { getChatMessageRenderState } from "./render-state";
@@ -54,6 +55,7 @@ export function TerminalChatMessage({
 }: TerminalChatMessageProps) {
   const rendererHost = useRendererHost();
   const slowSend = useSlowPendingSend(msg);
+  const selectionFill = useSelectionFill();
   const canReact = reactionsEnabled && canReactToMessage(msg);
   const state = getChatMessageRenderState({
     msg,
@@ -92,7 +94,8 @@ export function TerminalChatMessage({
   const clearHovered = () => setHoveredIdx((current) => (current === index ? null : current));
   const messageRowProps = {
     width: contentWidth,
-    backgroundColor: state.bgColor,
+    // The chosen message is quieter while the chat pane does not have the keys.
+    backgroundColor: state.isSelected ? selectionFill.bg : state.bgColor,
     onMouseOver: setHovered,
     onMouseOut: clearHovered,
   };
@@ -167,23 +170,21 @@ export function TerminalChatMessage({
         </Box>
       ))}
       {paneLinks.map((link, linkIndex) => (
-        <Box
+        <TerminalChatPaneChipRow
           key={`${msg.id}:pane:${link.kind === "share" ? link.id : link.link.kind}`}
-          {...messageRowProps}
-          paddingLeft={3}
-          height={1}
-          flexDirection="row"
-          position={state.grouped && bodyLines.length === 0 && linkIndex === 0 ? "relative" : undefined}
+          link={link}
+          width={messageBodyWidth}
+          rowProps={{
+            ...messageRowProps,
+            paddingLeft: 3,
+            position: state.grouped && bodyLines.length === 0 && linkIndex === 0 ? "relative" : undefined,
+          }}
+          selected={state.isSelected}
+          selectedTextColor={state.selectedTextColor}
+          onOpen={openPaneLink}
         >
-          <TerminalChatPaneChip
-            link={link}
-            width={messageBodyWidth}
-            selected={state.isSelected}
-            selectedTextColor={state.selectedTextColor}
-            onOpen={openPaneLink}
-          />
           {state.grouped && bodyLines.length === 0 && linkIndex === 0 && <ChatMessageActions floating {...actionProps} />}
-        </Box>
+        </TerminalChatPaneChipRow>
       ))}
       {attachments.map((attachment, imageIndex) => (
         <Box

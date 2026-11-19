@@ -1,3 +1,4 @@
+import type { CompanyFrom } from "../types/company-from";
 /**
  * Mergers and acquisitions read from news, press releases and SEC filings.
  * A deal is one target and one buyer; a target with competing bidders has a
@@ -57,6 +58,8 @@ export interface MnaDeal {
   announced: string;
   /** Expected close as the parties state it, e.g. "2026-12-31" or "Q1 2027". */
   expectedClose: string | null;
+  /** The merger agreement's outside date, as a filing states it; null or left out (older servers) when none was read. */
+  outsideDate?: MnaOutsideDate | null;
   closed: string | null;
   /** One line on the latest development. */
   headline: string;
@@ -65,6 +68,22 @@ export interface MnaDeal {
   lastReported: string;
   /** A pending private deal with no news for six months; nothing will report it closing. */
   stale: boolean;
+}
+
+/**
+ * The day after which either side may end the merger agreement if the deal
+ * has not closed: a deadline, not an expected close. Some agreements move it
+ * later on their own on a stated condition (regulatory approvals still
+ * pending); `extendedTo` is that day and `extension` the condition, briefly.
+ */
+export interface MnaOutsideDate {
+  /** `YYYY-MM-DD`. */
+  date: string;
+  extendedTo: string | null;
+  /** What moves it, e.g. "if only antitrust approvals and the Nasdaq listing remain". */
+  extension: string | null;
+  /** The filing it is read from. */
+  source: { form: string; filed: string; url: string | null };
 }
 
 export type MnaStatusFilter = MnaStatus | "all";
@@ -84,6 +103,8 @@ export interface MnaDealsParams {
 
 export interface MnaDealsPayload {
   deals: MnaDeal[];
+  /** The company's home line the data is read from, when not the listing asked (a receipt, a foreign line). */
+  companyFrom?: CompanyFrom;
   hasMore: boolean;
   nextOffset: number;
   /** "delayed" hides deals first reported within `delayDays` from a free account. */

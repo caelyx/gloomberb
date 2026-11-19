@@ -40,6 +40,19 @@ export function parseEconFigure(text: string | null | undefined): EconFigure | n
   return { value: Object.is(value, -0) ? 0 : value, unit: percent ? "%" : word ?? "", scale: 10 ** digits };
 }
 
+/**
+ * A figure with the currency its amount is in beside it, as the calendar
+ * states it: Japan's current account `-556.5B JPY` and its reserves
+ * `1178.4B USD`, which both read "B" alone. A percent or a figure in a unit
+ * of its own (`3%`, `-4.1M bbl`), a text that is no figure, and a row with no
+ * currency (an older server) read as printed.
+ */
+export function figureWithCurrency(text: string | null | undefined, currency: string | null | undefined): string | null {
+  if (text == null) return null;
+  if (!currency || parseEconFigure(text)?.unit !== "") return text;
+  return `${text.trim()} ${currency}`;
+}
+
 /** What a row's Actual, Forecast and Prior say in numbers, with the unit they share and the scale the first is drawn in. */
 export interface EconRowFigures {
   actual: number | null;
@@ -69,4 +82,52 @@ export function econRowFigures(row: { actual?: string | null; forecast?: string 
     unit: first?.unit ? first.unit : null,
     scale: first?.scale ?? null,
   };
+}
+
+/** A figure printed as a bare number, with no unit and no scale letter: `0.6`, `-3`, `1,5`. */
+const BARE_NUMBER = /^[+-]?(?:\d+(?:[.,]\d+)?|\.\d+)$/;
+
+/**
+ * Release names that are a percent whatever one row's figures say: a change
+ * month on month, quarter on quarter or year on year, and the rates published
+ * in percent. "Consumer Inflation Expectations" is a balance, not a rate, and
+ * is not one of them.
+ */
+const PERCENT_NAME = /\b(?:mom|qoq|yoy)\b|(?:^|\s)[mqy]\/[mqy](?=\s|$)|\b(?:inflation|unemployment|jobless|interest|growth|mortgage|funds|participation|savings) rate\b/i;
+
+type EconRowText = { country: string; event: string; indicatorId?: string | null; actual: string | null; forecast: string | null; prior: string | null };
+
+const FIGURE_KEYS = ["actual", "forecast", "prior"] as const;
+
+/** Every release of one indicator: its id, else its country and name. */
+const indicatorKey = (event: Pick<EconRowText, "country" | "event" | "indicatorId">) => event.indicatorId || `${event.country}|${event.event}`;
+
+/**
+ * The calendar with every figure of a percent indicator in percent. The feeds
+ * drop the sign on some rows: US Inflation Rate MoM's prior came as `0.6`, and
+ * the 30-year mortgage rate's as `7.32` beside its actual `7.41%`. An
+ * indicator is in percent when any of its figures is, or its name says so
+ * (`PERCENT_NAME`), and none of its figures is in another unit or scale; its
+ * bare figures then carry `%`. Anything else is left as the feed wrote it.
+ */
+export function withPercentUnits<T extends EconRowText>(events: readonly T[]): T[] {
+  const indicators = new Map<string, { percent: boolean; other: boolean }>();
+  for (const event of events) {
+    const key = indicatorKey(event);
+    const seen = indicators.get(key) ?? { percent: false, other: false };
+    if (PERCENT_NAME.test(event.event)) seen.percent = true;
+    for (const field of FIGURE_KEYS) {
+      const figure = parseEconFigure(event[field]);
+      if (!figure) continue;
+      if (figure.unit === "%") seen.percent = true;
+      else if (figure.unit || figure.scale !== 1) seen.other = true;
+    }
+    indicators.set(key, seen);
+  }
+  return events.map((event) => {
+    const seen = indicators.get(indicatorKey(event))!;
+    if (!seen.percent || seen.other) return event;
+    const bare = FIGURE_KEYS.filter((field) => BARE_NUMBER.test(event[field]?.trim() ?? ""));
+    return bare.length ? { ...event, ...Object.fromEntries(bare.map((field) => [field, `${event[field]!.trim()}%`])) } : event;
+  });
 }

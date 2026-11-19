@@ -1,28 +1,42 @@
 import type { PerpBoardRow, PerpHistoryPayload, PerpLongShortRatio, PerpRankingsPayload } from "../../../api-client/perps";
 import type { DataTableCell, DataTableColumn } from "../../../components";
 import { scalarPoint, staticSeries } from "../../../components/chart/static/series";
-import { getTableWidth } from "../../../components/ui/table-layout";
-import { formatCompact } from "../../../utils/format";
+import { getTableWidth, markHiddenTableColumns } from "../../../components/ui/table-layout";
+import { MISSING_VALUE, formatCompact } from "../../../utils/format";
 import { isUsListingExchange, publicTickerKey } from "../../../utils/exchanges";
 import { isRecord } from "../../../utils/guards";
 import type { ThemeColors } from "../../../theme/colors";
-export const PERP_TABS = ["board", "rankings", "compare", "history", "evidence"] as const;
+export const PERP_TABS = ["board", "rankings", "compare", "liquidations", "depth", "history", "evidence"] as const;
 export type PerpTab = typeof PERP_TABS[number];
 /** One market's tabs; the others list many markets. */
 export const isMarketTab = (tab: string) => tab === "history" || tab === "evidence";
-/** A named market opens its history; nothing named opens the board. */
-export const openingTab = (market: string | null | undefined): PerpTab => market?.trim() ? "history" : "board";
+/** One base asset's tabs, across its contracts on every venue; they share the asset. */
+export const isAssetTab = (tab: string) => tab === "compare" || tab === "liquidations" || tab === "depth";
+/**
+ * A named market opens its history, or its latest values (Evidence) where history is Pro's, so a free account
+ * lands on the figures it has and not on a lock; nothing named opens the board.
+ */
+export const openingTab = (market: string | null | undefined, pro = true): PerpTab => market?.trim() ? pro ? "history" : "evidence" : "board";
 export const ASSET_FILTERS = ["all", "stocks", "indices", "energy", "metals", "fx", "crypto"] as const;
-export const VENUES = ["hyperliquid", "binance", "bybit", "okx", "deribit", "coinbase", "kraken", "dydx"] as const;
+/** The venues Gloom collects perpetuals from: what the venue filter and `--venue` take. */
+export const VENUES = ["hyperliquid", "binance", "bybit", "okx"] as const;
+/** Every venue a market identity can name (`kraken:PF_XBTUSD`), collected or not. */
+export const IDENTITY_VENUES = [...VENUES, "deribit", "coinbase", "kraken", "dydx"] as const;
+/** What `--venue` says of a venue Gloom does not collect yet; null for a covered venue and for any other word. */
+export function uncoveredVenueNote(venue: string): string | null {
+  const id = venue.trim().toLowerCase();
+  return (IDENTITY_VENUES as readonly string[]).includes(id) && !(VENUES as readonly string[]).includes(id)
+    ? `Gloom doesn't cover ${venueName(id)} perps yet.` : null;
+}
 export const BOARD_SORTS = ["oi", "funding", "oi-change", "premium", "long-short"] as const;
 export const sortLabel = (sort: string) => ({ oi: "OI", funding: "Funding", "oi-change": "OI change", premium: "Premium", "long-short": "Long %" })[sort] ?? sort;
 export const label = (s: string) => s === "fx" ? "FX" : s.charAt(0).toUpperCase() + s.slice(1);
-export const percent = (n: number | null | undefined, digits = 3) => n == null ? "--" : `${n > 0 ? "+" : ""}${(n * 100).toFixed(digits)}%`;
-export const price = (n: number | null | undefined) => n == null ? "--" : n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: n < 1 ? 6 : 2 });
-export const compact = (n: number | null | undefined) => n == null ? "--" : formatCompact(n, { fixedDecimals: true });
-export const time = (s: string | null | undefined) => s ? `${s.slice(0, 10)} ${s.slice(11, 16)} UTC` : "--";
+export const percent = (n: number | null | undefined, digits = 3) => n == null ? MISSING_VALUE : `${n > 0 ? "+" : ""}${(n * 100).toFixed(digits)}%`;
+export const price = (n: number | null | undefined) => n == null ? MISSING_VALUE : n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: n < 1 ? 6 : 2 });
+export const compact = (n: number | null | undefined) => n == null ? MISSING_VALUE : formatCompact(n, { fixedDecimals: true });
+export const time = (s: string | null | undefined) => s ? `${s.slice(0, 10)} ${s.slice(11, 16)} UTC` : MISSING_VALUE;
 /** A list row's observation, month to minute: the header names UTC and the footer the full as-of. */
-const observed = (s: string | null | undefined) => s ? `${s.slice(5, 10)} ${s.slice(11, 16)}` : "--";
+export const observed = (s: string | null | undefined) => s ? `${s.slice(5, 10)} ${s.slice(11, 16)}` : MISSING_VALUE;
 /**
  * The listed security a market tracks, as DES, FA and G take it: a US listing by its symbol, the key a stock is
  * saved and opened under, and a listing abroad with its venue (`NET:XLON`), so they open the security the premium
@@ -35,7 +49,11 @@ export function underlyingTicker(row: Pick<PerpBoardRow, "underlyingSymbol" | "u
     : row.underlying?.symbol.toUpperCase() === symbol ? row.underlying.listingExchange : undefined;
   return !listing || isUsListingExchange(listing) ? symbol : publicTickerKey(symbol, listing);
 }
-export const marketLabel = (row: Pick<PerpBoardRow, "dex" | "baseAsset">) => row.dex && row.dex !== "default" ? `${row.baseAsset} · ${row.dex.toUpperCase()}` : row.baseAsset;
+/**
+ * A market as the Market column, the pane title and the CLI name it: its base asset, or for a market on a Hyperliquid
+ * builder dex Hyperliquid's own name for it, the dex before a colon (`xyz:NVDA`), which is also its contract symbol.
+ */
+export const marketLabel = (row: Pick<PerpBoardRow, "dex" | "baseAsset">) => row.dex && row.dex !== "default" ? `${row.dex.toLowerCase()}:${row.baseAsset}` : row.baseAsset;
 
 /**
  * Plain names for markets, as the Market column writes the contracts to try, nearest first. A name the board does
@@ -44,7 +62,7 @@ export const marketLabel = (row: Pick<PerpBoardRow, "dex" | "baseAsset">) => row
  */
 const PLAIN_NAMES: Readonly<Record<string, readonly string[]>> = {
   bitcoin: ["BTC"], ethereum: ["ETH"], ether: ["ETH"], solana: ["SOL"], dogecoin: ["DOGE"], ripple: ["XRP"],
-  brent: ["BZ", "BRENTOIL · XYZ"], brentcrude: ["BZ", "BRENTOIL · XYZ"], wti: ["CL"], wticrude: ["CL"], naturalgas: ["NATGAS · XYZ"],
+  brent: ["BZ", "xyz:BRENTOIL"], brentcrude: ["BZ", "xyz:BRENTOIL"], wti: ["CL"], wticrude: ["CL"], naturalgas: ["xyz:NATGAS"],
 };
 /** A pair as exchanges and charts write it: BTC-USD, BTC/USD, BTCUSD, BTCUSDT, BTC-PERP, BTC/USDT:USDT. */
 const QUOTED_PAIR = /^([A-Z0-9]{1,15}?)([-/_ ]?)(?:USDT|USDC|USD|PERP)(?::[A-Z]{3,4})?$/;
@@ -59,8 +77,8 @@ export function perpBaseCandidates(input: string): string[] {
   const pair = QUOTED_PAIR.exec(input.trim().toUpperCase());
   return pair ? [pair[1]!] : [];
 }
-/** The base asset a Market column label names: `BRENTOIL · XYZ` is BRENTOIL. */
-export const baseOfLabel = (label: string) => label.split("·")[0]!.trim();
+/** The base asset a Market column label names: `xyz:BRENTOIL` is BRENTOIL. */
+export const baseOfLabel = (label: string) => label.replace(/^[a-z][a-z0-9]*:/, "");
 /** The base asset of a pair written with a separator (BTC-USD, BTC/USD), which no board symbol spells; null for anything else. */
 export function separatedPairBase(input: string): string | null {
   const pair = QUOTED_PAIR.exec(input.trim().toUpperCase());
@@ -119,7 +137,7 @@ export function collectedVenueCount(sources: unknown): number | null {
   }));
   return venues.size || null;
 }
-export const fundingInterval = (row: Pick<PerpBoardRow, "fundingIntervalHours" | "fundingKind">) => row.fundingIntervalHours ? `${row.fundingIntervalHours}h${row.fundingKind === "last-paid" ? " paid" : row.fundingKind === "continuous" ? " continuous" : ""}` : "--";
+export const fundingInterval = (row: Pick<PerpBoardRow, "fundingIntervalHours" | "fundingKind">) => row.fundingIntervalHours ? `${row.fundingIntervalHours}h${row.fundingKind === "last-paid" ? " paid" : row.fundingKind === "continuous" ? " continuous" : ""}` : MISSING_VALUE;
 export const HISTORY_METRICS = ["funding", "oi", "premium", "price", "long-short"] as const;
 export type HistoryMetric = typeof HISTORY_METRICS[number];
 export const metricLabel = (metric: HistoryMetric) => metric === "oi" ? "OI" : metric === "long-short" ? "L/S" : label(metric);
@@ -157,9 +175,9 @@ export const venueLabel = (row: Pick<PerpBoardRow, "venue">) => venueName(row.ve
 export const venuesOf = (rows: readonly Pick<PerpBoardRow, "venue">[]): string[] => [...new Set<string>(rows.map((row) => row.venue))].sort((a, b) => venueName(a).localeCompare(venueName(b)));
 
 /** A share of accounts, unsigned: 0.6183 reads 61.8%. */
-export const share = (n: number | null | undefined, digits = 1) => n == null ? "--" : `${(n * 100).toFixed(digits)}%`;
+export const share = (n: number | null | undefined, digits = 1) => n == null ? MISSING_VALUE : `${(n * 100).toFixed(digits)}%`;
 /** Long accounts per short account, as the venue publishes it. */
-export const ratioText = (n: number | null | undefined, digits = 2) => n == null ? "--" : n.toFixed(digits);
+export const ratioText = (n: number | null | undefined, digits = 2) => n == null ? MISSING_VALUE : n.toFixed(digits);
 /** What a long/short reading counts, short enough for a legend; `definitionText` says it in full. */
 const longShortDefinition = (definition: string | null | undefined) => definition === "accounts_all" || !definition ? "All accounts" : label(definition.replaceAll("_", " "));
 const LONG_SHORT_REASONS: Record<string, string> = { unsupported: "This venue publishes no per-contract account ratio", off: "Not collected yet", collecting: "Collecting" };
@@ -189,10 +207,52 @@ export function positioningFields(row: Pick<PerpBoardRow, "longShortRatio" | "lo
 }
 
 // One text per figure, shared by the pane cells and the text report so the two always agree.
-const markText = (row: Pick<PerpBoardRow, "markPrice" | "quoteCurrency">) => row.markPrice == null ? "--" : `${price(row.markPrice)} ${row.quoteCurrency}`;
-const fundingPerInterval = (row: Pick<PerpBoardRow, "fundingRate" | "fundingIntervalHours" | "fundingKind">) => row.fundingRate == null ? "--" : `${percent(row.fundingRate, 5)} /${fundingInterval(row)}`;
+const markText = (row: Pick<PerpBoardRow, "markPrice" | "quoteCurrency">) => row.markPrice == null ? MISSING_VALUE : `${price(row.markPrice)} ${row.quoteCurrency}`;
+const fundingPerInterval = (row: Pick<PerpBoardRow, "fundingRate" | "fundingIntervalHours" | "fundingKind">) => row.fundingRate == null ? MISSING_VALUE : `${percent(row.fundingRate, 5)} /${fundingInterval(row)}`;
+/**
+ * The contract a bare name opens: the one with the largest open interest across venues, among the venues read
+ * recently (a stale one only when every one is). When that contract is Hyperliquid's, Hyperliquid's own pick is
+ * opened instead: its main-dex contract, else its xyz one, whatever its size beside another venue's.
+ */
+export function largestPerpMarket<Row extends Pick<PerpBoardRow, "venue" | "dex" | "openInterestUsd" | "stale">>(rows: readonly Row[]): Row | undefined {
+  const fresh = rows.filter((row) => !row.stale);
+  const ranked = [...fresh.length ? fresh : rows].sort((a, b) => (b.openInterestUsd ?? -Infinity) - (a.openInterestUsd ?? -Infinity));
+  const top = ranked[0];
+  if (top?.venue !== "hyperliquid") return top;
+  const own = ranked.filter((row) => row.venue === "hyperliquid");
+  return own.find((row) => row.dex === "default") ?? own.find((row) => row.dex === "xyz") ?? top;
+}
+/** The rate a venue charges when its premium sits inside the clamp: its interest component, 0.01% per 8 hours. */
+const BASELINE_RATE_8H = 0.0001;
+const atBaseline = (row: Pick<PerpBoardRow, "fundingRate8h">) => row.fundingRate8h != null && Math.abs(row.fundingRate8h - BASELINE_RATE_8H) < 1e-9;
+const listed = (names: readonly string[]) => names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)}` : names[0] ?? "";
+/**
+ * One asset's funding across the venues that list it, for a single market's view: the APR range, the APR weighted by
+ * open interest, and the venues whose rate is only the 0.01%/8h baseline. A delisted contract is left out, and so is
+ * one whose venue has not been read recently (stale), which the line counts. Null with fewer than two current rated
+ * contracts and none at the baseline.
+ */
+export function venueAprSummary(rows: readonly PerpBoardRow[]) {
+  const current = rows.filter((row) => row.fundingApr != null && !row.delisted);
+  const rated = current.filter((row) => !row.stale);
+  const stale = current.length - rated.length;
+  const baseline = [...new Set(rated.filter(atBaseline).map(venueLabel))];
+  if (rated.length < 2 && !baseline.length) return null;
+  const aprs = rated.map((row) => row.fundingApr!);
+  const weighted = rated.filter((row) => row.openInterestUsd != null && row.openInterestUsd > 0);
+  const oi = weighted.reduce((sum, row) => sum + row.openInterestUsd!, 0);
+  const oiWeighted = oi > 0 ? weighted.reduce((sum, row) => sum + row.fundingApr! * row.openInterestUsd!, 0) / oi : null;
+  const venues = new Set(rated.map((row) => row.venue)).size;
+  const low = Math.min(...aprs), high = Math.max(...aprs);
+  const count = rated.length === venues ? `${venues} venues` : `${rated.length} contracts on ${venues} venues`;
+  const range = rated.length >= 2 ? `${count}: ${percent(low, 1)} to ${percent(high, 1)}${oiWeighted == null ? "" : `, OI-weighted ${percent(oiWeighted, 1)}`}` : null;
+  const rest = baseline.length ? `${listed(baseline)} ${baseline.length === 1 ? "sits" : "sit"} at the 0.01%/8h baseline` : null;
+  const left = stale ? `${stale} stale ${stale === 1 ? "contract" : "contracts"} left out` : null;
+  return { text: [range, rest, left].filter(Boolean).join("; "), contracts: rated.length, venues, low: rated.length >= 2 ? low : null, high: rated.length >= 2 ? high : null,
+    oiWeighted: rated.length >= 2 ? oiWeighted : null, baseline, stale };
+}
 /** Percentage points between two fractions: 0.00003 reads 0.0030pp. */
-const points = (n: number | null | undefined, digits = 4) => n == null ? "--" : `${(n * 100).toFixed(digits)}pp`;
+const points = (n: number | null | undefined, digits = 4) => n == null ? MISSING_VALUE : `${(n * 100).toFixed(digits)}pp`;
 
 export type PerpColumnId = "market" | "venue" | "symbol" | "markPrice" | "fundingRate" | "fundingRate8h" | "fundingApr" | "premium"
   | "openInterestUsd" | "oiChange24h" | "longShare" | "priceChange24h" | "observedAt" | "value";
@@ -226,7 +286,8 @@ export const RANKING_COLUMNS: PerpColumnId[] = ["market", "venue", "value", "ope
 
 /** The columns that fit the pane, the least read going first; before the last of them goes, a long market name gives up its tail. */
 function fitPerpColumns(ids: readonly PerpColumnId[], drops: readonly PerpColumnId[], width: number): DataTableColumn[] {
-  let kept = ids.map((id) => PERP_COLUMNS[id]);
+  const columns = ids.map((id) => PERP_COLUMNS[id]);
+  let kept = columns;
   const fits = () => getTableWidth(kept) <= width;
   for (const [index, drop] of drops.entries()) {
     if (fits()) break;
@@ -236,7 +297,7 @@ function fitPerpColumns(ids: readonly PerpColumnId[], drops: readonly PerpColumn
     }
     kept = kept.filter((column) => column.id !== drop);
   }
-  return kept;
+  return markHiddenTableColumns(columns, kept);
 }
 export const boardColumns = (width: number) => fitPerpColumns(BOARD_COLUMNS, BOARD_DROPS, width);
 export const compareColumns = (width: number) => fitPerpColumns(COMPARE_COLUMNS, COMPARE_DROPS, width);
@@ -255,7 +316,7 @@ export function perpCellText(row: PerpBoardRow, id: PerpColumnId): string {
   if (id === "observedAt") return observed(row.observedAt);
   if (id === "longShare") return share(row.longShortRatio?.longShare);
   const digits = SIGNED[id];
-  return digits === undefined ? "--" : percent(row[id as keyof PerpBoardRow] as number | null, digits);
+  return digits === undefined ? MISSING_VALUE : percent(row[id as keyof PerpBoardRow] as number | null, digits);
 }
 export function perpCell(row: PerpBoardRow, id: PerpColumnId, colors: Pick<ThemeColors, "positive" | "negative" | "text" | "textBright" | "textMuted" | "textDim">): DataTableCell {
   const text = perpCellText(row, id);
@@ -274,7 +335,7 @@ export function perpCell(row: PerpBoardRow, id: PerpColumnId, colors: Pick<Theme
 }
 
 /** The five ranked lists, each with the figure it ranks by. */
-export type RankingKey = Exclude<keyof PerpRankingsPayload, "status" | "asOf" | "access" | "locked">;
+export type RankingKey = Exclude<keyof PerpRankingsPayload, "status" | "asOf" | "access" | "locked" | "assetClass">;
 export const RANKINGS: Array<{ key: RankingKey; label: string; header: string; field: "fundingRate8h" | "oiChange24h" | "premium" | "closedMarketPremium"; digits: number }> = [
   { key: "fundingPositive", label: "Highest Funding 8h", header: "Funding 8h %", field: "fundingRate8h", digits: 4 },
   { key: "fundingNegative", label: "Lowest Funding 8h", header: "Funding 8h %", field: "fundingRate8h", digits: 4 },
@@ -311,7 +372,7 @@ export function historyColumns(metric: HistoryMetric, currency: string, hasCandl
     { id: "basis", label: "Observation basis", width: 25, align: "left" },
   ];
 }
-export const historyChange = (value: number | null | undefined, metric: HistoryMetric) => value == null ? "--"
+export const historyChange = (value: number | null | undefined, metric: HistoryMetric) => value == null ? MISSING_VALUE
   : inPoints(metric) ? `${value > 0 ? "+" : ""}${(value * 100).toFixed(metric === "funding" ? 4 : metric === "long-short" ? 2 : 3)}pp` : historyValue(value, metric);
 export function historyCaption(data: PerpHistoryPayload | null | undefined, metric: HistoryMetric) {
   if (metric === "long-short") {

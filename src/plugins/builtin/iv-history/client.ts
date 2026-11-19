@@ -5,10 +5,19 @@ import type { ChartRequest, InstrumentRef } from "../../../market-data/request-t
 import type { QueryEntry } from "../../../market-data/result-types";
 import type { DataProvider } from "../../../types/data-provider";
 import type { PricePoint } from "../../../types/financials";
-import { realizedVolatility, realizedVolatilityCadenceIssue } from "../shared/volatility";
+import { realizedVolatilityCadenceIssue, rollingRealizedVolatility } from "../shared/volatility";
 import { NO_FATE, type ListingFate } from "../../../tickers/listing-fate";
+import { logFailure } from "../../../utils/log-failure";
 
 export type IvMethod = "quote-mid" | "trade-close";
+/**
+ * Which prices a trade-close reading was solved from: each option's closing
+ * print, kept because it sat inside the closing two-sided quote (`print`), the
+ * quote midpoint, used where a print sat outside it (`mid`), or both
+ * (`mixed`). Absent when no closing quote was stored to check the prints
+ * against, as for most history before the checks began.
+ */
+export type IvCloseBasis = "print" | "mid" | "mixed";
 export type IvCoverageStatus = "ready" | "backfilling" | "queued" | "unavailable";
 export interface IvPoint {
   sessionDate: string;
@@ -22,16 +31,22 @@ export interface IvPoint {
   iv180: number | null;
   iv365: number | null;
   /**
-   * 30-day 25-delta put and call IV, on quote captures only. Optional: a
-   * server that leaves them out has no skew history to give.
+   * 30-day 25-delta put and call IV: on quote captures, and on trade closes
+   * from servers that read the wings from the closes too. Optional: a server
+   * that leaves them out has no skew history to give.
    */
   put25_30?: number | null;
   call25_30?: number | null;
+  /** Prices a trade close was solved from; see `IvCloseBasis`. Absent from older servers. */
+  basis?: IvCloseBasis | null;
 }
 export interface IvStats {
   value: number;
   date: string;
   method: IvMethod;
+  /** The underlying at the reading: a close's session close, a quote capture's spot. Absent from older servers. */
+  spot?: number | null;
+  basis?: IvCloseBasis | null;
   rank: number | null;
   percentile: number | null;
   low: number | null;
@@ -42,6 +57,29 @@ export interface IvStats {
   minSamples?: number;
   /** Why rank or percentile is empty, when one is. */
   rankNote?: string | null;
+}
+/**
+ * The latest 30-day 25-delta risk reversal (call IV minus put IV, decimal)
+ * against its own prior 52 weeks, closes against closes (a symbol whose closes
+ * carry no wings: quote captures against quote captures). Rank and percentile
+ * come from `minSamples` prior sessions; until they reach back a year
+ * (`fullYear`) a reader says how many there are. Absent from older servers.
+ */
+export interface IvRiskReversalStats {
+  value: number;
+  put25: number;
+  call25: number;
+  date: string;
+  method: IvMethod;
+  basis?: IvCloseBasis | null;
+  rank: number | null;
+  percentile: number | null;
+  low: number | null;
+  high: number | null;
+  samples: number;
+  windowStart: string | null;
+  minSamples: number;
+  fullYear: boolean;
 }
 interface IvReading {
   date: string;
@@ -54,6 +92,7 @@ interface IvReading {
   iv90: number | null;
   iv180: number | null;
   iv365: number | null;
+  basis?: IvCloseBasis | null;
 }
 export interface IvHistoryPayload {
   version: 1;
@@ -65,7 +104,7 @@ export interface IvHistoryPayload {
     /** First trade close with a one-year reading; the 1Y series starts later and is sparser. */
     iv365Since?: string | null;
   } | null;
-  stats: { iv30: IvStats | null; iv90: IvStats | null; iv365?: IvStats | null };
+  stats: { iv30: IvStats | null; iv90: IvStats | null; iv365?: IvStats | null; rr25?: IvRiskReversalStats | null };
   latest: IvReading | null;
   series: IvPoint[];
   warnings: string[];
@@ -85,7 +124,9 @@ export interface IvScreenRow {
   iv365?: IvStats | null;
   iv365Since?: string | null;
   latest: IvReading | null;
+  /** The newest quote capture's wings; `rr25` is the ranked close's, where the server gives it. */
   skew: { date: string; put25: number; call25: number; skew: number } | null;
+  rr25?: IvRiskReversalStats | null;
 }
 /** Why a name IV history covers has no rank yet, by where its history stands. */
 const IV_COVERAGE_REASONS: Partial<Record<IvCoverageStatus, string>> = {
@@ -156,6 +197,40 @@ export function createHvDependencies(marketData?: DataProvider): HvDependencies 
 const MAX_FATE_LOOKUPS = 10;
 
 /**
+ * A symbol's realized volatility over one window: the newest, and after every
+ * session's close, so a reading is divided by the HV of its own date and not
+ * of today.
+ */
+export interface ScreenHv {
+  /** HV over the newest window of closes. */
+  value: number | null;
+  /** Date of the newest daily bar: the newest session the symbol's prices reach. */
+  date: string | null;
+  /** HV after each session's close, oldest first; sessions without a full window are left out. */
+  series: ReadonlyArray<readonly [date: string, value: number]>;
+  /** Each session's close, by date: the spot of a trade-close reading a server does not price. */
+  closes?: ReadonlyMap<string, number>;
+}
+
+const barDay = (value: Date) => new Date(value).toISOString().slice(0, 10);
+
+/** `ScreenHv` from daily closes; a provider that fell back to weekly or intraday bars would misstate daily HV, so it has none. */
+export function screenHv(history: readonly PricePoint[], window: number): ScreenHv {
+  if (realizedVolatilityCadenceIssue(history)) return { value: null, date: null, series: [] };
+  const rolling = rollingRealizedVolatility(history, { windows: [window] });
+  const series = rolling.flatMap((point) => {
+    const value = point.values[window];
+    return value == null ? [] : [[barDay(point.date), value] as const];
+  });
+  const newest = history.reduce<string | null>((latest, point) => {
+    const date = barDay(point.date);
+    return latest == null || date > latest ? date : latest;
+  }, null);
+  const closes = new Map(history.flatMap((point) => Number.isFinite(point.close) && point.close > 0 ? [[barDay(point.date), point.close] as const] : []));
+  return { value: rolling.at(-1)?.values[window] ?? null, date: newest, series, closes };
+}
+
+/**
  * HV for a screen's symbols (`loadRealizedVolatilities`), started at once,
  * and what became of the ones its rows have no reading for, at most
  * MAX_FATE_LOOKUPS of them, looked up as the rows arrive: TWTR stopped
@@ -166,11 +241,11 @@ const MAX_FATE_LOOKUPS = 10;
  */
 export async function loadScreenVolatilities(
   instruments: readonly InstrumentRef[], rows: Promise<readonly IvScreenRow[]>, window: number,
-  options: { signal?: AbortSignal; onValue?: (symbol: string, value: number | null) => void; onFates?: (fates: ReadonlyMap<string, ListingFate>) => void } = {},
+  options: { signal?: AbortSignal; onValue?: (symbol: string, value: ScreenHv | null) => void; onFates?: (fates: ReadonlyMap<string, ListingFate>) => void } = {},
   dependencies: HvDependencies = createHvDependencies(),
-): Promise<{ hv: Map<string, number | null>; fates: Map<string, ListingFate> }> {
+): Promise<{ hv: Map<string, ScreenHv | null>; fates: Map<string, ListingFate> }> {
   const moved = new Set<string>();
-  const onValue = options.onValue && ((symbol: string, value: number | null) => { if (!moved.has(symbol)) options.onValue!(symbol, value); });
+  const onValue = options.onValue && ((symbol: string, value: ScreenHv | null) => { if (!moved.has(symbol)) options.onValue!(symbol, value); });
   const [hv, fates] = await Promise.all([
     loadRealizedVolatilities(instruments, window, { ...options, onValue }, dependencies),
     rows.then(async (screened) => {
@@ -189,21 +264,19 @@ export async function loadScreenVolatilities(
 
 /** Close-to-close HV over one window for each symbol from one year of daily closes, four at a time. */
 async function loadRealizedVolatilities(
-  instruments: readonly InstrumentRef[], window: number, options: { signal?: AbortSignal; onValue?: (symbol: string, value: number | null) => void } = {},
+  instruments: readonly InstrumentRef[], window: number, options: { signal?: AbortSignal; onValue?: (symbol: string, value: ScreenHv | null) => void } = {},
   dependencies: HvDependencies = createHvDependencies(),
-): Promise<Map<string, number | null>> {
-  const result = new Map<string, number | null>();
+): Promise<Map<string, ScreenHv | null>> {
+  const result = new Map<string, ScreenHv | null>();
   let next = 0;
   const worker = async () => {
     while (next < instruments.length && !options.signal?.aborted) {
       const instrument = instruments[next++]!;
-      let value: number | null = null;
+      let value: ScreenHv | null = null;
       try {
         const entry = await dependencies.loadChart({ instrument, bufferRange: "1Y", granularity: "resolution", resolution: "1d" });
-        const history = resolveEntryValue(entry) ?? [];
-        // A provider that fell back to weekly or intraday bars would misstate daily HV.
-        value = realizedVolatilityCadenceIssue(history) ? null : realizedVolatility(history, window);
-      } catch { value = null; }
+        value = screenHv(resolveEntryValue(entry) ?? [], window);
+      } catch (error) { value = logFailure("iv-history.client", "Load screen price history failed", null)(error); }
       result.set(instrument.symbol, value);
       options.onValue?.(instrument.symbol, value);
     }

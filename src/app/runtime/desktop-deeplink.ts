@@ -13,9 +13,11 @@ import type { DesktopDeepLinkBridge } from "../../types/desktop-deeplink";
 import type { DesktopWindowBridge } from "../../types/desktop-window";
 import { requestAccountManagementTab } from "../../plugins/builtin/account-management/navigation";
 import { openTeamPane } from "../../team/pane-request";
+import { hasOnlyDmUsernameArgs, parseDmUsernames } from "../../plugins/builtin/chat/channels";
 import { chatController } from "../../plugins/builtin/chat/controller";
 import { getShare, type ShareRecord } from "../../shares/api";
-import { openShareLink, registerShareOpener } from "../../shares/open";
+import type { PaneShareData } from "../../shares/payload";
+import { openSharedPane, openShareLink, registerShareOpener } from "../../shares/open";
 import { openPaneShare } from "../../shares/pane";
 import { PluginOffError, notifyPluginOff } from "../../plugins/plugin-off";
 import { materializeMarketplaceLayout } from "../../shares/portable-layout";
@@ -34,6 +36,7 @@ const SHARE_ID = /^[a-f0-9]{32}$/;
 export type DesktopDeepLinkAction =
   | { type: "open-account-management"; route: CloudDeepLinkRoute; message: string }
   | { type: "open-ticker"; symbol: string; tabId: string | null; message: string }
+  | { type: "open-function"; code: string; arg: string | null; message: string }
   | { type: "open-collection"; kind: CollectionDeepLinkKind; collectionId: string; message: string }
   | {
       type: "create-alert";
@@ -194,6 +197,26 @@ function parseTickerDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
   return { type: "open-ticker", symbol, tabId, message: tickerMessage(symbol, tabId) };
 }
 
+/** A function's code as the command bar writes it: ERN, PERP, 13F. */
+const FUNCTION_CODE = /^[A-Z0-9]{1,12}$/;
+/**
+ * One argument, one word: a symbol or a comma list of them (NVDA, BRK.B,
+ * 7203:TSE, BTC-USD, ES=F, ^GSPC, AAPL,MSFT). No spaces, so a link names one
+ * function and what it opens on, never a second command.
+ */
+const FUNCTION_ARG = /^[A-Z0-9^$][A-Z0-9.:=/!^$,_-]{0,63}$/;
+
+function parseFunctionDeepLink(parsed: ParsedGloomUrl): DesktopDeepLinkAction {
+  const code = (parsed.segments[0] ?? param(parsed.url, "code"))?.trim().toUpperCase() ?? "";
+  if (!FUNCTION_CODE.test(code)) return { type: "unsupported", message: "Function links need a function code." };
+  const rawArg = param(parsed.url, "arg");
+  const arg = rawArg ? rawArg.toUpperCase().replace(/^\$/, "") : null;
+  if (rawArg !== null && (!arg || !FUNCTION_ARG.test(arg))) {
+    return { type: "unsupported", message: "Function links take one symbol or a list of symbols." };
+  }
+  return { type: "open-function", code, arg, message: arg ? `Opened ${code} ${arg}.` : `Opened ${code}.` };
+}
+
 function parseCollectionDeepLink(parsed: ParsedGloomUrl, kind: CollectionDeepLinkKind): DesktopDeepLinkAction {
   const collectionId = parsed.segments[0] ?? param(parsed.url, "id", "collection");
   if (!collectionId) return { type: "unsupported", message: "Collection links need an id." };
@@ -281,6 +304,8 @@ export function resolveDesktopDeepLinkAction(rawUrl: string): DesktopDeepLinkAct
       return parseCloudDeepLink(parsed);
     case "ticker":
       return parseTickerDeepLink(parsed);
+    case "fn":
+      return parseFunctionDeepLink(parsed);
     case "portfolio":
       return parseCollectionDeepLink(parsed, "portfolio");
     case "watchlist":
@@ -308,6 +333,23 @@ function notifyError(pluginRegistry: PluginRegistry, body: string): void {
 
 function notifySuccess(pluginRegistry: PluginRegistry, body: string): void {
   pluginRegistry.notify({ body, type: "success" });
+}
+
+/**
+ * A link that changes something (creates an alert, adds a layout, starts a
+ * conversation) waits for a click on a toast that says what it asks: any web
+ * page can open a gloomberb:// link, and a browser told to always allow them
+ * asks nothing more. Links that only show something, a shared pane among
+ * them, run at once.
+ */
+function askBeforeRunning(pluginRegistry: PluginRegistry, body: string, label: string, run: () => void): void {
+  pluginRegistry.notify({
+    title: "Gloom link",
+    body,
+    type: "info",
+    persistent: true,
+    action: { label, onClick: run },
+  });
 }
 
 function requirePane(pluginRegistry: PluginRegistry, paneId: string, unavailableMessage: string): boolean {
@@ -396,6 +438,26 @@ function handleOpenTicker(
   } else {
     notifySuccess(pluginRegistry, action.message);
   }
+}
+
+/**
+ * A function link opens the pane its code names, as typing the code and its
+ * argument in the command bar would. Only codes that open a pane run; a code
+ * for a command (settings, sign out) is refused, so a link only adds a view.
+ */
+function handleOpenFunction(
+  action: Extract<DesktopDeepLinkAction, { type: "open-function" }>,
+  pluginRegistry: PluginRegistry,
+): void {
+  const opensPane = [...pluginRegistry.paneTemplates.values()].some(({ shortcut }) => (
+    shortcut?.prefix.toUpperCase() === action.code
+    || shortcut?.aliases?.some((alias) => alias.toUpperCase() === action.code)
+  ));
+  if (!opensPane) {
+    notifyError(pluginRegistry, `${action.code} is not a function this version of Gloom opens from a link.`);
+    return;
+  }
+  pluginRegistry.runCommandBarQuery(action.arg ? `${action.code} ${action.arg}` : action.code);
 }
 
 function handleOpenCollection(
@@ -542,9 +604,22 @@ async function openShareInApp(
     else notifyError(pluginRegistry, "This link contains a snapshot, not a live pane.");
     return;
   }
+  await openSharedPaneInApp(share.data, pluginRegistry, { retry: options.retry, opened: "Opened shared pane." });
+}
+
+/**
+ * Opens a pane share's pane: one read from a link, or one held here (an Ask
+ * Gloom source). `opened` is the toast that says it opened, for a link the
+ * person cannot see land; a pane opened from where they are needs none.
+ */
+async function openSharedPaneInApp(
+  data: PaneShareData,
+  pluginRegistry: PluginRegistry,
+  options: { retry: () => void; opened?: string },
+): Promise<void> {
   try {
-    await openPaneShare(pluginRegistry, share.data);
-    notifySuccess(pluginRegistry, "Opened shared pane.");
+    await openPaneShare(pluginRegistry, data);
+    if (options.opened) notifySuccess(pluginRegistry, options.opened);
   } catch (error) {
     if (error instanceof PluginOffError) {
       notifyPluginOff(pluginRegistry, error, options.retry);
@@ -582,27 +657,48 @@ export function handleDesktopDeepLink(rawUrl: string, options: DesktopDeepLinkHa
     case "open-ticker":
       handleOpenTicker(action, options.pluginRegistry);
       return;
+    case "open-function":
+      // Like a ticker link, it only opens a view, so it runs at once.
+      handleOpenFunction(action, options.pluginRegistry);
+      return;
     case "open-collection":
       handleOpenCollection(action, options);
       return;
-    case "create-alert":
-      handleCreateAlert(action, options.pluginRegistry);
+    case "create-alert": {
+      const { symbol, condition, price } = action.values;
+      askBeforeRunning(options.pluginRegistry, `Create an alert for ${symbol} ${condition} ${price}?`, "Create alert", () => {
+        handleCreateAlert(action, options.pluginRegistry);
+      });
       return;
+    }
     case "open-chat-channel":
       handleOpenChatChannel(action, options.pluginRegistry);
       return;
-    case "open-chat-dm":
-      handleOpenChatDm(action, options.pluginRegistry);
+    case "open-chat-dm": {
+      // The toast names only what reads as usernames, never the link's own words.
+      const names = parseDmUsernames(action.participants);
+      if (names.length === 0 || !hasOnlyDmUsernameArgs(action.participants)) {
+        notifyError(options.pluginRegistry, "DM links need usernames.");
+        return;
+      }
+      askBeforeRunning(options.pluginRegistry, `Open a conversation with ${names.map((name) => `@${name}`).join(", ")}?`, "Open", () => {
+        handleOpenChatDm(action, options.pluginRegistry);
+      });
       return;
+    }
     case "open-news":
       handleOpenNews(action, options.pluginRegistry);
       return;
     case "open-share":
+      // Opening a shared pane only adds a view of what the person just
+      // clicked, so it runs at once.
       void openShareInApp(action.id, options.pluginRegistry, { retry: () => handleDesktopDeepLink(rawUrl, options) });
       return;
     case "open-layout":
-      void handleOpenLayout(action, options).catch((error) => {
-        notifyError(options.pluginRegistry, error instanceof Error ? error.message : "Could not open shared layout.");
+      askBeforeRunning(options.pluginRegistry, "Add the shared layout this link points to?", "Add layout", () => {
+        void handleOpenLayout(action, options).catch((error) => {
+          notifyError(options.pluginRegistry, error instanceof Error ? error.message : "Could not open shared layout.");
+        });
       });
       return;
   }
@@ -623,17 +719,21 @@ export function useDesktopDeepLinkRuntime({
   pluginRegistry: PluginRegistry;
   stateRef: { current: AppState };
 }) {
-  // Share links opened inside the app (chat's share chips) take the same path, in every renderer.
+  // Share links opened inside the app (chat's share chips) take the same path, in every
+  // renderer, and so do the pane shares an Ask Gloom answer holds for its sources.
   useEffect(() => {
     if (!initialized) return;
-    return registerShareOpener((id, { fallback }) => openShareInApp(id, pluginRegistry, {
-      fallback,
-      retry: () => openShareLink(id, fallback),
-    }));
+    return registerShareOpener(
+      (id, { fallback }) => openShareInApp(id, pluginRegistry, {
+        fallback,
+        retry: () => openShareLink(id, fallback),
+      }),
+      (share) => openSharedPaneInApp(share, pluginRegistry, { retry: () => openSharedPane(share) }),
+    );
   }, [initialized, pluginRegistry]);
 
   useEffect(() => {
-    if (!initialized || (desktopWindowKind && desktopWindowKind !== "main") || !desktopDeepLinkBridge) return;
+    if (!initialized || desktopWindowKind === "detached" || !desktopDeepLinkBridge) return;
     return desktopDeepLinkBridge.subscribe((deeplink) => {
       handleDesktopDeepLink(deeplink.url, { dispatch, pluginRegistry, stateRef });
     });

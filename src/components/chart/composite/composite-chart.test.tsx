@@ -10,6 +10,7 @@ import {
 } from "react";
 import type { ResolvedSeries, TimeSeriesPoint } from "../../../time-series/types";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
+import { PaneCaptureContext } from "../../layout/pane/capture-status";
 import {
   Box,
   Text,
@@ -25,12 +26,14 @@ import {
   type KeyEventLike,
 } from "../../../react/input";
 import { CompositeChart } from "./composite-chart";
+import { CHART_TOOLBAR_FOLD_DELAY_MS } from "./toolbar";
 import type { CompositeChartLevel, CompositeChartLevels, CompositeLevelEdit } from "./levels";
 import { createDefaultConfig } from "../../../types/config";
 import { AppContext, createInitialState, PaneInstanceProvider } from "../../../state/app/context";
 import { createStaticAppStore } from "../../../test-support/app-store";
 import { useTabCursorLink } from "../../../state/app/tab-cursor";
 import { PaneFocusedProvider } from "../../../state/app/activity";
+import { PaneFooterProvider, usePaneTabStripKeys } from "../../layout/pane/footer/registration";
 import { createTestResolvedSeries, createTestSeriesPoint as point } from "../../../test-support/time-series";
 import {
   buildCompositeNavigationFrame,
@@ -107,7 +110,7 @@ function pointerEvent(
     ctrl?: boolean;
     shift?: boolean;
     alt?: boolean;
-    scroll?: { direction: "up" | "down" | "left" | "right"; delta: number };
+    scroll?: { direction: "up" | "down" | "left" | "right"; delta: number; deltaX?: number; deltaY?: number };
   } = {},
 ) {
   const node = capturedSurfaceNode!;
@@ -149,6 +152,23 @@ function keyEvent(name: string, shift = false): KeyEventLike {
       propagationStopped = true;
     },
   };
+}
+
+/** The day the crosshair's label on the time axis reads, in a chart's rows of the frame. */
+function cursorDay(rows?: [number, number]): string | null {
+  const lines = tui.frame().split("\n");
+  return (rows ? lines.slice(rows[0], rows[1]) : lines).join("\n").match(/2025-01-0\d/)?.[0] ?? null;
+}
+
+/** Moves the pointer across the plot until the crosshair is on `day`. */
+async function hoverDay(day: string): Promise<void> {
+  const width = capturedSurfaceNode!.width as number;
+  for (let x = 0; x < width; x += 1) {
+    await act(async () => capturedSurfaceProps!.onMouseMove(pointerEvent(x, 3)));
+    await act(async () => tui.setup().renderOnce());
+    if (cursorDay() === day) return;
+  }
+  throw new Error(`no column of the plot is on ${day}`);
 }
 
 afterEach(() => {
@@ -249,6 +269,28 @@ describe("CompositeChart", () => {
     const expectedBackground = getThemeColors(nextThemeId).bg;
     const expectedRgb = [1, 3, 5].map((offset) => parseInt(expectedBackground.slice(offset, offset + 2), 16));
     expect(Array.from(bitmap.pixels.slice(0, 3))).toEqual(expectedRgb);
+  });
+
+  // A color-blind safe theme draws gains blue and losses vermillion, which no reader assumes as they do green and red.
+  test("a candle series keys its up and down colors in a color-blind safe theme, and keeps its dot in any other", async () => {
+    const legendLine = async (themeId: string) => {
+      await tui.render(
+        <ThemeProvider themeId={themeId}>
+          <CompositeChart width={60} height={12} series={[twoSessionCandles()]} panels={[{ id: "main" }]} />
+        </ThemeProvider>,
+        { width: 62, height: 14 },
+      );
+      await act(async () => {
+        await tui.setup().renderOnce();
+        await tui.setup().renderOnce();
+      });
+      return tui.frame().split("\n").find((row) => row.includes("ACME Price")) ?? "";
+    };
+    expect(await legendLine("colorblind-light")).toContain("▲▼ ACME Price");
+    expect(await legendLine("colorblind")).toContain("▲▼ ACME Price");
+    const plain = await legendLine(DEFAULT_THEME);
+    expect(plain).toContain("● ACME Price");
+    expect(plain).not.toContain("▲");
   });
 
   // A live tick edits the last bar of the series in place, so the scene is
@@ -410,8 +452,8 @@ describe("CompositeChart", () => {
     expect(frame).toContain("ACME Price");
     expect(frame).toContain("OTHER Revenue");
     expect(frame).toContain("$103");
-    expect(frame.match(/Jan 1/g)).toHaveLength(1);
-    expect(frame.match(/Jan 3/g)).toHaveLength(1);
+    expect(frame.match(/1 Jan/g)).toHaveLength(1);
+    expect(frame.match(/3 Jan/g)).toHaveLength(1);
   });
 
   test("a futures price reads in the legend as its number and contract unit, while its axis keeps the currency", async () => {
@@ -568,9 +610,30 @@ describe("CompositeChart", () => {
     await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
     const legend = tui.frame().split("\n")[0]!;
     expect(legend).toContain("MSFT:XNAS Revenue $90.01B");
-    expect(legend).toContain("... -49.6%");
+    // Cut at whole words, the value whole after it, and the right axis it reads against.
+    expect(legend).toContain("Very long issuer… -49.6% (right axis)");
     expect(legend).toContain("腾讯控股腾讯控股");
     expect(legend.match(/\$90\.01B/g)).toHaveLength(2);
+  });
+
+  test("a series on the right axis beside left-axis ones says so, and gives the note up to its tooltip only where names cannot shrink", async () => {
+    const legendAt = async (width: number) => {
+      await tui.render(
+        <CompositeChart width={width} height={8} panels={[{ id: "main" }]} series={[
+          { ...series("price", "main", "left", "USD", [4050]), label: "GC=F Gold Dec 2026" },
+          { ...series("silver", "main", "right", "USD", [51.8]), label: "SI=F Silver Dec 2026", unitGroup: "currency" },
+        ]} />,
+        { width: width + 2, height: 10 },
+      );
+      await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
+      return tui.frame().split("\n")[0]!;
+    };
+    expect(await legendAt(100)).toContain("SI=F Silver Dec 2026 $51.8 (right axis)");
+    // Names lose their last words first; the note goes only where every name is down to its first word.
+    expect(await legendAt(64)).toContain("SI=F Silver Dec… $51.8 (right axis)");
+    const narrow = await legendAt(40);
+    expect(narrow).not.toContain("(right axis)");
+    expect(narrow).toContain("$51.8");
   });
 
   test("gives legend names the row's room and drops the listing exchange before cutting a name", async () => {
@@ -586,10 +649,103 @@ describe("CompositeChart", () => {
       return tui.frame().split("\n")[0]!;
     };
     expect(await legendAt(60)).toContain("Volume AAPL:XNAS Price 8.00%");
+    // Both drop it together, so the row reads in one form.
     const narrow = await legendAt(50);
-    expect(narrow).toContain("AAPL:XNAS Price $101");
+    expect(narrow).toContain("AAPL Price $101");
     expect(narrow).toContain("Volume AAPL Price 8.00%");
     expect(narrow).not.toContain("...");
+  });
+
+  test("a legend short of room keeps each company's name and names their shared field once", async () => {
+    const house = (id: string, name: string, value: number) => ({
+      ...series(id, "main", "left", "%", [value]), label: `${id}:JPX Close · ${name}`, compactLabel: `${id}:JPX ${name}`,
+      legendContext: "Close",
+    });
+    const houses = [
+      house("8058", "Mitsubishi", 44.17), house("8031", "Mitsui", 2.95), house("8001", "Itochu", 18.99),
+      house("8053", "Sumitomo", 21.1), house("8002", "Marubeni", 12.11),
+    ];
+    // Narrow, and a few cells short of room for every full name.
+    for (const width of [116, 160]) {
+      await tui.render(
+        <CompositeChart width={width} height={10} panels={[{ id: "main" }]} series={houses} />,
+        { width: width + 2, height: 12 },
+      );
+      await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
+      const legend = tui.frame().split("\n")[0]!;
+      for (const name of ["8058 Mitsubishi", "8031 Mitsui", "8001 Itochu", "8053 Sumitomo", "8002 Marubeni"]) expect(legend, `${width}`).toContain(name);
+      expect(legend.split("Close")).toHaveLength(2);
+      expect(legend).not.toContain("...");
+    }
+  });
+
+  test("a compact multi-company financial legend keeps its metric and values at narrow widths", async () => {
+    for (const metric of ["Revenue", "Gross Profit"]) {
+      for (const width of [70, 90]) {
+        const financials = ["MSFT", "GOOGL", "AMZN"].map((symbol, index) => ({
+          ...series(symbol, "main", "left", "USD", [90_000_000_000 + index * 10_000_000_000]),
+          label: `${symbol}:XNAS ${metric} · Company ${index}`,
+          compactLabel: `${symbol} Company ${index}`,
+          legendContext: metric,
+          unitGroup: "currency-total:USD",
+          style: "bar" as const,
+        }));
+        await tui.render(<CompositeChart width={width} height={12} panels={[{ id: "main" }]} series={financials} />,
+          { width: width + 2, height: 14 });
+        await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
+        const legend = tui.frame().split("\n")[0]!;
+        expect(legend).toContain(metric);
+        for (const symbol of ["MSFT", "GOOGL", "AMZN"]) expect(legend).toContain(symbol);
+        for (const value of ["$90B", "$100B", "$110B"]) expect(legend).toContain(value);
+      }
+    }
+  });
+
+  test("company legend names fit together or fall back to clean tickers together", async () => {
+    const companies = [
+      ["MSFT", "Microsoft", 92_279_000_000],
+      ["GOOGL", "Alphabet", 127_577_000_000],
+      ["AMZN", "Amazon.com", 201_944_000_000],
+    ] as const;
+    for (const metric of ["Revenue", "Close"]) {
+      const entries = companies.map(([symbol, company, value]) => ({
+        ...series(symbol, "main", "left", "USD", [value]),
+        label: `${symbol}:NASDAQ ${metric} · ${company}`,
+        compactLabel: `${symbol} ${company}`,
+        legendContext: metric,
+        unitGroup: "currency-total:USD",
+      }));
+      for (const [width, accessory, names] of [[90, false, 3], [82, false, 0], [70, false, 0], [90, true, 0], [106, true, 3], [90, false, 3]] as const) {
+        await tui.render(<CompositeChart width={width} height={12} panels={[{ id: "main" }]} series={entries}
+          legendAccessory={accessory ? <Text>Add series</Text> : undefined} legendAccessoryWidth={14} />,
+          { width: width + 2, height: 14 });
+        await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
+        const legend = tui.frame().split("\n")[0]!;
+        expect(legend).toContain(metric);
+        expect(legend).not.toContain("…");
+        expect(companies.filter(([, company]) => legend.includes(company))).toHaveLength(names);
+        for (const [symbol] of companies) expect(legend).toContain(symbol);
+        for (const value of ["$92.28B", "$127.58B", "$201.94B"]) expect(legend).toContain(value);
+      }
+    }
+  });
+
+  test("different compacted fields keep their own metric instead of sharing a misleading caption", async () => {
+    const entries = ["Revenue", "Operating Income"].map((metric, index) => ({
+      ...series(`series-${index}`, "main", "left", "USD", [90_000_000_000]),
+      label: `${index ? "GOOGL" : "MSFT"} ${metric} · Company`,
+      compactLabel: index ? "GOOGL Alphabet" : "MSFT Microsoft",
+      legendContext: metric,
+      unitGroup: "currency-total:USD",
+    }));
+    await tui.render(<CompositeChart width={70} height={12} panels={[{ id: "main" }]} series={entries} />,
+      { width: 72, height: 14 });
+    await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
+    const legend = tui.frame().split("\n")[0]!;
+    expect(legend).toContain("Revenue");
+    expect(legend).toContain("Operating Income");
+    expect(legend).toContain("MSFT");
+    expect(legend).toContain("GOOGL");
   });
 
   test("keeps non-plotted legend series available for restoring", async () => {
@@ -704,6 +860,31 @@ describe("CompositeChart", () => {
     expect(toggled).toEqual(["price"]);
   });
 
+  test("counts series that overflow the last legend line, with and without room to wrap", async () => {
+    const symbols = ["QQQ", "VUG", "IWF", "SCHG"];
+    const entries = symbols.map((symbol) => ({
+      ...series(symbol, "main", "left", "%", [0, 12.34]),
+      label: `${symbol}:NASDAQ Close · Fund`, compactLabel: `${symbol} Fund`, legendContext: "Close",
+    }));
+    for (const width of [30, 40]) {
+      for (const height of [6, 22]) {
+        for (const capture of [false, true]) {
+          await tui.render(<PaneCaptureContext.Provider value={capture}>
+            <CompositeChart width={width} height={height} series={entries} panels={[{ id: "main" }]}
+              legendAccessory={<Text>Add series</Text>} legendAccessoryWidth={14} />
+          </PaneCaptureContext.Provider>, { width: width + 2, height: height + 2 });
+          await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
+          const legend = tui.frame().split("\n").slice(0, height === 6 ? 1 : 3).join("\n");
+          expect(legend).toContain("Close");
+          if (capture && height === 22) {
+            expect(legend).not.toContain("Add series");
+            for (const symbol of symbols) expect(legend).toContain(symbol);
+          } else if (!symbols.every((symbol) => legend.includes(symbol))) expect(legend).toContain("4 series");
+        }
+      }
+    }
+  });
+
   test("scrolls an overflowing legend horizontally", async () => {
     const labels = ["FIRST LONG SERIES", "SECOND LONG SERIES", "THIRD LONG SERIES", "LAST LONG SERIES"];
     const overflowingSeries = labels.map((label, index) => ({
@@ -761,6 +942,56 @@ describe("CompositeChart", () => {
     const short = await frameLines(6);
     expect(named(short[0]).length).toBeGreaterThan(0);
     expect(named(short[1])).toEqual([]);
+  });
+
+  // CMP TQQQ QQQ at 80 columns: five entries wanted four lines, and the last of three ran its value and unit off the edge.
+  test("a legend with more entries than its lines cuts names, never a value or its unit", async () => {
+    const legs = [
+      ["TQQQ ProShares UltraPro QQQ", "%", -30.4], ["QQQ Invesco QQQ Trust, Series 1", "%", -10.2], ["3× daily QQQ", "%", -29.9],
+      ["TQQQ decay vs 3× daily QQQ", "pp", -0.536], ["3× daily QQQ decay vs 3× QQQ", "pp", 0.675],
+    ] as const;
+    const frameLines = async (width: number) => {
+      await tui.render(
+        <CompositeChart width={width} height={20} panels={[{ id: "main" }]} series={legs.map(([label, unit, value], index) => ({
+          ...series(`series-${index}`, "main", "left", unit, [0, value]),
+          label, unitGroup: unit === "pp" ? "pp" : "percent",
+        }))} />,
+        { width: width + 2, height: 22 },
+      );
+      await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
+      return tui.frame().split("\n").slice(0, 3).join("\n");
+    };
+    for (const width of [62, 40]) {
+      const legend = await frameLines(width);
+      for (const value of ["-30.4%", "-10.2%", "-29.9%", "-0.536 pp", "0.675 pp"]) expect(legend).toContain(value);
+    }
+  });
+
+  // CHOKE's legend cut "Malacca" to "Malacc" on one line, and wrapped or scrolling legends still cut names through a word.
+  test("a legend that wraps or scrolls cuts a name at whole words too", async () => {
+    const labels = ["Strait of Hormuz daily transits", "Bab el-Mandeb daily transits", "Cape of Good Hope transits", "Strait of Malacca daily transits"];
+    const words = new Set(labels.flatMap((label) => label.split(" ")));
+    const lines = async (height: number) => {
+      await tui.render(
+        <CompositeChart width={30} height={height} panels={[{ id: "main" }]} series={labels.map((label, index) => ({
+          ...series(`series-${index}`, "main", "left", "vessels", [40 + index, 41 + index]),
+          label,
+        }))} />,
+        { width: 32, height: height + 2 },
+      );
+      await act(async () => { await tui.setup().renderOnce(); await tui.setup().renderOnce(); });
+      return tui.frame().split("\n").filter((line) => labels.some((label) => line.includes(label.split(" ")[0]!)));
+    };
+    // Every word a legend line shows is one of a name's words, whole: "Malacca", never "Malacc" or "transi".
+    // A series' one-letter marker (o) is not a word.
+    const cutWords = (shown: readonly string[]) => shown.flatMap((line) => line.replace(/\d+ series/g, "").split(/\s+|…/))
+      .filter((token) => /^[A-Za-z][A-Za-z-]+$/.test(token) && !words.has(token));
+    const wrapped = await lines(24);
+    expect(wrapped.length).toBeGreaterThan(1);
+    expect(cutWords(wrapped)).toEqual([]);
+    const scrolling = await lines(6);
+    expect(scrolling.length).toBeGreaterThan(0);
+    expect(cutWords(scrolling)).toEqual([]);
   });
 
   test("reaches and toggles overflowing legend series from the keyboard", async () => {
@@ -897,6 +1128,222 @@ describe("CompositeChart", () => {
     expect(cursorChanges).toEqual(["2025-01-01T00:00:00.000Z"]);
   });
 
+  // A pointer move renders what draws the crosshair: the legend's values,
+  // the cursor's labels on the axes and the crosshair over the plot. The
+  // chart and the plot's raster and handlers hold still under it.
+  test("a pointer move redraws the crosshair and its readouts, not the chart under them", async () => {
+    await tui.render(
+      <CaptureChartSurfaceProvider>
+        <CompositeChart
+          width={60}
+          height={12}
+          series={[series("price", "main", "left", "USD", [100, 103, 101])]}
+          panels={[{ id: "main" }]}
+        />
+      </CaptureChartSurfaceProvider>,
+      { width: 62, height: 14 },
+    );
+    await act(async () => tui.setup().renderOnce());
+    const atRest = capturedSurfaceProps!;
+    const legend = () => tui.frame().split("\n")[0]!;
+    const cursorDay = () => tui.frame().match(/2025-01-0\d/)?.[0] ?? null;
+    expect(legend()).toContain("101");
+    expect(cursorDay()).toBeNull();
+
+    await act(async () => atRest.onMouseMove(pointerEvent(1, 3)));
+    await act(async () => tui.setup().renderOnce());
+    const moved = capturedSurfaceProps!;
+    expect(legend()).toContain("100");
+    expect(cursorDay()).toBe("2025-01-01");
+    expect(moved).not.toBe(atRest);
+    expect(moved.bitmaps).toBe(atRest.bitmaps);
+    expect(moved.onMouseMove).toBe(atRest.onMouseMove);
+    expect(moved.onMouseDown).toBe(atRest.onMouseDown);
+    expect(moved.onMouseScroll).toBe(atRest.onMouseScroll);
+
+    await act(async () => moved.onMouseOut());
+    await act(async () => tui.setup().renderOnce());
+    expect(legend()).toContain("101");
+    expect(cursorDay()).toBeNull();
+  });
+
+  // A live tick builds the chart's scene again under a crosshair the pointer
+  // holds: the crosshair stays on its bar and reads the bar as the tick left it.
+  test("a tick under the pointer's crosshair keeps it on its bar, reading the bar as the tick left it", async () => {
+    let tick: (values: number[]) => void = () => {};
+    const panels = [{ id: "main" }];
+    function LiveChart() {
+      const [values, setValues] = useState([100, 101, 102]);
+      tick = setValues;
+      return <CompositeChart width={60} height={12} series={[series("price", "main", "left", "USD", values)]} panels={panels} />;
+    }
+    await tui.render(<CaptureChartSurfaceProvider><LiveChart /></CaptureChartSurfaceProvider>, { width: 62, height: 14 });
+    await act(async () => tui.setup().renderOnce());
+    const legend = () => tui.frame().split("\n")[0]!;
+    const tickTo = async (values: number[]) => {
+      await act(async () => tick(values));
+      await act(async () => tui.setup().renderOnce());
+    };
+
+    await hoverDay("2025-01-02");
+    expect(legend()).toContain("101");
+    await tickTo([100, 101, 150]);
+    expect(cursorDay()).toBe("2025-01-02");
+    expect(legend()).toContain("101");
+    expect(legend()).not.toContain("150");
+
+    await hoverDay("2025-01-03");
+    await tickTo([100, 101, 160]);
+    expect(cursorDay()).toBe("2025-01-03");
+    expect(legend()).toContain("160");
+    // The next bar opens; the crosshair stays where the pointer put it.
+    await tickTo([100, 101, 160, 170]);
+    expect(cursorDay()).toBe("2025-01-03");
+    expect(legend()).toContain("160");
+    expect(legend()).not.toContain("170");
+  });
+
+  // The arrows read the crosshair as the pointer moves it, which renders only
+  // what draws the crosshair, not the chart that holds the keys.
+  test("the arrows step on from the bar the pointer left the crosshair on", async () => {
+    const cursorChanges: Array<string | null> = [];
+    await tui.render(
+      <InputHostProvider host={chartInputHost}>
+        <CaptureChartSurfaceProvider>
+          <CompositeChart
+            width={60}
+            height={12}
+            focused
+            series={[series("price", "main", "left", "USD", [100, 103, 101, 104])]}
+            panels={[{ id: "main" }]}
+            onCursorDateChange={(date) => cursorChanges.push(date?.toISOString().slice(0, 10) ?? null)}
+          />
+        </CaptureChartSurfaceProvider>
+      </InputHostProvider>,
+      { width: 62, height: 14 },
+    );
+    await act(async () => tui.setup().renderOnce());
+    await hoverDay("2025-01-02");
+    await act(async () => chartShortcut?.(keyEvent("left")));
+    await act(async () => tui.setup().renderOnce());
+    expect(cursorChanges.at(-1)).toBe("2025-01-01");
+    expect(cursorDay()).toBe("2025-01-01");
+    await act(async () => {
+      chartShortcut?.(keyEvent("right"));
+      chartShortcut?.(keyEvent("right"));
+    });
+    expect(cursorChanges.at(-1)).toBe("2025-01-03");
+  });
+
+  test("a chart lets go of the cursor it follows when it unmounts", async () => {
+    const listeners = new Set<() => void>();
+    let shared: number | null = null;
+    const link = {
+      subscribe(listener: () => void) {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+      time: () => shared,
+      held: () => false,
+      publish() {},
+      clear() {
+        shared = null;
+      },
+    };
+    await tui.render(
+      <CaptureChartSurfaceProvider>
+        <CompositeChart width={60} height={12} series={[series("price", "main", "left", "USD", [100, 103, 101])]} panels={[{ id: "main" }]} cursorLink={link} />
+      </CaptureChartSurfaceProvider>,
+      { width: 62, height: 14 },
+    );
+    await act(async () => tui.setup().renderOnce());
+    expect(listeners.size).toBeGreaterThan(0);
+    shared = Date.parse("2025-01-02T12:00:00.000Z");
+    await act(async () => {
+      for (const listener of [...listeners]) listener();
+    });
+    await act(async () => tui.setup().renderOnce());
+    expect(cursorDay()).toBe("2025-01-02");
+    await act(async () => capturedSurfaceProps!.onMouseMove(pointerEvent(1, 3)));
+
+    await tui.destroy();
+    expect(listeners.size).toBe(0);
+  });
+
+  // Under a tab strip a press, drag or wheel moves into the chart. Once
+  // inside, a wheel step leaves that alone, so it costs the chart no render
+  // of its own; one that lands in the same batch as a step out moves in again.
+  test("a wheel step moves into a chart under a tab strip once, and again in the batch that stepped out of it", async () => {
+    let held = false;
+    function Strip() {
+      held = usePaneTabStripKeys(true, true).held;
+      return null;
+    }
+    let chartRenders = 0;
+    const countingHost: InputHost = {
+      useShortcut(handler) {
+        chartRenders += 1;
+        chartShortcut = handler;
+      },
+      useViewport: () => ({ width: 80, height: 24 }),
+    };
+    await tui.render(
+      <PaneFooterProvider>
+        {() => (
+          <InputHostProvider host={countingHost}>
+            <CaptureChartSurfaceProvider>
+              <Box flexDirection="column">
+                <Strip />
+                <CompositeChart
+                  width={60}
+                  height={12}
+                  focused
+                  interactive
+                  series={[series("price", "main", "left", "USD", [100, 101, 102, 103, 104, 105, 106, 107, 108])]}
+                  panels={[{ id: "main" }]}
+                  viewport={{ start: new Date("2025-01-04T00:00:00.000Z"), end: new Date("2025-01-08T00:00:00.000Z") }}
+                />
+              </Box>
+            </CaptureChartSurfaceProvider>
+          </InputHostProvider>
+        )}
+      </PaneFooterProvider>,
+      { width: 62, height: 14 },
+    );
+    const wheel = (direction: "left" | "right") => capturedSurfaceProps!.onMouseScroll(pointerEvent(25, 3, {
+      scroll: { direction, delta: 1 },
+    }));
+    const settle = () => act(async () => tui.setup().renderOnce());
+    await settle();
+    expect(held).toBe(false);
+    await act(async () => wheel("left"));
+    await settle();
+    expect(held).toBe(true);
+
+    // Inside, a step that moves nothing renders nothing, right after a pan
+    // too: the browser's steps pan on the next frame, after each such step.
+    for (const direction of ["left", "right", "left"] as const) {
+      await act(async () => wheel(direction));
+      const before = chartRenders;
+      await act(async () => capturedSurfaceProps!.onMouseScroll(pointerEvent(25, 3, {
+        scroll: { direction: "up", delta: 0, deltaX: 0, deltaY: 0 },
+      })));
+      expect(chartRenders).toBe(before);
+    }
+
+    await act(async () => {
+      chartShortcut?.(keyEvent("up"));
+      wheel("right");
+    });
+    await settle();
+    expect(held).toBe(true);
+    await act(async () => chartShortcut?.(keyEvent("up")));
+    await settle();
+    expect(held).toBe(false);
+  });
+
   // Charts in one layout tab share one cursor: the last one moved holds it,
   // and a chart that held it before does not get its own back later.
   test("linked charts show one cursor, taken by the last chart moved and cleared from any of them", async () => {
@@ -962,6 +1409,77 @@ describe("CompositeChart", () => {
     expect(cursors()).toEqual({ a: "2025-01-03", b: "2025-01-03" });
     await press("b", "escape");
     expect(cursors()).toEqual({ a: null, b: null });
+  });
+
+  // A chart following another chart's cursor builds its scene again on each
+  // of its own ticks: the cursor stays on the bar it landed on, read anew.
+  test("a tick on a chart following another chart's cursor keeps the cursor on its bar and reads the bar as the tick left it", async () => {
+    const shortcuts: Record<string, (event: KeyEventLike) => void> = {};
+    const hostFor = (id: string): InputHost => ({
+      useShortcut(handler) { shortcuts[id] = handler; },
+      useBeforeShortcut() {},
+      useViewport: () => ({ width: 80, height: 24 }),
+    });
+    const hosts = { a: hostFor("a"), b: hostFor("b") };
+    const panels = [{ id: "main" }];
+    const leading = [series("price", "main", "left", "USD", [100, 103, 101])];
+    let tick: (values: number[]) => void = () => {};
+    function LinkedChart({ id, focused, chartSeries }: { id: "a" | "b"; focused: boolean; chartSeries: ResolvedSeries[] }) {
+      const link = useTabCursorLink(id);
+      return (
+        <InputHostProvider host={hosts[id]}>
+          <CompositeChart width={60} height={12} focused={focused} series={chartSeries} panels={panels} cursorLink={link} />
+        </InputHostProvider>
+      );
+    }
+    function Tab() {
+      const [values, setValues] = useState([200, 201, 202]);
+      tick = setValues;
+      const following = useMemo(() => [series("price", "main", "left", "USD", values)], [values]);
+      return (
+        <Box flexDirection="column">
+          <LinkedChart id="a" focused chartSeries={leading} />
+          <LinkedChart id="b" focused={false} chartSeries={following} />
+        </Box>
+      );
+    }
+    await tui.render(
+      <AppContext value={createStaticAppStore(createInitialState(createDefaultConfig("/tmp/gloomberb-linked-tick")))}>
+        <Tab />
+      </AppContext>,
+      { width: 62, height: 24 },
+    );
+    const settle = () => act(async () => tui.setup().renderOnce());
+    const press = async (key: string) => {
+      await act(async () => shortcuts.a?.(keyEvent(key)));
+      await settle();
+    };
+    const tickTo = async (values: number[]) => {
+      await act(async () => tick(values));
+      await settle();
+    };
+    const following = () => ({ day: cursorDay([12, 24]), legend: tui.frame().split("\n")[12]! });
+    await settle();
+
+    await press("left");
+    await press("left");
+    expect(following().day).toBe("2025-01-02");
+    expect(following().legend).toContain("201");
+    await tickTo([200, 201, 250]);
+    expect(following().day).toBe("2025-01-02");
+    expect(following().legend).toContain("201");
+    expect(following().legend).not.toContain("250");
+
+    await press("right");
+    expect(following().day).toBe("2025-01-03");
+    await tickTo([200, 201, 260]);
+    expect(following().day).toBe("2025-01-03");
+    expect(following().legend).toContain("260");
+    // Its next bar opens; the cursor stays on the leading chart's day.
+    await tickTo([200, 201, 260, 270]);
+    expect(following().day).toBe("2025-01-03");
+    expect(following().legend).toContain("260");
+    expect(cursorDay([0, 12])).toBe("2025-01-03");
   });
 
   // A pinned cursor holds every chart in the tab at one moment: no pointer
@@ -1144,7 +1662,7 @@ describe("CompositeChart", () => {
     );
 
     await act(async () => tui.setup().renderOnce());
-    expect(tui.frame()).toContain("Jan 1");
+    expect(tui.frame()).toContain("1 Jan");
     expect(viewportChanges).toEqual([]);
 
     const zoomIn = keyEvent("=");
@@ -1154,13 +1672,13 @@ describe("CompositeChart", () => {
     await act(async () => tui.setup().renderOnce());
 
     expect(zoomIn.defaultPrevented).toBe(true);
-    expect(tui.frame()).not.toContain("Jan 1");
+    expect(tui.frame()).not.toContain("1 Jan");
     expect(viewportChanges.at(-1)?.start).not.toBe("2025-01-01T00:00:00.000Z");
     expect(viewportInteractions.at(-1)).toBe("zoom");
 
     await act(async () => chartShortcut?.(keyEvent("0")));
     await act(async () => tui.setup().renderOnce());
-    expect(tui.frame()).toContain("Jan 1");
+    expect(tui.frame()).toContain("1 Jan");
     expect(viewportChanges.at(-1)).toBeNull();
     expect(viewportInteractions.at(-1)).toBe("reset");
   });
@@ -1372,7 +1890,7 @@ describe("CompositeChart", () => {
     expect(viewportChanges.at(-1)).toEqual(pannedViewport);
     expect(viewportInteractions).not.toContain("sync");
     expect(tui.frame()).not.toContain("No chart data");
-    expect(tui.frame()).not.toContain("Jan 9");
+    expect(tui.frame()).not.toContain("9 Jan");
   });
 
   test("keeps the latest pan through delayed adaptive viewport and series echoes", async () => {
@@ -1534,7 +2052,7 @@ describe("CompositeChart", () => {
     );
 
     await act(async () => tui.setup().renderOnce());
-    expect(tui.frame()).toContain("Jan 5");
+    expect(tui.frame()).toContain("5 Jan");
 
     await act(async () => {
       capturedSurfaceProps!.onMouseDown(pointerEvent(10, 3));
@@ -1545,7 +2063,7 @@ describe("CompositeChart", () => {
 
     expect(activations).toBe(1);
     expect(cursorChanges.length).toBeGreaterThan(0);
-    expect(tui.frame()).toContain("Jan 3");
+    expect(tui.frame()).toContain("3 Jan");
   });
 
   test("zooms to a shift-drag selection instead of panning", async () => {
@@ -1867,6 +2385,48 @@ describe("CompositeChart", () => {
     expect(capturedSurfaceProps!.bitmaps[0]).toBe(raster);
   });
 
+  // The tool bar is folded to a handle until the pointer or the keyboard is on it.
+  const RULER = "\u2194";
+  const HAND = "\u2725";
+  const CHEVRON = "\u203a";
+  const frameNow = async () => {
+    await act(async () => tui.setup().renderOnce());
+    return tui.frame();
+  };
+  const locate = (glyph: string) => {
+    const lines = tui.frame().split("\n");
+    const row = lines.findIndex((line) => line.includes(glyph));
+    return { x: lines[row]?.indexOf(glyph) ?? -1, y: row };
+  };
+  const moveTo = async (at: { x: number; y: number }) => {
+    // The renderer folds moves that come within a frame of each other into the last.
+    await act(async () => {
+      await tui.setup().mockMouse.moveTo(at.x, at.y);
+      await Bun.sleep(40);
+    });
+    return frameNow();
+  };
+  /** Past the delay before an open bar folds once the pointer has left it. */
+  const waitToFold = () => act(async () => Bun.sleep(CHART_TOOLBAR_FOLD_DELAY_MS + 100));
+  const clickAt = async (at: { x: number; y: number }) => {
+    await act(async () => tui.setup().mockMouse.click(at.x, at.y));
+    return frameNow();
+  };
+  const toolBarChart = (
+    <CaptureChartSurfaceProvider>
+      <InputHostProvider host={chartInputHost}>
+        <CompositeChart
+          width={60}
+          height={12}
+          focused
+          interactive
+          series={[series("price", "main", "left", "USD", [100, 101, 102, 103, 104, 105, 106, 107, 108])]}
+          panels={[{ id: "main" }]}
+        />
+      </InputHostProvider>
+    </CaptureChartSurfaceProvider>
+  );
+
   test("arms and disarms a chart tool from the toolbar", async () => {
     await tui.render(
       <CaptureChartSurfaceProvider>
@@ -1882,9 +2442,10 @@ describe("CompositeChart", () => {
     );
     await act(async () => tui.setup().renderOnce());
 
-    // Pressing the ruler icon has to arm the tool for an unmodified drag.
-    const toolbarRow = tui.frame().split("\n").findIndex((line) => line.includes("↔"));
-    const rulerX = tui.frame().split("\n")[toolbarRow]!.indexOf("↔");
+    // Pressing the ruler icon has to arm the tool for an unmodified drag: the
+    // pointer on the handle opens the bar first.
+    await moveTo(locate(HAND));
+    const { x: rulerX, y: toolbarRow } = locate(RULER);
     await act(async () => {
       await tui.setup().mockMouse.moveTo(rulerX, toolbarRow);
       await tui.setup().mockMouse.click(rulerX, toolbarRow);
@@ -1910,6 +2471,75 @@ describe("CompositeChart", () => {
     expect(tui.frame()).not.toContain("Δ");
   });
 
+  test("starts with the tool bar folded to the pan tool, opens under the pointer, and folds a moment after it leaves", async () => {
+    await tui.render(toolBarChart, { width: 62, height: 14 });
+    const folded = await frameNow();
+    // Folded: the tool in hand with a hint that it opens, not the tools.
+    expect(folded).toContain(HAND + CHEVRON);
+    expect(folded).not.toContain(RULER);
+
+    expect(await moveTo(locate(HAND))).toContain(RULER);
+    // Crossing from one icon to the next leaves one and enters the other: it stays open past the delay.
+    await moveTo(locate(RULER));
+    await moveTo(locate("\u229e"));
+    await waitToFold();
+    expect(await frameNow()).toContain(RULER);
+    // Off the bar it waits, then folds.
+    expect(await moveTo({ x: 40, y: 8 })).toContain(RULER);
+    await waitToFold();
+    const after = await frameNow();
+    expect(after).not.toContain(RULER);
+    expect(after).toContain(HAND + CHEVRON);
+    // Back on the handle, it opens again.
+    expect(await moveTo(locate(HAND))).toContain(RULER);
+  });
+
+  test("a press on the folded handle keeps the tool bar open, and the chevron folds it at once", async () => {
+    await tui.render(toolBarChart, { width: 62, height: 14 });
+    await frameNow();
+    expect(await clickAt(locate(HAND))).toContain(RULER);
+    // Open for good: the pointer leaving does not fold it.
+    await moveTo({ x: 40, y: 8 });
+    await waitToFold();
+    expect(await frameNow()).toContain(RULER);
+    // The chevron that leads the bar folds it, under the pointer too.
+    const chevron = locate("\u2039");
+    await moveTo(chevron);
+    expect(await clickAt(chevron)).not.toContain(RULER);
+  });
+
+  test("a bar folded by a press stays folded while the pointer is on it, and opens when the pointer leaves and comes back within the delay", async () => {
+    await tui.render(toolBarChart, { width: 62, height: 14 });
+    await frameNow();
+    await clickAt(locate(HAND));
+    const chevron = locate("\u2039");
+    await moveTo(chevron);
+    expect(await clickAt(chevron)).not.toContain(RULER);
+    // Still on the bar, moving across the button: it stays folded.
+    const folded = locate(HAND);
+    expect(await moveTo({ x: folded.x + 1, y: folded.y })).not.toContain(RULER);
+    expect(await moveTo(folded)).not.toContain(RULER);
+    // Off the bar and back before the delay is up, it opens.
+    await moveTo({ x: 40, y: 8 });
+    expect(await moveTo(locate(HAND))).toContain(RULER);
+    await moveTo({ x: 40, y: 8 });
+    await waitToFold();
+    expect(await frameNow()).not.toContain(RULER);
+  });
+
+  test("the folded tool bar shows the tool in hand, and the pan tool again once it is put down", async () => {
+    await tui.render(toolBarChart, { width: 62, height: 14 });
+    await frameNow();
+    await act(async () => chartShortcut?.(keyEvent("m", true)));
+    const armed = await frameNow();
+    expect(armed).toContain(RULER + CHEVRON);
+    expect(armed).not.toContain(HAND);
+    await act(async () => chartShortcut?.(keyEvent("d", true)));
+    expect(await frameNow()).toContain("\u2571" + CHEVRON);
+    await act(async () => chartShortcut?.(keyEvent("escape")));
+    expect(await frameNow()).toContain(HAND + CHEVRON);
+  });
+
   test("shows its tools on the focused pane only, and keeps them while one is in hand or a press drags", async () => {
     let setFocused: (focused: boolean) => void = () => {};
     function FocusablePane({ children }: { children: ReactNode }) {
@@ -1931,30 +2561,28 @@ describe("CompositeChart", () => {
       </CaptureChartSurfaceProvider>,
       { width: 62, height: 14 },
     );
-    const RULER = "\u2194";
-    const HAND = "\u2725";
-    const frame = async () => {
-      await act(async () => tui.setup().renderOnce());
-      return tui.frame();
-    };
+    const frame = frameNow;
     const focus = async (focused: boolean) => {
       await act(async () => setFocused(focused));
       return frame();
     };
-    const press = async (glyph: string) => {
-      const lines = tui.frame().split("\n");
-      const row = lines.findIndex((line) => line.includes(glyph));
-      await act(async () => tui.setup().mockMouse.click(lines[row]!.indexOf(glyph), row));
-      return frame();
-    };
+    const press = async (glyph: string) => clickAt(locate(glyph));
 
-    expect(await frame()).not.toContain(RULER);
-    expect(await focus(true)).toContain(RULER);
+    expect(await frame()).not.toContain(HAND);
+    // The bar is folded; the pointer on its handle opens it.
+    expect(await focus(true)).toContain(HAND);
+    expect(await moveTo(locate(HAND))).toContain(RULER);
 
     // A tool in hand stays in view after focus moves on, until it is put down.
     await press(RULER);
-    expect(await focus(false)).toContain(RULER);
+    await focus(false);
+    await moveTo({ x: 40, y: 8 });
+    await waitToFold();
+    expect(await frame()).toContain(RULER + CHEVRON);
+    await moveTo(locate(RULER + CHEVRON));
     expect(await press(HAND)).not.toContain(RULER);
+    expect(tui.frame()).not.toContain(HAND);
+    await moveTo({ x: 40, y: 8 });
 
     // So does a drag that started on the focused pane, until its release.
     await focus(true);
@@ -1962,9 +2590,9 @@ describe("CompositeChart", () => {
       capturedSurfaceProps!.onMouseDown(pointerEvent(30, 6));
       capturedSurfaceProps!.onMouseDrag(pointerEvent(24, 6));
     });
-    expect(await focus(false)).toContain(RULER);
+    expect(await focus(false)).toContain(HAND);
     await act(async () => capturedSurfaceProps!.onMouseUp(pointerEvent(24, 6)));
-    expect(await frame()).not.toContain(RULER);
+    expect(await frame()).not.toContain(HAND);
   });
 
   test("draws a line, then grabs its end to reshape it", async () => {
@@ -2301,6 +2929,93 @@ describe("CompositeChart", () => {
     expect(tui.frame()).not.toContain("2025-01-01");
   });
 
+  // RETURN marks its best bar with a level and rests its cursor on the newest
+  // bar, which can be the best one: the axis then reads the value once.
+  test("a level's label leaves its value to the cursor only when the cursor reads that same value", async () => {
+    const render = (cursorDay: string) => tui.render(
+      <CaptureChartSurfaceProvider>
+        <CompositeChart width={60} height={12} showLegend={false} navigable={false}
+          series={[series("price", "main", "left", "USD", [100, 200, 199, 100])]}
+          panels={[{ id: "main" }]}
+          cursorDate={new Date(`${cursorDay}T00:00:00.000Z`)}
+          levels={{ seriesId: "price", items: [
+            { id: "best", value: 200, label: "Best", axisLabel: "200.00", color: "#00cc66", editable: false, actionable: false, prioritizeAxisLabel: true },
+          ] }} />
+      </CaptureChartSurfaceProvider>,
+      { width: 62, height: 14 },
+    );
+    const bestLabel = () => tui.frame().split("\n").find((line) => line.includes("Best"))!;
+
+    await render("2025-01-02");
+    await act(async () => tui.setup().renderOnce());
+    expect(bestLabel()).toContain("200");
+    expect(bestLabel()).not.toContain("Best 200.00");
+
+    // A cursor beside the level, at another value, covers its axis label: the label keeps the value.
+    await render("2025-01-03");
+    await act(async () => tui.setup().renderOnce());
+    expect(bestLabel()).toContain("Best 200.00");
+  });
+
+  // A read-only chart under a view strip (returns) has no viewport to pan,
+  // but its bars are read with the arrows: Down takes them from the strip,
+  // and handing them back puts the cursor on its resting bar again.
+  test("an enterable chart under a strip is read with the arrows once entered, and rests again when left", async () => {
+    let held = false;
+    function Strip() {
+      held = usePaneTabStripKeys(true, true).held;
+      return null;
+    }
+    await tui.render(
+      <PaneFooterProvider>
+        {() => (
+          <InputHostProvider host={chartInputHost}>
+            <CaptureChartSurfaceProvider>
+              <Box flexDirection="column">
+                <Strip />
+                <CompositeChart
+                  width={60}
+                  height={12}
+                  focused
+                  enterable
+                  navigable={false}
+                  showLegend={false}
+                  series={[series("price", "main", "left", "USD", [100, 200, 100, 100])]}
+                  panels={[{ id: "main" }]}
+                  cursorDate={new Date("2025-01-04T00:00:00.000Z")}
+                />
+              </Box>
+            </CaptureChartSurfaceProvider>
+          </InputHostProvider>
+        )}
+      </PaneFooterProvider>,
+      { width: 62, height: 14 },
+    );
+    const settle = () => act(async () => tui.setup().renderOnce());
+    const press = async (name: string) => {
+      const event = keyEvent(name);
+      await act(async () => chartShortcut?.(event));
+      await settle();
+      return event;
+    };
+    await settle();
+    expect(cursorDay()).toBe("2025-01-04");
+
+    // On the strip the arrows are the strip's.
+    expect((await press("left")).defaultPrevented).toBe(false);
+    expect(cursorDay()).toBe("2025-01-04");
+
+    await press("down");
+    expect(held).toBe(true);
+    await press("left");
+    await press("left");
+    expect(cursorDay()).toBe("2025-01-02");
+
+    await press("up");
+    expect(held).toBe(false);
+    expect(cursorDay()).toBe("2025-01-04");
+  });
+
   test.each([
     ["USD", "currency-total:USD", 90_007_000_000, "$90.01B"],
     ["EUR", "currency-total:EUR", -12_345_600_000, "-€12.35B"],
@@ -2388,9 +3103,9 @@ describe("CompositeChart", () => {
     );
     await act(async () => tui.setup().renderOnce());
     const frame = tui.frame();
-    expect(frame).toContain("Aug 10");
-    expect(frame).toContain("Sep 10");
-    expect(frame).not.toContain("Jul 31");
+    expect(frame).toContain("10 Aug");
+    expect(frame).toContain("10 Sep");
+    expect(frame).not.toContain("31 Jul");
   });
 
   test("zooms around the mouse pointer with control-wheel", async () => {
@@ -2412,7 +3127,7 @@ describe("CompositeChart", () => {
     );
 
     await act(async () => tui.setup().renderOnce());
-    expect(tui.frame()).toContain("Jan 9");
+    expect(tui.frame()).toContain("9 Jan");
 
     await act(async () => {
       capturedSurfaceProps!.onMouseScroll(pointerEvent(25, 3, {
@@ -2422,7 +3137,7 @@ describe("CompositeChart", () => {
     });
     await act(async () => tui.setup().renderOnce());
 
-    expect(tui.frame()).not.toContain("Jan 9");
+    expect(tui.frame()).not.toContain("9 Jan");
   });
 
   test("uses a supplied market timeline to keep control-wheel zoom under the pointer", async () => {

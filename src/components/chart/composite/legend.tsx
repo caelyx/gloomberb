@@ -1,8 +1,8 @@
-import { useEffect, useRef } from "react";
-import { Box, ScrollBox, Span, Text, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
+import { memo, useEffect, useRef } from "react";
+import { Box, ScrollBox, Span, Text, useShortcutLabel, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { colors as themeColors, hoverBg } from "../../../theme/colors";
 import { CANONICAL_EXCHANGE_ALIASES } from "../../../utils/exchanges";
-import { displayWidth, formatPercentRaw, truncateToDisplayWidth } from "../../../utils/format";
+import { MISSING_VALUE, displayWidth, formatPercentRaw, formatCompact } from "../../../utils/format";
 import type { ResolvedSeries } from "../../../time-series/types";
 import { consumeChartMouseEvent, type ChartMouseEvent } from "../core/pointer";
 import {
@@ -13,13 +13,16 @@ import {
   seriesPriceReference,
 } from "./format";
 import type { CompositeChartProps, CompositeChartScene } from "./types";
-import { seriesCueCssBackground, type SeriesLineCue } from "./series-cues";
-import { DisclosureMarker } from "../../ui/disclosure-marker";
+import { DIRECTION_MARKER, seriesColorsDirection, seriesCueCssBackground, type SeriesLineCue } from "./series-cues";
+import { DisclosureMarker as KitDisclosureMarker } from "../../ui/disclosure-marker";
+import { usePaneCapture } from "../../layout/pane/capture-status";
 
 const LEGEND_WHEEL_DELTA_PER_CELL = 8;
 const NO_LINE_CUES: ReadonlyMap<string, SeriesLineCue> = new Map();
 /** The dot every legend entry had before lines carried cues, and still has where they do not. */
 const DOT_MARKER = "● ";
+/** What a series read against the right axis says after its value, where others in its panel read against the left. */
+const RIGHT_AXIS_NOTE = " (right axis)";
 /** Cells the desktop and web marker takes: an 8px dot, or a 16px line sample, plus its margin. */
 const DOM_DOT_CELLS = 2;
 const DOM_LINE_CELLS = 3;
@@ -31,7 +34,7 @@ function formatLegendSeriesValue(
   formatValue: CompositeChartProps["formatValue"],
   scene: CompositeChartScene | null,
 ): string {
-  if (value === null) return "—";
+  if (value === null) return MISSING_VALUE;
   return formatValue ? formatValue(value, series) : formatCompositeSeriesValue(value, series, axisPriceReference(scene, series));
 }
 
@@ -99,6 +102,66 @@ function withoutListingExchange(label: string): string {
   ));
 }
 
+/** The words of a legend name, split at spaces: "Bab el-Mandeb" is two. */
+function nameWords(label: string): string[] {
+  return label.split(" ").filter(Boolean);
+}
+
+function sharedLegendContext(series: readonly ResolvedSeries[]): string | null {
+  const context = series[0]?.legendContext;
+  return context && series.length > 1 && series.every((entry) => entry.legendContext === context
+    && entry.label.split(" · ")[0]!.endsWith(` ${context}`)) ? context : null;
+}
+
+/** The shortest a legend name reads on one line: its first word whole, with one `…` for the rest ("Bab…"). */
+export function shortestLegendName(label: string): string {
+  const words = nameWords(label);
+  return words.length > 1 ? `${words[0]}…` : label;
+}
+
+/**
+ * A legend name cut to whole words within `width` cells, one `…` standing for
+ * the words left out, never a word cut through ("Malacc"): its first words,
+ * or its first and last ones where those tell it from the other names
+ * (`US…corporate OAS` beside `US high yield OAS`). At the least its first
+ * word, whatever `width` is. A name that fits is whole.
+ */
+export function wholeWordsCut(label: string, width: number, others: readonly string[] = []): string {
+  if (displayWidth(label) <= width) return label;
+  const { cuts, shown, tellsApart } = nameCuts(label, others);
+  const fitting = cuts.filter((cut) => displayWidth(shown(cut)) <= width);
+  const cut = fitting.find(tellsApart) ?? fitting[0];
+  return cut ? shown(cut) : shortestLegendName(label);
+}
+
+/**
+ * The shortest a legend name reads and is still told from the other names:
+ * beside "IV 90d", "IV 30d" cut to "IV…" would read as either, so it stays
+ * whole, and "IV 30d quote" reads "IV…quote". A name no other one shares its
+ * first word with reads as `shortestLegendName` has it.
+ */
+export function shortestLegendNameAmong(label: string, others: readonly string[]): string {
+  const { cuts, shown, tellsApart } = nameCuts(label, others);
+  const apart = cuts.filter(tellsApart).map(shown);
+  return apart.length ? apart.reduce((shortest, text) => displayWidth(text) < displayWidth(shortest) ? text : shortest) : label;
+}
+
+/** Every whole-word cut of a name, longest first, and whether a cut still tells it from `others`. */
+function nameCuts(label: string, others: readonly string[]) {
+  const words = nameWords(label);
+  const rivals = others.filter((other) => other !== label).map(nameWords);
+  const shown = ([head, tail]: readonly [number, number]) => `${words.slice(0, head).join(" ")}…${words.slice(words.length - tail).join(" ")}`;
+  // Another name with the same first and last words would read the same: "US high…" beside "US high yield OAS - …".
+  const tellsApart = ([head, tail]: readonly [number, number]) => !rivals.some((other) => other.length >= head + tail
+    && words.slice(0, head).every((word, index) => other[index] === word)
+    && words.slice(words.length - tail).every((word, index) => other[other.length - tail + index] === word));
+  const cuts: Array<readonly [number, number]> = [];
+  for (let kept = words.length - 1; kept >= 1; kept -= 1) {
+    for (let tail = 0; tail < kept; tail += 1) cuts.push([kept - tail, tail]);
+  }
+  return { cuts, shown, tellsApart };
+}
+
 /**
  * Entries laid left to right into lines of `available` cells, one cell apart,
  * a new line when the next does not fit. With `maxLines`, what does not fit in
@@ -120,12 +183,39 @@ function packLegendLines(widths: readonly number[], available: number, maxLines 
   return lines;
 }
 
-/** The legend's marker for a series on the desktop: its line as the plot strokes it, or a dot. */
-function CompositeSeriesSwatch({ series, cue, filled = true }: {
+/** A triangle pointing up or down, as the desktop legend keys a bar's direction. */
+const DIRECTION_TRIANGLES = {
+  up: "polygon(50% 0, 100% 100%, 0 100%)",
+  down: "polygon(0 0, 100% 0, 50% 100%)",
+} as const;
+
+// The legend renders with the crosshair, its values the series' at the
+// cursor; its markers and chevron hold still, so they render only when they change.
+const DisclosureMarker = memo(KitDisclosureMarker);
+
+/** The legend's marker for a series on the desktop: its line as the plot strokes it, its up and down colors, or a dot. */
+const CompositeSeriesSwatch = memo(function CompositeSeriesSwatch({ series, cue, downColor = null, filled = true }: {
   series: ResolvedSeries;
   cue: SeriesLineCue | null;
+  /** The down color, for a series keyed by direction: an up triangle in its color, then a down one in this. */
+  downColor?: string | null;
   filled?: boolean;
 }) {
+  if (downColor) {
+    return (
+      <Box
+        flexShrink={0}
+        flexDirection="row"
+        style={{ gap: 2, marginInlineEnd: 6, opacity: filled ? 1 : 0.35 }}
+        data-gloom-role="composite-chart-legend-marker"
+        data-gloom-cue="direction"
+      >
+        {([["up", series.color], ["down", downColor]] as const).map(([direction, color]) => (
+          <Box key={direction} flexShrink={0} style={{ width: 7, height: 7, backgroundColor: color, clipPath: DIRECTION_TRIANGLES[direction] }} />
+        ))}
+      </Box>
+    );
+  }
   return cue ? (
     // The line as the plot strokes it: solid, dashed, dotted or heavy.
     <Box
@@ -154,7 +244,7 @@ function CompositeSeriesSwatch({ series, cue, filled = true }: {
       data-gloom-role="composite-chart-legend-marker"
     />
   );
-}
+});
 
 export function CompositeLegend({
   scene,
@@ -162,8 +252,9 @@ export function CompositeLegend({
   visibleSeriesIds,
   lineCues = NO_LINE_CUES,
   cellPlot = false,
+  directionDownColor = null,
   width,
-  accessory,
+  accessory: liveAccessory,
   accessoryWidth,
   formatValue,
   showLatestChangePercent,
@@ -183,6 +274,12 @@ export function CompositeLegend({
   lineCues?: ReadonlyMap<string, SeriesLineCue>;
   /** The plot is cell text, so a line's cue is its mark rather than its dash. */
   cellPlot?: boolean;
+  /**
+   * The color bars that closed down are drawn in, where the theme's up and
+   * down are not the familiar green and red: a candle series' marker then keys
+   * both (`▲▼`). Null keeps its dot.
+   */
+  directionDownColor?: string | null;
   width: number;
   accessory: CompositeChartProps["legendAccessory"];
   accessoryWidth: CompositeChartProps["legendAccessoryWidth"];
@@ -201,7 +298,9 @@ export function CompositeLegend({
   /** Folds or opens the legend: a chevron in its inset, shown under the pointer while it is open. */
   onToggleCollapsed?: () => void;
 }) {
+  const accessory = usePaneCapture() ? null : liveAccessory;
   const isDesktopWeb = useUiCapabilities().nativePaneChrome === true;
+  const foldKey = useShortcutLabel()("Shift+L");
   // Folded, the legend keeps its first series; the rest wait behind a count.
   const foldedCount = collapsed ? Math.max(0, allSeries.length - 1) : 0;
   const series = foldedCount > 0 ? allSeries.slice(0, 1) : allSeries;
@@ -210,10 +309,14 @@ export function CompositeLegend({
     scene?.cursorValues.map((entry) => [entry.seriesId, entry] as const) ?? [],
   );
   const valueDates = legendValueDates(series, scene, cursorValueById);
-  const buildEntries = (withFiscalPeriods: boolean) => series.map((entry) => {
+  // A series read against the right axis while others in its panel read against the left says which is its scale.
+  const leftPanels = new Set(allSeries.filter((entry) => entry.axis === "left" && !entry.hidden).map((entry) => entry.panelId));
+  let context: string | null = null;
+  const buildEntries = (withFiscalPeriods: boolean, withAxisNotes = true) => series.map((entry) => {
     const cue = lineCues.get(entry.id) ?? null;
-    const marker = cue ? `${cellPlot ? cue.glyph : cue.sample} ` : DOT_MARKER;
-    const markerWidth = isDesktopWeb ? cue ? DOM_LINE_CELLS : DOM_DOT_CELLS : displayWidth(marker);
+    const downColor = !cue && directionDownColor && seriesColorsDirection(entry) ? directionDownColor : null;
+    const marker = cue ? `${cellPlot ? cue.glyph : cue.sample} ` : downColor ? DIRECTION_MARKER.text : DOT_MARKER;
+    const markerWidth = isDesktopWeb ? cue || downColor ? DOM_LINE_CELLS : DOM_DOT_CELLS : displayWidth(marker);
     const toggleable = !!onToggleSeries && (isSeriesToggleable?.(entry) ?? true);
     const cursorValue = cursorValueById.get(entry.id);
     // A stacked layer reads its own amount, not the top of the stack it is drawn to.
@@ -230,8 +333,13 @@ export function CompositeLegend({
     // What a futures price counts, beside its number as FUT prints it.
     const statedUnit = entry.points.length > 0 && !formatValue && entry.statedUnit ? ` ${entry.statedUnit}` : "";
     // A statement value names the fiscal period it reports, as FA's columns do.
+    const native = cursorValue?.point?.nativeAmount;
+    const statementEnd = native ? cursorValue?.point?.observedAt.toISOString().slice(0, 10) : undefined;
     const fiscalPeriod = withFiscalPeriods && cursorValue?.value != null ? cursorValue.point?.fiscalPeriod : undefined;
-    const valueTail = `${ownDate ? ` ${ownDate}` : ""}${fiscalPeriod ? ` ${fiscalPeriod}` : ""}${changeText}`;
+    const readDate = statementEnd ?? ownDate;
+    const valueTail = `${readDate ? ` ${readDate}` : ""}${fiscalPeriod && !statementEnd ? ` ${fiscalPeriod}` : ""}${native && withFiscalPeriods ? ` (${formatCompact(native.value)} ${native.currency})` : ""}${changeText}`;
+    const readsRight = entry.points.length > 0 && entry.axis === "right" && leftPanels.has(entry.panelId);
+    const axisNote = readsRight && withAxisNotes ? RIGHT_AXIS_NOTE : "";
     const valueText = entry.points.length === 0
       ? entry.hidden ? "" : "no data"
       : `${formatLegendSeriesValue(
@@ -239,30 +347,36 @@ export function CompositeLegend({
         legendValue,
         formatValue,
         scene,
-      )}${statedUnit}${valueTail}`;
-    const fullText = [entry.label, valueText].filter(Boolean).join(" ");
+      )}${statedUnit}${valueTail}${axisNote}`;
+    const fullText = [entry.label, valueText].filter(Boolean).join(" ") + (readsRight && !axisNote ? RIGHT_AXIS_NOTE : "");
     const details = formatCompositePointDetails(cursorValue?.point);
     const exactTotal = entry.unitGroup.split(":")[0] === "currency-total"
       && cursorValue?.value != null && Number.isFinite(cursorValue.value)
       ? `Value ${cursorValue.value} ${entry.unit}` : "";
     const tooltip = [fullText, exactTotal, details].filter(Boolean).join(" · ");
-    const label = entry.label;
-    const compactLabel = withoutListingExchange(label);
+    const metric = entry.legendContext && entry.label.split(" · ")[0]!.endsWith(` ${entry.legendContext}`) ? entry.legendContext : null;
+    const shortLabel = withoutListingExchange(entry.compactLabel ?? entry.label);
+    const compact = !context && metric && !shortLabel.endsWith(` ${metric}`) ? `${shortLabel} ${metric}` : shortLabel;
+    const compactLabel = context && compact.endsWith(` ${context}`) ? compact.slice(0, -context.length - 1) : compact;
+    const label = context ? compactLabel : entry.label;
     const labelWidth = displayWidth(label);
     const text = [label, valueText].filter(Boolean).join(" ");
     return {
       entry,
       cue,
+      downColor,
       marker,
       markerWidth,
       label,
       compactLabel,
+      metric,
       text,
       width: Math.max(1, displayWidth(text)) + markerWidth,
       labelWidth,
       valueText,
       statedUnit,
       valueTail,
+      axisNote,
       fiscalPeriod,
       toggleable,
       tooltip,
@@ -271,10 +385,20 @@ export function CompositeLegend({
   });
   let entries = buildEntries(true);
   type LegendEntry = (typeof entries)[number];
+  const otherNames = (target: LegendEntry) => entries.filter((other) => other !== target).map((other) => other.compactLabel);
+  const labelParts = (target: LegendEntry, label: string) => {
+    const suffix = !context && target.metric && label.endsWith(` ${target.metric}`) ? ` ${target.metric}` : "";
+    return { name: suffix ? label.slice(0, -suffix.length) : label, suffix };
+  };
+  const cutEntryLabel = (target: LegendEntry, label: string, budget: number) => {
+    const { name, suffix } = labelParts(target, label);
+    return wholeWordsCut(name, budget - displayWidth(suffix), otherNames(target)) + suffix;
+  };
   const setEntryLabel = (target: LegendEntry, label: string, labelWidth: number) => {
     target.label = label;
-    target.labelWidth = labelWidth;
-    target.text = [truncateToDisplayWidth(label, labelWidth), target.valueText].filter(Boolean).join(" ");
+    const shown = cutEntryLabel(target, label, labelWidth);
+    target.labelWidth = displayWidth(shown);
+    target.text = [shown, target.valueText].filter(Boolean).join(" ");
     target.width = Math.max(1, displayWidth(target.text)) + target.markerWidth;
   };
   const measureSeriesWidth = () => entries.reduce(
@@ -285,7 +409,12 @@ export function CompositeLegend({
   // line up with the query bar and tables above and below the chart.
   const inset = width > 1 ? 1 : 0;
   const leadWidth = valueDates.lead ? displayWidth(valueDates.lead) + 1 : 0;
-  const innerWidth = Math.max(0, width - inset - leadWidth);
+  if (measureSeriesWidth() > width - inset - leadWidth - (accessory ? accessoryWidth ?? 14 : 0)) {
+    context = sharedLegendContext(series);
+    if (context) entries = buildEntries(true);
+  }
+  const contextWidth = context ? displayWidth(context) + 1 : 0;
+  const innerWidth = Math.max(0, width - inset - leadWidth - contextWidth);
   const resolvedAccessoryWidth = accessory
     ? Math.max(1, Math.min(innerWidth, Math.floor(accessoryWidth ?? 14)))
     : 0;
@@ -294,14 +423,33 @@ export function CompositeLegend({
   const foldedWidth = foldedText ? displayWidth(foldedText) + 1 : 0;
   // The cursor date lives on the time axis, where the crosshair points at it.
   const widthBeforeAccessory = Math.max(0, innerWidth - resolvedAccessoryWidth - reservedAccessoryGap - foldedWidth);
-  // Names get the room the row has. When it overflows, the widest name
-  // shortens first: its listing exchange goes before any of the name is cut.
-  // The value (including its sign/unit) always stays intact. If the row cannot
-  // fit even with every name at a readable fragment, it keeps the old 30-cell
-  // entries and scrolls.
-  const minimumWidthOf = (list: LegendEntry[]) => list.reduce((total, entry, index) => {
-    const text = [truncateToDisplayWidth(entry.compactLabel, Math.min(8, displayWidth(entry.compactLabel))), entry.valueText]
-      .filter(Boolean).join(" ");
+  // Names get the room the row has. When it overflows, every name drops its
+  // listing exchange (and a company's field, compactLabel) together, so the
+  // row reads in one form; then the widest name loses its last words first,
+  // never a word cut through: one word stays whole, and "Bab el-Mandeb" reads "Bab…".
+  // The value (including its sign/unit) always stays intact. A name is cut no
+  // shorter than tells it from the others ("IV…" beside "IV 90d" would not)
+  // while the row fits so; if it does not, the row wraps where the chart gives
+  // it rows. With one row, names go to their first word before a value goes,
+  // and past that the row keeps the old 30-cell entries and scrolls.
+  // Worked out once per entry and name: the shrink loops below ask on every
+  // step, and the legend lays out again on every cursor move.
+  const shortestNames = new WeakMap<LegendEntry, Map<string, string>>();
+  const shortestName = (entry: LegendEntry, apart: boolean, label = entry.label) => {
+    let known = shortestNames.get(entry);
+    if (!known) shortestNames.set(entry, known = new Map());
+    const key = `${apart ? "apart" : "first"}:${label}`;
+    let name = known.get(key);
+    if (name === undefined) {
+      const parts = labelParts(entry, label);
+      name = (apart ? shortestLegendNameAmong(parts.name, otherNames(entry)) : shortestLegendName(parts.name)) + parts.suffix;
+      known.set(key, name);
+    }
+    return name;
+  };
+  const minimumWidthOf = (list: LegendEntry[], apart = false) => list.reduce((total, entry, index) => {
+    const name = shortestName(entry, apart, entry.compactLabel);
+    const text = [name, entry.valueText].filter(Boolean).join(" ");
     return total + Math.max(1, displayWidth(text)) + entry.markerWidth + (index > 0 ? 1 : 0);
   }, 0);
   // A fiscal period is context beside a value. Where it would push the row past
@@ -310,11 +458,27 @@ export function CompositeLegend({
   if (entries.some(({ fiscalPeriod }) => fiscalPeriod) && minimumWidthOf(entries) > widthBeforeAccessory) {
     entries = buildEntries(false);
   }
-  const minimumSeriesWidth = minimumWidthOf(entries);
-  const fitsOneLine = minimumSeriesWidth <= widthBeforeAccessory;
+  // Which axis a series reads against is what tells two scales apart: names lose words before it goes, and past what
+  // fits with every name at its first word it stays in the tooltip.
+  if (entries.some(({ axisNote }) => axisNote) && minimumWidthOf(entries) > widthBeforeAccessory) {
+    entries = buildEntries(entries.some(({ fiscalPeriod }) => fiscalPeriod), false);
+  }
+  if (entries.some((entry) => entry.entry.compactLabel) && measureSeriesWidth() > widthBeforeAccessory) {
+    for (const entry of entries) setEntryLabel(entry, entry.compactLabel, displayWidth(entry.compactLabel));
+    if (measureSeriesWidth() > widthBeforeAccessory) {
+      for (const entry of entries) {
+        if (!entry.entry.compactLabel) continue;
+        const { name, suffix } = labelParts(entry, entry.compactLabel);
+        entry.compactLabel = (nameWords(name)[0] ?? name) + suffix;
+        setEntryLabel(entry, entry.compactLabel, displayWidth(entry.compactLabel));
+      }
+    }
+  }
+  const fitsOneLine = minimumWidthOf(entries, true) <= widthBeforeAccessory;
   // Entries that cannot share a line even with names cut to fragments wrap onto
   // more lines when the chart gives them room, each whole, its name only cut
   // past a line's width; with one line they keep the old 30-cell entries and scroll.
+  // Either way a name loses whole words, as on one line.
   let lines: number[][] | null = null;
   let wantedRows = 1;
   if (!fitsOneLine) {
@@ -323,26 +487,59 @@ export function CompositeLegend({
       Math.max(1, widthBeforeAccessory - entry.markerWidth - (entry.valueText ? displayWidth(entry.valueText) + 1 : 0)),
     );
     const wrappedWidths = entries.map((entry) => entry.markerWidth + Math.max(1, displayWidth(
-      [truncateToDisplayWidth(entry.compactLabel, wrappedLabelWidth(entry)), entry.valueText].filter(Boolean).join(" "),
+      [cutEntryLabel(entry, entry.compactLabel, wrappedLabelWidth(entry)), entry.valueText].filter(Boolean).join(" "),
     )));
     wantedRows = packLegendLines(wrappedWidths, widthBeforeAccessory).length;
     if (rows > 1) {
       for (const entry of entries) setEntryLabel(entry, entry.compactLabel, wrappedLabelWidth(entry));
       lines = packLegendLines(wrappedWidths, widthBeforeAccessory, rows);
+      // More entries than the lines hold: they share the lines as they do with every name cut to the
+      // widest that fits them all, then each line's names lose words, widest first, until the line
+      // fits, before any value or unit leaves the view. A line that has no room even with every name
+      // at its first word keeps its names and scrolls.
+      if (wantedRows > rows) {
+        const widest = Math.max(...entries.map((entry) => entry.labelWidth));
+        for (let cap = widest - 1; cap >= 1; cap -= 1) {
+          const packed = packLegendLines(entries.map((entry) => entry.markerWidth + Math.max(1, displayWidth(
+            [cutEntryLabel(entry, entry.compactLabel, Math.min(cap, wrappedLabelWidth(entry))), entry.valueText].filter(Boolean).join(" "),
+          ))), widthBeforeAccessory);
+          if (packed.length <= rows) {
+            lines = packed;
+            break;
+          }
+        }
+      }
+      for (const line of lines) {
+        const lineEntries = line.map((index) => entries[index]!);
+        if (minimumWidthOf(lineEntries) > widthBeforeAccessory) continue;
+        const apart = minimumWidthOf(lineEntries, true) <= widthBeforeAccessory;
+        while (line.reduce((total, index, position) => total + entries[index]!.width + (position > 0 ? 1 : 0), 0) > widthBeforeAccessory) {
+          const shrinkable = lineEntries
+            .filter((entry) => entry.labelWidth > displayWidth(shortestName(entry, apart)))
+            .sort((left, right) => right.labelWidth - left.labelWidth)[0];
+          if (!shrinkable) break;
+          setEntryLabel(shrinkable, shrinkable.label, shrinkable.labelWidth - 1);
+        }
+      }
     }
   }
   const idle = !scene?.cursorDate;
   useEffect(() => {
     if (idle) onWantedRowsChange?.(wantedRows);
   }, [idle, onWantedRowsChange, wantedRows]);
-  if (fitsOneLine) {
+  if (fitsOneLine || (!lines && minimumWidthOf(entries) <= widthBeforeAccessory)) {
     while (measureSeriesWidth() > widthBeforeAccessory) {
       const shrinkable = entries
-        .filter((entry) => entry.label !== entry.compactLabel || entry.labelWidth > 8)
+        .filter((entry) => entry.label !== entry.compactLabel || entry.labelWidth > displayWidth(shortestName(entry, fitsOneLine)))
         .sort((left, right) => right.labelWidth - left.labelWidth)[0];
       if (!shrinkable) break;
       if (shrinkable.label !== shrinkable.compactLabel) {
-        setEntryLabel(shrinkable, shrinkable.compactLabel, Math.min(shrinkable.labelWidth, displayWidth(shrinkable.compactLabel)));
+        // One form across the row: every name takes its compact form together, never one beside the others' full ones.
+        for (const entry of entries) {
+          if (entry.label !== entry.compactLabel) {
+            setEntryLabel(entry, entry.compactLabel, Math.min(entry.labelWidth, displayWidth(entry.compactLabel)));
+          }
+        }
       } else {
         setEntryLabel(shrinkable, shrinkable.label, shrinkable.labelWidth - 1);
       }
@@ -414,11 +611,13 @@ export function CompositeLegend({
     scrollBox.scrollTo({ x: nextLeft, y: scrollBox.scrollTop });
   };
   const renderEntry = (
-    { entry, cue, marker, text, statedUnit, valueTail, toggleable, tooltip, carried, width: entryWidth }: LegendEntry,
+    { entry, cue, downColor, marker, text, statedUnit, valueTail, axisNote, toggleable, tooltip, carried, width: entryWidth }: LegendEntry,
     index: number,
   ) => {
     const entryVisible = visibleSeriesIds.has(entry.id);
-    const unitAt = statedUnit ? text.length - statedUnit.length - valueTail.length : -1;
+    // The axis note ends the text whenever it is there, after the value's own tail: both dim, as the unit is.
+    const noteAt = axisNote && text.endsWith(axisNote) ? text.length - axisNote.length : text.length;
+    const unitAt = statedUnit ? noteAt - statedUnit.length - valueTail.length : -1;
     return (
       <Box
         key={entry.id}
@@ -446,7 +645,13 @@ export function CompositeLegend({
         title={isDesktopWeb ? tooltip : undefined}
       >
         {isDesktopWeb ? (
-          <CompositeSeriesSwatch series={entry} cue={cue} filled={entryVisible} />
+          <CompositeSeriesSwatch series={entry} cue={cue} downColor={downColor} filled={entryVisible} />
+        ) : downColor && entryVisible ? (
+          <Text>
+            <Span fg={entry.color}>{DIRECTION_MARKER.up}</Span>
+            <Span fg={downColor}>{DIRECTION_MARKER.down}</Span>
+            {" "}
+          </Text>
         ) : (
           <Text fg={entryVisible ? entry.color : themeColors.textMuted}>{marker}</Text>
         )}
@@ -458,34 +663,52 @@ export function CompositeLegend({
               {text.slice(0, unitAt)}
               <Span fg={themeColors.textDim}>{statedUnit}</Span>
               {valueTail}
+              {noteAt < text.length ? <Span fg={themeColors.textDim}>{text.slice(noteAt)}</Span> : null}
+            </>
+          ) : noteAt < text.length ? (
+            <>
+              {text.slice(0, noteAt)}
+              <Span fg={themeColors.textDim}>{text.slice(noteAt)}</Span>
             </>
           ) : text}
         </Text>
       </Box>
     );
   };
-  const scrollLine = (line: number[] | null, key: string | number, ref: typeof scrollRef | undefined) => (
-    <ScrollBox
-      key={key}
-      ref={ref}
-      width={seriesWidth}
-      height={1}
-      flexShrink={0}
-      scrollX
-      focusable={false}
-      horizontalScrollbarOptions={{ visible: false }}
-      onMouseScroll={ref ? handleMouseScroll : undefined}
-      data-gloom-role="composite-chart-legend-scroll"
-    >
-      <Box flexDirection="row" width={line ? lineWidth(line) : desiredSeriesWidth} height={1} gap={1}>
-        {line ? line.map((index) => renderEntry(entries[index]!, index)) : entries.map(renderEntry)}
+  const scrollLine = (line: number[] | null, key: string | number, ref: typeof scrollRef | undefined) => {
+    const contentWidth = line ? lineWidth(line) : desiredSeriesWidth;
+    const count = ref && !collapsed && series.length > 1 && contentWidth > seriesWidth ? `${series.length} series` : "";
+    const countWidth = count ? Math.min(seriesWidth, displayWidth(count) + 1) : 0;
+    return (
+      <Box key={key} flexDirection="row" width={seriesWidth} height={1} flexShrink={0}>
+        <ScrollBox
+          ref={ref}
+          width={Math.max(0, seriesWidth - countWidth)}
+          height={1}
+          flexShrink={0}
+          scrollX
+          focusable={false}
+          horizontalScrollbarOptions={{ visible: false }}
+          onMouseScroll={ref ? handleMouseScroll : undefined}
+          data-gloom-role="composite-chart-legend-scroll"
+        >
+          <Box flexDirection="row" width={contentWidth} height={1} gap={1}>
+            {line ? line.map((index) => renderEntry(entries[index]!, index)) : entries.map(renderEntry)}
+          </Box>
+        </ScrollBox>
+        {count ? (
+          <Box width={countWidth} height={1} flexShrink={0} paddingLeft={countWidth > displayWidth(count) ? 1 : 0}
+            data-gloom-role="composite-chart-legend-count" title={series.map((entry) => entry.label).join(" · ")}>
+            <Text fg={themeColors.textDim}>{countWidth < displayWidth(count) ? String(series.length) : count}</Text>
+          </Box>
+        ) : null}
       </Box>
-    </ScrollBox>
-  );
+    );
+  };
   const lineCount = lines?.length ?? 1;
   const foldLabel = foldedCount > 0
-    ? `Show ${foldedCount} more series (Shift+L)`
-    : "Collapse the legend to its first series (Shift+L)";
+    ? `Show ${foldedCount} more series (${foldKey})`
+    : `Collapse the legend to its first series (${foldKey})`;
   const pressFold = (event: ChartMouseEvent) => {
     consumeChartMouseEvent(event);
     onToggleCollapsed?.();
@@ -535,6 +758,11 @@ export function CompositeLegend({
       {valueDates.lead ? (
         <Box width={leadWidth} height={1} flexShrink={0} data-gloom-role="composite-chart-legend-date">
           <Text fg={themeColors.textMuted}>{valueDates.lead}</Text>
+        </Box>
+      ) : null}
+      {context ? (
+        <Box width={contextWidth} height={1} flexShrink={0} data-gloom-role="composite-chart-legend-context">
+          <Text fg={themeColors.textMuted}>{context}</Text>
         </Box>
       ) : null}
       {seriesWidth > 0 && lines ? (

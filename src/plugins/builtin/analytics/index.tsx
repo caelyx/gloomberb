@@ -1,7 +1,9 @@
 import { usePaneSettingValue } from "../../../public/react";
 import { PortfolioRiskPane } from "./risk-pane";
 import { portfolioRiskHeadless } from "./risk-headless";
+import { NO_HOLDINGS_HINT } from "./risk-model";
 import { portfolioRiskCache } from "./risk-client";
+import { riskEpisodeCache } from "./risk-episodes";
 import { Box, Text } from "../../../ui";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -43,7 +45,7 @@ import {
 import {
   computeSharpeRatio,
   hasPortfolioPosition,
-} from "./metrics";
+} from "../../../portfolio/return-metrics";
 import {
   buildAnalyticsRiskRows,
   buildAnalyticsSummaryRows,
@@ -398,7 +400,7 @@ function LegacyPortfolioAnalyticsPane({ focused, width, height }: PaneProps) {
                 message={accountsError ?? undefined}
                 hint={accountsError
                   ? "Reconnect the broker in the Brokers pane (BR), then refresh."
-                  : "Add holdings from the Portfolio pane (PF), or connect a broker in BR to sync them."}
+                  : NO_HOLDINGS_HINT}
               />
             </Box>
           ) : historyOnly ? (
@@ -477,8 +479,14 @@ export const portfolioAnalyticsModule: PluginModule = {
     },
   ],
 
-  setup(ctx) { portfolioRiskCache.attach(ctx.persistence); },
-  dispose() { portfolioRiskCache.reset(); },
+  setup(ctx) {
+    portfolioRiskCache.attach(ctx.persistence);
+    riskEpisodeCache.attach(ctx.persistence);
+  },
+  dispose() {
+    portfolioRiskCache.reset();
+    riskEpisodeCache.reset();
+  },
   paneTemplates: ["PORT", "MARS"].map(prefix => ({
       id: prefix === "PORT" ? "analytics-pane" : "analytics-mars-pane",
       paneId: "analytics",
@@ -488,13 +496,13 @@ export const portfolioAnalyticsModule: PluginModule = {
       shortcut: {
         prefix, argKind: "text", argOptional: true, argPlaceholder: "portfolio-id",
         // `PORT Nope` names no portfolio: the bar says so, not the first portfolio's risk.
-        argError: (arg, context) => unknownCollectionArgError(arg, context.config.portfolios, "portfolio"),
+        argError: (arg, context) => unknownCollectionArgError(arg, context.config.portfolios, "portfolio", undefined, { prefix: true }),
       },
       headless: portfolioRiskHeadless,
       canCreate: (context) => context.config.portfolios.length > 0,
       createInstance: (context, options) => {
-        // `PORT Family` opens Family by its name or id, in any case, as `fn PORT` reads it.
-        const portfolioId = findNamedCollection(context.config.portfolios, options?.arg)?.id ?? resolveTemplatePortfolioId(context.config.portfolios, context.activeCollectionId);
+        // `PORT Family` opens Family by its name or id, in any case, or the start of one name, as `fn PORT` reads it.
+        const portfolioId = findNamedCollection(context.config.portfolios, options?.arg, { prefix: true })?.id ?? resolveTemplatePortfolioId(context.config.portfolios, context.activeCollectionId);
         return portfolioId ? { params: { portfolioId }, settings: { analyticsView: "risk" } } : null;
       },
     })),

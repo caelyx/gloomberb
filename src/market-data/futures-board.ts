@@ -1,5 +1,6 @@
 export type FuturesSector =
   | "equity-index"
+  | "volatility"
   | "equity-sectors"
   | "rates"
   | "energy"
@@ -23,13 +24,16 @@ export interface FuturesContract {
    */
   tick?: number;
   /** Exchange suffix of the root's listed contracts: CLZ26.NYM. */
-  venue: "CME" | "CBT" | "NYM" | "CMX" | "NYB";
+  venue: "CME" | "CBT" | "NYM" | "CMX" | "NYB" | "CFE";
   /** Lists a contract for every calendar month. */
   everyMonth?: true;
   /**
-   * What a price counts where the server sends no contract terms for the root:
-   * Dutch TTF gas quotes in euros per MWh, which a bare "EUR" does not say, and
-   * live cattle in US cents per pound, where the server's "USX" does not.
+   * What a price counts when the server's contract terms are not at hand: a
+   * terms read that failed, or a root the server sends none for. Dutch TTF gas
+   * quotes in euros per MWh, which a bare "EUR" does not say, live cattle in US
+   * cents per pound, where the server's "USX" does not, and copper in USD / lb,
+   * not a bare USD. Worded as the server's terms word it (checked 2026-11-17),
+   * which win when they come.
    */
   unit?: string;
   /**
@@ -47,6 +51,13 @@ export interface FuturesContract {
   bareCode?: true;
   /** Everyday names the board's own does not hold: oil is WTI crude, not heating or soybean oil. */
   aliases?: readonly string[];
+  /**
+   * A generic's row (VX1, VX2): it shows its symbol where the others show
+   * their code, two rows of one root told apart, and its place on the curve
+   * names it ("VIX Futures front month") until its quote or terms name the
+   * month it prices.
+   */
+  generic?: { place: string };
 }
 
 /** 0.005 -> 3, 0.25 -> 2, 1 -> 0. Written for ticks, not general numbers. */
@@ -102,39 +113,44 @@ export const FUTURES_CONTRACTS: FuturesContract[] = [
   { symbol: "ZB=F", code: "ZB", name: "30-Year T-Bond", sector: "rates", venue: "CBT", bareCode: true },
   { symbol: "UB=F", code: "UB", name: "Ultra T-Bond", sector: "rates", venue: "CBT", bareCode: true },
 
-  { symbol: "CL=F", code: "CL", name: "WTI Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01, aliases: ["oil"] },
-  { symbol: "BZ=F", code: "BZ", name: "Brent Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01 },
-  { symbol: "NG=F", code: "NG", name: "Natural Gas", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.001 },
+  { symbol: "CL=F", code: "CL", name: "WTI Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01, unit: "USD / barrel", aliases: ["oil"] },
+  // NYMEX's Brent, cash-settled to the ICE Brent futures settlement; ICE's own contract (B) is not carried.
+  { symbol: "BZ=F", code: "BZ", name: "Brent Crude Oil Last Day Financial", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01, unit: "USD / barrel" },
+  { symbol: "NG=F", code: "NG", name: "Natural Gas", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.001, unit: "USD / MMBtu", aliases: ["natgas", "nat gas"] },
   // Quoted in euros per MWh.
   { symbol: "TTF=F", code: "TTF", name: "Dutch TTF Gas", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.001, unit: "EUR / MWh", bareCode: true },
-  { symbol: "RB=F", code: "RB", name: "RBOB Gasoline", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.0001 },
-  { symbol: "HO=F", code: "HO", name: "Heating Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.0001 },
+  { symbol: "RB=F", code: "RB", name: "RBOB Gasoline", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.0001, unit: "USD / gallon" },
+  { symbol: "HO=F", code: "HO", name: "Heating Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.0001, unit: "USD / gallon" },
   // Cash settled on the CL and NG final settlements.
-  { symbol: "QM=F", code: "QM", name: "E-Mini Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.025, bareCode: true },
-  { symbol: "MCL=F", code: "MCL", name: "Micro WTI Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01 },
-  { symbol: "QG=F", code: "QG", name: "E-Mini Natural Gas", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.005, bareCode: true },
-  { symbol: "MNG=F", code: "MNG", name: "Micro Henry Hub Natural Gas", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.001 },
-  { symbol: "HH=F", code: "HH", name: "Henry Hub Last Day Financial", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.001 },
+  { symbol: "QM=F", code: "QM", name: "E-Mini Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.025, unit: "USD / barrel", bareCode: true },
+  { symbol: "MCL=F", code: "MCL", name: "Micro WTI Crude Oil", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.01, unit: "USD / barrel" },
+  { symbol: "QG=F", code: "QG", name: "E-Mini Natural Gas", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.005, unit: "USD / MMBtu", bareCode: true },
+  { symbol: "MNG=F", code: "MNG", name: "Micro Henry Hub Natural Gas", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.001, unit: "USD / MMBtu" },
+  { symbol: "HH=F", code: "HH", name: "Henry Hub Last Day Financial", sector: "energy", venue: "NYM", everyMonth: true, tick: 0.001, unit: "USD / MMBtu" },
 
-  { symbol: "GC=F", code: "GC", name: "Gold", sector: "metals", venue: "CMX", tick: 0.1 },
-  { symbol: "SI=F", code: "SI", name: "Silver", sector: "metals", venue: "CMX", tick: 0.005 },
-  { symbol: "HG=F", code: "HG", name: "Copper", sector: "metals", venue: "CMX", tick: 0.0005 },
+  { symbol: "GC=F", code: "GC", name: "Gold", sector: "metals", venue: "CMX", tick: 0.1, unit: "USD / troy oz" },
+  { symbol: "SI=F", code: "SI", name: "Silver", sector: "metals", venue: "CMX", tick: 0.005, unit: "USD / troy oz" },
+  { symbol: "HG=F", code: "HG", name: "Copper", sector: "metals", venue: "CMX", tick: 0.0005, unit: "USD / lb" },
+  // COMEX's micro metals, each settled daily at its full-size contract's settlement for the month.
+  { symbol: "MGC=F", code: "MGC", name: "Micro Gold", sector: "metals", venue: "CMX", tick: 0.1, unit: "USD / troy oz" },
+  { symbol: "SIL=F", code: "SIL", name: "Micro Silver", sector: "metals", venue: "CMX", tick: 0.005, unit: "USD / troy oz" },
+  { symbol: "MHG=F", code: "MHG", name: "Micro Copper", sector: "metals", venue: "CMX", tick: 0.0005, unit: "USD / lb" },
   { symbol: "ALI=F", code: "ALI", name: "Aluminum", sector: "metals", venue: "CMX", tick: 0.25, unit: "USD / metric ton" },
-  { symbol: "PL=F", code: "PL", name: "Platinum", sector: "metals", venue: "NYM", tick: 0.1 },
-  { symbol: "PA=F", code: "PA", name: "Palladium", sector: "metals", venue: "NYM", tick: 0.1 },
+  { symbol: "PL=F", code: "PL", name: "Platinum", sector: "metals", venue: "NYM", tick: 0.1, unit: "USD / troy oz" },
+  { symbol: "PA=F", code: "PA", name: "Palladium", sector: "metals", venue: "NYM", tick: 0.1, unit: "USD / troy oz" },
 
   // Most grains and softs quote in US cents (cocoa, soybean meal and lumber in
   // dollars); a tick is in the quote's own units.
-  { symbol: "ZC=F", code: "ZC", name: "Corn", sector: "agriculture", venue: "CBT", tick: 0.25 },
-  { symbol: "ZS=F", code: "ZS", name: "Soybeans", sector: "agriculture", venue: "CBT", tick: 0.25 },
-  { symbol: "ZM=F", code: "ZM", name: "Soybean Meal", sector: "agriculture", venue: "CBT", tick: 0.1 },
-  { symbol: "ZL=F", code: "ZL", name: "Soybean Oil", sector: "agriculture", venue: "CBT", tick: 0.01, bareCode: true },
-  { symbol: "ZW=F", code: "ZW", name: "Chicago SRW Wheat", sector: "agriculture", venue: "CBT", tick: 0.25, bareCode: true },
-  { symbol: "KE=F", code: "KE", name: "KC HRW Wheat", sector: "agriculture", venue: "CBT", tick: 0.25 },
-  { symbol: "KC=F", code: "KC", name: "Coffee", sector: "agriculture", venue: "NYB", tick: 0.05 },
-  { symbol: "SB=F", code: "SB", name: "Sugar #11", sector: "agriculture", venue: "NYB", tick: 0.01 },
-  { symbol: "CC=F", code: "CC", name: "Cocoa", sector: "agriculture", venue: "NYB", tick: 1 },
-  { symbol: "CT=F", code: "CT", name: "Cotton #2", sector: "agriculture", venue: "NYB", tick: 0.01, bareCode: true },
+  { symbol: "ZC=F", code: "ZC", name: "Corn", sector: "agriculture", venue: "CBT", tick: 0.25, unit: "US cents / bushel" },
+  { symbol: "ZS=F", code: "ZS", name: "Soybeans", sector: "agriculture", venue: "CBT", tick: 0.25, unit: "US cents / bushel" },
+  { symbol: "ZM=F", code: "ZM", name: "Soybean Meal", sector: "agriculture", venue: "CBT", tick: 0.1, unit: "USD / short ton" },
+  { symbol: "ZL=F", code: "ZL", name: "Soybean Oil", sector: "agriculture", venue: "CBT", tick: 0.01, unit: "US cents / lb", bareCode: true },
+  { symbol: "ZW=F", code: "ZW", name: "Chicago SRW Wheat", sector: "agriculture", venue: "CBT", tick: 0.25, unit: "US cents / bushel", bareCode: true },
+  { symbol: "KE=F", code: "KE", name: "KC HRW Wheat", sector: "agriculture", venue: "CBT", tick: 0.25, unit: "US cents / bushel" },
+  { symbol: "KC=F", code: "KC", name: "Coffee", sector: "agriculture", venue: "NYB", tick: 0.05, unit: "US cents / lb" },
+  { symbol: "SB=F", code: "SB", name: "Sugar #11", sector: "agriculture", venue: "NYB", tick: 0.01, unit: "US cents / lb" },
+  { symbol: "CC=F", code: "CC", name: "Cocoa", sector: "agriculture", venue: "NYB", tick: 1, unit: "USD / metric ton" },
+  { symbol: "CT=F", code: "CT", name: "Cotton #2", sector: "agriculture", venue: "NYB", tick: 0.01, unit: "US cents / lb", bareCode: true },
   { symbol: "OJ=F", code: "OJ", name: "Orange Juice", sector: "agriculture", venue: "NYB", tick: 0.05, unit: "US cents / lb", bareCode: true },
   { symbol: "LBR=F", code: "LBR", name: "Lumber", sector: "agriculture", venue: "CME", tick: 0.5, unit: "USD / 1,000 board ft", bareCode: true },
 
@@ -142,16 +158,40 @@ export const FUTURES_CONTRACTS: FuturesContract[] = [
   { symbol: "LE=F", code: "LE", name: "Live Cattle", sector: "livestock", venue: "CME", tick: 0.025, unit: "US cents / lb" },
   { symbol: "HE=F", code: "HE", name: "Lean Hogs", sector: "livestock", venue: "CME", tick: 0.025, unit: "US cents / lb" },
 
-  { symbol: "6E=F", code: "6E", name: "Euro FX", sector: "currencies", venue: "CME", tick: 0.00005, bareCode: true },
-  { symbol: "6J=F", code: "6J", name: "Japanese Yen", sector: "currencies", venue: "CME", tick: 0.0000005, bareCode: true },
-  { symbol: "6B=F", code: "6B", name: "British Pound", sector: "currencies", venue: "CME", tick: 0.0001, bareCode: true },
-  { symbol: "6A=F", code: "6A", name: "Australian Dollar", sector: "currencies", venue: "CME", tick: 0.00005, bareCode: true },
-  { symbol: "6C=F", code: "6C", name: "Canadian Dollar", sector: "currencies", venue: "CME", tick: 0.00005, bareCode: true },
-  { symbol: "6S=F", code: "6S", name: "Swiss Franc", sector: "currencies", venue: "CME", tick: 0.00005, bareCode: true },
+  // Quoted in US dollars per unit of the foreign currency, as the server's terms state for most of them.
+  { symbol: "6E=F", code: "6E", name: "Euro FX", sector: "currencies", venue: "CME", tick: 0.00005, unit: "USD / EUR", bareCode: true },
+  { symbol: "6J=F", code: "6J", name: "Japanese Yen", sector: "currencies", venue: "CME", tick: 0.0000005, unit: "USD / JPY", bareCode: true },
+  { symbol: "6B=F", code: "6B", name: "British Pound", sector: "currencies", venue: "CME", tick: 0.0001, unit: "USD / GBP", bareCode: true },
+  { symbol: "6A=F", code: "6A", name: "Australian Dollar", sector: "currencies", venue: "CME", tick: 0.00005, unit: "USD / AUD", bareCode: true },
+  { symbol: "6C=F", code: "6C", name: "Canadian Dollar", sector: "currencies", venue: "CME", tick: 0.00005, unit: "USD / CAD", bareCode: true },
+  { symbol: "6S=F", code: "6S", name: "Swiss Franc", sector: "currencies", venue: "CME", tick: 0.00005, unit: "USD / CHF", bareCode: true },
 ];
+
+/**
+ * The board's Volatility group: Cboe's VIX futures, the first two months, as
+ * their generics VX1 and VX2, which Gloom Cloud quotes at Cboe's daily
+ * settlement, the prices `CTM VX` draws. Kept out of FUTURES_CONTRACTS: VX has
+ * no continuous `=F` symbol and lists its contracts as VX/X6, which the
+ * catalogue's code and listed-contract lookups do not read. A settlement
+ * carries four decimals (23.6945), so the display tick does too; the contract
+ * trades in 0.05.
+ */
+const VOLATILITY_FUTURES: readonly FuturesContract[] = [
+  { symbol: "VX1", code: "VX", name: "VIX Futures", sector: "volatility", venue: "CFE", tick: 0.0001, generic: { place: "front month" } },
+  { symbol: "VX2", code: "VX", name: "VIX Futures", sector: "volatility", venue: "CFE", tick: 0.0001, generic: { place: "2nd month" } },
+];
+
+/** What a board row is called in its symbol column: its code (ES), or a generic's own symbol (VX1). */
+export function futuresBoardCode(contract: FuturesContract): string {
+  return contract.generic ? contract.symbol : contract.code;
+}
+
+/** Every row the FUT board lists: each root's front contract, and the VIX futures' first two months. */
+export const FUTURES_BOARD_ROWS: readonly FuturesContract[] = [...FUTURES_CONTRACTS, ...VOLATILITY_FUTURES];
 
 export const FUTURES_SECTOR_LABELS: Record<FuturesSector, string> = {
   "equity-index": "Equity Index",
+  volatility: "Volatility",
   "equity-sectors": "Equity Sectors",
   rates: "Rates",
   energy: "Energy",
@@ -163,6 +203,7 @@ export const FUTURES_SECTOR_LABELS: Record<FuturesSector, string> = {
 
 export const FUTURES_SECTOR_ORDER: FuturesSector[] = [
   "equity-index",
+  "volatility",
   "equity-sectors",
   "rates",
   "energy",
@@ -172,10 +213,46 @@ export const FUTURES_SECTOR_ORDER: FuturesSector[] = [
   "currencies",
 ];
 
+/**
+ * The board's groups a reader names by a word: its sectors in any of their
+ * forms, and the two the Agriculture sector holds that traders name apart,
+ * the softs (grown, not mined, and traded in New York) and the grains with
+ * their soybean products.
+ */
+const FUTURES_GROUP_WORDS: ReadonlyArray<{ words: readonly string[]; label: string; matches: (contract: FuturesContract) => boolean }> = [
+  { words: ["softs", "soft", "soft commodities"], label: "softs", matches: (contract) => ["KC", "SB", "CC", "CT", "OJ"].includes(contract.code) },
+  { words: ["grains", "grain", "grains and oilseeds"], label: "grains", matches: (contract) => ["ZC", "ZS", "ZM", "ZL", "ZW", "KE"].includes(contract.code) },
+  { words: ["agriculture", "agricultural", "ags", "ag", "agri"], label: "agriculture", matches: (contract) => contract.sector === "agriculture" },
+  { words: ["metals", "metal"], label: "metals", matches: (contract) => contract.sector === "metals" },
+  { words: ["energy", "energies"], label: "energy", matches: (contract) => contract.sector === "energy" },
+  { words: ["livestock", "meats"], label: "livestock", matches: (contract) => contract.sector === "livestock" },
+  { words: ["currencies", "currency", "fx"], label: "currencies", matches: (contract) => contract.sector === "currencies" },
+  { words: ["rates", "interest rates", "treasuries"], label: "rates", matches: (contract) => contract.sector === "rates" },
+  { words: ["equity index", "equity indices", "indices", "stock index", "stock indices"], label: "equity index",
+    matches: (contract) => contract.sector === "equity-index" },
+  { words: ["equity sectors", "sector futures"], label: "equity sectors", matches: (contract) => contract.sector === "equity-sectors" },
+  { words: ["volatility", "vol", "vix futures"], label: "volatility", matches: (contract) => contract.sector === "volatility" },
+];
+
+/**
+ * The rows a group word stands for (`FUT softs`, `FUT agriculture`), or null
+ * for any other search. A sector's word lists that sector alone: "energy"
+ * is the energy futures, not the S&P Energy sector future beside them.
+ */
+export function futuresGroupFilter(query: string): ((contract: FuturesContract) => boolean) | null {
+  const typed = query.trim().toLowerCase().replace(/\s+/g, " ");
+  return FUTURES_GROUP_WORDS.find((group) => group.words.includes(typed))?.matches ?? null;
+}
+
+/** The group words a contract is found by, as a catalog search reads them: KC is softs and agriculture. */
+export function futuresGroupTags(contract: FuturesContract): string[] {
+  return FUTURES_GROUP_WORDS.filter((group) => group.matches(contract)).map((group) => group.label);
+}
+
 export function getContractsBySector(): Map<FuturesSector, FuturesContract[]> {
   const map = new Map<FuturesSector, FuturesContract[]>();
   for (const sector of FUTURES_SECTOR_ORDER) {
-    map.set(sector, FUTURES_CONTRACTS.filter((contract) => contract.sector === sector));
+    map.set(sector, FUTURES_BOARD_ROWS.filter((contract) => contract.sector === sector));
   }
   return map;
 }
@@ -184,6 +261,41 @@ const BY_CODE: ReadonlyMap<string, FuturesContract> = new Map(FUTURES_CONTRACTS.
 const BY_SYMBOL: ReadonlyMap<string, FuturesContract> = new Map(FUTURES_CONTRACTS.map((contract) => [contract.symbol, contract]));
 
 const typed = (value: unknown) => typeof value === "string" ? value.trim().toUpperCase() : "";
+
+/**
+ * CME's crypto futures, which have a curve (CTM) but no board row, so their
+ * name and tick live here. Outright ticks: BTC $5, ETH $0.50, SOL $0.05, XRP
+ * $0.0005 (each $25 a contract). Their contracts are listed as ETHX26.CME.
+ */
+export const CME_CRYPTO_FUTURES: readonly { code: string; name: string; tick: number }[] = [
+  { code: "BTC", name: "Bitcoin", tick: 5 }, { code: "ETH", name: "Ether", tick: 0.5 },
+  { code: "SOL", name: "Solana", tick: 0.05 }, { code: "XRP", name: "XRP", tick: 0.0005 },
+];
+
+/**
+ * CME's micro crypto futures (Micro Bitcoin, Micro Ether, Micro SOL, Micro
+ * XRP): listed as MBTX26.CME, with no curve or board row, so only their codes
+ * live here.
+ */
+const CME_MICRO_CRYPTO_ROOTS: ReadonlySet<string> = new Set(["MBT", "MET", "MSL", "MXP"]);
+
+/** A root, a month letter and a two-digit year: CLZ26, ETHX26, 6EH27. */
+const LISTED_CONTRACT_CODE = /^([A-Z0-9]{1,4})([FGHJKMNQUVXZ])(\d{2})$/;
+
+/**
+ * A listed contract's code as CTM prints it (ETHX26, CLZ26), as the symbol
+ * its quote has (ETHX26.CME, CLZ26.NYM): the code with its root's venue.
+ * Null for any other text, and for a root neither the board nor CME crypto,
+ * micros included, has.
+ */
+export function listedFuturesSymbol(code: unknown): string | null {
+  const match = LISTED_CONTRACT_CODE.exec(typed(code));
+  if (!match) return null;
+  const root = match[1]!;
+  const venue = BY_CODE.get(root)?.venue
+    ?? (CME_CRYPTO_FUTURES.some((row) => row.code === root) || CME_MICRO_CRYPTO_ROOTS.has(root) ? "CME" : null);
+  return venue ? `${match[0]}.${venue}` : null;
+}
 
 /** The board row a bare code names, in any case: NG is Natural Gas whether or not a security also uses NG. */
 export function futuresContractByCode(code: unknown): FuturesContract | null {
@@ -199,7 +311,17 @@ export function futuresBoardContract(value: unknown): FuturesContract | null {
   return BY_SYMBOL.get(typed(value)) ?? futuresContractByCode(value);
 }
 
-const nameWords = (text: string) => text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+/**
+ * A contract's name as a reader may type it, with its number marked any way:
+ * "SUGAR NO. 11", the CFTC's name, and "Sugar #11", the board's, are both
+ * "sugar 11". Lower case, "No."/"Nr." before a number and "#" dropped,
+ * spaces collapsed.
+ */
+export function futuresNameKey(text: string): string {
+  return text.toLowerCase().replace(/\b(?:no|nr)\.?\s*(?=\d)/g, " ").replace(/#/g, " ").replace(/\s+/g, " ").trim();
+}
+
+const nameWords = (text: string) => futuresNameKey(text).split(/[^a-z0-9]+/).filter(Boolean);
 
 /**
  * The item a typed name means: every word of it starts a word of the item's
@@ -232,6 +354,51 @@ export function bestNameMatch<T>(items: readonly T[], names: (item: T) => readon
  */
 export function futuresContractByName(value: unknown): FuturesContract | null {
   return bestNameMatch(FUTURES_CONTRACTS, (contract) => [contract.name, ...contract.aliases ?? []], value);
+}
+
+/**
+ * The commodity words that name a board row when typed as a symbol, and the
+ * future each stands for: energy, metals, grains and softs, livestock. A list,
+ * not the words of every row's name, so DOW, NOTE, BOND, DOLLAR, NAT and LIVE,
+ * words of index, rate, currency and livestock rows, name none.
+ */
+const COMMODITY_WORDS: Readonly<Record<string, string>> = {
+  BRENT: "BZ=F",
+  WTI: "CL=F",
+  OIL: "CL=F",
+  CRUDE: "CL=F",
+  NATGAS: "NG=F",
+  GASOLINE: "RB=F",
+  RBOB: "RB=F",
+  GOLD: "GC=F",
+  SILVER: "SI=F",
+  COPPER: "HG=F",
+  ALUMINUM: "ALI=F",
+  ALUMINIUM: "ALI=F",
+  PLATINUM: "PL=F",
+  PALLADIUM: "PA=F",
+  CORN: "ZC=F",
+  WHEAT: "ZW=F",
+  SOYBEANS: "ZS=F",
+  SOYBEAN: "ZS=F",
+  SOY: "ZS=F",
+  COFFEE: "KC=F",
+  SUGAR: "SB=F",
+  COCOA: "CC=F",
+  COTTON: "CT=F",
+  LUMBER: "LBR=F",
+  CATTLE: "LE=F",
+  HOGS: "HE=F",
+};
+
+/**
+ * The board row a commodity's word names when typed as a symbol (BRENT is
+ * Brent Crude Oil Last Day Financial, BZ=F; WTI, OIL and CRUDE are WTI Crude Oil, CL=F; GOLD is
+ * GC=F), from COMMODITY_WORDS alone. Null for any other word.
+ */
+export function futuresContractByWord(symbol: unknown): FuturesContract | null {
+  const future = COMMODITY_WORDS[typed(symbol).toUpperCase()];
+  return future ? FUTURES_CONTRACTS.find((contract) => contract.symbol === future) ?? null : null;
 }
 
 /**

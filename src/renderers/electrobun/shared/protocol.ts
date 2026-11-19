@@ -4,8 +4,8 @@ import type {
   DesktopDockPreviewState,
   DesktopSharedStateSnapshot,
   DesktopThemePreviewState,
-  DesktopWindowIntent,
-  DesktopWindowIntentResult,
+  DesktopWindowInfo,
+  OtherWindowTab,
 } from "../../../types/desktop-window";
 import type { DesktopApplicationMenuCommand } from "../../../types/desktop-menu";
 import type { AppConfig, UpdateChannel } from "../../../types/config";
@@ -14,8 +14,10 @@ import type { TickerRecord } from "../../../types/ticker";
 import type { ReleaseInfo, UpdateCheckResult, UpdateProgress } from "../../../updater";
 import type { CapabilityManifest } from "../../../capabilities";
 import type { PluginOperationResult, PluginPin } from "../../../plugins/marketplace/store";
+import type { PluginSeedProgress } from "../../../plugins/seed-progress";
 import type { RemoteControlRequest, RemoteControlResponse } from "../../../remote/types";
 import type { HttpProxyRequestEnvelope, HttpProxyResponseEnvelope } from "../../../utils/http-proxy-response";
+import type { StallEvent } from "../../../utils/main-thread-stall";
 import type { BootFrame } from "../../dom/boot-frame-page";
 
 export const ELECTROBUN_CONTEXT_MENU_ACTION = "gloom.context-menu.select";
@@ -32,18 +34,28 @@ export interface ElectrobunBackendInit {
   desktopPlatform: string;
   /** The machine name, which a remote assistant sees this desktop app under. */
   hostName?: string;
-  windowKind: "main" | "detached" | "window";
-  /** A popped-out window's pane. */
+  windowKind: "main" | "detached";
   paneId?: string;
-  /** A secondary window's layout window id. */
+  /** A full window's id: `main`, or an extra window's. Absent for a popped-out pane's window. */
   windowId?: string;
-  /** The window with native focus, or the last one to have it, by channel key. */
-  activeWindowKey?: string | null;
-  /** What the launch's plugin seed could not install, for the main window to say once. */
-  pluginSeedNotice?: { body: string; type: "error" | "info" };
+  /** Every full window, for moving a tab or pane between them. */
+  windows?: DesktopWindowInfo[];
+  /** The main window's: the tabs the other windows hold, for cloud sync. */
+  otherWindowTabs?: OtherWindowTab[];
+  /**
+   * The main window's: the plugins the launch is restoring in the background,
+   * to bring into its session as they land and to say what could not be
+   * installed. Later changes arrive as `plugins.seedProgress`.
+   */
+  pluginSeed?: PluginSeedProgress;
   /** What the view needs to send crash reports and usage counts the same way the Bun process would. */
   telemetry: ElectrobunTelemetryInit;
+  /** The copy on disk of the ids the view keeps in its own storage (view/view-ids.ts). */
+  viewIds: DesktopViewIds;
 }
+
+/** Ids the view keeps in its WebView storage, by storage key. */
+export type DesktopViewIds = Record<string, string>;
 
 interface ElectrobunTelemetryInit {
   /** Random per-install id from `<dataDir>/install-id`; null when the file could not be written. */
@@ -64,6 +76,9 @@ export interface DesktopRestartMessage {
 }
 
 export type DesktopWindowControlAction = "minimize" | "toggle-maximize" | "close";
+
+/** The window edges the page pulls itself: the frame's own stop under its top. */
+export type DesktopWindowResizeEdge = "top" | "top-left" | "top-right";
 
 export type DesktopContextMenuItem =
   | { type: "divider" }
@@ -172,7 +187,7 @@ export type DesktopPluginActivationResult =
 
 interface DesktopBackendRequestMap {
   init: {
-    request: { kind?: "main" | "detached" | "window"; paneId?: string; windowId?: string };
+    request: { kind?: "main" | "detached"; paneId?: string };
     response: ElectrobunBackendInit;
   };
   "http.fetch": { request: HttpProxyRequestEnvelope; response: HttpProxyResponseEnvelope };
@@ -185,7 +200,8 @@ interface DesktopBackendRequestMap {
   "capability.cancel": { request: { invocationId: string }; response: null };
   "capability.subscribe": { request: DesktopCapabilitySubscribeRequest; response: null };
   "capability.unsubscribe": { request: { subscriptionId: string }; response: null };
-  "desktop.syncMainState": { request: { snapshot: DesktopSharedStateSnapshot }; response: null };
+  /** A full window's whole state. `baseSeq` names the last state it took from here; null, its own last sync. */
+  "desktop.syncMainState": { request: { snapshot: DesktopSharedStateSnapshot; baseSeq?: number | null }; response: null };
   "desktop.setThemePreview": { request: { preview: DesktopThemePreviewState }; response: null };
   "desktop.replaceDetachedPaneState": {
     request: { paneId: string; paneState: PaneRuntimeState };
@@ -198,16 +214,13 @@ interface DesktopBackendRequestMap {
   };
   "desktop.closeDetachedPane": { request: { paneId: string }; response: null };
   "desktop.focusDetachedPane": { request: { paneId: string }; response: null };
-  /** From a secondary window: a change the host passes to the main window, naming the window it came from. */
-  "window.intent": { request: { intent: DesktopWindowIntent }; response: DesktopWindowIntentResult };
-  /** From any window: bring forward the window that shows a pane, and focus the pane there. */
-  "window.focusPane": { request: { paneId: string }; response: null };
-  /**
-   * From any window: bring forward window `windowId` ("main" or a layout
-   * window id) and focus `paneId` there, once the layout has the pane there:
-   * a pane or window the main window has just moved or made.
-   */
-  "window.focus": { request: { windowId: string; paneId?: string | null }; response: null };
+  "desktop.openWindow": { request: null; response: null };
+  /** `windowId` null moves it to a new window. False when it cannot go. */
+  "desktop.moveLayoutToWindow": { request: { layoutId: string; windowId: string | null }; response: boolean };
+  "desktop.movePaneToWindow": { request: { paneId: string; windowId: string | null }; response: boolean };
+  "desktop.focusWindow": { request: { windowId: string }; response: null };
+  /** Brings forward the full window that shows a pane, on its tab, with the pane focused. False when no window has it. */
+  "desktop.focusPane": { request: { paneId: string }; response: boolean };
   "pluginState.setMany": { request: { entries: DesktopPluginStateSetEntry[] }; response: null };
   "pluginState.delete": { request: { pluginId: string; key: string }; response: null };
   "plugins.listExternal": { request: null; response: DesktopExternalPluginBundle[] };
@@ -227,6 +240,11 @@ interface DesktopBackendRequestMap {
   "host.exit": { request: null; response: null };
   "host.windowControl": { request: { action: DesktopWindowControlAction }; response: null };
   "host.windowFullscreen": { request: null; response: boolean };
+  "host.windowMaximized": { request: null; response: boolean };
+  /** Windows: moves the window with the pointer through the system's own move loop. */
+  "host.startWindowDrag": { request: null; response: null };
+  /** Windows: resizes the window from its top edge through the system's own size loop. */
+  "host.startWindowResize": { request: { edge: DesktopWindowResizeEdge }; response: null };
   "host.openExternal": { request: { url: string }; response: boolean };
   "host.copyText": { request: { text: string }; response: null };
   "host.focusWindow": { request: null; response: null };
@@ -243,6 +261,8 @@ interface DesktopBackendRequestMap {
   "host.showContextMenu": { request: { menu: DesktopContextMenuItem[] }; response: boolean };
   /** The layout the main window draws at the next launch before its script loads (dom/boot-frame.ts). Only the main window's is kept. */
   "host.saveBootFrame": { request: { frame: BootFrame }; response: null };
+  /** The ids the view keeps in its storage, for the copy on disk. Only the main window's are kept. */
+  "host.saveViewIds": { request: { ids: DesktopViewIds }; response: null };
   /** The unread count for the Dock icon badge: `""` (none), `"1"` to `"99"` or `"99+"`. Only the main window's is applied. */
   "host.setAppBadge": { request: { label: string }; response: null };
   /** `channel` absent (an older view) means stable. */
@@ -252,6 +272,10 @@ interface DesktopBackendRequestMap {
   /** Installs the staged update and relaunches. Sent only when the user presses Restart. */
   "update.apply": { request: null; response: null };
   "ticker.loadAll": { request: null; response: TickerRecord[] };
+  /** Changes when another program commits to the database (`TickerStore.changesElsewhere`). */
+  "ticker.changesElsewhere": { request: null; response: number | null };
+  /** The rows another program deleted that the backend held (`TickerRepository.takeRowsDeletedElsewhere`). */
+  "ticker.takeDeletedElsewhere": { request: null; response: string[] };
   "ticker.load": { request: { symbol: string }; response: TickerRecord | null };
   "ticker.save": { request: { ticker: TickerRecord }; response: null };
   "ticker.delete": { request: { symbol: string }; response: null };
@@ -339,26 +363,39 @@ export interface DesktopDeepLinkMessage {
   url: string;
 }
 
+interface DesktopWindowsMessage {
+  windows: DesktopWindowInfo[];
+}
+
+interface DesktopOtherWindowTabsMessage {
+  /** `OtherWindowTab[]`, encoded as the shared state is. */
+  tabs: unknown;
+}
+
+interface DesktopFocusPaneMessage {
+  paneId: string;
+}
+
+/** The window was minimized or brought back; a page cannot always tell by itself. */
+interface DesktopWindowVisibilityMessage {
+  visible: boolean;
+}
+
+/** A window change no request waited on (a window closed, a pane docked) could not be saved; to the main window. */
+type DesktopSaveFailedMessage = Record<string, never>;
+
 /** Plugin folders the Bun process updated in the background, for the main window to bring into its session. */
 interface PluginsUpdatedMessage {
   directories: string[];
 }
 
+/** The launch's restore of plugins that moved into their own repositories, after a change. */
+interface PluginSeedProgressMessage {
+  seed: PluginSeedProgress;
+}
+
 export interface RemoteControlRequestMessage {
   request: RemoteControlRequest;
-}
-
-export interface WindowIntentRequestMessage {
-  windowId: string;
-  intent: DesktopWindowIntent;
-}
-
-interface ActiveWindowMessage {
-  windowKey: string | null;
-}
-
-interface FocusPaneMessage {
-  paneId: string;
 }
 
 export interface ElectrobunDesktopRpcSchema {
@@ -371,6 +408,8 @@ export interface ElectrobunDesktopRpcSchema {
     };
     messages: {
       "host.restart": DesktopRestartMessage;
+      /** A window froze; the Bun process keeps the stall log and its report. */
+      "runtime.stall": StallEvent;
     };
   };
   webview: {
@@ -379,21 +418,21 @@ export interface ElectrobunDesktopRpcSchema {
         params: RemoteControlRequestMessage;
         response: RemoteControlResponse;
       };
-      "window.intent": {
-        params: WindowIntentRequestMessage;
-        response: DesktopWindowIntentResult;
-      };
     };
     messages: {
-      "desktop.activeWindow": ActiveWindowMessage;
-      "desktop.focusPane": FocusPaneMessage;
       "context-menu.select": ContextMenuSelectMessage;
       "application-menu.select": ApplicationMenuSelectMessage;
       "desktop.state": DesktopStateMessage;
       "desktop.dockPreview": DesktopDockPreviewMessage;
       "desktop.themePreview": DesktopThemePreviewMessage;
       "desktop.deepLink": DesktopDeepLinkMessage;
+      "desktop.windows": DesktopWindowsMessage;
+      "desktop.otherWindowTabs": DesktopOtherWindowTabsMessage;
+      "desktop.focusPane": DesktopFocusPaneMessage;
+      "desktop.windowVisibility": DesktopWindowVisibilityMessage;
+      "desktop.saveFailed": DesktopSaveFailedMessage;
       "plugins.updated": PluginsUpdatedMessage;
+      "plugins.seedProgress": PluginSeedProgressMessage;
       "update.progress": UpdateProgressMessage;
       "capability.event": CapabilityEventMessage;
       "http.stream.chunk": HttpStreamChunkMessage;

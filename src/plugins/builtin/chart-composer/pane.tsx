@@ -20,9 +20,16 @@ import {
   type MultiSelectRowAction,
 } from "../../../components/ui";
 import { CompositeChart } from "../../../components/chart/composite";
+import { useCaptureDatesData } from "../../../components/layout/pane/capture-status";
+import { savedCopyFooterInfo } from "../../../components/layout/pane/footer";
 import { useChartViewReset, useChartViewResetListener } from "../../../components/chart/core/view-reset";
 import { formatCompositeDatasetDate } from "../../../components/chart/composite/format";
 import type { CompositeChartLevels, CompositeLevelEdit } from "../../../components/chart/composite/levels";
+import type { FxInterventionsPayload } from "../../../api-client/fx-interventions";
+import { loadFxInterventions } from "../../../market-data/fx-interventions";
+import { chartInterventionPair, chartInterventions, rawPriceEntry } from "./intervention-events";
+import { formulaRollEvents, isRollEvent } from "./roll-events";
+import type { CompositeChartEvent } from "../../../components/chart/composite/types";
 import type { PaneProps, TickerResearchTabProps } from "../../../types/plugin";
 import type { ChartResolution, TimeRange } from "../../../components/chart/core/types";
 import type { ChartSpec, ResolvedSeries } from "../../../time-series/types";
@@ -55,7 +62,11 @@ import {
 import { colors } from "../../../theme/colors";
 import { isUsListingExchange, parsePublicTickerKey, publicTickerKey } from "../../../utils/exchanges";
 import { getTimeSeriesField, isMarketFieldId } from "../../../time-series/field-catalog";
-import { isDatasetChart } from "../../../time-series/spec";
+import { isDatasetChart, isOhlcSeriesStyle } from "../../../time-series/spec";
+import { useThemeColors } from "../../../theme/theme-context";
+import { comparisonLegCurrencies, priceComparisonSeriesIds } from "../../../time-series/price-comparison";
+import { periodDayText } from "../../../market-data/market/period-return";
+import { companyLegendLabels } from "./legend-names";
 import { seriesMessageName, studyMessageName } from "../../../time-series/series-name";
 import { CHART_COMPOSER_PANE_ID } from "../../../types/config";
 import { useRemoteUiNode } from "../../../remote/semantic-tree";
@@ -111,12 +122,14 @@ import {
   type PairStudySelection,
 } from "./studies";
 import { buildEmptyChartPreset, buildPriceChartPreset } from "./presets";
-import type { ChartInteractionViewport } from "./chart-spec";
+import { comparisonPresetResolution, type ChartInteractionViewport } from "./chart-spec";
 import {
   CHART_FORMULA_OPTIONS,
   CHART_BAR_SIZE_PRESETS,
   CHART_RANGES as RANGES,
   CHART_RESOLUTIONS,
+  CHART_CANDLE_COLOURS_SETTING_KEY,
+  chartCandleColours,
   chartStudyOptionsFor,
   chartStudyPeriodTitle,
   chartStudySettingLabel,
@@ -136,7 +149,10 @@ import { alertInstrument, syncAlertQuoteStream } from "../alerts/live";
 import { getSharedMarketDataCoordinator } from "../../../market-data/coordinator";
 import { useOptionChartRange } from "./option-range";
 import { getActiveQuoteDisplay } from "../../../market-data/market/status";
-import { resolveEntryData } from "../../../market-data/selectors";
+import { buildQuoteKey, resolveEntryData } from "../../../market-data/selectors";
+import { useQuoteEntries } from "../../../market-data/hooks";
+import { usePlanAccess } from "../../../api-client/plan-access";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
 import { editPriceLevels, parsePriceLevels, PRICE_LEVELS_KEY, priceLevelTickerKey } from "./price-levels";
 import { canonicalExchange } from "../../../utils/exchanges";
 import { resolveInstrumentForPane } from "../../../core/state/app/instrument";
@@ -213,6 +229,8 @@ interface ChartComposerSurfaceProps {
   onCapture?: (capturing: boolean) => void;
   /** The legend names each series' company; a ticker's own research tab already does. */
   nameSeries?: boolean;
+  /** The footer's delayed clock; a ticker's research tab says it in its quote footer instead. */
+  delayFooter?: boolean;
 }
 
 const QUICK_ADD_CAPTURE = "quick-add";
@@ -252,14 +270,9 @@ function levelListing(spec: ChartSpec, series: readonly ResolvedSeries[]): {
   instrument: InstrumentRef;
   lastPrice: number | null;
 } | null {
-  const entry = spec.series.find((candidate) => (
-    candidate.visible !== false
-    && candidate.transform === "raw"
-    && candidate.source.kind === "security"
-    && (candidate.source.fieldId === "market.ohlcv" || candidate.source.fieldId === "market.close")
-  ));
+  const entry = rawPriceEntry(spec);
   const resolved = entry ? series.find((candidate) => candidate.id === entry.id) : undefined;
-  if (!entry || entry.source.kind !== "security" || !resolved) return null;
+  if (!entry || !resolved) return null;
   const exchange = resolved.timeBasis?.exchange || canonicalExchange(entry.source.instrument.exchange) || undefined;
   const last = resolved.points.findLast((point) => Number.isFinite(point.close ?? point.value));
   return {
@@ -302,6 +315,7 @@ function ChartComposerSurface({
   footerId,
   onCapture,
   nameSeries = true,
+  delayFooter = true,
 }: ChartComposerSurfaceProps) {
   const trade = useResearchTrading();
   const dialog = useDialog();
@@ -342,6 +356,14 @@ function ChartComposerSurface({
   // plausible time is dropped without pinning. This handle only sets the
   // pin; the chart it opens on is what shows and keeps it.
   const [pinnedMoment, setPinnedMoment] = usePaneSettingValue<unknown>(CHART_PINNED_MOMENT_SETTING_KEY, null);
+  const [candleColoursSetting] = usePaneSettingValue<unknown>(CHART_CANDLE_COLOURS_SETTING_KEY, null);
+  const gainColour = useThemeColors().positive;
+  // Rising candles in the gain colour; falling ones already take the loss colour.
+  const candleColour = useCallback((list: ResolvedSeries[]) => (
+    chartCandleColours(candleColoursSetting) === "change"
+      ? list.map((entry) => isOhlcSeriesStyle(entry.style) ? { ...entry, color: gainColour } : entry)
+      : list
+  ), [candleColoursSetting, gainColour]);
   const momentLink = useTabCursorLink(paneId ? `${paneId}:moment` : null, { viewer: false });
   useEffect(() => {
     if (pinnedMoment == null || !momentLink?.pin) return;
@@ -388,8 +410,10 @@ function ChartComposerSurface({
   });
   currentResolutionRef.current = resolution.resolution ?? currentResolutionRef.current;
   // Intervals only resample market series. Quarterly revenue or a P/E line
-  // looks the same at every interval, so such a chart offers AUTO alone.
-  const hasMarketSeries = spec.series.some((entry) => (
+  // looks the same at every interval, so such a chart offers AUTO alone. A bare
+  // symbol read as a FRED series (DFII10) counts as that series once it is read.
+  const chartedSeries = listings.pending ? spec.series : listings.spec.series;
+  const hasMarketSeries = chartedSeries.some((entry) => (
     entry.source.kind === "security" && isMarketFieldId(entry.source.fieldId)
   ));
   // Bars built from a future's clock-aligned bars must not straddle its session's open.
@@ -460,28 +484,45 @@ function ChartComposerSurface({
   const legendSeries = useMemo(() => {
     // Each security series names its company once, beside its label: "AAPL Price · Apple".
     const named = new Set<string>();
+    // A company drawn once falls back to its ticker and name ("8058 Mitsubishi") before the legend cuts either.
+    const seriesPerSymbol = new Map<string, number>();
+    for (const series of spec.series) {
+      if (series.source.kind !== "security") continue;
+      const symbol = series.source.instrument.symbol;
+      seriesPerSymbol.set(symbol, (seriesPerSymbol.get(symbol) ?? 0) + 1);
+    }
     const resolved = (resolution.legendSeries ?? []).map((entry) => {
       const authored = spec.series.find((series) => series.id === entry.id);
       if (authored?.source.kind === "security" && authored.source.fieldId.startsWith("valuation.")) {
         const field = getTimeSeriesField(authored.source.fieldId);
         return { ...entry, label: authored.label?.trim()
-          || `${authored.source.instrument.symbol} ${field?.shortLabel ?? "Multiple"}` };
+          || `${authored.source.instrument.symbol} ${field?.shortLabel ?? "Multiple"}`,
+          legendContext: authored.label?.trim() ? undefined : field?.shortLabel ?? "Multiple" };
       }
       const name = nameSeries ? listings.names.get(entry.id) : undefined;
       const company = name ? shortCompanyName(name) : "";
       if (!company || named.has(company)) return entry;
       named.add(company);
-      return { ...entry, label: `${entry.label} · ${company}` };
+      const symbol = authored?.source.kind === "security" ? authored.source.instrument.symbol : null;
+      return { ...entry, ...companyLegendLabels(entry.label, symbol, company, !!symbol && seriesPerSymbol.get(symbol) === 1) };
     });
-    const resolvedIds = new Set(resolved.map((entry) => entry.id));
+    // Returns compared across currencies, or converted into one, say each leg's currency beside its return.
+    const legCurrencies = comparisonLegCurrencies(resolved, resolution.priceComparison?.seriesIds, spec.viewport.currency);
+    const captioned = legCurrencies.size === 0 ? resolved : resolved.map((entry) => {
+      const currency = legCurrencies.get(entry.id);
+      return currency && !entry.statedUnit ? { ...entry, statedUnit: `in ${currency}` } : entry;
+    });
+    const resolvedIds = new Set(captioned.map((entry) => entry.id));
     const missing = spec.series.filter((entry) => !resolvedIds.has(entry.id));
-    if (missing.length === 0) return resolved;
+    if (missing.length === 0) return candleColour(captioned);
     const bySpecOrder = new Map(spec.series.map((entry, index) => [entry.id, index] as const));
-    return [
-      ...resolved,
+    return candleColour([
+      ...captioned,
       ...missing.map((entry): ResolvedSeries => ({
         id: entry.id,
         label: chartSeriesLabel(entry),
+        legendContext: entry.label?.trim() || entry.source.kind !== "security" ? undefined
+          : getTimeSeriesField(entry.source.fieldId)?.seriesLabel ?? getTimeSeriesField(entry.source.fieldId)?.shortLabel,
         color: entry.color ?? colors.textDim,
         unit: "",
         unitGroup: "unknown",
@@ -495,15 +536,15 @@ function ChartComposerSurface({
         hidden: true,
         points: [],
       })),
-    ].sort((a, b) => (bySpecOrder.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (bySpecOrder.get(b.id) ?? Number.MAX_SAFE_INTEGER));
-  }, [listings.names, nameSeries, resolution.legendSeries, spec.series]);
+    ].sort((a, b) => (bySpecOrder.get(a.id) ?? Number.MAX_SAFE_INTEGER) - (bySpecOrder.get(b.id) ?? Number.MAX_SAFE_INTEGER)));
+  }, [candleColour, listings.names, nameSeries, resolution.legendSeries, resolution.priceComparison?.seriesIds, spec.series, spec.viewport.currency]);
   const plottedSeries = useMemo(
-    () => projectVisibleChartSeries(
+    () => candleColour(projectVisibleChartSeries(
       spec,
       resolution.bufferedSeries ?? resolution.series,
       resolution.legendSeries,
-    ),
-    [resolution.bufferedSeries, resolution.legendSeries, resolution.series, spec],
+    )),
+    [candleColour, resolution.bufferedSeries, resolution.legendSeries, resolution.series, spec],
   );
   const { notify } = usePluginAppActions();
   const { runtime } = usePluginRenderContext();
@@ -590,6 +631,30 @@ function ChartComposerSurface({
       ...(alertsOn ? { action: { label: "alert", title: "Alert at Level", run: (level) => { void alertAtLevel(level.value); } } } : {}),
     };
   }, [alertAtLevel, alertsJson, alertsOn, editLevels, levelStore, listing, trade?.levels, trade?.contract]);
+  // A yen pair's chart marks Japan's interventions in it, from the Ministry of Finance's releases.
+  const [interventions, setInterventions] = useState<FxInterventionsPayload | null>(null);
+  const wantsInterventions = chartInterventionPair(spec) !== null;
+  useEffect(() => {
+    if (!wantsInterventions) return;
+    let live = true;
+    // The loader answers null when the record cannot be read; anything else is logged.
+    loadFxInterventions().then((payload) => { if (live) setInterventions(payload); },
+      logFailure("chart-composer.pane", "Showing yen interventions failed"));
+    return () => { live = false; };
+  }, [wantsInterventions]);
+  const chartSeries = resolution.bufferedSeries ?? resolution.series;
+  const interventionMarks = useMemo(
+    () => wantsInterventions ? chartInterventions(spec, chartSeries, interventions) : null,
+    [chartSeries, interventions, spec, wantsInterventions],
+  );
+  // A futures formula marks the days its legs roll, as `history` marks a front month's.
+  const chartEvents = useMemo(() => {
+    const rolls = formulaRollEvents(chartSeries);
+    if (rolls.length === 0) return interventionMarks;
+    const merge = (events: readonly CompositeChartEvent[]) => events.every(isRollEvent) ? ["Rolls"]
+      : events.some(isRollEvent) ? [] : interventionMarks?.merge(events) ?? [];
+    return { events: [...interventionMarks?.events ?? [], ...rolls], merge };
+  }, [chartSeries, interventionMarks]);
   const [interactionCaptured, setInteractionCapturedState] = useState(false);
   // Typing in quick-add must not freeze the plot: it only takes the keyboard.
   const [modalCaptured, setModalCaptured] = useState(false);
@@ -899,14 +964,18 @@ function ChartComposerSurface({
   /** The range the bar shows as selected; a fixed window or a period count leaves a range to pick. */
   const rangeReselects = !spec.viewport.dateWindow && spec.viewport.maxPoints === undefined;
   const setRange = useCallback((range: TimeRange) => {
+    const current = spec.viewport;
+    const changesSession = range === "1D" ? current.resolution === "1d"
+      : current.range === "1D" && current.resolution === "auto";
+    const resolution = changesSession && priceComparisonSeriesIds(spec) ? comparisonPresetResolution(range) : current.resolution;
     // The range already showing: a view moved off it goes back to it, as `0` does.
-    if (rangeReselects && range === spec.viewport.range) {
+    if (rangeReselects && range === current.range && resolution === current.resolution) {
       resetChartView();
       return;
     }
     setSpec({
       ...spec,
-      viewport: { ...spec.viewport, range, dateWindow: undefined, maxPoints: undefined },
+      viewport: { ...current, range, resolution, dateWindow: undefined, maxPoints: undefined },
     });
   }, [rangeReselects, resetChartView, setSpec, spec]);
   const setResolution = useCallback((next: ChartResolution) => {
@@ -1104,9 +1173,28 @@ function ChartComposerSurface({
     }
     return newest > end ? formatCompositeDatasetDate(new Date(newest), end) : null;
   }, [activeRuntimeViewport, plottedSeries, spec, viewport]);
+  // A series a failed refresh left on a saved copy says when that copy was saved, as every pane does.
+  const savedAt = resolution.savedAt;
+  // Signed out or free, a market series' latest bars are built from delayed quotes.
+  const marketInstruments = useMemo(() => (delayFooter ? spec.series.flatMap((entry) => (
+    entry.source.kind === "security" && isMarketFieldId(entry.source.fieldId) ? [entry.source.instrument] : []
+  )) : []), [delayFooter, spec.series]);
+  const marketQuotes = useQuoteEntries(marketInstruments);
+  // Signed out no stream feeds a chart's quotes: without Pro the chart reads them once to know which are late.
+  const { hasProAccess } = usePlanAccess();
+  const marketQuoteKey = marketInstruments.map(buildQuoteKey).join("\u001f");
+  useEffect(() => {
+    const coordinator = getSharedMarketDataCoordinator();
+    if (hasProAccess || !coordinator) return;
+    for (const instrument of marketInstruments) {
+      void coordinator.loadQuote(instrument).catch(logFailure("chart-composer.pane", "Loading a chart quote failed"));
+    }
+  }, [hasProAccess, marketQuoteKey]);
+  const quoteDelay = useQuoteDelayFooter(Array.from(marketQuotes.values(), resolveEntryData), "chart-delay");
   usePaneFooter(footerId, () => ({
     info: [
       ...(delistingKey ? [{ id: "delisted", parts: [{ text: delistingKey, tone: "warning" as const }] }] : []),
+      ...savedCopyFooterInfo([savedAt]),
       ...(loading
         ? [{ id: "loading", parts: [{ text: "loading", tone: "muted" as const }] }]
         : pickingAnchor
@@ -1114,6 +1202,7 @@ function ChartComposerSurface({
           : newestBeyondView
             ? [{ id: "newest", asOf: true, parts: [{ text: `newest ${newestBeyondView}`, tone: "muted" as const }] }]
             : []),
+      ...(quoteDelay ? [quoteDelay] : []),
     ],
     hints: [
       // One key opens the ticket, which chooses Buy or Sell; [s]eries keeps its key with trading on.
@@ -1124,7 +1213,7 @@ function ChartComposerSurface({
       { id: "resolution", key: "b", label: "ars", title: "Bar Size", onPress: footerResolution },
       ...(anchorable ? [{ id: "vwap-anchor", key: "v", label: "wap anchor", title: "Anchor VWAP", onPress: footerAnchor }] : []),
     ],
-  }), [delistingKey, loading, pickingAnchor, newestBeyondView, footerSeries, openIndicators, indicatorsDisabled, openFormulas, formulasDisabled, footerResolution, anchorable, footerAnchor, trade]);
+  }), [delistingKey, savedAt, loading, pickingAnchor, newestBeyondView, quoteDelay, footerSeries, openIndicators, indicatorsDisabled, openFormulas, formulasDisabled, footerResolution, anchorable, footerAnchor, trade]);
 
   // A fixed window (a GIP session) highlights no range, so the bar names it.
   const dateWindowLabel = useMemo(() => {
@@ -1134,8 +1223,14 @@ function ChartComposerSurface({
     const timeZone = exchange?.kind === "security"
       ? intradaySessionTimeZone(exchange.instrument.symbol, exchange.instrument.exchange)
       : "UTC";
-    return formatChartDateWindow(window, timeZone);
-  }, [spec.series, spec.viewport.dateWindow]);
+    const end = window.endAtLatestObservation && viewport?.end
+      ? /^\d{4}-\d{2}-\d{2}$/.test(window.end) ? viewport.end.toISOString().slice(0, 10) : viewport.end.toISOString()
+      : window.end;
+    return formatChartDateWindow({ ...window, end }, timeZone);
+  }, [spec.series, spec.viewport.dateWindow, viewport?.end]);
+  const comparisonEnd = resolution.resolution === "1d" ? Object.values(resolution.priceComparison?.legs ?? {})[0] : undefined;
+  const comparisonAsOf = comparisonEnd && `${periodDayText(comparisonEnd.endDay, new Date().getUTCFullYear())} ${comparisonEnd.intraday ? "partial" : "close"}`;
+  const captureDatesData = useCaptureDatesData();
 
   // A generic future (CL1) is a rolling series: its roll rule and adjustment are chart controls.
   const generic = useMemo(() => chartFuturesGeneric(spec), [spec]);
@@ -1190,6 +1285,22 @@ function ChartComposerSurface({
     }]
     : [];
 
+  // Returns of two or more prices compare as price returns; the toggle reinvests their cash distributions.
+  const totalReturnOn = spec.viewport.totalReturn === true;
+  const totalReturnFilters = totalReturnOn || priceComparisonSeriesIds(spec) !== null
+    ? [{
+      id: "total-return",
+      kind: "toggle" as const,
+      label: "Total return",
+      short: "Total ret",
+      value: totalReturnOn,
+      onChange: (value: boolean) => {
+        const { totalReturn: _previous, ...viewport } = specRef.current.viewport;
+        updateSpec({ ...specRef.current, viewport: value ? { ...viewport, totalReturn: true } : viewport });
+      },
+    }]
+    : [];
+
   // A company that reports no quarterly figures says so, and where its annual ones are.
   const unreported = resolution.legendSeries?.find((entry) => entry.unreportedPeriod && entry.points.length === 0);
   const emptyMessage = spec.series.length === 0
@@ -1216,13 +1327,16 @@ function ChartComposerSurface({
             onChange: (value: string) => setRange(value as TimeRange) },
           ...genericFilters,
           ...extendedHoursFilters,
+          ...totalReturnFilters,
         ]}
         view={resolutionOptions.length > 1 ? {
+          label: "Interval",
           value: spec.viewport.resolution,
           options: resolutionOptions,
           onChange: (value: string) => setResolution(value as ChartResolution),
         } : undefined}
-        meta={dateWindowLabel}
+        asOf={comparisonAsOf}
+        meta={[dateWindowLabel, captureDatesData && comparisonAsOf].filter(Boolean).join(" · ") || undefined}
       />
       <MultiSelectDialogButton
         ref={indicatorsDialogRef}
@@ -1286,6 +1400,8 @@ function ChartComposerSurface({
           timePick={timePick}
           pricePick={pricePick}
           levels={chartLevels}
+          events={chartEvents?.events}
+          mergeEventCaptions={chartEvents?.merge}
           rangeStatisticsSeriesId={rangeStatisticsSeriesId}
           emptyMessage={emptyMessage}
           emptyDetail={emptyDetail}
@@ -1294,7 +1410,7 @@ function ChartComposerSurface({
               spec={spec}
               setSpec={setSpec}
               focused={focused}
-              width={Math.max(8, Math.min(36, width - 1))}
+              width={Math.max(8, width - 1)}
               height={height}
               shortcutEnabled={surfaceInteractive}
               shortcutBlocked={dialogOpen}
@@ -1389,7 +1505,7 @@ export function ChartComposerPane({ paneId, focused, width, height }: PaneProps)
     if (!leveragePending) return;
     const mounted = new AbortController();
     // The chart draws meanwhile, so it can wait longer for them than a report does.
-    void loadDailyObjectives(comparedFundTickers(storedRef.current),
+    loadDailyObjectives(comparedFundTickers(storedRef.current),
       async (ticker, signal) => (await loadFundFacts(ticker, false, { signal })).payload,
       { timeoutMs: LEVERAGE_FACTS_PANE_TIMEOUT_MS, signal: mounted.signal })
       .then((objectives) => {
@@ -1398,7 +1514,9 @@ export function ChartComposerPane({ paneId, focused, width, height }: PaneProps)
           [CHART_SPEC_SETTING_KEY]: withLeverageOverlay(storedRef.current, objectives),
           [CHART_LEVERAGE_PENDING_SETTING_KEY]: undefined,
         });
-      });
+      })
+      // The chart stays without the objectives, and asks again when it is next opened.
+      .catch(logFailure("chart-composer.pane", "Adding leveraged fund objectives failed"));
     return () => mounted.abort();
   }, [leveragePending, updateSettings]);
   if (follows && !target && ownedIds.length > 0) {
@@ -1443,6 +1561,7 @@ export function ChartComposerResearchTab({ focused, width, height, onCapture }: 
       footerId="chart-composer:research"
       onCapture={onCapture}
       nameSeries={false}
+      delayFooter={false}
     />
   );
 }

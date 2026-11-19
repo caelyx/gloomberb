@@ -2,8 +2,10 @@ import type { ScreenerQuote } from "../../../api-client/market-discovery";
 export type { ScreenerQuote } from "../../../api-client/market-discovery";
 import { resolveCurrencyUnit } from "../../../utils/currency-units";
 import { logFailure } from "../../../utils/log-failure";
+import { savedCopyMark, servedFromSavedCopy } from "../../../data/saved-copies";
 import type { PluginPersistence } from "../../../types/plugin";
 import { apiClient } from "../../../api-client";
+import { isTransientFailure, sourceDidNotAnswer } from "../../../api-client/errors";
 import type {
   CloudMarketResponse,
   CloudMarketScreenerCategory,
@@ -68,7 +70,7 @@ function shouldUseCache(api: MarketScreenerApi, options?: FetchCacheOptions): bo
   return options?.cache === true || (options?.cache !== false && api === screenerApi);
 }
 
-function readCache<T>(key: string, options?: { allowExpired?: boolean }): { data: T; stale: boolean } | null {
+function readCache<T>(key: string, options?: { allowExpired?: boolean }): { data: T; stale: boolean; fetchedAt: number; asOf?: number } | null {
   const record = marketMoversPersistence?.getResource<CachedResult<T>>(CACHE_KIND, key, {
     sourceKey: CACHE_SOURCE,
     schemaVersion: CACHE_SCHEMA_VERSION,
@@ -79,6 +81,8 @@ function readCache<T>(key: string, options?: { allowExpired?: boolean }): { data
   return {
     data: record.value.data,
     stale: record.value.stale || !!record.stale || failedFetches.has(key),
+    fetchedAt: record.fetchedAt,
+    ...(Number.isFinite(record.value.asOf) ? { asOf: record.value.asOf } : {}),
   };
 }
 
@@ -94,6 +98,10 @@ function writeCache<T>(key: string, data: T): void {
 export interface CachedResult<T> {
   data: T;
   stale: boolean;
+  /** Its refresh failed and the copy saved at this time (ms) answered instead. */
+  savedAt?: number;
+  /** When the list itself is current at (ms), as the service dates it: a delayed list's time, not its rows'. */
+  asOf?: number;
 }
 
 async function loadCached<T>(
@@ -104,7 +112,7 @@ async function loadCached<T>(
   if (options?.cache === false) return fetcher();
 
   const cached = readCache<T>(key);
-  if (!options?.forceRefresh && cached && !cached.stale) return { data: cached.data, stale: false };
+  if (!options?.forceRefresh && cached && !cached.stale) return { data: cached.data, stale: false, ...(cached.asOf != null ? { asOf: cached.asOf } : {}) };
 
   const activeFetch = activeFetches.get(key) as Promise<CachedResult<T>> | undefined;
   if (activeFetch) return activeFetch;
@@ -117,10 +125,13 @@ async function loadCached<T>(
       return result;
     })
     .catch((error) => {
-      // Serving the expired copy is right; hiding that it is expired is not.
-      if (fallback) {
-        failedFetches.add(key);
-        return { data: fallback.data, stale: true };
+      // The next read asks again rather than read the saved copy as current.
+      if (fallback) failedFetches.add(key);
+      // Serving the expired copy is right for a failure asking again may get past; hiding that it is
+      // expired is not. A command that shows it ends with when the copy was saved. A refusal or a
+      // reply that fails validation is the error, saved copy or not.
+      if (fallback && isTransientFailure(error)) {
+        return servedFromSavedCopy({ data: fallback.data, stale: true, savedAt: fallback.fetchedAt, ...(fallback.asOf != null ? { asOf: fallback.asOf } : {}) }, fallback.fetchedAt);
       }
       throw error;
     })
@@ -143,6 +154,14 @@ export interface MarketMoversResult {
   quotes: ScreenerQuote[];
   source: MarketMoversDataSource;
   stale: boolean;
+  /** Its refresh failed and the list saved at this time (ms) answered instead. */
+  savedAt?: number;
+  /**
+   * When the list is current at (ms), as the service dates it: what a
+   * footer shows, never a row's own time (a Most Active row read from the
+   * day's stored snapshot can be dated midnight).
+   */
+  asOf?: number;
 }
 
 export interface PreferredMarketMoverSources {
@@ -220,6 +239,17 @@ function parseScreenerSessions(row: Record<string, unknown>): CloudMoverSessionF
   return sessions;
 }
 
+/** A positive float with its state, or nothing: a row without one fails any minimum. */
+function floatOf(source: { floatShares?: unknown; floatSharesState?: unknown; floatSharesReason?: unknown } | null | undefined): Pick<ScreenerQuote, "floatShares" | "floatSharesState" | "floatSharesReason"> {
+  const shares = screenerNumber(source?.floatShares);
+  if (shares == null || !(shares > 0)) return {};
+  return {
+    floatShares: shares,
+    ...(source?.floatSharesState === "partial" ? { floatSharesState: "partial" as const } : {}),
+    ...(source?.floatSharesState === "partial" && typeof source.floatSharesReason === "string" ? { floatSharesReason: source.floatSharesReason } : {}),
+  };
+}
+
 /** Validate numeric fields at the API boundary so absent values stay unavailable. */
 export function parseScreenerResponse(data: unknown): ScreenerQuote[] {
   if (!data || typeof data !== "object" || !("quotes" in data) || !Array.isArray(data.quotes)) {
@@ -239,6 +269,7 @@ export function parseScreenerResponse(data: unknown): ScreenerQuote[] {
       previousClose: screenerNumber(q.previousClose) ?? undefined, exchange: typeof q.exchange === "string" ? q.exchange : "",
       lastUpdated: typeof q.lastUpdated === "number" && Number.isFinite(q.lastUpdated) && q.lastUpdated > 0 ? q.lastUpdated : undefined,
       sessions: parseScreenerSessions(q),
+      ...floatOf(q),
     }];
   });
 }
@@ -253,8 +284,12 @@ export async function fetchScreenerResult(
   const session = category === "most_actives" ? undefined : options?.session;
   const load = async () => {
     const response = await api.getMarketMovers(category, count, options?.forceRefresh, session);
+    // The service's own source did not answer this time: a saved list answers, as it does a 5xx.
+    if (!response.data && response.status === "retryable_error") throw sourceDidNotAnswer("Market movers temporarily unavailable");
     if (!response.data) throw new Error("Invalid market movers response");
-    return { data: parseScreenerResponse(response.data), stale: response.stale === true || response.data.stale === true };
+    const asOf = Date.parse(response.data.asOf);
+    return { data: parseScreenerResponse(response.data), stale: response.stale === true || response.data.stale === true,
+      ...(Number.isFinite(asOf) ? { asOf } : {}) };
   };
   if (!shouldUseCache(api, options)) return load();
   return loadCached(`screener:${category}:count=${count}${session ? `:session=${session}` : ""}`, load, options);
@@ -315,7 +350,8 @@ function mergeCloudScreenerItem(
     volume: screenerVolume(item.volume),
     avgVolume,
     volumeRatio: screenerVolumeRatio(screenerVolume(item.volume), avgVolume),
-    marketCap: metadata?.marketCap,
+    // The live list's own size, else the delayed list's: before the open that list can be short.
+    marketCap: screenerVolume(item.marketCap) ?? metadata?.marketCap,
     currency,
     fiftyTwoWeekHigh: screenerNumber(item.high52w) ?? metadataPrice(metadata?.fiftyTwoWeekHigh),
     fiftyTwoWeekLow: screenerNumber(item.low52w) ?? metadataPrice(metadata?.fiftyTwoWeekLow),
@@ -325,6 +361,8 @@ function mergeCloudScreenerItem(
     lastUpdated: item.lastUpdated,
     previousClose: screenerNumber(item.previousClose) ?? undefined,
     sessions: parseScreenerSessions(item as unknown as Record<string, unknown>),
+    // The live list's own float, the delayed list's when it sends none, each with its own state.
+    ...floatOf(item.floatShares != null ? item : metadata),
   };
 }
 
@@ -375,7 +413,14 @@ export async function fetchPreferredMarketMovers(
   const eligibility = sources.isCloudEligible();
   if (!(typeof eligibility === "boolean" ? eligibility : await eligibility)) {
     const result = await sources.fetchMarket(category, count, options);
-    return { quotes: rankScreenerQuotes(category, result.data), source: "gloom", stale: result.stale };
+    return {
+      ...savedCopyMark(result),
+      quotes: rankScreenerQuotes(category, result.data),
+      source: "gloom",
+      stale: result.stale,
+      ...(result.savedAt != null ? { savedAt: result.savedAt } : {}),
+      ...(result.asOf != null ? { asOf: result.asOf } : {}),
+    };
   }
 
   const marketMetadata = sources.fetchMarket(
@@ -403,6 +448,7 @@ export async function fetchPreferredMarketMovers(
         ))),
         source: "cloud",
         stale: response.stale === true || response.data.stale === true,
+        ...(Number.isFinite(Date.parse(response.data.asOf)) ? { asOf: Date.parse(response.data.asOf) } : {}),
       };
     }
   } catch (error) {
@@ -411,9 +457,12 @@ export async function fetchPreferredMarketMovers(
 
   const fallback = await marketMetadata;
   return {
+    ...savedCopyMark(fallback),
     quotes: rankScreenerQuotes(category, fallback.data),
     source: "gloom",
     stale: fallback.stale,
+    ...(fallback.savedAt != null ? { savedAt: fallback.savedAt } : {}),
+    ...(fallback.asOf != null ? { asOf: fallback.asOf } : {}),
   };
 }
 
@@ -430,6 +479,7 @@ export async function fetchTrendingResult(
   const load = async () => {
     const response = await (api.getMarketTrending ?? apiClient.getMarketTrending)(count);
     if (response.status === "empty") return { data: [], stale: response.stale === true };
+    if (!response.data && response.status === "retryable_error") throw sourceDidNotAnswer("Market trends temporarily unavailable");
     if (!response.data) throw new Error("Market trends unavailable");
     return { data: parseTrendingResponse(response.data), stale: response.stale === true };
   };

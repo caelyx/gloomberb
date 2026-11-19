@@ -5,6 +5,8 @@ import { backendRequest } from "./backend-rpc";
 import { NATIVE_CONTEXT_MENU_SUPPORTED, showDesktopContextMenu } from "./host/native";
 import { startElectrobunWindowDrag } from "./host/window-move";
 import { createDomUiHost } from "../../dom/dom-ui-host";
+import { detectPlatform } from "../../../utils/platform";
+import { logFailure } from "../../../utils/log-failure";
 
 export function createWebUiHost(desktopPlatform?: string): UiHost {
   return createDomUiHost(desktopPlatform, {
@@ -24,13 +26,34 @@ export const webRendererHost: RendererHost = {
       void backendRequest("host.exit").catch(() => window.close());
     });
   },
-  startWindowDrag() {
+  startWindowDrag(press) {
+    // Windows moves the window itself, as it does from a native title bar, and
+    // a double-click there maximizes or restores it.
+    if (detectPlatform() === "win32") {
+      if (press?.detail === 2) {
+        void backendRequest("host.windowControl", { action: "toggle-maximize" }).catch((error: unknown) => {
+          console.error("[desktop] could not maximize the window", error instanceof Error ? error.message : String(error));
+        });
+        return;
+      }
+      void backendRequest("host.startWindowDrag").catch((error: unknown) => {
+        console.error("[desktop] could not start moving the window", error instanceof Error ? error.message : String(error));
+      });
+      return;
+    }
     startElectrobunWindowDrag();
   },
   async controlWindow(action) {
     // Closing the main window quits the app; send what was counted first.
     if (action === "close") await flushUsageCounts({ timeoutMs: 1_000 });
     await backendRequest("host.windowControl", { action });
+  },
+  startWindowResize(edge) {
+    // Windows resizes the window itself, as it does from a native frame's edge.
+    if (detectPlatform() !== "win32") return;
+    void backendRequest("host.startWindowResize", { edge }).catch((error: unknown) => {
+      console.error("[desktop] could not start resizing the window", error instanceof Error ? error.message : String(error));
+    });
   },
   async openExternal(url) {
     return await backendRequest("host.openExternal", { url });
@@ -54,7 +77,7 @@ export const webRendererHost: RendererHost = {
         return;
       }
     } catch {
-      // Fall through to the native Electrobun clipboard bridge.
+      // Intentional ignore: the native Electrobun clipboard bridge below copies the image instead.
     }
     await backendRequest("host.copyPngImage", { pngBase64 });
   },
@@ -74,7 +97,7 @@ export const webRendererHost: RendererHost = {
       body: notification.body,
       subtitle: notification.subtitle,
       sound: notification.sound,
-    }).catch(() => {});
+    }).catch(logFailure("desktop-host", "Could not show a notification"));
   },
   showContextMenu: showDesktopContextMenu,
 };

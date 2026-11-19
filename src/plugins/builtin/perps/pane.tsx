@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { Fragment, useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { isAccessDenied } from "../../../api-client/errors";
 import { usePlanAccess } from "../../../api-client/plan-access";
@@ -5,13 +6,10 @@ import type { PerpBoardRow, PerpMarketPayload } from "../../../api-client/perps"
 import { buildSectionedRows, ChartTableHeader, DataTableView, EmptyState, KeyValueRow, SectionHeading, PaneStatusBody, QueryBar, StatGrid, useChartTableSelection,
   usePaneNoticeFooter, usePaneStatusFooter, usePaneTabs, useQueryBarSearch, type DataTableCell, type KeyValueRowProps, type PaneFooterSegment, type PaneHint, type SectionedRow,
   type StatItem } from "../../../components";
-import { deriveHeadlessFreshness, paneStatusLineVariants } from "../../../cli/pane-functions/freshness";
 import { openFormModal } from "../../../components/form-modal";
 import { tf } from "../../../i18n";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { useAsyncResource, useAutoRefresh, usePaneSettingValue, usePaneTitle, usePluginAppActions, usePluginPaneState } from "../../../public/react";
-import { useAgeClock } from "../../../react/auto-refresh";
-import { useRemoteUiNode } from "../../../remote/semantic-tree";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
 import { Box, ScrollBox, useRendererHost, useUiCapabilities } from "../../../ui";
@@ -25,10 +23,12 @@ import { isCloudSessionRequired, useResearchCloudSession } from "../shared/resea
 import { boardSearchText, cachedPerpSelection, cachedPerpsBoard, cachedPerpsCompare, cachedPerpsRankings, loadPerpSelection, loadPerpsBoard, loadPerpsCompare,
   loadPerpsHistoryForRange, loadPerpsRankings } from "./client";
 import { perpFreshness } from "./freshness";
+import { Depth, Liquidations } from "./cascade-tabs";
+import { useFreshnessStatusLine } from "./status-line";
 import { useLivePerpRows, useLivePerpTableRows } from "./live-rows";
 import { aprFormula, ASSET_FILTERS, BOARD_SORTS, boardColumns, collectedVenueCount, compact, compareColumns, dayChange, fundingInterval, fundingSpread, historyCaption, historyCell, historyChange, historyColumns,
-  HISTORY_METRICS, historyRows, historySeries, historyValue, inPoints, isMarketTab, label, longShortReason, marketLabel, metricLabel, openingTab, perpCell, perpHistoryProText, PERP_TABS, percent,
-  positioningFields, price, rankingColumns, rankingRows, RANKINGS, ratioText, share, sortLabel, time, underlyingTicker, venueLabel, venueName, venuesOf, type HistoryMetric,
+  HISTORY_METRICS, historyRows, historySeries, historyValue, inPoints, isAssetTab, isMarketTab, label, longShortReason, marketLabel, metricLabel, openingTab, perpCell, perpHistoryProText, PERP_TABS, percent,
+  positioningFields, price, rankingColumns, rankingRows, RANKINGS, ratioText, share, sortLabel, time, underlyingTicker, venueAprSummary, venueLabel, venueName, venuesOf, type HistoryMetric,
   type PerpColumnId, type PerpTab, type RankingKey } from "./model";
 
 const NO_ROWS: readonly PerpBoardRow[] = [];
@@ -45,26 +45,19 @@ const withRankedRow = (entry: SectionedRow<Ranked>, row: PerpBoardRow): Sectione
  * same way.
  */
 function usePerpStatusLine(rows: readonly PerpBoardRow[], funding: readonly PerpBoardRow[], since: number | null, live = false): PaneFooterSegment[] {
-  const now = useAgeClock(since);
-  const declared = useMemo(() => rows.length ? perpFreshness(rows, { funding, now, live }) : null, [rows, funding, now, live]);
-  useRemoteUiNode(declared ? { role: "report-freshness", label: "Venue freshness", getMetadata: () => ({ ...declared }) } : null);
-  return useMemo(() => {
-    if (!declared) return [];
-    const freshness = deriveHeadlessFreshness({ shape: "rows" }, { rows: [], freshness: declared }, now);
-    const tone = freshness.status === "stale" ? "warning" as const : "muted" as const;
-    // A footer too narrow beside its keys gives up the funding part before any venue's time.
-    const [line, ...shorter] = paneStatusLineVariants(freshness).map((text) => [{ text, tone }]);
-    return [{ id: "perp-freshness", asOf: true, parts: line!, variants: shorter }];
-  }, [declared, rows, now]);
+  const declare = useCallback((now: number) => rows.length ? perpFreshness(rows, { funding, now, live }) : null, [rows, funding, live]);
+  return useFreshnessStatusLine(declare, since);
 }
 
 type EvidenceField = [label: string, value: string, detail?: string, link?: KeyValueRowProps["link"]];
 
-function MarketEvidence({ row, data, width, height }: { row: PerpBoardRow; data: PerpMarketPayload; width: number; height: number }) {
+function MarketEvidence({ row, data, width, height }: { row: PerpBoardRow; data: PerpMarketPayload & { venues?: PerpBoardRow[] }; width: number; height: number }) {
   const desktop = !!useUiCapabilities().nativePaneChrome;
   const upgrade = useCloudUpgradeAction("perp");
   const openDescription = useOpenDescription();
   const positioning = positioningFields(row);
+  // The asset's funding on every venue, beside this contract's own.
+  const acrossVenues = venueAprSummary(data.venues ?? []);
   // The security the premium is measured against opens its DES, as the `d` key does.
   const security = underlyingTicker(row);
   const listed: EvidenceField[] = security && row.underlying ? [["Ticker", row.underlying.symbol, row.underlying.listingExchange,
@@ -72,17 +65,20 @@ function MarketEvidence({ row, data, width, height }: { row: PerpBoardRow; data:
   // Grouped as a trader reads a contract; a stock reference only for a market that has one.
   const groups: Array<[string, EvidenceField[]]> = [
     ["Market", [["Venue", venueLabel(row)], ["Contract symbol", row.symbol], ["Observed", time(row.observedAt)], ["Source as of", time(row.sourceAsOf)],
+      // Where the figures were read; `o` opens it.
+      ["Source", row.sourceUrl],
       ["Mark", `${price(row.markPrice)} ${row.quoteCurrency}`], ["Oracle", `${price(row.oraclePrice)} ${row.quoteCurrency}`], ["Premium vs oracle", percent(row.premium)]]],
     ["Funding", [["Funding", `${percent(row.fundingRate, 5)} / ${fundingInterval(row)}`, row.fundingKind === "last-paid" ? "Last paid" : row.fundingKind === "continuous" ? "Continuous rate" : "Current rate"],
       ["Funding 8h / APR", `${percent(row.fundingRate8h, 4)} / ${percent(row.fundingApr, 2)}`, row.fundingIntervalHours ? `APR = current ${aprFormula(row.fundingIntervalHours)}` : undefined],
-      ...(row.predictedFundingRate != null ? [["Predicted funding", `${percent(row.predictedFundingRate)} / ${row.predictedFundingIntervalHours ?? "--"}h`] as [string, string]] : []),
-      ...(row.nextFundingAt ? [["Next funding", time(row.nextFundingAt)] as [string, string]] : [])]],
+      ...(row.predictedFundingRate != null ? [["Predicted funding", `${percent(row.predictedFundingRate)} / ${row.predictedFundingIntervalHours ?? MISSING_VALUE}h`] as [string, string]] : []),
+      ...(row.nextFundingAt ? [["Next funding", time(row.nextFundingAt)] as [string, string]] : []),
+      ...(acrossVenues ? [["APR across venues", acrossVenues.text] as [string, string]] : [])]],
     ["Open Interest", [["Open interest", `${compact(row.openInterestBase)} ${row.baseAsset} · ${compact(row.openInterestUsd)} USD`],
       ["OI change 1h / 24h", row.oiChange1h == null && row.oiChange24h == null ? "Collecting" : `${percent(row.oiChange1h, 2)} / ${percent(row.oiChange24h, 2)}`, "own snapshots"]]],
     ...(positioning ? [["Positioning", positioning.map((field) => [field.label, field.text, field.detail])] as [string, EvidenceField[]]] : []),
     ...(row.underlying ? [["Underlying", [...listed, ["Underlying last", `${price(row.underlying.price)} ${row.underlying.currency}`, time(row.underlying.asOf)], ["Underlying session", row.underlying.marketState ?? "Unknown"],
       ["Premium vs underlying", percent(row.underlyingPremium)], ["Closed-market premium", percent(row.closedMarketPremium)]]] as [string, EvidenceField[]]] : []),
-    ["Contract", [["Contract", `${label(row.contractType)} · ${row.priceMultiplier}× price`], ["Margin", row.marginCurrency], ["Max leverage", row.maxLeverage == null ? "--" : `${row.maxLeverage}×`],
+    ["Contract", [["Contract", `${label(row.contractType)} · ${row.priceMultiplier}× price`], ["Margin", row.marginCurrency], ["Max leverage", row.maxLeverage == null ? MISSING_VALUE : `${row.maxLeverage}×`],
       ["Margin mode", row.isolatedOnly === null ? "Unspecified" : row.isolatedOnly ? "Isolated only" : "Cross / isolated"], ["Listing", row.delisted ? "Delisted" : "Active"], ["Confidence", label(row.confidence)]]],
   ];
   // The ticker's link is not listed in the pane menu again: `d` there opens the same DES.
@@ -111,8 +107,9 @@ function MarketEvidence({ row, data, width, height }: { row: PerpBoardRow; data:
   </ScrollBox>;
 }
 
-function History({ market, live = false, venues, accessKey, width, height, focused, range, metric, refreshMarket }: {
-  market: PerpBoardRow; live?: boolean; venues: number | null; accessKey: string; width: number; height: number; focused: boolean; range: string; metric: HistoryMetric; refreshMarket: () => void;
+function History({ market, live = false, venues, venueApr, accessKey, width, height, focused, range, metric, refreshMarket }: {
+  market: PerpBoardRow; live?: boolean; venues: number | null; venueApr: ReturnType<typeof venueAprSummary>; accessKey: string; width: number; height: number; focused: boolean;
+  range: string; metric: HistoryMetric; refreshMarket: () => void;
 }) {
   const colors = useThemeColors();
   const loader = useCallback((force: boolean) => loadPerpsHistoryForRange(market.marketId, Number(range), accessKey, force), [market.marketId, range, accessKey]);
@@ -128,7 +125,7 @@ function History({ market, live = false, venues, accessKey, width, height, focus
   const series = useMemo(() => historySeries(data, metric, seriesName, colors.warning), [data, metric, seriesName, colors.warning]);
   const upgrade = useCloudUpgradeAction("perp");
   useAutoRefresh(resource.updatedAt, resource.load, { intervalMs: 60_000 });
-  usePaneRefreshKey(() => { refreshMarket(); void resource.reload(); }, { focused });
+  usePaneRefreshKey(() => { refreshMarket(); resource.reload(); }, { focused });
   const lastTime = rows.at(-1)?.time;
   // The market row dates the figures beside the series. Its funding is the current estimate, unless the series is paid funding.
   const marketRows = useMemo(() => [market], [market]);
@@ -142,7 +139,13 @@ function History({ market, live = false, venues, accessKey, width, height, focus
   // Long/short: the latest reading stays free on the row; history adds its ratio and the day's move once it reaches back a day.
   const reading = market.longShortRatio ?? null;
   const day = metric === "long-short" ? dayChange(rows) : null;
-  // The same four figures on every series: the series itself, its move over the range, and the market around it.
+  // The asset's funding on every venue, as Evidence lists it: the range, with the OI-weighted APR and any stale venue left out.
+  const acrossVenues: StatItem | null = venueApr?.low != null && venueApr.high != null ? { id: "venues", label: `APR across ${venueApr.venues} venues`,
+    value: `${percent(venueApr.low, 1)} to ${percent(venueApr.high, 1)}`,
+    detail: [venueApr.oiWeighted != null ? `OI-weighted ${percent(venueApr.oiWeighted, 1)}` : null, venueApr.stale ? `${venueApr.stale} stale left out` : null]
+      .filter(Boolean).join(" · ") || undefined } : null;
+  // The same four figures on every series: the series itself, its move over the range, and the market around it (its funding
+  // across venues before its mark).
   const figures: StatItem[] = [
     { id: "latest", label: metric === "funding" ? "Funding / 8h" : metric === "oi" ? "Open interest USD" : metric === "premium" ? "Oracle premium" : metric === "long-short" ? "Long accounts" : `Price ${market.quoteCurrency}`,
       value: rows.length ? historyValue(rows.at(-1)?.value, metric) : metric === "funding" ? percent(market.fundingRate8h, 4) : metric === "oi" ? compact(market.openInterestUsd)
@@ -153,7 +156,8 @@ function History({ market, live = false, venues, accessKey, width, height, focus
     ...(day !== null ? [{ id: "day", label: "24h change", value: historyChange(day, metric), color: tone(day) }] : []),
     // On a one-day range the day's move already says it.
     ...(periodChange !== null && !(day !== null && range === "1") ? [{ id: "change", label: `${range}D change`, value: historyChange(periodChange, metric), color: tone(periodChange) }] : []),
-    ...(metric !== "price" ? [{ id: "mark", label: `Mark ${market.quoteCurrency}`, value: price(market.markPrice) }] : []),
+    ...(acrossVenues ? [acrossVenues] : []),
+    ...(metric === "oi" || metric !== "price" && !acrossVenues ? [{ id: "mark", label: `Mark ${market.quoteCurrency}`, value: price(market.markPrice) }] : []),
     ...(metric !== "oi" ? [{ id: "oi", label: "Open interest USD", value: compact(market.openInterestUsd) }] : []),
   ].slice(0, 4);
   // A series with one basis says it in the legend; the column only appears when the basis changes along the range.
@@ -238,7 +242,7 @@ function Board({ accessKey, width, height, focused, onPick, onOpen }: ListTabPro
   const columns = useMemo(() => boardColumns(width), [width]);
   const locked = typeof data?.locked === "number" ? data.locked : 0;
   useAutoRefresh(resource.updatedAt, resource.load, { intervalMs: 60_000 });
-  usePaneRefreshKey(() => { void resource.reload(); }, { focused: focused && !querySearch.active });
+  usePaneRefreshKey(() => { resource.reload(); }, { focused: focused && !querySearch.active });
   const line = usePerpStatusLine(stream.shown, stream.shown, resource.updatedAt, stream.live);
   usePaneStatusFooter({ registrationId: "perps:board", loading: resource.loading, error: data ? resource.error : null, stale: resource.data?.stale, info: line });
   usePaneNoticeFooter({ registrationId: "perps:board-notice", focused, notices: resource.data?.refreshError ? [resource.data.refreshError] : [] });
@@ -274,8 +278,11 @@ function Rankings({ accessKey, width, height, focused, onPick, onOpen }: ListTab
   const upgrade = useCloudUpgradeAction("perp");
   const session = useResearchCloudSession();
   const [selectedId, setSelected] = usePluginPaneState<string | null>("perps:rank-selected", null);
-  const loader = useCallback((force: boolean) => loadPerpsRankings(accessKey, force), [accessKey]);
-  const resource = useAsyncResource(loader, { initialData: () => cachedPerpsRankings(accessKey), clearOnError: isAccessDenied });
+  // The board's asset class: a class picked on either tab ranks and lists the same markets.
+  const [openingAsset] = usePaneSettingValue("assetClass", "all");
+  const [asset, setAsset] = usePluginPaneState<string>("perps:asset", openingAsset);
+  const loader = useCallback((force: boolean) => loadPerpsRankings(accessKey, force, asset), [accessKey, asset]);
+  const resource = useAsyncResource(loader, { initialData: () => cachedPerpsRankings(accessKey, asset), clearOnError: isAccessDenied, keepPreviousData: true });
   const data = resource.data?.payload;
   const fetchedItems = useMemo(() => buildSectionedRows(RANKINGS.map((ranking) => ({ label: ranking.label, emptyLabel: "None",
     items: rankingRows(data, ranking.key).map((row): Ranked => ({ list: ranking.key, row })) })), rankedKey), [data]);
@@ -287,7 +294,7 @@ function Rankings({ accessKey, width, height, focused, onPick, onOpen }: ListTab
   useEffect(() => { onPick(selected?.row ?? null); }, [selected, onPick]);
   const columns = useMemo(() => rankingColumns(width), [width]);
   useAutoRefresh(resource.updatedAt, resource.load, { intervalMs: 60_000 });
-  usePaneRefreshKey(() => { void resource.reload(); }, { focused });
+  usePaneRefreshKey(() => { resource.reload(); }, { focused });
   // The ranked rows on screen are dated; only the funding lists show funding.
   const shownRanked = useMemo(() => stream.shown.flatMap((entry) => entry.kind === "item" ? [entry.item] : []), [stream.shown]);
   const rankedRows = useMemo(() => shownRanked.map((item) => item.row), [shownRanked]);
@@ -305,8 +312,10 @@ function Rankings({ accessKey, width, height, focused, onPick, onOpen }: ListTab
     const value = row[ranking.field];
     return { text: percent(value, ranking.digits), value: value == null ? null : value * 100, color: value == null || value === 0 ? colors.textMuted : value > 0 ? colors.positive : colors.negative };
   };
+  const queryBar = <QueryBar width={width} filters={[{ id: "asset", label: "Asset", value: asset, defaultValue: "all", options: ASSET_FILTERS.map((value) => ({ value, label: label(value) })),
+    onChange: (value: string) => { setAsset(value); setSelected(null); } }]} />;
   return <PaneStatusBody loading={!data && resource.loading} error={!data ? resource.error : null} subject="perpetual rankings">
-    <DataTableView<SectionedRow<Ranked>> columns={columns} items={items} focused={focused} rootWidth={width} rootHeight={height}
+    <DataTableView<SectionedRow<Ranked>> columns={columns} items={items} focused={focused} rootWidth={width} rootHeight={height} rootBefore={queryBar}
       getItemKey={(entry) => entry.key} sortColumnId={null} sortDirection="desc" isNavigable={(entry) => entry.kind === "item"} onVisibleRangeChange={stream.onVisibleRangeChange}
       renderSectionHeader={(entry) => entry.kind === "section" ? { text: entry.label } : null}
       selection={{ kind: "id", selectedId: selected ? rankedKey(selected) : null, getId: (entry) => entry.key, onChange: (id) => { if (ranked.some((item) => rankedKey(item) === id)) setSelected(id); } }}
@@ -337,7 +346,7 @@ function Compare({ asset, onAssetChange, accessKey, width, height, focused, onPi
   const spread = useMemo(() => fundingSpread(rows), [rows]);
   const locked = typeof data?.locked === "number" ? data.locked : 0;
   useAutoRefresh(resource.updatedAt, resource.load, { intervalMs: 60_000 });
-  usePaneRefreshKey(() => { void resource.reload(); }, { focused: focused && !querySearch.active });
+  usePaneRefreshKey(() => { resource.reload(); }, { focused: focused && !querySearch.active });
   usePaneStatusFooter({ registrationId: "perps:compare", loading: resource.loading, error: data ? resource.error : null, stale: resource.data?.stale, info: line });
   usePaneNoticeFooter({ registrationId: "perps:compare-notice", focused, notices: resource.data?.refreshError ? [resource.data.refreshError] : [] });
   if (!data && isCloudSessionRequired(resource.error)) return <SignInWall placement="perps-signin" action="compare perpetual venues" needsVerification={session.needsVerification} />;
@@ -378,11 +387,12 @@ export function PerpsPane({ width, height, focused, marketAction }: Pick<PanePro
   const openDescription = useOpenDescription();
   const upgrade = useCloudUpgradeAction("perp");
   const [openingMarket] = usePaneSettingValue("market", "");
-  const [openingTabValue] = usePaneSettingValue("tab", openingTab(openingMarket));
+  const opening = openingTab(openingMarket, access.hasProAccess);
+  const [openingTabValue] = usePaneSettingValue("tab", opening);
   // A market asked for again (a stock's perpetual row, PERP) comes back to it on its opening tab, whatever this pane
   // shows by then.
   const [savedTab, setTab] = useCommandValue<string>("perps", "perps:tab", (params) => params.market ? openingTabValue : null, openingTabValue);
-  const tab = PERP_TABS.includes(savedTab as PerpTab) ? savedTab as PerpTab : openingTab(openingMarket);
+  const tab = PERP_TABS.includes(savedTab as PerpTab) ? savedTab as PerpTab : opening;
   const marketTab = isMarketTab(tab);
   const [search, setSearch] = useCommandValue("perps", "perps:search", (params) => params.market || null, openingMarket);
   const [compareAsset, setCompareAsset] = usePluginPaneState<string>("perps:compare", compareOpening(openingMarket));
@@ -396,9 +406,10 @@ export function PerpsPane({ width, height, focused, marketAction }: Pick<PanePro
   const [metricValue, setMetric] = usePluginPaneState<string>("perps:metric", openingMetric);
   const metric: HistoryMetric = HISTORY_METRICS.includes(metricValue as HistoryMetric) ? metricValue as HistoryMetric : "funding";
   // One market's selection only loads for its own tabs; the lists bring their own rows.
-  const loader = useCallback((force: boolean) => loadPerpSelection(search, accessKey, force), [search, accessKey]);
-  const resource = useAsyncResource(marketTab ? loader : null, { initialData: () => cachedPerpSelection(search, accessKey), clearOnError: isAccessDenied });
+  const loader = useCallback((force: boolean) => loadPerpSelection(search, accessKey, force, true), [search, accessKey]);
+  const resource = useAsyncResource(marketTab ? loader : null, { initialData: () => cachedPerpSelection(search, accessKey, true), clearOnError: isAccessDenied });
   const data = marketTab ? resource.data?.payload : undefined;
+  const venueApr = useMemo(() => venueAprSummary(data?.venues ?? []), [data?.venues]);
   const fetchedActive = data?.rows[0] ?? null;
   // The market on screen moves with the quote stream, as its listing's quote does everywhere else.
   const activeRows = useMemo(() => fetchedActive ? [fetchedActive] : NO_ROWS, [fetchedActive]);
@@ -409,15 +420,21 @@ export function PerpsPane({ width, height, focused, marketAction }: Pick<PanePro
   // The market on screen goes with the user: History and Evidence open the row picked on a list, Compare its base asset.
   const current = marketTab ? active : listRow;
   const carried = marketTab ? active : listRow ?? picked;
+  // Liquidations and Depth list no board rows: a market tab after them opens their asset, and they keep Compare's.
+  const assetOnly = tab === "liquidations" || tab === "depth";
   const selectTab = useCallback((next: string) => {
-    if (carried && isMarketTab(next) && !marketTab) setSearch(carried.marketId);
-    if (carried && next === "compare") setCompareAsset(carried.baseAsset);
+    if (assetOnly && isMarketTab(next)) setSearch(compareAsset);
+    else if (carried && isMarketTab(next) && !marketTab) setSearch(carried.marketId);
+    if (carried && isAssetTab(next) && !assetOnly) setCompareAsset(carried.baseAsset);
     setListRow(null);
     setTab(next);
-  }, [carried, marketTab, setSearch, setCompareAsset, setTab]);
-  const openMarket = useCallback((row: PerpBoardRow, next: PerpTab = "history") => { setSearch(row.marketId); setTab(next); }, [setSearch, setTab]);
-  const { strip, rows: tabRows } = usePaneTabs({ tabs: PERP_TABS.map((value) => ({ value, label: label(value) })), activeValue: tab, onSelect: selectTab, focused, dense: true });
-  const refreshMarket = useCallback(() => { void resource.reload(); }, [resource.reload]);
+  }, [assetOnly, carried, compareAsset, marketTab, setSearch, setCompareAsset, setTab]);
+  const openMarket = useCallback((row: PerpBoardRow, next: PerpTab = openingTab(row.marketId, access.hasProAccess)) => { setSearch(row.marketId); setTab(next); }, [setSearch, setTab, access.hasProAccess]);
+  const openMarketId = useCallback((marketId: string) => { setSearch(marketId); setTab(openingTab(marketId, access.hasProAccess)); }, [setSearch, setTab, access.hasProAccess]);
+  // Kept between board updates, so the tab strip skips the renders they give the pane.
+  const tabItems = useMemo(() => PERP_TABS.map((value) => ({ value, label: label(value) })), []);
+  const { strip, rows: tabRows } = usePaneTabs({ tabs: tabItems, activeValue: tab, onSelect: selectTab, focused, dense: true });
+  const refreshMarket = useCallback(() => { resource.reload(); }, [resource.reload]);
   useAutoRefresh(resource.updatedAt, resource.load, { intervalMs: 60_000 });
   usePaneRefreshKey(refreshMarket, { focused: focused && marketTab && !querySearch.active && (tab !== "history" || !active) });
   // The listed stock or fund a market tracks opens the way a ticker link does, on the DES already open for that
@@ -450,14 +467,16 @@ export function PerpsPane({ width, height, focused, marketAction }: Pick<PanePro
   return <Box width={width} height={height} flexDirection="column">
     {strip}
     {tab === "board" ? <Board {...list} /> : tab === "rankings" ? <Rankings {...list} />
-      : tab === "compare" ? <Compare {...list} asset={compareAsset} onAssetChange={setCompareAsset} /> : <>
+      : tab === "compare" ? <Compare {...list} asset={compareAsset} onAssetChange={setCompareAsset} />
+      : tab === "liquidations" ? <Liquidations accessKey={accessKey} width={width} height={listHeight} focused={focused} asset={compareAsset} onAssetChange={setCompareAsset} onOpenMarket={openMarketId} />
+      : tab === "depth" ? <Depth accessKey={accessKey} width={width} height={listHeight} focused={focused} asset={compareAsset} onAssetChange={setCompareAsset} onOpenMarket={openMarketId} /> : <>
         <QueryBar width={width} search={{ focused, value: search, onChange: setSearch, placeholder: "Market or canonical identity", debounceMs: 300, ...querySearch.searchProps }}
           filters={tab === "history" ? [
             { id: "metric", label: "Series", value: metric, options: HISTORY_METRICS.map((value) => ({ value, label: metricLabel(value) })), onChange: setMetric },
             { id: "range", label: "Range", value: range, options: ["1", "7", "30", "90", "365"].map((value) => ({ value, label: `${value}D` })), onChange: setRange },
           ] : []} />
         <PaneStatusBody loading={!data && resource.loading} error={!data ? resource.error : null} subject="perpetual market">
-          {active ? tab === "history" ? <History key={active.marketId} market={active} live={activeStream.live} venues={collectedVenueCount(data?.sources)} accessKey={accessKey} width={width} height={listHeight - 1} focused={focused && !querySearch.active} range={range} metric={metric} refreshMarket={refreshMarket} />
+          {active ? tab === "history" ? <History key={active.marketId} market={active} live={activeStream.live} venues={collectedVenueCount(data?.sources)} venueApr={venueApr} accessKey={accessKey} width={width} height={listHeight - 1} focused={focused && !querySearch.active} range={range} metric={metric} refreshMarket={refreshMarket} />
             : <MarketEvidence row={active} data={data!} width={width} height={listHeight - 1} />
             : <EmptyState title="No market matches." message={data?.suggestions?.length ? `Try ${data.suggestions.join(", ")}.` : undefined} />}
         </PaneStatusBody>

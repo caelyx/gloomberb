@@ -23,6 +23,12 @@ import {
 } from "./protocol";
 import { normalizeJson } from "./json";
 import {
+  redactRelayResult,
+  redactResource,
+  storedCredentials,
+  withoutStoredCredentials,
+} from "../terminal-relay/redact";
+import {
   capToolNote,
   joinToolNotes,
   summarizeToolWarnings,
@@ -33,6 +39,7 @@ import {
   remoteRequestForTool,
   resolveRemoteToolBinding,
   toolExecutionTimeoutMs,
+  type RemoteToolBinding,
 } from "./manifest";
 import {
   ASKGUndoManager,
@@ -40,6 +47,7 @@ import {
   type InProcessRemoteControlHandler,
 } from "./undo";
 import { logFailure } from "../../../../utils/log-failure";
+import { describeConfirmedOperation, planUiCall, UiCallRefusal, type UiCallPlan } from "../terminal-relay/policy";
 
 interface HeadlessExecution {
   result: unknown;
@@ -68,10 +76,32 @@ export interface ASKGToolExecutorDependencies {
 
 interface ASKGToolExecutionOptions {
   signal?: AbortSignal;
+  /** The person approved this call (or a dry run found nothing to approve). */
   confirmed?: boolean;
   /** The confirmKey of the preview the person approved, so the app does not ask again. */
   confirmedChange?: string;
+  /** The gate the call was asked about with, checked again right before it runs. */
+  gate?: ASKGToolGate;
+  /** One of Ask Gloom's confirmations waits for the person. */
+  promptOpen?: () => boolean;
 }
+
+/**
+ * What the per-operation policy shared with the terminal relay
+ * (terminal-relay/policy.ts) says about a call that acts on what is on
+ * screen (a press, a submit, a command-bar row), or about a confirmed
+ * operation it describes (a layout delete, by the layout's name).
+ */
+export type ASKGToolGate =
+  /** Refused before anything is asked: it aims at a confirmation, or one is open. */
+  | { kind: "refusal"; message: string }
+  /** Scroll, select, setValue, focus, a row that opens a ticker or a pane. */
+  | { kind: "silent"; recheck: UiCallPlan["recheck"] }
+  /** Asks first, naming the control and its pane, the row it opens, or the layout it deletes. */
+  | { kind: "ask"; title: string; lines: string[]; recheck: UiCallPlan["recheck"] };
+
+/** Why a call that changes the app did not run while one of Ask Gloom's questions waited (controller.ts). */
+export const CONFIRMATION_WAITING_NOTE = "Gloom is waiting for the person to answer a confirmation, and nothing else that changes the app runs until then. This call did not run; retry it after they answer.";
 
 /**
  * What a call needing approval will change, from the operation's own dry run:
@@ -95,6 +125,11 @@ export interface ASKGToolExecutor {
   ): Promise<ToolResultPayload>;
   /** Null when the call has no dry run that says more than its arguments. */
   preview?(call: ASKGToolCallEvent, signal?: AbortSignal): Promise<ASKGToolPreview | null>;
+  /**
+   * Null when the policy has nothing to add for the call. Throws when it
+   * cannot tell (the screen could not be read): the call does not run.
+   */
+  gate(call: ASKGToolCallEvent, options: { promptOpen: boolean; signal?: AbortSignal }): Promise<ASKGToolGate | null>;
   undo(token: string, signal?: AbortSignal): Promise<AppliedUndo>;
 }
 
@@ -180,7 +215,8 @@ function rawArgumentFor(manifest: ClientToolManifest, args: Record<string, JsonV
     }
     case "tickers":
     case "symbol-list": {
-      const symbols = args.symbols;
+      // One ticker as `symbol`, as a call to a function that took one (FA before it read several) names it.
+      const symbols = args.symbols ?? (typeof args.symbol === "string" ? [args.symbol] : undefined);
       if (symbols == null && manifest.argument.optional) return "";
       if (!Array.isArray(symbols) || !symbols.every((symbol) => typeof symbol === "string")) {
         throw new Error(`${manifest.name} requires a symbols array.`);
@@ -236,6 +272,15 @@ function inferRemoteRowCount(value: unknown): number | undefined {
     if (Array.isArray(record[key])) return record[key].length;
   }
   return 1;
+}
+
+/**
+ * An app resource or operation result as an assistant may read it, by the
+ * same rules as the terminal relay: configuration without its credentials
+ * and broker settings, and no secret-named or typed-password value anywhere.
+ */
+function redactRemoteData(binding: RemoteToolBinding, args: Record<string, JsonValue>, data: unknown): unknown {
+  return redactRelayResult(binding.kind === "resource" ? redactResource(String(args.resource), data) : data);
 }
 
 /**
@@ -342,20 +387,67 @@ export function createASKGToolExecutor(
     ?? defaultHeadlessExecutor(dependencies.registry, dependencies.context);
   const undoManager = dependencies.undoManager ?? new ASKGUndoManager(dependencies.remoteHandler);
 
+  const readResource = async (resource: string, signal?: AbortSignal): Promise<unknown> => {
+    const response = await runWithDeadline(
+      () => dependencies.remoteHandler({ type: "get", resource }),
+      PREVIEW_TIMEOUT_MS,
+      signal,
+    );
+    if (!response.ok) throw new Error(response.error.message);
+    return response.data;
+  };
+
+  const gate = async (
+    call: ASKGToolCallEvent,
+    { promptOpen, signal }: { promptOpen: boolean; signal?: AbortSignal },
+  ): Promise<ASKGToolGate | null> => {
+    if (manifests.get(call.name)?.source !== "remote-op") return null;
+    const binding = resolveRemoteToolBinding(call.name);
+    if (binding?.kind !== "operation") return null;
+    const read = (resource: string) => readResource(resource, signal);
+    try {
+      const plan = await planUiCall(binding.operation, call.args, { read, promptOpen });
+      if (plan) {
+        return plan.confirm
+          ? {
+            kind: "ask",
+            title: plan.confirm.title,
+            lines: plan.confirm.lines.map(({ label, value }) => `${label}: ${value}`),
+            recheck: plan.recheck,
+          }
+          : { kind: "silent", recheck: plan.recheck };
+      }
+      const described = await describeConfirmedOperation(binding.operation, call.args, read);
+      if (!described) return null;
+      const recheck = described.recheck;
+      return {
+        kind: "ask",
+        title: described.confirm.title,
+        lines: described.confirm.lines.map(({ label, value }) => `${label}: ${value}`),
+        recheck: async () => (recheck ? recheck() : null),
+      };
+    } catch (error) {
+      if (error instanceof UiCallRefusal) return { kind: "refusal", message: error.message };
+      throw error;
+    }
+  };
+
   const execute = async (
     call: ASKGToolCallEvent,
     options: ASKGToolExecutionOptions = {},
   ): Promise<ToolResultPayload> => {
     const startedAt = now();
+    // Whatever leaves the app, a pane function's rows included, without a credential the config stores.
+    const credentials = storedCredentials(dependencies.context?.config);
     const base = (value: ExecutionValue): ToolResultPayload => withBoundedPayload({
       turnId: call.turnId,
       toolCallId: call.toolCallId,
       status: value.status,
-      ...(value.result !== undefined ? { result: normalizeJson(value.result) } : {}),
+      ...(value.result !== undefined ? { result: withoutStoredCredentials(normalizeJson(value.result), credentials) } : {}),
       ...(value.rowCount !== undefined ? { rowCount: value.rowCount } : {}),
       truncated: value.truncated ?? false,
       elapsedMs: Math.max(0, now() - startedAt),
-      ...(value.note ? { note: capToolNote(value.note) } : {}),
+      ...(value.note ? { note: capToolNote(withoutStoredCredentials(value.note, credentials)) } : {}),
       ...(value.rev ? { rev: value.rev } : {}),
       ...(value.undoToken ? { undoToken: value.undoToken } : {}),
     });
@@ -371,6 +463,17 @@ export function createASKGToolExecutor(
       });
     }
     if ((manifest.confirm === "always" || call.requiresConfirmation) && !options.confirmed) {
+      return base({ status: "denied", note: "This tool call requires local confirmation." });
+    }
+    const promptOpen = () => options.promptOpen?.() ?? false;
+    let screenGate: ASKGToolGate | null;
+    try {
+      screenGate = options.gate ?? await gate(call, { promptOpen: promptOpen(), ...(options.signal ? { signal: options.signal } : {}) });
+    } catch (error) {
+      return base({ status: "error", note: toolErrorNote(error) });
+    }
+    if (screenGate?.kind === "refusal") return base({ status: "denied", note: screenGate.message });
+    if (screenGate?.kind === "ask" && !options.confirmed) {
       return base({ status: "denied", note: "This tool call requires local confirmation." });
     }
 
@@ -403,6 +506,12 @@ export function createASKGToolExecutor(
           }
         }
 
+        // The last look before it acts: the screen may have changed while the person decided.
+        const stale = await screenGate?.recheck(promptOpen());
+        if (stale) return { status: "denied", note: stale };
+        // Nothing that changes the app runs while one of Ask Gloom's questions waits.
+        if (manifest.writeTier !== "read" && promptOpen()) return { status: "denied", note: CONFIRMATION_WAITING_NOTE };
+
         const response = await dependencies.remoteHandler(remoteRequestForTool(binding, call.args), {
           signal,
           ...(options.confirmed && options.confirmedChange ? { confirmed: options.confirmedChange } : {}),
@@ -410,7 +519,7 @@ export function createASKGToolExecutor(
         if (!response.ok) {
           return {
             status: "error",
-            result: { code: response.error.code, ...(response.error.details !== undefined ? { details: response.error.details } : {}) },
+            result: redactRemoteData(binding, call.args, { code: response.error.code, ...(response.error.details !== undefined ? { details: response.error.details } : {}) }),
             note: toolErrorNote(response.error.message),
           };
         }
@@ -425,7 +534,7 @@ export function createASKGToolExecutor(
         }
         return {
           status: "ok",
-          result: response.data,
+          result: redactRemoteData(binding, call.args, response.data),
           rowCount: inferRemoteRowCount(response.data),
           ...(undoNote ? { note: undoNote } : {}),
           ...(response.rev ? { rev: response.rev } : response.state?.rev ? { rev: response.state.rev } : {}),
@@ -471,6 +580,7 @@ export function createASKGToolExecutor(
   return {
     execute,
     preview,
+    gate,
     undo: (token, signal) => undoManager.undo(token, signal),
   };
 }

@@ -16,8 +16,13 @@ refreshes only the rows it lists: `FUT gold` asks for gold alone, and a row is
 asked for when a search or an opened section first lists it. The listed rows go
 out in up to four batches at once, and a batch with no answer after five
 seconds is given up, so one slow contract cannot hold the rest; its rows keep
-the cached quote, marked stale. The 1W, 1M and YTD returns load history only
-for the listed rows. The footer, the empty state and the source line of
+the cached quote, marked stale, until the answer arrives, and a late answer
+paints its rows then, unless a newer load has started. The 1W, 1M and YTD returns load history only
+for the listed rows. Each return runs from the front contract's last close on or before the same
+calendar day back (a week, a month, three months) or the prior year's last close, the base RETURN
+and CTM's month and year ghosts use too; the header's hover and `fn FUT` name that close
+(`Returns: 1W from Thu 29 Oct close; 1M from Mon 5 Oct close; YTD from Wed 31 Dec 2025 close.`),
+and its JSON carries each base date beside the return (`1M from`). The footer, the empty state and the source line of
 `fn FUT` and `shot FUT` count the listed rows alone, so `fn FUT gold` is dated
 by gold's quote.
 
@@ -29,8 +34,8 @@ for CME's support of zero and negative energy futures prices.
 
 The futures board uses Gloom Cloud's continuous aliases, which quote each root's
 front month until a stated roll date and name the nearer month while it still
-trades after the roll, and the day's most active month by volume when it is
-another one (see the `Front month` glossary entry). Each row's unit comes from the contract terms
+trades after the roll (see the `Front month` glossary entry); the day's most
+active month by volume is in `quote`'s contract lines, never beside the price. Each row's unit comes from the contract terms
 `quote` shows. The aliases do not establish an explicit expiry curve, contract
 quantity, physical-unit conversion, or roll-adjusted investment return. Quote
 validation does not add those capabilities.

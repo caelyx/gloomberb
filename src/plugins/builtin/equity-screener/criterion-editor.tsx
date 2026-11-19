@@ -13,7 +13,7 @@ import type {
   ScreenFieldDefinition,
   ScreenOperator,
 } from "../../../api-client/equity-screener";
-import { parseCriterion } from "./model";
+import { criterionInputText, criterionValueHint, criterionValueLabel, parseCriterion, typedListName } from "./model";
 
 export function CriterionEditor({
   fields,
@@ -22,10 +22,14 @@ export function CriterionEditor({
   onCancel,
   focused,
   width,
+  readWatchlist,
 }: {
   fields: ScreenFieldDefinition[];
   value: ScreenCriterion | null;
-  onSave: (criterion: ScreenCriterion) => void;
+  /** One name typed for the symbol field, read as that watchlist's symbols with the note saying so, or null. */
+  readWatchlist?: (typed: string) => { symbols: readonly string[]; note: string } | null;
+  /** `note` says how a watchlist's name was read, as `fn EQS` says it. */
+  onSave: (criterion: ScreenCriterion, note: string | null) => void;
   onCancel: () => void;
   focused: boolean;
   width: number;
@@ -40,13 +44,7 @@ export function CriterionEditor({
   const [operator, setOperator] = useState<ScreenOperator>(
     value?.op ?? field.operators[0]!,
   );
-  const [text, setText] = useState(
-    value && "value" in value
-      ? Array.isArray(value.value)
-        ? value.value.join(", ")
-        : String(value.value)
-      : "",
-  );
+  const [text, setText] = useState(criterionInputText(value));
   const [error, setError] = useState<string | null>(null);
   const [active, setActive] = useState("field");
   const fieldControl = useRef<SelectControl>(null),
@@ -58,9 +56,12 @@ export function CriterionEditor({
     "save",
     "cancel",
   ];
+  // A watchlist's name typed for the symbol list: what it reads as, before Save.
+  const listName = typedListName(field.id, operator, text);
+  const watchlistRead = listName ? readWatchlist?.(listName) ?? null : null;
   const save = () => {
     try {
-      onSave(parseCriterion(field, operator, text));
+      onSave(parseCriterion(field, operator, text, readWatchlist), watchlistRead?.note ?? null);
     } catch (error) {
       setError(error instanceof Error ? error.message : "Invalid criterion.");
     }
@@ -138,23 +139,19 @@ export function CriterionEditor({
       />
       {!["present", "missing"].includes(operator) ? (
         <TextField
-          label={`Value${field.unit ? ` (${field.unit})` : ""}`}
+          label={criterionValueLabel(field)}
           value={text}
           onChange={setText}
-          placeholder={
-            operator === "between"
-              ? "minimum, maximum"
-              : operator === "in"
-                ? "comma-separated values"
-                : "threshold, e.g. 25 or 10B"
-          }
+          placeholder={criterionValueHint(field, operator)}
           width={Math.min(45, width - 4)}
           focused={focused && active === "value"}
           onMouseDown={() => setActive("value")}
           onSubmit={save}
         />
       ) : null}
-      {error ? <Notice tone="negative">{error}</Notice> : null}
+      {error ? <Notice tone="negative">{error}</Notice>
+        : watchlistRead ? <Notice tone="muted">{watchlistRead.note}</Notice>
+        : null}
       <Box flexDirection="row" gap={1}>
         <Button
           label="Save criterion"
