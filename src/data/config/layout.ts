@@ -20,6 +20,7 @@ import {
   normalizePaneId,
   removeUnreachablePaneInstances,
 } from "../../types/config";
+import { getDockLeafLayouts, type LayoutBounds } from "../../layout/pane-manager/dock-tree";
 import { compactFloatingZ } from "../../layout/pane-manager/floating";
 import { withoutTransientPanes } from "../../layout/pane-manager/transient";
 import { alignFloatingStacks } from "../../layout/pane-manager/floating-stack";
@@ -301,6 +302,39 @@ function sanitizeDetachedEntries(value: unknown, validInstanceIds: Set<string>):
     }));
 }
 
+const LEGACY_WINDOW_BOUNDS: LayoutBounds = { x: 0, y: 0, width: 120, height: 40 };
+
+/**
+ * The panes a layout saved by this fork's own secondary windows held
+ * (`layout.windows`, each `{ dockRoot, floating }`), as floating entries for
+ * the main window: a docked one where its window's grid put it, a floating one
+ * at its own rect. Upstream's desktop windows replaced that model; without
+ * this, those panes would be dropped on load as reachable from nowhere.
+ */
+function legacySecondaryWindowPanes(value: unknown): unknown[] {
+  if (!Array.isArray(value)) return [];
+  const entries: unknown[] = [];
+  for (const window of value) {
+    if (!window || typeof window !== "object" || Array.isArray(window)) continue;
+    const { dockRoot, floating } = window as { dockRoot?: unknown; floating?: unknown };
+    if (dockRoot && typeof dockRoot === "object") {
+      try {
+        const leaves = getDockLeafLayouts(
+          { dockRoot: dockRoot as LayoutConfig["dockRoot"], instances: [], floating: [], detached: [] },
+          LEGACY_WINDOW_BOUNDS,
+        );
+        for (const leaf of leaves) {
+          for (const instanceId of leaf.stack ?? [leaf.instanceId]) entries.push({ instanceId, ...leaf.rect });
+        }
+      } catch {
+        // A malformed tree loses its grid placement only; its floating panes still come back.
+      }
+    }
+    if (Array.isArray(floating)) entries.push(...floating);
+  }
+  return entries;
+}
+
 export function sanitizeLayout(
   value: unknown,
   fallback: LayoutConfig,
@@ -319,7 +353,12 @@ export function sanitizeLayout(
   );
   const validInstanceIds = new Set(instances.map((entry) => entry.instanceId));
   const dockRoot = (value as { dockRoot?: LayoutConfig["dockRoot"] }).dockRoot ?? null;
-  const floating = sanitizeFloatingEntries((value as { floating?: unknown }).floating, validInstanceIds);
+  const savedFloating = (value as { floating?: unknown }).floating;
+  const legacyWindowPanes = legacySecondaryWindowPanes((value as { windows?: unknown }).windows);
+  const floating = sanitizeFloatingEntries(
+    legacyWindowPanes.length > 0 ? [...(Array.isArray(savedFloating) ? savedFloating : []), ...legacyWindowPanes] : savedFloating,
+    validInstanceIds,
+  );
   const detached = sanitizeDetachedEntries((value as { detached?: unknown }).detached, validInstanceIds);
 
   const layout: LayoutConfig = {

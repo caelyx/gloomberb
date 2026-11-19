@@ -308,6 +308,31 @@ describe("sanitizeLayout", () => {
     });
   });
 
+  test("brings the panes of a layout saved with this fork's secondary windows back into the main window", () => {
+    // Before upstream's desktop windows, this fork kept extra windows in layout.windows; their panes
+    // are unreachable from the main window's dock and floating lists and would be dropped on load.
+    const pane = (instanceId: string) => ({ instanceId, paneId: "portfolio-list", binding: { kind: "none" } });
+    const layout = sanitizeLayout({
+      dockRoot: { kind: "pane", instanceId: "main" },
+      instances: [pane("main"), pane("left"), pane("right"), pane("floating")],
+      floating: [],
+      detached: [],
+      windows: [{
+        id: "w2",
+        dockRoot: { kind: "split", axis: "horizontal", ratio: 0.5, first: { kind: "pane", instanceId: "left" }, second: { kind: "pane", instanceId: "right" } },
+        floating: [{ instanceId: "floating", x: 4, y: 3, width: 40, height: 12 }],
+      }, { id: "w3", dockRoot: { kind: "nonsense" }, floating: "nonsense" }],
+    }, DEFAULT_LAYOUT);
+
+    expect(layout.instances.map((entry) => entry.instanceId).sort()).toEqual(["floating", "left", "main", "right"]);
+    expect(getDockedPaneIds(layout)).toEqual(["main"]);
+    expect(layout.floating.map((entry) => entry.instanceId).sort()).toEqual(["floating", "left", "right"]);
+    expect(layout.floating.find((entry) => entry.instanceId === "floating")).toMatchObject({ x: 4, y: 3, width: 40, height: 12 });
+    const [left, right] = ["left", "right"].map((id) => layout.floating.find((entry) => entry.instanceId === id)!);
+    expect(left!.x).toBeLessThan(right!.x);
+    expect("windows" in layout).toBe(false);
+  });
+
   test("keeps the pane lock across a save/load round trip", () => {
     const layout = sanitizeLayout({
       dockRoot: { kind: "pane", instanceId: "portfolio-list:locked" },
