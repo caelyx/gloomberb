@@ -327,7 +327,7 @@ function legacySecondaryWindowPanes(value: unknown): unknown[] {
           for (const instanceId of leaf.stack ?? [leaf.instanceId]) entries.push({ instanceId, ...leaf.rect });
         }
       } catch {
-        // A malformed tree loses its grid placement only; its floating panes still come back.
+        // Intentional ignore: a malformed legacy window tree loses its grid placement only; its floating panes still come back.
       }
     }
     if (Array.isArray(floating)) entries.push(...floating);
