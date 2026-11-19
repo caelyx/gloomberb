@@ -2,6 +2,7 @@ import type { CommandBarResultLine } from "../../../types/plugin";
 import type { TickerRecord } from "../../../types/ticker";
 import type { BrokerContractRef, TickerListingRef } from "../../../types/instrument";
 import type { InstrumentRef } from "../../../market-data/request-types";
+import { ASSIST_CATEGORY } from "../assist/model";
 import {
   buildSections,
   type CommandBarCategoryPriorities,
@@ -36,10 +37,18 @@ export interface ResultItem {
   /** The other spellings the row answers to (IBOV for ^BVSP), for the same checks. */
   searchAliases?: string[];
   contractKey?: string;
+  /** A listing that no longer trades (delisted, or withdrawn by its exchange): never the exact match a word leads with. */
+  stoppedTrading?: boolean;
   instrument?: BrokerContractRef | null;
   listing?: TickerListingRef;
   /** Materialize this exact listing when another command consumes the row. */
   resolveTicker?: () => Promise<TickerRecord>;
+  /**
+   * A ticker row's three choices: `des` opens it as DES does (the row's `action`), `new` in a
+   * new research pane (its `secondaryAction`), and `pane` changes the focused pane's ticker, as
+   * ticker search's Enter does.
+   */
+  pickTicker?: (how: TickerPick) => void;
   /**
    * What the pane this row opens will load, so the bar can warm it while the
    * row is the pick. Unset when only opening can tell (a broker contract, a
@@ -49,10 +58,12 @@ export interface ResultItem {
   shortcutQuery?: string;
   searchText?: string;
   /**
-   * Draws the shortcut in the right column instead of the badge column, for a
-   * row that leads with what it does in plain words.
+   * The words that name one of the bar's own actions outright, as other apps
+   * call it (Fullscreen Pane: maximize, zoom, full screen). A word typed in
+   * small letters that begins one leads with the action, ahead of a listing
+   * the same letters spell. Unlike `searchText`, never its label or description.
    */
-  shortcutOnRight?: boolean;
+  commandWords?: readonly string[];
   /** Tints the trailing marker and the section heading with the AI accent. */
   accent?: boolean;
   /**
@@ -71,6 +82,14 @@ export interface ResultItem {
   current?: boolean;
   disabled?: boolean;
   action: () => void | Promise<void>;
+}
+
+/** What choosing a ticker row does; see `ResultItem.pickTicker`. */
+export type TickerPick = "des" | "pane" | "new";
+
+/** A row plain Enter can run, so the untouched selection may rest on it. */
+export function isDefaultSelectable(item: ResultItem): boolean {
+  return item.disabled !== true && item.defaultSelectable !== false;
 }
 
 type ListScreenKind = "root" | "mode" | "picker";
@@ -199,6 +218,14 @@ export function resolveListPageTarget(
   return target;
 }
 
+/**
+ * Whether every row is the AI's offer (`Ask AI — sign up to enable`), which
+ * no Enter takes: nothing in the list answers what was typed.
+ */
+function onlyAssistOffers(results: readonly ResultItem[]): boolean {
+  return results.length > 0 && results.every((item) => item.category === ASSIST_CATEGORY && !isDefaultSelectable(item));
+}
+
 export function buildNativeListRows(listState: ListScreenState, rows: CommandBarListRow[]): CommandBarListRow[] {
   if (listState.searching && rows.length === 0) {
     return [{ kind: "spinner", id: "searching", label: "Searching…" }];
@@ -208,6 +235,10 @@ export function buildNativeListRows(listState: ListScreenState, rows: CommandBar
   }
   if (listState.searching) {
     return [...rows, { kind: "spinner", id: "searching", label: "Searching…" }];
+  }
+  // A query nothing matches says so above the offer, rather than leave the offer looking like the answer.
+  if (listState.query.trim() && onlyAssistOffers(listState.results)) {
+    return [{ kind: "message", id: "empty", label: listState.emptyLabel }, { kind: "spacer", id: "spacer:empty" }, ...rows];
   }
   return rows;
 }

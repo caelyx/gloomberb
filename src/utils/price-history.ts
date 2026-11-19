@@ -2,12 +2,14 @@ import type { PricePoint, TickerFinancials } from "../types/financials";
 import { canonicalExchange } from "./exchanges";
 import { isRoundTheClockCoin } from "./crypto-pair";
 import { isCurrencyPairListing, isFxMarketOpen, latestFxWeekClose, latestFxWeekOpen } from "./fx-market-hours";
-import { hasPublishedSessionCalendar, historySourceWeekendDays, latestRegularSessionClose, latestRegularSessionOpen, sessionCalendarTimeZone } from "../market-data/market/freshness";
+import { hasPublishedSessionCalendar, historySourceWeekendDays, isMiddayBreakPrint, latestRegularSessionClose, latestRegularSessionOpen, sessionCalendarTimeZone } from "../market-data/market/freshness";
 import { zonedDateTimeParts } from "./zoned-date-time";
 import { regularHistorySessionStaleness } from "../market-data/history-session";
 import type { HistorySession } from "../types/price-history";
 import { BAR_INTERVAL_UNIT_MS, parseBarInterval } from "../time-series/resolution";
 import { parseOptionTicker } from "./options";
+import { indexSessionVenue } from "../market-data/market/index-session-venues";
+import { listingSuffixVenue } from "../sources/listing-symbols";
 
 // A venue without session hours here (OTC Markets, Cboe Canada) has no
 // session to hold: its copy is current while the latest bar is this recent.
@@ -234,6 +236,12 @@ export function isPriceHistoryStaleForCurrentWindow(
   const age = now - latestTime;
   const allowedLag = allowedBarLagMs(intervalMs);
   if (age <= allowedLag) return false;
+  // A venue paused at midday (SSE/SZSE/BSE, TKO, ...) holds the morning's last
+  // bar current through the break, as the quote freshness rule does. A bar is
+  // labelled by its start, so an hourly bar ending at the break is judged by
+  // when it ends.
+  const latestBarEnd = intervalMs != null ? Math.min(latestTime + intervalMs, now) : latestTime;
+  if (isMiddayBreakPrint(latestBarEnd, options.exchange || indexSessionVenue(options.symbol) || undefined, now, 0)) return false;
   const sessions = listingSessionsAt(now, options);
   if (!sessions) return age > UNSCHEDULED_HISTORY_MAX_AGE_MS;
   const fetchedAt = options.fetchedAt ?? Number.NEGATIVE_INFINITY;
@@ -241,7 +249,7 @@ export function isPriceHistoryStaleForCurrentWindow(
   // A venue whose chart source files another week (DFM's Sunday to Thursday)
   // may end on the last session that week has: current under either week.
   // Bars of a day that week lacks (a DFM Friday) answer to the venue's own.
-  const exchange = listingSessionExchange(options.exchange);
+  const exchange = listingSessionExchange(options.exchange, options.symbol);
   const sourceWeekendDays = historySourceWeekendDays(exchange);
   const timeZone = sessionCalendarTimeZone(exchange);
   const latestWeekday = timeZone ? zonedWeekday(latestTime, timeZone) : null;
@@ -250,9 +258,12 @@ export function isPriceHistoryStaleForCurrentWindow(
   return !sourceSessions || !holdsLatestSession(latestTime, now, sourceSessions, allowedLag, fetchedAt);
 }
 
-/** Bare symbols resolve to their US listing at the sources. */
-function listingSessionExchange(exchange: string | undefined): string {
-  return canonicalExchange(exchange) || "NYSE";
+/**
+ * Bare symbols resolve to their US listing at the sources; a bare index symbol to the venue whose sessions it
+ * follows, and one written with a venue's suffix (GUBRF.IS) to that venue, whose hours its bars keep.
+ */
+function listingSessionExchange(exchange: string | undefined, symbol?: string): string {
+  return canonicalExchange(exchange) || indexSessionVenue(symbol) || (symbol ? listingSuffixVenue(symbol)?.exchange : undefined) || "NYSE";
 }
 
 interface ListingSessions {
@@ -279,7 +290,7 @@ function listingSessionsAt(
     return { liveOpen: isFxMarketOpen(time) ? latestFxWeekOpen(time) : null,
       last: close !== null && open !== null ? { open, close } : null };
   }
-  const exchange = listingSessionExchange(options.exchange);
+  const exchange = listingSessionExchange(options.exchange, options.symbol);
   const open = latestRegularSessionOpen(exchange, time, weekendDays);
   if (open === null) return null;
   const latest = latestRegularSessionClose(exchange, time, weekendDays);

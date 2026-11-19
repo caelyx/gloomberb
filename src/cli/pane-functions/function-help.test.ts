@@ -49,4 +49,12 @@ test("a function is tagged Pro exactly when Free gets nothing but the upgrade", 
 test("EQS help names ATR% and says IV rank is a rank, not an IV percentile", () => {
   expect(FUNCTION_HELP.EQS!.summary).toContain("ATR% is the 14-session average true range as a percent of the last close");
   expect(FUNCTION_HELP.EQS!.summary).toContain("IV rank is a rank, not an IV percentile");
+  expect(FUNCTION_HELP.EQS!.summary).toContain("Technical fields read the last completed session");
+  expect(FUNCTION_HELP.EQS!.usage).toContain("gloom fn EQS --preset golden-cross");
+  expect(FUNCTION_HELP.EQS!.summary).toContain("ROIC, FCF yield, net debt / EBITDA, debt / equity and the revenue and EPS CAGRs read FA's bases");
+  expect(FUNCTION_HELP.EQS!.usage).toContain("gloom fn EQS --preset quality");
+  expect(FUNCTION_HELP.EQS!.summary).toContain("Classic scores: Piotroski F, Altman Z, the Graham number and Lynch fair value");
+  expect(FUNCTION_HELP.EQS!.usage).toContain("gloom fn EQS --preset magic-formula");
+  expect(FUNCTION_HELP.EQS!.summary).toContain("each ranked within the sector, and their equal-weighted 1-5 composite labelled Top, Strong, Neutral, Weak or Bottom");
+  expect(FUNCTION_HELP.EQS!.usage).toContain("gloom fn EQS --preset top-grades");
 });

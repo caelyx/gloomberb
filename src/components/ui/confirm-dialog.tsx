@@ -1,12 +1,39 @@
-import { useCallback, useRef, type ReactNode } from "react";
-import { Box, Text, useUiHost } from "../../ui";
+import { useCallback, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { Box, Text, TextAttributes, useUiHost } from "../../ui";
 import { colors } from "../../theme/colors";
 import { t, tf } from "../../i18n";
 import { type DialogApi, type PromptContext, useDialogKeyboard } from "../../ui/dialog";
+import type { InputRenderable } from "../../ui/host";
+import { useViewport, type KeyEventLike } from "../../react/input";
 import { isPlainKey } from "../../utils/keyboard";
 import { Button, type ButtonVariant } from "./button";
 import { DialogActions } from "./dialog-actions";
+import { TextField } from "./fields";
 import { DialogFrame, fitDialogWidth } from "./frame";
+import { ListView, listCursorMove, type ListViewItem } from "./list-view";
+import { logFailure } from "../../utils/log-failure";
+import { sliceWholeCharacters } from "../../utils/untrusted-text";
+
+/**
+ * An optional question a confirm asks under its body, such as why: one of a
+ * few choices and a short note. Nothing in it is required and it adds no
+ * step: the buttons and keys answer the dialog as they do without it.
+ */
+export interface ConfirmDialogQuestion {
+  /** Over the choices, e.g. "What made you decide to cancel? (optional)". */
+  label: string;
+  choices: ReadonlyArray<{ id: string; label: string }>;
+  /** The note field's placeholder; left out, the dialog asks for no note. */
+  notePlaceholder?: string;
+  /** The most characters the note takes. */
+  noteMaxLength?: number;
+}
+
+/** What a confirm's question got: the choice picked and the note, trimmed, when there was one. */
+export interface ConfirmDialogAnswer {
+  choice?: string;
+  note?: string;
+}
 
 export interface ConfirmDialogProps extends PromptContext<boolean> {
   title: string;
@@ -24,7 +51,7 @@ export interface ConfirmDialogProps extends PromptContext<boolean> {
   status?: ReactNode;
   /** While the confirmed work runs: the buttons are off and only Esc answers. */
   busy?: boolean;
-  /** Adds the desktop close button beside the title. */
+  /** Adds the desktop close button beside the title; the terminal has its Cancel button. */
   onClose?: () => void;
   /**
    * Lays the buttons out as a form's Cancel and Submit: Cancel, then the
@@ -42,10 +69,29 @@ export interface ConfirmDialogProps extends PromptContext<boolean> {
    * and only `y` or the confirm button confirms.
    */
   defaultAction?: "confirm" | "cancel";
+  /**
+   * Asks an optional question under the body. The arrows pick a choice, and
+   * Space or a click on the picked one clears it. Tab moves into the note and
+   * back; while the note has the keys, what is typed goes there, Enter leaves
+   * it and only Esc answers the dialog.
+   */
+  question?: ConfirmDialogQuestion;
+  /** With `question`: what it got, called as the dialog confirms. */
+  onAnswer?: (answer: ConfirmDialogAnswer) => void;
+  /**
+   * For a confirm whose two buttons are both ways on, such as an offer's
+   * accept and continue: Esc and the desktop close button leave without
+   * either answer (the prompt resolves undefined) instead of pressing the
+   * cancel button. See `confirmDialogChoice`.
+   */
+  escapeLeaves?: boolean;
+  /** Buttons that do not fit the dialog's width (long labels on a phone) wrap to another row. */
+  wrapButtons?: boolean;
 }
 
 export function ConfirmDialog({
   resolve,
+  dismiss,
   title,
   body,
   confirmLabel,
@@ -59,20 +105,39 @@ export function ConfirmDialog({
   formButtons = false,
   keyGraceMs = 0,
   defaultAction = "confirm",
+  question,
+  onAnswer,
+  escapeLeaves = false,
+  wrapButtons = false,
 }: ConfirmDialogProps) {
   const enterCancels = defaultAction === "cancel";
   const desktop = useUiHost().kind === "desktop-web";
+  // The terminal's dialog box is the window less its border and padding: a
+  // narrow terminal wraps the words inside it rather than past its edge.
+  const viewport = useViewport();
+  const terminalWidth = Math.max(16, Math.min(width, viewport.width - 8));
   const openedAt = useRef(Date.now());
-  const confirm = useCallback(() => resolve(true), [resolve]);
+  const answer = useQuestionAnswer(question);
+  const confirm = useCallback(() => {
+    if (question) onAnswer?.(answer.read());
+    resolve(true);
+  }, [answer, onAnswer, question, resolve]);
   const cancel = useCallback(() => resolve(false), [resolve]);
+  const leave = escapeLeaves ? dismiss : cancel;
 
   // Every key, even with a field focused under the dialog: a confirm has
-  // nothing to type into, so nothing below should take one.
+  // nothing to type into but its own note, so nothing below should take one.
   useDialogKeyboard((event) => {
+    // The note takes what is typed, `y` and `n` included. Stopping a key here
+    // would keep it from the note too, so only the dialog's own keys stop.
+    if (question && answer.noteHasKeys(event) && event.name !== "escape") {
+      answer.handleNoteKey(event);
+      return;
+    }
     event.stopPropagation();
     if (event.name === "escape") {
       event.preventDefault();
-      cancel();
+      leave();
       return;
     }
     if (busy) {
@@ -80,6 +145,7 @@ export function ConfirmDialog({
       return;
     }
     const enter = event.name === "enter" || event.name === "return";
+    if (question && answer.handleKey(event)) return;
     if (enter && enterCancels) {
       event.preventDefault();
       cancel();
@@ -96,7 +162,7 @@ export function ConfirmDialog({
       cancel();
       return;
     }
-    // Two buttons and nothing to type: Tab has nowhere to go.
+    // Two buttons and nothing to type (a note takes Tab above): Tab has nowhere to go.
     if (event.name === "tab") event.preventDefault();
   }, { allowEditable: true });
 
@@ -113,19 +179,33 @@ export function ConfirmDialog({
       onPress={confirm}
     />
   );
-  const cancelButton = <Button label={cancelLabel} variant={enterCancels ? "primary" : "secondary"} disabled={busy} desktopShortcut={keys ? (enterCancels ? "Enter" : "Esc") : undefined} onPress={cancel} />;
+  // With Esc stepping out, `n` is the cancel button's key.
+  const cancelKey = enterCancels ? "Enter" : escapeLeaves ? "N" : "Esc";
+  const cancelButton = <Button label={cancelLabel} variant={enterCancels ? "primary" : "secondary"} disabled={busy} desktopShortcut={keys ? cancelKey : undefined} onPress={cancel} />;
+  const noteKey = question?.notePlaceholder !== undefined;
   const keyLine = enterCancels
-    ? tf("y {action} · Enter or Esc {cancel}", { action: t(confirmLabel).toLowerCase(), cancel: t(cancelLabel).toLowerCase() })
-    : tf("Enter {action} · Esc cancel", { action: t(confirmLabel).toLowerCase() });
+    ? noteKey
+      ? tf("y {action} · Tab note · Enter or Esc {cancel}", { action: t(confirmLabel).toLowerCase(), cancel: t(cancelLabel).toLowerCase() })
+      : tf("y {action} · Enter or Esc {cancel}", { action: t(confirmLabel).toLowerCase(), cancel: t(cancelLabel).toLowerCase() })
+    : escapeLeaves
+      ? tf("Enter {action} · n {cancel} · Esc close", { action: t(confirmLabel).toLowerCase(), cancel: t(cancelLabel).toLowerCase() })
+      : tf("Enter {action} · Esc cancel", { action: t(confirmLabel).toLowerCase() });
   return (
     <DialogFrame
       title={title}
       footer={footer ?? keyLine}
       desktopFooter={null}
-      onClose={onClose}
+      // The terminal's Cancel is its mouse close already: a second close in the title would only repeat it.
+      onClose={desktop ? (escapeLeaves ? dismiss : onClose) : undefined}
     >
-      <Box flexDirection="column" {...(desktop ? { style: { width: fitDialogWidth(width) } } : { width })}>
+      <Box flexDirection="column" {...(desktop ? { style: { width: fitDialogWidth(width) } } : { width: terminalWidth })}>
         {renderBody(body)}
+        {question && (
+          <>
+            <Box height={1} />
+            <QuestionFields question={question} answer={answer} width={terminalWidth} disabled={busy} />
+          </>
+        )}
         {status && (
           <>
             <Box height={1} />
@@ -133,12 +213,185 @@ export function ConfirmDialog({
           </>
         )}
         <Box height={1} />
-        <DialogActions alignEnd={formButtons}>
+        <DialogActions
+          alignEnd={formButtons}
+          wrap={wrapButtons}
+          hints={question && keys ? { keys: [{ key: "↑↓", label: "choose" }, ...noteKey ? [{ key: "Tab", label: "note" }] : []] } : undefined}
+        >
           {formButtons ? cancelButton : confirmButton}
           {formButtons ? confirmButton : cancelButton}
         </DialogActions>
       </Box>
     </DialogFrame>
+  );
+}
+
+interface QuestionAnswer {
+  items: ListViewItem[];
+  choiceIndex: number;
+  note: string;
+  noteFocused: boolean;
+  noteInputRef: RefObject<InputRenderable | null>;
+  /** A click or Space on a choice: picks it, or clears it when it was the one picked. */
+  toggle(index: number): void;
+  setNote(note: string): void;
+  /** Moves the keyboard into the note or out of it, the field's own focus with it. */
+  focusNote(focused: boolean): void;
+  read(): ConfirmDialogAnswer;
+  /**
+   * Whether the note has the keys, ahead of the render that shows it. Only the
+   * note itself: a field under the dialog that kept the focus takes nothing
+   * from the dialog, which answers `y` and Enter as it does without a note.
+   */
+  noteHasKeys(event: KeyEventLike): boolean;
+  /** A key while the note has the keys: Tab and Enter leave it; the rest is typing. */
+  handleNoteKey(event: KeyEventLike): void;
+  /**
+   * A key while the note does not have them: the arrows pick, Space clears
+   * the choice or picks it back, Tab enters the note. True when it was one.
+   */
+  handleKey(event: KeyEventLike): boolean;
+}
+
+function isTabKey(event: KeyEventLike): boolean {
+  return event.name === "tab" && !event.ctrl && !event.meta && !event.alt;
+}
+
+function useQuestionAnswer(question: ConfirmDialogQuestion | undefined): QuestionAnswer {
+  const items = useMemo<ListViewItem[]>(() => (question?.choices ?? []).map(({ id, label }) => ({ id, label: t(label) })), [question?.choices]);
+  const [choiceIndex, setChoiceIndex] = useState(-1);
+  const [note, setNoteState] = useState("");
+  const [noteFocused, setNoteFocused] = useState(false);
+  // Terminal input can deliver a pick, the note and `y` before React renders.
+  const choiceRef = useRef(-1);
+  // The choice last picked, where the arrows and Space go on from once it is cleared.
+  const cursorRef = useRef(-1);
+  const noteRef = useRef("");
+  const noteFocusedRef = useRef(false);
+  const noteInputRef = useRef<InputRenderable | null>(null);
+  const hasNote = question?.notePlaceholder !== undefined;
+  const setChoice = (index: number) => {
+    if (index < -1 || index >= items.length) return;
+    if (index >= 0) cursorRef.current = index;
+    choiceRef.current = index;
+    setChoiceIndex(index);
+  };
+  // No reason stays a choice: the picked one clears.
+  const toggle = (index: number) => setChoice(index === choiceRef.current ? -1 : index);
+  const setNote = (next: string) => {
+    noteRef.current = next;
+    setNoteState(next);
+  };
+  const focusNote = (focused: boolean) => {
+    const next = focused && hasNote;
+    noteFocusedRef.current = next;
+    setNoteFocused(next);
+    // Now, not on the render the flag makes: the next key must find the field
+    // that has it, and a note left must not take Enter or `y` as typing.
+    if (next) noteInputRef.current?.focus?.();
+    else noteInputRef.current?.blur?.();
+  };
+  return {
+    items,
+    choiceIndex,
+    note,
+    noteFocused,
+    noteInputRef,
+    toggle,
+    setNote,
+    focusNote,
+    read: () => {
+      const choice = question?.choices[choiceRef.current]?.id;
+      const trimmed = sliceWholeCharacters(noteRef.current.trim(), question?.noteMaxLength ?? Infinity);
+      return { ...(choice ? { choice } : {}), ...(hasNote && trimmed ? { note: trimmed } : {}) };
+    },
+    noteHasKeys: (event) => {
+      if (!noteFocusedRef.current) return false;
+      if (event.targetEditable === true && noteInputRef.current?.focused === true) return true;
+      // The note lost the keys without saying so: they are the dialog's, and the note stops showing them.
+      focusNote(false);
+      return false;
+    },
+    handleNoteKey: (event) => {
+      if (!isTabKey(event) && event.name !== "enter" && event.name !== "return") return;
+      event.preventDefault();
+      event.stopPropagation();
+      focusNote(false);
+    },
+    handleKey: (event) => {
+      if (hasNote && isTabKey(event)) {
+        event.preventDefault();
+        focusNote(true);
+        return true;
+      }
+      if (isPlainKey(event, "space")) {
+        event.preventDefault();
+        if (cursorRef.current >= 0) toggle(cursorRef.current);
+        return true;
+      }
+      const move = listCursorMove(event, items.length);
+      if (!move) return false;
+      event.preventDefault();
+      setChoice(move(items, choiceRef.current >= 0 ? choiceRef.current : cursorRef.current));
+      return true;
+    },
+  };
+}
+
+function QuestionFields({
+  question,
+  answer,
+  width,
+  disabled,
+}: {
+  question: ConfirmDialogQuestion;
+  answer: QuestionAnswer;
+  width: number;
+  disabled: boolean;
+}) {
+  const desktop = useUiHost().kind === "desktop-web";
+  const label = t(question.label);
+  return (
+    <Box flexDirection="column">
+      {/* A form label, as a TextField draws its own: bold and a row above its control on the desktop. */}
+      <Box height={1}>
+        <Text fg={colors.textDim} attributes={desktop ? TextAttributes.BOLD : 0}>{label}</Text>
+      </Box>
+      {desktop && <Box height={1} />}
+      <ListView
+        items={answer.items}
+        selectedIndex={answer.choiceIndex}
+        remoteLabel={label}
+        rowGap={0}
+        surface="framed"
+        height={answer.items.length}
+        // Enter answers the dialog, a focused choice too: Space picks or clears it.
+        checkboxRows
+        onSelect={(index) => {
+          if (disabled) return;
+          answer.focusNote(false);
+          answer.toggle(index);
+        }}
+      />
+      {question.notePlaceholder !== undefined && (
+        <>
+          <Box height={1} />
+          <TextField
+            accessibleLabel={t(question.notePlaceholder)}
+            value={answer.note}
+            placeholder={t(question.notePlaceholder)}
+            maxLength={question.noteMaxLength}
+            focused={answer.noteFocused}
+            inputRef={answer.noteInputRef}
+            disabled={disabled}
+            width={desktop ? undefined : width}
+            onMouseDown={() => answer.focusNote(true)}
+            onBlur={() => answer.focusNote(false)}
+            onChange={answer.setNote}
+          />
+        </>
+      )}
+    </Box>
   );
 }
 
@@ -158,8 +411,43 @@ export async function confirmDialog(
   const confirmed = await dialog.prompt<boolean>({
     closeOnClickOutside,
     content: (context) => <ConfirmDialog {...context} {...props} />,
-  }).catch(() => false);
+  }).catch(logFailure("ui.confirm-dialog", "Open confirm dialog failed", false));
   return confirmed === true;
+}
+
+/**
+ * A confirmDialog that asks `question` under its body: the answer when the
+ * person confirms, empty when they skipped the question, and null when they
+ * cancelled (Cancel, Esc, a click outside or a failed dialog).
+ */
+export async function confirmDialogWithAnswer(
+  dialog: DialogApi,
+  { closeOnClickOutside = true, ...props }: ConfirmDialogOptions & { question: ConfirmDialogQuestion },
+): Promise<ConfirmDialogAnswer | null> {
+  let answer: ConfirmDialogAnswer = {};
+  const confirmed = await dialog.prompt<boolean>({
+    closeOnClickOutside,
+    content: (context) => <ConfirmDialog {...context} {...props} onAnswer={(next) => { answer = next; }} />,
+  }).catch(logFailure("ui.confirm-dialog", "Open confirm dialog failed", false));
+  return confirmed === true ? answer : null;
+}
+
+/**
+ * A confirm whose two buttons are both ways on (an offer's accept and its
+ * continue): "confirm" or "cancel" for the button pressed, null when the
+ * person stepped out instead (Esc, a click outside, the desktop close button,
+ * a failed dialog).
+ */
+export async function confirmDialogChoice(
+  dialog: DialogApi,
+  { closeOnClickOutside = true, ...props }: ConfirmDialogOptions,
+): Promise<"confirm" | "cancel" | null> {
+  const answer = await dialog.prompt<boolean>({
+    closeOnClickOutside,
+    content: (context) => <ConfirmDialog {...context} {...props} escapeLeaves />,
+  }).catch(logFailure("ui.confirm-dialog", "Open confirm dialog failed"));
+  if (answer === true) return "confirm";
+  return answer === false ? "cancel" : null;
 }
 
 function renderBody(body: ReactNode | string | string[]): ReactNode {

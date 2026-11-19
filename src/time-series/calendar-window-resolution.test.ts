@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, setSystemTime, test } from "bun:test";
 import { createSnapshotDataProvider } from "../market-data/snapshot-provider";
 import { buildComparisonChartPreset } from "../plugins/builtin/chart-composer/presets";
 import { loadChartPaneModel } from "../plugins/builtin/chart-composer/headless";
@@ -9,6 +9,7 @@ import { resolveChartSpecData } from "./resolve";
 import { ChartResolveCache } from "./resolve-context";
 import type { ChartResolutionSupport } from "./resolution";
 import { createTestHeadlessContext } from "../test-support/headless";
+import { applyChartComposerCapabilityOptions } from "../plugins/builtin/chart-composer/cli-options";
 
 const history = Array.from({ length: 368 }, (_, index) => ({
   date: new Date(Date.UTC(2025, 8, 14 + index)), close: 100 + index,
@@ -18,6 +19,35 @@ const noLive = createTestDataProvider({
   getQuote: async () => { throw Error("Unexpected live quote"); },
   getTickerFinancials: async () => { throw Error("Unexpected live financials"); },
   getDetailedPriceHistory: async () => { throw Error("Unexpected live history"); },
+});
+
+test("an open-ended comparison follows its last data date through serialization, without changing pinned windows", async () => {
+  const daily = ["2026-07-01", "2026-11-13", "2026-11-16"].map((date, index) => ({ date: new Date(date), close: 100 + index }));
+  const provider = createTestDataProvider({
+    getQuoteMetadata: async (symbol) => ({ symbol, currency: "USD", instrumentType: "ETF" }),
+    getChartResolutionSupport: () => [{ resolution: "1d", maxRange: "5Y" }],
+    getDetailedPriceHistory: async () => daily,
+  });
+  try {
+    setSystemTime(new Date("2026-11-17T04:00:00Z"));
+    for (const to of [undefined, "2026-11-16", "2026-11-17"]) {
+      const spec = applyChartComposerCapabilityOptions(buildComparisonChartPreset(["QQQ:XNAS", "SPY:XNYS"]), "price-comparison",
+        { from: "2026-07-01", ...(to ? { to } : {}) });
+      const reopened = parseChartSpec(serializeChartSpec(spec))!;
+      const model = await loadChartPaneModel(reopened, context(provider));
+      expect(model.errors).toEqual([]);
+      expect(model.chart.viewport?.end.toISOString().slice(0, 10)).toBe(to ?? "2026-11-16");
+      expect(model.series.every((entry) => entry.points.at(-1)?.date.toISOString().startsWith("2026-11-16"))).toBe(true);
+      if (!to) {
+        const pinned = await resolveChartSpecData(reopened, { dataProvider: provider }, new ChartResolveCache(), {
+          requestViewport: { start: new Date("2026-07-01"), end: new Date("2026-11-17") },
+        });
+        expect(pinned.viewport?.end.toISOString().slice(0, 10)).toBe("2026-11-17");
+      }
+    }
+  } finally {
+    setSystemTime();
+  }
 });
 
 for (const start of ["2026-08-15", "2025-09-16", "2025-09-15"]) {
@@ -45,8 +75,10 @@ for (const start of ["2026-08-15", "2025-09-16", "2025-09-15"]) {
       expect(Date.parse(request.start)).toBeLessThanOrEqual(Date.parse(start));
       if (start === "2025-09-15") expect(request.start).toBe("2025-09-15T00:00:00.000Z");
     }
+    // An authored --from is measured from the close before it, where the loaded bars reach back to one.
+    const base = start === "2025-09-15" ? start : new Date(Date.parse(start) - 86_400_000).toISOString().slice(0, 10);
     for (const series of model.series) {
-      expect(series.points[0]?.date.toISOString().slice(0, 10)).toBe(start);
+      expect(series.points[0]?.date.toISOString().slice(0, 10)).toBe(base);
       expect(series.points.at(-1)?.date.toISOString()).toBe("2026-09-15T00:00:00.000Z");
     }
     const snapshot = JSON.parse(JSON.stringify(model.snapshot), (_key, value) =>
@@ -124,7 +156,8 @@ for (const resolution of ["auto", "1d"] as const) for (const dailyMax of ["1Y", 
     expect(oneShot.errors).toEqual([]);
     expect(new Set(requests)).toEqual(new Set([expected]));
     if (dailyMax === "1Y") {
-      expect(settled.priceComparison?.start).toBe(Date.parse("2025-09-15"));
+      // From the close before 15 Sep, which the 1Y daily history reaches.
+      expect(settled.priceComparison?.start).toBe(Date.parse("2025-09-14"));
       expect(settled.priceComparison?.end).toBe(Date.parse("2026-09-15"));
     }
   });

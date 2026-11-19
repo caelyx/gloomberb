@@ -1,6 +1,7 @@
 import type { MarketContext } from "../types";
 import type { NormalizedPaneFunctionOptions } from "./capabilities";
 import type { ResolvedPaneFunction } from "./resolver";
+import type { PaneFunctionCatalog } from "./catalog";
 import { buildHeadlessFunctionReport } from "./headless";
 import { appendDomReportFooter, buildDomFunctionReport, domReportNote, domReportView } from "./dom";
 import type { ReportFreshness } from "./freshness";
@@ -52,6 +53,12 @@ export function resolvePaneFunctionReportSource(
   return resolved.capability.reportReadiness === "live-dom" ? "dom" : null;
 }
 
+/** `gloom catalog tsa`, the query quoted when it has spaces. */
+function catalogCommand(rawArg: string): string {
+  const arg = rawArg.trim();
+  return ["gloom catalog", arg && /\s/.test(arg) ? JSON.stringify(arg) : arg].filter(Boolean).join(" ");
+}
+
 /** `gloom shot CAT santander`, the argument quoted when it has spaces. */
 function shotCommand(token: string, rawArg: string): string {
   const arg = rawArg.trim();
@@ -62,6 +69,8 @@ export async function buildFunctionReport(
   resolved: ResolvedPaneFunction,
   context: MarketContext,
   rawArg: string,
+  /** The functions the report was resolved among, for a note that offers others (ASKG behind its wall). */
+  catalog?: PaneFunctionCatalog,
 ): Promise<PaneFunctionReport> {
   const startedAt = performance.now();
   const source = resolvePaneFunctionReportSource(resolved);
@@ -69,6 +78,10 @@ export async function buildFunctionReport(
     // HELP is what a newcomer tries first: send them to the command guide and the function list.
     if (resolved.pane.id === "help") {
       throw new Error("HELP is an in-app pane, so it has no report. For the commands run `gloom help`; for the functions run `gloom catalog`.");
+    }
+    // The data catalog's search is `gloom catalog`'s, which lists the functions and series a word finds and what it cannot.
+    if (resolved.pane.id === "data-catalog") {
+      throw new Error(`${resolved.token} is the in-app data catalog, so it has no report. Search it from the terminal with \`${catalogCommand(rawArg)}\`.`);
     }
     // A pane `shot` can draw is still one command away.
     const screenshot = resolved.capability.screenshotReadiness;
@@ -83,7 +96,7 @@ export async function buildFunctionReport(
 
   const report = source === "headless"
     ? await buildHeadlessFunctionReport(resolved, context, rawArg)
-    : await buildDomFunctionReport(resolved, context, rawArg);
+    : await buildDomFunctionReport(resolved, context, rawArg, catalog);
   const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
   report.data = { ...report.data, source, elapsedMs };
   // A report about one symbol names it on every exported row; a chart's series name their own.

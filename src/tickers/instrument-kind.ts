@@ -148,18 +148,59 @@ export function isCryptoVenuePerpetual(type: string | null | undefined, name: st
   return classifyInstrumentType(type) === "crypto" && /\(derivatives\)/i.test(name ?? "");
 }
 
+/** An exchange-traded fund's intraday indicative value as an index feed lists it, under the fund's own name: ^ARKK-IV. */
+export function isIndicativeValueListing(symbol: string | null | undefined, type?: string | null): boolean {
+  return /^\^[A-Z0-9.]{1,10}-IV$/i.test(parsePublicTickerKey(symbol ?? "").symbol) || normalizeInstrumentType(type) === "INDICATIVEVALUE";
+}
+
 /**
- * A listing's type, in plain words where the provider's type misleads (a
- * perpetual typed as a coin). `detail` says what it is not, for a report line.
+ * A crypto venue's copy of a fund's or a company's price: a token on its
+ * shares ("... Tokenized ETF (Ondo)", typed as a coin) or a perpetual on it
+ * ("... ETF (Derivatives)"). Neither is a listing of the fund or the company.
+ * A fund or share whose own name says tokenized is a listing.
+ */
+export function isCryptoVenueCopy(type: string | null | undefined, name: string | null | undefined): boolean {
+  return normalizeInstrumentType(type) === "TOKENIZEDPRODUCT"
+    || (classifyInstrumentType(type) === "crypto" && /\btokeni[sz]ed\b/i.test(name ?? ""))
+    || (isCryptoVenuePerpetual(type, name) && /\b(?:ETFS?|ETNS?|FUNDS?|TRUST|SHARES?|STOCK)\b/i.test(name ?? ""));
+}
+
+/**
+ * A quote type's code in the words the other types are written in ("Common
+ * Stock", "Depositary Receipt"), so one search lists one vocabulary. A generic
+ * EQUITY is any share, a receipt's too, so it reads as Stock, never Common
+ * Stock. A broker's own codes (STK, CASH) stay as the broker files them.
+ */
+const TYPE_CODE_WORDS: Record<string, string> = {
+  EQUITY: "Stock",
+  CRYPTOCURRENCY: "Cryptocurrency",
+  INDEX: "Index",
+  FUTURE: "Future",
+  MUTUALFUND: "Mutual Fund",
+  MONEYMARKET: "Money Market Fund",
+  CURRENCY: "Currency",
+  OPTION: "Option",
+};
+
+/**
+ * A listing's type, in plain words: a provider's type code as the words the
+ * others use, and where the type misleads (a perpetual typed as a coin), what
+ * it is. `detail` says what it is not, for a report line.
  */
 export function instrumentTypeLabel(
   type: string | null | undefined,
   name: string | null | undefined,
-  options: { detail?: boolean } = {},
+  options: { detail?: boolean; symbol?: string } = {},
 ): string | undefined {
+  if (isIndicativeValueListing(options.symbol, type)) return options.detail ? "Indicative value (the fund's intraday estimate, not a listing)" : "Indicative value";
+  if (normalizeInstrumentType(type) !== "TOKENIZEDPRODUCT" && /\btokeni[sz]ed\b/i.test(name ?? "") && classifyInstrumentType(type) === "crypto") {
+    return options.detail ? "Tokenized product (a crypto token, not the listing)" : "Tokenized product";
+  }
   if (isCryptoVenuePerpetual(type, name)) {
     return options.detail ? "Perpetual futures price (24/7 on crypto venues; not the listed future, not spot)" : "Perpetual futures price";
   }
   if (classifyInstrumentType(type) === "perpetual") return "Perpetual futures";
-  return type?.trim() || undefined;
+  const written = type?.trim();
+  // Only a code: a type written in words ("Equity Fund") stays as written.
+  return (written && written === written.toUpperCase() ? TYPE_CODE_WORDS[written] : undefined) ?? (written || undefined);
 }

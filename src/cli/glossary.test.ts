@@ -4,25 +4,25 @@ import { GLOSSARY, lookupGlossary, reportGlossary } from "./glossary";
 const terms = (entries: readonly { term: string }[]) => entries.map((entry) => entry.term);
 
 test("a term is found by its name, abbreviation or another name, whatever its case and punctuation", () => {
-  // The stop-out is the high yield; the column that compares it with the average comes with it.
+  // The stop-out is the high yield; the column that compares it with the median comes with it, and the after view's percentile of it.
   expect(lookupGlossary("Stop Out")).toEqual(lookupGlossary("stop-out"));
   expect(terms(lookupGlossary("stop-out").exact)).toEqual(["High yield"]);
-  expect(terms(lookupGlossary("stop-out").partial)).toEqual(["Stop-out vs average"]);
+  expect(terms(lookupGlossary("stop-out").partial)).toEqual(["Stop-out vs median", "Auction percentile"]);
   expect(lookupGlossary("b/c")).toEqual({ exact: [GLOSSARY.find((entry) => entry.short === "B/C")!], partial: [] });
   expect(terms(lookupGlossary("dealers").exact)).toEqual(["Dealer"]);
-  expect(terms(lookupGlossary("discount").partial)).toEqual(["High discount margin", "Premium/discount", "ADR premium"]);
+  expect(terms(lookupGlossary("discount").partial)).toEqual(["Discount rate", "High discount margin", "Premium/discount", "ADR premium"]);
   // Carry is no entry of its own, but the basis trade it names is: found as a related term.
   expect(terms(lookupGlossary("carry").exact)).toEqual([]);
   expect(terms(lookupGlossary("carry").partial)).toEqual(["Futures basis"]);
   // Every name leads to one entry, so a lookup never has to pick between two.
   const keys = GLOSSARY.flatMap((entry) => [...new Set([entry.term, entry.short, ...entry.aliases].filter(Boolean)
-    .map((name) => name!.toLowerCase().replace(/[^a-z0-9]/g, "")))]);
+    .map((name) => name!.toLowerCase().replace(/²/g, "2").replace(/[^a-z0-9]/g, "")))]);
   expect(keys.filter((key, index) => keys.indexOf(key) !== index)).toEqual([]);
 });
 
 test("a report explains the terms its own function shows, read as whole labels", () => {
   const auctions = [
-    "Date        Type  Term     Rate  Stop-out vs avg (bp)   B/C  Indirect  Direct  Dealer   Size  CUSIP",
+    "Date        Type  Term     Rate  Stop-out vs median (bp)   B/C  Indirect  Direct  Dealer   Size  CUSIP",
     "2026-10-08  Bill  4-Week  4.048%                  1.5  2.40     57.3%   30.0%   12.7%  $110B  912797VW4",
     "2026-09-23  FRN   1-Year 10-Month  4.0bp            -  2.63     59.1%   30.0%   10.9%   $28B  91282CRD5",
     "",
@@ -30,7 +30,7 @@ test("a report explains the terms its own function shows, read as whole labels",
   ].join("\n");
   // A Bill row's rate is an investment rate and an FRN's a discount margin; no Note row, no high yield.
   expect(terms(reportGlossary("AUCT", `\x1b[1m${auctions}\x1b[0m`))).toEqual([
-    "Bid-to-cover", "Indirect", "Direct", "Dealer", "Stop-out vs average", "Investment rate", "High discount margin",
+    "Bid-to-cover", "Indirect", "Direct", "Dealer", "Stop-out vs median", "Investment rate", "High discount margin",
     "Term", "CUSIP", "Bill", "FRN", "Basis point",
   ]);
   // `bp` inside `4.0bp` is a unit, not the heading GC's `Chg bp` is; another function's terms stay out.
@@ -74,12 +74,13 @@ test("a term's related terms hold its word whole; a word no term names still fin
   // `float` is the float of a stock: the floating rate note only starts with the same letters, so it is not related.
   const float = lookupGlossary("float");
   expect([...terms(float.exact), ...terms(float.partial)]).toEqual(["Float"]);
-  // Target and Drift hold "weight" whole; WIRP's Monthly-weighted method only starts with it.
-  expect(terms(lookupGlossary("weight").partial)).toEqual(["Target", "Drift"]);
+  // Target, Drift and the 13F weight hold "weight" whole; WIRP's Monthly-weighted method only starts with it.
+  expect(terms(lookupGlossary("weight").partial)).toEqual(["Target", "Drift", "13F weight"]);
   expect(terms(lookupGlossary("settle").partial)).toEqual([]);
   // A plural holds its word whole; a search that names no term keeps the word starts after the whole words.
-  expect(terms(lookupGlossary("asset").partial)).toEqual(["Fed assets", "NAV"]);
-  expect(terms(lookupGlossary("vol").partial)).toEqual(["Average daily volume", "VVIX", "Short volume", "Term structure", "Contango/backwardation (VIX)", "DVOL"]);
+  expect(terms(lookupGlossary("asset").partial)).toEqual(["Fed assets", "NAV", "Asset manager/institutional"]);
+  expect(terms(lookupGlossary("vol").partial)).toEqual(["Average daily volume", "VVIX", "Leveraged and inverse ETFs", "Short volume", "Term structure", "Contango/backwardation (VIX)",
+    "25-delta implied volatility", "DVOL"]);
   expect(["short interest", "shares short", "short ratio", "dtc", "settlement date", "crowded rising", "short squeeze", "% float"].map((query) => terms(lookupGlossary(query).exact)))
     .toEqual([["Short interest"], ["Short interest"], ["Days to cover"], ["Days to cover"], ["Settlement"], ["Crowded"], ["Squeeze"], ["Float"]]);
   // Borrow data is not offered, so it has no entry to define.
@@ -102,7 +103,7 @@ test("ADR's ratio, premium and implied rate and the peso's CCL and MEP are found
     "Implied USD/ARS  1,651.28 (CCL)",
     "Spot USD/ARS     1,529.00 (official wholesale)",
     "ADR vs home      -7.4% discount (at spot)",
-    "Ratio            1 ADR = 10 ordinary shares",
+    "Ratio            1 ADR = 10 shares",
   ].join("\n");
   expect(terms(reportGlossary("ADR", report))).toEqual(["ADR ratio", "ADR premium", "Implied FX", "Contado con liquidación"]);
 });
@@ -203,7 +204,11 @@ test("the bond fund and muni words are found by plain names, and DVD explains th
   ]);
   const tey = GLOSSARY.find((entry) => entry.term === "Tax-equivalent yield")!;
   expect(tey.definition).toContain("yield / (1 - (federal rate + state rate))");
-  expect(tey.definition).toContain("MUB's 4.04% is 6.83%");
+  // An example with numbers says when they were: they move with the market.
+  expect(tey.definition).toContain("MUB's SEC yield of 3.7955% on 2026-11-04 was 6.41%");
+  expect(["NIIT", "net investment income tax", "AMT", "private activity bonds", "amt free"].map(exact)).toEqual([
+    ["Net investment income tax"], ["Net investment income tax"], ["Alternative minimum tax"], ["Alternative minimum tax"], ["Alternative minimum tax"],
+  ]);
   expect(GLOSSARY.find((entry) => entry.term === "Muni/Treasury ratio")!.definition).toContain("MMD or BVAL, which are licensed");
   const report = [
     "Forward distribution yield (not SEC yield)   3.27% (latest distribution annualized, as of 2026-10-01)",
@@ -215,6 +220,10 @@ test("the bond fund and muni words are found by plain names, and DVD explains th
   ].join("\n");
   expect(terms(reportGlossary("DVD", report))).toEqual([
     "SEC yield", "Yield to worst", "Distribution yield", "Duration", "Tax-equivalent yield", "Muni/Treasury ratio",
+  ]);
+  // A ranking with --tax-rate heads its columns with the short names.
+  expect(terms(reportGlossary("DVD", "Ticker  Yield TTM  SEC yield  YTW  Duration  TEY  Muni/Tsy  Tenor"))).toEqual([
+    "SEC yield", "Yield to worst", "Duration", "Tax-equivalent yield", "Muni/Treasury ratio",
   ]);
   // A stock's DVD report prints none of them.
   expect(reportGlossary("DVD", "Trailing yield  2.24% (last 12 months of distributions)\nForward yield  2.26%")).toEqual([]);
@@ -249,4 +258,67 @@ test("COT's words are found by plain names and explained from the classes and co
   // The disaggregated report's classes are its own.
   expect(terms(reportGlossary("COT", "Class  Net\nManaged Money  +1\nProducer/Merchant  -1\nSwap Dealers  +2\nOther Reportables  0")))
     .toEqual(["Net position", "Managed money", "Producer/merchant", "Swap dealers", "Other reportables"]);
+  // So are the TFF report's, and the options it can count.
+  expect(terms(reportGlossary("COT", "Class  Net\nLeveraged Funds  +1\nAsset Manager/Institutional  -1\nDealer/Intermediary  +2\nFutures + options")))
+    .toEqual(["Net position", "Leveraged funds (COT)", "Asset manager/institutional", "Dealer/intermediary", "Futures and options combined"]);
+});
+
+test("a leveraged ETF's words find the ETF entry first, the COT class only beside it, and ETF and CMP explain it from their reports", () => {
+  for (const query of ["leveraged", "inverse", "decay", "daily reset", "3x", "-3x"]) expect(terms(lookupGlossary(query).exact)).toEqual(["Leveraged and inverse ETFs"]);
+  expect(terms(lookupGlossary("leveraged").partial)).toEqual(["Leveraged funds (COT)"]);
+  expect(terms(lookupGlossary("leveraged funds").exact)).toEqual(["Leveraged funds (COT)"]);
+  expect(terms(reportGlossary("ETF", "Objective  3× daily, long · 2026-11-09"))).toEqual(["Leveraged and inverse ETFs"]);
+  expect(terms(reportGlossary("CMP", "TQQQ decay vs 3× daily QQQ  -1.95  pp"))).toEqual(["Leveraged and inverse ETFs"]);
+  expect(terms(reportGlossary("CMP", "TQQQ:XNAS Close  -23.36  %"))).toEqual([]);
+});
+
+test("CRYP's stablecoin words are found by plain names and explained from what its stablecoin list prints", () => {
+  const exact = (query: string) => terms(lookupGlossary(query).exact);
+  expect(["depeg", "off peg", "24h low", "Low UTC", "total supply", "supply share"].map(exact))
+    .toEqual([["Off peg"], ["Off peg"], ["24h low/high"], ["24h low/high"], ["Supply"], ["Share"]]);
+  const stablecoins = [
+    "Total supply 299.41B · 7D -4.61B (-1.52%) · 30D -9.28B (-3.01%) · as of 2026-11-02",
+    " #  Coin   Name       Price USD  Peg       Off peg  24h low  Low UTC    24h high  High UTC   Supply  Supply 7D %  Share",
+    "12  USDY   Ondo US    1.1511     USD yield       —   1.1508  Tue 16:00    1.1520  Tue 17:45       —            —      —",
+  ].join("\n");
+  expect(terms(reportGlossary("CRYP", stablecoins))).toEqual(["Off peg", "24h low/high", "Supply", "Share"]);
+  // The coin list prints none of them.
+  expect(reportGlossary("CRYP", " #  Coin  Name     Price USD  Chg % UTC  7D %  Market cap USD")).toEqual([]);
+});
+
+// `catalog glossary TVL` found only Share, and `fn CRYP tvl --explain` said CRYP shows no glossary terms.
+test("TVL is a term of its own, found by its abbreviation and explained from what CRYP's DeFi list prints", () => {
+  expect(terms(lookupGlossary("TVL").exact)).toEqual(["Total value locked"]);
+  expect(terms(lookupGlossary("total value locked").exact)).toEqual(["Total value locked"]);
+  // What is counted and what is not: deposits counted once, bridged and liquid-staked assets left out.
+  expect(lookupGlossary("TVL").exact[0]!.definition).toMatch(/Each deposit counts once:.*liquid staking, bridges and borrowed amounts are left out/);
+  const defi = [
+    "Total DeFi TVL 78.92B · 7D -2.99B (-3.65%) · 30D -11.00B (-12.24%) · as of 2026-11-09 UTC close · DefiLlama, daily since 2018-02-11",
+    "#  Protocol   Category        TVL USD    1D %        7D    7D %     30D    30D %  Chains",
+  ].join("\n");
+  expect(terms(reportGlossary("CRYP", defi))).toEqual(["Total value locked"]);
+});
+
+// `catalog glossary AMC` found nothing, and `fn 13F --explain` said 13F shows no glossary terms.
+test("ERN's timing labels and the 13F report's words are found by the labels they print, and 13F explains its own", () => {
+  const exact = (query: string) => terms(lookupGlossary(query).exact);
+  expect(["AMC", "bmo", "DMH", "13F", "QoQ", "Est P&L", "13F %"].map(exact)).toEqual([
+    ["After market close"], ["Before market open"], ["During market hours"], ["13F"], ["Quarter over quarter"], ["Estimated P&L"], ["13F"],
+  ]);
+  const report = "Berkshire Hathaway 13F, Q2 2026\nTicker  13F %  Shares  QoQ  Est P&L\nAAPL    22.0%  227.9M  -7%  +$9.1B";
+  expect(reportGlossary("13F", report).map((entry) => entry.term)).toEqual(["13F", "13F weight", "Quarter over quarter", "Estimated P&L"]);
+  expect(reportGlossary("ERN", "2026-11-09  AMC  1.47").map((entry) => entry.term)).toEqual(["After market close"]);
+});
+
+test("PORT's risk words are found by the names a reader types, R² with or without its superscript", () => {
+  const exact = (query: string) => terms(lookupGlossary(query).exact);
+  expect(["beta", "R²", "r2", "r-squared", "weak fit", "var", "VaR 95%", "expected shortfall", "hhi", "herfindahl"].map(exact))
+    .toEqual([["Beta"], ["R²"], ["R²"], ["R²"], ["R²"], ["Value at risk"], ["Value at risk"], ["Value at risk"], ["HHI"], ["HHI"]]);
+  const report = "Metric  Value  Evidence\n1D VaR 95% (60D)  1.19%  historical\nMarket (SPY)  0.54 beta  60 sessions\nHHI  0.20  4.9 effective holdings\nFactor  Value  R²";
+  expect(terms(reportGlossary("PORT", report))).toEqual(["Beta", "R²", "Value at risk", "HHI"]);
+  // MARS opens the same report on its risk view: `fn MARS --explain` said it showed no terms.
+  const risk = "risk\n60D max drawdown  -7.23%\n1D VaR 95% (60D)  1.90%\n60D tracking error  7.83%\n\nstress\nIndex -10%  -9.96%";
+  expect(terms(reportGlossary("MARS", risk))).toEqual(["Value at risk", "Max drawdown", "Stress test", "Tracking error"]);
+  expect(["drawdown", "max drawdown", "stress test", "scenarios", "active risk"].map(exact))
+    .toEqual([["Max drawdown"], ["Max drawdown"], ["Stress test"], ["Stress test"], ["Tracking error"]]);
 });

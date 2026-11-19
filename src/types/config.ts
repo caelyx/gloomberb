@@ -1,6 +1,7 @@
 import type { Portfolio, Watchlist } from "./ticker";
 import type { BrokerContractRef, TickerListingRef } from "./instrument";
 import type { LanguagePreference } from "../i18n/languages";
+import { buildDockStack } from "../layout/pane-manager/dock-stack";
 
 export const CURRENT_CONFIG_VERSION = 28;
 
@@ -42,15 +43,8 @@ export type PaneBinding =
 export interface DockedPlacementMemory {
   path?: Array<0 | 1>;
   anchorInstanceId?: string;
-  position?: "left" | "right" | "above" | "below";
-}
-
-/**
- * Where a pane sat docked in the window it was last moved out of, so moving
- * it back puts it there again. `windowId` is "main" for the main window.
- */
-export interface WindowPlacementMemory extends DockedPlacementMemory {
-  windowId: string;
+  /** "tab": a tab of the stack `anchorInstanceId` is in. */
+  position?: "left" | "right" | "above" | "below" | "tab";
 }
 
 export interface FloatingPlacementMemory {
@@ -71,7 +65,6 @@ export interface PanePlacementMemory {
   docked?: DockedPlacementMemory;
   floating?: FloatingPlacementMemory;
   detached?: DetachedPlacementMemory;
-  window?: WindowPlacementMemory;
 }
 
 /**
@@ -110,6 +103,25 @@ export interface PaneInstanceConfig {
   locked?: boolean;
   /** Set by Move to New Layout and cleared by Move Back; never published. */
   movedFrom?: PaneMovedFrom;
+  /** Set when a follower was pinned on its ticker; read only while it follows nothing. Never published. */
+  unlinkedFrom?: PaneUnlinkedFrom;
+}
+
+/**
+ * The link a follower left when it was pinned on the ticker it showed. Its title says so
+ * (`AAPL  ⧉ Unlinked`) until it is linked again.
+ */
+export interface PaneUnlinkedFrom {
+  /** The pane it followed. */
+  instanceId: string;
+  /** That pane's kind (`portfolio-list`), so a research pane can follow a new one of it. */
+  paneId?: string;
+  /**
+   * The app cut the link, not the user: the source closed or left the layout, or another
+   * research pane took it. A research pane pinned this way follows again once its source, or
+   * one of that kind, is in the layout with no research pane of its own (`relinkPinnedResearchPanes`).
+   */
+  auto?: true;
 }
 
 interface DockPaneNode {
@@ -123,6 +135,11 @@ export interface DockSplitNode {
   ratio: number;
   first: DockLayoutNode;
   second: DockLayoutNode;
+  /**
+   * Set on every split of a stack of tabs, with the pane it shows: the panes
+   * under it share one spot (see layout/pane-manager/dock-stack.ts).
+   */
+  tabs?: { active: string };
 }
 
 export type DockLayoutNode = DockPaneNode | DockSplitNode;
@@ -134,6 +151,11 @@ export interface FloatingPaneEntry {
   width: number;
   height: number;
   zIndex?: number;
+  /**
+   * Floating windows stacked as tabs share this key and one rect; the one
+   * in front (highest z) is shown (layout/pane-manager/floating-stack.ts).
+   */
+  stack?: string;
 }
 
 interface DetachedPaneEntry {
@@ -144,24 +166,11 @@ interface DetachedPaneEntry {
   height: number;
 }
 
-/**
- * A desktop window beside the main one with a grid of its own. Its panes are
- * instances of the same layout; the window only says where they sit. Its frame
- * is kept per machine, not here.
- */
-export interface SecondaryWindowLayout {
-  id: string;
-  dockRoot: DockLayoutNode | null;
-  floating: FloatingPaneEntry[];
-}
-
 export interface LayoutConfig {
   dockRoot: DockLayoutNode | null;
   instances: PaneInstanceConfig[];
   floating: FloatingPaneEntry[];
   detached: DetachedPaneEntry[];
-  /** Secondary desktop windows; missing means none. Renderers without desktop windows keep them untouched. */
-  windows?: SecondaryWindowLayout[];
 }
 
 /**
@@ -199,6 +208,8 @@ export type OnboardingStage =
   | "portfolio"
   | "add-ticker"
   | "desks"
+  /** "Which tickers do you follow?", after the desks, in the `tickers` arm of first_run_tickers. */
+  | "tickers"
   | "research"
   | "verify"
   | "account"
@@ -215,8 +226,20 @@ export interface OnboardingProgress {
   positionsImported?: number;
   accountStatus?: "signed-in" | "skipped";
   checkoutOpenedAt?: string;
-  /** Desks picked at "What do you trade?", in the order picked; empty when skipped. */
+  /** Desks picked at "What do you trade most?", in the order picked; empty when skipped. */
   desks?: string[];
+  /**
+   * Opened again from Settings (Run Setup Again) after setup was done: every
+   * step can be left, and the layouts are rebuilt in place.
+   */
+  rerun?: boolean;
+  /**
+   * This first run left "What do you hold?" holding nothing on a build that
+   * asks "Which tickers do you follow?". Only such a run is put in the
+   * first_run_tickers experiment, so an install that began setup on an
+   * earlier build never sees the step.
+   */
+  asksTickers?: boolean;
 }
 
 /**
@@ -253,8 +276,19 @@ export interface TelemetryConfig {
    * both off; absent means on.
    */
   usage?: boolean;
-  /** Ticker-level research counts. Only an explicit true opts in; absent is OFF. */
+  /**
+   * Ticker-level research counts (Attention Counts). On by default: `false`
+   * turns them off and `true` is an explicit on. While unset, an account is
+   * counted only once this installation has shown it the one-time notice.
+   * Cloud sync carries only whether it is off, so an off reaches the
+   * account's other devices.
+   */
   attention?: boolean;
+  /**
+   * The accounts this installation has shown the Attention Counts notice to,
+   * oldest first. Kept on this device; never synced or sent.
+   */
+  attentionNoticeShownTo?: string[];
 }
 
 /**
@@ -366,11 +400,32 @@ export interface AppConfig {
    */
   timezone?: string;
   /**
+   * The decimal mark CSV exports write numbers with, the CLI's and the app's:
+   * `comma` writes `17,2` with cells split by `;`, as a spreadsheet in a
+   * decimal-comma locale reads them. Absent is the dot. Text and JSON keep
+   * the dot. Kept on this machine only.
+   */
+  csvDecimal?: "comma" | "dot";
+  /**
    * Presentation mode: the panes fill the window, without the header or the
    * status bar, for a screen that is shown rather than worked at. Absent is off.
    */
   presentationMode?: boolean;
+  /**
+   * The market the header shows. Absent until the user picks one: the
+   * benchmark of this machine's time zone. Kept on this machine only.
+   */
+  headerMarket?: HeaderMarketChoice;
+  /**
+   * The strip above the layout that says what moved in the user's portfolios
+   * and watchlists since their last visit. `false` turns it off; absent means
+   * on. Kept on this machine only.
+   */
+  sinceLastVisit?: boolean;
 }
+
+/** A benchmark the header offers, by its id (`hang-seng`), or any listing the user searched for. */
+export type HeaderMarketChoice = { benchmark: string } | { symbol: string; exchange?: string };
 
 export const TICKER_RESEARCH_PANE_ID = "ticker-research";
 export const LEGACY_TICKER_DETAIL_PANE_ID = "ticker-detail";
@@ -630,6 +685,7 @@ function cloneDockNode(node: DockLayoutNode): DockLayoutNode {
     ratio: node.ratio,
     first: cloneDockNode(node.first),
     second: cloneDockNode(node.second),
+    ...(node.tabs ? { tabs: { active: node.tabs.active } } : {}),
   };
 }
 
@@ -651,6 +707,14 @@ function normalizeDockNode(
 
   if ((node as DockSplitNode).kind !== "split") return null;
   const split = node as DockSplitNode;
+  if (split.tabs) {
+    // Whatever is under a stack is its tabs, nested or not: a pane put back
+    // at a place inside it (its remembered spot) joins it.
+    const plain: DockSplitNode = { kind: "split", axis: split.axis, ratio: split.ratio, first: split.first, second: split.second };
+    const flat = normalizeDockNode(plain, validInstanceIds, seenPaneIds);
+    const active = typeof split.tabs.active === "string" ? split.tabs.active : null;
+    return flat ? buildDockStack(getDockedPaneIdsFromNode(flat), active) : null;
+  }
   const first = normalizeDockNode(split.first, validInstanceIds, seenPaneIds);
   const second = normalizeDockNode(split.second, validInstanceIds, seenPaneIds);
   if (!first && !second) return null;
@@ -681,65 +745,7 @@ export function getPlacedPaneInstanceIds(layout: LayoutConfig): string[] {
     ...getDockedPaneIdsFromNode(layout.dockRoot),
     ...layout.floating.map((entry) => entry.instanceId),
     ...(layout.detached ?? []).map((entry) => entry.instanceId),
-    ...(layout.windows ?? []).flatMap((window) => [
-      ...getDockedPaneIdsFromNode(window.dockRoot),
-      ...window.floating.map((entry) => entry.instanceId),
-    ]),
   ])];
-}
-
-function cloneSecondaryWindow(window: SecondaryWindowLayout): SecondaryWindowLayout {
-  return {
-    id: window.id,
-    dockRoot: window.dockRoot ? cloneDockNode(window.dockRoot) : null,
-    floating: window.floating.map((entry) => ({ ...entry })),
-  };
-}
-
-/** `{ windows }` when there are any, so a layout without windows keeps its shape. */
-function windowsField(windows: SecondaryWindowLayout[]): Pick<LayoutConfig, "windows"> {
-  return windows.length > 0 ? { windows } : {};
-}
-
-/**
- * Window docks normalised after the main dock, sharing its seen set so a pane
- * docked in two places keeps the first. A repeated window id keeps the first.
- */
-function normalizeWindowDocks(
-  windows: SecondaryWindowLayout[] | undefined,
-  validInstanceIds: Set<string>,
-  seenPaneIds: Set<string>,
-): SecondaryWindowLayout[] {
-  const seenWindowIds = new Set<string>();
-  const result: SecondaryWindowLayout[] = [];
-  for (const window of windows ?? []) {
-    if (!window || typeof window.id !== "string" || window.id.length === 0 || seenWindowIds.has(window.id)) continue;
-    seenWindowIds.add(window.id);
-    result.push({
-      id: window.id,
-      dockRoot: normalizeDockNode(window.dockRoot, validInstanceIds, seenPaneIds),
-      floating: Array.isArray(window.floating) ? window.floating : [],
-    });
-  }
-  return result;
-}
-
-/** Keeps each window's floating panes that are valid and not already placed, first place wins. */
-function filterWindowFloating(
-  windows: SecondaryWindowLayout[],
-  validInstanceIds: Set<string>,
-  placedPaneIds: Set<string>,
-): SecondaryWindowLayout[] {
-  return windows.map((window) => ({
-    ...window,
-    floating: window.floating
-      .filter((entry) => {
-        if (!validInstanceIds.has(entry.instanceId) || placedPaneIds.has(entry.instanceId)) return false;
-        placedPaneIds.add(entry.instanceId);
-        return true;
-      })
-      .map((entry) => ({ ...entry })),
-  }));
 }
 
 export function createPaneInstanceId(paneId: string): string {
@@ -762,7 +768,6 @@ export function clonePlacementMemory(memory: PanePlacementMemory | undefined): P
     } : undefined,
     floating: memory.floating ? { ...memory.floating } : undefined,
     detached: memory.detached ? { ...memory.detached } : undefined,
-    ...(memory.window ? { window: { ...memory.window, path: memory.window.path ? [...memory.window.path] : undefined } } : {}),
   };
 }
 
@@ -871,28 +876,20 @@ export function removePaneInstances(layout: LayoutConfig, instanceIds: Iterable<
         anchorInstanceId: undefined,
       };
       const nextDocked = docked.path || docked.position ? docked : undefined;
-      const placementMemory = nextDocked || memory.floating || memory.detached || memory.window
+      const placementMemory = nextDocked || memory.floating || memory.detached
         ? { ...memory, docked: nextDocked }
         : undefined;
       return { ...instance, placementMemory };
     });
-  const dockedPaneIds = new Set<string>();
-  const dockRoot = normalizeDockNode(layout.dockRoot, validInstanceIds, dockedPaneIds);
-  const windowDocks = normalizeWindowDocks(layout.windows, validInstanceIds, dockedPaneIds);
+  const dockRoot = normalizeDockNode(layout.dockRoot, validInstanceIds, new Set<string>());
+  const dockedPaneIds = new Set(getDockedPaneIdsFromNode(dockRoot));
   const detached = layout.detached ?? [];
-  const floating = layout.floating.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId));
-  const windows = windowDocks.map((window) => ({
-    ...window,
-    floating: window.floating.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId)),
-  }));
-  const { windows: _previousWindows, ...rest } = layout;
   return {
-    ...rest,
+    ...layout,
     instances,
     dockRoot,
-    floating,
+    floating: layout.floating.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId)),
     detached: detached.filter((entry) => !removedIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId)),
-    ...windowsField(windows),
   };
 }
 
@@ -926,6 +923,11 @@ export function normalizePaneLayout(
     resolveOrphanSymbol?: (instanceId: string) => string | null;
     /** Pins an orphaned follower on its last symbol; by default only its binding changes. */
     pinOrphan?: (instance: PaneInstanceConfig, symbol: string | null) => PaneInstanceConfig;
+    /**
+     * Panes outside this layout that a pane here may follow: on another
+     * desktop window's tab. A link to one is not orphaned.
+     */
+    externalSourceIds?: ReadonlySet<string>;
   },
 ): LayoutConfig {
   const fallbackSourceId = options?.defaultFollowSourceInstanceId ?? null;
@@ -955,7 +957,11 @@ export function normalizePaneLayout(
     const orphanPins = new Map<string, PaneInstanceConfig>();
 
     for (const instance of nextLayout.instances) {
-      if (instance.binding?.kind === "follow" && !validInstanceIds.has(instance.binding.sourceInstanceId)) {
+      if (
+        instance.binding?.kind === "follow"
+        && !validInstanceIds.has(instance.binding.sourceInstanceId)
+        && !options?.externalSourceIds?.has(instance.binding.sourceInstanceId)
+      ) {
         // Structural helpers remove the source before the app can resolve its last ticker. Preserve
         // the dangling binding until the runtime normalizes again with a resolver.
         if (!options?.resolveOrphanSymbol) continue;
@@ -998,10 +1004,8 @@ export function normalizePaneLayout(
   }
 
   const validInstanceIds = new Set(nextLayout.instances.map((instance) => instance.instanceId));
-  // One place per pane: main dock, window docks, detached, main floating, then window floating.
-  const dockedPaneIds = new Set<string>();
-  const dockRoot = normalizeDockNode(nextLayout.dockRoot, validInstanceIds, dockedPaneIds);
-  const windowDocks = normalizeWindowDocks(nextLayout.windows, validInstanceIds, dockedPaneIds);
+  const dockRoot = normalizeDockNode(nextLayout.dockRoot, validInstanceIds, new Set<string>());
+  const dockedPaneIds = new Set(getDockedPaneIdsFromNode(dockRoot));
   const detached = (nextLayout.detached ?? [])
     .filter((entry) => validInstanceIds.has(entry.instanceId) && !dockedPaneIds.has(entry.instanceId))
     .filter((entry, index, entries) => entries.findIndex((candidate) => candidate.instanceId === entry.instanceId) === index)
@@ -1012,12 +1016,7 @@ export function normalizePaneLayout(
       width: entry.width,
       height: entry.height,
     }));
-  const placedPaneIds = new Set([...dockedPaneIds, ...detached.map((entry) => entry.instanceId)]);
-  const floating = nextLayout.floating
-    .filter((entry) => validInstanceIds.has(entry.instanceId) && !placedPaneIds.has(entry.instanceId))
-    .map((entry) => ({ ...entry }));
-  for (const entry of floating) placedPaneIds.add(entry.instanceId);
-  const windows = filterWindowFloating(windowDocks, validInstanceIds, placedPaneIds);
+  const detachedPaneIds = new Set(detached.map((entry) => entry.instanceId));
 
   return {
     dockRoot,
@@ -1029,9 +1028,14 @@ export function normalizePaneLayout(
       placementMemory: clonePlacementMemory(instance.placementMemory),
       ...(instance.movedFrom ? { movedFrom: clonePaneMovedFrom(instance.movedFrom) } : {}),
     })),
-    floating,
+    floating: nextLayout.floating
+      .filter((entry) => (
+        validInstanceIds.has(entry.instanceId)
+        && !dockedPaneIds.has(entry.instanceId)
+        && !detachedPaneIds.has(entry.instanceId)
+      ))
+      .map((entry) => ({ ...entry })),
     detached,
-    ...windowsField(windows),
   };
 }
 
@@ -1049,7 +1053,6 @@ export function cloneLayout(layout: LayoutConfig): LayoutConfig {
     })),
     floating: layout.floating.map((entry) => ({ ...entry })),
     detached: detached.map((entry) => ({ ...entry })),
-    ...windowsField((layout.windows ?? []).map(cloneSecondaryWindow)),
   };
 }
 

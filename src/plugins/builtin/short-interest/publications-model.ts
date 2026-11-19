@@ -1,7 +1,7 @@
 import type { DataTableColumn } from "../../../components";
 import type { HeadlessPaneColumn } from "../../../types/plugin";
 import type { PublicationKind, PublicationPayload } from "./publications-client";
-import { formatCompact } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact } from "../../../utils/format";
 
 export interface PublicationRow {
   id: string;
@@ -13,9 +13,9 @@ export interface PublicationColumn extends DataTableColumn {
   detailLabel: string;
   format?: (value: string | number | null) => string;
 }
-const shares = (value: string | number | null) => value == null ? "--" : formatCompact(Number(value), { fixedDecimals: true });
-const percentage = (value: string | number | null) => value == null ? "--" : `${Number(value).toFixed(2)}%`;
-const price = (value: string | number | null) => value == null ? "--" : `$${Number(value).toFixed(2)}`;
+const shares = (value: string | number | null) => value == null ? MISSING_VALUE : formatCompact(Number(value), { fixedDecimals: true });
+const percentage = (value: string | number | null) => value == null ? MISSING_VALUE : `${Number(value).toFixed(2)}%`;
+const price = (value: string | number | null) => value == null ? MISSING_VALUE : `$${Number(value).toFixed(2)}`;
 const FTD_COLUMNS: PublicationColumn[] = [
   { id: "date", label: "SETTLEMENT", detailLabel: "Settlement date", width: 12, align: "left" },
   { id: "quantity", label: "FAIL SHARES", detailLabel: "Outstanding fail shares", width: 14, align: "right", format: shares },
@@ -32,14 +32,35 @@ const ATS_COLUMNS: PublicationColumn[] = [
   { id: "atsTrades", label: "ATS TRADES", detailLabel: "ATS trades", width: 14, align: "right", format: shares },
   { id: "nonAtsTrades", label: "NON-ATS TRADES", detailLabel: "Non-ATS trades", width: 16, align: "right", format: shares },
 ];
-export const publicationColumns = (kind: PublicationKind) => kind === "ftd" ? FTD_COLUMNS : ATS_COLUMNS;
+/**
+ * What every fail row names: one CUSIP and one security, as a ticker with a
+ * single issue has. A shared value is said once above the table (and in the
+ * export's notes), not on every row; a ticker with several CUSIPs, or a
+ * security the filings spell differently over time, keeps the column.
+ */
+interface FailIdentity {
+  cusip: string | null;
+  security: string | null;
+}
+const NO_IDENTITY: FailIdentity = { cusip: null, security: null };
+export function sharedFailIdentity(rows: readonly PublicationRow[]): FailIdentity {
+  const shared = (id: "cusip" | "description"): string | null => {
+    const values = new Set(rows.map((row) => row[id]));
+    const [value] = values;
+    return values.size === 1 && typeof value === "string" && value.trim() ? value : null;
+  };
+  return rows.length ? { cusip: shared("cusip"), security: shared("description") } : NO_IDENTITY;
+}
+export const publicationColumns = (kind: PublicationKind, shared: FailIdentity = NO_IDENTITY) => kind === "ftd"
+  ? FTD_COLUMNS.filter((column) => !(column.id === "cusip" && shared.cusip) && !(column.id === "description" && shared.security))
+  : ATS_COLUMNS;
 export function publicationRows(data: PublicationPayload): PublicationRow[] {
   return data.history.toReversed().map((row) => "cusip" in row
     ? { ...row, id: `${row.date}:${row.cusip}` }
     : { ...row, id: row.weekStart, date: row.weekStart });
 }
 export const publicationCell = (column: PublicationColumn, value: string | number | null) =>
-  column.format ? column.format(value) : String(value ?? "--");
+  column.format ? column.format(value) : String(value ?? MISSING_VALUE);
 /** Reports retain exact quantities; compact display values are never the exported data. */
 export function publicationReportColumns(kind: PublicationKind): HeadlessPaneColumn[] {
   return publicationColumns(kind).map((column) => ({

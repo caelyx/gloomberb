@@ -3,18 +3,27 @@ import { CloudApiSocket } from "./socket";
 import { getServerClockOffsetMs, resetServerClockForTests } from "../market-data/quotes/clock";
 import type { CloudQuotePayload, QuoteStreamTarget } from "./types";
 import { createTestSocketDeps, installTestWebSocket, type TestWebSocket } from "../test-support/cloud-api";
+import { debugLog } from "../utils/debug-log";
 
 const originalWebSocket = globalThis.WebSocket;
+/** Every socket a test opens: one left open past its test would reconnect into the next file's. */
+const opened: CloudApiSocket[] = [];
 let sockets: TestWebSocket[] = [];
 
+function track(socket: CloudApiSocket): CloudApiSocket {
+  opened.push(socket);
+  return socket;
+}
+
 afterEach(() => {
+  for (const socket of opened.splice(0)) socket.dispose();
   globalThis.WebSocket = originalWebSocket;
   resetServerClockForTests();
 });
 
 function createSocket() {
   sockets = installTestWebSocket(0);
-  const socket = new CloudApiSocket(createTestSocketDeps());
+  const socket = track(new CloudApiSocket(createTestSocketDeps()));
   const received: Array<{ target: QuoteStreamTarget; quote: CloudQuotePayload }> = [];
   socket.subscribeQuotes(
     [{ symbol: "AAPL", exchange: "NASDAQ" }, { symbol: "MSFT", exchange: "NASDAQ" }],
@@ -67,7 +76,7 @@ test("measures how far the server clock runs ahead from ready and batch stamps",
 
 test("a perpetual listing reaches the server only once it offers perpetual markets", () => {
   sockets = installTestWebSocket(0);
-  const socket = new CloudApiSocket(createTestSocketDeps());
+  const socket = track(new CloudApiSocket(createTestSocketDeps()));
   socket.subscribeQuotes([{ symbol: "AAPL", exchange: "NASDAQ" }, { symbol: "BTC", exchange: "HYPERLIQUID" }], () => {});
   const ws = sockets.at(-1)!;
   ws.open();
@@ -91,7 +100,7 @@ test("a perpetual listing reaches the server only once it offers perpetual marke
 
 test("the app streams one budget of perpetual listings across every pane, those on screen first", async () => {
   sockets = installTestWebSocket(0);
-  const socket = new CloudApiSocket(createTestSocketDeps());
+  const socket = track(new CloudApiSocket(createTestSocketDeps()));
   const coins = Array.from({ length: 70 }, (_, index) => `C${index}`);
   // A board's rows off screen, then a watchlist's rows on screen.
   socket.subscribeQuotes(coins.slice(0, 65).map((symbol) => ({ symbol, exchange: "HYPERLIQUID" })), () => {});
@@ -119,4 +128,25 @@ test("the app streams one budget of perpetual listings across every pane, those 
   await Bun.sleep(50);
   expect(replay().size).toBe(60);
   expect([...streamed].sort()).toEqual(coins.slice(0, 60).sort());
+});
+
+test("the debug log names the first few symbols of a long subscription, not all of them", async () => {
+  sockets = installTestWebSocket(0);
+  const socket = track(new CloudApiSocket(createTestSocketDeps()));
+  const symbols = Array.from({ length: 300 }, (_, index) => `S${index}`);
+  const before = debugLog.getEntries({ source: "cloud-api" }).length;
+  socket.subscribeQuotes(symbols.map((symbol) => ({ symbol, exchange: "NASDAQ" })), () => {});
+  const ws = sockets.at(-1)!;
+  ws.open();
+  ws.receive({ type: "ready", user: null, serverTime: Date.now(), features: ["market.batch"] });
+  await Bun.sleep(50);
+
+  // The server still gets every symbol.
+  expect(ws.sent.filter((message) => message.type === "market.subscribe").flatMap((message) => message.symbols)).toHaveLength(300);
+  const logged = debugLog.getEntries({ source: "cloud-api" }).slice(before)
+    .filter((entry) => entry.message === "register quote listeners" || entry.message === "send websocket message");
+  expect(logged.length).toBeGreaterThanOrEqual(2);
+  for (const entry of logged) expect(JSON.stringify(entry.data).length).toBeLessThan(600);
+  expect(logged.find((entry) => entry.message === "register quote listeners")?.data)
+    .toEqual({ count: 300, symbols: { count: 300, first: ["S0:NASDAQ", "S1:NASDAQ", "S2:NASDAQ", "S3:NASDAQ", "S4:NASDAQ"] } });
 });

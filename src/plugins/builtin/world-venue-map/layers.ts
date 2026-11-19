@@ -3,6 +3,7 @@
  * caps, the view a request covers, and plain-value formatting shared by the
  * pane, the terminal map and the headless report.
  */
+import { formatShortDate } from "../../../utils/datetime-format";
 import {
   GEO_MAX_LIVE_LAYERS,
   type GeoBbox,
@@ -19,6 +20,7 @@ import { unprojectWorldPoint, type WorldMapViewport } from "./model";
 
 export const LAYERS_SETTING_KEY = "layers";
 export const VENUES_SETTING_KEY = "venues";
+export const HOME_AREA_SETTING_KEY = "mapHomeArea";
 /** Layers that refresh on their own (ships, flights) are the expensive ones. */
 const MAX_LIVE_LAYERS = GEO_MAX_LIVE_LAYERS;
 const MAX_DATA_LAYERS = 4;
@@ -123,17 +125,31 @@ export function resolveActiveLayers(tokens: readonly string[], layers: readonly 
 export interface MapPreset {
   layers: string[];
   venues: boolean;
+  place?: string;
 }
 
 /**
- * `MAP ships` and friends: the typed words become layer tokens, resolved once
- * the catalog is known. `MAP venues` alone is the venue map without layers.
+ * Layers lead the argument; the remaining text names a place, keeping its commas.
  */
-export function parseMapPreset(arg: string | null | undefined): MapPreset | null {
-  const tokens = parseLayerTokens(arg ?? "");
-  const venues = /\bvenues\b/i.test(arg ?? "");
-  if (!tokens.length) return venues ? { layers: [], venues: true } : null;
-  return { layers: tokens, venues };
+export function parseMapPreset(arg: string | null | undefined, catalog: readonly GeoLayerInfo[] = []): MapPreset | null {
+  const text = arg?.trim() ?? "";
+  if (!text) return null;
+  const known = new Set([
+    "venues", "ships", "ports", "energy", "air", "infrastructure", "facilities",
+    "vessels", "chokepoints", "airports", "flights", "pipelines", "oil-gas-fields", "terminals",
+    ...catalog.flatMap((layer) => [layer.id.toLowerCase(), String(layer.group).toLowerCase()]),
+  ]);
+  const layers: string[] = [];
+  let venues = false;
+  let rest = text;
+  while (rest) {
+    const token = /^[^\s,;+]+/.exec(rest)?.[0]?.toLowerCase();
+    if (!token || !known.has(token)) break;
+    if (token === "venues") venues = true;
+    else if (!layers.includes(token)) layers.push(token);
+    rest = rest.slice(token.length).replace(/^[\s,;+]+/, "");
+  }
+  return { layers, venues: venues || !layers.length, ...(rest ? { place: rest } : {}) };
 }
 
 export const MAP_PRESET_OPTIONS = [
@@ -142,12 +158,13 @@ export const MAP_PRESET_OPTIONS = [
   { value: "ports", label: "Ports" },
   { value: "energy", label: "Pipelines, fields and terminals" },
   { value: "air", label: "Airports and flights" },
+  { value: "facilities", label: "AI buildout facilities" },
 ] as const;
 
 function shortDate(iso: string): string | null {
   const time = Date.parse(iso);
   if (!Number.isFinite(time)) return null;
-  return new Date(time).toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+  return formatShortDate(time, { year: false, utc: true });
 }
 
 /**
@@ -176,7 +193,7 @@ export function layerCoverageNote(layer: Pick<GeoLayerInfo, "id" | "name" | "asO
 function asOfDate(iso: string): string | null {
   const time = Date.parse(iso);
   if (!Number.isFinite(time)) return null;
-  return new Date(time).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+  return formatShortDate(time, { utc: true });
 }
 
 /** Status and cadence in plain words, for the layer picker. */
@@ -219,17 +236,23 @@ export function readVenuesSetting(settings: Record<string, unknown> | undefined,
 
 /**
  * The layer picker in the pane settings: venues, then one list per group with
- * each layer's cadence and status. Without a catalog there is nothing to add,
- * so a server without geo layers shows the settings it always had.
+ * each layer's cadence and status. Home area also works without a catalog.
  */
 export function buildMapSettingsDef(
   settings: Record<string, unknown>,
   layers: readonly GeoLayerInfo[] | null | undefined,
-): PaneSettingsDef | undefined {
-  if (!layers?.length) return undefined;
+): PaneSettingsDef {
+  layers ??= [];
   const active = resolveActiveLayers(activeLayerTokens(settings, layers), layers);
   const values: Record<string, unknown> = { [VENUES_SETTING_KEY]: readVenuesSetting(settings, active.length) };
   const fields: PaneSettingField[] = [{
+    key: HOME_AREA_SETTING_KEY,
+    label: "Home area",
+    description: "New maps start here. Place name or latitude,longitude; blank for world.",
+    type: "text",
+    storage: "plugin",
+    placeholder: "Sydney or 51.5,-0.1",
+  }, {
     key: VENUES_SETTING_KEY,
     label: "Venues",
     description: "Trading venues with open or closed status.",
@@ -260,6 +283,7 @@ export function applyMapSetting(
   value: unknown,
   layers: readonly GeoLayerInfo[],
 ): Record<string, unknown> {
+  if (key === HOME_AREA_SETTING_KEY) return { ...settings, [key]: value };
   const before = resolveActiveLayers(activeLayerTokens(settings, layers), layers);
   // The first edit of a plain map writes down what it showed, so only the edited part changes.
   const chosen = isPlainMap(settings)
@@ -327,6 +351,22 @@ export function geoViewForViewport(
 export function entityOpenZoom(layer: Pick<GeoLayerInfo, "geometry" | "minZoom">): number {
   const base = layer.geometry === "point" ? 16 : 4;
   return layer.minZoom === undefined ? base : Math.max(base, 2 ** layer.minZoom);
+}
+
+/** Below this span a frame is a region, not a street: one facility shows its surroundings. */
+const FRAME_MIN_SPAN_DEGREES = 6;
+const FRAME_MAX_ZOOM = 8;
+
+/** The centre and zoom that frame a set of places (a linked company's facilities); null without one. */
+export function framePlaces(places: readonly { lon: number; lat: number }[]): { longitude: number; latitude: number; zoom: number } | null {
+  const located = places.filter((place) => Number.isFinite(place.lon) && Number.isFinite(place.lat));
+  if (!located.length) return null;
+  const lons = located.map((place) => place.lon);
+  const lats = located.map((place) => place.lat);
+  const west = Math.min(...lons), east = Math.max(...lons), south = Math.min(...lats), north = Math.max(...lats);
+  // The map is about twice as wide as tall, so latitude counts double; a margin keeps edge markers inside.
+  const span = Math.max(east - west, (north - south) * 2, FRAME_MIN_SPAN_DEGREES) * 1.5;
+  return { longitude: (west + east) / 2, latitude: (south + north) / 2, zoom: Math.min(FRAME_MAX_ZOOM, Math.max(1, 360 / span)) };
 }
 
 /**

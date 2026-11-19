@@ -1,8 +1,8 @@
-import { createContext, useContext, type ComponentType, type ReactNode, type Ref } from "react";
+import { createContext, useCallback, useContext, type ComponentType, type ReactNode, type Ref } from "react";
 import type { ContextMenuItem } from "../types/context-menu";
 import type { AppNotificationRequest } from "../types/plugin";
 import { getShortcutDisplayMode } from "../utils/shortcut-labels";
-import { formatAdvertisedChord, useKeybindings } from "../app/keybindings";
+import { formatAdvertisedChord, formatShortcutForHost, useKeybindings } from "../app/keybindings";
 import type { AsciiFontName } from "./ascii-font";
 
 export const TextAttributes = {
@@ -82,6 +82,8 @@ export interface ChartVectorShape {
   gradient?: readonly string[];
   /** Opacity of the whole shape, so others can recede behind a highlighted one. */
   opacity?: number;
+  /** Text set just above the shape's first point, such as a retracement level's ratio and price. */
+  label?: string;
 }
 
 interface TextEditBuffer {
@@ -165,6 +167,8 @@ interface ScrollBarRenderable {
   visible: boolean;
   /** Terminal only: whether a click on the bar moves the keyboard focus to it. */
   focusable?: boolean;
+  /** Terminal only: shows the bar again while the content overflows, after `visible` was set. */
+  resetVisibilityControl?(): void;
   on?(event: "change", handler: () => void): void;
   off?(event: "change", handler: () => void): void;
 }
@@ -202,6 +206,8 @@ export interface InputRenderable {
   setCursorOffset?(offset: number): void;
   focus?(): void;
   blur?(): void;
+  /** Whether the field has the keyboard now: the keys typed go to it. */
+  readonly focused?: boolean;
 }
 
 export interface TextareaRenderable extends InputRenderable {
@@ -263,6 +269,20 @@ export interface NativePaneImage {
   cells?: { cols: number; rows: number; cells: NativeFrameCell[] };
 }
 
+/**
+ * What the frame on screen drew on top, cell by cell: kitty images are drawn
+ * out of band, so the terminal image layer reads this to keep each image under
+ * whatever covers it.
+ */
+export interface NativeFrameHits {
+  /** The renderable drawn last at a cell of the frame on screen, or null. */
+  at(x: number, y: number): unknown;
+  /** Whether a renderable fills its cells (a background), rather than only grouping or writing over others. */
+  paints(renderable: unknown): boolean;
+  /** Whether a renderable is still in the tree the terminal draws. */
+  attached(renderable: unknown): boolean;
+}
+
 /** The last frame the terminal renderer drew, as styled rows. */
 export interface NativeFrameCapture {
   cols: number;
@@ -300,6 +320,8 @@ export interface NativeRendererHost {
   removePostProcessFn?(processFn: NativePostProcessFn): void;
   /** Terminal renderers only. Kitty graphics are drawn out of band and come back as blank cells. */
   captureFrame?(): NativeFrameCapture | null;
+  /** Terminal renderers only: what each cell of the frame on screen drew on top. */
+  frameHits?: NativeFrameHits;
   /**
    * Terminal renderers only: a PNG of a rectangle of the frame shown now, in
    * cells, its characters drawn in a bundled font and its kitty images put back.
@@ -373,6 +395,17 @@ export interface ImageSurfaceProps extends BoxProps {
   src?: string;
   alt?: string;
   objectFit?: "contain" | "cover";
+  /**
+   * Draw `children` until the image has loaded, not only without a `src` or
+   * once it fails, so a box that waits on a picture shows its stand-in rather
+   * than an empty one. The terminal always does.
+   */
+  fallbackWhileLoading?: boolean;
+  /**
+   * A colour behind the picture once it has loaded (a logo made for a light
+   * page), never behind `children`. The terminal draws none.
+   */
+  imageBackground?: string;
 }
 export interface MediaSurfaceProps extends BoxProps {
   src?: string;
@@ -449,6 +482,8 @@ interface HostTabItem {
   value: string;
   /** Artwork before the label, such as a logo; decoration only. */
   leading?: ReactNode;
+  /** The key the label starts with (`⌘1 `), hidden on a touch screen. */
+  keyPrefix?: string;
   disabled?: boolean;
   reorderable?: boolean;
   onClose?: (value: string) => void;
@@ -508,6 +543,7 @@ export interface HostCheckboxProps {
 interface HostQueryBarOption {
   value: string;
   label: string;
+  group?: string;
   description?: string;
   disabled?: boolean;
   selected: boolean;
@@ -527,6 +563,10 @@ export interface HostQueryBarItem {
   narrowing: boolean;
   /** Short exclusive choice drawn as inline segments instead of a menu. */
   inline?: boolean;
+  /** Inline: a long list that runs past the bar's edge, drawn as a strip that scrolls by itself rather than folding into its menu. */
+  scrolls?: boolean;
+  /** Toggles: a shorter label for a bar short of room. */
+  short?: string;
   /** Text filters: the live input, rendered by the kit, and its field state. */
   node?: ReactNode;
   active?: boolean;
@@ -556,10 +596,16 @@ export interface HostQueryBarProps {
     value: string;
     options: { value: string; label: string; hint?: string; disabled?: boolean }[];
     onChange(value: string): void;
+    /** Drawn first, where a tab row starts: a nested tab strip. */
+    start?: boolean;
+    /** What the choice is ("Interval"), for a screen reader and its folded menu; "View" when unnamed. */
+    label?: string;
   };
   onClearAll?: () => void;
-  /** Muted context at the right edge, e.g. the selected row's date. */
+  /** Muted context at the right edge, e.g. the selected row's date. Gives way first. */
   meta?: string;
+  /** The date the data is as of: its own segment before `meta` that never gives way; inline filters collapse to menus first. */
+  asOf?: string;
   /** Drawn before the search and filters, e.g. the ticker the list is about. */
   leading?: ReactNode;
   /** Opens one item's menu, e.g. from a pane shortcut. The token changes per request. */
@@ -679,6 +725,10 @@ export interface UiHost {
   DialogFrame?: ComponentType<any>;
   /** Props are `DialogActionsProps` from components/ui/dialog-actions. */
   DialogActions?: ComponentType<any>;
+  /** Props are `KeyHintProps` from components/ui/key-hints. */
+  KeyHint?: ComponentType<any>;
+  /** Props are `KeyHintsProps` from components/ui/key-hints. */
+  KeyHints?: ComponentType<any>;
   PageStackView?: ComponentType<any>;
   Tabs?: ComponentType<HostTabsProps>;
   Checkbox?: ComponentType<HostCheckboxProps>;
@@ -706,8 +756,17 @@ export interface SaveTextFileRequest {
 
 export interface RendererHost {
   requestExit(): void;
-  startWindowDrag?(): Promise<void> | void;
+  /** False where the app cannot quit itself (a browser tab): Quit is not offered. */
+  canExit?: boolean;
+  /**
+   * From a press on a title bar. `press.detail` counts the clicks: where the
+   * system's title bars maximize on a double-click, the second press does that
+   * instead of moving the window.
+   */
+  startWindowDrag?(press?: { detail?: number }): Promise<void> | void;
   controlWindow?(action: "minimize" | "toggle-maximize" | "close"): Promise<void> | void;
+  /** From a press on the page's top edge, where its own window frame has none to pull. */
+  startWindowResize?(edge: "top" | "top-left" | "top-right"): Promise<void> | void;
   /**
    * Opens a link in the person's browser. Resolves false when no browser could
    * be shown from here (a terminal over SSH, or no opener installed), so the
@@ -720,6 +779,8 @@ export interface RendererHost {
   saveTextFile?(request: SaveTextFileRequest): Promise<string>;
   supportsNativeDesktopNotifications?: boolean;
   notify(notification: AppNotificationRequest): void;
+  notifyInBackground?(notification: AppNotificationRequest): boolean;
+  subscribeAppActivity?(listener: (active: boolean) => void): () => void;
   showContextMenu?(items: ContextMenuItem[]): Promise<boolean>;
   playTerminalMedia?(url: string, title?: string, options?: { muted?: boolean }): Promise<void>;
   /** Stop terminal playback started by `playTerminalMedia`. */
@@ -730,6 +791,7 @@ interface UiHostContextValue {
   ui: UiHost;
   renderer: RendererHost;
   nativeRenderer: NativeRendererHost;
+  cellGrid: number;
 }
 
 const noopNativeRenderer: NativeRendererHost = {
@@ -749,15 +811,22 @@ export function UiHostProvider({
   ui,
   renderer,
   nativeRenderer = noopNativeRenderer,
+  cellGrid = 0,
   children,
 }: {
   ui: UiHost;
   renderer: RendererHost;
   nativeRenderer?: NativeRendererHost;
+  /**
+   * Changes with the host's cell size (the DOM's follows the font size). The
+   * context carries it so every kit element, memoized ones included, and every
+   * reader of `cellWidthPx` renders again on the new grid.
+   */
+  cellGrid?: number;
   children: ReactNode;
 }) {
   return (
-    <UiHostContext value={{ ui, renderer, nativeRenderer }}>
+    <UiHostContext value={{ ui, renderer, nativeRenderer, cellGrid }}>
       {children}
     </UiHostContext>
   );
@@ -794,6 +863,19 @@ export function useActionShortcut(actionId: string): string {
   // still gets a label rather than an error.
   const kind = useContext(UiHostContext)?.ui.kind;
   return formatAdvertisedChord(keybindings, actionId, getShortcutDisplayMode(kind));
+}
+
+/**
+ * Writes a key named in text (`Ctrl+S`, `Shift+Enter`, `Shift+Left/Right`) the
+ * way this host shows keys: Apple's symbols on a Mac desktop or in a Mac
+ * browser (`⌃S`, `⇧↩`), as written in a terminal and on Windows and Linux.
+ * For any key a pane, hint, tooltip or sentence names that is not a
+ * keybinding action (those come from useActionShortcut).
+ */
+export function useShortcutLabel(): (text: string) => string {
+  const kind = useContext(UiHostContext)?.ui.kind;
+  const mode = getShortcutDisplayMode(kind);
+  return useCallback((text: string) => formatShortcutForHost(text, mode), [mode]);
 }
 
 export function useRendererHost(): RendererHost {

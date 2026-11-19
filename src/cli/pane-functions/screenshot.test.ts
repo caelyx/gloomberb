@@ -1,11 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
 import type { RemoteUiNodeSnapshot } from "../../remote/types";
-import { assessPaneScreenshot, filledKeyValueCount, isPaneScreenshotUsable, missingActiveTabSelections, shotTableRows } from "./screenshot-assessment";
+import {
+  assessPaneScreenshot, filledKeyValueCount, isPaneScreenshotUsable, liveDomRowCount, missingActiveTabSelections, shotCutColumnsWarning, shotLoadedNothing,
+  shotShowsText, shotTableRows, essentialFigureMismatches,
+} from "./screenshot-assessment";
 import { buildDesktopShotPayload } from "./screenshot-payload";
 import { chartSeriesEvidenceWithinRange, chartEvidenceMismatchesFor } from "./screenshot-chart-evidence";
 import { createDesktopShotBridge, resolveDesktopShotApiProxy, stripDesktopShotCredentials } from "./screenshot-bridge";
 import { shotDataEvidenceFor, shotExpectedText, shotSemanticRowCount, shotUnavailableSymbols } from "./screenshot-data-evidence";
-import { shotFreshness, shownReportTab } from "./screenshot-render";
+import { shotFreshness, shotHasStatusLine, shownReportTab, unreadRowsNote } from "./screenshot-render";
 import type { PaneScreenshotExpectedChartEvidence, PaneScreenshotExpectedSelection } from "./screenshot-types";
 import { paneEvidenceMismatches } from "./screenshot-evidence";
 import { shotRowsText } from "./index";
@@ -13,10 +16,19 @@ import { commoditiesEnergyModule } from "../../plugins/builtin/commodities-energ
 import { realizedVolSemanticEvidence } from "../../plugins/builtin/realized-vol/evidence";
 import { coneChartSeries, realizedChartSeries } from "../../plugins/builtin/realized-vol/chart-model";
 import { collectShotSymbols } from "./data";
-import type { DesktopPaneShotPayload, DesktopPaneShotRenderResult } from "../desktop-pane-shot";
+import { paneStateMarkers, shotStatusDateClipped, type DesktopPaneShotPayload, type DesktopPaneShotRenderResult } from "../desktop-pane-shot";
 import type { ResolvedPaneFunction } from "./resolver";
 import { buildCustomChartPreset } from "../../plugins/builtin/chart-composer/presets";
 import { CHART_COMPOSER_PANE_ID, createDefaultConfig } from "../../types/config";
+
+test("a dropped essential figure is a screenshot gap even when its table holds the same value", () => {
+  const semanticUi = [{ id: "figures", role: "figure-layout", label: "Essential figures", actions: [],
+    metadata: { figures: [{ label: "Next ex", value: "2026-11-19" }], omitted: ["Next ex"] } }];
+  expect(essentialFigureMismatches({ semanticUi, visibleText: "Next ex 2026-11-19" })).toHaveLength(1);
+  semanticUi[0]!.metadata.omitted = [];
+  expect(essentialFigureMismatches({ semanticUi, visibleText: "Next ex 2026-11-19" })).toEqual([]);
+  expect(essentialFigureMismatches({ semanticUi, visibleText: "Next ex 2026-11…" })).toHaveLength(1);
+});
 import type { MarketContext } from "../types";
 import { createSnapshotDataProvider } from "../../market-data/snapshot-provider";
 import { volatilitySemanticEvidence } from "../../plugins/builtin/volatility/evidence";
@@ -29,12 +41,15 @@ import { draftFromCalculatorInputs } from "../../plugins/builtin/options-calcula
 import { optionsCalculatorHeadless } from "../../plugins/builtin/options-calculator/headless";
 import { valueOption, solveImpliedVolatility } from "../../plugins/builtin/shared/volatility";
 import { loadSeasonalityHistory } from "../../plugins/builtin/seasonality/client";
+import { estimateKellyHistoryInputs, kellyHistoryRequest } from "../../plugins/builtin/kelly-sizer/history";
 import { createTestDataProvider, createTestFinancials, createTestQuote } from "../../test-support/data-provider";
 import { accountManagementModule } from "../../plugins/builtin/account-management";
 import { brokerManagerModule } from "../../plugins/builtin/broker-manager";
 import { changelogModule } from "../../plugins/builtin/changelog";
 import { chartComposerModule } from "../../plugins/builtin/chart-composer";
 import { connectionsModule } from "../../plugins/builtin/connections";
+import { docsModule } from "../../plugins/builtin/docs";
+import { tickerDetailModule } from "../../plugins/builtin/ticker-detail";
 import { helpModule } from "../../plugins/builtin/help";
 import { layoutManagerModule } from "../../plugins/builtin/layout-manager";
 import { pluginMarketplaceModule } from "../../plugins/builtin/plugin-marketplace";
@@ -42,7 +57,23 @@ import { debtMaturitiesModule } from "../../plugins/builtin/debt-maturities";
 import { debtMaturitiesHeadless } from "../../plugins/builtin/debt-maturities/headless";
 import { traceBondsModule } from "../../plugins/builtin/trace-bonds";
 import { traceBondsHeadless } from "../../plugins/builtin/trace-bonds/headless";
-import { deriveCaptureReport } from "./freshness";
+import { deriveCaptureReport, formatFreshnessLine, statusDateEvidence, statusLineVariants } from "./freshness";
+
+test("fitting may shorten status context, but not the as-of date or any source clock", () => {
+  const freshness = { source: "Gloom Cloud", status: "not-a-feed" as const, asOf: "2026-10-30", retrievedAt: "2026-11-17T06:00:00Z" };
+  const dated = { dates: "data" as const, variants: statusLineVariants(freshness), dateEvidence: statusDateEvidence(freshness) };
+  expect(shotStatusDateClipped(dated, "Fri 30 Oct 2026 · not a … settlement)")).toBe(false);
+  expect(shotStatusDateClipped(dated, "Fri 30 Oct … settlement)")).toBe(true);
+  const sources = { ...freshness, asOf: "2026-11-17T06:00:00Z", sources: [
+    { source: "Venue A", asOf: "2026-11-17T06:00:00Z" }, { source: "Venue B", asOf: "2026-11-17T05:45:00Z" },
+  ] };
+  const timed = { ...dated, variants: statusLineVariants(sources), dateEvidence: statusDateEvidence(sources) };
+  expect(shotStatusDateClipped(timed, "Tue 17 Nov 2026 · Venue A 06:00 · Venue B 05:45 UTC · …")).toBe(false);
+  expect(shotStatusDateClipped(timed, "Tue 17 Nov 2026 · Venue A … Venue B 05:45 UTC")).toBe(true);
+});
+import { futuresCurveHeadless } from "../../plugins/builtin/futures-curve/headless";
+import { curveFreshnessObservations, curveReportFreshness } from "../../plugins/builtin/futures-curve/model";
+import type { FuturesContract } from "../../api-client/futures-curve";
 import { MARGIN_PORTFOLIO, MARGIN_TICKERS, marginQuotes } from "../../test-support/margin-account";
 import { noProviderError } from "../../sources/provider-errors";
 import { ApiRequestError } from "../../api-client/errors";
@@ -111,6 +142,19 @@ test("calculator screenshot evidence must match the requested inputs, not just a
   expect(shotUnavailableSymbols(request, source, [])).toEqual(["AAPL"]);
   expect(mismatches(request, source, nodes(), visibleKeyValues.slice(0, 5)))
     .toEqual(["option calculator metrics are clipped or missing: Vega, Rho"]);
+
+  // `shot OVME --symbol SPY` drew Underlying SPY in a text field, whose value is no page text: it read as missing.
+  const assess = (fieldValues?: string[]) => assessPaneScreenshot(request, source, {
+    visibleText: "Options Calculator Type Call Put Underlying Spot 120 Model 21.36 Delta +0.68", ...fieldValues ? { fieldValues } : {},
+    rows: [], truncated: false, truncationReasons: [], loadingStateDetected: false, errorStateDetected: false, errorStateMarkers: [],
+    emptyStateDetected: false, emptyStateMarkers: [], visibleKeyValues, semanticUi: nodes(),
+  }, "", "/tmp/ovme-shot-test.png");
+  const read = assess(["AAPL"]);
+  expect(read).toMatchObject({ semanticMismatch: false, empty: false, render: { missingExpectedText: [] } });
+  expect(assess().render.missingExpectedText).toContain("AAPL");
+  // A field's value is read for the check alone: the result, and so its JSON and print, never carries one.
+  expect(read.render).not.toHaveProperty("fieldValues");
+  expect(JSON.stringify(read)).not.toContain("fieldValues");
 });
 
 // Regression: an overview without fundamentals reported its "-" grid as rows.
@@ -118,6 +162,17 @@ test("counts only labeled values that hold data", () => {
   const row = (label: string, value: string) => ({ label, text: `${label} ${value}` });
   expect(filledKeyValueCount([row("P/E", "-"), row("Beta", "—"), row("Yield", "N/A"), row("EPS", "")])).toBe(0);
   expect(filledKeyValueCount([row("P/E", "-12.5"), row("Sector", "Technology"), row("Beta", "-")])).toBe(2);
+});
+
+// Regression: RETURN's chart view reported its three figures (Total, Best, Worst) as its rows.
+test("a live pane counts its table's rows, else the values its chart plotted, else its labeled values", () => {
+  const figures = ["Total", "Best", "Worst"].map((label) => ({ label, text: `${label} +1.00%` }));
+  const chart = (plottedValueCount: number) => [{ role: "chart-data", metadata: { kind: "returns", version: 1, plottedValueCount } } as RemoteUiNodeSnapshot];
+  const tableRow = { tableIndex: 0, rowIndex: 0, selected: false, cells: [{ columnLabel: "Date", text: "2026-11-04" }] };
+  expect(liveDomRowCount({ rows: [], visibleKeyValues: figures, semanticUi: chart(251) })).toBe(251);
+  expect(liveDomRowCount({ rows: [tableRow], visibleKeyValues: figures, semanticUi: [] })).toBe(1);
+  // A chart with no bars (the window failed to load) leaves the figures to count.
+  expect(liveDomRowCount({ rows: [], visibleKeyValues: figures, semanticUi: chart(0) })).toBe(3);
 });
 
 test("typed option scenario screenshot freezes report inputs without an unrelated market request", async () => {
@@ -237,6 +292,59 @@ describe("realized volatility screenshot history", () => {
     }]]);
     const captured = createSnapshotDataProvider(shot, {} as MarketContext["dataProvider"]);
     expect(await captured.getPriceHistoryForResolution!("AAPL", "NASDAQ", "1Y", "1d")).toEqual(daily);
+  });
+});
+
+describe("KELLY screenshot history", () => {
+  // 6 Nov 2026: the five-year window runs November 2021 to October 2026, measured from October 2021's close.
+  const now = Date.parse("2026-11-06T03:00:00Z");
+  const kelly = {
+    pane: { id: "kelly-sizer" }, capability: { id: "kelly-sizer", options: [] },
+    instance: { instanceId: "kelly:test", paneId: "kelly-sizer", binding: { kind: "none" }, params: { symbol: "AAPL" } },
+    createOptions: { symbol: "AAPL" }, options: {},
+  } as unknown as ResolvedPaneFunction;
+  const weekdays: PricePoint[] = [];
+  for (let time = Date.UTC(2021, 9, 1); time < now - 43_200_000; time += 86_400_000) {
+    const date = new Date(time);
+    if (date.getUTCDay() !== 0 && date.getUTCDay() !== 6) weekdays.push({ date, close: 100 + (date.getUTCMonth() % 3 ? 4 : 0) });
+  }
+  const financials = { quote: { symbol: "AAPL", listingExchangeName: "NASDAQ" }, annualStatements: [], quarterlyStatements: [], priceHistory: [] };
+  const capture = (provider: object) => buildDesktopShotPayload(kelly, {
+    config: createDefaultConfig("/tmp/kelly-shot-test"),
+    store: { loadTicker: async () => null, loadAllTickers: async () => [] },
+    dataProvider: { getTickerFinancials: async () => financials, ...provider },
+  } as unknown as MarketContext, "AAPL", {}, 800, 600, null, 1, null);
+  afterEach(() => setSystemTime());
+
+  test("captures the dated closes the History tab asks for, so it reads the 60 returns the KELLY report does", async () => {
+    setSystemTime(new Date(now));
+    const asked: Array<[Date, Date]> = [];
+    const shot = await capture({
+      async getDetailedPriceHistory(_symbol: string, _exchange: string, start: Date, end: Date) {
+        asked.push([start, end]);
+        return weekdays.filter((point) => point.date >= start && point.date < end);
+      },
+      async getPriceHistoryForResolution() { throw new Error("The trailing range starts after October's close"); },
+    });
+    expect(asked.map(([start]) => start.toISOString())).toEqual(["2021-10-01T00:00:00.000Z"]);
+    // The pane's own request, answered from the capture, reads the same window as the report.
+    const request = kellyHistoryRequest({ symbol: "AAPL", exchange: "NASDAQ" }, 5);
+    const captured = createSnapshotDataProvider(shot, {} as MarketContext["dataProvider"]);
+    const points = await captured.getDetailedPriceHistory!("AAPL", "NASDAQ", request.startDate!, request.endDate!, "1d");
+    expect(estimateKellyHistoryInputs(points, 5, { exchange: "NASDAQ" }))
+      .toMatchObject({ periods: 60, start: "2021-10-29", end: "2026-10-30" });
+  });
+
+  test("a source with no dated history is captured over the trailing range the pane falls back to", async () => {
+    setSystemTime(new Date(now));
+    const trailing = weekdays.filter((point) => point.date >= new Date("2021-11-06"));
+    const calls: unknown[][] = [];
+    const shot = await capture({
+      async getDetailedPriceHistory() { throw new Error("No dated history"); },
+      async getPriceHistoryForResolution(...args: unknown[]) { calls.push(args.slice(0, 4)); return trailing; },
+    });
+    expect(calls).toEqual([["AAPL", "NASDAQ", "5Y", "1d"]]);
+    expect(shot.financials[0]![1].priceHistory).toEqual(trailing);
   });
 });
 
@@ -372,7 +480,7 @@ describe("financial analysis ratio screenshots", () => {
       }))],
     }] : []);
     const render: DesktopPaneShotRenderResult = {
-      visibleText: ["FA MSFT Statement Income Cash Flow Balance Sheet Ratios Ratio", tab.name, "USD · as of 2026-06-30 Annual Quarterly RATIO",
+      visibleText: ["FA MSFT Statement Income Cash Flow Balance Sheet Ratios Ratio", tab.name, "USD Annual Quarterly RATIO FY2026 2026-06-30",
         ...rows.flatMap(({ cells }) => cells.map(({ text }) => text))].join(" "),
       rows, truncated: false, truncationReasons: [], loadingStateDetected: false, errorStateDetected: false, errorStateMarkers: [],
       emptyStateDetected: false, emptyStateMarkers: [], visibleKeyValues: [],
@@ -495,6 +603,38 @@ describe("realized volatility screenshot evidence", () => {
     expect(shotUnavailableSymbols(hvt, source, nodes(cone))).toEqual([]);
   });
 
+  test("a window a short history is too short for leaves the capture whole: HAWK listed in May has no HV180 yet", () => {
+    const windows = { ...request, options: { ...request.options, windows: "10,180" } } as ResolvedPaneFunction;
+    const short = realizedChartSeries({ history: dates.map((date) => ({ date, close: 100 })),
+      rolling: dates.map((date, index) => ({ date, values: { 10: index ? 0.2 : null, 180: null } })), windows: [10, 180], priceUnit: "USD",
+      iv: { value: 0.22, date: new Date(status.currentIv.date), label: status.currentIv.label } }, ["green", "red"], "white");
+    const listed = realizedVolSemanticEvidence(short, { ...status, windows: [10, 180], shortWindows: [180] });
+    expect(listed.complete).toBe(true);
+    expect(shotUnavailableSymbols(windows, source, nodes(listed))).toEqual([]);
+    expect(shotDataEvidenceFor(windows, source, nodes(listed))).not.toBeNull();
+    // A window with no values for any other reason still is not.
+    const failed = realizedVolSemanticEvidence(short, { ...status, windows: [10, 180] });
+    expect(failed.complete).toBe(false);
+    expect(shotUnavailableSymbols(windows, source, nodes(failed))).toEqual(["AAPL"]);
+  });
+
+  test("a chart drawn without the current IV matches its data and is partial for the IV alone", () => {
+    const noIv = realizedChartSeries({ history: dates.map((date) => ({ date, close: 100 })),
+      rolling: dates.map((date, index) => ({ date, values: { 10: index ? 0.2 : null } })), windows: [10], priceUnit: "USD", iv: null },
+    ["green"], "white");
+    const ivErrors = ["Current ATM IV unavailable from cleaned option quotes", "Current ATM IV unavailable"];
+    const drawn = realizedVolSemanticEvidence(noIv, { ...status, currentIv: null, errors: ivErrors, ivErrors });
+    expect(drawn.complete).toBe(false);
+    expect(paneEvidenceMismatches(request, source, { semanticUi: nodes(drawn) })).toEqual([]);
+    expect(shotSemanticRowCount(request, source, nodes(drawn))).toBe(3);
+    // It names what is missing: the IV, not the symbol's data.
+    expect(shotUnavailableSymbols(request, source, nodes(drawn))).toEqual(["AAPL current ATM IV"]);
+    // Any other error beside it still leaves the symbol unavailable.
+    expect(shotUnavailableSymbols(request, source, nodes({ ...drawn, errors: [...ivErrors, "History unavailable"] }))).toEqual(["AAPL"]);
+    // An IV the pane names must still be the point it drew.
+    expect(shotDataEvidenceFor(request, source, nodes({ ...drawn, currentIv: status.currentIv }))).toBeNull();
+  });
+
   test("rejects invented counts, price-only charts, mismatched settings and stale or pending data", () => {
     expect(shotDataEvidenceFor(request, source, [])).toBeNull();
     expect(shotDataEvidenceFor(request, source, nodes({ ...evidence, plottedValueCount: 200 }))).toBeNull();
@@ -530,6 +670,13 @@ describe("pane screenshot rendered readiness", () => {
     expect(isPaneScreenshotUsable({ ...rendered, emptyStateDetected: true })).toBe(false);
   });
 
+  test("a surface to operate needs no rows or empty-state marker, only that it rendered", () => {
+    const layouts = { ...rendered, interactive: true, rowCount: 0, emptyStateDetected: true };
+    expect(isPaneScreenshotUsable(layouts)).toBe(true);
+    expect(isPaneScreenshotUsable({ ...layouts, loadingStateDetected: true })).toBe(false);
+    expect(isPaneScreenshotUsable({ ...layouts, errorStateDetected: true })).toBe(false);
+  });
+
   test("preserves mapped capability completeness and evidence checks", () => {
     expect(isPaneScreenshotUsable({ ...rendered, complete: false })).toBe(false);
     expect(isPaneScreenshotUsable({ ...rendered, semanticMismatch: true })).toBe(false);
@@ -542,6 +689,130 @@ describe("pane screenshot rendered readiness", () => {
       requiresStructuredDataEvidence: true,
       hasStructuredDataEvidence: true,
     })).toBe(true);
+  });
+});
+
+describe("a capture of a pane that marks no rows", () => {
+  const diag = {
+    token: "DIAG", label: "Diagnostic", description: "", pane: { id: "equity-diagnostic", name: "Diagnostic" },
+    instance: { instanceId: "diag", paneId: "equity-diagnostic" }, createOptions: undefined, optionSettings: {}, options: {},
+    capability: { id: "equity-diagnostic-pane", botSafe: false, outputKind: "rendered-view", reportReadiness: "live-dom", screenshotReadiness: "live-dom", options: [] },
+  } as unknown as ResolvedPaneFunction;
+  const chat = { ...diag, token: "CHAT", pane: { id: "chat", name: "Chat" }, instance: { instanceId: "chat", paneId: "chat" } } as unknown as ResolvedPaneFunction;
+  const assess = (resolved: ResolvedPaneFunction, render: Partial<DesktopPaneShotRenderResult>) => assessPaneScreenshot(
+    resolved, { financials: [] } as unknown as DesktopPaneShotPayload, {
+      visibleText: "", rows: [], truncated: false, truncationReasons: [], loadingStateDetected: false, errorStateDetected: false,
+      errorStateMarkers: [], emptyStateDetected: false, emptyStateMarkers: [], visibleKeyValues: [], semanticUi: [], ...render,
+    }, "", "/tmp/shot-test.png",
+  );
+
+  // DIAG's prose and CORR's matrix were "not verifiable" for want of table rows, however much they showed.
+  test("an ellipsis in status content is not a clipped date; the renderer's dated-line evidence decides", () => {
+    expect(assess(diag, { contentFigures: 24, statusLine: "2026-11-17 06:00 UTC · Checking…" })).toMatchObject({ usable: true, complete: true });
+    expect(assess(diag, { contentFigures: 24, statusLine: "17 Nov … history", statusLineClipped: true })).toMatchObject({
+      usable: true, empty: false, semanticMismatch: false, notices: ["The as-of status line is clipped."],
+    });
+  });
+  test("is read by the figures its body shows: prose passes, a form's one hint or an empty state does not", () => {
+    expect(assess(diag, { contentFigures: 24 })).toMatchObject({ usable: true, empty: false, unusableReason: null });
+    expect(assess(diag, { contentFigures: 1 })).toMatchObject({ usable: false, empty: true });
+    expect(assess(diag, { contentFigures: 24, emptyStateDetected: true })).toMatchObject({ usable: false, empty: true });
+    expect(assess(diag, { contentFigures: 24, errorStateDetected: true })).toMatchObject({ usable: false });
+    // Figures beside a Pro lock or a sign-in wall are not the pane asked for.
+    expect(assess(diag, { contentFigures: 24, accessGate: "pro" })).toMatchObject({ usable: false });
+    expect(assess(diag, { contentFigures: 24, accessGate: "sign-in" })).toMatchObject({ usable: false });
+  });
+
+  // CHAT drew the capture proxy's refusal as its content and reported Status complete.
+  test("a pane that drew the capture's refusal is not usable, surface or not, and says where to see it", () => {
+    for (const text of ["#everyone The pane screenshot does not send this request.", "TheBuildout Not available in screenshots."]) {
+      expect(assess(chat, { visibleText: text })).toMatchObject({
+        usable: false, refused: true, unusableReason: "CHAT is not available in screenshots: the capture does not send the requests it reads its content with. Open CHAT in the app.",
+      });
+      expect(assess(diag, { visibleText: text, contentFigures: 24 })).toMatchObject({ usable: false, refused: true });
+    }
+    expect(assess(chat, { visibleText: "#everyone hello" })).toMatchObject({ usable: true });
+  });
+
+  // Market Movers before the open: every row read "—" under VOL and V/AVG, and `shot --strict` passed it.
+  test("a column blank in every row makes it unusable, named in the Reason; a sparse or a mayBeBlank column does not", () => {
+    const row = (rank: number, volume: string, ratio: string, event?: string) => ({
+      tableIndex: 0, rowIndex: rank - 1, selected: false,
+      cells: [
+        { columnId: "rank", columnLabel: "#", text: String(rank) },
+        { columnId: "symbol", columnLabel: "TICKER", text: `T${rank}` },
+        { columnId: "volume", columnLabel: "VOL", text: volume },
+        { columnId: "volumeRatio", columnLabel: "V/AVG", text: ratio },
+        ...(event ? [{ columnId: "catalyst", columnLabel: "EVENT", text: event }] : []),
+        // An upcoming report's move: blank on every row with nothing missing (ERN).
+        { columnId: "move", columnLabel: "MOVE", text: "--", mayBeBlank: true as const },
+      ],
+    });
+    const blank = assess(diag, { rows: [row(1, "—", "—"), row(2, "—", "—", "News"), row(3, "—", "—")] });
+    expect(blank).toMatchObject({ usable: false, blankColumns: ["VOL", "V/AVG"], unusableReason: "The VOL and V/AVG columns are blank in every row." });
+    const filled = assess(diag, { rows: [row(1, "150.57M", "18x"), row(2, "—", "—", "News"), row(3, "294.1k", "—")] });
+    expect(filled).toMatchObject({ usable: true, unusableReason: null });
+    expect(filled).not.toHaveProperty("blankColumns");
+    // Two rows are a short list's gaps, not a lost column.
+    expect(assess(diag, { rows: [row(1, "—", "—"), row(2, "—", "—")] })).toMatchObject({ usable: true });
+  });
+
+  // ECO at 00:07Z on 17 Nov 2026 failed "ACTUAL blank in every row" with every listed release still to come.
+  test("a row still waiting on its value leaves its blank out; the rows that should have it still fail the column", () => {
+    const release = (index: number, actual: string, waiting: boolean) => ({
+      tableIndex: 0, rowIndex: index, selected: false,
+      cells: [
+        { columnId: "event", columnLabel: "EVENT", text: `Release ${index}` },
+        { columnId: "actual", columnLabel: "ACTUAL", text: actual, ...(waiting ? { mayBeBlank: true as const } : {}) },
+        { columnId: "prior", columnLabel: "PRIOR", text: "0.4%" },
+      ],
+    });
+    const upcoming = Array.from({ length: 6 }, (_, index) => release(index, "—", true));
+    expect(assess(diag, { rows: upcoming })).toMatchObject({ usable: true, unusableReason: null });
+    // Released rows with no figure fail the column, however many rows still wait on theirs.
+    const lost = [release(0, "—", false), release(1, "—", false), release(2, "—", false), ...upcoming];
+    expect(assess(diag, { rows: lost })).toMatchObject({ usable: false, blankColumns: ["ACTUAL"], unusableReason: "The ACTUAL column is blank in every row." });
+    expect(assess(diag, { rows: [release(0, "0.3%", false), release(1, "—", false), release(2, "—", false), ...upcoming] })).toMatchObject({ usable: true });
+    // As few released rows as a short list has are its gaps, as without waiting rows.
+    expect(assess(diag, { rows: [release(0, "—", false), release(1, "—", false), ...upcoming] })).toMatchObject({ usable: true });
+  });
+
+  // APPS read "Grossing and genre ranks are unavailable." in its footer as an error over its empty state, and INS's
+  // "…$21.24M A Form 4/A in this window is unreconciled, so the affected transaction totals are unavailable." over a full table.
+  test("a footer note is not the pane's state; the same words in its body are", () => {
+    const appsNote = "App Store official Apps charts provide top 100 free and paid apps; gaming charts are not verified. Grossing and genre… +4 more";
+    const apps = `APPS AAPL Table Chart AAPL has no mapped apps in the observed App Store and Google Play charts. ${appsNote}`;
+    expect(paneStateMarkers(apps, [appsNote])).toMatchObject({ error: [], loading: [] });
+    // Cut at a word, the note still names what is missing; whole, it would have matched.
+    const whole = "Grossing and genre ranks are unavailable.";
+    expect(paneStateMarkers(`APPS AAPL ${whole}`, [whole]).error).toEqual([]);
+    expect(paneStateMarkers(`APPS AAPL ${whole}`).error).toEqual([`APPS AAPL ${whole}`]);
+    const insNote = "A Form 4/A in this window is unreconciled, so the affected transaction totals are unavailable.";
+    expect(paneStateMarkers(`INS NVDA 20 Mar 2026 Mark A. Stevens Director SELL 121.7k $174.57 $21.24M ${insNote} Source: SEC EDGAR`, [insNote]).error).toEqual([]);
+    // A body that failed still reads as failed beside any note.
+    const rdcf = "RDCF DWSN Discount 9% reverse DCF unavailable. Free cash flow over the last twelve months is negative.";
+    expect(paneStateMarkers(`${rdcf} ${insNote}`, [insNote]).error).toEqual(["RDCF DWSN Discount 9% reverse DCF unavailable."]);
+    expect(paneStateMarkers(`HP AAPL Failed to fetch ${insNote}`, [insNote]).error).toEqual(["Failed to fetch"]);
+  });
+
+  // AUCT's after view at 720px lost +5D, +20D and the CUSIP past the table's edge unsaid. Nineteen other panes cut one
+  // there too, so it is a named warning for now, not a failed --strict; FA's centred headers read "The       FY2024      ,".
+  test("a column cut at its table's edge is named in a warning and leaves the picture usable; padded headers read clean", () => {
+    const row = { tableIndex: 0, rowIndex: 0, selected: false, cells: [{ columnId: "date", columnLabel: "DATE", text: "Nov 10" }] };
+    const cut = assess(diag, { rows: [row, row, row], cutColumns: ["      FY2025      ", "      FY2024      ", "FY2024", " "] });
+    expect(cut).toMatchObject({ usable: true, unusableReason: null, cutColumns: ["FY2025", "FY2024"] });
+    expect(shotCutColumnsWarning(cut.cutColumns)).toBe("The FY2025 and FY2024 columns are cut at this width: a wider --width shows them.");
+    expect(shotCutColumnsWarning(["+20D BP"])).toBe("The +20D BP column is cut at this width: a wider --width shows it.");
+    const whole = assess(diag, { rows: [row, row, row] });
+    expect([whole.cutColumns, shotCutColumnsWarning(whole.cutColumns)]).toEqual([undefined, null]);
+  });
+
+  test("an error or empty state's Reason keeps its sentence and quotes what the pane said", () => {
+    expect(assess(diag, { errorStateDetected: true, stateText: { error: ["Market movers temporarily unavailable. Try again in a moment."] } }).unusableReason)
+      .toBe('The pane rendered an error state. It reads "Market movers temporarily unavailable. Try again in a moment."');
+    expect(assess(diag, { emptyStateDetected: true, emptyStateMarkers: ["No movers returned"] }).unusableReason)
+      .toBe('The pane rendered an empty state. It reads "No movers returned".');
+    expect(assess(diag, { emptyStateDetected: true }).unusableReason).toBe("The pane rendered an empty state.");
   });
 });
 
@@ -1009,6 +1280,8 @@ describe("pane screenshot structured data evidence", () => {
       resolved("financial-statements", { statement: "cashflow", period: "annual" }),
       payload([["NVDA", financials]]),
     );
+    expect(shotExpectedText(resolved("financial-statements", { statement: "cashflow", period: "annual" }),
+      ["NVDA"], payload([["NVDA", financials]]))).toContain("FY2026 2026-01-31");
     expect(statementEvidence).toMatchObject({
       kind: "financial-statement",
       symbol: "NVDA",
@@ -1226,13 +1499,54 @@ describe("portfolio screenshot members", () => {
     // Captured with nothing, so the page shows the row unpriced rather than fetching it.
     expect(shot.financials.find(([symbol]) => symbol === "AAA")?.[1]).toMatchObject({ priceHistory: [], annualStatements: [] });
     expect(shot.financials.find(([symbol]) => symbol === "AAA")?.[1].quote).toBeUndefined();
-    // A read the service rate limited may answer when taken again: the capture fails rather than show the row unpriced.
-    await expect(capture({
+    expect(shot.unreadRows).toBeUndefined();
+    // A read the service refused is a row too, unpriced, and named on the capture's status line: it never fails the
+    // capture of the rest (a portfolio's shot failed for one OTC name the service did not answer for).
+    const refused = await capture({
       getTickerFinancials: async (symbol) => {
         if (symbol === "AAA") throw noProviderError("No provider available for AAA", { failure: new ApiRequestError("Too many requests", 429) }, "AAA");
-        return quotes.get(symbol)!;
+        const financials = quotes.get(symbol);
+        if (!financials) throw new Error(`No provider available for ${symbol}`);
+        return financials;
       },
-    }, [unmarked, ...MARGIN_TICKERS.slice(1)])).rejects.toThrow("No provider available for AAA");
+    }, [unmarked, ...MARGIN_TICKERS.slice(1)]);
+    expect(refused.tickers.map(({ metadata }) => metadata.ticker)).toEqual(["AAA", "BBB", option.metadata.ticker]);
+    expect(refused.unreadRows).toEqual(["AAA"]);
+    expect(unreadRowsNote(refused.unreadRows)).toBe("AAA did not load");
+    // With the source's reason, which `shot` prints beside the row it names.
+    expect(refused.unreadReasons).toEqual({ AAA: "Gloom's data service is at its request limit for AAA. Try again in a minute" });
+  });
+
+  test("a named portfolio's capture reads that portfolio's rows only, never another list's", async () => {
+    const other = { metadata: { ...MARGIN_TICKERS[1]!.metadata, ticker: "OTHER", portfolios: [], watchlists: ["elsewhere"], positions: [] } };
+    const asked: string[] = [];
+    await capture({
+      getTickerFinancials: async (symbol) => {
+        asked.push(symbol);
+        const financials = quotes.get(symbol);
+        if (!financials) throw new Error(`No provider available for ${symbol}`);
+        return financials;
+      },
+    }, [...MARGIN_TICKERS, other as never]);
+    expect(asked).toContain("OTHER");
+    asked.length = 0;
+    const named = await buildDesktopShotPayload(request, {
+      config: { ...createDefaultConfig("/tmp/portfolio-shot-test"), portfolios: [MARGIN_PORTFOLIO], watchlists: [{ id: "elsewhere", name: "Elsewhere" }] },
+      store: {
+        loadAllTickers: async () => [...MARGIN_TICKERS, other],
+        loadTicker: async (symbol: string) => [...MARGIN_TICKERS, other].find(({ metadata }) => metadata.ticker === symbol) ?? null,
+      },
+      dataProvider: createTestDataProvider({
+        getTickerFinancials: async (symbol) => {
+          asked.push(symbol);
+          const financials = quotes.get(symbol);
+          if (!financials) throw new Error(`No provider available for ${symbol}`);
+          return financials;
+        },
+      }),
+    } as unknown as MarketContext, MARGIN_PORTFOLIO.name, {}, 1200, 800, null, 1, null);
+    expect(asked).not.toContain("OTHER");
+    expect(named.tickers.map(({ metadata }) => metadata.ticker)).not.toContain("OTHER");
   });
 });
 
@@ -1260,6 +1574,23 @@ test("an Issuer Debt or TRACE capture is dated by its own data, never by the iss
   expect(trace.variants[0]).toBe("Source: FINRA · Mon 27 Jul 2026 · not a live feed (last sales)");
 });
 
+test("a CTM capture states the delay its contracts' source does, as fn CTM does, not the spot quote's on the page", () => {
+  // CTM BTC at 03:40 UTC on Mon 9 Nov 2026: CME states 10 minutes for its futures; the BTC quote beside them reads 15.
+  const NOW = Date.parse("2026-11-09T03:41:00Z");
+  const contract = (symbol: string, asOf: string) => ({ symbol, asOf, delayMinutes: 10, stale: false }) as FuturesContract;
+  const curve = { source: "gloom" as const, contracts: [contract("BTCX26.CME", "2026-11-09T03:40:00.000Z"), contract("BTCZ26.CME", "2026-11-06T20:59:00.000Z")] };
+  const spot = createTestQuote({ symbol: "BTC=F", dataSource: "delayed", delayMinutes: 15, lastUpdated: NOW - 5 * 60_000, sessionExchange: "CME" } as never);
+  const payload = { financials: [], instrumentFinancials: [] } as unknown as Pick<DesktopPaneShotPayload, "financials" | "instrumentFinancials">;
+  const published = [{ role: "report-freshness", metadata: { ...curveReportFreshness(curve), observations: curveFreshnessObservations(curve.contracts) } } as unknown as RemoteUiNodeSnapshot];
+  const pane = { reportFreshness: undefined } as ResolvedPaneFunction["pane"];
+  const shot = shotFreshness({ pane }, payload, { semanticUi: published, footerText: "", rows: [] }, [spot], undefined, NOW);
+  const report = deriveCaptureReport(futuresCurveHeadless, { sections: [{ title: "Contracts", columns: [], rows: curveFreshnessObservations(curve.contracts) }],
+    freshness: curveReportFreshness(curve) }, NOW);
+  expect(shot.variants[0]).toContain("10 min delayed");
+  expect(shot.variants[0]).not.toContain("15 min");
+  expect(formatFreshnessLine(report.freshness)).toContain("10 min delayed");
+});
+
 test("a pane with no market data is not dated by the quotes the page loaded for something else (CHG, BR, ACM, CAT)", () => {
   const NOW = Date.parse("2026-10-24T00:23:00Z");
   // A portfolio holding's quote, which the page loads whatever pane it shows.
@@ -1280,6 +1611,45 @@ test("a pane with no market data is not dated by the quotes the page loaded for 
     expect(lines, resolved.pane.id).toContain("not a live feed");
     expect(lines, resolved.pane.id).not.toMatch(/delayed|markets? closed/);
   }
+});
+
+describe("a capture's footer with nothing to date", () => {
+  const nothing = { accessGate: null, emptyStateDetected: false, loadingStateDetected: false, errorStateDetected: false, rows: [], visibleKeyValues: [], semanticUi: [] } satisfies Parameters<typeof shotLoadedNothing>[0];
+  const row = { tableIndex: 0, rowIndex: 0, selected: false, cells: [{ columnLabel: "Symbol", text: "AAPL" }] };
+
+  test("a sign-in wall, an empty, loading or failed pane has no status line: the quotes the page loaded are not on screen (RISK, SRCH, VIEW)", () => {
+    expect(shotLoadedNothing({ ...nothing, accessGate: "sign-in" })).toBe(true);
+    expect(shotLoadedNothing({ ...nothing, accessGate: "pro" })).toBe(true);
+    expect(shotLoadedNothing({ ...nothing, emptyStateDetected: true })).toBe(true);
+    expect(shotLoadedNothing({ ...nothing, loadingStateDetected: true })).toBe(true);
+    expect(shotLoadedNothing({ ...nothing, errorStateDetected: true, visibleKeyValues: [{ label: "Price", text: "Price -" }] })).toBe(true);
+  });
+
+  test("a pane that shows rows, labeled values or a chart keeps its line, whatever else it says (DES, a Pro lock on one section)", () => {
+    expect(shotLoadedNothing(nothing)).toBe(false);
+    expect(shotLoadedNothing({ ...nothing, emptyStateDetected: true, rows: [row] })).toBe(false);
+    expect(shotLoadedNothing({ ...nothing, accessGate: "pro", rows: [row] })).toBe(false);
+    expect(shotLoadedNothing({ ...nothing, emptyStateDetected: true, visibleKeyValues: [{ label: "Price", text: "Price 189.20" }] })).toBe(false);
+    const chart = (metadata: Record<string, unknown>) => [{ role: "chart-data", metadata } as RemoteUiNodeSnapshot];
+    expect(shotLoadedNothing({ ...nothing, errorStateDetected: true, semanticUi: chart({ plottedValueCount: 120 }) })).toBe(false);
+    expect(shotLoadedNothing({ ...nothing, errorStateDetected: true, semanticUi: chart({ kind: "chart-composer", baseSeries: [{ pointCount: 0 }, { pointCount: 250 }], projectedPointCount: 250 }) })).toBe(false);
+    // A chart's evidence node is there whether or not anything was plotted (COVN with no covenants).
+    expect(shotLoadedNothing({ ...nothing, emptyStateDetected: true, semanticUi: chart({ kind: "credit-documents", plottedValueCount: 0 }) })).toBe(true);
+    expect(shotLoadedNothing({ ...nothing, emptyStateDetected: true, semanticUi: chart({ kind: "chart-composer", baseSeries: [{ pointCount: 0 }], projectedPointCount: 0 }) })).toBe(true);
+  });
+
+  test("a pane of the user's own state keeps no row for a line; a market pane keeps it (NOTE, LAY, DOCS, CONN, a quote pane)", () => {
+    const local = [layoutManagerModule, connectionsModule, helpModule, docsModule, changelogModule, brokerManagerModule, accountManagementModule, pluginMarketplaceModule]
+      .map((module) => ({ pane: module.panes![0]! as ResolvedPaneFunction["pane"] }));
+    // Declared on the pane, as the notes pane registers it, or on the template that opens one view of a pane.
+    local.push({ pane: { reportFreshness: { source: "Your notes", status: "not-a-feed", basis: "your notes", local: true } } as ResolvedPaneFunction["pane"] });
+    for (const resolved of local) expect(shotHasStatusLine(resolved), resolved.pane.id).toBe(false);
+    const catalog = chartComposerModule.paneTemplates!.find((template) => template.shortcut?.prefix === "CAT")!;
+    expect(shotHasStatusLine({ pane: chartComposerModule.panes![0]! as ResolvedPaneFunction["pane"], template: catalog })).toBe(false);
+    // Market data keeps it, declared as not-a-feed or not.
+    for (const pane of tickerDetailModule.panes!) expect(shotHasStatusLine({ pane: pane as ResolvedPaneFunction["pane"] }), pane.id).toBe(true);
+    expect(shotHasStatusLine({ pane: { reportFreshness: undefined } as ResolvedPaneFunction["pane"] })).toBe(true);
+  });
 });
 
 describe("a board that grows to show every row (FUT)", () => {
@@ -1310,6 +1680,18 @@ describe("a board that grows to show every row (FUT)", () => {
     expect(shotTableRows(fut, { rows: board(symbols.slice(0, 37)) })).toBeNull();
   });
 
+  test("a pane that keeps its height says how many of its table's rows the image holds (MEMB XLK at 720 wide)", () => {
+    const memb = { pane: { id: "members" }, instance: {} } as unknown as typeof fut;
+    const drawn = Array.from({ length: 36 }, (_, index) => row(`H${index}`));
+    expect(shotTableRows(memb, { rows: drawn, tableRowTotals: [76] })).toEqual({ shown: 36, total: 76 });
+    expect(shotRowsText({ shown: 36, total: 76 })).toBe("36 of 76 rows");
+    // Every row in the image, or a table that does not say how many it holds: the plain count.
+    expect(shotTableRows(memb, { rows: drawn, tableRowTotals: [36] })).toBeNull();
+    expect(shotTableRows(memb, { rows: drawn, tableRowTotals: [null] })).toBeNull();
+    // Only the tables that say count: a second table's rows are not the first one's.
+    expect(shotTableRows(memb, { rows: [...drawn, row("other", 1)], tableRowTotals: [76, null] })).toEqual({ shown: 36, total: 76 });
+  });
+
   test("the Commodities & Energy workspace grows on its Markets tab (FUT) and keeps its height on the others", () => {
     const fits = commoditiesEnergyModule.panes![0]!.shotFitsRows;
     expect(typeof fits).toBe("function");
@@ -1321,3 +1703,26 @@ describe("a board that grows to show every row (FUT)", () => {
     expect(on({ tab: "markets" }, { workspaceTab: "positioning" })).toBe(false);
   });
 });
+
+// a five-name CMP folded its title to "+2" and its legend named 8053:JPX and 8002:JPX by their codes, so a good picture read "not usable".
+test("a shot shows a listing by its bare code where a legend names it so, and only as a whole token", () => {
+  const visible = "CMP 8058:JPX · 8031:JPX · 8001:JPX +2\n8053 Close · Sumitomo +21.10% 8002 Marubeni +12.11% 58,775.50";
+  expect(shotShowsText(visible, "8053:JPX")).toBe(true);
+  expect(shotShowsText(visible, "8002:JPX")).toBe(true);
+  expect(shotShowsText(visible, "8058:JPX")).toBe(true);
+  expect(shotShowsText(visible, "8306:JPX")).toBe(false);
+  expect(shotShowsText("8053:TWSE 18002", "8053:JPX")).toBe(false);
+  expect(shotShowsText("8053:TWSE 18002", "8002:JPX")).toBe(false);
+  // A listing saved under its MIC is shown by its venue's code, as every label names it.
+  expect(shotShowsText("GF 9992:HKEX\n9992:HKEX Revenue", "9992:XHKG")).toBe(true);
+  expect(shotShowsText(visible, "Sumitomo")).toBe(true);
+  // Whole tokens only: a longer listing or a price holding the code is not it.
+  expect(shotShowsText("18058:JPX 8306 MUFG", "8058:JPX")).toBe(false);
+  expect(shotShowsText("Last 8058.50 ¥8058 8058,1", "8058:JPX")).toBe(false);
+  expect(shotShowsText("P/E 11.25", "1.2")).toBe(false);
+  expect(shotShowsText("P/E 1.2x", "1.2")).toBe(false);
+  expect(shotShowsText("FCF $1.2B (TTM)", "$1.2B")).toBe(true);
+  expect(shotShowsText("FCF $1.2B (TTM)", "(TTM)")).toBe(true);
+  expect(shotShowsText("Sumitomo Corp.", "Sumitomo Corp.")).toBe(true);
+});
+

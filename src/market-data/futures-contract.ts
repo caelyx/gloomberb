@@ -1,12 +1,15 @@
+import { MISSING_VALUE } from "../utils/format";
 import { apiClient } from "../api-client";
 import type { FuturesContractSpec, FuturesContractTermsPayload } from "../api-client/futures-curve";
 import { classifyInstrumentType } from "../tickers/instrument-kind";
 import type { Quote } from "../types/financials";
 import { parsePublicTickerKey } from "../utils/exchanges";
 import { logFailure } from "../utils/log-failure";
+import { createPluginCache, savedCopyForTransientFailure } from "../data/plugin-cache";
 import { futuresBoardContract, futuresContractByCode, type FuturesContract } from "./futures-board";
 import { formatMarketPrice, formatMarketPriceWithCurrency, quoteFormatOptions, withCurrencyMinorDigits } from "./market/format";
 import { previousPublishedSession } from "./market/freshness";
+import { globexPrintSession } from "./market/globex-day";
 import { minorUnitSign } from "../utils/currency-units";
 import { contractPriceUnit } from "../time-series/price-units";
 import { deliveryMonthLabel } from "../utils/contract-month";
@@ -19,7 +22,7 @@ import { deliveryMonthLabel } from "../utils/contract-month";
  */
 
 /** A settlement the exchange has not confirmed reads as CTM writes a missing price. */
-const FUTURES_MISSING = "--";
+const FUTURES_MISSING = MISSING_VALUE;
 
 type FuturesContractLineKey = "contract" | "unit" | "size" | "tick" | "pointValue" | "settlement" | "firstNotice" | "lastTrade"
   | "roll" | "front" | "nearest" | "mostActive";
@@ -69,7 +72,9 @@ export function futuresSpecLines(spec: FuturesContractSpec): FuturesContractLine
     { key: "size", label: "Size", value: spec.size },
     { key: "tick", label: "Tick", value: futuresTickText(spec) },
     { key: "pointValue", label: "Point Value", value: `$${spec.pointValue.toLocaleString("en-US")}` },
-    { key: "settlement", label: "Settlement", value: SETTLEMENT_TYPE[spec.settlement] },
+    // A contract settled to another's says which: BZ is cash-settled to the ICE Brent futures settlement.
+    { key: "settlement", label: "Settlement", value: spec.settlement === "cash" && spec.settlesTo?.trim()
+      ? `${SETTLEMENT_TYPE.cash} to ${spec.settlesTo.trim()}` : SETTLEMENT_TYPE[spec.settlement] },
   ];
 }
 
@@ -79,13 +84,23 @@ function contractCode(symbol: string): string {
 }
 
 /**
+ * A listed contract as `CTM` names it: its quote symbol without the venue,
+ * GCZ26 for GCZ26.CMX and Cboe's VX/X6 for VIX November, so `quote` and the
+ * curve write one contract alike. Its archive code where it has no symbol.
+ */
+export function futuresContractCode(contract: { contract: string | null; contractSymbol?: string | null }): string {
+  return contract.contractSymbol ? contract.contractSymbol.replace(/\.[A-Z]+$/, "") : contract.contract ?? "";
+}
+
+/**
  * The Contract block: the contract an alias or a generic prices, its terms and
  * the dates a long faces delivery. A line with nothing to say is left out, so
  * a cash-settled root has no first notice and a listed contract no Contract line.
  */
 export function futuresContractLines(terms: FuturesContractTermsPayload, symbol: string): FuturesContractLine[] {
   const lines: FuturesContractLine[] = [];
-  if (terms.contract && terms.contract !== contractCode(symbol)) lines.push({ key: "contract", label: "Contract", value: terms.contract });
+  const code = terms.contract ? futuresContractCode(terms) : null;
+  if (code && code !== contractCode(symbol)) lines.push({ key: "contract", label: "Contract", value: code });
   if (terms.spec) lines.push(...futuresSpecLines(terms.spec));
   else {
     // A root the server sends no terms for still says what its price counts: Dutch TTF gas is EUR / MWh.
@@ -111,7 +126,7 @@ export function fitFuturesContractLines(lines: readonly FuturesContractLine[], m
 /**
  * The exchange settlement dated by its session, `$4,216.30 (2026-10-09)`, as
  * `ticker` prints a futures price: in the quote's currency, padded to its minor
- * unit and at the contract's own precision, with or without a quote to hand.
+ * unit and at the contract's own precision (its tick's decimals), with or without a quote to hand.
  * Without a quote currency the price is a bare number, never a guessed `$`: a
  * grain settles in cents. A contract without a confirmed settlement reads
  * `--`: never an older settlement, and never the last trade.
@@ -124,15 +139,21 @@ export function fitFuturesContractLines(lines: readonly FuturesContractLine[], m
  * session is not confirmed yet. A settlement of that session or a later one
  * is shown: the same session, or the one the move itself belongs to.
  */
+/** The contract's tick for a price format (`MarketFormatOptions.tick`), so its prices print to it; none without terms. */
+export function futuresTickOption(terms: { spec?: Pick<FuturesContractSpec, "tick"> | null } | null | undefined): { tick?: number } {
+  const tick = terms?.spec?.tick;
+  return tick != null && Number.isFinite(tick) && tick > 0 ? { tick } : {};
+}
+
 export function futuresSettleText(
-  terms: Pick<FuturesContractTermsPayload, "settlement">,
+  terms: Pick<FuturesContractTermsPayload, "settlement"> & { spec?: Pick<FuturesContractSpec, "tick"> | null },
   quote: Pick<Quote, "currency" | "instrumentType" | "priceBasis" | "providerPriceDivisor"> | null | undefined,
   movesFrom?: string | null,
 ): string {
   if (!terms.settlement) return FUTURES_MISSING;
   if (movesFrom && terms.settlement.date < movesFrom) return `${FUTURES_MISSING} (${movesFrom} not confirmed yet)`;
   const currency = quote?.currency;
-  const options = withCurrencyMinorDigits(quoteFormatOptions(quote, "FUTURE"), currency);
+  const options = { ...withCurrencyMinorDigits(quoteFormatOptions(quote, "FUTURE"), currency), ...futuresTickOption(terms) };
   const price = currency ? formatMarketPriceWithCurrency(terms.settlement.price, currency, options) : formatMarketPrice(terms.settlement.price, options);
   return `${price} (${terms.settlement.date})`;
 }
@@ -245,61 +266,116 @@ function settlementTolerance(tick: number | null | undefined, price: number): nu
 }
 
 /**
- * What a futures move is measured from: a session's settlement, the last
- * trade of a session that settled elsewhere, or a session's close that the
- * settlement in the contract terms cannot confirm either way. `session` is
- * the date of that reference.
+ * What a futures move is measured from: a session's settlement or close.
+ * `session` is the date of that reference. `from` is set when the move is to
+ * be measured again from that session's settlement, at that price
+ * (futuresQuoteFromSettle): the source measured it from something else.
  */
 export interface FuturesChangeBasis {
-  kind: "settle" | "last trade" | "close";
+  kind: "settle" | "close";
   session: string;
+  from?: number;
 }
+
+/** "Nov 2026", "Nov 26" or "Futures,Nov-2026"; a hyphen takes only a whole year, since "Futures,Nov-20" is 2026 cut short. */
+export const CONTRACT_MONTH_NAME = /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(?: (\d{4}|\d{2})|-(\d{4}))$/i;
+const MONTH_ABBREVIATIONS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+const CONTRACT_SYMBOL = /^[A-Z0-9]+?([FGHJKMNQUVXZ])(\d{2})(?:\.[A-Z]+)?$/i;
+const MONTH_CODES = "FGHJKMNQUVXZ";
+
+/**
+ * The delivery month a futures quote prices, `YYYY-MM`: from a listed
+ * contract's code (ESZ26.CME), else from the month a continuous symbol's name
+ * carries ("E-Mini S&P 500 Dec 26"). Null when neither says.
+ */
+export function futuresQuoteMonth(quote: Pick<Quote, "symbol" | "name"> | null | undefined): string | null {
+  const coded = CONTRACT_SYMBOL.exec(quote?.symbol?.trim() ?? "");
+  if (coded) return `20${coded[2]}-${String(MONTH_CODES.indexOf(coded[1]!.toUpperCase()) + 1).padStart(2, "0")}`;
+  const named = CONTRACT_MONTH_NAME.exec(quote?.name?.trim() ?? "");
+  if (!named) return null;
+  const written = named[2] ?? named[3]!;
+  const year = written.length === 2 ? 2000 + Number(written) : Number(written);
+  return `${year}-${String(MONTH_ABBREVIATIONS.indexOf(named[1]!.toLowerCase()) + 1).padStart(2, "0")}`;
+}
+
+/** The terms a futures move is checked against: the settlement, the tick it is rounded to and the contract's month. */
+export type FuturesChangeTerms = Pick<FuturesContractTermsPayload, "settlement"> & {
+  spec?: Pick<FuturesContractSpec, "tick"> | null;
+  deliveryMonth?: string | null;
+};
 
 /**
  * What the move a futures quote headlines is measured from, for the words
- * after it ("vs Fri 16 Oct settle", quoteChangeBasis). `sessionDate` is the
- * session the move belongs to (regularSessionDisplayDate); a Saturday or
- * Sunday is Friday's, as no session is dated on one, and a holiday CME Globex
- * traded is the next trade date's. The basis is only what the numbers show,
- * against the one settlement the contract terms carry: a reference (the price
- * less the move) within half a tick of it is that settlement, of whichever
- * session it is. A reference that is not the settlement of the session just
- * before the move's is that session's last trade. Otherwise, when the terms
- * carry no settlement that old or one the reference can be checked against
- * (the move's own session has settled, and the one before is not in the
- * terms), it is the session before's close, left unnamed. The session before
- * is the trade date before the move's on the `exchange`'s published holiday
- * calendar (previousPublishedSession), so the Tuesday after Memorial Day
- * moves from Friday. On a venue without one, only a matching settlement is
- * named, by the date the terms give it. Null without a session date, a move
- * or terms, or when nothing but the calendar could date the reference and
- * there is none.
+ * after it ("vs Fri 16 Oct settle", quoteChangeBasis). The move covers one
+ * session, the one before its own, and is labelled by it. Its session is
+ * `sessionDate` (regularSessionDisplayDate), a Saturday or Sunday being
+ * Friday's, unless the print (`tradedAt`) was made after the CME Globex
+ * reopen that opened a later trade date (globexPrintSession), whose move it
+ * then is, whatever date the source still gives it. The session before is
+ * the trade date before on the `exchange`'s published holiday calendar
+ * (previousPublishedSession), so the Tuesday after Memorial Day moves from
+ * Friday; a holiday Globex traded is the next trade date's.
+ *
+ * A reference (the price less the move) within half a tick of the settlement
+ * in the terms is that settlement. Any other reference:
+ * - with the session before's settlement in the terms, for the contract the
+ *   quote prices (`month` is the terms' `deliveryMonth`), is measured again
+ *   from it (`from`); around a roll the terms can name the month before, and
+ *   the gap between the two would read as the day's move, so for another
+ *   contract, or one the quote does not name, the source's move stands with
+ *   no session named (null, "vs prev close");
+ * - with an older settlement in the terms, is the session before's close in
+ *   the overnight hours after the reopen, before that session's settlement
+ *   is confirmed: Wednesday's 7,720.50 close at 23:18 UTC, "+14 vs Wed 4 Nov
+ *   close", never +137.75 from Tuesday's settlement, two sessions. At any
+ *   other time the terms are behind and nothing dates it (null);
+ * - once the move's own session has settled, is the session before's
+ *   settlement when the quote closes on its own (Gloom Cloud then measures
+ *   it from the one before: CC=F's 5,155 on Fri 6 Nov 2026, "-26 vs Thu 5
+ *   Nov settle"), and otherwise the session before's close;
+ * - without a settlement in the terms, is the session before's close, which
+ *   nothing else checks.
+ * On a venue without a calendar only a settlement is named. Null without a
+ * session date, a move or terms.
  */
 export function futuresChangeBasis(
-  terms: Pick<FuturesContractTermsPayload, "settlement"> & { spec?: Pick<FuturesContractSpec, "tick"> | null } | null | undefined,
-  move: { price: number; change?: number | null; sessionDate?: string | null } | null | undefined,
+  terms: FuturesChangeTerms | null | undefined,
+  move: { price: number; change?: number | null; sessionDate?: string | null; tradedAt?: number | null; month?: string | null } | null | undefined,
   exchange: string | null | undefined,
 ): FuturesChangeBasis | null {
   const dated = move?.sessionDate;
   if (!terms || !move || !dated || !isoDate.test(dated) || move.change == null) return null;
   const reference = move.price - move.change;
   if (!Number.isFinite(reference)) return null;
-  const session = weekdayOnOrBefore(dated);
-  const previous = previousPublishedSession(exchange ?? undefined, dated, { closedDayRollsForward: true })?.date ?? null;
+  const sessionBefore = (date: string) => previousPublishedSession(exchange ?? undefined, date, { closedDayRollsForward: true })?.date ?? null;
+  // A print in the night after the session the source dates the move by opened the next trade date.
+  const print = globexPrintSession(exchange, move.tradedAt);
+  const reopened = !!print?.overnight && print.tradeDate > dated && (sessionBefore(print.tradeDate) ?? "") >= weekdayOnOrBefore(dated);
+  const moveDate = reopened ? print!.tradeDate : dated;
+  const session = weekdayOnOrBefore(moveDate);
+  const previous = sessionBefore(moveDate);
   const settled = terms.settlement;
-  if (settled && settled.date <= session) {
-    if (Math.abs(reference - settled.price) <= settlementTolerance(terms.spec?.tick, settled.price)) {
-      return { kind: "settle", session: settled.date };
-    }
-    if (settled.date === previous) return { kind: "last trade", session: settled.date };
+  if (settled && settled.date <= session && Math.abs(reference - settled.price) <= settlementTolerance(terms.spec?.tick, settled.price)) {
+    return { kind: "settle", session: settled.date };
   }
+  const sameContract = !!move.month && terms.deliveryMonth?.slice(0, 7) === move.month;
+  if (settled && previous && settled.date === previous) {
+    return sameContract && Number.isFinite(move.price) ? { kind: "settle", session: previous, from: settled.price } : null;
+  }
+  // The move's own session settled, and the quote closes on that settlement: Gloom Cloud measures it from the one before.
+  if (settled && previous && settled.date === session && sameContract
+    && Math.abs(move.price - settled.price) <= settlementTolerance(terms.spec?.tick, settled.price)) {
+    return { kind: "settle", session: previous };
+  }
+  if (settled && previous && settled.date < previous) return print?.overnight && print.tradeDate === moveDate ? { kind: "close", session: previous } : null;
   return previous ? { kind: "close", session: previous } : null;
 }
 
 /** A listed contract as code and month: "NGX26 (Nov 2026)". */
-function contractWithMonth(contract: { contract: string; deliveryMonth: string }): string {
+function contractWithMonth(contract: { contract: string; contractSymbol: string; deliveryMonth: string }): string {
   const month = deliveryMonthLabel(contract.deliveryMonth);
-  return month ? `${contract.contract} (${month})` : contract.contract;
+  const code = futuresContractCode(contract);
+  return month ? `${code} (${month})` : code;
 }
 
 /**
@@ -349,7 +425,8 @@ export function isFuturesContractSpec(spec: unknown): spec is FuturesContractSpe
   const row = spec as Record<string, unknown>;
   return typeof row.unit === "string" && typeof row.size === "string"
     && positive(row.tick) && positive(row.tickValue) && positive(row.pointValue)
-    && (row.settlement === "physical" || row.settlement === "cash");
+    && (row.settlement === "physical" || row.settlement === "cash")
+    && (row.settlesTo === undefined || row.settlesTo === null || typeof row.settlesTo === "string");
 }
 
 function isNearestContract(value: unknown): boolean {
@@ -387,13 +464,50 @@ export function validateFuturesContractTerms(data: FuturesContractTermsPayload):
   return invalid.length ? { ...data, ...Object.fromEntries(invalid.map(([key]) => [key, null])) } : data;
 }
 
+/**
+ * A futures symbol's terms as last read, kept where the profile keeps saved
+ * copies once a command or the app attaches it. Every read asks the service
+ * again (a contract rolls, its settlement moves each session); a read the
+ * service could not answer is answered from the copy, which a command dates
+ * as saved (`servedFromSavedCopy`). Offline, DES GC=F and `quote GC=F` kept
+ * the saved price but lost the settle, the Contract block and the unit.
+ */
+const savedTerms = createPluginCache<FuturesContractTermsPayload>({
+  kind: "futures-contract-terms",
+  source: "gloom-cloud",
+  policy: { staleMs: 0, expireMs: 14 * 86_400_000 },
+});
+
+/** Where the terms read are saved for a later read the service cannot answer: a command's profile, or the app's. */
+export const attachFuturesTermsPersistence = savedTerms.attach;
+
+const savedTermsKey = (symbol: string) => parsePublicTickerKey(symbol).symbol.trim().toUpperCase();
+
+/** Keeps terms read on another path (a capture's page asking through its proxy) as `loadFuturesContractTerms` keeps its own. */
+export function rememberFuturesContractTerms(symbol: string, terms: FuturesContractTermsPayload): void {
+  void savedTerms.load(savedTermsKey(symbol), async () => validateFuturesContractTerms(terms), { force: true })
+    .catch(logFailure("market-data.futures-contract", "Saving futures contract terms failed"));
+}
+
+/** The terms saved for a symbol, and when (ms), however old; null when none were. */
+export function savedFuturesContractTerms(symbol: string): { terms: FuturesContractTermsPayload; savedAt: number } | null {
+  const saved = savedTerms.get(savedTermsKey(symbol), { allowExpired: true });
+  return saved ? { terms: saved.data, savedAt: saved.fetchedAt } : null;
+}
+
 /** A futures symbol's contract, terms and latest confirmed settlement; throws when the server has none for it. */
 export async function loadFuturesContractTerms(
   symbol: string,
   client: Pick<typeof apiClient, "getCloudFuturesContract"> = apiClient,
+  /** `batch`: one of many asked at once (a futures board's rows), to go out in a batch request with them. */
+  options: { batch?: boolean } = {},
 ): Promise<FuturesContractTermsPayload> {
   // The terms are the contract's wherever it is listed: GC=F:CMX asks for GC=F.
-  return validateFuturesContractTerms(await client.getCloudFuturesContract(parsePublicTickerKey(symbol).symbol));
+  const read = async () => validateFuturesContractTerms(await client.getCloudFuturesContract(parsePublicTickerKey(symbol).symbol, options));
+  // A board's rows, read in batches every minute, and a caller's own client are not kept: one symbol's read is.
+  if (options.batch || client !== apiClient) return read();
+  // A failure asking again may get past (no connection, a timeout) is answered from the saved copy; a refusal is not.
+  return savedCopyForTransientFailure(await savedTerms.load(savedTermsKey(symbol), read, { force: true })).data;
 }
 
 /**

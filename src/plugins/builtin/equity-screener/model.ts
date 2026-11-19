@@ -3,10 +3,18 @@ import {
   DIVIDEND_FIELDS,
   HIRING_APP_FIELDS,
   CATEGORY_FIELDS,
+  GRADE_FIELDS,
+  LETTER_GRADE_FIELDS,
   NUMERIC_FIELDS,
+  OPTION_VOLATILITY_FIELDS,
+  OWNERSHIP_FIELDS,
+  QUALITY_FIELDS,
   RESEARCH_FIELDS,
   KPI_FIELDS,
+  MEMBERSHIP_FIELDS,
+  SCORE_FIELDS,
   SOCIAL_FIELDS,
+  TECHNICAL_FIELDS,
   VOLATILITY_FIELDS,
   type NumericField,
   type ScreenMetric,
@@ -14,14 +22,16 @@ import {
   type ScreenDefinition,
   type ScreenFieldDefinition,
   type ScreenOperator,
+  type ScreenListingRead,
   type ScreenPayload,
   type ScreenRow,
 } from "../../../api-client/equity-screener";
 import { yearToDateBaseLabel } from "../../../market-data/market/year-to-date";
-import { canonicalExchange } from "../../../utils/exchanges";
+import { canonicalExchange, isUsListingExchange, parsePublicTickerKey } from "../../../utils/exchanges";
 import { LATEST_DISTRIBUTION, TRAILING_DIVIDEND_BASIS } from "../../../utils/forward-dividend";
-import { formatCompact, formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatNumber, formatPercentRaw } from "../../../utils/format";
 import { formatPriceEarnings, NOT_MEANINGFUL } from "../../../utils/price-earnings";
+import { ATTENTION_LISTED } from "../attention/listing";
 import { kpiFreeLimitNote } from "../company-kpis/model";
 
 /**
@@ -63,7 +73,7 @@ export const SHORT_LABELS: Record<NumericField, string> = {
   revenueGrowthPercent: "FY REV GR%",
   earningsGrowthPercent: "FY EARN GR%",
   grossMarginPercent: "FY GROSS MGN%",
-  payoutRatioPercent: "FY PAYOUT%",
+  payoutRatioPercent: "FY CASH PAYOUT%",
   dividendGrowth1YPercent: "DIV GR 1Y%",
   dividendGrowth3YPercent: "DIV CAGR 3Y%",
   operatingMarginPercent: "FY OP MGN%",
@@ -90,6 +100,20 @@ export const SHORT_LABELS: Record<NumericField, string> = {
   fromHigh52WPercent: "VS 52W HI%",
   beta: "BETA",
   atrPercent: "ATR%",
+  rsi14: "RSI 14",
+  priceVsSma20Percent: "VS SMA20%",
+  priceVsSma50Percent: "VS SMA50%",
+  priceVsSma200Percent: "VS SMA200%",
+  // Sessions since the event: 0 is the last completed session.
+  macdBullishCrossDays: "MACD BULL AGO",
+  macdBearishCrossDays: "MACD BEAR AGO",
+  goldenCrossDays: "GOLDEN X AGO",
+  deathCrossDays: "DEATH X AGO",
+  newHigh20dDays: "20D HIGH AGO",
+  newLow20dDays: "20D LOW AGO",
+  newHigh52wDays: "52W HIGH AGO",
+  newLow52wDays: "52W LOW AGO",
+  bollingerWidthPercentile: "BB WIDTH PCTL",
   priceToBook: "P/B",
   evToEbitda: "EV/EBITDA",
   roePercent: "FY ROE%",
@@ -97,6 +121,52 @@ export const SHORT_LABELS: Record<NumericField, string> = {
   analystUpsidePercent: "UPSIDE%",
   ivRank: "IV RANK",
   ivToHv: "IV/HV",
+  iv30Percent: "IV30%",
+  ivPercentile: "IV PCTL",
+  // Volatility points: IV30 25% to 27% is +2.
+  iv30Change1d: "IV30 CHG 1D",
+  iv30Change5d: "IV30 CHG 5D",
+  hv20Percent: "HV20%",
+  hvRank: "HV RANK",
+  sharesOutstanding: "SHARES OUT",
+  floatShares: "FLOAT",
+  shortPercentOfFloat: "SI % FLOAT",
+  institutionalOwnershipPercent: "INST OWN%",
+  roicPercent: "ROIC%",
+  fcfYieldPercent: "FCF YLD%",
+  netDebtToEbitda: "ND/EBITDA",
+  debtToEquity: "D/E",
+  revenueCagr3YPercent: "REV CAGR 3Y%",
+  revenueCagr5YPercent: "REV CAGR 5Y%",
+  epsCagr3YPercent: "EPS CAGR 3Y%",
+  epsCagr5YPercent: "EPS CAGR 5Y%",
+  forwardRevenueGrowthPercent: "FWD REV GR%",
+  forwardEpsGrowthPercent: "FWD EPS GR%",
+  piotroskiFScore: "F-SCORE",
+  altmanZScore: "ALTMAN Z",
+  grahamNumber: "GRAHAM #",
+  grahamUpsidePercent: "GRAHAM UPS%",
+  lynchFairValue: "LYNCH FV",
+  lynchUpsidePercent: "LYNCH UPS%",
+  earningsYieldPercent: "EBIT/EV%",
+  returnOnCapitalPercent: "ROC%",
+  magicFormulaRank: "MAGIC RANK",
+  totalReturn1YPercent: "1Y TR%",
+  rsRating: "RS RATING",
+  profitableYears: "PROFIT YRS",
+  revenueGrowthYears: "REV GR YRS",
+  dividendGrowthYears: "DIV GR YRS",
+  sp500Member: "S&P 500",
+  dowMember: "DOW",
+  // Letter grades, F to A+, and the composite with its label.
+  valueGrade: "VALUE",
+  growthGrade: "GROWTH",
+  profitabilityGrade: "PROFIT",
+  momentumGrade: "MOMENTUM",
+  revisionsGrade: "REVISIONS",
+  gradeComposite: "COMPOSITE",
+  nextYearEpsRevision30dPercent: "NXT EPS REV%",
+  revenueRevision30dPercent: "REVENUE REV%",
   hiringOpenRoles: "OPEN ROLES",
   hiringNetAddsWeek: "NET ROLES/WK",
   hiringRemotePercent: "REMOTE%",
@@ -106,39 +176,120 @@ export const SHORT_LABELS: Record<NumericField, string> = {
   appRatingDrift7d: "RATING 7D",
   appRatingCountGrowth7d: "RATINGS 7D",
 };
-const COMPACT = new Set<NumericField>(["kpiArr", "kpiRpo", "kpiCrpo", "kpiSubscribers", "kpiDau", "kpiMau", "kpiGmv", "kpiStores", "kpiBacklog", "marketCap", "volume", "averageVolume20d", "shortInterestShares"]);
+const COMPACT = new Set<NumericField>(["kpiArr", "kpiRpo", "kpiCrpo", "kpiSubscribers", "kpiDau", "kpiMau", "kpiGmv", "kpiStores", "kpiBacklog", "marketCap", "volume", "averageVolume20d", "shortInterestShares", "sharesOutstanding", "floatShares"]);
 /** Daily counts: whole numbers below a thousand, compact above. */
 const DAILY_COUNTS = new Set<NumericField>(["xPostsPerDay", "wikiViewsPerDay"]);
-const RATIOS = new Set<NumericField>(["kpiBookToBill", "xPostsVsMedian", "wikiViewsVsMedian", "priceToBook", "evToEbitda", "ivToHv"]);
+const RATIOS = new Set<NumericField>(["kpiBookToBill", "xPostsVsMedian", "wikiViewsVsMedian", "priceToBook", "evToEbitda", "ivToHv",
+  "netDebtToEbitda", "debtToEquity"]);
 const RETURNS: NumericField[] = ["return1WPercent", "return1MPercent", "return3MPercent", "returnYtdPercent", "return1YPercent"];
 const SIGNED = new Set<NumericField>(["hiringNetAddsWeek", "hiringZScore", "appRankVelocity7d", "appRatingDrift7d", "appRatingCountGrowth7d",
   "guideRevenueChangePercent", "guideEpsChangePercent", "kpiSameStoreSalesPercent",
   "changePercent", "revenueGrowthPercent", "earningsGrowthPercent", "shortInterestChangePercent",
   "dividendGrowth1YPercent", "dividendGrowth3YPercent",
   ...RETURNS, "fromHigh52WPercent", "epsRevision30dPercent", "analystUpsidePercent",
+  "priceVsSma20Percent", "priceVsSma50Percent", "priceVsSma200Percent",
+  "iv30Change1d", "iv30Change5d",
+  "revenueCagr3YPercent", "revenueCagr5YPercent", "epsCagr3YPercent", "epsCagr5YPercent",
+  "forwardRevenueGrowthPercent", "forwardEpsGrowthPercent",
+  "totalReturn1YPercent", "grahamUpsidePercent", "lynchUpsidePercent",
+  "nextYearEpsRevision30dPercent", "revenueRevision30dPercent",
 ]);
-/** Moves whose sign is the news: they take the sign colour. */
-export const SIGN_COLORED = new Set<NumericField>(["changePercent", ...RETURNS, "epsRevision30dPercent", "analystUpsidePercent"]);
-const COUNTS = new Set<NumericField>(["appRatingCountGrowth7d", "hiringNetAddsWeek", "hiringOpenRoles", "attentionResearchUnits", "insiderPurchases90d", "insiderSales90d", "institutionalHolders", "institutionalNewHolders", "institutionalExits", "ivRank"]);
-const MONETARY = new Set<NumericField>(["price", "marketCap", "kpiArr", "kpiRpo", "kpiCrpo", "kpiGmv", "kpiBacklog"]);
+/** Moves whose sign is the news: they take the sign colour. A fair value's upside reads as the analysts' does. */
+export const SIGN_COLORED = new Set<NumericField>(["changePercent", ...RETURNS, "epsRevision30dPercent", "analystUpsidePercent",
+  "priceVsSma20Percent", "priceVsSma50Percent", "priceVsSma200Percent",
+  "totalReturn1YPercent", "grahamUpsidePercent", "lynchUpsidePercent",
+  "nextYearEpsRevision30dPercent", "revenueRevision30dPercent"]);
+const LETTER_GRADES = new Set<NumericField>(LETTER_GRADE_FIELDS);
+/** Fields that print as a grade, a letter or the composite with its label, never as a number and a unit. */
+export const GRADE_DISPLAY_FIELDS: ReadonlySet<string> = new Set<string>([...LETTER_GRADE_FIELDS, "gradeComposite"]);
+/** A grade's letter by its value: 1 is F, 13 is A+. */
+const GRADE_LETTERS = ["F", "D-", "D", "D+", "C-", "C", "C+", "B-", "B", "B+", "A-", "A", "A+"] as const;
+/** The composite's labels from the score each starts at: its nearest whole number. */
+const COMPOSITE_BANDS = [
+  { from: 4.5, label: "Top" },
+  { from: 3.5, label: "Strong" },
+  { from: 2.5, label: "Neutral" },
+  { from: 1.5, label: "Weak" },
+  { from: 1, label: "Bottom" },
+] as const;
+const gradeLetter = (value: number): string | null =>
+  Number.isInteger(value) ? GRADE_LETTERS[value - 1] ?? null : null;
+const compositeLabel = (score: number): string =>
+  (COMPOSITE_BANDS.find((band) => score >= band.from) ?? COMPOSITE_BANDS.at(-1)!).label;
+/**
+ * The number a cell's sign colour reads, or null for a field without one: a move is its own sign, and a grade the side
+ * of the middle it falls on, B- and up above it and D+ and down below, Strong and Top above the composite's middle and
+ * Weak and Bottom below. So every grade reads in the colours a move does, in every view that shows it.
+ */
+export function screenSignValue(field: NumericField, value: number | null): number | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  if (SIGN_COLORED.has(field)) return Math.abs(value) < 0.05 ? 0 : value;
+  if (LETTER_GRADES.has(field)) return value >= 8 ? 1 : value <= 4 ? -1 : 0;
+  if (field === "gradeComposite") return value >= 3.5 ? 1 : value < 2.5 ? -1 : 0;
+  return null;
+}
+const COUNTS = new Set<NumericField>(["appRatingCountGrowth7d", "hiringNetAddsWeek", "hiringOpenRoles", "attentionResearchUnits", "insiderPurchases90d", "insiderSales90d", "institutionalHolders", "institutionalNewHolders", "institutionalExits", "ivRank", "ivPercentile", "hvRank",
+  "macdBullishCrossDays", "macdBearishCrossDays", "goldenCrossDays", "deathCrossDays",
+  "newHigh20dDays", "newLow20dDays", "newHigh52wDays", "newLow52wDays", "bollingerWidthPercentile",
+  "piotroskiFScore", "magicFormulaRank", "rsRating", "profitableYears", "revenueGrowthYears", "dividendGrowthYears"]);
+const MONETARY = new Set<NumericField>(["price", "marketCap", "kpiArr", "kpiRpo", "kpiCrpo", "kpiGmv", "kpiBacklog", "grahamNumber", "lynchFairValue"]);
+/** Prices and scores read to two decimals, as the quote and beta are. */
+const HUNDREDTHS = new Set<NumericField>(["price", "beta", "altmanZScore", "grahamNumber", "lynchFairValue"]);
+const MEMBERSHIP = new Set<NumericField>(MEMBERSHIP_FIELDS);
 /** Shown after the screen's own criteria when the pane has room. */
 const CONTEXT_FIELDS: NumericField[] = ["marketCap", "price", "changePercent", "trailingPE", "revenueGrowthPercent", "operatingMarginPercent", "dividendYieldPercent"];
 
 export function formatScreenValue(field: NumericField, value: number | null): string {
-  if (value == null || !Number.isFinite(value)) return "--";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   if (COMPACT.has(field)) return formatCompact(value, { fixedDecimals: true });
   if (DAILY_COUNTS.has(field)) return value < 1_000 ? value.toFixed(0) : formatCompact(value, { fixedDecimals: true });
   if (RATIOS.has(field)) return `${value.toFixed(1)}x`;
   if (COUNTS.has(field)) return formatNumber(value, 0);
-  if (field === "price" || field === "beta") return formatNumber(value, 2);
+  if (MEMBERSHIP.has(field)) return value === 1 ? "Yes" : "No";
+  if (LETTER_GRADES.has(field)) return gradeLetter(value) ?? MISSING_VALUE;
+  if (field === "gradeComposite") return `${formatNumber(value, 2)} ${compositeLabel(value)}`;
+  if (HUNDREDTHS.has(field)) return formatNumber(value, 2);
+  // The day's move reads as every quote list's CHG% does (+2.04%), not +2.0 (review, 12 Nov 2026).
+  if (field === "changePercent") return formatPercentRaw(value);
   // A value that rounds to zero prints 0.0, never -0.0.
   const fixed = Math.abs(value) < 0.05 ? "0.0" : formatNumber(value, 1);
   return SIGNED.has(field) && value > 0 && fixed !== "0.0" ? `+${fixed}` : fixed;
 }
 
 /** A row's metric as a cell prints it: N/M for a multiple that is not meaningful, as RV and `valuation` print it. */
-export function formatScreenMetric(field: NumericField, metric: Pick<ScreenMetric, "value" | "notMeaningful">): string {
-  return metric.value == null && metric.notMeaningful ? formatPriceEarnings(NOT_MEANINGFUL) : formatScreenValue(field, metric.value);
+export function formatScreenMetric(field: NumericField, metric: Pick<ScreenMetric, "value" | "notMeaningful"> & Partial<Pick<ScreenMetric, "reason">>): string {
+  const text = metric.value == null && metric.notMeaningful ? formatPriceEarnings(NOT_MEANINGFUL) : formatScreenValue(field, metric.value);
+  return field === "dividendGrowthYears" && metric.value != null && /^At least \d+: the stored history starts \d{4}-\d{2}-\d{2}$/.test(metric.reason ?? "") ? `${text}+` : text;
+}
+
+/** A metric as a company's detail prints it: with its unit, but a grade or the composite reads as itself (B+, 4.72 Top). */
+export function screenDetailValue(field: NumericField, metric: Pick<ScreenMetric, "value" | "notMeaningful" | "unit"> & Partial<Pick<ScreenMetric, "reason">>): string {
+  // A missing value is just "--", without the unit it would have had; N/M says so.
+  if (metric.value == null) return metric.notMeaningful ? formatScreenMetric(field, metric) : formatScreenValue(field, null);
+  const text = formatScreenMetric(field, metric);
+  if (GRADE_DISPLAY_FIELDS.has(field)) return text;
+  // A count of one is singular: 1 year, 1 day.
+  const unit = metric.value === 1 && COUNT_UNITS.has(metric.unit) ? metric.unit.slice(0, -1) : metric.unit;
+  return unit ? `${text} ${unit}` : text;
+}
+const COUNT_UNITS: ReadonlySet<string> = new Set(["years", "days", "sessions", "weeks", "months"]);
+
+/** The note a grade on a company's other line leads with, naming the line it was graded on (the server's text). */
+const COMPANY_NOTE = /^One company with \S+, its primary line: graded once, on that line's figures\.\s*/;
+/**
+ * A grade's reason split into the company note, which every grade of the line repeats and the detail says once, and
+ * what is this grade's own (its peers, an N/M or stale input), null when nothing is left.
+ */
+export function splitGradeReason(reason: string | null): { company: string | null; own: string | null } {
+  const match = reason == null ? null : COMPANY_NOTE.exec(reason);
+  if (!match) return { company: null, own: reason };
+  return { company: match[0].trim(), own: reason!.slice(match[0].length).trim() || null };
+}
+
+/** Where a grade ranks, from its source without the letter it leads with: `percentile 82.4 among 412 Technology listings, from ...`. */
+export function gradeRankText(metric: Pick<ScreenMetric, "source">): string | null {
+  const text = metric.source?.replace(/^[^:]{1,12}:\s*/, "").trim();
+  return text ? text : null;
 }
 
 /**
@@ -158,14 +309,31 @@ export function dividendYieldBasis(metric: ScreenMetric): string | null {
 export function metricDate(metric: ScreenMetric): { text: string; collected: boolean } {
   if (metric.asOf) return { text: metric.asOf.slice(0, 10), collected: false };
   if (metric.value != null && metric.observedAt) return { text: metric.observedAt.slice(0, 10), collected: true };
-  return { text: "--", collected: false };
+  return { text: MISSING_VALUE, collected: false };
 }
 
-/** Focus metric, then the screen's numeric criteria, then context columns. Money needs one currency. */
-export function resultFields(definition: ScreenDefinition, metric: NumericField): NumericField[] {
-  const numeric = (field: string): field is NumericField => (NUMERIC_FIELDS as readonly string[]).includes(field);
-  const fields = [metric, ...definition.criteria.map((criterion) => criterion.field).filter(numeric), ...CONTEXT_FIELDS];
+const isNumeric = (field: string): field is NumericField => (NUMERIC_FIELDS as readonly string[]).includes(field);
+
+/**
+ * Focus metric, the other metrics asked for, the field the rows are sorted
+ * by (so their order is explained by a column), then the screen's numeric
+ * criteria and the context columns. Money needs one currency.
+ */
+export function resultFields(definition: ScreenDefinition, metric: NumericField, others: readonly NumericField[] = []): NumericField[] {
+  const sort = isNumeric(definition.sort.field) ? [definition.sort.field] : [];
+  const fields = [metric, ...others, ...sort, ...definition.criteria.map((criterion) => criterion.field).filter(isNumeric), ...CONTEXT_FIELDS];
   return [...new Set(fields)].filter((field) => definition.currency || !MONETARY.has(field) || field === metric);
+}
+
+/**
+ * The metrics a pane's `metric` setting names, the focus first: one field, or
+ * the comma list `--metric` leaves (`trailingPE,dividendYieldPercent`).
+ * Unknown names are skipped; none known leaves `fallback`.
+ */
+export function screenMetricSetting(setting: unknown, fallback: NumericField): [NumericField, ...NumericField[]] {
+  const fields = typeof setting === "string" ? setting.split(",").map((part) => part.trim()).filter(isNumeric) : [];
+  const unique = [...new Set(fields)];
+  return unique.length > 0 ? unique as [NumericField, ...NumericField[]] : [fallback];
 }
 
 /**
@@ -174,8 +342,12 @@ export function resultFields(definition: ScreenDefinition, metric: NumericField)
  * snapshot's day without one.
  */
 export function screenYtdBase(rows: readonly ScreenRow[], assembledAt?: string | null, now = Date.now()): string | null {
-  const day = rows.map((row) => row.metrics.returnYtdPercent?.asOf?.slice(0, 10) ?? "").filter(Boolean).sort().at(-1)
-    ?? assembledAt?.slice(0, 10);
+  let newest = "";
+  for (const row of rows) {
+    const day = row.metrics.returnYtdPercent?.asOf?.slice(0, 10);
+    if (day && day > newest) newest = day;
+  }
+  const day = newest || assembledAt?.slice(0, 10);
   return day ? yearToDateBaseLabel(day, "NYSE", now) : null;
 }
 
@@ -189,8 +361,37 @@ export function screenColumnLabel(field: NumericField, ytdBase: string | null, f
   return form === "compact" ? `YTD% ${ytdBase}` : `YTD% vs ${ytdBase}${form === "report" ? " close" : ""}`;
 }
 
-/** Prices get room for a separated six-figure quote (757,398.00). */
-export const columnWidth = (field: NumericField, label = SHORT_LABELS[field]) => Math.max(field === "price" ? 10 : 8, label.length);
+/** Prices get room for a separated six-figure quote (757,398.00), the composite for its label (3.36 Neutral). */
+export const columnWidth = (field: NumericField, label = SHORT_LABELS[field]) =>
+  Math.max(field === "price" ? 10 : field === "gradeComposite" ? 12 : 8, label.length);
+
+/** Valuation multiples, where the cheapest is what a screen looks for first. */
+const VALUATION_MULTIPLE_FIELDS: ReadonlySet<string> = new Set(["trailingPE", "forwardPE", "enterpriseToRevenue", "priceToBook", "evToEbitda"]);
+
+/**
+ * Whether a field is a valuation multiple: it sorts cheapest first, and one
+ * at zero or below (a loss, negative book or EBITDA) is no cheap price, so it
+ * ranks after every positive one either way, as the server sorts it.
+ */
+export function isValuationMultiple(field: string): boolean {
+  return VALUATION_MULTIPLE_FIELDS.has(field);
+}
+
+/**
+ * The order a field ranks in when picked as the metric or its header is first
+ * pressed: a valuation multiple cheapest first, anything else largest first.
+ */
+export function firstScreenSortDirection(field: string): "asc" | "desc" {
+  return isValuationMultiple(field) ? "asc" : "desc";
+}
+
+/** The sort a header press asks for: the column sorted flips, another starts the way it ranks. */
+export function pressedScreenSort<F extends string>(current: { field: string; direction: "asc" | "desc" }, field: F): { field: F; direction: "asc" | "desc" } {
+  return {
+    field,
+    direction: current.field === field ? current.direction === "desc" ? "asc" : "desc" : firstScreenSortDirection(field),
+  };
+}
 
 export const DEFAULT_SCREEN: ScreenDefinition = {
   version: 1,
@@ -226,8 +427,19 @@ export function screenCurrencyEmpty(
   };
 }
 
-export const screenRowId = (row: Pick<ScreenRow, "symbol" | "exchange">) =>
-  `${canonicalExchange(row.exchange)}:${row.symbol}`;
+/**
+ * A row's id as last read: the table, the order and the lookups of a long list
+ * ask for it row by row on every render, and a screen's rows do not change
+ * between them.
+ */
+const rowIds = new WeakMap<object, { symbol: string; exchange: string; id: string }>();
+export const screenRowId = (row: Pick<ScreenRow, "symbol" | "exchange">) => {
+  const known = rowIds.get(row);
+  if (known && known.symbol === row.symbol && known.exchange === row.exchange) return known.id;
+  const id = `${canonicalExchange(row.exchange)}:${row.symbol}`;
+  rowIds.set(row, { symbol: row.symbol, exchange: row.exchange, id });
+  return id;
+};
 export const screenLabel = (field: string) =>
   ({
     kpiArr: "Annual recurring revenue",
@@ -273,7 +485,7 @@ export const screenLabel = (field: string) =>
     dividendYieldPercent: "Dividend yield %",
     xPostsPerDay: "X posts per day",
     xPostsVsMedian: "X posts vs median",
-    payoutRatioPercent: "Annual payout ratio %",
+    payoutRatioPercent: "FY cash dividends / parent net income %",
     dividendGrowth1YPercent: "Dividend growth 1Y %",
     dividendGrowth3YPercent: "Dividend growth 3Y CAGR %",
     wikiViewsPerDay: "Wikipedia views per day",
@@ -288,6 +500,19 @@ export const screenLabel = (field: string) =>
     fromHigh52WPercent: "From 52-week high %",
     beta: "Beta",
     atrPercent: "ATR%",
+    rsi14: "RSI 14",
+    priceVsSma20Percent: "Price vs SMA 20 %",
+    priceVsSma50Percent: "Price vs SMA 50 %",
+    priceVsSma200Percent: "Price vs SMA 200 %",
+    macdBullishCrossDays: "Days since MACD bullish cross",
+    macdBearishCrossDays: "Days since MACD bearish cross",
+    goldenCrossDays: "Days since golden cross",
+    deathCrossDays: "Days since death cross",
+    newHigh20dDays: "Days since new 20-day high",
+    newLow20dDays: "Days since new 20-day low",
+    newHigh52wDays: "Days since new 52-week high",
+    newLow52wDays: "Days since new 52-week low",
+    bollingerWidthPercentile: "Bollinger width percentile",
     priceToBook: "P/B",
     evToEbitda: "EV / EBITDA",
     roePercent: "Annual ROE %",
@@ -295,6 +520,50 @@ export const screenLabel = (field: string) =>
     analystUpsidePercent: "Analyst upside %",
     ivRank: "IV rank",
     ivToHv: "IV / HV",
+    iv30Percent: "IV30 %",
+    ivPercentile: "IV percentile",
+    iv30Change1d: "IV30 change 1D, vol pts",
+    iv30Change5d: "IV30 change 5D, vol pts",
+    hv20Percent: "HV20 %",
+    hvRank: "HV rank",
+    sharesOutstanding: "Shares outstanding",
+    floatShares: "Float",
+    shortPercentOfFloat: "Short interest % of float",
+    institutionalOwnershipPercent: "Institutional ownership % (13F)",
+    roicPercent: "ROIC %",
+    fcfYieldPercent: "FCF yield %",
+    netDebtToEbitda: "Net debt / EBITDA",
+    debtToEquity: "Debt / equity",
+    revenueCagr3YPercent: "Revenue CAGR 3Y %",
+    revenueCagr5YPercent: "Revenue CAGR 5Y %",
+    epsCagr3YPercent: "EPS CAGR 3Y %",
+    epsCagr5YPercent: "EPS CAGR 5Y %",
+    forwardRevenueGrowthPercent: "Forward revenue growth %",
+    forwardEpsGrowthPercent: "Forward EPS growth %",
+    piotroskiFScore: "Piotroski F-score",
+    altmanZScore: "Altman Z-score",
+    grahamNumber: "Graham number",
+    grahamUpsidePercent: "Graham number upside %",
+    lynchFairValue: "Lynch fair value",
+    lynchUpsidePercent: "Lynch fair value upside %",
+    earningsYieldPercent: "Earnings yield (EBIT / EV) %",
+    returnOnCapitalPercent: "Return on capital (Greenblatt) %",
+    magicFormulaRank: "Magic Formula rank",
+    totalReturn1YPercent: "1Y total return %",
+    rsRating: "RS rating",
+    profitableYears: "Profitable years",
+    revenueGrowthYears: "Revenue growth years",
+    dividendGrowthYears: "Dividend growth years",
+    sp500Member: "S&P 500 member",
+    dowMember: "Dow member",
+    valueGrade: "Value grade",
+    growthGrade: "Growth grade",
+    profitabilityGrade: "Profitability grade",
+    momentumGrade: "Momentum grade",
+    revisionsGrade: "Revisions grade",
+    gradeComposite: "Grade composite",
+    nextYearEpsRevision30dPercent: "Next FY EPS revision 30D %",
+    revenueRevision30dPercent: "Revenue revision 30D %",
     hiringOpenRoles: "Hiring open roles",
     hiringNetAddsWeek: "Net open roles per week",
     hiringRemotePercent: "Remote roles %",
@@ -307,35 +576,114 @@ export const screenLabel = (field: string) =>
   field
     .replace(/([A-Z])/g, " $1")
     .replace(/^./, (value) => value.toUpperCase());
+/** A category's `in` alternatives. */
+const MAX_CATEGORY_VALUES = 25;
+/** A list of symbols is a watchlist or a pasted list, so it takes up to 500 names. */
+export const MAX_SYMBOL_VALUES = 500;
+const maxCategoryValues = (field: string) => (field === "symbol" ? MAX_SYMBOL_VALUES : MAX_CATEGORY_VALUES);
+
+/**
+ * A watchlist's tickers as a screen's symbols: each with its venue (`BN:TSX`,
+ * `PM:NYSE`), once. The screener matches such a value by company: the listing
+ * and the company's other screened listings, never another company's line with
+ * the same code (BN in Paris is Danone). A ticker with no known venue stays bare.
+ */
+export function screenListings(tickers: ReadonlyArray<{ ticker: string; exchange?: string }>): string[] {
+  return [...new Set(tickers.flatMap(({ ticker, exchange }) => {
+    const parsed = parsePublicTickerKey(ticker);
+    if (!parsed.symbol) return [];
+    const venue = canonicalExchange(parsed.exchange ?? exchange);
+    return [venue ? `${parsed.symbol}:${venue}` : parsed.symbol];
+  }))];
+}
+
+/** A listing value as a list names it: bare on a US venue (PM), SYMBOL:EXCHANGE elsewhere (RCI.B:TSX). */
+function listingName(value: string): string {
+  const parsed = parsePublicTickerKey(value);
+  return parsed.exchange && !isUsListingExchange(parsed.exchange) ? `${parsed.symbol}:${parsed.exchange}` : parsed.symbol;
+}
+
+/** The most members the screen's notes name one by one as matched through another listing. */
+const LISTING_NOTES = 10;
+
+/**
+ * What a screen says of the symbol values it did not read as themselves: each
+ * member matched through another listing of its company (`RCI.B:TSX: not in
+ * the screener; matched its NYSE listing RCI.`, the first ten), every member
+ * nothing in the screener carries, bare or with its venue, and every member
+ * whose matched listings the screen's `currency` leaves out.
+ */
+export function listingReadNotes(reads: readonly ScreenListingRead[] | undefined, currency?: string | null): string[] {
+  const list: readonly ScreenListingRead[] = (Array.isArray(reads) ? reads : [])
+    .filter((read) => typeof read?.value === "string" && typeof read.covered === "boolean" && Array.isArray(read.others));
+  const leftOut = list.filter((read) => Array.isArray(read.outsideCurrency) && read.outsideCurrency.length > 0);
+  const kept = list.filter((read) => !leftOut.includes(read));
+  const matchedElsewhere = kept.filter((read) => !read.covered && read.others.length > 0);
+  const absent = kept.filter((read) => !read.covered && read.others.length === 0);
+  const notes = matchedElsewhere.slice(0, LISTING_NOTES).map(({ value, others }) =>
+    `${listingName(value)}: not in the screener; matched its ${others.map((other) => `${other.exchange} listing ${other.symbol}`).join(" and ")}.`);
+  const more = matchedElsewhere.length - notes.length;
+  if (more > 0) notes.push(`${more} more member${more === 1 ? " is" : "s are"} matched through another listing of the company.`);
+  if (absent.length > 0) notes.push(`Not in the screener under any listing: ${absent.map((read) => listingName(read.value)).join(", ")}.`);
+  if (leftOut.length > 0) {
+    const named = leftOut.map((read) => {
+      const own = listingName(read.value);
+      const code = parsePublicTickerKey(read.value).symbol;
+      return read.outsideCurrency!.map((listing) => listing.symbol === code
+        ? `${own} in ${listing.currency}`
+        : `${own} as its ${listing.exchange} listing ${listing.symbol} in ${listing.currency}`).join(", ");
+    });
+    notes.push(`${currency ? `Quoted outside ${currency}, so this screen leaves them out` : "Quoted in another currency than the screen's, so left out"}: ${named.join("; ")}.`);
+  }
+  return notes;
+}
+
+/** The one name typed for a symbol list, which may name a watchlist (`HY3`), or null. */
+export function typedListName(fieldId: string, operator: ScreenOperator, text: string): string | null {
+  if (fieldId !== "symbol" || operator !== "in") return null;
+  const typed = text.split(",").map((value) => value.trim()).filter(Boolean);
+  return typed.length === 1 ? typed[0]! : null;
+}
+
+/**
+ * A criterion as the editor's fields give it. `readWatchlist` reads one name
+ * typed for the symbol field as that watchlist's symbols (`HY3`), or null
+ * when it names none.
+ */
 export function parseCriterion(
   field: ScreenFieldDefinition,
   operator: ScreenOperator,
   text: string,
+  readWatchlist?: (typed: string) => { symbols: readonly string[] } | null,
 ): ScreenCriterion {
   if (!field.operators.includes(operator))
     throw new Error("Choose a supported operator for this field.");
   if (operator === "present" || operator === "missing")
     return { field: field.id, op: operator };
   if (field.kind === "category") {
-    const values = [
-      ...new Set(
-        text
-          .split(",")
-          .map((value) => value.trim())
-          .filter(Boolean),
-      ),
-    ];
-    if (operator !== "in" || !values.length || values.length > 25 || values.some((value) => value.length > 120))
-      throw new Error("Enter 1-25 comma-separated values, up to 120 characters each.");
+    const typed = text
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const name = typedListName(field.id, operator, text);
+    const listed = name ? readWatchlist?.(name)?.symbols ?? null : null;
+    const values = [...new Set(listed ?? typed)];
+    const maximum = maxCategoryValues(field.id);
+    if (operator !== "in" || !values.length || values.length > maximum || values.some((value) => value.length > 120))
+      throw new Error(field.id === "symbol"
+        ? `Enter a watchlist name or 1-${maximum} comma-separated symbols, up to 120 characters each.`
+        : `Enter 1-${maximum} comma-separated values, up to 120 characters each.`);
     return {
       field: field.id as (typeof CATEGORY_FIELDS)[number],
       op: "in",
       value: values,
     };
   }
-  const values = text.split(",").map(parseThreshold);
+  const values = text.split(",").map((part) => parseGradeThreshold(field.id, part) ?? parseThreshold(part));
   if (values.some((value) => value === null))
-    throw new Error("Enter a finite numeric threshold, such as 25 or 10B.");
+    throw new Error(LETTER_GRADES.has(field.id as NumericField)
+      ? "Enter a grade from F to A+, such as B+."
+      : "Enter a finite numeric threshold, such as 25 or 10B.");
   if (operator === "between") {
     if (values.length !== 2 || Number(values[0]) > Number(values[1]))
       throw new Error("Enter minimum, maximum in ascending order.");
@@ -356,6 +704,35 @@ export function parseCriterion(
     value: Number(values[0]),
   };
 }
+/** A grade typed as its letter (`b+`, `A`), or the composite as its label (`Strong` is 3.5); null for anything else. */
+function parseGradeThreshold(field: string, text: string): number | null {
+  const typed = text.trim().toUpperCase();
+  if (LETTER_GRADES.has(field as NumericField)) {
+    const index = (GRADE_LETTERS as readonly string[]).indexOf(typed);
+    return index >= 0 ? index + 1 : null;
+  }
+  if (field === "gradeComposite") return COMPOSITE_BANDS.find((band) => band.label.toUpperCase() === typed)?.from ?? null;
+  return null;
+}
+/** A criterion's value as the editor shows it: a grade as its letter, a range as `min, max`. */
+export function criterionInputText(criterion: ScreenCriterion | null): string {
+  if (!criterion || !("value" in criterion)) return "";
+  const shown = (value: string | number) => typeof value === "number" && LETTER_GRADES.has(criterion.field as NumericField)
+    ? gradeLetter(value) ?? String(value) : String(value);
+  return Array.isArray(criterion.value) ? criterion.value.map(shown).join(", ") : shown(criterion.value);
+}
+/** What the value field asks for: the grade's range for a grade, else the field's unit. */
+export function criterionValueLabel(field: Pick<ScreenFieldDefinition, "id" | "unit">): string {
+  const unit = LETTER_GRADES.has(field.id as NumericField) ? "F to A+" : field.unit;
+  return `Value${unit ? ` (${unit})` : ""}`;
+}
+/** An example value: a letter for a grade, a score or label for the composite. */
+export function criterionValueHint(field: Pick<ScreenFieldDefinition, "id">, operator: ScreenOperator): string {
+  if (LETTER_GRADES.has(field.id as NumericField)) return operator === "between" ? "lowest, highest grade, e.g. B, A+" : "grade, e.g. B+";
+  if (field.id === "gradeComposite") return operator === "between" ? "minimum, maximum, e.g. 3.5, 5" : "score or label, e.g. 3.5 or Strong";
+  if (field.id === "symbol" && operator === "in") return "a watchlist's name or symbols, e.g. AAPL, MSFT";
+  return operator === "between" ? "minimum, maximum" : operator === "in" ? "comma-separated values" : "threshold, e.g. 25 or 10B";
+}
 const SCALE: Record<string, number> = { k: 1e3, m: 1e6, b: 1e9, t: 1e12 };
 /** A plain number or one with a k/M/B/T scale suffix: 25, -0.5, 1e6, 10B. */
 export function parseThreshold(text: string): number | null {
@@ -366,6 +743,13 @@ export function parseThreshold(text: string): number | null {
 }
 const thresholdText = (value: number) =>
   Math.abs(value) >= 1e6 ? formatCompact(value) : String(value);
+
+/** A list past a category's length names its first values and counts the rest: a watchlist's 300 symbols do not fill a line. */
+function listText(items: readonly string[]): string {
+  return items.length > MAX_CATEGORY_VALUES
+    ? `${items.slice(0, 8).join(", ")} and ${items.length - 8} more`
+    : items.join(", ");
+}
 
 export function criterionText(criterion: ScreenCriterion): string {
   const symbols = {
@@ -381,8 +765,17 @@ export function criterionText(criterion: ScreenCriterion): string {
   };
   const value = !("value" in criterion)
     ? ""
+    // Membership is 1 or 0: `S&P 500 member = yes`.
+    : MEMBERSHIP.has(criterion.field as NumericField) && typeof criterion.value === "number" && [0, 1].includes(criterion.value)
+      ? ` ${criterion.value === 1 ? "yes" : "no"}`
+    // A grade reads as its letter: `Value grade >= B+`.
+    : LETTER_GRADES.has(criterion.field as NumericField)
+      ? ` ${criterionInputText(criterion)}`
+    // The composite names the label a threshold starts: `Grade composite >= 4.5 (Top)`.
+    : criterion.field === "gradeComposite" && typeof criterion.value === "number"
+      ? ` ${thresholdText(criterion.value)}${COMPOSITE_BANDS.some((band) => band.from === criterion.value && band.from > 1) ? ` (${compositeLabel(criterion.value)})` : ""}`
     : Array.isArray(criterion.value)
-      ? ` ${criterion.value.map((item) => (typeof item === "number" ? thresholdText(item) : item)).join(", ")}`
+      ? ` ${listText(criterion.value.map((item) => (typeof item === "number" ? thresholdText(item) : item)))}`
       : ` ${thresholdText(criterion.value)}`;
   return `${screenLabel(criterion.field)} ${symbols[criterion.op]}${value}`;
 }
@@ -390,6 +783,8 @@ export function criterionText(criterion: ScreenCriterion): string {
 const OBSERVED_SUBSET_FIELDS: readonly string[] = ["insiderPurchases90d", "insiderSales90d"];
 const NUMERIC_OPERATORS: ScreenOperator[] = ["gte", "lte", "gt", "lt", "eq", "between", "present", "missing"];
 const OBSERVED_SUBSET_OPERATORS: ScreenOperator[] = ["gte", "gt", "present", "missing"];
+/** Index membership is 1 or 0: equal to one, or there or not. */
+const MEMBERSHIP_OPERATORS: ScreenOperator[] = ["eq", "present", "missing"];
 const CATEGORY_OPERATORS: ScreenOperator[] = ["in", "present", "missing"];
 
 /**
@@ -415,6 +810,7 @@ function unknownFieldText(field: unknown): string {
 /** The operators a definition may use on a field, or null for a field screens do not have. */
 function screenFieldOperators(field: string): ScreenOperator[] | null {
   if (OBSERVED_SUBSET_FIELDS.includes(field)) return [...OBSERVED_SUBSET_OPERATORS];
+  if ((MEMBERSHIP_FIELDS as readonly string[]).includes(field)) return [...MEMBERSHIP_OPERATORS];
   if ((NUMERIC_FIELDS as readonly string[]).includes(field)) return [...NUMERIC_OPERATORS];
   if ((CATEGORY_FIELDS as readonly string[]).includes(field)) return [...CATEGORY_OPERATORS];
   return null;
@@ -432,7 +828,10 @@ export function screenDefinitionSyntax(): string {
     `Operators by field: numeric fields (the --metric values) take ${single.join(", ")} with one number,`,
     "between with [min, max], present and missing with no value;",
     `${OBSERVED_SUBSET_FIELDS.join(" and ")} take only ${OBSERVED_SUBSET_OPERATORS.join(", ")};`,
-    `category fields (${CATEGORY_FIELDS.join(", ")}) take in with an array of 1-25 names, present, missing.`,
+    `${MEMBERSHIP_FIELDS.join(" and ")} take only ${MEMBERSHIP_OPERATORS.join(", ")}, eq with 1 for a member or 0;`,
+    `the grades (${LETTER_GRADE_FIELDS.join(", ")}) are numbers from 1 (F) to 13 (A+), so B+ or better is gte 10, and gradeComposite runs from 1 to 5 (4.5 and up is Top);`,
+    `category fields (${CATEGORY_FIELDS.join(", ")}) take in with an array of 1-${MAX_CATEGORY_VALUES} names, present, missing;`,
+    `symbol takes up to ${MAX_SYMBOL_VALUES}, or one watchlist's name, which reads as its symbols.`,
   ].join(" ");
 }
 
@@ -448,8 +847,16 @@ export const EXAMPLE_SCREEN_DEFINITION: ScreenDefinition = {
   sort: { field: "marketCap", direction: "desc" },
 };
 
+/** A screen of one watchlist's names: the name stands for its symbols. */
+export const WATCHLIST_SCREEN_DEFINITION: ScreenDefinition = {
+  version: 1,
+  currency: "USD",
+  criteria: [{ field: "symbol", op: "in", value: ["Watchlist"] }],
+  sort: { field: "marketCap", direction: "desc" },
+};
+
 const VALUE_SHAPES: Partial<Record<ScreenOperator, string>> = {
-  in: "an array of 1-25 names, such as [\"Gold\"]",
+  in: `an array of 1-${MAX_CATEGORY_VALUES} names (symbol: 1-${MAX_SYMBOL_VALUES}, or a watchlist's name), such as ["Gold"]`,
   between: "[min, max] in ascending order, such as [5, 30]",
 };
 
@@ -481,7 +888,7 @@ function checkCriterion(criterion: unknown, index: number): ScreenCriterion {
   const value = item.value;
   const shape = VALUE_SHAPES[op] ?? "one number, such as 10000000000";
   const valid = op === "in"
-    ? Array.isArray(value) && value.length >= 1 && value.length <= 25
+    ? Array.isArray(value) && value.length >= 1 && value.length <= maxCategoryValues(field)
       && value.every((entry) => typeof entry === "string" && entry.trim().length > 0 && entry.length <= 120)
     : op === "between"
       ? Array.isArray(value) && value.length === 2 && value.every((entry) => typeof entry === "number" && Number.isFinite(entry))
@@ -538,6 +945,21 @@ const unavailableMetric = (): ScreenMetric => ({
   state: "unavailable", scope: "reported", reason: "Not provided by this server", sourceUrl: null,
   percentile: { value: null, sampleCount: 0, scope: "covered-universe" },
 });
+/**
+ * The fields the field and metric pickers offer. ATTN's two (ATTN HRS,
+ * ATTN Z) stay out until ATTN is listed again (attention/listing.ts), but for
+ * one the screen already uses, so a saved screen still shows it.
+ */
+export function pickerFields<Field extends { id: string }>(
+  fields: readonly Field[],
+  inUse: readonly string[] = [],
+  listed: boolean = ATTENTION_LISTED,
+): Field[] {
+  if (listed) return [...fields];
+  const unlisted = new Set<string>(ATTENTION_FIELDS);
+  return fields.filter((field) => !unlisted.has(field.id) || inUse.includes(field.id));
+}
+
 /** Company KPIs, guidance, hiring and app attention: the server leaves them out of a screen for a caller without Gloom Pro. */
 const PRO_FIELDS: ReadonlySet<string> = new Set([...KPI_FIELDS, ...HIRING_APP_FIELDS]);
 const withheldMetric = (): ScreenMetric => ({ ...unavailableMetric(), reason: "Needs Gloom Pro", access: "pro" });
@@ -593,9 +1015,9 @@ export function validateScreenPayload(value: unknown): ScreenPayload {
       throw new Error("Invalid screener listing identity.");
     ids.add(screenRowId(row));
     for (const field of NUMERIC_FIELDS) {
-      // A server from before social, research, volatility or dividend fields omits them; they read as unavailable.
-      // A Pro field it left out was held back from this caller.
-      if (!row.metrics[field] && ([...SOCIAL_FIELDS, ...RESEARCH_FIELDS, ...VOLATILITY_FIELDS, ...ATTENTION_FIELDS, ...HIRING_APP_FIELDS, ...KPI_FIELDS, ...DIVIDEND_FIELDS] as readonly string[]).includes(field))
+      // A server from before social, research, volatility, dividend, technical, option volatility, ownership, quality,
+      // score or grade fields omits them; they read as unavailable. A Pro field it left out was held back from this caller.
+      if (!row.metrics[field] && ([...SOCIAL_FIELDS, ...RESEARCH_FIELDS, ...VOLATILITY_FIELDS, ...TECHNICAL_FIELDS, ...OPTION_VOLATILITY_FIELDS, ...OWNERSHIP_FIELDS, ...QUALITY_FIELDS, ...SCORE_FIELDS, ...GRADE_FIELDS, ...ATTENTION_FIELDS, ...HIRING_APP_FIELDS, ...KPI_FIELDS, ...DIVIDEND_FIELDS] as readonly string[]).includes(field))
         row.metrics[field] = PRO_FIELDS.has(field) ? withheldMetric() : unavailableMetric();
       const metric = row.metrics[field];
       if (
@@ -635,5 +1057,6 @@ export function appendScreenPage(
     throw new Error("Screen snapshot changed. Refresh to start again.");
   const rows = new Map(current.rows.map((row) => [screenRowId(row), row]));
   for (const row of next.rows) rows.set(screenRowId(row), row);
-  return { ...next, rows: [...rows.values()] };
+  // How a watchlist's listings read comes with the first page.
+  return { ...next, rows: [...rows.values()], ...(current.listings ? { listings: current.listings } : {}) };
 }

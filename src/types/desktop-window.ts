@@ -1,6 +1,5 @@
 import type { PaneRuntimeState } from "../core/state/app/state";
-import type { SecondaryWindowLayoutEdit, WindowMoveTarget, WindowSize } from "../layout/pane-manager/secondary-windows";
-import type { AppConfig, PaneInstanceConfig } from "./config";
+import type { AppConfig, SavedLayout } from "./config";
 
 export interface DesktopSharedStateSnapshot {
   config: AppConfig;
@@ -13,6 +12,66 @@ export interface DesktopSharedStateSnapshot {
   brokerSyncErrors?: Record<string, string>;
   mainStateRevision?: number;
   layoutChanged?: boolean;
+  /**
+   * The tickers of panes in other windows that panes in this one follow, by
+   * pane id: a link keeps working when the pane it follows moved away.
+   */
+  linkedTickers?: Record<string, string>;
+  /**
+   * The number of a state the desktop process sent. A window's next sync
+   * names the one it last took, so only what it changed since counts.
+   */
+  stateSeq?: number;
+}
+
+/** A full desktop window, as the others list it to move a tab or a pane there. */
+export interface DesktopWindowInfo {
+  id: string;
+  /** Its place in the order windows opened in: 1 for the main window. */
+  number: number;
+  /** The tab it shows. */
+  activeLayoutName: string;
+  tabCount: number;
+}
+
+/**
+ * A tab another full window holds, at its place among all the tabs. The main
+ * window's cloud sync pushes and pulls every window's tabs, not only its own.
+ */
+export interface OtherWindowTab {
+  at: number;
+  tab: SavedLayout;
+}
+
+/** Where a tab or pane goes: one of the open windows, or a new one. */
+export type DesktopWindowTarget = { windowId: string } | { newWindow: true };
+
+/**
+ * The desktop app's full windows, for the window that holds this. Each has
+ * its own tabs; a tab or a pane can move to another, and focus can follow.
+ */
+export interface DesktopWindowsBridge {
+  /** This window's id. */
+  readonly windowId: string;
+  /** Every full window, this one included, in the order they opened. */
+  list(): DesktopWindowInfo[];
+  subscribe(listener: () => void): () => void;
+  /** A new window on an empty tab of its own. */
+  openWindow(): Promise<void>;
+  /** Moves a tab of this window. Resolves false when it cannot go (this window's last tab, for the main window). */
+  moveLayout(layoutId: string, target: DesktopWindowTarget): Promise<boolean>;
+  movePane(paneId: string, target: DesktopWindowTarget): Promise<boolean>;
+  focusWindow(windowId: string): Promise<void>;
+  /** Brings forward the window showing a pane in another window, on the pane's tab, with the pane focused. */
+  focusPane(paneId: string): Promise<boolean>;
+  /** Asked by another window to focus one of this window's panes. */
+  subscribeFocusRequests(listener: (paneId: string) => void): () => void;
+  /**
+   * The tabs the other windows hold, for cloud sync; the same array until
+   * they change, which `subscribe` reports. Only the main window is sent
+   * them, and only while there is more than one window.
+   */
+  otherWindowTabs(): readonly OtherWindowTab[];
 }
 
 export interface DesktopDockPreviewState {
@@ -24,77 +83,19 @@ export interface DesktopThemePreviewState {
   theme: string | null;
 }
 
-/**
- * A change a secondary window asks the main window to make. The main window is
- * the only one that writes layout and config, so its revisions order every
- * change; the host tells it which window asked, and it applies the change to
- * that window's panes only.
- */
-export type DesktopWindowIntent =
-  | { type: "editLayout"; edit: SecondaryWindowLayoutEdit }
-  | { type: "replacePaneState"; paneState: Record<string, PaneRuntimeState> }
-  /** Plugin settings a pane changed, by plugin; null removes that plugin's settings. */
-  | { type: "setPluginConfig"; values: Record<string, Record<string, unknown> | null> }
-  /**
-   * App settings changed in the window, such as the theme or base currency:
-   * only the fields that changed there. The main window takes the ones a
-   * window may set and ignores the rest.
-   */
-  | { type: "setConfig"; fields: Partial<AppConfig> }
-  /**
-   * Panes in other windows that this window changed, as reusing one from its
-   * command bar retargets it. Their places stay as they are.
-   */
-  | { type: "updateInstances"; instances: PaneInstanceConfig[] }
-  /** One of the window's own panes to another window: "main", a window id, or "new". */
-  | { type: "movePane"; paneId: string; target: WindowMoveTarget }
-  /** A new, empty secondary window. */
-  | { type: "addWindow" }
-  /** This window gone, its panes moved into the main window. */
-  | { type: "closeWindow" }
-  /**
-   * What the main window needs to place a pane moved here: the window's
-   * focused pane and its size. Not a change; it is kept, not saved.
-   */
-  | { type: "windowStatus"; status: SecondaryWindowStatus };
-
-/** A secondary window's focused pane and size, as it last told the main window. */
-export interface SecondaryWindowStatus {
-  focusedPaneId: string | null;
-  size: WindowSize | null;
-}
-
-export interface DesktopWindowIntentResult {
-  /** False when the main window dropped the change, for instance an edit made on a state it has since moved past. */
-  applied: boolean;
-}
-
 export interface DesktopWindowBridge {
-  /** The main window, a popped-out pane, or a secondary window with its own grid. */
-  kind: "main" | "detached" | "window";
+  kind: "main" | "detached";
   paneId?: string;
-  /** A secondary window's layout window id. */
-  windowId?: string;
-  /** This window's channel key, as `subscribeActiveWindow` reports windows. */
-  windowKey?: string;
-  /** The window with native focus when this one opened, or the last one to have it. */
-  initialActiveWindowKey?: string | null;
-  /** Native focus moving between this app's windows; it keeps the last one while the app is in the background. */
-  subscribeActiveWindow?(listener: (windowKey: string | null) => void): () => void;
-  /** A pane in another window: that window comes forward and focuses it. */
-  focusPaneInItsWindow?(paneId: string): Promise<void>;
   /**
-   * Window `windowId` ("main" or a layout window id) comes forward, focusing
-   * `paneId` there once the layout has it there.
+   * False in a full window other than the main one: it has its own tabs, but
+   * the app-wide work (cloud sync, the session, the Dock badge, deep links,
+   * remote control) stays with the main window.
    */
-  focusWindow?(windowId: string, paneId?: string | null): Promise<void>;
-  /** The host asking this window to focus one of its own panes. */
-  subscribeFocusPane?(listener: (paneId: string) => void): () => void;
-  /** From a secondary window: a change for the main window to apply. */
-  sendWindowIntent?(intent: DesktopWindowIntent): Promise<DesktopWindowIntentResult>;
-  /** In the main window: applies the changes secondary windows ask for. */
-  handleWindowIntents?(handler: (windowId: string, intent: DesktopWindowIntent) => DesktopWindowIntentResult): () => void;
-  syncMainState?(snapshot: DesktopSharedStateSnapshot): Promise<void>;
+  primary?: boolean;
+  /** The full windows, where the shell has more than one. */
+  windows?: DesktopWindowsBridge;
+  /** `baseSeq` is the `stateSeq` of the last state this window took, or null when it built on its own last sync. */
+  syncMainState?(snapshot: DesktopSharedStateSnapshot, baseSeq?: number | null): Promise<void>;
   syncThemePreview?(preview: DesktopThemePreviewState): Promise<void>;
   replaceDetachedPaneState?(paneId: string, paneState: PaneRuntimeState): Promise<void>;
   popOutPane?(paneId: string): Promise<void>;
@@ -104,4 +105,6 @@ export interface DesktopWindowBridge {
   subscribeState(listener: (snapshot: DesktopSharedStateSnapshot) => void): () => void;
   subscribeDockPreview?(listener: (preview: DesktopDockPreviewState) => void): () => void;
   subscribeThemePreview?(listener: (preview: DesktopThemePreviewState) => void): () => void;
+  /** A window change the desktop app could not save (a window closed, a pane docked or moved), in the main window. */
+  subscribeSaveFailures?(listener: () => void): () => void;
 }

@@ -18,7 +18,6 @@ import {
 import type { LayoutConfig } from "../../../../types/config";
 import {
   constrainFloatingRectToBounds,
-  makeSnapGuides,
   sameRect,
   type DragPreview,
   type PaneDragRectState,
@@ -27,8 +26,11 @@ import {
 import type { ActionMenuState } from "../action-menu-overlay";
 import type { DividerPreviewState } from "../native/window-state";
 import { createLiveDragStore, IDLE_DRAG, type LiveDockGeometry, type LiveDragStore } from "./live";
+import type { MagnetDistances } from "./magnets";
+import { sameDropZone, type DropZoneMetrics, type DropZoneState } from "./drop-zones";
 import { beginLiveResize, createCatchUp } from "../../../../ui/live-resize";
 import type { WindowEditState } from "../../window-edit/mode";
+import type { PaneHeaderQuickSetting } from "../../pane/header";
 import { useShellActiveDrag } from "../active-drag";
 import { useShellNativePointerRuntime } from "../native/pointer-runtime";
 import { useShellTerminalPointerRuntime } from "../terminal-pointer-runtime";
@@ -67,6 +69,8 @@ export interface ShellMouseEvent {
   /** Desktop: where the browser predicts the pointer a moment later, for drawing only. */
   predictedX?: number;
   predictedY?: number;
+  /** Alt (Option) held: a moving or resizing pane ignores its magnets. */
+  modifiers?: { alt?: boolean };
   /** Whether a later handler has claimed this pointer interaction. */
   isDefaultPrevented?: () => boolean;
   stopPropagation: () => void;
@@ -86,23 +90,29 @@ export interface ShellDragRuntimeState {
   hasActiveDrag: () => boolean;
   /** Positions that follow the pointer, outside React state. */
   live: LiveDragStore;
-  /** The tiled pane whose drop grid is under the pointer. */
-  setHoverTarget: (targetId: string | null) => void;
   startDrag: (drag: DragMode) => void;
   /** `dock`: on the desktop, the panes and dividers under the split, where the pointer has them. */
   updateDividerPreview: (next: DividerPreviewState | null, dock?: LiveDockGeometry | null) => void;
   updateDockPreview: (next: DragPreview | null) => void;
+  /** The targets a pane on the move is over: the one on a pane, a window-edge strip. */
+  updateDropZone: (next: DropZoneState | null) => void;
   updateDragFloatingRect: (next: { paneId: string; rect: FloatingRect } | null) => void;
+  /** The windows a resize moves with it (shared edges), where the pointer has them. */
+  updateDragPartners: (next: ReadonlyMap<string, FloatingRect> | null) => void;
 }
 
 function sameDragPreview(a: DragPreview | null, b: DragPreview | null): boolean {
   if (a === b) return true;
   if (!a || !b || a.kind !== b.kind || !sameRect(a.rect, b.rect)) return false;
-  if (a.kind === "snap" && b.kind === "snap") return a.position === b.position;
+  if (a.kind === "float" && b.kind === "float") {
+    return a.drop.type === b.drop.type && a.drop.targetId === b.drop.targetId
+      && (a.drop.type !== "split" || (b.drop.type === "split" && a.drop.side === b.drop.side));
+  }
   if (a.kind === "dock" && b.kind === "dock") {
     const [x, y] = [a.target, b.target];
     if (x.kind === "frame" && y.kind === "frame") return x.edge === y.edge;
     if (x.kind === "leaf" && y.kind === "leaf") return x.targetId === y.targetId && x.position === y.position;
+    if (x.kind === "tab" && y.kind === "tab") return x.targetId === y.targetId;
   }
   return false;
 }
@@ -149,9 +159,12 @@ export function useShellDragRuntimeState({
     }
   }, [catchUp, contentHeight, live, nativePaneChrome, width]);
 
-  const setHoverTarget = useCallback((targetId: string | null) => {
-    live.set({ hoverTargetId: targetId });
-  }, [live]);
+  const updateDragPartners = useCallback((next: ReadonlyMap<string, FloatingRect> | null) => {
+    const current = live.get();
+    // Like the resized window: restyled on the desktop once they have started following.
+    if (nativePaneChrome && next && current.partners && current.paneResize) live.move({ partners: next });
+    else live.set({ partners: next });
+  }, [live, nativePaneChrome]);
 
   const updateDividerPreview = useCallback((next: DividerPreviewState | null, dock: LiveDockGeometry | null = null) => {
     const current = live.get().divider;
@@ -172,6 +185,11 @@ export function useShellDragRuntimeState({
     live.set({ dockPreview: next });
   }, [live]);
 
+  const updateDropZone = useCallback((next: DropZoneState | null) => {
+    if (sameDropZone(live.get().zones, next)) return;
+    live.set({ zones: next });
+  }, [live]);
+
   const startDrag = useCallback((drag: DragMode) => {
     finishLiveResize();
     dragRef.current = drag;
@@ -184,7 +202,7 @@ export function useShellDragRuntimeState({
 
   const endDrag = useCallback(() => {
     dragRef.current = null;
-    live.set({ paneDrag: null, paneResize: null });
+    live.set({ paneDrag: null, paneResize: null, partners: null, zones: null });
     finishLiveResize();
   }, [finishLiveResize, live]);
 
@@ -202,11 +220,12 @@ export function useShellDragRuntimeState({
     endDrag,
     hasActiveDrag,
     live,
-    setHoverTarget,
     startDrag,
     updateDividerPreview,
     updateDockPreview,
     updateDragFloatingRect,
+    updateDragPartners,
+    updateDropZone,
   };
 }
 
@@ -222,6 +241,10 @@ interface UseShellPointerRuntimeOptions {
   focusPane: (paneId: string) => void;
   focusedPaneId: string | null;
   handleFloatingClose: (paneId: string) => void;
+  /** How close a moving or resizing pane's edge comes to another before it sticks, in cells. */
+  magnetDistances: MagnetDistances;
+  /** The size of the drop targets a moving pane is offered, in cells. */
+  dropZoneMetrics: DropZoneMetrics;
   restoreFullscreen: () => void;
   menuState: ActionMenuState | null;
   nativePaneChrome: boolean;
@@ -231,13 +254,16 @@ interface UseShellPointerRuntimeOptions {
     event?: { preventDefault?: () => void; stopPropagation?: () => void },
   ) => void;
   openPaneDocs: (paneId: string) => void;
+  /** A pane's title as its header shows it: the terminal finds a stack's tabs by it. */
+  getPaneTitle: (pane: ResolvedPane) => string;
+  /** A pane's quick settings, which take room from a stack's tabs in its terminal header. */
+  getPaneQuickSettings: (paneId: string) => ReadonlyArray<Pick<PaneHeaderQuickSetting, "icon">>;
   paneMap: Map<string, ResolvedPane>;
   persistLayout: (nextLayout: LayoutConfig, options?: { pushHistory?: boolean }) => void;
   precisePointer: boolean | undefined;
   selectWindowModePane: (paneId: string) => void;
   setHoveredMenuItemId: Dispatch<SetStateAction<string | null>>;
   setMenuState: Dispatch<SetStateAction<ActionMenuState | null>>;
-  snapGuides: ReturnType<typeof makeSnapGuides>;
   transientFocusActive: boolean;
   updateWindowModePreviewLayout: (nextLayout: LayoutConfig, paneId?: string) => void;
   visibleFloatingPanes: VisibleFloatingPane[];
@@ -259,18 +285,21 @@ export function useShellPointerRuntime({
   focusPane,
   focusedPaneId,
   handleFloatingClose,
+  magnetDistances,
+  dropZoneMetrics,
   restoreFullscreen,
   menuState,
   nativePaneChrome,
   openPaneMenu,
   openPaneDocs,
+  getPaneTitle,
+  getPaneQuickSettings,
   paneMap,
   persistLayout,
   precisePointer,
   selectWindowModePane,
   setHoveredMenuItemId,
   setMenuState,
-  snapGuides,
   transientFocusActive,
   updateWindowModePreviewLayout,
   visibleFloatingPanes,
@@ -287,11 +316,12 @@ export function useShellPointerRuntime({
     dockLeafLayouts,
     focusPane,
     dragRuntime,
+    magnetDistances,
+    dropZoneMetrics,
     nativePaneChrome,
     paneMap,
     persistLayout,
     precisePointer,
-    snapGuides,
     updateWindowModePreviewLayout,
     visibleLayout,
     windowMode,
@@ -313,12 +343,15 @@ export function useShellPointerRuntime({
     menuState,
     openPaneMenu,
     openPaneDocs,
+    getPaneTitle,
+    getPaneQuickSettings,
     paneMap,
     selectWindowModePane,
     setHoveredMenuItemId,
     setMenuState,
     transientFocusActive,
     visibleFloatingPanes,
+    floatingOrder: visibleLayout.floating,
     width,
     windowMode,
   });

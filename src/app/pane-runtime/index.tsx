@@ -1,11 +1,10 @@
-import { useCallback, type Dispatch } from "react";
+import { useCallback, useRef, type Dispatch } from "react";
 import type { AppTickerRepositoryPort } from "../../core/app-service-ports";
 import {
   addPaneFloating,
   addPaneToLayout,
   bringToFront,
   findDockLeaf,
-  findPaneLocation,
   getDockedPaneIds,
   isPaneDetached,
   isPaneInLayout,
@@ -15,13 +14,14 @@ import { PluginOffError, notifyPluginOff } from "../../plugins/plugin-off";
 import type { LoadedExternalPlugin } from "../../plugins/loader";
 import {
   getFocusedCollectionId,
+  linkedSourceIds,
   resolveTickerForPane,
   syncConfigActiveLayoutState,
   type AppAction,
   type AppState,
 } from "../../state/app/context";
 import { scheduleConfigSave } from "../../state/config-save-scheduler";
-import { pinFollowingPane } from "../../layout/pane-follow";
+import { pinOrphanedFollower } from "../../layout/pane-follow";
 import {
   createPaneInstance,
   isTickerPaneId,
@@ -39,6 +39,8 @@ import type {
 } from "../../types/plugin";
 import type { DialogApi } from "../../ui/dialog";
 import {
+  gridDockTarget,
+  utilityWindowsOf,
   resolvePaneShowTarget,
   resolvePaneTarget as resolvePaneTargetInLayout,
   selectEdgeAnchor,
@@ -57,8 +59,6 @@ interface AppPaneRuntimeArgs {
   externalPlugins: readonly LoadedExternalPlugin[];
   /** Desktop main window: raises a detached pane's own window. */
   focusDetachedPane?: (paneId: string) => void;
-  /** Desktop: brings forward the window whose grid holds a pane, and focuses it there. */
-  focusPaneInItsWindow?: (paneId: string) => void;
   isDetachedWindow: boolean;
   notify: (body: string, options?: { type?: "info" | "success" | "error" }) => void;
   persistConfig: (nextConfig: AppState["config"]) => void;
@@ -75,7 +75,6 @@ export function useAppPaneRuntime({
   dispatch,
   externalPlugins,
   focusDetachedPane,
-  focusPaneInItsWindow,
   isDetachedWindow,
   notify,
   persistConfig,
@@ -92,7 +91,8 @@ export function useAppPaneRuntime({
     const currentState = stateRef.current;
     const normalizedLayout = normalizePaneLayout(layout, {
       resolveOrphanSymbol: (instanceId) => resolveTickerForPane(currentState, instanceId),
-      pinOrphan: pinFollowingPane,
+      pinOrphan: pinOrphanedFollower(currentState.config.layout),
+      externalSourceIds: linkedSourceIds(currentState),
     });
     if (options?.pushHistory !== false) {
       dispatch({ type: "PUSH_LAYOUT_HISTORY" });
@@ -108,8 +108,8 @@ export function useAppPaneRuntime({
     ));
   }, [dispatch, stateRef]);
 
-  const activatePane = useCallback((paneId: string) => {
-    dispatch({ type: "FOCUS_PANE", paneId });
+  const activatePane = useCallback((paneId: string, options?: { trackTicker?: boolean }) => {
+    dispatch({ type: "FOCUS_PANE", paneId, ...options });
   }, [dispatch]);
 
   const {
@@ -160,12 +160,6 @@ export function useAppPaneRuntime({
   }, [buildPaneBinding, state]);
 
   const focusVisiblePane = useCallback((paneId: string, layout: LayoutConfig = state.config.layout) => {
-    // A pane in another window's grid is that window's to focus, and that window comes forward.
-    const location = findPaneLocation(layout, paneId);
-    if (focusPaneInItsWindow && location && location.window !== "main" && location.kind !== "detached") {
-      focusPaneInItsWindow(paneId);
-      return;
-    }
     const nextLayout = layout.floating.some((entry) => entry.instanceId === paneId)
       ? bringToFront(layout, paneId)
       : layout;
@@ -176,7 +170,10 @@ export function useAppPaneRuntime({
     activatePane(paneId);
     // Focus in this window's state alone would leave the pane's window behind this one.
     if (isPaneDetached(nextLayout, paneId)) focusDetachedPane?.(paneId);
-  }, [activatePane, focusDetachedPane, focusPaneInItsWindow, persistLayout, state.config.layout]);
+  }, [activatePane, focusDetachedPane, persistLayout, state.config.layout]);
+
+  /** The layouts this window has been filling from empty, which a new pane docks into as a grid (gridDockTarget). */
+  const gridLayouts = useRef(new Set<string>());
 
   const placePaneInstance = useCallback((
     instance: PaneInstanceConfig,
@@ -186,7 +183,8 @@ export function useAppPaneRuntime({
     const { width, height } = pluginRegistry.getTermSize();
     // Templates can await ticker resolution before placing their pane, so the
     // layout from the render that started the request may be out of date.
-    const { config: { layout }, focusedPaneId } = stateRef.current;
+    const { config, focusedPaneId } = stateRef.current;
+    const { layout } = config;
     const relativeTo = options?.relativeToPaneId
       ? resolvePaneTarget(options.relativeToPaneId, layout)
       : (focusedPaneId && isPaneInLayout(layout, focusedPaneId) ? focusedPaneId : null);
@@ -194,8 +192,16 @@ export function useAppPaneRuntime({
     let nextLayout = layout;
     const dockedPaneIds = getDockedPaneIds(nextLayout);
 
-    if (options?.placement === "floating" || (options?.placement !== "docked" && paneDef.defaultMode === "floating")) {
-      nextLayout = addPaneFloating(nextLayout, instance, width, height, paneDef);
+    const floating = options?.placement === "floating" || (options?.placement !== "docked" && paneDef.defaultMode === "floating");
+    // A pane that would float, as most functions ask to, docks into a layout being built as a grid; one placed
+    // beside a given pane goes there, and a utility window (account, brokers, Ask Gloom, team) floats.
+    const grid = floating && !options?.relativeToPaneId && !paneDef.utilityWindow
+      ? gridDockTarget(gridLayouts.current, config, instance.instanceId, { width, height },
+        utilityWindowsOf(layout, (paneId) => !!pluginRegistry.panes.get(paneId)?.utilityWindow)) : null;
+    if (grid) {
+      nextLayout = addPaneToLayout(nextLayout, instance, grid);
+    } else if (floating) {
+      nextLayout = addPaneFloating(nextLayout, instance, width, height, paneDef, { focusedPaneId });
     } else if (relativeTo && findDockLeaf(nextLayout, relativeTo)) {
       nextLayout = addPaneToLayout(nextLayout, instance, { relativeTo, position: relativePosition });
     } else if (dockedPaneIds.length === 0) {
@@ -294,6 +300,7 @@ export function useAppPaneRuntime({
     dataProvider,
     dispatch,
     focusVisiblePane,
+    gridLayouts: gridLayouts.current,
     persistLayout,
     pluginRegistry,
     stateRef,

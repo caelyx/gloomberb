@@ -5,6 +5,7 @@ import { deriveHeadlessFreshness } from "../../../cli/pane-functions/freshness";
 import { convertMarketCapitalization } from "../../../utils/market-capitalization";
 import { relativeValuationValues } from "./relative-valuation-model";
 import { relativeValuationHeadless } from "./relative-valuation-headless";
+import { relativeCapCurrency } from "./relative-valuation-currency";
 import { exportRowsTable, renderReportCsv } from "../../../cli/report-tables";
 import { headlessReportTables } from "../../../cli/pane-functions/headless";
 import { renderFundamentalsReport } from "../../../cli/commands/ticker";
@@ -77,6 +78,53 @@ test("relative valuations share derived metrics, preserve zeroes, and identify m
   expect(result.errors).toEqual(["MISSING: Unavailable"]);
 });
 
+
+test("RV's TTM Op Margin names the fiscal year it falls back to, in the text table and the export", async () => {
+  const carnival = {
+    annualStatements: [{ date: "2025-11-30", totalRevenue: 26.62e9, operatingIncome: 4.48e9 }], quarterlyStatements: [], priceHistory: [],
+    quote: { symbol: "CCL", price: 26, change: 0, changePercent: 0, currency: "USD", lastUpdated: 1, marketCap: 35e9 },
+    fundamentals: { financialCurrency: "USD", marketCap: 35e9, enterpriseValue: 59e9, revenue: 27.59e9, freeCashFlow: 3.2e9 },
+  };
+  const royal = { ...carnival, quote: { ...carnival.quote, symbol: "RCL" }, fundamentals: { ...carnival.fundamentals, operatingMargin: 0.2732 } };
+  const ctx = { signal: new AbortController().signal, marketData: createTestDataProvider({
+    async getTickerFinancials(symbol) { return symbol === "CCL" ? carnival : royal; },
+  }) } as HeadlessPaneContext;
+  const result = await relativeValuationHeadless.load({ symbols: ["CCL", "RCL"], argument: ["CCL", "RCL"], rawArgument: "CCL RCL", options: {} }, ctx);
+  const margin = relativeValuationHeadless.columns!.find((column) => column.key === "operatingMargin")!;
+  expect(result.rows.map((row) => margin.textFormat!(row.operatingMargin, row))).toEqual(["16.83% FY25", "27.32%"]);
+  // An export's column holds the figure alone; the year is in its own column after it.
+  expect(result.rows.map((row) => margin.format!(row.operatingMargin, row))).toEqual(["16.83%", "27.32%"]);
+  const period = relativeValuationHeadless.columns!.find((column) => column.header === "TTM Op Margin period")!;
+  expect(result.rows.map((row) => period.format!(row[period.key], row))).toEqual(["FY25", "TTM"]);
+  expect(result.rows[0]).toMatchObject({ operatingMarginPeriod: "FY25", operatingMarginPeriodEnd: "2025-11-30" });
+  expect(result.unavailableSymbols).toEqual([]);
+});
+
+test("RV's forward P/E names the fiscal year of its consensus, as valuation does, in the text table and the export", async () => {
+  // Visa's year ends in September: in November 2026 next year's consensus is FY28's, which a bare 24.8 never said.
+  const visa = {
+    annualStatements: [], quarterlyStatements: [], priceHistory: [],
+    quote: { symbol: "V", price: 425.76, change: 0, changePercent: 0, currency: "USD", lastUpdated: 1, marketCap: 800e9 },
+    fundamentals: { financialCurrency: "USD", marketCap: 800e9, trailingPE: 34.6, forwardPE: 24.84, forwardEps: 17.14, forwardEpsPeriodEnd: "2028-09-30" },
+  };
+  const unknown = { ...visa, quote: { ...visa.quote, symbol: "MCO" }, fundamentals: { ...visa.fundamentals, forwardEpsPeriodEnd: undefined } };
+  const ctx = { signal: new AbortController().signal, marketData: createTestDataProvider({
+    async getTickerFinancials(symbol) { return symbol === "V" ? visa : unknown; },
+  }) } as HeadlessPaneContext;
+  const result = await relativeValuationHeadless.load({ symbols: ["V", "MCO"], argument: ["V", "MCO"], rawArgument: "V MCO", options: {} }, ctx);
+  const forward = relativeValuationHeadless.columns!.find((column) => column.key === "forwardPE")!;
+  expect(result.rows.map((row) => forward.textFormat!(row.forwardPE, row))).toEqual(["24.8 FY28", "24.8"]);
+  expect(result.rows.map((row) => forward.format!(row.forwardPE, row))).toEqual(["24.8", "24.8"]);
+  const period = relativeValuationHeadless.columns!.find((column) => column.header === "Fwd P/E period")!;
+  expect(result.rows.map((row) => period.format!(row[period.key], row))).toEqual(["FY28", ""]);
+  // The column came after the export's others were set: it closes the row, so none of the earlier ones moves.
+  const input = { symbols: ["V", "MCO"], argument: ["V", "MCO"], rawArgument: "V MCO", options: {} };
+  const freshness = deriveHeadlessFreshness(relativeValuationHeadless, result);
+  const header = renderReportCsv(headlessReportTables(relativeValuationHeadless, result, input, "RV", freshness,
+    { complete: true, unavailableSymbols: [] }), freshness).split("\n")[0]!.split(",");
+  expect(header.slice(header.indexOf("Fwd P/E"), header.indexOf("Fwd P/E") + 2)).toEqual(["Fwd P/E", "EV/S"]);
+  expect(header.slice(-3)).toEqual(["as_of", "retrieved_at", "Fwd P/E period"]);
+});
 
 test("relative valuation does not divide unconverted foreign cash flows by a USD market value", () => {
   const financials = {
@@ -225,7 +273,8 @@ test("a stale quote may use an independent fundamental cap with its own source a
 
 test("every blank RV cell says why in the export's status, and the cap is the one valuation shows", async () => {
   // EVN:ASX on 2026-10-22: the quote's 24.4B cap rests on another count than the 1.99B shares served beside it,
-  // and the TTM block names no currency and has no free cash flow. RMS:ASX has no quarter's revenue growth either.
+  // and the TTM block names no currency (the statements' AUD is the price's, so EV/S reads) and has no free cash
+  // flow, nor do the quarters. RMS:ASX has no quarter's revenue growth either.
   const evn = {
     annualStatements: [], quarterlyStatements: [], priceHistory: [], financialCurrency: "AUD",
     quote: { symbol: "EVN", price: 11.93, change: -0.2, changePercent: -1.65, currency: "AUD", lastUpdated: 1, marketCap: 24.4e9 },
@@ -241,13 +290,13 @@ test("every blank RV cell says why in the export's status, and the cap is the on
   const table = exportRowsTable("RV", relativeValuationHeadless.columns!, result.rows, { status: true });
   const status = table.columns.indexOf("status");
   expect(table.rows.map((row) => row[status])).toEqual([
-    "EV/S: revenue ccy unstated; FCF Yield: no TTM FCF",
-    "Mkt Cap, Quarter Revenue YoY: not reported; EV/S: revenue ccy unstated; FCF Yield: no TTM FCF",
+    "FCF Yield: no TTM FCF",
+    "Mkt Cap, Quarter Revenue YoY: not reported; FCF Yield: no TTM FCF",
   ]);
   // No blank figure without its reason; a session with no print is no missing figure.
   table.rows.forEach((row) => row.forEach((cell, index) => {
     const column = table.columns[index]!;
-    if (cell === "" && index !== status && !/^(?:Pre-Market|After Hours|Overnight)/.test(column)) {
+    if (cell === "" && index !== status && !/^(?:Name|Pre-Market|After Hours|Overnight)| period$/.test(column)) {
       expect(String(row[status])).toContain(column.replace(/ \(.*\)$| unit$/, ""));
     }
   }));
@@ -370,8 +419,9 @@ test("RV's export writes each peer's Last as a number in its own currency, named
   setSystemTime(new Date("2026-10-23T21:00:00Z"));
   try {
     const both = await csvOf(["NESN:SWX", "AAPL"]);
-    expect(both.header.slice(0, 3)).toEqual(["Ticker", "Last", "Chg%"]);
-    expect(both.row("NESN:SWX")).toMatchObject({ Last: "84.37", symbol_or_series: "NESN:SWX", currency_or_unit: "CHF", "Mkt Cap unit": "CHF" });
+    expect(both.header.slice(0, 4)).toEqual(["Ticker", "Name", "Last", "Chg%"]);
+    // Last stays in francs; the cap is compared in dollars beside AAPL's.
+    expect(both.row("NESN:SWX")).toMatchObject({ Last: "84.37", symbol_or_series: "NESN:SWX", currency_or_unit: "CHF", "Mkt Cap unit": "USD" });
     expect(both.row("AAPL")).toMatchObject({ Last: "336.64", "After Hours": "337.2", symbol_or_series: "AAPL", currency_or_unit: "USD" });
     expect(Number(both.row("AAPL")["After Hours Chg%"])).toBeCloseTo(0.1663, 4);
     // A figure a peer does not have is empty, its reason in status, never words in a column of numbers.
@@ -382,4 +432,34 @@ test("RV's export writes each peer's Last as a number in its own currency, named
   } finally {
     setSystemTime();
   }
+});
+
+// The pane and `fn RV` compare caps in one currency: four Xetra names in euros, a set with a dollar listing in dollars.
+test("RV compares caps in the peers' own currency when they share one, else in the base currency, in the report and the pane", async () => {
+  const peer = (symbol: string, currency: string, cap: number) => ({
+    annualStatements: [], quarterlyStatements: [], priceHistory: [], financialCurrency: currency,
+    quote: { symbol, price: 10, change: 0, changePercent: 0, currency, lastUpdated: 1, marketCap: cap },
+    fundamentals: { marketCap: cap, marketCapCurrency: currency },
+  });
+  const peers: Record<string, ReturnType<typeof peer>> = {
+    SIE: peer("SIE", "EUR", 200e9), VOW3: peer("VOW3", "EUR", 30e9), AAPL: peer("AAPL", "USD", 4e12),
+  };
+  const ctx = { signal: new AbortController().signal, marketData: createTestDataProvider({
+    async getTickerFinancials(symbol) { return peers[symbol]!; },
+    async getExchangeRate(currency) { return currency === "EUR" ? 1.1 : 1; },
+  }) } as HeadlessPaneContext;
+  const load = (symbols: string[]) => relativeValuationHeadless.load({ symbols, argument: symbols, rawArgument: symbols.join(","), options: {} }, ctx);
+  const caps = (rows: Array<Record<string, unknown>>) => rows.map((row) => [row.symbol, Number(row.marketCap), row.marketCapCurrency]);
+
+  const euros = await load(["SIE:XETRA", "VOW3:XETRA"]);
+  expect(caps(euros.rows)).toEqual([["SIE:XETRA", 200e9, "EUR"], ["VOW3:XETRA", 30e9, "EUR"]]);
+  expect(euros.freshness?.note ?? "").not.toContain("market caps in");
+  const mixed = await load(["SIE:XETRA", "AAPL"]);
+  expect(caps(mixed.rows).map(([symbol, cap, currency]) => [symbol, Math.round(cap as number / 1e9), currency]))
+    .toEqual([["SIE:XETRA", 220, "USD"], ["AAPL", 4000, "USD"]]);
+  expect(mixed.freshness?.note).toContain("market caps in USD at EUR/USD 1.1");
+  // The pane reads the same default, and the app's base currency stands in for dollars when it is set.
+  expect(relativeCapCurrency(null, ["EUR", "EUR", null], "USD")).toBe("EUR");
+  expect(relativeCapCurrency(null, ["EUR", "USD"], "GBP")).toBe("GBP");
+  expect(relativeCapCurrency("CHF", ["EUR", "EUR"], "USD")).toBe("CHF");
 });

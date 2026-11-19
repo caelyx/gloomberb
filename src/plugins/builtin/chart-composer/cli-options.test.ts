@@ -11,6 +11,26 @@ describe("chart composer CLI options", () => {
     const restored = applyChartComposerCapabilityOptions(annual, "valuation-series", { period: "daily", metric: "evSales" });
     expect(restored.series.map((series) => series.source)).toEqual(daily.series.map((series) => ({ ...series.source, fieldId: "valuation.evSales" })));
   });
+  test("a comparison's --from and --to are its window, read from history that reaches back to it", () => {
+    const now = new Date();
+    // Without --to the window runs to today: the reader's date, or UTC's where that is later. East of UTC in the hours
+    // before 00:00 UTC it is the reader's, a day past UTC's, so it is read in the same zone the window takes it in.
+    const pad = (value: number) => String(value).padStart(2, "0");
+    const local = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+    const today = [local, now.toISOString().slice(0, 10)].sort()[1];
+    const since = applyChartComposerCapabilityOptions(buildComparisonChartPreset(["IAG:LSE", "LHA:XETRA"]), "price-comparison",
+      { rangePreset: "1Y", from: "2019-12-31" });
+    expect(since.viewport).toMatchObject({ range: "ALL", dateWindow: { start: "2019-12-31", end: today } });
+    const year = applyChartComposerCapabilityOptions(buildComparisonChartPreset(["IAG:LSE", "LHA:XETRA"]), "price-comparison",
+      { rangePreset: "1Y", from: "2021", to: "2021" });
+    expect(year.viewport).toMatchObject({ range: "ALL", dateWindow: { start: "2021-01-01", end: "2021-12-31" } });
+    const recent = new Date(now.getTime() - 40 * 86_400_000).toISOString().slice(0, 10);
+    expect(applyChartComposerCapabilityOptions(buildComparisonChartPreset(["IAG:LSE", "LHA:XETRA"]), "price-comparison",
+      { rangePreset: "1Y", from: recent }).viewport.range).toBe("3M");
+    expect(() => applyChartComposerCapabilityOptions(buildComparisonChartPreset(["A", "B"]), "price-comparison", { to: "2021" }))
+      .toThrow("--to needs a --from");
+  });
+
   test("applies price and financial options to the persisted spec", () => {
     const candle = applyChartComposerCapabilityOptions(
       buildPriceChartPreset("AAPL"),
@@ -26,6 +46,14 @@ describe("chart composer CLI options", () => {
     );
     expect(comparison.viewport).toMatchObject({ range: "3M", resolution: "1h" });
     expect(comparison.series.every((series) => series.transform === "raw")).toBe(true);
+
+    // Total return survives the spec's own normalization, and only a comparison asks for it.
+    const total = applyChartComposerCapabilityOptions(buildComparisonChartPreset(["AAPL", "MSFT"]), "price-comparison", { totalReturn: true });
+    expect(total.viewport.totalReturn).toBe(true);
+    expect(applyChartComposerCapabilityOptions(buildComparisonChartPreset(["AAPL", "MSFT"]), "price-comparison", {}).viewport.totalReturn).toBeUndefined();
+    expect(applyChartComposerCapabilityOptions(buildPriceChartPreset("AAPL"), "price-chart", { totalReturn: true }).viewport.totalReturn).toBeUndefined();
+    // So does a comparison's currency.
+    expect(applyChartComposerCapabilityOptions(buildComparisonChartPreset(["THYAO:BIST", "MSFT"]), "price-comparison", { currency: "USD" }).viewport.currency).toBe("USD");
 
     // YTD is a year of bars shown from the prior year's last close, the one YTD returns are measured from.
     const ytd = applyChartComposerCapabilityOptions(

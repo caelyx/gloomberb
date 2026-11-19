@@ -1,5 +1,5 @@
 import type { PricePoint, TickerFinancials } from "../types/financials";
-import { pricePointIntegrity, pricePointValues, priceHistoryIntegrityNotice, mergePriceHistoryIntegrity, type PriceHistoryIntegrity } from "../utils/price-history-integrity";
+import { pricePointIntegrity, pricePointOpenWithheld, pricePointValues, pricePointWicks, priceHistoryIntegrityNotice, mergePriceHistoryIntegrity, type PriceHistoryIntegrity } from "../utils/price-history-integrity";
 import { canonicalTimeSeriesFieldId, isFundamentalFieldId, isMarketFieldId } from "./field-catalog";
 import { extractFundamentalSeries } from "./fundamentals";
 import type { ChartSeriesPriceHistoryIntegrity, ResolvedSeries, SecuritySeriesSource, SeriesPeriod, TimeSeriesPoint } from "./types";
@@ -72,9 +72,12 @@ function aggregatePriceHistory(
   const buckets = new Map<string, AggregatedPricePoint>();
   for (const point of sorted) {
     const key = periodKey(point.date, period);
-    const open = isFiniteNumber(point.open) ? point.open : point.close;
-    const high = isFiniteNumber(point.high) ? point.high : point.close;
-    const low = isFiniteNumber(point.low) ? point.low : point.close;
+    // An open withheld as outside its bar's range (pricePointOpenWithheld) opens no week or month either.
+    const open = isFiniteNumber(point.open) && !pricePointOpenWithheld(point) ? point.open : point.close;
+    // A wick too far from its bar's body to have traded does not set the week's or month's range.
+    const wicks = pricePointWicks(point);
+    const high = isFiniteNumber(wicks.high) ? wicks.high : isFiniteNumber(point.high) ? Math.max(open, point.close) : point.close;
+    const low = isFiniteNumber(wicks.low) ? wicks.low : isFiniteNumber(point.low) ? Math.min(open, point.close) : point.close;
     const current = buckets.get(key);
     if (!current) {
       buckets.set(key, {
@@ -106,7 +109,9 @@ export function extractPriceSeries(
   const fieldId = canonicalTimeSeriesFieldId(source.fieldId);
   if (!isMarketFieldId(fieldId)) return [];
   const aggregated = aggregatePriceHistory(priceHistory, source.period ?? "auto");
-  return aggregated.map((point) => {
+  return aggregated.map((point, index) => {
+    // A roll is the contract changing from the bar before, which a window's first bar knows from the bars before it.
+    const before = index > 0 ? aggregated[index - 1]!.contract : undefined;
     const { integrity, ...values } = pricePointValues(point, point.integrity);
     const value = fieldId === "market.open"
       ? values.open
@@ -123,6 +128,10 @@ export function extractPriceSeries(
       availableAt: new Date(point.date),
       value,
       ...values,
+      // A continuous future's bar names its contract, and the source marks a bar still forming.
+      ...(point.contract ? { contract: point.contract } : {}),
+      ...(point.contract && before && point.contract !== before ? { roll: true } : {}),
+      ...(point.partial ? { partial: true } : {}),
       provenance: { quality: "reported" as const, ...(integrity ? { priceHistoryIntegrity: integrity } : {}) },
     };
   });

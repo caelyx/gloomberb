@@ -21,12 +21,16 @@ import {
   hasRecentFinancialProfileAttempt,
   hasDetailedStatementRows,
   isProviderQuoteUsableForCurrentSession,
+  lastKnownProviderQuote,
   providerFinancialsMatchTarget,
   quoteWithFreshnessExchange,
   type CachedFinancialsSelection,
 } from "./financials";
 import type { ProviderRouterCoreDeps } from "./route-types";
+import { isRateLimited, rateLimitedError } from "../provider-errors";
+import { quoteServedFromSavedCopy } from "../../data/saved-copies";
 import { isNetworkFailure } from "../../utils/network-failure";
+import { withRetrievedAt } from "./retrieved-at";
 
 export interface ProviderRouterBatchDeps extends ProviderRouterCoreDeps {
   readCachedMergedFinancialsSelection(
@@ -58,6 +62,10 @@ export class ProviderRouterBatchRoutes {
     const providerOptions = { forceRefresh: options.forceRefresh };
     const forceRefresh = options.forceRefresh === true;
     const results = new Array<QuoteBatchResult | null>(targets.length).fill(null);
+    // A dated price the batch answered that is not current: shown, flagged stale, when asking alone brings none.
+    const lastKnown = new Array<Quote | null>(targets.length).fill(null);
+    // The data service's copy each listing has saved here, which answers for it when the service refuses the batch.
+    const saved = new Array<{ value: Quote; fetchedAt: number } | null>(targets.length).fill(null);
     const misses: Array<{ index: number; target: QuoteSubscriptionTarget }> = [];
 
     targets.forEach((target, index) => {
@@ -80,10 +88,11 @@ export class ProviderRouterBatchRoutes {
           misses.push({ index, target });
           return;
         }
-        results[index] = { target, quote: cached.value };
+        results[index] = { target, quote: withRetrievedAt(cached.value, cached.fetchedAt) };
         return;
       }
       // Revalidated, a fresh copy is still what the quote route answers when no source does.
+      if (cached && !brokerSourceKeys.includes(cached.sourceKey)) saved[index] = cached;
       misses.push({ index, target });
     });
 
@@ -91,6 +100,8 @@ export class ProviderRouterBatchRoutes {
     const providerMisses = misses.filter(({ target }) => !this.deps.hasBrokerContext(target.context));
     const providerIndexes = new Map<string, Array<{ index: number; target: QuoteSubscriptionTarget }>>();
     let batchFailure: unknown = null;
+    // Listings the service refused for its request limit, by batch key, with the refusal.
+    const limited = new Map<string, unknown>();
     if (batchProvider && providerMisses.length > 0) {
       for (const entry of providerMisses) {
         const key = this.quoteBatchKey(entry.target);
@@ -103,9 +114,16 @@ export class ProviderRouterBatchRoutes {
         batchFailure = error;
         return logFailure("sources.provider-router.batches", "Loading batch quotes failed", [] as QuoteBatchResult[])(error);
       });
-      for (const item of batchResults) {
-        if (!isProviderQuoteUsableForCurrentSession(item.quote, item.target.exchange, item.target.symbol, { recentAnswer: true })) continue;
+      const answeredAt = Date.now();
+      for (const answered of batchResults) {
+        const item = { ...answered, quote: withRetrievedAt(answered.quote, answeredAt) };
         const key = this.quoteBatchKey(item.target);
+        if (!item.quote && isRateLimited(item.error)) limited.set(key, item.error);
+        if (!isProviderQuoteUsableForCurrentSession(item.quote, item.target.exchange, item.target.symbol, { recentAnswer: true })) {
+          const fallback = lastKnownProviderQuote(item.quote, item.target.exchange, item.target.symbol);
+          if (fallback) for (const entry of providerIndexes.get(key) ?? []) lastKnown[entry.index] = fallback;
+          continue;
+        }
         const sourceKey = this.deps.providerSourceKey(batchProvider);
         for (const entry of providerIndexes.get(key) ?? []) {
           const entityKey = this.deps.getEntityKey(entry.target.symbol, entry.target.context?.instrument);
@@ -116,19 +134,38 @@ export class ProviderRouterBatchRoutes {
       }
     }
 
+    // Refused for the request limit, a listing is never asked again alone: that is a request each, more of what was
+    // refused. Its saved copy answers, as a single read's would, else the row says when to try again.
+    for (const { index, target } of providerMisses) {
+      const refusal = isRateLimited(batchFailure) ? batchFailure : limited.get(this.quoteBatchKey(target));
+      if (results[index] || refusal === undefined) continue;
+      const copy = saved[index];
+      results[index] = copy ? { target, quote: quoteServedFromSavedCopy(withRetrievedAt(copy.value, copy.fetchedAt), copy.fetchedAt) }
+        : lastKnown[index] ? { target, quote: lastKnown[index] }
+        : { target, quote: null, error: rateLimitedError(refusal, target.symbol) };
+    }
+
     // The batch never reached the data service: a copy saved a moment ago is still a saved copy, not the
     // service's answer, so each is asked for as a refresh, which fails at once and says it answers from that copy.
     const unreached = isNetworkFailure(batchFailure) ? new Set(providerMisses.map(({ index }) => index)) : null;
+    const followUp = (index: number): "default" | "refresh" => (forceRefresh || unreached?.has(index) ? "refresh" : "default");
+    if (options.deferFollowUps) {
+      for (const { index, target } of misses) {
+        results[index] ??= { target, quote: lastKnown[index] ?? null, followUp: followUp(index) };
+      }
+    }
     await Promise.all(misses.map(async ({ index, target }) => {
       if (results[index]) return;
       try {
         const quote = await this.deps.getQuote(target.symbol, target.exchange, {
           ...target.context,
-          cacheMode: forceRefresh || unreached?.has(index) ? "refresh" : "default",
+          cacheMode: followUp(index),
         });
         results[index] = { target, quote };
       } catch (error) {
-        results[index] = { target, quote: null, error };
+        // Asked alone it brought nothing: the batch's dated price, flagged stale, rather than none, as the quote route answers.
+        const fallback = lastKnown[index];
+        results[index] = fallback ? { target, quote: fallback } : { target, quote: null, error };
       }
     }));
 
@@ -220,7 +257,8 @@ export class ProviderRouterBatchRoutes {
       ...this.deps.getBrokerCandidatesForContext(context, false).map((candidate) => this.deps.brokerSourceKey(candidate)),
       ...this.deps.getProviderSourceKeys(),
     ];
-    return selectCachedResource<Quote>(this.deps.resources, "quote", entityKey, variantKeys, sourceKeys, true)?.value ?? null;
+    const cached = selectCachedResource<Quote>(this.deps.resources, "quote", entityKey, variantKeys, sourceKeys, true);
+    return cached ? withRetrievedAt(cached.value, cached.fetchedAt) : null;
   }
 
   private quoteBatchKey(target: QuoteSubscriptionTarget): string {

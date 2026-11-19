@@ -10,9 +10,10 @@ import { cardSurfaceStyle } from "../../../components/ui/card";
 import { TOOLTIP_SURFACE_STYLE } from "../../../components/ui/frame";
 import { blendHex } from "../../../theme/colors";
 import { useThemeColors } from "../../../theme/theme-context";
+import { useSelectionFill } from "../../../components/ui/selection-fill";
 import { useStaticChartBitmapSize } from "../../../components/chart/composite/bitmap";
 import { fillOpaque, fillRect, parseHex } from "../../../components/chart/native/raster/primitives";
-import { counterpartyKind, counterpartyLabel, disclosedValue, dollars, nativeValue, periodText, roleLabel, ROLE_COLORS, scopeWords, shareParts, fitShareBasis, type FlowBand, type ShareParts } from "./model";
+import { counterpartyKind, counterpartyKindLabel, counterpartyLabel, counterpartyLabelEnd, disclosedValue, dollars, isRelatedParty, nativeValue, periodText, relationshipLabel, roleLabel, ROLE_COLORS, scopeWords, shareParts, fitShareBasis, type FlowBand, type ShareParts } from "./model";
 import { entityTicker } from "./graph-model";
 import { flowChipLabel, flowGeometry, RELATED_LABEL_CELLS, ribbonY, type FlowRibbon, type PositionedNode } from "./flow-layout";
 import { evidenceDate, evidenceLabel, trustTier } from "./trust";
@@ -35,8 +36,21 @@ function shareText(share: ShareParts, cells: number): string {
   return `${share.value} ${fitShareBasis(share, cells - displayWidth(share.value) - 1)}`;
 }
 
-/** The disclosed figure a card shows under the name, in the reporting company's own terms, in `cells` cells. */
+/**
+ * The line a card shows under the name, in `cells` cells: a related party
+ * says so first ("related group · 9,515,093.66 CNY"), on the card itself and
+ * not only in its tooltip, then the disclosed figure. A card too narrow for
+ * both whole says "related ·" so the figure keeps its digits.
+ */
 function nodeMetric(node: PositionedNode, focusId: string | undefined, cells: number): string {
+  const row = node.row!;
+  if (!isRelatedParty(row)) return nodeFigure(node, focusId, cells);
+  const lines = [`${counterpartyKindLabel(row, true)} · `, "related · "].map((label) => `${label}${nodeFigure(node, focusId, cells - displayWidth(label))}`);
+  return lines.find((line) => displayWidth(line) <= cells) ?? lines.at(-1)!;
+}
+
+/** The disclosed figure a card shows under the name, in the reporting company's own terms, in `cells` cells. */
+function nodeFigure(node: PositionedNode, focusId: string | undefined, cells: number): string {
   const row = node.row!;
   if (trustTier(row) !== 1) return `${evidenceLabel(row)} · ${evidenceDate(row)}`;
   if (node.weight !== null && node.weightBasis === "usd") return dollars(row);
@@ -248,7 +262,7 @@ export function SupplyFlow({ rows, symbol, focusName, focusId, width, height, fo
 function flowNodeName(node: PositionedNode): string {
   if (node.more) return `Show ${node.more} more ${node.role ? ROLE_PLURAL[node.role].toLowerCase() : node.band}`;
   const name = node.row ? counterpartyLabel(node.row) : node.label;
-  const role = node.role ? roleLabel(node.role) : node.band;
+  const role = node.row ? relationshipLabel(node.row) : node.role ? roleLabel(node.role) : node.band;
   return `Open ${name}, ${role}`;
 }
 
@@ -297,6 +311,9 @@ function FlowCard({ node, focusId, desktop, active, onPress, onHover }: {
   node: PositionedNode; focusId?: string; desktop: boolean; active: boolean; onPress: () => void; onHover: (on: boolean) => void;
 }) {
   const colors = useThemeColors();
+  // The chosen card is the flow's cursor: quieter while the pane does not have the keys.
+  const selectionFill = useSelectionFill();
+  const chosenText = (own: string) => (selectionFill.lit ? colors.selectedText : selectionFill.ink(own));
   const role = node.role;
   const accent = role ? ROLE_COLORS[role] : colors.textMuted;
   const company = node.row ? counterpartyKind(node.row) === "company" : false;
@@ -307,7 +324,7 @@ function FlowCard({ node, focusId, desktop, active, onPress, onHover }: {
   const nameWidth = Math.max(4, inner - (ticker ? displayWidth(ticker) + 1 : 0));
   const titleColor = node.more ? colors.textDim : company ? colors.textBright : colors.text;
   return <Box position="absolute" left={node.x} top={node.y} width={node.width} height={node.more ? 1 : node.height} flexDirection="column"
-    backgroundColor={desktop ? undefined : node.more ? undefined : active ? colors.selected : blendHex(colors.bg, accent, 0.12)}
+    backgroundColor={desktop ? undefined : node.more ? undefined : active ? selectionFill.bg : blendHex(colors.bg, accent, 0.12)}
     // The card, in the relationship's colour; "+N more" is the same card without a fill, its rule dotted.
     style={desktop ? { ...cardSurfaceStyle({ selected: active, accent, padding: "0 var(--gloom-space-sm)" }),
       ...(node.more ? { background: "transparent", borderLeftStyle: "dotted" } : {}), cursor: "pointer" } : undefined}
@@ -316,12 +333,13 @@ function FlowCard({ node, focusId, desktop, active, onPress, onHover }: {
     {/* The ticker shows only beside the whole name. On the desktop that is CSS: the row wraps, one line shows, and a ticker that does not fit goes to the hidden line. */}
     <Box flexDirection="row" height={1} overflow="hidden" style={desktop ? { flexWrap: "wrap" } : undefined}>
       {!desktop ? <Text fg={node.more ? colors.textMuted : accent}>▍</Text> : null}
-      <ClippedText fg={active && !desktop ? colors.selectedText : titleColor} attributes={company ? TextAttributes.BOLD : 0} text={name} width={nameWidth} />
+      <ClippedText fg={active && !desktop ? chosenText(titleColor) : titleColor} attributes={company ? TextAttributes.BOLD : 0} text={name} width={nameWidth}
+        keepEnd={node.row && !node.more ? counterpartyLabelEnd(node.row) : null} />
       {ticker && (desktop || displayWidth(name) + displayWidth(ticker) + 1 <= inner)
-        ? <Text fg={colors.textDim} style={desktop ? { flex: "0 0 auto" } : undefined}>{` ${ticker}`}</Text> : null}
+        ? <Text fg={active && !desktop ? selectionFill.ink(colors.textDim) : colors.textDim} style={desktop ? { flex: "0 0 auto" } : undefined}>{` ${ticker}`}</Text> : null}
     </Box>
     {metric ? <Box height={1} paddingLeft={desktop ? 0 : 1} overflow="hidden">
-      <ClippedText fg={active && !desktop ? colors.selectedText : colors.textDim} text={metric} width={inner - (desktop ? 0 : 1)} />
+      <ClippedText fg={active && !desktop ? chosenText(colors.textDim) : colors.textDim} text={metric} width={inner - (desktop ? 0 : 1)} />
     </Box> : null}
   </Box>;
 }
@@ -350,7 +368,7 @@ function FlowTooltip({ node, focusId, width, desktop, anchor }: { node: Position
   const share = shareParts(row, focusId);
   const lines = [
     share ? `${share.value} ${share.basis}` : nativeValue(row) !== null || row.usd !== null ? disclosedValue(row) : "No figure disclosed",
-    `${roleLabel(row.role)} · ${periodText(row)}`,
+    `${relationshipLabel(row)} · ${periodText(row)}`,
     trustTier(row) === 1
       ? `${evidenceLabel(row)} · ${entityTicker(row.reportingEntity) ?? row.reportingEntity.name} ${row.form ?? "filing"}${row.filedDate ? ` filed ${row.filedDate}` : ""}`
       : `${evidenceLabel(row)} · ${evidenceDate(row)}`,
@@ -360,7 +378,7 @@ function FlowTooltip({ node, focusId, width, desktop, anchor }: { node: Position
     flexDirection="column" paddingX={1} backgroundColor={desktop ? undefined : colors.panel} border={!desktop} borderColor={ROLE_COLORS[row.role]}
     style={desktop ? { ...TOOLTIP_SURFACE_STYLE, padding: "0 var(--gloom-space-sm)", zIndex: 20 } : undefined}
     data-gloom-role="supply-flow-tooltip">
-    <ClippedText fg={colors.textBright} attributes={TextAttributes.BOLD} text={counterpartyLabel(row)} width={tooltipWidth - 2} />
+    <ClippedText fg={colors.textBright} attributes={TextAttributes.BOLD} text={counterpartyLabel(row)} width={tooltipWidth - 2} keepEnd={counterpartyLabelEnd(row)} />
     {lines.map((line, index) => <ClippedText key={index} fg={index === 0 ? colors.text : colors.textDim} text={line} width={tooltipWidth - 2} />)}
   </Box>;
 }

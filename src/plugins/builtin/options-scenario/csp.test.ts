@@ -6,7 +6,8 @@ import { deriveHeadlessFreshness } from "../../../cli/pane-functions/freshness";
 import { headlessReportTables } from "../../../cli/pane-functions/headless";
 import { renderReportCsv } from "../../../cli/report-tables";
 import { daysToExpiryFrom, valueOption } from "../shared/volatility";
-import { cashSecuredPut, cspReportEntries, earningsBeforeExpiry } from "./csp";
+import { cashSecuredPut, cspReportEntries, cspStatItems, earningsBeforeExpiry, loadNextEarningsDate } from "./csp";
+import { cspEarningsText } from "./csp-screen";
 import { optionsScenarioHeadless } from "./headless";
 import type { ScenarioPosition } from "./model";
 
@@ -77,7 +78,7 @@ test("the CSV writes each cash-secured put figure as a number, with its unit in 
     .split("\n").map((line) => line.split(","));
   // Metric, value and unit.
   const row = (metric: string) => { const cells = csv.find((line) => line[0] === metric); return cells && [cells[0], cells[1], cells[3]]; };
-  expect(csv[0]).toEqual(["Metric", "Value", "symbol_or_series", "currency_or_unit", "interval", "source", "as_of"]);
+  expect(csv[0]).toEqual(["Metric", "Value", "symbol_or_series", "currency_or_unit", "interval", "source", "as_of", "retrieved_at"]);
   expect(row("Cash secured (USD)")).toEqual(["Cash secured (USD)", "8500", "USD"]);
   expect(row("Annualised yield at the bid (%)")).toEqual(["Annualised yield at the bid (%)", "7.57120743034", "%"]);
   expect(row("Spread (% of mid)")?.[2]).toBe("% of mid");
@@ -100,6 +101,20 @@ test("days to expiry count from the valuation date in New York, and earnings are
   // On the expiry day there is nothing left to annualise.
   const lastDay = cashSecuredPut({ ...position, asOf: Date.parse("2026-11-20T15:00:00Z") }, "typed", null)!;
   expect([lastDay.daysToExpiry, lastDay.annualizedYield]).toEqual([0, null]);
+});
+
+test("an earnings calendar that cannot be read is reported unavailable, and one with no date keeps saying none is published", async () => {
+  const unreadable = { getEarningsCalendar: async () => { throw new Error("Fixture calendar unavailable"); } } as unknown as DataProvider;
+  const empty = { getEarningsCalendar: async () => [] } as unknown as DataProvider;
+  const flag = (earningsDate: string | null) => {
+    const csp = cashSecuredPut(position, "typed", earningsDate)!;
+    const stat = cspStatItems(csp).find((item) => item.id === "csp-earnings")!;
+    return [cspReportEntries(csp).find((entry) => entry.key === "earningsBeforeExpiry")?.formatted, stat.value, stat.detail, stat.tone ?? null, cspEarningsText(csp)];
+  };
+  expect(flag(await loadNextEarningsDate(empty, "CSPNONE", "2026-10-13")))
+    .toEqual(["unknown (no upcoming date published)", "unknown", "no date", null, "unknown"]);
+  expect(flag(await loadNextEarningsDate(unreadable, "CSPFAIL", "2026-10-13")))
+    .toEqual(["unknown (earnings calendar unavailable)", "unknown", "calendar unavailable", "warning", "unavailable"]);
 });
 
 test("--strategy csp sells the put at its midpoint and reports it, with earnings unknown when the calendar has no date", async () => {

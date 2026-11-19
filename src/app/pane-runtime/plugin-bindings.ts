@@ -42,6 +42,7 @@ import {
   resolveTickerNavigationReplacementPane,
   shouldFocusTickerNavigationTarget,
 } from "../../layout/ticker-navigation";
+import { userUnlinkedFrom } from "../../layout/pane-follow";
 import {
   resolveTickerForPane,
   type AppAction,
@@ -51,7 +52,9 @@ import type {
   LayoutConfig,
   PaneInstanceConfig,
 } from "../../types/config";
-import { findPaneInstance, TICKER_RESEARCH_PANE_ID } from "../../types/config";
+import { findPaneInstance, normalizePaneId, TICKER_RESEARCH_PANE_ID } from "../../types/config";
+import { getDesktopWindows } from "../../state/desktop-windows";
+import { fireAndForget } from "../../utils/fire-and-forget";
 import type { DataProvider } from "../../types/data-provider";
 import type {
   PaneDef,
@@ -163,22 +166,19 @@ export function bindAppPanePluginRegistry({
   };
   const setPluginEnabled = (pluginId: string, enabled: boolean) => setPluginsEnabled({ [pluginId]: enabled });
 
-  // A popped-out pane's window shows one pane and opens none; a secondary
-  // window has a grid of its own and opens panes there, as the main window does.
-  const popOutWindow = isDetachedWindow && detachedPaneId !== null;
   pluginRegistry.bindHost({
     setPluginEnabled,
     setPluginsEnabled,
     selectTicker: (symbol, paneId) => selectTickerInPane(symbol, paneId),
     switchPanel: (panel) => {
-      if (popOutWindow) return;
+      if (isDetachedWindow) return;
       const paneId = getPanelFocusTarget(stateRef.current.config.layout, panel);
       if (paneId) dispatch({ type: "FOCUS_PANE", paneId });
     },
     switchTab: (tabId, paneId) => switchTickerResearchTab(tabId, paneId),
     // The bar would open over a dialog without its keys, so it waits for none to be open.
     openCommandBar: (query) => {
-      if (popOutWindow || isDialogOpen()) return;
+      if (isDetachedWindow || isDialogOpen()) return;
       dispatch({ type: "SET_COMMAND_BAR", open: true, query });
     },
     runCommandBarQuery: (query) => {
@@ -213,16 +213,16 @@ export function bindAppPanePluginRegistry({
     },
     getLayout: () => stateRef.current.config.layout,
     updateLayout: (layout) => {
-      if (popOutWindow) return;
+      if (isDetachedWindow) return;
       persistLayout(layout);
     },
     openPaneSettings: (paneId, options) => { void openPaneSettings(paneId, options); },
     showPane: (paneId) => {
-      if (popOutWindow) return;
+      if (isDetachedWindow) return;
       showPane(paneId);
     },
     createPaneFromTemplateAsync: async (templateId, options) => {
-      if (popOutWindow) return;
+      if (isDetachedWindow) return;
       await createPaneTemplateOrThrow(templateId, options, {
         dataProvider,
         tickerRepository,
@@ -252,7 +252,7 @@ export function bindAppPanePluginRegistry({
       placePaneInstance(instance, paneDef, { placement: "floating" });
     },
     createPaneFromTemplate: (templateId, options) => {
-      if (popOutWindow) return;
+      if (isDetachedWindow) return;
       void createPaneFromTemplate(templateId, options);
     },
     applyPaneSettingValue: async (paneId, field: PaneSettingField, value) => {
@@ -266,19 +266,28 @@ export function bindAppPanePluginRegistry({
       });
     },
     hidePane: (paneId) => {
-      if (popOutWindow) return;
+      if (isDetachedWindow) return;
       const instanceId = resolvePaneTarget(paneId);
       const layout = stateRef.current.config.layout;
       if (!instanceId || !isPaneInLayout(layout, instanceId)) return;
       persistLayout(removePane(layout, instanceId));
     },
     focusPane: (paneId, layout) => {
-      if (popOutWindow) {
-        if (paneId === detachedPaneId) dispatch({ type: "FOCUS_PANE", paneId });
+      if (isDetachedWindow) {
+        if (paneId === detachedPaneId) {
+          dispatch({ type: "FOCUS_PANE", paneId });
+        }
         return;
       }
       const instanceId = resolvePaneTarget(paneId);
       if (!instanceId || !isPaneInLayout(stateRef.current.config.layout, instanceId)) {
+        // A pane id that is no pane type may be a pane in another desktop
+        // window, as a link's source is: that window brings it forward.
+        const windows = getDesktopWindows();
+        if (windows && windows.list().length > 1 && !pluginRegistry.panes.has(normalizePaneId(paneId))) {
+          fireAndForget(windows.focusPane(paneId), "desktop.focusPane");
+          return;
+        }
         showPane(paneId);
         return;
       }
@@ -297,12 +306,12 @@ export function bindAppPanePluginRegistry({
     // Ticker links in panes and menus, and DES from the command bar, open the
     // research pane (or the pane asked for) through these two.
     pinTicker: (symbol, options) => {
-      if (popOutWindow) return;
+      if (isDetachedWindow) return;
       recordFunctionOpen(usageFunctionForPane(pluginRegistry, options?.paneType ?? TICKER_RESEARCH_PANE_ID));
       void openPinnedTicker(symbol, options);
     },
     navigateTicker: (rawSymbol, options) => {
-      if (popOutWindow) return;
+      if (isDetachedWindow) return;
       // Navigation lands in a research pane, which stays hidden while its plugin is off.
       const researchOwner = pluginRegistry.getDisabledPaneOwner(TICKER_RESEARCH_PANE_ID, stateRef.current.config.disabledPlugins);
       if (researchOwner) {
@@ -359,11 +368,12 @@ export function bindAppPanePluginRegistry({
               ...(instrument !== undefined ? { instrument } : {}),
               ...(target.listing ? { listing: target.listing } : {}),
             };
+            const unlinkedFrom = userUnlinkedFrom(detailPane, currentLayout);
             const nextLayout = {
               ...currentLayout,
               instances: currentLayout.instances.map((instance) => (
                 instance.instanceId === detailPane.instanceId
-                  ? { ...instance, title: tickerInstrumentLabel(symbol, instrument), binding }
+                  ? { ...instance, title: tickerInstrumentLabel(symbol, instrument), binding, ...(unlinkedFrom ? { unlinkedFrom } : {}) }
                   : instance
               )),
             };
@@ -514,13 +524,17 @@ export function bindAppPanePluginRegistry({
       removeExternalPlugin(pluginId, directory);
     },
     contributions: (pluginId) => {
+      // An unlisted function (`listed: false`) and a pane only it opens are left out, as of every list.
+      const registered = pluginRegistry.getPluginPaneTemplateIds(pluginId)
+        .map((id) => ({ id, template: pluginRegistry.paneTemplates.get(id) }));
+      const listedPaneIds = new Set(registered.flatMap(({ template }) => template && template.listed !== false ? [template.paneId] : []));
+      const unlistedPaneIds = new Set(registered.flatMap(({ template }) => template?.listed === false && !listedPaneIds.has(template.paneId) ? [template.paneId] : []));
       const panes = pluginRegistry.getPluginPaneIds(pluginId)
+        .filter((id) => !unlistedPaneIds.has(id))
         .map((id) => ({ id, name: pluginRegistry.panes.get(id)?.name ?? id }));
-      const templates = pluginRegistry.getPluginPaneTemplateIds(pluginId)
-        .map((id) => {
-          const template = pluginRegistry.paneTemplates.get(id);
-          return { id, label: template?.label ?? id, ...(template?.shortcut?.prefix ? { prefix: template.shortcut.prefix } : {}) };
-        });
+      const templates = registered
+        .filter(({ template }) => template?.listed !== false)
+        .map(({ id, template }) => ({ id, label: template?.label ?? id, ...(template?.shortcut?.prefix ? { prefix: template.shortcut.prefix } : {}) }));
       const commands = [...pluginRegistry.commands.entries()]
         .filter(([id]) => pluginRegistry.getCommandPluginId(id) === pluginId && !id.endsWith(":setup"))
         .map(([id, command]) => ({ id, label: command.label, ...(command.shortcut ? { shortcut: command.shortcut } : {}) }));

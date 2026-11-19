@@ -1,9 +1,10 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ChartTableHeader,
   DataTableStackView,
   DataTableView,
-  EmptyState, formatBpAxis, PaneStatusBody, spanAxisFormatter, staticSeries,
+  EmptyState, PaneStatusBody, spanAxisFormatter, staticSeries,
   useChartTableSelection,
   usePaneMenuItems,
   usePaneNoticeFooter,
@@ -40,7 +41,6 @@ import {
   DEFAULT_ISSUER_SORT,
   DEFAULT_TRADE_SORT,
   ISSUER_SORT_COLUMN_IDS,
-  TRADE_SORT_COLUMN_IDS,
   buildIssuerColumns,
   buildTradeColumns,
   cdsFreshness,
@@ -48,9 +48,11 @@ import {
   formatEventTime,
   formatMaturity,
   formatNotional,
+  formatPoints,
   formatQuoted,
   formatQuotedMove,
   formatUpfront,
+  hasPointsQuotes,
   issuerListSort,
   lastTradeOf,
   noLevelMessage,
@@ -63,6 +65,7 @@ import {
   spreadChartPoints,
   spreadFigures,
   summarizeIssuers,
+  tradeSortColumnIds,
   tradesForIssuer,
   withSpreadLevels,
   type CdsIssuerSummary,
@@ -130,13 +133,18 @@ function renderTradeCell(row: CdsTrade, column: TradeColumn, lineMaturity: strin
     case "notional":
       return { text: formatNotional(row), color: dimmed ?? colors.textBright };
     case "currency":
-      return { text: row.currency ?? "--", color: dimmed ?? colors.textDim };
+      return { text: row.currency ?? MISSING_VALUE, color: dimmed ?? colors.textDim };
     case "coupon":
       return { text: formatBp(row.couponBp), color: dimmed ?? colors.text };
     case "spread":
       return {
         text: formatBp(row.spreadBp),
         color: dimmed ?? (row.spreadBp == null ? colors.textDim : colors.textBright),
+      };
+    case "points":
+      return {
+        text: formatPoints(row.pointsUpfront),
+        color: dimmed ?? (row.pointsUpfront == null ? colors.textDim : colors.textBright),
       };
     case "upfront":
       return {
@@ -175,7 +183,8 @@ function CdsTradeTable({
   /** What an empty table says: the window and the name searched. */
   emptyMessage: string;
 }) {
-  const columns = useMemo(() => buildTradeColumns(width), [width]);
+  const points = hasPointsQuotes(trades);
+  const columns = useMemo(() => buildTradeColumns(width, points), [points, width]);
   const renderTradeRow = useCallback((trade: CdsTrade, column: TradeColumn) => (
     renderTradeCell(trade, column, lineMaturity)
   ), [lineMaturity]);
@@ -206,7 +215,9 @@ function CdsTradeTable({
 }
 
 /** Points upfront on the chart's axis: `58pts`, `57.6pts`. */
-const formatPointsAxis = spanAxisFormatter((value, digits) => `${value.toFixed(digits)}pts`);
+const formatPointsAxis = spanAxisFormatter((value, digits) => `${value.toFixed(digits)}pts`, 1);
+/** Spreads on the chart's axis, a tag to the table's precision: whole bp from 100bp, tenths below. */
+const formatSpreadAxis = spanAxisFormatter((value, digits) => `${value.toFixed(digits)}bp`, (value) => Math.abs(value) >= 100 ? 0 : 1);
 
 const NO_TRADES: CdsTrade[] = [];
 const NO_ISSUERS: CdsIssuerSummary[] = [];
@@ -257,7 +268,7 @@ function IssuerHeader({ issuer, line, trades, width, height, focused, loading, s
   const unit: CdsQuoteUnit = line.quote === "upfront" && line.upfrontPts != null ? "pts" : "bp";
   const charted = useMemo(() => unit === "pts" ? quotedPoints(line) : points.map((point) => ({ date: point.date, value: point.spreadBp })), [line, points, unit]);
   const shown = loading && !points.length
-    ? [{ id: "spread", label: "5Y spread", value: "--" }]
+    ? [{ id: "spread", label: "5Y spread", value: MISSING_VALUE }]
     : spreadFigures(line);
   const why = !points.length ? noLevelMessage(line.noLevelReason, null) : null;
   const moves = shown.filter((item) => item.id === "spread" || item.id === "1w" || item.id === "1m");
@@ -276,11 +287,11 @@ function IssuerHeader({ issuer, line, trades, width, height, focused, loading, s
   });
   return (
     <ChartTableHeader width={width} height={height} tableRows={trades.length} figures={figures}
-      tableColumns={buildTradeColumns(width)}
+      tableColumns={buildTradeColumns(width, hasPointsQuotes(trades))}
       chart={points.length >= 2 || loading || why ? {
         series,
         formatValue: (value: number) => formatQuoted(unit, value),
-        formatAxisValue: unit === "pts" ? formatPointsAxis : formatBpAxis,
+        formatAxisValue: unit === "pts" ? formatPointsAxis : formatSpreadAxis,
         remoteKind: "cds-spread-history", loading, ...link,
         ...(why ? { empty: why } : {}),
       } : null} />
@@ -388,12 +399,13 @@ export function CdsPane({
     setDetailOpen(false);
   }, [issuerQuery, issuers, selectedIssuerKey]);
 
+  const tradePoints = hasPointsQuotes(visibleTrades);
   const cycleTradeSort = useCallback((step: 1 | -1) => {
     setTradeSort((current) => {
-      const next = cycleSortPreference<TradeColumnId>(TRADE_SORT_COLUMN_IDS, current, step);
+      const next = cycleSortPreference<TradeColumnId>(tradeSortColumnIds(tradePoints), current, step);
       return { columnId: next.columnId ?? DEFAULT_TRADE_SORT.columnId, direction: next.direction };
     });
-  }, []);
+  }, [tradePoints]);
   const cycleIssuerSort = useCallback((step: 1 | -1) => {
     setIssuerSort((current) => {
       const next = cycleSortPreference<IssuerColumnId>(ISSUER_SORT_COLUMN_IDS, current, step);
@@ -451,6 +463,8 @@ export function CdsPane({
     query: issuerQuery ? activity?.query ?? issuerQuery : selectedSummary?.issuer ?? null,
     issuer: issuerQuery ? activity?.issuer ?? null : selectedSummary?.issuer ?? null,
     days: activity?.days ?? CDS_TRADE_DAYS,
+    // A name the covered issuers do not have, once the tape has neither trades nor a line under it.
+    unmatched: issuerQuery && activity?.unmatched && !trades.length && history.data && !history.data.issuer ? activity.unmatched : null,
   });
 
   if (status === "loading" && !activity) {

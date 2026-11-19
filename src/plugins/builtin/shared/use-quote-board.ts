@@ -1,3 +1,4 @@
+import { logFailure } from "../../../utils/log-failure";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DataTableCell, DataTableVisibleRange, PaneFooterSegment } from "../../../components";
 import { savedCopyFooterSegment } from "../../../components/layout/pane/footer/model";
@@ -10,9 +11,10 @@ import { buildQuoteKey, resolveEntryData } from "../../../market-data/selectors"
 import { useAppVisible, usePaneVisible } from "../../../state/app/activity";
 import { useQuoteStreaming } from "../../../state/hooks/quote-streaming";
 import { colors, priceColor } from "../../../theme/colors";
-import type { QuoteSubscriptionTarget } from "../../../types/data-provider";
+import type { MarketDataRequestContext, QuoteBatchResult, QuoteSubscriptionTarget } from "../../../types/data-provider";
 import type { MarketState, Quote } from "../../../types/financials";
-import { formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentRaw } from "../../../utils/format";
+import { formatClockTime } from "../../../utils/datetime-format";
 import { useAssetData } from "../../runtime";
 
 export interface BoardQuoteState {
@@ -21,6 +23,8 @@ export interface BoardQuoteState {
   error: string | null;
   /** The quote is the last good one, kept because the newest load returned nothing. */
   stale: boolean;
+  /** When the board's own load last answered this symbol with a current quote. */
+  answeredAt?: number;
 }
 
 export type BoardQuoteMap = Map<string, BoardQuoteState>;
@@ -40,10 +44,12 @@ export interface QuoteBoardOptions {
   fallbackIntervalMs?: number;
   /**
    * Paint each listed symbol's cached quote, however old, as the network is
-   * asked, and refresh the listed symbols in a few batches at once, each
-   * given up after `refreshTimeoutMs` so one slow symbol cannot hold the
-   * rest. A row whose refresh fails or times out keeps its cached quote,
-   * marked stale.
+   * asked, and refresh the listed symbols in a few batches at once. A batch
+   * is given up after `refreshTimeoutMs`, and so is each symbol it left to
+   * be asked for alone, so one slow symbol cannot hold the rest. A row whose
+   * refresh fails or times out keeps its cached quote, marked stale; an
+   * answer that still comes in later paints then, unless a newer load has
+   * started.
    */
   cacheFirst?: boolean;
   /**
@@ -53,7 +59,7 @@ export interface QuoteBoardOptions {
    * Keep the reference stable until its contents change.
    */
   listedSymbols?: ReadonlySet<string> | null;
-  /** How long a cache-first refresh waits for one batch. */
+  /** How long a cache-first refresh waits for one batch, and for each symbol it asks for alone. */
   refreshTimeoutMs?: number;
 }
 
@@ -67,12 +73,17 @@ const QUOTE_BOARD_FALLBACK_MS = 60_000;
 const STREAM_SILENCE_MS = 3 * 60_000;
 /** The feed answers a new subscription with a snapshot; give it this long before polling around it. */
 const STREAM_CONNECT_GRACE_MS = 10_000;
+/** A dropped stream's symbols are asked for within this long, each client at a random moment in it. */
+const STREAM_DROP_REFRESH_SPREAD_MS = 5_000;
 
 /** A cache-first refresh splits the listed symbols into at most this many batches, sent at once. */
 const QUOTE_REFRESH_BATCHES = 4;
 /** And sends no batch smaller than this, so a short list is one request. */
 const QUOTE_REFRESH_MIN_BATCH = 8;
-/** A batch still unanswered after this long is given up and its rows keep their cached quote. */
+/**
+ * A batch still unanswered after this long is given up and its rows keep
+ * their cached quote; so is a symbol it left to be asked for alone.
+ */
 const QUOTE_REFRESH_TIMEOUT_MS = 5_000;
 
 const EMPTY_STATE: BoardQuoteState = { quote: null, loading: false, error: null, stale: false };
@@ -85,19 +96,44 @@ function boardInstrument(symbol: string): InstrumentRef {
   return { symbol, exchange: "" };
 }
 
+/** A price its source answered as its last, not a current one. A listing that no longer trades has nothing newer. */
+function isFlaggedStale(quote: Quote): boolean {
+  return quote.stale === true && !quote.delisting;
+}
+
+/**
+ * What a load hands the board for a symbol. `interim`: the batch's dated
+ * price for a symbol it left to be asked for alone, shown meanwhile only on
+ * a row that has no quote yet (mergeQuotes).
+ */
+type LoadedQuoteState = BoardQuoteState & { interim?: true };
+type LoadedQuoteMap = Map<string, LoadedQuoteState>;
+
 /**
  * A failed refresh must not blank a board that was showing prices a second
- * ago: keep the last good quote and mark it stale instead.
+ * ago: keep the last good quote and mark it stale instead. A load that
+ * brings only a price flagged stale shows the newer of it and the last one,
+ * marked stale too. An interim price fills only a row with no quote, which
+ * stays loading until its own read answers; a row that has one keeps it as
+ * it is, so a background top-up never marks it loading or stale.
  */
-function mergeQuotes(previous: BoardQuoteMap, loaded: BoardQuoteMap): BoardQuoteMap {
+function mergeQuotes(previous: BoardQuoteMap, loaded: LoadedQuoteMap): BoardQuoteMap {
   const next: BoardQuoteMap = new Map(previous);
+  const now = Date.now();
   for (const [symbol, state] of loaded) {
-    const retained = state.quote ?? previous.get(symbol)?.quote ?? null;
+    const kept = previous.get(symbol)?.quote ?? null;
+    if (state.interim) {
+      if (!kept) next.set(symbol, { ...(previous.get(symbol) ?? EMPTY_STATE), quote: state.quote, loading: true, stale: true });
+      continue;
+    }
+    const current = state.quote && !isFlaggedStale(state.quote) ? state.quote : null;
+    const retained = current ?? (state.quote && (state.quote.lastUpdated ?? 0) >= (kept?.lastUpdated ?? 0) ? state.quote : kept);
     next.set(symbol, {
       quote: retained,
       loading: false,
       error: state.error,
-      stale: !state.quote && retained !== null,
+      stale: !current && retained !== null,
+      ...(current ? { answeredAt: now } : {}),
     });
   }
   return next;
@@ -126,50 +162,112 @@ export function isStreamCarryingQuote(
   return quote.marketState !== "REGULAR" || now - receivedAt <= STREAM_SILENCE_MS;
 }
 
-/** The newer of the board's snapshot and the shared feed's quote, per symbol. */
+/**
+ * The newer of the board's snapshot and the shared feed's quote, per symbol.
+ * A feed quote flagged stale because the stream stopped is current again once
+ * the board's own refresh answers after the feed last delivered it: the row
+ * then shows the newer of the two prices, unflagged.
+ */
 function overlayStreamQuote(base: BoardQuoteState, streamed: Quote | null): BoardQuoteState {
   if (!finitePrice(streamed)) return base;
-  if (base.quote && (streamed.lastUpdated ?? 0) < (base.quote.lastUpdated ?? 0)) return base;
+  const baseTime = base.quote?.lastUpdated ?? 0;
+  if (base.quote && (streamed.lastUpdated ?? 0) < baseTime) return base;
+  if (streamed.stale === true && base.quote && !base.stale && base.answeredAt != null
+    && base.answeredAt >= (streamed.receivedAt ?? 0)) {
+    return (streamed.lastUpdated ?? 0) > baseTime ? { ...base, quote: { ...streamed, stale: false }, error: null } : base;
+  }
   if (base.quote === streamed && !base.stale && base.error === null) return base;
   return { quote: streamed, loading: base.loading, error: null, stale: streamed.stale === true };
 }
 
-/** Quotes for `subset`, one state per symbol; throws only when the whole request fails. */
+/**
+ * `promise`, or a timeout error once `timeoutMs` has passed (never, without
+ * one). A result that arrives after the timeout is handed to `onLate`, so the
+ * caller can still use what it stopped waiting for; a failure then is only
+ * logged, as the caller has recorded the timeout.
+ */
+function within<T>(promise: Promise<T>, timeoutMs: number | undefined, onLate?: (late: T) => void): Promise<T> {
+  if (timeoutMs == null) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      if (onLate) promise.then(onLate, logFailure("shared.use-quote-board", "Late board quote read failed"));
+      reject(new Error("Quote refresh timed out"));
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timedOut]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Quotes for `subset`, handed to `apply` as they land: the batch's answer at
+ * once, then each symbol it left without a current quote, asked for alone
+ * into its own row. Such a symbol whose own read fails shows the dated price
+ * the batch had, flagged stale, when it had one. Each request is given
+ * `timeoutMs`, when set; one that answers after it is applied then, over the
+ * timeout the caller recorded, so `apply` must drop what a newer load
+ * superseded. Throws only when the batch itself fails or times out, before
+ * anything was applied.
+ */
 async function requestBoardQuotes(
   dataProvider: NonNullable<ReturnType<typeof useAssetData>>,
   subset: readonly string[],
   forceRefresh: boolean,
-  signal?: AbortSignal,
-): Promise<BoardQuoteMap> {
-  const next: BoardQuoteMap = new Map();
-  if (dataProvider.getQuotesBatch) {
-    const results = await dataProvider.getQuotesBatch(
-      subset.map((symbol) => ({ symbol, exchange: "" })),
-      { forceRefresh, ...(signal ? { signal } : {}) },
-    );
-    const bySymbol = new Map(results.map((result) => [result.target.symbol, result]));
-    for (const symbol of subset) {
-      const result = bySymbol.get(symbol);
-      next.set(symbol, {
-        quote: result?.quote ?? null,
-        loading: false,
-        error: result?.error ? errorMessage(result.error) : null,
-        stale: false,
-      });
+  apply: (loaded: LoadedQuoteMap) => void,
+  timeoutMs?: number,
+): Promise<void> {
+  const askAlone = async (symbol: string, context: MarketDataRequestContext | undefined, fallback: Quote | null = null) => {
+    const answered = (quote: Quote): BoardQuoteState => ({ quote, loading: false, error: null, stale: false });
+    let state: BoardQuoteState;
+    try {
+      const request = dataProvider.getQuote(symbol, "", context);
+      state = answered(await within(request, timeoutMs, (late) => apply(new Map([[symbol, answered(late)]]))));
+    } catch (error: unknown) {
+      state = { quote: fallback, loading: false, error: fallback ? null : errorMessage(error), stale: false };
     }
-    return next;
+    apply(new Map([[symbol, state]]));
+  };
+
+  if (dataProvider.getQuotesBatch) {
+    const applyBatch = async (results: QuoteBatchResult[]) => {
+      const bySymbol = new Map(results.map((result) => [result.target.symbol, result]));
+      const answered: LoadedQuoteMap = new Map();
+      const followUps: QuoteBatchResult[] = [];
+      for (const symbol of subset) {
+        const result = bySymbol.get(symbol);
+        if (result?.followUp) {
+          followUps.push(result);
+          continue;
+        }
+        answered.set(symbol, {
+          quote: result?.quote ?? null,
+          loading: false,
+          error: result?.error ? errorMessage(result.error) : null,
+          stale: false,
+        });
+      }
+      // A symbol asked for again alone shows the batch's dated quote meanwhile on a row with none (a cold board), so
+      // what reads its quote (a future's contract month, which FUT's returns read the contract's history by) starts
+      // now rather than after a round trip. A row that has a quote keeps it (mergeQuotes).
+      for (const result of followUps) {
+        if (finitePrice(result.quote ?? null)) {
+          answered.set(result.target.symbol, { quote: result.quote!, loading: true, error: null, stale: true, interim: true });
+        }
+      }
+      if (answered.size > 0) apply(answered);
+      await Promise.all(followUps.map((result) => askAlone(result.target.symbol, { cacheMode: result.followUp }, result.quote)));
+    };
+    const results = await within(dataProvider.getQuotesBatch(
+      subset.map((symbol) => ({ symbol, exchange: "" })),
+      { forceRefresh, deferFollowUps: true },
+    ), timeoutMs, (late) => {
+      applyBatch(late).catch(logFailure("shared.use-quote-board", "Apply late board quotes failed"));
+    });
+    await applyBatch(results);
+    return;
   }
 
   const context = forceRefresh ? { cacheMode: "refresh" as const } : undefined;
-  await Promise.all(subset.map(async (symbol) => {
-    try {
-      const quote = await dataProvider.getQuote(symbol, "", context);
-      next.set(symbol, { quote, loading: false, error: null, stale: false });
-    } catch (error: unknown) {
-      next.set(symbol, { quote: null, loading: false, error: errorMessage(error), stale: false });
-    }
-  }));
-  return next;
+  await Promise.all(subset.map((symbol) => askAlone(symbol, context)));
 }
 
 /**
@@ -286,7 +384,7 @@ export function useQuoteBoard(symbols: string[], options: QuoteBoardOptions = {}
     }
     if (!dataProvider || subset.length === 0) return;
 
-    requestBoardQuotes(dataProvider, subset, forceRefresh).then((loaded) => {
+    requestBoardQuotes(dataProvider, subset, forceRefresh, (loaded) => {
       if (fetchGenRef.current !== gen) return;
       setSnapshots((prev) => mergeQuotes(prev, loaded));
     }).catch((error: unknown) => {
@@ -305,28 +403,24 @@ export function useQuoteBoard(symbols: string[], options: QuoteBoardOptions = {}
   // Symbols a cache-first board has asked the network for since its last full load.
   const requestedRef = useRef(new Set<string>());
 
-  /** Refreshes `subset` a few batches at once; a batch that fails or times out keeps its rows' cached quotes. */
+  /**
+   * Refreshes `subset` a few batches at once. Each batch's rows paint as it
+   * answers, and a symbol it leaves to be asked for alone fills its own row
+   * later; a batch or a symbol that fails or times out keeps its rows' cached
+   * quotes.
+   */
   const refreshInBatches = useCallback((subset: readonly string[], forceRefresh: boolean, gen: number) => {
     if (!dataProvider) return;
+    const apply = (loaded: LoadedQuoteMap) => {
+      if (fetchGenRef.current !== gen) return;
+      setSnapshots((prev) => mergeQuotes(prev, loaded));
+    };
     for (const batch of inBatches(subset)) {
-      const controller = new AbortController();
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const timedOut = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          controller.abort();
-          reject(new Error("Quote refresh timed out"));
-        }, refreshTimeoutMs);
-      });
-      Promise.race([requestBoardQuotes(dataProvider, batch, forceRefresh, controller.signal), timedOut])
-        .catch((error: unknown): BoardQuoteMap => new Map(batch.map((symbol) => [
+      requestBoardQuotes(dataProvider, batch, forceRefresh, apply, refreshTimeoutMs)
+        .catch((error: unknown) => apply(new Map(batch.map((symbol) => [
           symbol,
           { quote: null, loading: false, error: errorMessage(error), stale: false },
-        ])))
-        .then((loaded) => {
-          clearTimeout(timer);
-          if (fetchGenRef.current !== gen) return;
-          setSnapshots((prev) => mergeQuotes(prev, loaded));
-        });
+        ]))));
     }
   }, [dataProvider, refreshTimeoutMs]);
 
@@ -341,7 +435,7 @@ export function useQuoteBoard(symbols: string[], options: QuoteBoardOptions = {}
         if (fetchGenRef.current !== gen) return;
         setSnapshots((prev) => paintCachedQuotes(prev, cached));
       })
-      .catch(() => {});
+      .catch(logFailure("shared.use-quote-board", "Paint cached board quotes failed"));
   }, [dataProvider]);
 
   /** The cache-first full load: the listed symbols' cached quotes at once, then from the network. */
@@ -423,6 +517,25 @@ export function useQuoteBoard(symbols: string[], options: QuoteBoardOptions = {}
       if (timer) clearTimeout(timer);
     };
   }, [dataProvider, fallbackIntervalMs, liveStreaming, load, paneVisible, selectedSymbol, symbols, visibleSymbols]);
+
+  // The symbols whose feed quote reads stale: the stream went down while
+  // their market trades. The board then runs as it does without streaming:
+  // they are all asked for now, as a first load would, and the poll keeps
+  // the ones on screen current. A row reads stale only when a refresh fails.
+  const interrupted = useMemo(() => (liveStreaming
+    ? symbols.filter((symbol) => resolveEntryData(entries.get(buildQuoteKey(boardInstrument(symbol))))?.stale === true).join("\u001f")
+    : ""), [entries, liveStreaming, symbols]);
+  useEffect(() => {
+    if (!interrupted || !paneVisible || !dataProvider) return;
+    // At a random moment within a few seconds, so clients a server restart dropped together do not ask together.
+    const timer = setTimeout(() => {
+      const now = Date.now();
+      const due = interrupted.split("\u001f").filter((symbol) =>
+        !isStreamCarryingQuote(entriesRef.current.get(buildQuoteKey(boardInstrument(symbol))), streamStartRef.current.at, now));
+      if (due.length > 0) load(true, due);
+    }, Math.random() * STREAM_DROP_REFRESH_SPREAD_MS);
+    return () => clearTimeout(timer);
+  }, [dataProvider, interrupted, load, paneVisible]);
 
   // Settings changes must affect rows and footer status in the same render,
   // including the frame before the next request effect starts. Unchanged
@@ -519,6 +632,11 @@ export function quoteBoardStatus(quotes: BoardQuoteMap): QuoteBoardStatus {
   return { loading, stale, unavailable, latestTs, savedAt: oldestSavedCopyAt(Array.from(quotes.values(), (state) => state.quote)) };
 }
 
+/** The quotes a board shows, for the footer's delayed clock (`useQuoteDelayFooter`). */
+export function* boardQuotes(quotes: BoardQuoteMap): Generator<Quote | null> {
+  for (const state of quotes.values()) yield state.quote;
+}
+
 /** Board footer status: everything here changes as loads succeed or fail. */
 export function quoteBoardFooterInfo(status: QuoteBoardStatus): PaneFooterSegment[] {
   const info: PaneFooterSegment[] = [];
@@ -536,7 +654,7 @@ export function quoteBoardFooterInfo(status: QuoteBoardStatus): PaneFooterSegmen
       id: "fresh",
       quoteStatus: true,
       parts: [{
-        text: new Date(status.latestTs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        text: formatClockTime(status.latestTs),
         tone: "muted",
       }],
     });
@@ -597,12 +715,12 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
  * closed market's last print is not read as a time today.
  */
 function formatQuoteTime(lastUpdated: number | undefined, now = Date.now()): string {
-  if (!lastUpdated) return "—";
+  if (!lastUpdated) return MISSING_VALUE;
   const date = new Date(lastUpdated);
   const today = new Date(now);
   if (date.getUTCFullYear() !== today.getUTCFullYear() || date.getUTCMonth() !== today.getUTCMonth()
     || date.getUTCDate() !== today.getUTCDate()) {
-    return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}`;
+    return `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`;
   }
   return `${String(date.getUTCHours()).padStart(2, "0")}:${String(date.getUTCMinutes()).padStart(2, "0")}`;
 }
@@ -613,6 +731,8 @@ export type QuoteBoardCellKind = "status" | "price" | "change" | "changePercent"
 export interface QuoteBoardCellFormat {
   /** Spell out the session instead of a colored dot. */
   sessionText?: boolean;
+  /** The moment the status cell reads the venue's session at, in ms; the current time when omitted. */
+  now?: number;
   /** Called with the quote at its headline: a finite price. */
   formatPrice: (quote: Quote) => string;
   /** Called with the quote at its headline: a finite change; the text carries its sign. */
@@ -662,22 +782,22 @@ export function renderQuoteBoardCell(
   switch (kind) {
     case "status": {
       if (format.sessionText) {
-        return { text: quoteSessionLabel(quote) ?? "—", color: quoteSessionColor(quote) };
+        return { text: quoteSessionLabel(quote, format.now) ?? MISSING_VALUE, color: quoteSessionColor(quote, colors, format.now) };
       }
-      const dot = marketStatusDot(quoteDotMarketState(quote));
+      const dot = marketStatusDot(quoteDotMarketState(quote, format.now));
       // The dot is a picture; the export says which session it means.
-      return { text: dot.char, value: quoteSessionLabel(quote), color: dot.color };
+      return { text: dot.char, value: quoteSessionLabel(quote, format.now), color: dot.color };
     }
     case "price":
-      if (!quote || !Number.isFinite(quote.price)) return { text: "—", color: colors.textDim };
+      if (!quote || !Number.isFinite(quote.price)) return { text: MISSING_VALUE, color: colors.textDim };
       // A retained quote still beats a dash; dim it so stale is visible.
       return { text: format.formatPrice(quote), value: quote.price, color: state?.stale ? colors.textDim : undefined };
     case "change":
-      if (!quote || !Number.isFinite(quote.change)) return { text: "—", color: colors.textDim };
+      if (!quote || !Number.isFinite(quote.change)) return { text: MISSING_VALUE, color: colors.textDim };
       // No raw value: a change is a difference of two prices, so its float noise would outlive the text.
       return { text: format.formatChange(quote), color: priceColor(quote.change) };
     case "changePercent":
-      if (!quote || !Number.isFinite(quote.changePercent)) return { text: "—", color: colors.textDim };
+      if (!quote || !Number.isFinite(quote.changePercent)) return { text: MISSING_VALUE, color: colors.textDim };
       return {
         text: formatPercentRaw(quote.changePercent),
         value: quote.changePercent,

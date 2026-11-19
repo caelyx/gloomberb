@@ -1,5 +1,6 @@
 import { Box, Text, useUiCapabilities } from "../ui";
 import { colors } from "../theme/colors";
+import { clipToDisplayWidth, displayWidth } from "../utils/format";
 import { Checkbox } from "./ui/checkbox";
 import { ListView, type ListRowState, type ListViewItem } from "./ui/list-view";
 
@@ -33,6 +34,43 @@ export interface ToggleListProps {
   remoteLabel?: string;
   remoteScope?: string;
   remoteMetadata?: Record<string, unknown>;
+  /**
+   * The terminal row's width in cells. With it, a label and detail that do
+   * not both fit are cut with an ellipsis, the detail first, and a
+   * two-cell gap always parts them; without it they are
+   * drawn whole.
+   */
+  width?: number;
+}
+
+/** The checkbox's `> [ ] ` before a label, and the gap kept before the detail. */
+const CHECKBOX_PREFIX = 6;
+const DETAIL_GAP = 2;
+
+/** Words that fit `width`, then an ellipsis: a list of codes is never cut inside one. */
+function clipWords(text: string, width: number): string {
+  if (displayWidth(text) <= width) return text;
+  const words = text.split(" ");
+  let kept = "";
+  for (const word of words) {
+    const next = kept ? `${kept} ${word}` : word;
+    if (displayWidth(next) + 1 > width) break;
+    kept = next;
+  }
+  return kept ? `${kept}…` : clipToDisplayWidth(text, width);
+}
+
+/**
+ * A terminal toggle row's label and detail, cut to fit `width` with an
+ * ellipsis: the detail gives way first, at a word. Whole when they fit.
+ */
+export function fitToggleRow(label: string, detail: string | undefined, width: number): { label: string; detail: string | undefined } {
+  const room = Math.max(0, width - CHECKBOX_PREFIX);
+  if (!detail) return { label: clipToDisplayWidth(label, room), detail };
+  const available = Math.max(0, room - DETAIL_GAP);
+  const labelWidth = Math.min(displayWidth(label), available);
+  const fittedDetail = clipWords(detail, Math.max(0, available - labelWidth));
+  return { label: clipToDisplayWidth(label, fittedDetail ? labelWidth : room), detail: fittedDetail || undefined };
 }
 
 function DesktopToggleRow({
@@ -113,6 +151,7 @@ export function ToggleList({
   remoteLabel,
   remoteScope,
   remoteMetadata,
+  width,
 }: ToggleListProps) {
   const isDesktopWeb = useUiCapabilities().nativePaneChrome === true;
   const listItems: ListViewItem[] = items.map((item) => ({
@@ -166,6 +205,7 @@ export function ToggleList({
           );
         }
 
+        const fitted = width != null && !showDescriptions ? fitToggleRow(item.label, item.detail, width) : null;
         return (
           <Box
             id={rowIdPrefix ? `${rowIdPrefix}:${item.id}` : undefined}
@@ -175,6 +215,7 @@ export function ToggleList({
           >
             <Checkbox
               label={item.label}
+              displayLabel={fitted?.label}
               checked={toggleItem?.enabled === true}
               disabled={state.disabled}
               active={state.selected}
@@ -185,7 +226,7 @@ export function ToggleList({
                 {item.description ? <Text fg={colors.textMuted}>{item.description}</Text> : null}
                 {item.detail ? <Text fg={colors.textMuted}>{item.detail}</Text> : null}
               </Box>
-            ) : item.detail ? <Text fg={colors.textMuted}>{item.detail}</Text> : null}
+            ) : (fitted ? fitted.detail : item.detail) ? <Text fg={colors.textMuted}>{fitted ? fitted.detail : item.detail}</Text> : null}
           </Box>
         );
       }}

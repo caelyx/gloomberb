@@ -1,5 +1,5 @@
 import { RADIUS, SPACE } from "../../theme/ui-tokens";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { Box, Text, TextAttributes, useUiCapabilities } from "../../ui";
 import { useViewport } from "../../react/input";
 import { blendHex } from "../../theme/colors";
@@ -9,6 +9,8 @@ import { Button, ListView, type ListViewItem } from "../ui";
 import type { ButtonProps } from "../ui/button";
 import { ListRowLines } from "../ui/list-row-lines";
 import { TITLEBAR_OVERLAY_HEIGHT_PX } from "../layout/titlebar-overlay";
+import { RemoteSurface, useRemoteSurfaceHeader, useRemoteSurfaceHeading } from "../../remote/surface";
+import { holdSetupCard } from "./setup-cards";
 
 /**
  * Spacing for the DOM card, in px. The card is a form the user fills in, not
@@ -57,6 +59,11 @@ export function OnboardingModal({
   const colors = useThemeColors();
   const desktop = useUiCapabilities().nativePaneChrome === true;
   const viewport = useViewport();
+  // Up while drawn, so a card that must not open over it can wait (setup-cards.ts).
+  useEffect(() => holdSetupCard(), []);
+
+  // It covers the app, so remote control reads it as the open form.
+  const content = <RemoteSurface kind="setup">{children}</RemoteSurface>;
 
   if (desktop) {
     return (
@@ -92,7 +99,7 @@ export function OnboardingModal({
           }}
           data-gloom-role="onboarding-modal"
         >
-          {children}
+          {content}
         </Box>
       </Box>
     );
@@ -126,7 +133,7 @@ export function OnboardingModal({
         borderColor={colors.borderFocused}
         data-gloom-role="onboarding-modal"
       >
-        {children}
+        {content}
       </Box>
     </Box>
   );
@@ -219,7 +226,8 @@ export function OnboardingCoach({
       </Box>
       <Box height={1} />
       <Box flexGrow={1} minHeight={0}>{children}</Box>
-      <Box height={1} flexDirection="row" gap={1}>{actions}</Box>
+      {/* As OnboardingActions: a button that does not fit beside the one before it wraps under it. */}
+      <Box flexDirection="row" flexWrap="wrap" alignItems="center" columnGap={1} flexShrink={0}>{actions}</Box>
     </Box>
   );
 }
@@ -244,6 +252,7 @@ export function OnboardingTitle({
 }) {
   const colors = useThemeColors();
   const desktop = useUiCapabilities().nativePaneChrome === true;
+  useRemoteSurfaceHeading({ step, title: titleSuffix ? `${title} ${titleSuffix}` : title, description });
 
   if (desktop) {
     return (
@@ -339,6 +348,10 @@ export function OnboardingHeader({
     { id: "cloud", label: t("Gloom Cloud") },
     { id: "pro", label: t("Pro") },
   ];
+  useRemoteSurfaceHeader({
+    section: sections.find((section) => section.id === active)?.label,
+    cancel: showDismiss && !dismissing && !dismissDisabled ? onDismiss : undefined,
+  });
 
   if (!desktop) {
     return (
@@ -358,7 +371,8 @@ export function OnboardingHeader({
   }
 
   // Progress, not navigation: three segments, the current one lit, the ones
-  // behind it filled. A filled segment is still a way back.
+  // behind it filled. A filled segment is a way back unless the wizard marks
+  // it unavailable: a step done for good stays filled and is not offered again.
   const activeIndex = sections.findIndex((section) => section.id === active);
   return (
     <Box flexDirection="row" alignItems="flex-start" justifyContent="space-between" minWidth={0}>
@@ -522,7 +536,8 @@ export function OnboardingChoiceList({
       onActivate={(_item, index) => onActivate(index)}
       surface="framed"
       rowGap={0}
-      rowHeight={2}
+      // Two lines where a choice says more under its name; one where none does.
+      rowHeight={items.some((item) => item.description) ? 2 : 1}
       selectOnHover
       renderRow={(item, state) => (
         <Box flexDirection="row" alignItems="center" width="100%" minWidth={0}>

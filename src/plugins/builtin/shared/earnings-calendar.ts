@@ -2,8 +2,10 @@ import type { DataProvider, EarningsEvent } from "../../../types/data-provider";
 import type { CorporateActionsData, EarningsAction, EarningsDateStatus, EarningsEpsBasis } from "../../../types/financials";
 import { logFailure } from "../../../utils/log-failure";
 import { zonedDateKey } from "../../../utils/zoned-date-time";
-import { dateStatusFromEstimateFlag, earningsDateStatus, earningsEpsBasis } from "./earnings-report";
+import { isNotMeaningful } from "../../../utils/growth";
+import { dateStatusFromEstimateFlag, earningsDateStatus, earningsEpsBasis, epsSurprise } from "./earnings-report";
 import { coherentEarningsValue, EARNINGS_ESTIMATE_FIELDS } from "./earnings-estimate-basis";
+import { listingTimeZone } from "../../../market-data/market/trading-sessions";
 
 /**
  * The one reading of a company's report dates that `earnings`, `events`, EE,
@@ -32,6 +34,17 @@ export function newYorkDay(now = Date.now()): string {
   return zonedDateKey(now, "America/New_York");
 }
 
+/**
+ * The day on a listing's own venue, which its report date is on: SIE:XETRA's
+ * 12 Nov report has passed at 02:00 UTC on the 13th, Berlin's Friday, while
+ * New York is still on Thursday. A US listing, or a venue with no known
+ * clock, keeps New York's day.
+ */
+export function listingDay(exchange: string | null | undefined, now = Date.now()): string {
+  const zone = exchange ? listingTimeZone(undefined, exchange) : null;
+  return zone ? zonedDateKey(now, zone) : newYorkDay(now);
+}
+
 /** The day the calendar puts a report on, YYYY-MM-DD. */
 function calendarDay(event: Pick<EarningsEvent, "earningsDate">): string {
   return event.earningsDate.toISOString().slice(0, 10);
@@ -55,7 +68,7 @@ function calendarDateWins(calendar: EarningsDateStatus | null, other: EarningsDa
 }
 
 /** The calendar's report as a quarter on record takes it. */
-interface CalendarReport {
+export interface CalendarReport {
   date: string;
   timing: "bmo" | "amc" | null;
   dateStatus: EarningsDateStatus | null;
@@ -70,6 +83,8 @@ interface CalendarReport {
   /** The quarter the estimate is for, YYYY-MM, when the calendar names it. */
   fiscalPeriod: string | null;
   currency: string | null;
+  /** The revenue estimate's currency, when the calendar names it. */
+  revenueCurrency: string | null;
 }
 
 /**
@@ -86,7 +101,11 @@ function consensusIsReports(event: EarningsEvent, dateStatus: EarningsDateStatus
   return periodEnd != null && periodEnd < date;
 }
 
-function calendarReport(event: EarningsEvent, today: string): CalendarReport {
+/**
+ * A calendar event read as its report, as every surface reads it: reported
+ * once out, and with a consensus only when it is that report's.
+ */
+export function calendarReport(event: EarningsEvent, today: string): CalendarReport {
   const date = calendarDay(event);
   const dateStatus = calendarStatus(event, today);
   const ownConsensus = consensusIsReports(event, dateStatus, date);
@@ -104,6 +123,7 @@ function calendarReport(event: EarningsEvent, today: string): CalendarReport {
     revenueEstimate: ownConsensus ? coherentEarningsValue(event, "revenueEstimate") : null,
     fiscalPeriod: ownConsensus && periodEnd ? periodEnd.slice(0, 7) : null,
     currency: epsEstimate == null ? null : event.estimateBasis?.epsEstimate?.currency ?? null,
+    revenueCurrency: event.estimateBasis?.revenueEstimate?.currency ?? null,
   };
 }
 
@@ -117,8 +137,8 @@ interface ReportSlot {
 /** How one source's rows are read and rebuilt: corporate actions for events and EE, history for ERN. */
 export interface ReportRowAdapter<T> {
   slot(row: T): ReportSlot;
-  /** The row labelled reported, with `epsActual` when it has no figure of its own. */
-  reported(row: T, epsActual: number | null): T;
+  /** The row labelled reported, with `epsActual` (the calendar's `report`'s, when it has one) when it has no figure of its own. */
+  reported(row: T, epsActual: number | null, report?: CalendarReport): T;
   /** The calendar's report as a row: over `row` when it is the same report, else a new one. */
   fromCalendar(report: CalendarReport, row: T | null): T;
 }
@@ -172,7 +192,7 @@ function resolveReportRowsWithCalendar<T>(
   const row = resolved[index]!;
   const slot = adapter.slot(row);
   if (isOut(slot, today)) {
-    if (slot.epsActual == null && report.epsActual != null) resolved[index] = adapter.reported(row, report.epsActual);
+    if (slot.epsActual == null && report.epsActual != null) resolved[index] = adapter.reported(row, report.epsActual, report);
   } else if (report.dateStatus === "reported" || calendarDateWins(report.dateStatus, earningsDateStatus(slot.dateStatus))) {
     resolved[index] = adapter.fromCalendar(report, row);
   }
@@ -185,13 +205,23 @@ export function resolveReportRows<T>(rows: readonly T[], event: EarningsEvent | 
 
 const TIME_TEXT = { bmo: "Pre Market", amc: "After Hours" } as const;
 
-/** A row's beat, measured as Gloom Cloud measures it, once the calendar gives it a figure or an estimate it lacked. */
+/**
+ * A row's beat, measured as Gloom Cloud measures it, once the calendar gives it a figure or an estimate it lacked.
+ * Against a loss or zero estimate it has no surprise percentage (N/M), the record's either; the difference stands.
+ */
 function withSurprise(row: EarningsAction, before: EarningsAction | null): EarningsAction {
   const { epsActual: actual, epsEstimate: estimate } = row;
-  if (actual == null || estimate == null || (actual === before?.epsActual && estimate === before.epsEstimate)) return row;
+  if (actual == null || estimate == null) return row;
+  const surprise = epsSurprise(actual, estimate);
+  const unchanged = actual === before?.epsActual && estimate === before.epsEstimate;
+  if (unchanged && !isNotMeaningful(surprise)) return row;
   const cents = (value: number) => Math.round(value * 100) / 100;
   const { difference: _difference, surprisePercent: _surprise, ...rest } = row;
-  return { ...rest, difference: cents(actual - estimate), ...(estimate !== 0 ? { surprisePercent: cents((actual - estimate) / Math.abs(estimate) * 100) } : {}) };
+  return {
+    ...rest,
+    difference: unchanged && row.difference != null ? row.difference : cents(actual - estimate),
+    ...(typeof surprise === "number" ? { surprisePercent: cents(surprise * 100) } : {}),
+  };
 }
 
 function definedFields<T extends object>(row: T): T {
@@ -284,6 +314,8 @@ function eventOfRow(event: EarningsEvent, row: EarningsAction, report: CalendarR
       ...base,
       earningsDate,
       earningsCallDate: ownDate ? event.earningsCallDate ?? null : null,
+      // The company's time is for its own date, never another the record places the report on.
+      releaseAt: ownDate ? event.releaseAt ?? null : null,
       isDateEstimate: statusFlag(dateStatus) ?? (dateStatus === "reported" ? base.isDateEstimate ?? null : null),
       epsEstimate: recordFigures ? row.epsEstimate ?? null : base.epsEstimate ?? row.epsEstimate ?? null,
       epsAnalysts: recordFigures ? row.epsAnalysts ?? null : base.epsAnalysts ?? row.epsAnalysts ?? null,
@@ -340,6 +372,66 @@ export interface EarningsListing {
   key: string;
   symbol: string;
   exchange: string;
+  /** The day on the listing's venue (`listingDay`), when it is not the one every listing is read on. */
+  today?: string;
+}
+
+/** A listing's latest report on record, for a listing the calendar has no next date for. */
+export interface LastReport {
+  /** The day it came out, YYYY-MM-DD; null when only the quarter it covered is on record. */
+  date: string | null;
+  /** The quarter it covered, as its period end names it: 2026-09-30, or 2026-09 when only the month is known. */
+  periodEnd: string | null;
+}
+
+/** A report's statement is the quarter that ended at most this long before it came out. */
+const REPORT_LAG_DAYS = 150;
+
+/**
+ * The listing's latest report on record: the newest announcement on or before
+ * `today` with a reported figure (its corporate actions), and the quarter it
+ * covered, from the action itself or else the newest quarterly statement that
+ * ended before it. A listing whose statements are on record but no report
+ * date is answered with the quarter alone. Null when neither is.
+ */
+export async function lastReportOnRecord(
+  provider: Pick<DataProvider, "getCorporateActions" | "getTickerFinancials">,
+  listing: Pick<EarningsListing, "symbol" | "exchange">,
+  today: string,
+): Promise<LastReport | null> {
+  const actions = provider.getCorporateActions
+    ? await provider.getCorporateActions(listing.symbol, listing.exchange)
+      .catch(logFailure("earnings-calendar", "Read a listing's reported quarters failed", null))
+    : null;
+  const reported = (actions?.earnings ?? [])
+    .filter((row) => row.dateType !== "fiscal-period-end" && row.epsActual != null && row.date.slice(0, 10) <= today)
+    .sort((left, right) => left.date.localeCompare(right.date))
+    .at(-1);
+  const date = reported?.date.slice(0, 10) ?? null;
+  if (reported?.fiscalPeriod) return { date, periodEnd: reported.fiscalPeriod };
+  const financials = await provider.getTickerFinancials(listing.symbol, listing.exchange)
+    .catch(logFailure("earnings-calendar", "Read a listing's quarterly statements failed", null));
+  const until = date ?? today;
+  const earliest = date ? new Date(Date.parse(`${date}T00:00:00Z`) - REPORT_LAG_DAYS * DAY_MS).toISOString().slice(0, 10) : "";
+  const quarter = (financials?.quarterlyStatements ?? [])
+    .map((statement) => statement.date.slice(0, 10))
+    .filter((end) => end < until && end >= earliest)
+    .sort()
+    .at(-1) ?? null;
+  return date || quarter ? { date, periodEnd: quarter } : null;
+}
+
+/**
+ * What a listing the calendar has no next date for says, after its key: "no
+ * next report date on record; last reported 2026-10-29 (quarter ended
+ * 2026-09-30)", the quarter alone when no report date is on record.
+ */
+export function noNextReportText(last: LastReport | null): string {
+  const lead = "no next report date on record";
+  if (!last) return lead;
+  const period = last.periodEnd ? `quarter ended ${last.periodEnd}` : null;
+  if (last.date) return `${lead}; last reported ${last.date}${period ? ` (${period})` : ""}`;
+  return period ? `${lead}; latest results on record: ${period}` : lead;
 }
 
 /** Calendar events need their quarters on record read at most this many at a time. */
@@ -364,11 +456,12 @@ export async function resolveListingEvents(
   });
   for (let index = 0; index < pending.length; index += RECORD_CONCURRENCY) {
     await Promise.all(pending.slice(index, index + RECORD_CONCURRENCY).map(async ({ listing, event }) => {
-      const earnings = needsRecordedQuarters(event, today) && provider.getCorporateActions
+      const day = listing.today ?? today;
+      const earnings = needsRecordedQuarters(event, day) && provider.getCorporateActions
         ? await provider.getCorporateActions(listing.symbol, listing.exchange)
           .then((actions) => actions.earnings, logFailure("earnings-calendar", "Read corporate actions for a past report date failed", null))
         : null;
-      resolved.set(listing.key.toUpperCase(), resolveCalendarEvent(event, earnings, today));
+      resolved.set(listing.key.toUpperCase(), resolveCalendarEvent(event, earnings, day));
     }));
   }
   return resolved;

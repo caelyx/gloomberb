@@ -35,6 +35,7 @@ function normalizeApplicationMenuCommand(value: unknown): ElectrobunApplicationM
     case "layout-redo":
     case "layout-gridlock":
     case "open-devtools":
+    case "new-window":
     case "quit":
       return { type: command.type };
     default:
@@ -48,6 +49,7 @@ function decodeApplicationMenuAction(action: string): unknown {
   try {
     return JSON.parse(decodeURIComponent(action.slice(prefix.length)));
   } catch {
+    // Intentional ignore: an action that is not this app's encoded command is no command, as an unknown action is.
     return null;
   }
 }

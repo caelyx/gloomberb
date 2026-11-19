@@ -1,10 +1,10 @@
 import type { DefiTvlChain, DefiTvlPayload, DefiTvlProtocol } from "../../../api-client/crypto-markets";
 import type { DataTableColumn } from "../../../components";
 import { getTableWidth } from "../../../components/ui/table-layout";
-import { formatCompact, formatCompactAmount } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatCompactAmount } from "../../../utils/format";
 import { compareSortValues, nextHeaderSort, type SortDirection } from "../../../utils/sort-values";
 import { formatUtcTime } from "../../../utils/utc-time";
-import { formatCryptoPercent } from "./model";
+import { formatCryptoPercent, utcCloseAsOfText } from "./model";
 import { SUPPLY_RANGES, type SupplyRangeId } from "./supply";
 
 const DAY_MS = 86_400_000;
@@ -34,7 +34,16 @@ export interface DefiRow {
   share: number | null;
   /** How many chains a protocol is on; null for a chain. */
   chains: number | null;
+  /** A protocol's fees and revenue, USD over 24 hours, 7 and 30 days; null for a chain and where the source has none. */
+  fees24h: number | null;
+  fees7d: number | null;
+  fees30d: number | null;
+  revenue24h: number | null;
+  revenue7d: number | null;
+  revenue30d: number | null;
 }
+
+const NO_INCOME = { fees24h: null, fees7d: null, fees30d: null, revenue24h: null, revenue7d: null, revenue30d: null } as const;
 
 const protocolRow = (protocol: DefiTvlProtocol, index: number): DefiRow => ({
   id: `protocol:${protocol.name}`,
@@ -49,6 +58,12 @@ const protocolRow = (protocol: DefiTvlProtocol, index: number): DefiRow => ({
   change30dPercent: protocol.change30dPercent,
   share: null,
   chains: protocol.chains,
+  fees24h: protocol.fees24h ?? null,
+  fees7d: protocol.fees7d ?? null,
+  fees30d: protocol.fees30d ?? null,
+  revenue24h: protocol.revenue24h ?? null,
+  revenue7d: protocol.revenue7d ?? null,
+  revenue30d: protocol.revenue30d ?? null,
 });
 
 const chainRow = (chain: DefiTvlChain, index: number): DefiRow => ({
@@ -64,6 +79,7 @@ const chainRow = (chain: DefiTvlChain, index: number): DefiRow => ({
   change30dPercent: chain.change30dPercent,
   share: chain.share,
   chains: null,
+  ...NO_INCOME,
 });
 
 const rowsByPayload = new WeakMap<DefiTvlPayload, Record<DefiList, DefiRow[]>>();
@@ -123,11 +139,17 @@ export function defiHistoryRows(payload: DefiTvlPayload): Array<{ date: string; 
 }
 
 const change = (amount: number | null, percent: number | null) =>
-  amount == null ? "—" : `${formatCompactAmount(amount, { signed: true })} (${formatCryptoPercent(percent)})`;
+  amount == null ? MISSING_VALUE : `${formatCompactAmount(amount, { signed: true })} (${formatCryptoPercent(percent)})`;
+
+/**
+ * How the total's days are dated: each by the UTC day it closes, which
+ * DefiLlama stamps 00:00 UTC the day after (Gloom's 4 Nov is its 5 Nov).
+ */
+export const DEFI_DAY_CONVENTION = "UTC daily closes";
 
 /**
  * `Total DeFi TVL 92.39B · 7D +2.01B (+2.23%) · 30D -1.06B (-1.14%) · as of
- * 2026-10-21 · DefiLlama, daily since 2018-02-12`, as the CLI states it.
+ * 2026-10-21 UTC close · DefiLlama, daily since 2018-02-12`, as the CLI states it.
  */
 export function defiSummaryLine(payload: DefiTvlPayload): string | null {
   const total = payload.total;
@@ -137,7 +159,7 @@ export function defiSummaryLine(payload: DefiTvlPayload): string | null {
     `Total DeFi TVL ${formatCompact(total.tvl, { fixedDecimals: true })}`,
     `7D ${change(total.change7d, total.change7dPercent)}`,
     `30D ${change(total.change30d, total.change30dPercent)}`,
-    ...(payload.asOf ? [`as of ${payload.asOf}`] : []),
+    ...(payload.asOf ? [utcCloseAsOfText(payload.asOf)] : []),
     `${payload.source.name}${since ? `, daily since ${since}` : ""}`,
   ].join(" · ");
 }
@@ -161,7 +183,13 @@ type DefiColumnId =
   | "change30d"
   | "change30dPercent"
   | "share"
-  | "chains";
+  | "chains"
+  | "fees24h"
+  | "fees7d"
+  | "fees30d"
+  | "revenue24h"
+  | "revenue7d"
+  | "revenue30d";
 
 export type DefiColumn = DataTableColumn & { id: DefiColumnId };
 
@@ -201,6 +229,13 @@ const PROTOCOL_COLUMNS: DefiColumnSpec[] = [
   { id: "change30d", label: "30D", width: 8, align: "right", optional: 4 },
   { id: "change30dPercent", label: "30D%", width: 8, align: "right", optional: 1 },
   { id: "chains", label: "CHAINS", width: 6, align: "right", optional: 6 },
+  // Fees and revenue, USD, in pairs: the 30-day figures stay longest, the 7-day ones leave first.
+  { id: "fees24h", label: "FEES 24H", width: 8, align: "right", optional: 8 },
+  { id: "fees7d", label: "FEES 7D", width: 8, align: "right", optional: 9 },
+  { id: "fees30d", label: "FEES 30D", width: 8, align: "right", optional: 7 },
+  { id: "revenue24h", label: "REV 24H", width: 8, align: "right", optional: 8 },
+  { id: "revenue7d", label: "REV 7D", width: 8, align: "right", optional: 9 },
+  { id: "revenue30d", label: "REV 30D", width: 8, align: "right", optional: 7 },
 ];
 
 const CHAIN_COLUMNS: DefiColumnSpec[] = [
@@ -217,14 +252,22 @@ const CHAIN_COLUMNS: DefiColumnSpec[] = [
 
 const MAX_NAME_WIDTH = 26;
 
+const INCOME_COLUMNS = new Set<DefiColumnId>(["fees24h", "fees7d", "fees30d", "revenue24h", "revenue7d", "revenue30d"]);
+
+/** Whether the board carries the protocols' fees and revenue: a server before them, or a read that failed, has none to show. */
+export function defiHasIncome(payload: DefiTvlPayload | null | undefined): boolean {
+  return !!payload?.incomeAsOf;
+}
+
 /**
- * Optional columns leave in a fixed order as the pane narrows, dollar changes
- * before percents as on the stablecoin list (the chain count and the day's
- * move, the 30D then 7D dollar change, the category, the 30D percent); the
- * name takes what width is left.
+ * Optional columns leave in a fixed order as the pane narrows: a protocol's
+ * fees and revenue first, in pairs (7D, 24H, then 30D), then dollar changes before
+ * percents as on the stablecoin list (the chain count and the day's move, the
+ * 30D then 7D dollar change, the category, the 30D percent); the name takes
+ * what width is left.
  */
-export function buildDefiColumns(width: number, list: DefiList): DefiColumn[] {
-  const specs = list === "chain" ? CHAIN_COLUMNS : PROTOCOL_COLUMNS;
+export function buildDefiColumns(width: number, list: DefiList, income = false): DefiColumn[] {
+  const specs = list === "chain" ? CHAIN_COLUMNS : income ? PROTOCOL_COLUMNS : PROTOCOL_COLUMNS.filter((column) => !INCOME_COLUMNS.has(column.id));
   const optional = specs.flatMap((column) => column.optional ?? []).sort((a, b) => b - a);
   const dropped = new Set<number>();
   const visible = () => specs.filter((column) => !column.optional || !dropped.has(column.optional));

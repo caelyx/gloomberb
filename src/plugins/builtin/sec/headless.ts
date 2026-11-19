@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type {
   HeadlessBundleResult,
   HeadlessPaneColumn,
@@ -7,25 +8,32 @@ import type {
   HeadlessPaneRow,
 } from "../../../types/plugin";
 import { parsePublicTickerKey } from "../../../utils/exchanges";
-import { US_FUND_FACTS_ONLY } from "../../../utils/sec";
+import { hasFundFactsAbroad, US_FUND_FACTS_ONLY } from "../../../utils/sec";
 import type { SecFilingItem } from "../../../types/data-provider";
 import type { FundFactsPayload } from "../../../api-client/fund-facts";
 import { errorMessage } from "../../../utils/errors";
+import { filingStoryNote, loadFilingStories, type FilingStory } from "../insider/filing-stories";
+import { logFailure } from "../../../utils/log-failure";
 import { loadSecFilings } from "./client";
-import { ETF_FILING_FORMS, filingFormMatches, filterFilingsByForms, fundSeriesFilings, SEC_FILING_FETCH_LIMIT } from "./forms";
-import { hiddenFilingsNote, loadLatestFilings } from "../../../utils/sec-filings";
+import { ETF_FILING_FORMS, filterFilingsByForms, fundSeriesFilings, loadShownSecFilings, SEC_FILING_FETCH_LIMIT } from "./forms";
+import { hiddenFilingsMetadata, hiddenFilingsNote } from "../../../utils/sec-filings";
 import { buildSecFilingRows, secFilingIssuers, SEC_ACCEPTANCE_NOTE } from "./model";
 import { SEC_FILINGS } from "../shared/report-freshness";
-import { fetchFundFacts, fundFactEntries, fundFactPublishers, fundFactsEmpty, fundFactsErrorText, fundFactsStaleNote, listNames } from "./fund-facts";
+import { fetchFundFacts, fundFactEntries, fundFactPublishers, fundFactsEmpty, fundFactsErrorText, fundFactsStaleNote, fundNoteEntries, listNames } from "./fund-facts";
 import { REPORT_ROWS } from "../shared/headless-options";
 import { fundAbroadProfile, venueAbroad, type FundAbroadProfile } from "./fund-abroad";
 import { listingAnnouncementsPage } from "../../../utils/exchange-announcements";
+import { companyDataNotes } from "../../../types/company-from";
+import {
+  analyzeTaxEquivalent, distributionBasis, loadTreasuryTenors, parseTaxRates, TAX_RATE_EXAMPLES, TAX_RATE_OPTIONS, taxEquivalentJson, taxEquivalentSection,
+  type TaxEquivalentAnalysis, type TreasuryTenor, type YieldBasis,
+} from "../../../market-data/tax-equivalent";
 
 const SEC_COLUMNS: HeadlessPaneColumn[] = [
   {
     key: "filedAt",
     header: "Filed",
-    format: (value) => typeof value === "string" ? value.slice(0, 10) : "-",
+    format: (value) => typeof value === "string" ? value.slice(0, 10) : MISSING_VALUE,
   },
   { key: "acceptanceReported", header: "SEC-reported acceptance" },
   { key: "form", header: "Form" },
@@ -38,8 +46,45 @@ const SEC_COLUMNS: HeadlessPaneColumn[] = [
 /** Some row has 8-K item codes; a column every row leaves `-` takes no room in the text table (exports keep it). */
 const hasItems = (rows: readonly HeadlessPaneRow[]) => rows.some((row) => typeof row.items === "string" && row.items !== "");
 
+/** A current report's press release exhibit, printed only when some row has one; exports keep it with the filing's link. */
+const PRESS_RELEASE_COLUMN: HeadlessPaneColumn = { key: "pressReleaseUrl", header: "Press release" };
+
+/** The stories that report a Form 4, under its row, as INS prints them under its lines; JSON has them as `stories`. */
+const STORIES_NOTE_COLUMN: HeadlessPaneColumn = {
+  key: "storiesNote", header: "Stories", underRow: true, format: (value) => typeof value === "string" ? value : "",
+};
+
 function secTextColumns(rows: readonly HeadlessPaneRow[]): HeadlessPaneColumn[] {
-  return hasItems(rows) ? SEC_COLUMNS : SEC_COLUMNS.filter((column) => column.key !== "items");
+  const columns = hasItems(rows) ? SEC_COLUMNS : SEC_COLUMNS.filter((column) => column.key !== "items");
+  const withRelease = rows.some((row) => typeof row.pressReleaseUrl === "string" && row.pressReleaseUrl) ? [...columns, PRESS_RELEASE_COLUMN] : columns;
+  return rows.some((row) => typeof row.storiesNote === "string" && row.storiesNote) ? [...withRelease, STORIES_NOTE_COLUMN] : withRelease;
+}
+
+const INSIDER_FORM = /^4(?:\/A)?$/i;
+
+/**
+ * The Form 4 rows with the stories that report them: `stories` on the row, and
+ * a note under it that names each (`fn story <id>` opens one). The other rows,
+ * and a Form 4 Gloom Cloud could not be asked about, stay as they were, and
+ * the report says nothing of it: the stories are a lead, not its data.
+ */
+async function withFilingStories(
+  rows: HeadlessPaneRow[],
+  ctx: HeadlessPaneContext,
+  dependencies: SecHeadlessDependencies,
+): Promise<HeadlessPaneRow[]> {
+  const accessions = rows
+    .filter((row) => typeof row.form === "string" && INSIDER_FORM.test(row.form.trim()))
+    .map((row) => row.accessionNumber)
+    .filter((value): value is string => typeof value === "string");
+  const load = dependencies.loadFilingStories;
+  if (!load || accessions.length === 0) return rows;
+  const found = await load(accessions, ctx).catch(logFailure("sec.headless", "Read the stories reporting Form 4s failed", new Map<string, FilingStory[]>()));
+  return rows.map((row) => {
+    const stories = typeof row.accessionNumber === "string" ? found.get(row.accessionNumber) : undefined;
+    if (!stories) return row;
+    return { ...row, stories: stories.map((story) => ({ ...story })), ...(stories.length ? { storiesNote: stories.map(filingStoryNote).join("\n") } : {}) };
+  });
 }
 
 /**
@@ -63,10 +108,13 @@ export interface SecHeadlessDependencies {
     args: HeadlessPaneLoadArgs,
     ctx: HeadlessPaneContext,
   ): Promise<SecFilingItem[]>;
+  /** The stories reporting each Form 4, by accession number (Gloom Cloud's match); none asked when absent. */
+  loadFilingStories?(accessions: readonly string[], ctx: HeadlessPaneContext): Promise<Map<string, FilingStory[]>>;
 }
 
 const defaultDependencies: SecHeadlessDependencies = {
   loadFilings: (symbol, limit, _args, ctx) => loadSecFilings(ctx.marketData, symbol, limit),
+  loadFilingStories: (accessions, ctx) => loadFilingStories(accessions, ctx.apiClient),
 };
 
 /**
@@ -113,7 +161,7 @@ export function createSecHeadless(dependencies: SecHeadlessDependencies = defaul
       },
       {
         key: "all",
-        description: "Also list the pricing supplements and term sheets (424B2, FWP, and a 424B3 filed among them) a bank files for each structured note, which are left out by default.",
+        description: "Also list what is left out by default: the pricing supplements and term sheets (424B2, FWP, and a 424B3 filed among them) a bank files for each structured note, and a fund trust's filings for its other funds.",
         type: "boolean",
         defaultValue: false,
         pluginState: { pluginId: "ticker-research", key: "pricingSupplements" },
@@ -126,21 +174,18 @@ export function createSecHeadless(dependencies: SecHeadlessDependencies = defaul
       const limit = Number(args.options.limit);
       const form = typeof args.options.form === "string" ? args.options.form.trim() : "";
       const load = (count: number) => dependencies.loadFilings(symbol, count, args, ctx);
-      // A form filter searches every filing listed for the issuer, as `filings --form` does, and keeps
-      // the supplements it names; without one, a bank's pricing supplements stay out unless --all.
-      const { filings, hidden } = form
-        ? { filings: (await load(SEC_FILING_FETCH_LIMIT)).filter((filing) => filingFormMatches(filing.form, form)).slice(0, limit), hidden: null }
-        : args.options.all === true
-          ? { filings: (await load(limit)).slice(0, limit), hidden: null }
-          : await loadLatestFilings(load, limit);
-      const note = hidden && hiddenFilingsNote(hidden);
-      const rows = buildSecFilingRows(filings);
+      // A form filter searches every filing listed for the issuer and keeps the supplements it names; without
+      // one, a bank's pricing supplements and a trust's other funds stay out unless --all, as in `filings`.
+      const { filings, hidden } = await loadShownSecFilings(load, limit, { form: form || null, all: args.options.all === true });
+      const hiddenNote = hidden && hiddenFilingsNote(hidden);
+      const rows = await withFilingStories(buildSecFilingRows(filings), ctx, dependencies);
+      const notes = hiddenNote ? [hiddenNote] : [];
       // A listing abroad whose company files nothing with the SEC says where its exchange publishes its announcements.
       const page = !form && filings.length === 0 ? listingAnnouncementsPage(symbol) : null;
       return {
         rows,
         textColumns: secTextColumns(rows),
-        ...(note ? { notes: [note] } : {}),
+        ...(notes.length || filings[0]?.companyFrom ? { notes: [...notes, ...companyDataNotes(filings[0]?.companyFrom)] } : {}),
         ...(form ? { empty: `No ${form} filings found for ${symbol}.` }
           : page ? { empty: `${symbol} files no SEC reports. ${page.name}: ${page.url}` } : {}),
         metadata: {
@@ -149,7 +194,7 @@ export function createSecHeadless(dependencies: SecHeadlessDependencies = defaul
           returned: filings.length,
           issuers: secFilingIssuers(filings),
           ...(form ? { form } : {}),
-          pricingSupplementsHidden: hidden?.pricingSupplements ?? 0,
+          ...hiddenFilingsMetadata(hidden),
         },
       };
     },
@@ -161,11 +206,20 @@ export const secHeadless = createSecHeadless();
 export interface FundHeadlessDependencies extends SecHeadlessDependencies {
   loadFacts(symbol: string, ctx: HeadlessPaneContext): Promise<FundFactsPayload>;
   loadAbroadProfile?(key: string, ctx: HeadlessPaneContext): Promise<FundAbroadProfile | null>;
+  /** With `--tax-rate`: the Treasury par curve GC shows, for the muni/Treasury ratio; null when it cannot be read. */
+  loadTreasury?(ctx: HeadlessPaneContext): Promise<TreasuryTenor[] | null>;
+  /** With `--tax-rate`, for a muni fund whose sponsor publishes no SEC yield: its distribution yield, as `fundamentals` states it. */
+  loadDistribution?(symbol: string, ctx: HeadlessPaneContext): Promise<YieldBasis | null>;
 }
 
 const defaultFundDependencies = {
   ...defaultDependencies,
   loadFacts: (symbol: string, ctx: HeadlessPaneContext) => fetchFundFacts(symbol, ctx.apiClient),
+  loadTreasury: (ctx: HeadlessPaneContext) => loadTreasuryTenors(ctx.apiClient),
+  async loadDistribution(symbol: string, ctx: HeadlessPaneContext): Promise<YieldBasis | null> {
+    const fundamentals = (await ctx.marketData.getTickerFinancials(symbol, "")).fundamentals;
+    return distributionBasis(fundamentals?.dividendYield, fundamentals?.dividendYieldBasis === "trailing" ? "trailing" : "forward");
+  },
   async loadAbroadProfile(key: string, ctx: HeadlessPaneContext): Promise<FundAbroadProfile | null> {
     const { symbol, exchange } = parsePublicTickerKey(key);
     return fundAbroadProfile(await ctx.marketData.getTickerFinancials(symbol, exchange));
@@ -198,6 +252,29 @@ function fundAbroadResult(symbol: string, venue: string, profile: FundAbroadProf
 }
 
 /**
+ * ETF for a Hong Kong spot bitcoin or ether fund's counter (3046:HKEX): its
+ * issuer's figures, the NAV in the counter's own currency, and the units per
+ * coin. It files nothing with the SEC, so there is no filings section.
+ */
+function fundAbroadFactsResult(symbol: string, venue: string, facts: FundFactsPayload): HeadlessBundleResult {
+  const publishers = fundFactPublishers(facts);
+  const stale = fundFactsStaleNote(symbol, facts);
+  return {
+    sections: [{ title: "Fund facts", entries: fundFactEntries(facts) }],
+    complete: true,
+    ...(stale ? { notes: [stale] } : {}),
+    freshness: {
+      source: listNames(publishers) || "Fund issuer",
+      ...(publishers.length ? { publisher: listNames(publishers) } : {}),
+      status: "not-a-feed",
+      basis: "published fund data",
+      ...(facts.nav?.asOf ? { asOf: facts.nav.asOf } : {}),
+    },
+    metadata: { symbol, venue, fundFacts: facts },
+  };
+}
+
+/**
  * ETF: a US-listed fund's facts (fee, NAV, premium or discount, net assets,
  * sponsor, inception, index) as its sponsor publishes them, then its fund
  * filings. Either part can fail or be empty without taking the other with it:
@@ -207,7 +284,8 @@ export function createFundHeadless(dependencies: FundHeadlessDependencies = defa
   return {
     shape: "bundle",
     freshness: { source: "Fund sponsors and SEC EDGAR", status: "not-a-feed", basis: "published fund data" },
-    argument: { kind: "ticker", placeholder: "ticker", description: "US-listed fund ticker. A fund listed abroad gets its issuer's page." },
+    argument: { kind: "ticker", placeholder: "ticker", description: "US-listed fund ticker. A fund listed abroad gets its issuer's page.",
+      examples: TAX_RATE_EXAMPLES.slice(0, 2) },
     options: [{
       key: "limit",
       shot: REPORT_ROWS,
@@ -217,25 +295,41 @@ export function createFundHeadless(dependencies: FundHeadlessDependencies = defa
       defaultValue: 50,
       minimum: 1,
       maximum: 200,
-    }],
+    }, ...TAX_RATE_OPTIONS],
     discovery: { limitations: ["Fund facts cover the sponsors Gloom collects; other funds point to their SEC filings."] },
     describe: (args) => `ETF | ${args.symbols[0]}`,
     async load(args, ctx) {
       const symbol = args.symbols[0]!;
+      // Checked before anything is read: a state rate without its state is refused, not ignored.
+      const rates = parseTaxRates({ taxRate: args.options["tax-rate"], stateRate: args.options["state-rate"], state: args.options.state });
       const abroad = venueAbroad(symbol);
       if (abroad) {
+        // --tax-rate reads US tax on a US fund's income: a fund listed abroad says it does not apply rather than drop it.
+        const taxed = (result: HeadlessBundleResult): HeadlessBundleResult => {
+          if (!rates) return result;
+          const tax = analyzeTaxEquivalent({ symbol: symbol.toUpperCase(), bond: null, rates, noBondFigures: "listed-abroad" });
+          return { ...result, sections: [...result.sections, taxEquivalentSection(tax)],
+            metadata: { ...result.metadata, taxEquivalent: taxEquivalentJson(tax) } };
+        };
+        // A Hong Kong spot coin fund has its issuer's figures; any other fund abroad, or a server without them, keeps the issuer link.
+        const facts = hasFundFactsAbroad(abroad)
+          ? await dependencies.loadFacts(symbol, ctx).catch(logFailure("sec.fund-headless", "Read fund facts abroad failed", null))
+          : null;
+        if (facts?.covered) return taxed(fundAbroadFactsResult(symbol, abroad, facts));
         try {
           const profile = await (dependencies.loadAbroadProfile ?? defaultFundDependencies.loadAbroadProfile)(symbol, ctx);
-          return fundAbroadResult(symbol, abroad, profile);
+          return taxed(fundAbroadResult(symbol, abroad, profile));
         } catch (error) {
-          return {
+          return taxed({
             ...fundAbroadResult(symbol, abroad, null),
             complete: false,
             errors: [`Fund profile unavailable: ${errorMessage(error)}`],
-          };
+          });
         }
       }
       const limit = Number(args.options.limit);
+      const treasury = rates ? (dependencies.loadTreasury ?? defaultFundDependencies.loadTreasury)(ctx)
+        .catch(logFailure("sec.fund-headless", "Read Treasury curve for tax-equivalent yield failed", null)) : null;
       const [factsResult, filingsResult] = await Promise.allSettled([
         dependencies.loadFacts(symbol, ctx),
         dependencies.loadFilings(symbol, SEC_FILING_FETCH_LIMIT, args, ctx),
@@ -246,36 +340,57 @@ export function createFundHeadless(dependencies: FundHeadlessDependencies = defa
       // A trust's list holds every fund it runs; the fund's own series is the view.
       const filings = filterFilingsByForms(fundSeriesFilings(issuerFilings), ETF_FILING_FORMS).slice(0, limit);
       const searchedAll = issuerFilings.length < SEC_FILING_FETCH_LIMIT;
+      // An exchange-traded note (VXX) is no fund: its terms from its pricing supplement, and no fund forms to look for.
+      const etn = facts?.note ?? null;
       const filingsEmpty = filingsResult.status === "rejected"
         ? `Fund filings unavailable: ${errorMessage(filingsResult.reason)}`
+        : etn ? `${symbol} is a note of ${etn.issuer}, which files no fund forms for it. Its issuer's filings: fn SEC ${symbol}.`
         : fundFilingsEmpty(symbol, { count: issuerFilings.length, complete: searchedAll });
       // The filings line already sends a fund without fund forms to SEC; the facts line does not say it twice.
       const filingsPointToSec = filingsResult.status === "fulfilled" && filings.length === 0 && issuerFilings.length > 0;
       const factsSection = facts?.covered
         ? { title: "Fund facts", entries: fundFactEntries(facts) }
+        : etn ? { title: "Note terms", entries: fundNoteEntries(etn) }
         : { title: "Fund facts", rows: [], empty: factsResult.status === "rejected"
           ? fundFactsErrorText(factsResult.reason)
           : fundFactsEmpty(symbol, facts, !filingsPointToSec) };
       const publishers = facts?.covered ? fundFactPublishers(facts) : [];
       const filingRows = buildSecFilingRows(filings);
+      // With --tax-rate, the section DVD and fundamentals show, on the sponsor's SEC yield (else the distribution yield).
+      let tax: TaxEquivalentAnalysis | null = null;
+      if (rates) {
+        const bond = facts?.covered ? facts.bond ?? null : null;
+        const distribution = bond?.kind === "municipal" && !bond.secYield
+          ? await (dependencies.loadDistribution ?? defaultFundDependencies.loadDistribution)(symbol, ctx)
+            .catch(logFailure("sec.fund-headless", "Read distribution yield for tax-equivalent yield failed", null))
+          : null;
+        tax = analyzeTaxEquivalent({
+          symbol: symbol.toUpperCase(), bond, rates, distribution, treasury: await treasury,
+          ...factsResult.status === "rejected" ? { checkError: `no tax-equivalent yield: ${fundFactsErrorText(factsResult.reason)}` } : {},
+          // A stock (fn ETF KO) is not on the SEC's lists of funds, and says so rather than that no bond figures are loaded.
+          noBondFigures: facts?.status === "not-a-fund" || facts?.status === "etn" ? "not-a-fund" : null,
+        });
+      }
       return {
         sections: [
           factsSection,
+          ...tax ? [taxEquivalentSection(tax)] : [],
           { title: "Fund filings", columns: SEC_COLUMNS, textColumns: fundFilingTextColumns(filingRows), rows: filingRows, ...(filings.length === 0 ? { empty: filingsEmpty } : {}) },
         ],
-        complete: !!facts?.covered && filingsResult.status === "fulfilled" && searchedAll,
+        complete: (!!facts?.covered && searchedAll || !!etn) && filingsResult.status === "fulfilled",
         errors: [
           ...(factsResult.status === "rejected" ? [fundFactsErrorText(factsResult.reason)] : []),
           ...(filingsResult.status === "rejected" ? [`Fund filings: ${errorMessage(filingsResult.reason)}`] : []),
         ],
-        notes: facts ? [fundFactsStaleNote(symbol, facts)].filter((note): note is string => !!note) : [],
+        // A stale NAV says since when; a covered fund without one says why, as the server words it.
+        notes: facts ? [fundFactsStaleNote(symbol, facts), facts.covered && !facts.nav ? facts.navReason : null].filter((note): note is string => !!note) : [],
         // The facts' publisher is the source, named the same way for every fund; without facts it is the SEC.
         freshness: {
           source: listNames(publishers) || "SEC EDGAR",
           ...(publishers.length ? { publisher: listNames(publishers) } : {}),
           status: "not-a-feed",
           basis: publishers.length ? "published fund data" : "filed data",
-          ...(facts?.nav?.asOf ? { asOf: facts.nav.asOf } : {}),
+          ...(facts?.nav?.asOf ? { asOf: facts.nav.asOf } : etn ? { asOf: etn.filing.filedAt } : {}),
         },
         metadata: {
           symbol,
@@ -285,6 +400,7 @@ export function createFundHeadless(dependencies: FundHeadlessDependencies = defa
           forms: [...ETF_FILING_FORMS],
           searchedFilings: issuerFilings.length,
           issuers: secFilingIssuers(filings),
+          ...tax ? { taxEquivalent: taxEquivalentJson(tax) } : {},
         },
       };
     },

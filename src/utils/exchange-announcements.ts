@@ -39,6 +39,8 @@ const PAGES: Readonly<Record<string, (code: string) => ExchangeAnnouncementsPage
   BSE: () => ({ name: "BSE corporate announcements", url: "https://www.bseindia.com/corporates/ann.html" }),
   SGX: () => ({ name: "SGX company announcements", url: "https://www.sgx.com/securities/company-announcements" }),
   SET: () => ({ name: "SET company news", url: "https://www.set.or.th/en/market/news-and-alert/news" }),
+  // The Public Disclosure Platform, where every Borsa Istanbul company files its disclosures.
+  BIST: () => ({ name: "KAP disclosures", url: "https://www.kap.org.tr/en/bildirim-sorgu" }),
 };
 
 /**
@@ -46,16 +48,41 @@ const PAGES: Readonly<Record<string, (code: string) => ExchangeAnnouncementsPage
  * ASX is ASX's announcements page for NST, a TSX listing SEDAR+. Null for a
  * US venue and for a venue Gloom knows no page for.
  */
-export function exchangeAnnouncementsPage(symbol: string, exchange: string | null | undefined): ExchangeAnnouncementsPage | null {
+function exchangeAnnouncementsPage(symbol: string, exchange: string | null | undefined): ExchangeAnnouncementsPage | null {
   const page = PAGES[canonicalExchange(exchange ?? "")];
   const code = symbol.trim().toUpperCase();
   return page && code ? page(code) : null;
 }
 
-/** Whether Gloom Cloud lists the company's announcements on this venue (ASX). */
-export function listsExchangeAnnouncements(exchange: string | null | undefined): boolean {
+/**
+ * Who publishes the announcements Gloom Cloud lists for a listing on this
+ * venue, as a source line names them: "ASX" (and Cboe Australia's, which
+ * trade under ASX codes), "HKEXnews". Null for a venue it lists none for.
+ */
+export function exchangeAnnouncementsPublisher(exchange: string | null | undefined): string | null {
   const venue = canonicalExchange(exchange ?? "");
-  return venue === "ASX" || venue === "CXA";
+  return venue === "ASX" || venue === "CXA" ? "ASX" : venue === "HKEX" ? "HKEXnews" : null;
+}
+
+/** Whether Gloom Cloud lists the company's announcements on this venue (ASX, HKEX). */
+export function listsExchangeAnnouncements(exchange: string | null | undefined): boolean {
+  return exchangeAnnouncementsPublisher(exchange) != null;
+}
+
+/**
+ * HKEXnews' routine returns: a buyback's or a share issue's next day
+ * disclosure, and the monthly return of movements in securities. A company
+ * buying back shares files one each trading day, so they bury its results
+ * and business updates; `filings` leaves them out unless --all.
+ */
+const ROUTINE_RETURNS = new Set(["Next Day Disclosure Returns", "Monthly Returns"]);
+
+const ISSUER_RESULTS_PAGES: Readonly<Record<string, string>> = {
+  "RHM:XETRA": "https://www.rheinmetall.com/en/investor-relations/publications/financial-publications-and-presentations",
+};
+
+export function isRoutineReturn(item: { category?: string | null }): boolean {
+  return item.category != null && ROUTINE_RETURNS.has(item.category);
 }
 
 /**
@@ -67,5 +94,6 @@ export function listingAnnouncementsPage(key: string, exchange?: string | null):
   const suffixed = parsed.exchange ? null : listingSuffixExchange(parsed.symbol);
   const venue = parsed.exchange || suffixed || exchange;
   const symbol = suffixed ? parsed.symbol.replace(/\.[A-Z]+$/i, "") : parsed.symbol;
-  return venue ? exchangeAnnouncementsPage(symbol, venue) : null;
+  const issuerPage = !listsExchangeAnnouncements(venue) && ISSUER_RESULTS_PAGES[`${symbol.toUpperCase()}:${canonicalExchange(venue ?? "")}`];
+  return issuerPage ? { name: "Company results", url: issuerPage } : venue ? exchangeAnnouncementsPage(symbol, venue) : null;
 }

@@ -5,12 +5,14 @@ import {
   type CloudEarningsCallPayload,
   type CloudEarningsTranscriptPayload,
 } from "../../../api-client";
-import { ApiRequestError } from "../../../api-client/errors";
+import { ApiRequestError, isTransientFailure } from "../../../api-client/errors";
 import { listingAbroad, type IssuerListingParams, type ListingAbroad } from "../../../api-client/paths";
+import { servedFromSavedCopy } from "../../../data/saved-copies";
 import { areDifferentCompanies } from "../../../sources/sec-registrant";
 import type { HeadlessPaneApiClient, PluginPersistence } from "../../../types/plugin";
 import { shortDate } from "../earnings/format";
 import { callCountdown, callDay, callTimeKnown, isUpcomingCall } from "./upcoming";
+import { type CompanyFrom, readCompanyFrom } from "../../../types/company-from";
 
 type EarningsCallsApiClient = Pick<
   HeadlessPaneApiClient,
@@ -20,7 +22,8 @@ type EarningsCallsApiClient = Pick<
 const LIST_KIND = "calls";
 const TRANSCRIPT_KIND = "transcript";
 const CACHE_SOURCE = "earnings-calls";
-const CACHE_SCHEMA_VERSION = 1;
+// Version 2: a translated call carries its language and original text.
+const CACHE_SCHEMA_VERSION = 2;
 // Version 3: a listing abroad is keyed by its venue and company, not its symbol alone.
 const LIST_CACHE_SCHEMA_VERSION = 3;
 
@@ -43,13 +46,21 @@ export interface EarningsCallsResult {
   calls: CloudEarningsCallPayload[];
   fetchedAt: number;
   stale: boolean;
+  /** Its refresh failed and the copy saved at this time (ms) answered instead. */
+  savedAt?: number;
   refreshError?: string;
   /** HTTP status when the request failed, used to pick the right gate. */
   errorStatus?: number;
   /** The server has just started looking for this company's calls. */
   pending?: boolean;
-  /** The symbol is not one the SEC knows, so there is nothing to look for. */
+  /**
+   * The symbol is not one the SEC knows, so there is nothing to look for. Never
+   * set for a listing abroad, which the server answers by its stored calls:
+   * C38U:SGX with none yet is a company whose calls are not yet available.
+   */
   unknownTicker?: boolean;
+  /** The company's home line the calls are read from, when not the listing asked. */
+  companyFrom?: CompanyFrom | null;
   /** Maximum rows requested from the server, which supplies no total/hasMore. */
   sourceLimit?: number;
   /** The response filled its request; additional calls may exist. */
@@ -118,6 +129,8 @@ export interface UpcomingCallsResult {
   stale: boolean;
   /** The server answered its limit's worth: calls later on these days may be missing. */
   truncated?: boolean;
+  /** Its refresh failed and the copy saved at this time (ms) answered instead. */
+  savedAt?: number;
   refreshError?: string;
   errorStatus?: number;
 }
@@ -130,7 +143,7 @@ export interface UpcomingDays {
 let persistence: PluginPersistence | null = null;
 const activeUpcomingFetches = new Map<string, Promise<UpcomingCallsResult>>();
 const activeListFetches = new Map<string, Promise<EarningsCallsResult>>();
-const activeTranscriptFetches = new Map<string, Promise<CloudEarningsTranscriptPayload>>();
+const activeTranscriptFetches = new Map<string, Promise<EarningsTranscriptResult>>();
 
 export function attachEarningsCallsPersistence(value: PluginPersistence): void {
   persistence = value;
@@ -163,16 +176,32 @@ function listKey(ticker: string | null, abroad: ListingAbroad | null, limit: num
   return offset > 0 ? JSON.stringify([identity, limit, offset]) : JSON.stringify([identity, limit]);
 }
 
+/** A listing code without the zeros a venue pads it with: 0016 and 16 are one Hong Kong listing. */
+const listingCode = (symbol: string) => symbol.trim().toUpperCase().replace(/^0+(?=\d)/, "");
+
+/**
+ * A call filed under the listing's own key (0016:HKEX) is the listing's,
+ * whatever short name the exchange gives the company there: "SHK PPT" is Sun
+ * Hung Kai Properties, "HKEX" Hong Kong Exchanges and Clearing.
+ */
+function filedUnderListing(call: CloudEarningsCallPayload, abroad: ListingAbroad): boolean {
+  const separator = call.ticker.lastIndexOf(":");
+  if (separator < 0) return false;
+  return listingCode(call.ticker.slice(0, separator)) === listingCode(abroad.symbol)
+    && call.ticker.slice(separator + 1).trim().toUpperCase() === abroad.exchange.toUpperCase();
+}
+
 /**
  * A server that predates venue-aware lookups ignores the venue and lists the
  * calls of the US company with the same symbol: AI in Paris would show C3.ai.
  * Those calls are another company's, so they are dropped, and without the
- * listing's company they cannot be told apart.
+ * listing's company they cannot be told apart. A call filed under the
+ * listing's own key is never such a call.
  */
 function listingCalls(calls: CloudEarningsCallPayload[], abroad: ListingAbroad | null): CloudEarningsCallPayload[] {
   if (!abroad) return calls;
   const name = abroad.name;
-  return name ? calls.filter((call) => !areDifferentCompanies(name, call.companyName)) : [];
+  return calls.filter((call) => filedUnderListing(call, abroad) || (!!name && !areDifferentCompanies(name, call.companyName)));
 }
 
 type EarningsCallsLoadOptions = IssuerListingParams & { force?: boolean; limit?: number; offset?: number };
@@ -216,8 +245,15 @@ export async function loadEarningsCallsWithClient(
       ...(offset > 0 ? { offset } : {}),
     })
     .then((payload) => {
-      const calls = listingCalls(payload.calls ?? [], abroad);
-      const value = { calls, pending: payload.pending === true, unknownTicker: payload.unknownTicker === true };
+      // Calls the service read from the company's home line are the company's, whatever the line's own name.
+      const companyFrom = readCompanyFrom(payload.companyFrom);
+      const calls = companyFrom ? payload.calls ?? [] : listingCalls(payload.calls ?? [], abroad);
+      const value = {
+        calls,
+        pending: payload.pending === true,
+        unknownTicker: payload.unknownTicker === true && !abroad,
+        ...(companyFrom ? { companyFrom } : {}),
+      };
       // A list with calls still being produced changes by the minute, so it
       // is not worth keeping; a list of finished transcripts is.
       const settled = !value.pending && calls.every((call) => call.hasTranscript);
@@ -242,22 +278,24 @@ export async function loadEarningsCallsWithClient(
     .catch((error: unknown) => {
       const refreshError = error instanceof Error ? error.message : String(error);
       const errorStatus = statusOf(error);
-      // An auth failure must surface its gate rather than silently showing
-      // a cached list the user is no longer entitled to refresh.
+      // A refusal (signed out, no Pro, a route the server stopped serving) or a reply that fails
+      // validation is said rather than covered by a cached list.
       const expired = store?.getResource<CloudEarningsCallListPayload>(LIST_KIND, key, {
         sourceKey: CACHE_SOURCE,
         schemaVersion: LIST_CACHE_SCHEMA_VERSION,
         allowExpired: true,
       });
-      if (expired && errorStatus !== 401 && errorStatus !== 402 && errorStatus !== 403) {
-        return {
+      if (expired && isTransientFailure(error)) {
+        // A command that shows it ends with when the copy was saved, not with the failure.
+        return servedFromSavedCopy({
           ...expired.value,
           ...sourceScope(expired.value.calls),
           fetchedAt: expired.fetchedAt,
           stale: true,
+          savedAt: expired.fetchedAt,
           refreshError,
           errorStatus,
-        };
+        }, expired.fetchedAt);
       }
       throw error;
     })
@@ -355,12 +393,13 @@ export async function loadUpcomingCallsWithClient(
       const errorStatus = statusOf(error);
       // Losing Pro access re-gates the calendar, as it does the list.
       const expired = read(true);
-      if (expired && errorStatus !== 401 && errorStatus !== 402 && errorStatus !== 403) {
-        return {
+      if (expired && isTransientFailure(error)) {
+        return servedFromSavedCopy({
           ...upcomingFromCache(expired.value, expired.fetchedAt, true),
+          savedAt: expired.fetchedAt,
           refreshError: error instanceof Error ? error.message : String(error),
           errorStatus,
-        };
+        }, expired.fetchedAt);
       }
       throw error;
     })
@@ -397,11 +436,14 @@ export function isPendingTranscript(
   return record.status === "pending" || !Array.isArray(record.turns);
 }
 
+/** A transcript, and when it was saved when its refresh failed and the saved copy answered. */
+export type EarningsTranscriptResult = CloudEarningsTranscriptPayload & { savedAt?: number };
+
 export async function loadTranscriptWithClient(
   client: EarningsCallsApiClient,
   callId: string,
   options?: { force?: boolean },
-): Promise<CloudEarningsTranscriptPayload> {
+): Promise<EarningsTranscriptResult> {
   const force = options?.force ?? false;
   const store = persistence;
 
@@ -432,7 +474,6 @@ export async function loadTranscriptWithClient(
       return transcript;
     })
     .catch((error: unknown) => {
-      const status = statusOf(error);
       const expired = store?.getResource<CloudEarningsTranscriptPayload>(
         TRANSCRIPT_KIND,
         callId,
@@ -443,8 +484,8 @@ export async function loadTranscriptWithClient(
         },
       );
       // Losing Pro access must re-gate the transcript, not serve it from cache.
-      if (expired && status !== 401 && status !== 402 && status !== 403) {
-        return expired.value;
+      if (expired && isTransientFailure(error)) {
+        return servedFromSavedCopy({ ...expired.value, savedAt: expired.fetchedAt }, expired.fetchedAt);
       }
       throw error;
     })
@@ -461,7 +502,7 @@ export async function loadTranscriptWithClient(
 export function loadTranscript(
   callId: string,
   options?: { force?: boolean },
-): Promise<CloudEarningsTranscriptPayload> {
+): Promise<EarningsTranscriptResult> {
   return loadTranscriptWithClient(apiClient, callId, options);
 }
 

@@ -20,6 +20,7 @@ import type { PricePoint, Quote } from "../types/financials";
 import type { PriceHistoryResult } from "../types/price-history";
 import type { InstrumentRef } from "../market-data/request-types";
 import { getSharedMarketDataCoordinator } from "../market-data/coordinator";
+import { connectionHealth, recoversDataRequests } from "../core/connection-health";
 import { resolveEntryData } from "../market-data/selectors";
 import { usePaneVisible } from "../state/app/activity";
 import { DEFAULT_QUOTE_POLL_INTERVAL_MS, useQuoteUpdates } from "../state/hooks/quote-streaming";
@@ -28,9 +29,11 @@ import { CHART_RESOLUTION_STEP_MS, getNextBufferRange, isIntradayResolution, typ
 import { normalizeHistoryResult } from "../sources/history-result";
 import { publicListingTarget } from "../sources/listing-target";
 import { isPriceHistoryStaleForCurrentWindow, normalizePriceHistory } from "../utils/price-history";
+import { withFormulaNextMonths } from "./formula-months";
 import {
   parsedPriceHistoryKey,
   readParsedHistoryResult,
+  readSeedListingFacts,
 } from "./parsed-history-cache";
 
 export interface UseChartResolutionResult extends ChartResolutionResult {
@@ -219,7 +222,13 @@ export function useChartResolution(
   const specKey = JSON.stringify(spec);
   const seedResult = () => {
     const now = sources.now ?? new Date();
-    return seedChartResolutionResult(spec, collectSeedHistory(spec, now, options), now, options);
+    // The first paint prices a formula's legs in one month as the settled chart does, from the next months it read.
+    const seedSpec = withFormulaNextMonths(spec);
+    const history = collectSeedHistory(seedSpec, now, options);
+    if (seedSpec.series.some(({ source }) => source.kind === "security"
+      && history.has(chartQuoteOverrideKeyForSource(source))
+      && readSeedListingFacts(source.instrument)?.quoteMetadata === undefined)) return null;
+    return seedChartResolutionResult(seedSpec, history, now, options);
   };
   const [state, setState] = useState(() => ({
     key: specKey,
@@ -301,6 +310,19 @@ export function useChartResolution(
   const latestRequestRef = useRef({ spec, sources, options: resolveOptions });
   latestRequestRef.current = { spec, sources, options: resolveOptions };
   const reload = useCallback(() => setRevision((current) => current + 1), []);
+
+  // A chart that failed is loaded again once the data service, or the desktop
+  // bridge to it, answers after an outage, so the pane recovers by itself
+  // instead of keeping the failure.
+  const live = !snapshot;
+  const failedRef = useRef(false);
+  failedRef.current = live && displayed.errors.length > 0 && !displayed.loading;
+  useEffect(() => {
+    if (!live) return;
+    return connectionHealth.subscribeRecovery((sourceId) => {
+      if (recoversDataRequests(sourceId) && failedRef.current) reload();
+    });
+  }, [live, reload]);
 
   // A covered chart keeps its quotes arriving at the off-screen cadence but
   // builds no live bars; coming back into view catches up from the store.

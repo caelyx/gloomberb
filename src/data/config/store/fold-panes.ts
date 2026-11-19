@@ -81,7 +81,6 @@ function asLayout(value: unknown): LayoutConfig | null {
     instances: value.instances as PaneInstanceConfig[],
     floating: Array.isArray(value.floating) ? value.floating as LayoutConfig["floating"] : [],
     detached: Array.isArray(value.detached) ? value.detached as LayoutConfig["detached"] : [],
-    ...(Array.isArray(value.windows) ? { windows: value.windows as NonNullable<LayoutConfig["windows"]> } : {}),
   };
 }
 
@@ -95,7 +94,12 @@ function interestInstanceId(instanceId: string): string {
 function mapNode(node: DockLayoutNode | null, idMap: Map<string, string>): DockLayoutNode | null {
   if (!node) return null;
   if (node.kind === "pane") return { ...node, instanceId: idMap.get(node.instanceId) ?? node.instanceId };
-  return { ...node, first: mapNode(node.first, idMap)!, second: mapNode(node.second, idMap)! };
+  return {
+    ...node,
+    first: mapNode(node.first, idMap)!,
+    second: mapNode(node.second, idMap)!,
+    ...(node.tabs ? { tabs: { active: idMap.get(node.tabs.active) ?? node.tabs.active } } : {}),
+  };
 }
 
 /** Daily short volume becomes the short interest pane's volume tab, and sovereign CDS the index board's Sovereign tab. */
@@ -159,13 +163,6 @@ export function foldPaneLayout(layout: LayoutConfig): FoldedLayout {
     }),
     floating: layout.floating.map((entry) => ({ ...entry, instanceId: idMap.get(entry.instanceId) ?? entry.instanceId })),
     detached: (layout.detached ?? []).map((entry) => ({ ...entry, instanceId: idMap.get(entry.instanceId) ?? entry.instanceId })),
-    ...(layout.windows ? {
-      windows: layout.windows.map((window) => ({
-        ...window,
-        dockRoot: mapNode(window.dockRoot, idMap),
-        floating: window.floating.map((entry) => ({ ...entry, instanceId: idMap.get(entry.instanceId) ?? entry.instanceId })),
-      })),
-    } : {}),
   };
   return { layout: removePaneInstances(mapped, removed), idMap, removed, fixedIncomeRoutes };
 }

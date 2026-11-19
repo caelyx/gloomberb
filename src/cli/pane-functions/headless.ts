@@ -1,9 +1,11 @@
+import { currencyRateUnitText } from "../../time-series/price-units";
 import { getSharedRegistry } from "../../plugins/registry";
+import { seriesExpression, seriesNamedBy } from "../../series/registry";
 import { findCachedPortfolioAccount } from "../../plugins/builtin/portfolio-list/cached-account";
-import { parsePublicTickerKey } from "../../utils/exchanges";
 import { findNamedCollection } from "../../portfolio/collection-name";
 import { readBareListing } from "../listing-arg";
 import { apiClient } from "../../api-client";
+import { resolveSavedInstrument } from "../../tickers/saved-instrument";
 import type { MarketContext } from "../types";
 import type {
   HeadlessArgumentExpansion,
@@ -19,6 +21,7 @@ import type {
   HeadlessPaneRow,
   HeadlessRowsResult,
   HeadlessSeries,
+  HeadlessSeriesPoint,
   HeadlessSeriesResult,
   HeadlessSnapshotResult,
 } from "../../types/plugin";
@@ -35,19 +38,25 @@ import {
 } from "../report-tables";
 import type { ExportIdentity } from "../export-source";
 import { observationDate } from "../../time-series/price-comparison";
+import { chartBarSizeParts } from "../../time-series/resolution";
 import type { ResolvedSeries } from "../../time-series/types";
 import { barLastSession } from "../../market-data/market/bar-period";
 import type { PaneFunctionReport } from "./report";
 import type { ResolvedPaneFunction } from "./resolver";
 import { isRecord } from "../../utils/guards";
+import { displayTickerKey } from "../../utils/exchanges";
 import { splitSymbolWords } from "../symbol-args";
 import { formatUtcTime, localTimeSuffix } from "../../utils/utc-time";
+import { MISSING_VALUE, formatCompact } from "../../utils/format";
 import { deriveHeadlessFreshness, formatFreshnessLine, staleRowsText, withSavedCopy, type ReportFreshness } from "./freshness";
 import { DATA_SERVICE_UNREACHABLE_MESSAGE } from "../../utils/network-failure";
 import { accessGateStatus, errorsAccessGate, isProLock, reportGateText } from "./access-gate";
+import { readableStatus } from "../../utils/reason-codes";
 import { noArgumentMessage } from "./capabilities";
 import { lockedHeadlessReport } from "./lock-note";
 import { resumeStateKey } from "../../plugins/registry/plugin-state";
+import { logFailure } from "../../utils/log-failure";
+import { windowRows, type RowWindow, type RowWindowOptions } from "../row-window";
 
 interface SerializableHeadlessColumn {
   key: string;
@@ -189,7 +198,7 @@ async function loadHeadlessPaneModel(
   return result;
 }
 
-type HeadlessMarketContext = Pick<MarketContext, "config" | "store" | "refresh" | "resolveBroker"> & Partial<Pick<MarketContext, "persistence" | "seriesCapabilities" | "findCatalogSeries">> & {
+type HeadlessMarketContext = Pick<MarketContext, "config" | "store" | "refresh" | "resolveBroker"> & Partial<Pick<MarketContext, "persistence" | "seriesCapabilities" | "findCatalogSeries" | "findCatalogSeriesNamed">> & {
   dataProvider: HeadlessPaneContext["marketData"];
 };
 
@@ -209,33 +218,52 @@ export function createHeadlessPaneContext(
     capabilities: getSharedRegistry() ?? context.seriesCapabilities,
     catalogSeriesName: (expression) => (getSharedRegistry()?.series.findByExpression(expression)?.definition
       ?? context.findCatalogSeries?.(expression))?.name,
+    catalogSeriesNamed: (word) => {
+      const registered = getSharedRegistry()?.series?.list().map(({ definition }) => definition) ?? [];
+      const definition = seriesNamedBy(registered, word) ?? context.findCatalogSeriesNamed?.(word);
+      return definition ? { expression: seriesExpression(definition), name: definition.name } : undefined;
+    },
     resolveBroker: context.resolveBroker,
     async resolvePortfolio(id) {
-      const portfolio = findNamedCollection(context.config.portfolios, id);
+      // A report reads a portfolio by the start of its name too, as the command bar opens it (`PORT family`).
+      const portfolio = findNamedCollection(context.config.portfolios, id, { prefix: true });
       if (!portfolio) return null;
       const tickers = (await context.store.loadAllTickers()).filter(row => row.metadata.portfolios.includes(portfolio.id));
       return { portfolio, tickers, account: findCachedPortfolioAccount(context.config, portfolio, context.persistence?.resources) };
     },
     async resolveWatchlist(id) {
-      const watchlist = findNamedCollection(context.config.watchlists, id);
+      const watchlist = findNamedCollection(context.config.watchlists, id, { prefix: true });
       if (!watchlist) return null;
       return (await context.store.loadAllTickers()).filter(row => row.metadata.watchlists.includes(watchlist.id));
     },
-    async resolveInstrument(key) {
-      const parsed = parsePublicTickerKey(key);
-      const ticker = await context.store.loadTicker(key)
-        ?? (key !== parsed.symbol ? await context.store.loadTicker(parsed.symbol) : null);
-      return { symbol: parsed.symbol, exchange: parsed.exchange ?? ticker?.metadata.exchange };
-    },
+    resolveInstrument: (key) => resolveSavedInstrument(key, (saved) => context.store.loadTicker(saved)),
     readDeviceState: <T,>(pluginId: string, key: string) =>
       context.persistence?.pluginState.get<T>(pluginId, resumeStateKey(key))?.value ?? null,
+    readSavedState: <T,>(pluginId: string, key: string, schemaVersion?: number) => {
+      try {
+        // Strict: a copy this build cannot read stays for the app, where `get` would drop it.
+        const record = context.persistence?.pluginState.getStrict<T>(pluginId, key, schemaVersion);
+        return record ? { value: record.value, savedAt: record.updatedAt } : null;
+      } catch (error) {
+        return logFailure("headless.saved-state", `Read ${pluginId}'s saved ${key} failed`, null)(error);
+      }
+    },
     async resolveListing(symbol, argumentWith) {
       const command = `fn ${resolved.token}`;
       const read = await readBareListing(symbol, context, {
         command, noun: "a quote", retry: (key) => `gloom ${command} ${argumentWith(key)}`,
-      }, { refresh: !!context.refresh });
+      }, { refresh: !!context.refresh, successor: true });
       if (!read) return null;
-      return { symbol: read.symbol, ...read.exchange ? { exchange: read.exchange } : {}, ...read.name ? { name: read.name } : {} };
+      if ("notATicker" in read) return { symbol, notATicker: read.notATicker };
+      return {
+        symbol: read.symbol,
+        ...read.exchange ? { exchange: read.exchange } : {},
+        ...read.name ? { name: read.name } : {},
+        ...read.coinNote ? { coinNote: read.coinNote } : {},
+        ...read.successorNote ? { successorNote: read.successorNote } : {},
+        ...read.readAs ? { readAs: read.readAs } : {},
+        ...read.ownedNotes?.length ? { ownedNotes: read.ownedNotes } : {},
+      };
     },
   };
 }
@@ -343,7 +371,7 @@ export function serializeHeadlessPaneResult(
   result: HeadlessPaneResult,
 ): Record<string, unknown> {
   const common = {
-    ...(result.errors ? { errors: result.errors } : {}),
+    ...(result.errors ? { errors: result.errors.map((error) => isProLock(error) ? error : readableStatus(error)) } : {}),
     ...(result.notes?.length ? { notes: result.notes } : {}),
     ...(result.warnings?.length ? { warnings: result.warnings } : {}),
     ...(result.metadata ? { metadata: result.metadata } : {}),
@@ -369,8 +397,10 @@ export function serializeHeadlessPaneResult(
     }
     case "series": {
       const series = result as HeadlessSeriesResult;
-      // `textDecimals` only shapes the text report; JSON keeps every digit and does not carry it.
-      return { ...common, series: series.series.map(({ textDecimals: _text, ...kept }) => kept), ...(series.stats ? { stats: series.stats } : {}) };
+      // `textDecimals` and `textCompact` only shape the text report; JSON keeps every digit and does not carry them.
+      return { ...common, series: series.series.map(({ textDecimals: _decimals, textCompact: _compact, ...kept }) => (
+        kept.unit ? { ...kept, unit: currencyRateUnitText(kept.unit) } : kept
+      )), ...(series.stats ? { stats: series.stats } : {}) };
     }
     case "snapshot": {
       const snapshot = result as HeadlessSnapshotResult;
@@ -380,6 +410,7 @@ export function serializeHeadlessPaneResult(
         asOf: snapshot.asOf,
         columns: serializableColumns(columns),
         items: snapshot.items,
+        ...(snapshot.empty && snapshot.items.length === 0 ? { empty: snapshot.empty } : {}),
       };
     }
     default: {
@@ -390,7 +421,7 @@ export function serializeHeadlessPaneResult(
 }
 
 function displayValue(value: unknown): string {
-  if (value == null) return "-";
+  if (value == null) return MISSING_VALUE;
   if (value instanceof Date) return displayTime(value.getTime());
   if (typeof value === "number") return displayNumber(value);
   if (typeof value === "object") return JSON.stringify(value);
@@ -420,7 +451,7 @@ function displayNumber(value: number): string {
 }
 
 function displayTime(time: number): string {
-  if (!Number.isFinite(time)) return "-";
+  if (!Number.isFinite(time)) return MISSING_VALUE;
   return formatUtcTime(new Date(time));
 }
 
@@ -459,7 +490,7 @@ function observesDays(series: HeadlessSeries): boolean {
 
 function seriesPointDate(series: HeadlessSeries, date: SeriesPointDate): string {
   const time = seriesPointTime(date);
-  if (!Number.isFinite(time)) return typeof date === "string" ? date : "-";
+  if (!Number.isFinite(time)) return typeof date === "string" ? date : MISSING_VALUE;
   const calendar = calendarSeries(series);
   return calendar ? observationDate(time, calendar) : formatUtcTime({ time, dateOnly: isDateOnly(date) || observesDays(series) });
 }
@@ -476,7 +507,8 @@ function seriesLatestDate(series: HeadlessSeries, date: SeriesPointDate): string
   const time = seriesPointTime(date);
   if (!calendar || !period || !Number.isFinite(time)) return seriesPointDate(series, date);
   const venue = calendar.timeBasis?.exchange || calendar.listing?.exchange || undefined;
-  return barLastSession(observationDate(time, calendar), period, venue, Date.now()) ?? seriesPointDate(series, date);
+  // A period still forming on a venue whose sessions are not known here (an index publisher, a futures board) is its value's own day.
+  return barLastSession(observationDate(time, calendar), period, venue, Date.now()) ?? series.latestDate ?? seriesPointDate(series, date);
 }
 
 /** The same date for a spreadsheet: the trading date, the calendar date, or the ISO instant. */
@@ -495,19 +527,25 @@ function seriesPointExportDate(series: HeadlessSeries, date: SeriesPointDate, da
  * points, multiples and
  * ratios (P/E, EV/EBITDA, one series over another, VIX 3M / VIX) to two
  * decimals, which a ratio under 0.1 trades for three significant digits so it
- * is not flattened to 0.03, and a 0 to 100 score to a tenth of a point. The
- * exports keep every digit. Any other unit prints as loaded, without float
- * noise.
+ * is not flattened to 0.03, and a 0 to 100 score to a tenth of a point. A
+ * company's reported total (`textCompact`) reads as the tables print one:
+ * 63.33B. The exports keep every digit. Any other unit prints as loaded,
+ * without float noise.
  */
 function seriesValue(series: HeadlessSeries, value: number | null): string {
-  if (value == null) return "-";
+  if (value == null) return MISSING_VALUE;
   if (!Number.isFinite(value)) return displayNumber(value);
   if (series.textDecimals != null) return value.toFixed(series.textDecimals);
+  if (series.textCompact) return formatCompact(value);
   const unit = series.unit?.trim().toLowerCase();
   if (unit === "%" || unit === "pp") return value.toFixed(2);
   if (unit === "x" || unit === "ratio") return value !== 0 && Math.abs(value) < 0.1 ? value.toPrecision(3) : value.toFixed(2);
   if (unit === "score") return value.toFixed(1);
-  return displayNumber(value);
+  // A count or amount of five digits or more groups its thousands as every other table does (27,256,037 shares).
+  const plain = displayNumber(value);
+  const [whole, fraction] = plain.split(".");
+  return Math.abs(value) >= 10_000 && /^-?\d+(?:\.\d+)?$/.test(plain)
+    ? `${whole!.replace(/\B(?=(\d{3})+$)/g, ",")}${fraction ? `.${fraction}` : ""}` : plain;
 }
 
 function renderRows(
@@ -535,12 +573,17 @@ function renderRows(
       stackPriority: column.stackPriority,
       stackRows: column.stackRows,
       minTableWidth: column.minTableWidth,
+      optional: column.optional,
+      dropPriority: column.dropPriority,
     })),
     rows.map((row) => columns.map((column) => cell(row, column))),
     {
-      below: under.length === 0 ? undefined : rows.map((row) => under.flatMap((column) => (
-        row[column.key] == null || row[column.key] === "" ? [] : cell(row, column).split("\n")
-      ))),
+      // A value the text leaves out (a summary that only repeats the headline) takes no line.
+      below: under.length === 0 ? undefined : rows.map((row) => under.flatMap((column) => {
+        const text = row[column.key] == null || row[column.key] === "" ? "" : cell(row, column);
+        return text === "" ? [] : text.split("\n");
+      })),
+      ...(under.length > 0 && under.every((column) => column.underRow === "line") ? { cutBelow: true } : {}),
     },
   );
 }
@@ -556,13 +599,13 @@ function statisticsEntries(stats: NonNullable<HeadlessSeriesResult["stats"]>): H
 
 function renderBundle(
   definition: HeadlessPaneDefinition,
-  result: HeadlessBundleResult,
+  sections: readonly HeadlessBundleSection[],
 ): string[] {
   // A locked table is named once, on the Pro line, not under each heading.
-  return result.sections.filter((section) => !isLockedSection(section)).flatMap((section, index) => [
+  return sections.filter((section) => !isLockedSection(section)).flatMap((section, index) => [
     ...(index > 0 ? [""] : []),
     // A section with no title is its rows, or its empty message, alone.
-    ...(section.title ? [renderSection(section.title)] : []),
+    ...(section.title ? [renderSection(section.textTitle ?? section.title)] : []),
     "rows" in section && section.rows
       ? renderRows(section.textRows ?? section.rows, section.textColumns ?? section.columns, definition.columns, section.empty)
       : renderEntries(section.textEntries ?? section.entries),
@@ -574,30 +617,62 @@ function observationCount(series: HeadlessSeries): number {
   return series.points.filter((point) => point.value != null || point.close != null).length;
 }
 
+const TRAILING_COLUMNS: HeadlessPaneColumn[] = [
+  { key: "avg7", header: "7D avg", literalHeader: true, align: "right" },
+  { key: "avg28", header: "28D avg", literalHeader: true, align: "right" },
+  { key: "vsYearAgo", header: "28D vs yr ago", literalHeader: true, align: "right" },
+];
+
+function trailingCells(trailing: HeadlessSeries["trailing"]): Record<string, string> {
+  if (!trailing) return {};
+  const mean = (value: number | null) => (value == null ? MISSING_VALUE : value.toFixed(1));
+  const change = trailing.changeVsYearAgoPct;
+  return {
+    avg7: mean(trailing.avg7),
+    avg28: mean(trailing.avg28),
+    vsYearAgo: change == null || !Number.isFinite(change) ? MISSING_VALUE : `${change > 0 ? "+" : ""}${change.toFixed(1)}%`,
+  };
+}
+
 function renderSeries(result: HeadlessSeriesResult): string[] {
-  const rows = result.series.map((series) => {
+  // Series served in different bars (a chart's 5-minute bars beside a series a source answered in daily ones) name theirs.
+  const barSizes = result.series.map((series) => (chartBarSizeParts(series.interval?.trim()) ? series.interval!.trim() : null));
+  const mixedBars = new Set(barSizes.filter(Boolean)).size > 1;
+  const rows = result.series.map((series, index) => {
     const latest = [...series.points].reverse().find((point) => (
       point.value != null || point.close != null
     ));
+    // N/M stands for the period the series would end on, not an older value before it.
     return {
       series: series.label,
       name: series.name?.trim() || null,
-      latest: latest ? seriesLatestDate(series, latest.date) : "-",
-      value: seriesValue(series, latest?.value ?? latest?.close ?? null),
-      unit: series.unit?.trim() || null,
+      latest: series.notMeaningful ? series.notMeaningful.asOf : latest ? seriesLatestDate(series, latest.date) : MISSING_VALUE,
+      value: series.notMeaningful ? "N/M" : seriesValue(series, latest?.value ?? latest?.close ?? null),
+      unit: series.unit?.trim() ? currencyRateUnitText(series.unit.trim()) : null,
+      native: latest?.nativeAmount ? `${seriesValue(series, latest.nativeAmount.value)} ${latest.nativeAmount.currency}` : null,
+      ...trailingCells(series.trailing),
+      ...(mixedBars ? { bars: barSizes[index] ?? MISSING_VALUE } : {}),
       points: observationCount(series),
     };
   });
+  const trailing = result.series.some((series) => series.trailing);
   const columns: HeadlessPaneColumn[] = [
     { key: "series", header: "Series" },
     // A security's series names its company (BDI:XTSE is Black Diamond Group); other series have none.
     ...(rows.some((row) => row.name) ? [{ key: "name", header: "Name" }] : []),
     { key: "latest", header: "Latest", shrink: false },
     { key: "value", header: "Value", align: "right" },
+    ...(trailing ? TRAILING_COLUMNS : []),
     ...(rows.some((row) => row.unit) ? [{ key: "unit", header: "Unit" }] : []),
-    { key: "points", header: "Points", align: "right" },
+    ...(mixedBars ? [{ key: "bars", header: "Bars" }] : []),
+    ...(rows.some((row) => row.native) ? [{ key: "native", header: "Native", align: "right" as const }] : []),
+    // Beside the averages, the count of points is the first thing a narrow table drops.
+    { key: "points", header: "Points", align: "right", ...(trailing ? { optional: true } : {}) },
   ];
   const lines = [renderRows(rows, columns, undefined)];
+  const notMeaningful = result.series.flatMap((series) => series.notMeaningful
+    ? [`${series.label}: N/M, ${series.notMeaningful.reason.charAt(0).toLowerCase()}${series.notMeaningful.reason.slice(1)}.`] : []);
+  if (notMeaningful.length) lines.push("", ...notMeaningful.map((line) => wrapToTerminal(line)));
   if (result.stats) {
     lines.push("", renderSection("Statistics"), renderEntries(statisticsEntries(result.stats)));
   }
@@ -626,21 +701,55 @@ function seriesTable(series: HeadlessSeries): CliReportTable {
   const days = observesDays(series);
   const dates = series.points.map((point) => seriesPointExportDate(series, point.date, days));
   const header = (field: (typeof SERIES_FIELDS)[number]) => `${field[0]!.toUpperCase()}${field.slice(1)}`;
+  const contracts = seriesContractColumns(series);
   return {
     title: series.label,
     identity: {
-      ...(series.symbol?.trim() ? { symbolOrSeries: series.symbol.trim() } : {}),
-      ...(series.unit?.trim() ? { currencyOrUnit: series.unit.trim() } : {}),
+      // A listing by its venue's code (9992:HKEX), as every other export names it; JSON keeps the stored key.
+      ...(series.symbol?.trim() ? { symbolOrSeries: displayTickerKey(series.symbol.trim()) } : {}),
+      // A rate reads `JPY per USD` here as in every other export.
+      ...(series.unit?.trim() ? { currencyOrUnit: currencyRateUnitText(series.unit.trim()) } : {}),
       ...(series.interval?.trim() ? { interval: series.interval.trim() } : {}),
     },
-    columns: [dates.every((date) => date.length <= 10) ? "Date" : "Time", ...fields.map(header)],
+    columns: [dates.every((date) => date.length <= 10) ? "Date" : "Time", ...fields.map(header), ...contracts.columns],
+    // The contract columns came after the fixed ones: they close the row, so no earlier column moves.
+    ...contracts.columns.length ? { appendedColumns: contracts.columns.length } : {},
     rows: series.points.map((point, index) => [
       dates[index]!,
       ...fields.map((field) => {
         const value = point[field];
         return typeof value === "number" && Number.isFinite(value) ? exportNumber(value) : "";
       }),
+      ...contracts.cells(point, index),
     ]),
+  };
+}
+
+/**
+ * The contract columns of a futures series, after its figures, as `history`
+ * writes them: a continuous future's `Contract`, or a formula's contract of
+ * each leg (`RB=F Contract`), then `Roll` and `Partial`. A roll is the
+ * contract (a formula's legs') changing from the point before, the bar
+ * before the window included, so a window's first row can be one. None for a
+ * series of no contracts.
+ */
+function seriesContractColumns(series: HeadlessSeries): { columns: string[]; cells: (point: HeadlessSeriesPoint, index: number) => string[] } {
+  const legNames = series.formulaLegs ?? [];
+  const formula = legNames.length > 0
+    && series.points.some((point) => point.legs?.length === legNames.length && point.legs.some((leg) => leg.contract));
+  const continuous = !formula && series.points.some((point) => point.contract);
+  if (!formula && !continuous) return { columns: [], cells: () => [] };
+  const flag = (value: boolean | undefined) => value ? "true" : "false";
+  return {
+    columns: [...formula ? legNames.map((leg) => `${leg} Contract`) : ["Contract"], "Roll", "Partial"],
+    cells: (point, index) => {
+      if (formula) {
+        return [...legNames.map((_, position) => point.legs?.[position]?.contract ?? ""), flag(point.roll), flag(point.partial)];
+      }
+      const previous = index > 0 ? series.points[index - 1]?.contract : null;
+      const roll = point.roll || (!!point.contract && !!previous && point.contract !== previous);
+      return [point.contract ?? "", flag(roll), flag(point.partial)];
+    },
   };
 }
 
@@ -650,6 +759,7 @@ function incompleteDetail(
   status: { complete: boolean; unavailableSymbols: string[] },
 ): boolean | string {
   if (status.complete) return false;
+  if (result.incompleteDetail) return result.incompleteDetail;
   const requested = result.metadata?.requested;
   const available = result.metadata?.available;
   if (typeof requested === "number" && typeof available === "number" && available < requested) {
@@ -661,7 +771,8 @@ function incompleteDetail(
 /** What Gloom Pro would unlock apart from what failed: a lock is not an error, though it stays in `errors` for JSON. */
 function splitErrors(result: HeadlessPaneResult): { locked: string[]; failed: string[] } {
   const errors = result.errors ?? [];
-  return { locked: errors.filter(isProLock), failed: errors.filter((error) => !isProLock(error)) };
+  // A failure reads in words: "AAPL: the source did not answer", not its reason code.
+  return { locked: errors.filter(isProLock), failed: errors.filter((error) => !isProLock(error)).map(readableStatus) };
 }
 
 /**
@@ -701,6 +812,7 @@ function emptyReportReason(
   const bundleReason = definition.shape === "bundle" ? (result as HeadlessBundleResult).empty : undefined;
   if (bundleReason) return bundleReason;
   const ownReason = definition.shape === "rows" ? !!(result as HeadlessRowsResult).empty
+    : definition.shape === "snapshot" ? !!(result as HeadlessSnapshotResult).empty
     : definition.shape === "bundle" && (result as HeadlessBundleResult).sections.some((section) => "empty" in section && !!section.empty && !isLockedSection(section));
   const { failed } = splitErrors(result);
   if (ownReason || failed.length) return null;
@@ -724,21 +836,24 @@ function textNotices(result: HeadlessPaneResult): string[] {
 
 /**
  * What each row of a table is of, from the fields its report names
- * (`rowUnitKey`, `rowSymbolKey`, `rowAsOfKey`); undefined when it names none.
- * An as-of may be an ISO date or instant, or epoch milliseconds.
+ * (`rowUnitKey`, `rowSymbolKey`, `rowAsOfKey`, `rowIntervalKey`,
+ * `rowSourceKey`); undefined when it names none. An as-of may be an ISO date
+ * or instant, or epoch milliseconds.
  */
 function rowIdentitiesOf(
   rows: readonly HeadlessPaneRow[],
-  keys: { rowUnitKey?: string; rowSymbolKey?: string; rowAsOfKey?: string },
+  keys: { rowUnitKey?: string; rowSymbolKey?: string; rowAsOfKey?: string; rowIntervalKey?: string; rowSourceKey?: string },
 ): ExportIdentity[] | undefined {
-  const { rowUnitKey: unitKey, rowSymbolKey: symbolKey, rowAsOfKey: asOfKey } = keys;
-  if (!unitKey && !symbolKey && !asOfKey) return undefined;
+  const { rowUnitKey: unitKey, rowSymbolKey: symbolKey, rowAsOfKey: asOfKey, rowIntervalKey: intervalKey, rowSourceKey: sourceKey } = keys;
+  if (!unitKey && !symbolKey && !asOfKey && !intervalKey && !sourceKey) return undefined;
   const text = (value: unknown) => (typeof value === "string" ? value : null);
   const instant = (value: unknown) => typeof value === "number" && Number.isFinite(value) ? new Date(value).toISOString() : text(value);
   return rows.map((row) => ({
     ...(unitKey ? { currencyOrUnit: text(row[unitKey]) } : {}),
     ...(symbolKey ? { symbolOrSeries: text(row[symbolKey]) } : {}),
     ...(asOfKey ? { asOf: instant(row[asOfKey]) } : {}),
+    ...(intervalKey ? { interval: text(row[intervalKey]) } : {}),
+    ...(sourceKey ? { source: text(row[sourceKey]) } : {}),
   }));
 }
 
@@ -765,8 +880,11 @@ export function headlessReportTables(
       const columns = displayedColumns(columnsFor(rowsResult.rows, rowsResult.columns, definition.columns));
       const rowIdentities = rowIdentitiesOf(rowsResult.rows, rowsResult);
       const own = exportRowsTable(title, columns, rowsResult.rows, { status: true, ...(rowsResult.rowUnitKey ? { rowUnitKey: rowsResult.rowUnitKey } : {}) });
-      const interval = rowsResult.interval?.trim();
-      tables = [{ ...own, ...(rowIdentities ? { rowIdentities } : {}), ...(interval ? { identity: { interval } } : {}) }, ...(rowsResult.exportTables ?? []).map((extra) => {
+      const ownIdentity = {
+        ...(rowsResult.unit?.trim() ? { currencyOrUnit: rowsResult.unit.trim() } : {}),
+        ...(rowsResult.interval?.trim() ? { interval: rowsResult.interval.trim() } : {}),
+      };
+      tables = [{ ...own, ...(rowIdentities ? { rowIdentities } : {}), ...(Object.keys(ownIdentity).length > 0 ? { identity: ownIdentity } : {}) }, ...(rowsResult.exportTables ?? []).map((extra) => {
         const identity = {
           ...(extra.unit?.trim() ? { currencyOrUnit: extra.unit.trim() } : {}),
           ...(extra.interval?.trim() ? { interval: extra.interval.trim() } : {}),
@@ -781,6 +899,9 @@ export function headlessReportTables(
         // A section of one name or one date says so for every line it exports.
         const named = {
           ...(section.symbol?.trim() ? { symbolOrSeries: section.symbol.trim() } : {}),
+          ...(section.unit?.trim() ? { currencyOrUnit: section.unit.trim() } : {}),
+          ...(section.interval?.trim() ? { interval: section.interval.trim() } : {}),
+          ...("source" in section && section.source?.trim() ? { source: section.source.trim() } : {}),
           ...(section.asOf === null ? { asOf: null } : section.asOf?.trim() ? { asOf: section.asOf.trim() } : {}),
           ...(section.period?.trim() ? { period: section.period.trim() } : {}),
           ...(section.released?.trim() ? { released: section.released.trim() } : {}),
@@ -791,7 +912,9 @@ export function headlessReportTables(
           // A line of its own period or release (a previous reading) names them rather than the section's.
           const own = (entry: HeadlessPaneEntry): ExportIdentity | undefined => {
             const identity = {
-              ...(entry.unit?.trim() ? { currencyOrUnit: entry.unit.trim() } : {}),
+              // An export unit names a number's unit: a figure missing with its reason has none.
+              ...(entry.unit?.trim() ? { currencyOrUnit: entry.unit.trim() }
+                : entry.exportUnit?.trim() && typeof entry.value === "number" && Number.isFinite(entry.value) ? { currencyOrUnit: entry.exportUnit.trim() } : {}),
               ...(entry.period !== undefined ? { period: entry.period } : {}),
               ...(entry.released !== undefined ? { released: entry.released } : {}),
               ...(entry.asOf !== undefined ? { asOf: entry.asOf } : {}),
@@ -801,14 +924,16 @@ export function headlessReportTables(
           const rowIdentities = section.entries.some((entry) => own(entry)) ? section.entries.map(own) : undefined;
           return { ...entries, ...(Object.keys(named).length > 0 ? { identity: named } : {}), ...(rowIdentities ? { rowIdentities } : {}) };
         }
-        const table = exportRowsTable(section.title, displayedColumns(columnsFor(section.rows, section.columns, definition.columns)), section.rows, { status: true });
+        const table = exportRowsTable(section.title, displayedColumns(columnsFor(section.rows, section.columns, definition.columns)), section.rows,
+          { status: true, appendedColumns: section.appendedColumns });
         const identity = {
           ...named,
           ...(section.unit?.trim() ? { currencyOrUnit: section.unit.trim() } : {}),
           ...(section.interval?.trim() ? { interval: section.interval.trim() } : {}),
         };
         const rowIdentities = rowIdentitiesOf(section.rows, section);
-        return { ...table, ...(Object.keys(identity).length > 0 ? { identity } : {}), ...(rowIdentities ? { rowIdentities } : {}) };
+        return { ...table, ...(section.appendedColumns ? { appendedColumns: section.appendedColumns } : {}),
+          ...(Object.keys(identity).length > 0 ? { identity } : {}), ...(rowIdentities ? { rowIdentities } : {}) };
       });
       break;
     case "series": {
@@ -888,7 +1013,8 @@ export function renderHeadlessPaneText(
 ): string {
   // A long title wraps to a narrow --width like the text under a table; each line stays bold.
   const lines = [...wrapToTerminal(reportTitle(definition, args, result, fallbackTitle)).split("\n").map(cliStyles.bold), ""];
-  const notices = textNotices(result);
+  // A notice wraps to a narrow --width, as the notes and errors under the tables do.
+  const notices = textNotices(result).map((notice) => wrapToTerminal(notice));
   if (notices.length) lines.push(...notices, "");
   const gate = reportGate(definition, result);
   const reason = emptyReportReason(definition, result, args, token, gate);
@@ -898,10 +1024,11 @@ export function renderHeadlessPaneText(
     case "rows": {
       const rowsResult = result as HeadlessRowsResult;
       lines.push(renderRows(rowsResult.textRows ?? rowsResult.rows, rowsResult.textColumns ?? rowsResult.columns, definition.columns, rowsResult.empty));
+      if (rowsResult.textSections?.length) lines.push("", ...renderBundle(definition, rowsResult.textSections));
       break;
     }
     case "bundle":
-      lines.push(...renderBundle(definition, result as HeadlessBundleResult));
+      lines.push(...renderBundle(definition, (result as HeadlessBundleResult).sections));
       break;
     case "series":
       lines.push(...renderSeries(result as HeadlessSeriesResult));
@@ -909,7 +1036,7 @@ export function renderHeadlessPaneText(
     case "snapshot": {
       const snapshot = result as HeadlessSnapshotResult;
       // The closing source line carries the snapshot's as-of, so it is not printed twice.
-      lines.push(renderRows(snapshot.items, undefined, definition.columns));
+      lines.push(renderRows(snapshot.items, undefined, definition.columns, snapshot.empty));
       break;
     }
     default: {
@@ -935,7 +1062,8 @@ function resultRowCount(definition: HeadlessPaneDefinition, result: HeadlessPane
         count + ("rows" in section && section.rows ? section.rows.length : section.entries.length)
       ), 0);
     case "series":
-      return (result as HeadlessSeriesResult).series.reduce((count, series) => count + observationCount(series), 0);
+      // An N/M is a reading: the report has something to say for the series.
+      return (result as HeadlessSeriesResult).series.reduce((count, series) => count + Math.max(observationCount(series), series.notMeaningful ? 1 : 0), 0);
     case "snapshot":
       return (result as HeadlessSnapshotResult).items.length;
     default: {
@@ -990,6 +1118,62 @@ function withUnreached(
   return nothingServed && unreached ? { ...freshness, unreached: true } : freshness;
 }
 
+/** What a cut says: which rows of how many it kept, and of which table when the report has several. */
+function cutNote(window: RowWindowOptions, cut: RowWindow<unknown>, table?: string): string | null {
+  if (cut.rows.length >= cut.total) return null;
+  const kept = `${window.tail != null ? (cut.kept === "newest" ? "newest" : "last") : "first"} ${cut.rows.length} of ${cut.total} rows`;
+  return `${table ? `${table}: ` : ""}${cut.note ?? `${kept} (--${window.tail != null ? "tail" : "limit"} ${window.tail ?? window.limit})`}`;
+}
+
+/**
+ * The report's rows as `--limit` and `--tail` keep them, for a function with no option of its own for them
+ * (`fn CTM CL --limit 3`): the first or last n of each table, of a series' points the oldest or newest n, as every
+ * command that prints a list keeps them; the notes say what was cut.
+ */
+function windowHeadlessResult(shape: HeadlessPaneDefinition["shape"], result: HeadlessPaneResult, window: RowWindowOptions): HeadlessPaneResult {
+  const notes: string[] = [];
+  const cut = <Row,>(rows: readonly Row[], table?: string, dateOf?: (row: Row) => unknown): Row[] => {
+    const kept = windowRows(rows, window, dateOf);
+    const note = cutNote(window, kept, table);
+    if (note) notes.push(note);
+    return kept.rows;
+  };
+  const quiet = <Row,>(rows: readonly Row[] | undefined) => rows ? windowRows(rows, window).rows : undefined;
+  let windowed: HeadlessPaneResult;
+  switch (shape) {
+    case "rows": {
+      const rows = result as HeadlessRowsResult;
+      windowed = { ...rows, rows: cut(rows.rows), ...(rows.textRows ? { textRows: quiet(rows.textRows)! } : {}) };
+      break;
+    }
+    case "bundle": {
+      const bundle = result as HeadlessBundleResult;
+      const several = bundle.sections.filter((section) => section.rows).length > 1;
+      windowed = { ...bundle, sections: bundle.sections.map((section) => !section.rows ? section : {
+        ...section, rows: cut(section.rows, several ? section.title : undefined), ...(section.textRows ? { textRows: quiet(section.textRows)! } : {}),
+      }) };
+      break;
+    }
+    case "series": {
+      const series = result as HeadlessSeriesResult;
+      windowed = { ...series, series: series.series.map((entry) => ({
+        ...entry, points: cut(entry.points, series.series.length > 1 ? entry.label : undefined, (point) => point.date),
+      })) };
+      break;
+    }
+    case "snapshot": {
+      const snapshot = result as HeadlessSnapshotResult;
+      windowed = { ...snapshot, items: cut(snapshot.items) };
+      break;
+    }
+    default: {
+      const _exhaustive: never = shape;
+      return _exhaustive;
+    }
+  }
+  return notes.length > 0 ? { ...windowed, notes: [...windowed.notes ?? [], ...notes] } : windowed;
+}
+
 export async function buildHeadlessFunctionReport(
   resolved: ResolvedPaneFunction,
   context: MarketContext,
@@ -998,6 +1182,7 @@ export async function buildHeadlessFunctionReport(
   let loaded: LoadedHeadlessPaneModel;
   try {
     loaded = await loadResolvedHeadlessPaneModel(resolved, context, rawArgument);
+    if (resolved.rowWindow) loaded = { ...loaded, result: windowHeadlessResult(loaded.definition.shape, loaded.result, resolved.rowWindow) };
   } catch (error) {
     // A Pro pane the server refused reports what its wall covers, as its rendered view does.
     const locked = await lockedHeadlessReport(resolved, error, () => (
@@ -1021,7 +1206,7 @@ export async function buildHeadlessFunctionReport(
       target: resolved.token,
       capabilityId: resolved.capability.id,
       symbols,
-      options: resolved.options,
+      options: { ...resolved.options, ...loaded.result.appliedOptions },
       rowCount,
       empty: rowCount === 0,
       complete,

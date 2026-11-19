@@ -3,6 +3,7 @@ import { isAccessDenied } from "../../../api-client/errors";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import type { PerpBoardRow } from "../../../api-client/perps";
 import { ActionRow, ColumnGrid, SectionHeading, type ColumnGridCell, type ColumnGridColumn } from "../../../components";
+import { hiddenTableColumnText, markHiddenTableColumns } from "../../../components/ui/table-layout";
 import { t, tf } from "../../../i18n";
 import { useAsyncResource, useAutoRefresh } from "../../../public/react";
 import { useThemeColors } from "../../../theme/theme-context";
@@ -18,7 +19,7 @@ import { loadPerpsCompare, loadPerpsEquity } from "./client";
 import { perpEquityIdentity } from "./equity-identity";
 import { useLivePerpRows } from "./live-rows";
 import { compact, perpCell, percent, price, readingTime, venueName } from "./model";
-import { useOpenPerpMarket } from "./open-market";
+import { openPerpLabel, useOpenPerpMarket } from "./open-market";
 import { contractText, foldSmallMarkets, mergeVenueMarkets, type PerpVenueMarket } from "./venue-markets";
 
 const STOCK_TYPES = new Set(["STK", "EQUITY", "STOCK", "COMMON STOCK"]);
@@ -52,18 +53,22 @@ const COLUMNS: readonly Column[] = [
   { id: "oi", label: "OI USD", width: 7, align: "right" },
   { id: "volume", label: "Vol 24h", width: 7, align: "right" },
 ];
-/** What a narrow overview gives up first: the volume, then the contract, then the premium. */
-const DROP_ORDER: readonly Column["id"][] = ["volume", "contract", "premium"];
+/**
+ * What a narrow overview gives up first: the volume, then the contract, the premium, the open interest and the
+ * funding, so the columns left fit whole rather than squeezed into cut figures ("+0." for +0.0050%).
+ */
+const DROP_ORDER: readonly Column["id"][] = ["volume", "contract", "premium", "oi", "funding"];
 const GAP = 2;
 const span = (columns: readonly Column[]) => columns.reduce((sum, column) => sum + column.width, 0) + GAP * (columns.length - 1);
 
 function fitColumns(width: number, venueWidth: number): Column[] {
-  let columns = COLUMNS.map((column) => column.id === "venue" ? { ...column, width: venueWidth } : column);
+  const original = COLUMNS.map((column) => column.id === "venue" ? { ...column, width: venueWidth } : column);
+  let columns = original;
   for (const id of DROP_ORDER) {
     if (span(columns) <= width) break;
     columns = columns.filter((column) => column.id !== id);
   }
-  return columns;
+  return markHiddenTableColumns(original, columns);
 }
 
 /**
@@ -119,7 +124,7 @@ export function PerpMarketsSection({ symbol, exchange, instrumentType, quote, wi
   const cell = (column: Column, market: PerpVenueMarket, row: PerpBoardRow): ColumnGridCell => {
     if (column.id === "venue") {
       return { text: venueName(market.venue), color: row.stale ? colors.textDim : colors.textBright,
-        link: { label: tf("Open {label}", { label: `PERP ${row.baseAsset} · ${venueName(market.venue)}` }), onOpen: () => openMarket(row.marketId) } };
+        link: { label: openPerpLabel(row), onOpen: () => openMarket(row.marketId) } };
     }
     if (column.id === "contract") return { text: contractText(market), color: colors.textMuted };
     if (column.id === "mark") return { text: price(row.markPrice ?? row.lastPrice), color: colors.text };
@@ -142,6 +147,7 @@ export function PerpMarketsSection({ symbol, exchange, instrumentType, quote, wi
   return (
     <Box flexDirection="column" data-gloom-role="perp-markets">
       <SectionHeading title={t("Perpetuals")} />
+      {hiddenTableColumnText(columns) && <Text fg={colors.textDim}>{hiddenTableColumnText(columns)}</Text>}
       <ColumnGrid columns={gridColumns} rows={[header, ...body]} width={width} role="perp-markets-grid" />
       {folded.length > 0 && (
         <ActionRow expanded={expanded} width={width}

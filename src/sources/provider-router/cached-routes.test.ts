@@ -2,7 +2,7 @@ import { describe, expect, setSystemTime, test } from "bun:test";
 import { AppPersistence } from "../../data/app-persistence";
 import { MarketDataCoordinator } from "../../market-data/coordinator";
 import { buildArticleSummaryKey } from "../../market-data/selectors";
-import { createTestDataProvider } from "../../test-support/data-provider";
+import { createTestDataProvider, createTestQuote } from "../../test-support/data-provider";
 import type { BrokerAdapter } from "../../types/broker";
 import { AssetDataRouter } from "./index";
 import { MARKET_METADATA_SCHEMA_VERSION } from "./cache";
@@ -119,6 +119,63 @@ describe("shared cached market queries", () => {
     } finally { persistence.close(); }
   });
 
+  test("a rate read before the FX week closed is read again once the close is out, the close itself is kept", async () => {
+    // A profile that last asked on Friday 30 Oct 2026 at 20:54Z, a delayed 20:39Z print, run again on Sunday while FX is shut.
+    setSystemTime(new Date("2026-11-01T16:30:00Z"));
+    const persistence = new AppPersistence(":memory:");
+    let calls = 0;
+    const close = { fromCurrency: "EUR", toCurrency: "USD" as const, rate: 1.11601, source: "gloom", asOf: "2026-10-30T20:59:00.000Z",
+      fetchedAt: "2026-11-01T16:30:00.000Z", stale: false, delayMinutes: 15 };
+    const provider = createTestDataProvider({ id: "fx", getExchangeRate: async () => close.rate,
+      getExchangeRateSnapshot: async () => { calls++; return close; } });
+    const cache = (fetchedAt: string, asOf: string, rate: number) => persistence.resources.set(
+      { namespace: "market", kind: "exchange-rate", entityKey: "EUR/USD", sourceKey: "provider:fx" },
+      { fromCurrency: "EUR", toCurrency: "USD", rate, source: "gloom", asOf, fetchedAt, stale: false, delayMinutes: 15 },
+      { schemaVersion: MARKET_METADATA_SCHEMA_VERSION, fetchedAt: Date.parse(fetchedAt), cachePolicy: { staleMs: 60 * 60_000, expireMs: 7 * 24 * 60 * 60_000 } });
+    const load = async () => {
+      const router = new AssetDataRouter(provider, [], persistence.resources);
+      router.setBackgroundRevalidation(false);
+      return router.getCachedQuery("getExchangeRate", ["EUR"]).load();
+    };
+    try {
+      cache("2026-10-30T20:54:00.000Z", "2026-10-30T20:39:00.000Z", 1.1168193);
+      expect(await load()).toMatchObject({ value: 1.11601, asOf: Date.parse("2026-10-30T20:59:00Z") });
+      expect(calls).toBe(1);
+      // The close, read after it was out, stands until the market reopens.
+      expect(await load()).toMatchObject({ value: 1.11601 });
+      expect(calls).toBe(1);
+      // A delayed print read before the close was out, though after 17:00 New York, is read again too.
+      cache("2026-10-30T21:05:00.000Z", "2026-10-30T20:50:00.000Z", 1.1165);
+      expect(await load()).toMatchObject({ value: 1.11601 });
+      expect(calls).toBe(2);
+      // The app reads in the background, and its desktop window holds what getExchangeRate returns as read now: it waits
+      // for the close instead of returning the 20:39Z print while it reads again.
+      cache("2026-10-30T20:54:00.000Z", "2026-10-30T20:39:00.000Z", 1.1168193);
+      const app = new AssetDataRouter(provider, [], persistence.resources);
+      app.setBackgroundRevalidation(true);
+      expect(await app.getExchangeRate("EUR")).toBe(1.11601);
+      expect(calls).toBe(3);
+    } finally { persistence.close(); setSystemTime(); }
+  });
+
+  test("an app open across the FX week's close reads its pre-close rate again once the close is out", async () => {
+    setSystemTime(new Date("2026-10-30T20:54:00Z"));
+    const persistence = new AppPersistence(":memory:");
+    const snapshot = (rate: number, asOf: string) => ({ fromCurrency: "EUR", toCurrency: "USD" as const, rate, source: "gloom", asOf,
+      fetchedAt: new Date().toISOString(), stale: false, delayMinutes: 15 });
+    let served = snapshot(1.1168193, "2026-10-30T20:39:00.000Z");
+    const provider = createTestDataProvider({ id: "fx", getExchangeRate: async () => served.rate,
+      getExchangeRateSnapshot: async () => served });
+    const router = new AssetDataRouter(provider, [], persistence.resources);
+    router.setBackgroundRevalidation(true);
+    try {
+      expect(await router.getExchangeRate("EUR")).toBe(1.1168193);
+      setSystemTime(new Date("2026-10-30T21:15:00Z"));
+      served = snapshot(1.11601, "2026-10-30T20:59:00.000Z");
+      expect(await router.getExchangeRate("EUR")).toBe(1.11601);
+    } finally { persistence.close(); setSystemTime(); }
+  });
+
   test("shares cold loads with direct provider calls and keeps errors attached to stale fallback", async () => {
     let calls = 0;
     const pending = Promise.withResolvers<number>();
@@ -186,6 +243,23 @@ describe("shared cached market queries", () => {
     } finally { persistence.close(); }
   });
 
+  test("a chain's adjusted contracts are kept apart from the chain: neither is ever read for the other", async () => {
+    const persistence = new AppPersistence(":memory:");
+    const provider = createTestDataProvider({ id: "provider",
+      getOptionsChain: async (_symbol, _exchange, _expiration, context) => ({ underlyingSymbol: "ETHA", expirationDates: [1], puts: [],
+        calls: [{ contractSymbol: context?.adjustedOptions ? "ETHA1261106C00009000" : "ETHA261106C00009000" } as never] }),
+    });
+    const contracts = async (adjustedOptions?: boolean) => (await new AssetDataRouter(provider, [], persistence.resources)
+      .getOptionsChain("ETHA", "NASDAQ", 1, adjustedOptions ? { adjustedOptions } : undefined)).calls.map((entry) => entry.contractSymbol);
+    try {
+      // Each read stores what it was answered, then a new router (the next command) reads the store.
+      expect(await contracts(true)).toEqual(["ETHA1261106C00009000"]);
+      expect(await contracts()).toEqual(["ETHA261106C00009000"]);
+      expect(await contracts(true)).toEqual(["ETHA1261106C00009000"]);
+      expect(await contracts()).toEqual(["ETHA261106C00009000"]);
+    } finally { await tick(); persistence.close(); }
+  });
+
   test("a caller that cannot see a background refresh is not handed a stale stored chain as current", async () => {
     let online = true;
     const provider = createTestDataProvider({ id: "provider",
@@ -234,6 +308,24 @@ describe("shared cached market queries", () => {
       expect(coordinator.getFxEntry("EUR").error).not.toBeNull();
       expect(calls).toBe(2);
     } finally { coordinator.destroy(); persistence.close(); }
+  });
+
+  test("a quote says when Gloom fetched it, and its saved copy read back later keeps that time, not the read's", async () => {
+    const fetchedAt = Date.parse("2026-11-11T19:45:00Z");
+    let calls = 0;
+    const persistence = new AppPersistence(":memory:");
+    const provider = createTestDataProvider({ id: "cloud", getQuote: async () => {
+      if (++calls > 1) throw new Error("offline");
+      return createTestQuote({ symbol: "TTEK", price: 37.53, lastUpdated: fetchedAt - 60_000, marketState: "REGULAR" });
+    } });
+    setSystemTime(new Date(fetchedAt));
+    try {
+      expect(await new AssetDataRouter(provider, [], persistence.resources).getQuote("TTEK", "NYSE"))
+        .toMatchObject({ price: 37.53, retrievedAt: fetchedAt });
+      setSystemTime(new Date(fetchedAt + 5 * 60_000));
+      expect(await new AssetDataRouter(provider, [], persistence.resources).getQuote("TTEK", "NYSE"))
+        .toMatchObject({ price: 37.53, retrievedAt: fetchedAt });
+    } finally { setSystemTime(); persistence.close(); }
   });
 
   test("expired numeric FX fallback also rejects a mismatched pair", () => {

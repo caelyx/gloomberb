@@ -3,15 +3,14 @@ import type { PluginModule } from "../plugin-module";
 import { IV_SERIES } from "./series";
 import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
 import { ivHistoryHeadless, ivScreenHeadless } from "./headless";
-import { IvHistoryPane } from "./pane";
 import { IvScreenPane, VCA_SCOPE_OPTIONS } from "./screen-pane";
 
 
 export const ivHistoryModule: PluginModule = {
   series: IV_SERIES,
   panes: [{
-    id: "iv-history", name: "Implied Volatility History", icon: "V", component: IvHistoryPane,
-    defaultPosition: "right", tickerFollower: true, defaultMode: "floating", defaultFloatingSize: { width: 118, height: 36 },
+    id: "iv-history", name: "Implied Volatility History", icon: "V", get component(): typeof import("./pane").IvHistoryPane { const { IvHistoryPane } = require("./pane"); return IvHistoryPane; },
+    defaultPosition: "right", shareItem: { ticker: true }, tickerFollower: true, defaultMode: "floating", defaultFloatingSize: { width: 118, height: 36 },
     tableExport: true,
     settings: { title: "Implied Volatility History", fields: [
       { key: "lookback", label: "Lookback", type: "select", options: [{ value: "1Y", label: "1 year" }, { value: "2Y", label: "2 years" }, { value: "ALL", label: "All stored" }] },
@@ -32,13 +31,13 @@ export const ivHistoryModule: PluginModule = {
     { ...createTickerSurfacePaneTemplate({
       id: "iv-history-pane", paneId: "iv-history", label: "Implied Volatility History",
       description: "30-day, 90-day and one-year ATM implied volatility since 2024 against realized, with IV rank and percentile.",
-      keywords: ["hivg", "implied", "volatility", "history", "iv rank", "ivr", "percentile", "vrp", "iv1y", "leaps"], shortcut: "HIVG", publicShare: true,
+      keywords: ["hivg", "implied", "volatility", "vol", "history", "iv rank", "ivr", "percentile", "vrp", "iv1y", "leaps"], shortcut: "HIVG", publicShare: true,
     }), headless: ivHistoryHeadless },
     {
       id: "iv-screen-pane", paneId: "iv-screen", label: "Volatility Rich/Cheap",
       description: "IV rank, percentile, one-year IV, term slope, skew and IV/HV across a list, ranked rich to cheap.",
       // Where a put seller finds rich premium; CSP and OSA own the exact put-selling phrases and rank first on them.
-      keywords: ["vca", "rich", "cheap", "iv rank", "implied volatility", "screen", "cash-secured puts", "selling puts", "short-put candidates",
+      keywords: ["vca", "vol", "rich", "cheap", "iv rank", "implied volatility", "screen", "cash-secured puts", "selling puts", "short-put candidates",
         "csp candidates", "wheel candidates"],
       shortcut: { prefix: "VCA", argKind: "ticker-list" as const, argOptional: true }, headless: ivScreenHeadless,
       createInstance: (_context, options) => ({

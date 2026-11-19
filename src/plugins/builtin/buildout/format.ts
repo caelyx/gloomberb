@@ -1,8 +1,11 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { colors, priceColor } from "../../../theme/colors";
+import { collectUniqueTickerSymbols } from "../../../tickers/tokenizer";
+import { isKnownExchangeCode } from "../../../utils/exchanges";
 import { formatDetailDate as sharedFormatDetailDate, parseDisplayDate } from "../../../utils/datetime-format";
 import type { BuildoutSource, BuildoutUpdate } from "./model/types";
 
-export function text(value: unknown, fallback = "-") {
+export function text(value: unknown, fallback = MISSING_VALUE) {
   if (value == null) return fallback;
   const stringValue = String(value).trim();
   return stringValue || fallback;
@@ -44,9 +47,47 @@ export function metricNumber(value: unknown): number | null {
   return (negative ? -parsed : parsed) * multiplier;
 }
 
+/** A dollar figure as the service prints it ("$5094.1B", "$-4.9B"); anything else is not money to reformat. */
+const DOLLAR_STRING = /^-?\$-?[\d,]*\.?\d+\s*[KMBT]?$/i;
+
+/** The dollars in a string the service prints as money, or null for anything else. */
+export function moneyAmount(value: unknown): number | null {
+  return typeof value === "string" && DOLLAR_STRING.test(value.trim()) ? metricNumber(value) : null;
+}
+
+const MONEY_UNITS = [
+  { divisor: 1e12, suffix: "T" },
+  { divisor: 1e9, suffix: "B" },
+  { divisor: 1e6, suffix: "M" },
+  { divisor: 1e3, suffix: "K" },
+] as const;
+
+/**
+ * Dollars in the one compact form every TheBuildout table uses: "$5.1T",
+ * "$356.4B", "-$4.9B". The unit is picked after rounding, so $999.96B is
+ * "$1.0T" and not "$1000.0B".
+ */
+export function formatCompactMoney(amount: number): string {
+  const abs = Math.abs(amount);
+  let index = MONEY_UNITS.findIndex((unit) => abs >= unit.divisor);
+  let digits = index < 0 ? abs.toFixed(0) : (abs / MONEY_UNITS[index]!.divisor).toFixed(1);
+  if (index > 0 && Number(digits) >= 1000) {
+    index -= 1;
+    digits = (abs / MONEY_UNITS[index]!.divisor).toFixed(1);
+  }
+  const sign = amount < 0 && /[1-9]/.test(digits) ? "-" : "";
+  return `${sign}$${digits}${index < 0 ? "" : MONEY_UNITS[index]!.suffix}`;
+}
+
+/** A table cell's text for a dollar figure: compact when it is money, the service's own text otherwise, "-" when absent. */
+export function moneyText(value: string | null | undefined): string {
+  const amount = moneyAmount(value);
+  return amount == null ? text(value) : formatCompactMoney(amount);
+}
+
 export function dateShort(value: string | null | undefined) {
   const date = parseDisplayDate(value);
-  if (!date) return "-";
+  if (!date) return MISSING_VALUE;
   return date.toISOString().slice(5, 10);
 }
 
@@ -56,7 +97,7 @@ export function dateDetail(value: string | null | undefined) {
 }
 
 export function activityLabel(value: number | null | undefined) {
-  if (value == null) return "-";
+  if (value == null) return MISSING_VALUE;
   if (value >= 2) return "High";
   if (value >= 1) return "Low";
   return "None";
@@ -89,14 +130,43 @@ export function criticalityColor(value: string | null | undefined) {
   }
 }
 
+/** A theme's tiers, most important first. */
+export const LIST_TIER_ORDER: readonly string[] = ["leader", "major", "notable", "watchlist"];
+
+/** `core_vendor` reads "Core vendor". */
+export function listWord(value: string | null | undefined): string | null {
+  const words = value?.trim().replace(/[_-]+/g, " ").toLowerCase();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : null;
+}
+
 export function tickerSymbol(value: string | null | undefined): string | null {
   const symbol = value?.trim();
   return symbol ? symbol.toUpperCase() : null;
 }
 
+/**
+ * The key the app looks a dataset ticker up and opens it by. A name-led
+ * symbol (NVDA, BRK.B) is its own. The dataset writes some Asian listings by
+ * number alone (2330, 005930), which a cashtag reads as money, so one takes
+ * the venue the dataset names (2330:TWSE, 005930:KRX). Null when the dataset
+ * names no venue the app knows: such a ticker is plain text, never a chip
+ * that looks different from the resolved ones around it.
+ */
+export function listingKey(ticker: string | null | undefined, exchange?: string | null): string | null {
+  const symbol = tickerSymbol(ticker);
+  if (!symbol) return null;
+  let key: string | null = symbol;
+  if (!/^[A-Z]/.test(symbol)) {
+    const venue = tickerSymbol(exchange);
+    // `688795.SS` names its venue twice: the dataset's venue is the one kept.
+    key = venue && isKnownExchangeCode(venue) ? `${symbol.replace(/\.[A-Z]{1,4}$/, "")}:${venue}` : null;
+  }
+  return key && collectUniqueTickerSymbols([`$${key}`]).includes(key) ? key : null;
+}
+
 export function tickerSearchText(symbols: readonly string[]) {
   return symbols
-    .filter((symbol) => /^[A-Z]/.test(symbol))
+    .filter((symbol) => collectUniqueTickerSymbols([`$${symbol}`]).includes(symbol))
     .map((symbol) => `$${symbol}`)
     .join(" ");
 }

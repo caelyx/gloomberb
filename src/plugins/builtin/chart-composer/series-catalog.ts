@@ -10,12 +10,15 @@ import type { TimeSeriesFieldDefinition } from "../../../time-series/types";
 import type { SeriesCatalogEntry, SeriesPlacement } from "../../../series/types";
 import {
   canonicalExchange,
+  canonicalTickerKey,
   parsePublicTickerKey,
   publicTickerKey,
 } from "../../../utils/exchanges";
 import { parseSeriesExpression, type ParsedSeriesExpression } from "./series-expression";
 import { parseFormulaExpression } from "./formula";
 import { currencyCodeLabel } from "../../../utils/currency-units";
+import { classifyInstrumentType, kindFromListingSyntax } from "../../../tickers/instrument-kind";
+import { isCryptoPairSymbol } from "../../../utils/crypto-pair";
 
 export interface SeriesCatalogInstrument {
   symbol: string;
@@ -43,6 +46,8 @@ export type SeriesCatalogSuggestion = SeriesCatalogSuggestionText & (
 ) & {
   /** A registered series' own name, and where it asks to be drawn for the ticker it was filled in for. */
   seriesName?: string;
+  /** A catalog formula's leg the others take their delivery month from (`CL=F`), as its entry gives it. */
+  rollsWith?: string;
   placement?: SeriesPlacement;
   symbol?: string;
 };
@@ -201,7 +206,9 @@ export function fieldCategory(field: TimeSeriesFieldDefinition): string {
   return "Fundamentals";
 }
 
+/** A market field is drawn at the chart's own bar size (1m on a day's chart), never fixed at its daily default. */
 function fieldFrequency(field: TimeSeriesFieldDefinition): string {
+  if (field.id.startsWith("market.")) return "Chart bars";
   return field.nativeFrequency === "auto"
     ? "Automatic"
     : `${field.nativeFrequency[0]!.toUpperCase()}${field.nativeFrequency.slice(1)}`;
@@ -267,9 +274,11 @@ function exactExpressionSuggestion(query: string): SeriesCatalogSuggestion | nul
   }
   const field = getTimeSeriesField(expression.fieldId);
   const instrument = publicTickerKey(expression.symbol, expression.exchange);
+  // Shown with the venue's code (9992:HKEX), as chart titles name it; the id keeps the stored key.
+  const shown = canonicalTickerKey(expression.symbol, expression.exchange);
   return {
     id: `${instrument}:${expression.fieldId}`,
-    label: expression.label ?? `${instrument} · ${field?.label ?? expression.fieldId}`,
+    label: expression.label ?? `${shown} · ${field?.label ?? expression.fieldId}`,
     description: field
       ? `${fieldCategory(field)} · ${fieldFrequency(field)}`
       : "Security series",
@@ -334,7 +343,7 @@ function registeredSeriesSuggestions(
       text = tickerQuery;
     }
     if (!matchesAliasQuery(text, entry.name, entry.expression, entry.id, entry.group ?? "", ...(entry.tags ?? []))) continue;
-    const prefix = symbol ? `${symbol} · ` : "";
+    const prefix = symbol ? `${canonicalTickerKey(instrument.symbol, instrument.exchange)} · ` : "";
     if (entry.lines?.length) {
       const lines = entry.lines.flatMap((line) => {
         const parsed = parseSeriesExpression(fill(line.expression));
@@ -358,7 +367,8 @@ function registeredSeriesSuggestions(
     if (formula !== undefined) {
       // A formula runs long: its name leads, and the formula is in the description.
       const formulaDescription = [formula, unit, entry.frequency].filter(Boolean).join(" · ");
-      return { id: `formula:${formula}`, label: entry.name, description: formulaDescription, detail, formula };
+      return { id: `formula:${formula}`, label: entry.name, description: formulaDescription, detail, formula,
+        seriesName: entry.name, ...(entry.rollsWith ? { rollsWith: entry.rollsWith } : {}) };
     }
     const placed = {
       seriesName: entry.name,
@@ -419,6 +429,17 @@ export function buildCapabilitySeriesSuggestions(
   }));
 }
 
+/**
+ * Whether a listing can have company fields (revenue, EPS, valuation): not a coin, a currency pair, an index or a
+ * future, which have prices alone. A coin's add-series list offered Revenue, Net Income and EPS.
+ */
+export function hasCompanyFields(instrument: SeriesCatalogInstrument): boolean {
+  const kind = classifyInstrumentType(instrument.assetCategory)
+    ?? kindFromListingSyntax(instrument.symbol, instrument.exchange)
+    ?? (isCryptoPairSymbol(instrument.symbol.trim().toUpperCase()) ? "crypto" : null);
+  return kind == null || kind === "equity" || kind === "fund" || kind === "other";
+}
+
 export function buildSeriesCatalogSuggestions(
   query: string,
   defaultInstrument: SeriesCatalogInstrument,
@@ -447,8 +468,10 @@ export function buildSeriesCatalogSuggestions(
   }
   const fieldLimit = instruments.length > 1 && !analysis.metricQuery ? 1 : rankedFields.length;
   for (const instrument of instruments) {
-    const instrumentLabel = publicTickerKey(instrument.symbol, instrument.exchange);
-    for (const { field } of rankedFields.slice(0, fieldLimit)) {
+    const instrumentKey = publicTickerKey(instrument.symbol, instrument.exchange);
+    const instrumentLabel = canonicalTickerKey(instrument.symbol, instrument.exchange);
+    const fields = hasCompanyFields(instrument) ? rankedFields : rankedFields.filter(({ field }) => field.id.startsWith("market."));
+    for (const { field } of fields.slice(0, fieldLimit)) {
       const expression: ParsedSeriesExpression = {
         kind: "security",
         symbol: instrument.symbol,
@@ -456,7 +479,7 @@ export function buildSeriesCatalogSuggestions(
         fieldId: field.id,
       };
       const suggestion: SeriesCatalogSuggestion = {
-        id: `${instrumentLabel}:${field.id}`,
+        id: `${instrumentKey}:${field.id}`,
         label: `${instrumentLabel} · ${field.label}`,
         description: [
           instrument.name,

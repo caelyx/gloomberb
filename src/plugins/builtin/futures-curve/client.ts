@@ -19,6 +19,13 @@ const rank = (value: unknown) => value === null || typeof value === "number" && 
 const optionalDate = (value: unknown) => value === undefined || value === null || date(value);
 /** Contract terms the pane computes with; a curve from before the server sent them has none. */
 const validSpec = (spec: unknown) => spec === undefined || spec === null || isFuturesContractSpec(spec);
+/** A contract's spot in its print's minute; absent from other roots and older servers. */
+function validContractSpot(spot: unknown): boolean {
+  if (spot === undefined || spot === null) return true;
+  if (typeof spot !== "object") return false;
+  const { symbol, price, minute } = spot as Record<string, unknown>;
+  return typeof symbol === "string" && typeof price === "number" && Number.isFinite(price) && price > 0 && timestamp(minute);
+}
 
 export function validateFuturesCurve(data: FuturesCurvePayload, root: string): FuturesCurvePayload {
   if (!data || data.root !== root || !Array.isArray(data.contracts) || !Array.isArray(data.ghosts)
@@ -39,7 +46,7 @@ export function validateFuturesCurve(data: FuturesCurvePayload, root: string): F
       || row.asOf !== null && !timestamp(row.asOf)
       || ![row.volume, row.openInterest, row.delayMinutes].every((value) => finiteOrNull(value) && (value === null || value >= 0))
       || row.settlement !== undefined && !finiteOrNull(row.settlement) || !optionalDate(row.lastTrade) || !optionalDate(row.firstNotice)
-      || row.inDelivery !== undefined && typeof row.inDelivery !== "boolean") {
+      || row.inDelivery !== undefined && typeof row.inDelivery !== "boolean" || !validContractSpot(row.spot)) {
       throw new Error("The server returned an invalid futures contract");
     }
     symbols.add(row.symbol);
@@ -57,7 +64,10 @@ export function validateFuturesCurve(data: FuturesCurvePayload, root: string): F
     || ![slope.percentile, slope.rollPercentile].every(rank) || !Number.isInteger(slope.samples) || slope.samples < 0
     || slope.asOf !== null && !timestamp(slope.asOf)
     || slope.basis != null && slope.basis !== "last" && slope.basis !== "settle"
-    || slope.thinSymbol != null && typeof slope.thinSymbol !== "string") throw new Error("The server returned an invalid futures spread");
+    || slope.thinSymbol != null && typeof slope.thinSymbol !== "string"
+    || slope.skippedSymbols != null && !(Array.isArray(slope.skippedSymbols) && slope.skippedSymbols.every((symbol) => typeof symbol === "string"))) {
+    throw new Error("The server returned an invalid futures spread");
+  }
   return data;
 }
 
@@ -94,6 +104,7 @@ export async function loadFuturesCurveAsOf(root: string, date: string,
       client.getCloudFuturesCurveAsOf(normalized, curveLookbackDate(date, 30)).catch(logFailure("futures-curve.client", "Load month comparison curve failed", null)),
     ]);
     if (!curve || curve.root !== normalized || !Array.isArray(curve.contracts) || !Array.isArray(curve.gaps)
+      || curve.notes !== undefined && (!Array.isArray(curve.notes) || curve.notes.some((note) => typeof note !== "string"))
       || curve.contracts.some((row) => !row || typeof row.symbol !== "string" || !Number.isFinite(row.price)
         || row.settled !== undefined && typeof row.settled !== "boolean" || !optionalDate(row.firstNotice) || !optionalDate(row.lastTrade))
       || !validSpec(curve.spec)) {
@@ -109,6 +120,25 @@ export async function loadFuturesCurveAsOf(root: string, date: string,
  */
 export async function loadCurveSpot(symbol: string, provider: Pick<DataProvider, "getQuote">, now = Date.now()): Promise<CurveSpot> {
   return curveSpot(symbol, await provider.getQuote(symbol, "").catch(logFailure("futures-curve.client", "Load curve spot quote failed", null)), now);
+}
+
+/**
+ * A month of the spot index's daily closes, read through the same history path
+ * the charts use, which the front premium takes its settlement session's close
+ * from. A failed read has none: the curve stands, its premium saying why.
+ */
+export async function loadCurveSpotCloses(symbol: string,
+  provider: Pick<AssetDataProvider, "getPriceHistoryForResolutionWithMetadata" | "getPriceHistoryForResolution">, force = false): Promise<{ date: Date; close: number }[]> {
+  const context = force ? { cacheMode: "refresh" as const } : undefined;
+  try {
+    if (provider.getPriceHistoryForResolutionWithMetadata) {
+      const history = await provider.getPriceHistoryForResolutionWithMetadata(symbol, "", "1M", "1d", context);
+      return history.resolution && history.resolution !== "1d" ? [] : history.points;
+    }
+    return provider.getPriceHistoryForResolution ? await provider.getPriceHistoryForResolution(symbol, "", "1M", "1d", context) : [];
+  } catch (error) {
+    return logFailure("futures-curve.client", "Load curve spot closes failed", [] as { date: Date; close: number }[])(error);
+  }
 }
 
 /** The last day of one-minute bars: the reach of a curve's trades a basis is read for, the far months' older ones aside. */

@@ -57,6 +57,7 @@ function harness(options: {
           { id: "ui:3", role: "button", label: "Always allow", actions: ["press"], metadata: { scope: "terminal-relay-prompt" } },
           { id: "ui:4", role: "form-field", label: "Password", actions: ["setValue"], metadata: { fieldType: "password", value: "hunter2", summary: "hunter2" }, paneId: "brokers:main" },
           { id: "ui:5", role: "input", actions: ["setValue"], metadata: { inputType: "password", value: "hunter2" }, paneId: "brokers:main" },
+          { id: "ui:6", role: "button", label: "Approve", actions: ["press"], metadata: { scope: "askg-prompt" } },
         ] };
       }
       if (request.type === "get" && request.resource.startsWith("app://pane-settings/")) {
@@ -301,7 +302,7 @@ describe("terminal relay engine", () => {
     }
   });
 
-  test("semantic UI: scrolling runs, pressing asks, and the relay's own prompt is out of reach", async () => {
+  test("semantic UI: scrolling runs, pressing asks, and the confirmation prompts are out of reach", async () => {
     const h = harness();
     h.grants.decide(ASSISTANT.id, ASSISTANT.name, "always");
     h.call("c1", "ui.invoke", { nodeId: "ui:2", action: "scrollBy", input: { delta: 3 } });
@@ -310,14 +311,17 @@ describe("terminal relay engine", () => {
 
     h.call("c2", "ui.invoke_matching", { role: "button", label: "Submit order" });
     await settle();
-    expect(h.confirmations[0]!.title).toBe("Press \"Submit order\"");
+    expect(h.confirmations[0]!.title).toBe("Press \"Submit order\" (button)");
     h.confirmations[0]!.answer("allow");
     await settle();
     expect(ran(h, "ui.invokeMatching")).toBe(1);
 
     h.call("c3", "ui.invoke", { nodeId: "ui:3", action: "press" });
+    // Ask Gloom's approval row is out of reach as well.
+    h.call("c4", "ui.invoke", { nodeId: "ui:6", action: "press" });
     await settle();
     expect(h.results().find((frame) => frame.id === "c3")).toMatchObject({ ok: false, error: { code: "not_allowed" } });
+    expect(h.results().find((frame) => frame.id === "c4")).toMatchObject({ ok: false, error: { code: "not_allowed" } });
     expect(h.confirmations).toHaveLength(1);
   });
 
@@ -370,6 +374,39 @@ describe("terminal relay engine", () => {
     expect(JSON.stringify(content.items)).not.toContain("hunter2");
   });
 
+  test("the snapshot tool reads the app's lean snapshot: layouts by name, panes, and the setup dialog as the open form", async () => {
+    // app://snapshot as the app answers it: no schema or guide, no layout paneState, no pane runtimeState.
+    const lean = {
+      rev: "r1",
+      app: { focusedPaneId: "quote:1", commandBarOpen: false },
+      config: { activeLayoutIndex: 1, layouts: [{ name: "Home", layout: { instances: [] } }, { name: "Monitor", layout: { instances: [] } }] },
+      panes: [{ instanceId: "quote:1", paneId: "quote", placement: "docked", focused: true }],
+      commandBar: { open: false, query: "", results: [] },
+      form: {
+        open: true,
+        kind: "setup",
+        step: "PORTFOLIO",
+        title: "What do you hold?",
+        fields: [{ nodeId: "ui:7", label: "API key", secret: true, filled: true }],
+      },
+      ui: [],
+      references: { full: "app://snapshot/full has all of it inline." },
+    };
+    const h = harness({ handle: async () => ({ ok: true, data: lean }) });
+    h.grants.decide(ASSISTANT.id, ASSISTANT.name, "always");
+    h.call("c1", "snapshot");
+    await settle();
+    const snapshot = h.results()[0]!.data as Record<string, unknown>;
+    expect(snapshot).toMatchObject({
+      rev: "r1",
+      activeLayout: { index: 1, name: "Monitor" },
+      layouts: [{ index: 0, name: "Home" }, { index: 1, name: "Monitor" }],
+      commandBar: { open: false, query: "", results: 0 },
+      form: lean.form,
+      items: lean.panes,
+    });
+  });
+
   test("a pane screenshot runs on the approval alone and its PNG leaves beside the items, not in them", async () => {
     const png = "iVBORw0KGgo".padEnd(600_000, "A");
     const h = harness({
@@ -393,6 +430,73 @@ describe("terminal relay engine", () => {
     expect((shot!.data as { image: { data: string } }).image.data).toBe(png);
     expect(JSON.stringify(shot!.data).length).toBeLessThan(900_000);
     expect(tui).toMatchObject({ ok: false, error: { code: "unsupported" } });
+  });
+
+  describe("a screen that changes while the person decides", () => {
+    function screenHarness() {
+      const screen: Array<Record<string, unknown>> = [
+        { id: "ui:1", role: "button", label: "Submit order", actions: ["press"] },
+        {
+          id: "ui:2",
+          role: "list",
+          label: "Results",
+          actions: ["activate"],
+          metadata: { scope: "command-bar", items: [{ index: 0, id: "ticker:AAPL", label: "AAPL", kind: "ticker" }] },
+        },
+      ];
+      const h = harness({
+        handle: async (request) => {
+          if (request.type === "get" && request.resource === "ui://tree") return { ok: true, data: screen };
+          if (request.type === "get") return { ok: false, error: { code: "remote_error", message: "Not here." } };
+          return { ok: true, data: { done: true } };
+        },
+      });
+      h.grants.decide(ASSISTANT.id, ASSISTANT.name, "always");
+      return { ...h, screen };
+    }
+
+    test("a press is not run when the control it named changed before the answer", async () => {
+      const h = screenHarness();
+      h.call("c1", "ui.invoke_matching", { role: "button", label: "Submit order" });
+      await settle();
+      h.screen[0] = { ...h.screen[0], label: "Cancel all orders" };
+      h.confirmations[0]!.answer("allow");
+      await settle();
+      expect(h.results()[0]).toMatchObject({ ok: false, error: { code: "not_allowed" } });
+      expect(String((h.results()[0]!.error as { message: string }).message)).toContain("changed while the person decided");
+      expect(ran(h, "ui.invokeMatching")).toBe(0);
+    });
+
+    test("no command-bar row runs while a confirmation is open, not even one that opens a ticker", async () => {
+      const h = screenHarness();
+      h.call("c1", "capability.invoke", { capabilityId: "x", operationId: "send" });
+      await settle();
+      h.call("c2", "command_bar.activate_result", { label: "AAPL" });
+      await settle();
+      expect(h.results().find((frame) => frame.id === "c2")).toMatchObject({ ok: false, error: { code: "not_allowed" } });
+      expect(ran(h, "commandBar.activateResult")).toBe(0);
+
+      // With the question answered, the same row runs without asking.
+      h.confirmations[0]!.answer("deny");
+      await settle();
+      h.call("c3", "command_bar.activate_result", { label: "AAPL" });
+      await settle();
+      expect(h.results().find((frame) => frame.id === "c3")).toMatchObject({ ok: true });
+    });
+
+    test("of two presses asked about together, the first one allowed runs before the second is asked", async () => {
+      const h = screenHarness();
+      h.call("c1", "ui.invoke_matching", { role: "button", label: "Submit order" });
+      h.call("c2", "ui.invoke_matching", { role: "button", label: "Submit order" });
+      await settle();
+      expect(h.confirmations).toHaveLength(1);
+      h.confirmations[0]!.answer("allow");
+      await settle();
+      expect(h.results().find((frame) => frame.id === "c1")).toMatchObject({ ok: true });
+      expect(ran(h, "ui.invokeMatching")).toBe(1);
+      // Only then the second question opens.
+      expect(h.confirmations).toHaveLength(2);
+    });
   });
 
   test("a tool this app did not generate is refused", async () => {

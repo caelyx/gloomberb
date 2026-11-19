@@ -4,6 +4,8 @@ import type { HeadlessPaneContext } from "../../../types/headless";
 import { estimateRevisionsLockNote } from "../estimate-revisions/lock-note";
 import { explainRefusal, refusedLock } from "./cloud-denied";
 import { proLockNote, type FreeRoute } from "./pro-lock-note";
+import { flowLockNote } from "../scanner/lock-note";
+import { riskFactorsLockNote } from "../risk-factors/lock-note";
 
 const free: FreeRoute[] = [{ text: (ticker, company) => `gloom events ${ticker} lists ${company}'s earnings dates.` }];
 
@@ -66,8 +68,8 @@ function routeData({ guided = [] as string[], eightKs = [] as string[], guidance
 }
 
 /**
- * GUID offered `fn GUIDE AAPL`, which answers "No data for AAPL:
- * not covered by GUIDE". A route is named only when it has data for the
+ * GUID offered `fn GUIDE AAPL`, which answers "Guidance for AAPL is not yet available".
+ * A route is named only when it has data for the
  * symbol; otherwise the next one that does, or none.
  */
 test("GUID names GUIDE only where GUIDE has guidance, else the company's 8-Ks, else no route", async () => {
@@ -125,6 +127,69 @@ test("a route check that stalls past the deadline or fails is no data for that n
   } finally {
     jest.useRealTimers();
   }
+});
+
+/**
+ * FLOW offered `options LHA:XETRA`, which answers "Options are not available", and `fn FLOW LHA:XETRA` once
+ * unlocked; RISK's note on IAG:LSE named a 10-K route it files none of. A note names only what reads the listing.
+ */
+test("a function whose free routes all answer that the listing has none says so, and names no command for that listing", async () => {
+  const chains: Record<string, () => Promise<unknown>> = {
+    AAPL: async () => ({ underlyingSymbol: "AAPL", expirationDates: [1_800_000_000], calls: [], puts: [] }),
+    LHA: async () => { throw new Error("No options provider available for LHA"); },
+    SAP: async () => { throw new Error("Service unavailable"); },
+  };
+  const context = {
+    marketData: { getOptionsChain: (ticker: string) => chains[ticker]!() },
+  } as unknown as HeadlessPaneContext;
+  const flow = (symbol: string) => flowLockNote({ gate: "sign-in", symbol, context });
+  const apple = await flow("AAPL");
+  expect(apple).toContain("Free, with no sign-in: gloom options AAPL lists AAPL's option chain");
+  expect(apple).toContain("gloom fn FLOW AAPL then reads");
+  expect((await flow("LHA:XETRA")).split("\n")).toEqual([
+    "FLOW is part of Gloom Cloud Pro: it streams real-time sweeps, blocks and large premium prints across US options exchanges. Signed out it shows none of it.",
+    "Options are not available for LHA:XETRA, so FLOW has no prints of it.",
+    "To read it in FLOW, open the app (gloom), log in or sign up from the command bar (Ctrl+P, Log In or Sign Up), then upgrade (Ctrl+P, UPGRADE); gloom fn FLOW then reads with that session.",
+  ]);
+  // A check that failed is not known to have none: no route is named, and the command keeps the ticker.
+  const failed = await flow("SAP:XETRA");
+  expect(failed).not.toContain("gloom options");
+  expect(failed).not.toContain("not available");
+  expect(failed).toContain("gloom fn FLOW SAP:XETRA then reads");
+
+});
+
+test("RISK names its page on gloom.sh, else the filings, and asks for no upgrade where the company files no 10-K or 20-F", async () => {
+  // AAPL has a report on gloom.sh and files 10-Ks; ASML files 20-Fs; ALL:ASX files neither.
+  const reports: Record<string, number> = { AAPL: 28, "BRK.B": 13 };
+  const forms: Record<string, string[]> = { AAPL: ["10-K"], ASML: ["20-F"], ALL: [] };
+  const context = {
+    marketData: { getQuote: async () => null },
+    apiClient: {
+      getCloudSecFilings: async ({ ticker, forms: [form] }: { ticker: string; forms: string[] }) =>
+        ({ filings: forms[ticker]!.includes(form!) ? [{ form }] : [] }),
+    },
+  } as unknown as HeadlessPaneContext;
+  const readSummary = async (wall: string, symbol: string, exchange?: string) => {
+    expect(wall).toBe("risk-wall");
+    // ALL:ASX is not Allstate: a venue abroad reads no US company's report.
+    const count = exchange && !["NASDAQ", "NYSE"].includes(exchange) ? undefined : reports[symbol];
+    return count ? { kind: "counts" as const, items: [{ label: "risk_count" as const, value: count }] } : null;
+  };
+  const note = (symbol: string) => riskFactorsLockNote({ gate: "sign-in", symbol, context }, readSummary);
+
+  const apple = (await note("AAPL")).split("\n");
+  expect(apple[1]).toBe("Free, with no sign-in: gloom.sh/stocks/aapl/risk-factors has AAPL's risk factors from each 10-K, with what was added, dropped or reworded since the year before.");
+  expect(apple[2]).toContain("then upgrade (Ctrl+P, UPGRADE); gloom fn RISK AAPL then reads");
+  // The page is named by the listing, as gloom.sh spells it: no venue, a share class after a dash.
+  expect(await note("AAPL:NASDAQ")).toContain("Free, with no sign-in: gloom.sh/stocks/aapl/risk-factors has AAPL:NASDAQ's risk factors");
+  expect(await note("BRK.B")).toContain("Free, with no sign-in: gloom.sh/stocks/brk-b/risk-factors has BRK.B's risk factors");
+  expect(await note("ASML")).toContain("Free, with no sign-in: gloom filings ASML --form 20-F lists");
+
+  expect((await note("ALL:ASX")).split("\n")).toEqual([
+    "RISK is part of Gloom Cloud Pro: it groups a 10-K's risk factors by theme and shows what was added, dropped or reworded since the year before. Signed out it shows none of it.",
+    "ALL:ASX's company files no 10-K or 20-F with the SEC, so RISK has no risk factors for it.",
+  ]);
 });
 
 async function flushMicrotasks() {

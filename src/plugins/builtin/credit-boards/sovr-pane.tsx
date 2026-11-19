@@ -21,16 +21,19 @@ import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
 import { formatPercentileRank } from "../../../utils/format";
 import { useAssetData, usePluginPaneState } from "../../runtime";
-import { formatAsOf } from "../cds/model";
 import { FIXED_INCOME_PANE_ID } from "../fixed-income/model";
 import { useCommandValue } from "../shared/command-tab";
+import { reportFooterSegment } from "../shared/source-footer";
 import { getCachedSovrBoard, loadCurrencyMoves, loadSovrBoard } from "./client";
+import { sovrHeadless } from "./headless";
+import { readsInBatches } from "../../../market-data/batched-reads";
 import {
   findSovereign,
   formatContract,
   formatCurrencyMove,
   formatLevel,
   formatMove,
+  SETTLEMENT_TEXT,
   sovrRows,
   type SovrRow,
 } from "./model";
@@ -65,7 +68,7 @@ function SovereignDetail({ row, width, height, focused }: { row: SovrRow; width:
   const { sovereign, year } = row;
   const items: StatItem[] = [
     { id: "level", label: "5Y spread", value: formatLevel("spread", sovereign.level),
-      detail: `${formatPercentileRank(year.percentile, "1Y")} · ${sovereign.date}` },
+      detail: [formatPercentileRank(year.percentile, "1Y"), sovereign.date, ...(sovereign.kind === "settlement" ? [SETTLEMENT_TEXT] : [])].join(" · ") },
     { id: "1m", label: "1M", value: formatMove("spread", sovereign.change1M) },
     { id: "1w", label: "1W", value: formatMove("spread", sovereign.change1W) },
     { id: "fx", label: "Currency 1M", value: formatCurrencyMove(sovereign.currency, row.currencyMove) },
@@ -99,9 +102,12 @@ export function SovrPane({ focused, width, height }: PaneProps) {
   // Each currency's month against the dollar, from the same daily closes the FX panes use.
   const currencies = useMemo(() => [...new Set(payload?.sovereigns.map((row) => row.currency) ?? [])].sort().join(","),
     [payload]);
-  const movesLoader = useCallback(() => provider && currencies
-    ? loadCurrencyMoves(currencies.split(","), (symbol) => provider.getPriceHistory(symbol, "", "3M"))
-    : Promise.resolve(NO_MOVES), [currencies, provider]);
+  const movesLoader = useCallback(async () => {
+    if (!provider || !currencies) return NO_MOVES;
+    // Every currency at once, in batch requests, from a source that batches them; a few at a time otherwise.
+    const batch = await readsInBatches(provider, "getPriceHistory");
+    return loadCurrencyMoves(currencies.split(","), (symbol) => provider.getPriceHistory(symbol, "", "3M", batch ? { batch } : undefined), batch);
+  }, [currencies, provider]);
   const moves = useAsyncResource(movesLoader, { keepPreviousData: true });
   const rows = useMemo(() => payload ? sovrRows(payload.sovereigns, payload.asOf, moves.data ?? NO_MOVES) : EMPTY_ROWS,
     [moves.data, payload]);
@@ -110,12 +116,16 @@ export function SovrPane({ focused, width, height }: PaneProps) {
     moves.reload();
   }, { focused, enabled: !loading });
 
-  const asOf = formatAsOf(payload?.asOf ?? null);
+  // Its source and the newest day the rows carry, not when the response was put together, as `fn SOVR` ends.
+  // The clock says the prints are delayed, so the line does not again.
+  const sourceLine = useMemo(() => payload
+    ? reportFooterSegment(sovrHeadless, { rows: payload.sovereigns.map((sovereign) => ({ date: sovereign.date })) }, { feed: false })
+    : null, [payload]);
   const info = useMemo<PaneFooterSegment[]>(() => [
-    ...(asOf ? [{ id: "as-of", parts: [{ text: `as of ${asOf}`, tone: "muted" as const }] }] : []),
+    ...(sourceLine ? [sourceLine] : []),
     ...(payload ? [DELAYED_SEGMENT] : []),
     ...(resource.data?.stale ? [{ id: "stale", parts: [{ text: "STALE", tone: "warning" as const }] }] : []),
-  ], [asOf, payload, resource.data?.stale]);
+  ], [payload, sourceLine, resource.data?.stale]);
   usePaneStatusFooter({
     registrationId: "sovr",
     loading: loading || moves.loading,

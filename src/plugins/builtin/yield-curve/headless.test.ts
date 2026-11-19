@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { describe, expect, test } from "bun:test";
 import type { HeadlessPaneContext, HeadlessPaneLoadArgs } from "../../../types/plugin";
 import { renderHeadlessPaneText } from "../../../cli/pane-functions/headless";
@@ -35,7 +36,7 @@ describe("yield curve headless model", () => {
     expect(result.metadata).toMatchObject({ asOf: "2026-10-20", treasuryDate: "2026-10-20", history: { tenor: "2Y" } });
     const lines = renderHeadlessPaneText(headless, result, swapArgs, "GC").split("\n");
     expect(lines.find((line) => line.startsWith("1Y "))).toMatch(/3\.50%\s+\+1\.2bp\s+-20\.5bp/);
-    expect(lines.find((line) => line.startsWith("5Y "))).toMatch(/-\s+-\s+-\s+2\s*$/);
+    expect(lines.find((line) => line.startsWith("5Y "))).toMatch(new RegExp(String.raw`${MISSING_VALUE}\s+${MISSING_VALUE}\s+${MISSING_VALUE}\s+2\s*$`));
     expect(lines.find((line) => line.startsWith("30Y "))).toMatch(/3 Thin/);
   });
 
@@ -94,7 +95,29 @@ describe("yield curve headless model", () => {
     expect(cells("2Y")).toEqual(["2Y", "2", "4.80%", "+5bp", "2026-10-09"]);
     expect(cells("10Y")[3]).toBe("-1bp");
     expect(cells("30Y")[3]).toBe("0bp");
-    expect(cells("5Y")[3]).toBe("-");
+    expect(cells("5Y")[3]).toBe(MISSING_VALUE);
+  });
+
+  test("the text prints the pane's spreads under the tenors, ranked when the stored curve ranks them", async () => {
+    const headless = createYieldCurveHeadless({
+      load: async (_curve, requestedDate) => ({
+        curve: "us", requestedDate, basis: "par", couponsPerYear: 2, lookbacks: null,
+        points: curve("2026-10-30", { "3M": 4.16, "2Y": 4.56, "5Y": 4.71, "10Y": 4.94, "30Y": 5.31 }),
+        spreads: [{ id: "2s10s", value: 0.38, change1d: 0.01, percentile1y: 20 }, { id: "3m10y", value: 0.78, change1d: -0.02, percentile1y: null },
+          { id: "5s30s", value: null, change1d: null, percentile1y: null }],
+      }),
+    });
+    const result = await headless.load(args, {} as HeadlessPaneContext);
+    const lines = renderHeadlessPaneText(headless, result, args, "GC").split("\n");
+    const at = lines.indexOf("Spreads");
+    expect(at).toBeGreaterThan(lines.findIndex((line) => line.startsWith("30Y ")));
+    expect(lines.slice(at + 1, at + 4)).toEqual([
+      "2s10s  +38bp  +1bp 1D \u00b7 20 pctl 1Y",
+      "3m10y  +78bp  -2bp 1D",
+      `5s30s  ${MISSING_VALUE}  ${MISSING_VALUE} 1D`,
+    ]);
+    // JSON keeps the spreads as numbers in metadata, not as text.
+    expect(result.metadata).toMatchObject({ spread2Y10YBasisPoints: 38, spread3M10YBasisPoints: 78, spread5Y30YBasisPoints: null });
   });
 
   test("leaves the move blank when the stored curve has no previous session, and loads FRED's look-backs for the fallback", async () => {
@@ -142,10 +165,25 @@ describe("yield curve headless model", () => {
     const text = renderHeadlessPaneText(createYieldCurveHeadless(), past, args, "GC");
     expect(text).not.toContain("Not issued");
     expect(text).not.toContain("Errors:");
-    expect(text.split("\n").find((line) => line.startsWith("1M "))!.split(/\s+/)).toContain("-");
+    expect(text.split("\n").find((line) => line.startsWith("1M "))!.split(/\s+/)).toContain(MISSING_VALUE);
 
     const latest = await createYieldCurveHeadless(stored(yields, null)).load(args, {} as HeadlessPaneContext);
     expect(latest.notes).toBeUndefined();
     expect(latest.errors).toEqual([`Tenors unavailable: ${["1M", "1Y", "2Y", "3Y", "5Y", "7Y", "20Y", "30Y"].join(", ")}`]);
   });
 });
+
+test("a date the US bond market was shut says so, and which session the curve shows", async () => {
+  const headless = createYieldCurveHeadless({
+    load: async (_curve, requestedDate) => ({
+      curve: "us", requestedDate, basis: "par", couponsPerYear: 2, lookbacks: null, spreads: null,
+      points: curve(requestedDate === "2026-11-11" ? "2026-11-10" : requestedDate, { "2Y": 4.73, "10Y": 4.98 }),
+    }),
+  });
+  const closed = await headless.load({ ...args, options: { date: "2026-11-11" } }, {} as HeadlessPaneContext);
+  expect(closed.notes).toContain("Wed 11 Nov: US bond market closed (Veterans Day); showing Tue 10 Nov");
+  // A day with its own curve says nothing.
+  const open = await headless.load({ ...args, options: { date: "2026-11-10" } }, {} as HeadlessPaneContext);
+  expect((open.notes ?? []).some((note) => note.includes("bond market closed"))).toBe(false);
+});
+

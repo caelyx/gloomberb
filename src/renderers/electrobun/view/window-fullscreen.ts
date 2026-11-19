@@ -1,5 +1,7 @@
-import { setWindowFullscreen } from "../../../components/layout/window-fullscreen";
+import { setWindowFullscreen, setWindowMaximized } from "../../../components/layout/window-fullscreen";
+import { detectPlatform } from "../../../utils/platform";
 import { backendRequest } from "./backend-rpc";
+import { logFailure } from "../../../utils/log-failure";
 
 /**
  * Long enough that dragging a window edge does not ask the host on every
@@ -12,7 +14,8 @@ const RESIZE_SETTLE_MS = 120;
  * Keeps the view's idea of its window's fullscreen state current. Electrobun
  * emits no fullscreen event and a webview cannot see its window's style mask,
  * but entering and leaving fullscreen always resizes the window, so the host
- * is asked every time the size settles.
+ * is asked every time the size settles. On Windows, so is maximizing, which
+ * takes away the window's top edge.
  */
 export function installElectrobunWindowFullscreenTracking(): () => void {
   let settleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -26,10 +29,16 @@ export function installElectrobunWindowFullscreenTracking(): () => void {
     }
     reading = true;
     try {
-      setWindowFullscreen(await backendRequest("host.windowFullscreen") === true);
-    } catch {
+      const [fullscreen, maximized] = await Promise.all([
+        backendRequest("host.windowFullscreen"),
+        detectPlatform() === "win32" ? backendRequest("host.windowMaximized") : false,
+      ]);
+      setWindowFullscreen(fullscreen === true);
+      setWindowMaximized(maximized === true);
+    } catch (error) {
       // A host too old to answer has the window chrome the header already
       // assumes, so leaving the last known state alone is the safe read.
+      logFailure("desktop-window", "Could not read the window's fullscreen state")(error);
     } finally {
       reading = false;
       if (readAgain) {

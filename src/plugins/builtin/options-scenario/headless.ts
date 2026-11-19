@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
 import { parsePublicTickerKey } from "../../../utils/exchanges";
 import { DATE_OPTION_EXAMPLES } from "../../../utils/calendar-date";
@@ -12,19 +13,19 @@ import {
 import { scenarioFreshness } from "./freshness";
 import { cashSecuredPut, cspReportEntries, loadNextEarningsDate } from "./csp";
 import { formatSpotTime } from "../options/model-spot";
-import { amountUnit, buildScenario, currencyLabel, exportPercent, parseLegs, scenarioValueUnit } from "./model";
+import { amountUnit, buildScenario, currencyLabel, exportPercent, parseLegs, scenarioDateLabels, scenarioValueUnit } from "./model";
 import { hedgeInputsFromSettings, hedgeReportEntries, scenarioHedgeBudget, seededLegQuotes } from "./hedge";
 import { collarReportEntries, scenarioCollar } from "./collar";
 import { modelDividendYieldNote } from "../../../market-data/model-dividend-yield";
 import { listingFateEmpty, loadListingFate } from "../../../tickers/listing-fate";
 
 // Float noise at a flat origin or a breakeven prints as 0.00, not -0.00.
-const money = (value: unknown) => typeof value === "number" ? (Math.abs(value) < 0.005 ? 0 : value).toFixed(2) : "--";
-const percent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(2)}%` : "--";
+const money = (value: unknown) => typeof value === "number" ? (Math.abs(value) < 0.005 ? 0 : value).toFixed(2) : MISSING_VALUE;
+const percent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(2)}%` : MISSING_VALUE;
 const supplied = (value: unknown) => value != null && value !== "";
 // A seeded entry is a quote midpoint, often to the half cent (5.495), so it keeps up to four decimals.
 const premium = (value: unknown) => typeof value === "number"
-  ? value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4, useGrouping: false }) : "--";
+  ? value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 4, useGrouping: false }) : MISSING_VALUE;
 /** Entry prices and spot are quoted per share of the underlying. */
 const PRICE_UNIT = "per share";
 /** The Valuation entries, in model order, with the unit each is in. */
@@ -141,7 +142,7 @@ export const optionsScenarioHeadless: HeadlessPaneDefinition<"bundle"> = {
       ? scenarioSpotBasis({}, { spot: market.spot!, legs: [] }, market) : null;
     const currency = position ? currencyLabel(position.currency) : null;
     const dividendNote = supplied(settings.dividendYield) ? null
-      : modelDividendYieldNote({ basis: market.dividendYieldBasis ?? "stated", lastPaid: market.dividendLastPaid });
+      : modelDividendYieldNote({ basis: market.dividendYieldBasis ?? "stated", lastPaid: market.dividendLastPaid, historyEnds: market.dividendHistoryEnds });
     // Value, P&L, risk and the grid add every contract; entry prices and spot are per share.
     const valueUnit = position ? scenarioValueUnit(position) : null;
     const per = `${currency} ${valueUnit}`;
@@ -155,7 +156,7 @@ export const optionsScenarioHeadless: HeadlessPaneDefinition<"bundle"> = {
         { title: "Position", columns: [
           { key: "side", header: "Side" }, { key: "strike", header: "Strike" }, { key: "expiry", header: "Expiry" },
           { key: "quantity", header: "Contracts" }, { key: "price", header: "Entry/share", format: premium },
-          { key: "volatility", header: "IV", format: (value) => typeof value === "number" ? `${(value * 100).toFixed(2)}%` : "--" },
+          { key: "volatility", header: "IV", format: (value) => typeof value === "number" ? `${(value * 100).toFixed(2)}%` : MISSING_VALUE },
           ...(midVolatility ? [{ key: "volatilityFrom", header: "IV from" }] : []),
           { key: "multiplier", header: "Multiplier" },
         ], rows: position!.legs.map((leg) => ({ ...leg, expiry: new Date(leg.expiration * 1000).toISOString().slice(0, 10),
@@ -167,7 +168,11 @@ export const optionsScenarioHeadless: HeadlessPaneDefinition<"bundle"> = {
             formatted: `${money(lastPrint)} ${PRICE_UNIT}${lastSession && lastSession !== "last price" ? ` (${scenarioSpotStamp(lastSession, market.asOf)})` : ""}` }] : []),
           ...(position!.underlying ? [{ key: "shares", label: "Shares held", value: position!.underlying.quantity, unit: "shares",
             formatted: `${position!.underlying.quantity.toLocaleString("en-US")} at ${money(position!.underlying.price)} ${PRICE_UNIT}` }] : []),
-          { key: "asOf", label: "Valued at", value: new Date(position!.asOf).toISOString(), formatted: formatSpotTime(position!.asOf) },
+          // The figures are valued at the scenario date; its spot, IVs and rate are as of the position's own time.
+          ...(scenario.controls.date !== position!.asOf ? [
+            { key: "asOf", label: "As of", value: new Date(position!.asOf).toISOString(), formatted: formatSpotTime(position!.asOf) },
+            { key: "valuedAt", label: "Valued at", value: new Date(scenario.controls.date).toISOString(), formatted: formatSpotTime(scenario.controls.date) },
+          ] : [{ key: "asOf", label: "Valued at", value: new Date(position!.asOf).toISOString(), formatted: formatSpotTime(position!.asOf) }]),
           { key: "rate", label: "Rate", value: exportPercent(position!.rate), unit: "%", formatted: percent(position!.rate) },
           // A yield read as 0 because no dividend was paid, or the dividend stopped, says so; a stated or typed one is the figure alone.
           { key: "dividendYield", label: "Dividend yield", value: exportPercent(position!.dividendYield), unit: "%", formatted: percent(position!.dividendYield)
@@ -189,8 +194,8 @@ export const optionsScenarioHeadless: HeadlessPaneDefinition<"bundle"> = {
         ] },
         { title: `Scenario grid (P&L, ${per})`, columns: [
           { key: "spot", header: "Spot/share", format: money },
-          { key: "move", header: "Move", format: (value) => typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "--" },
-          ...scenario.dates.map((date, index) => ({ key: `date${index}`, header: new Date(date).toISOString().slice(0, 10), format: money })),
+          { key: "move", header: "Move", format: (value) => typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : MISSING_VALUE },
+          ...scenarioDateLabels(scenario.dates).map((label, index) => ({ key: `date${index}`, header: label, format: money })),
         ], rows: scenario.grid.map((row) => ({ spot: row.spot, move: row.move,
           ...Object.fromEntries(row.values.map((value, index) => [`date${index}`, value])) })) },
       ] : [],

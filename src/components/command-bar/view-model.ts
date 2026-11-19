@@ -1,4 +1,5 @@
 import { matchPrefix, type Command } from "./commands/registry";
+import { ASSIST_CATEGORY } from "./assist/model";
 import { t, tf } from "../../i18n";
 
 export { rankTickerSearchItems } from "../../tickers/search";
@@ -193,6 +194,12 @@ const EXACT_MATCH_SECTION_PRIORITY = -150;
  */
 const DID_YOU_MEAN_SECTION_PRIORITY = -120;
 /**
+ * The offer to add a list pasted into the bar (`Add 12 symbols to a
+ * watchlist`): what the user put in, so it sits above the AI's reading of it.
+ */
+export const PASTED_LIST_CATEGORY = "Pasted list";
+const PASTED_LIST_SECTION_PRIORITY = -110;
+/**
  * The AI leads the rest even though it is the slowest source (~600ms+): it
  * translates the sentence the user typed into commands, which is the answer to
  * what they asked when no symbol matched outright. Its Thinking placeholder
@@ -200,6 +207,15 @@ const DID_YOU_MEAN_SECTION_PRIORITY = -120;
  * shifting the list.
  */
 const ASSIST_SECTION_PRIORITY = -100;
+/**
+ * Where the AI's section goes once the typed text names a listing: after the
+ * listings and the local matches, ahead of news and the rest of the corpus.
+ * The symbol is the answer there, and the AI's reading of it (DES on the same
+ * symbol) is a guess that arrives last; above the listings, its Thinking row
+ * would hold the top until the symbol's rows pushed it down, and its answer
+ * would push down the rows the user is reading.
+ */
+const ASSIST_AFTER_LISTINGS_PRIORITY = 150;
 /** Empty-bar recents lead the browse list, under an exact symbol or the AI. */
 const SUGGESTED_SECTION_PRIORITY = -90;
 /**
@@ -208,6 +224,23 @@ const SUGGESTED_SECTION_PRIORITY = -90;
  * at 190 and the rest of the corpus at 200 (both contributed by their provider).
  */
 const INSTRUMENTS_SECTION_PRIORITY = 100;
+
+/**
+ * Where the exact listing goes when the word also names one of the bar's own
+ * commands (`wordNamesCommand`): after the local matches, ahead of the other
+ * listings, so "full" runs Fullscreen Pane and EQ FULL sits under it.
+ */
+const EXACT_MATCH_AFTER_COMMANDS_PRIORITY = 50;
+
+/** `priorities` with the exact listing under the commands, for a word that names one. */
+export function exactMatchAfterCommands(priorities?: CommandBarCategoryPriorities): CommandBarCategoryPriorities {
+  return new Map([...priorities ?? [], ["Exact Match", EXACT_MATCH_AFTER_COMMANDS_PRIORITY]]);
+}
+
+/** `priorities` with the AI's section after the listings, for text that names one. */
+export function assistAfterListings(priorities?: CommandBarCategoryPriorities): CommandBarCategoryPriorities {
+  return new Map([...priorities ?? [], [ASSIST_CATEGORY, ASSIST_AFTER_LISTINGS_PRIORITY]]);
+}
 
 function getCategoryPriority(category: string, options?: CommandBarSectionOptions): number {
   const contributed = options?.categoryPriorities?.get(category);
@@ -219,6 +252,7 @@ function getCategoryPriority(category: string, options?: CommandBarSectionOption
   if (normalized === "exact match") return EXACT_MATCH_SECTION_PRIORITY;
   if (normalized === "did you mean") return DID_YOU_MEAN_SECTION_PRIORITY;
   if (category === PLUGIN_INSTALL_CATEGORY) return PLUGIN_INSTALL_SECTION_PRIORITY;
+  if (category === PASTED_LIST_CATEGORY) return PASTED_LIST_SECTION_PRIORITY;
   if (normalized === "instruments") return INSTRUMENTS_SECTION_PRIORITY;
   if (normalized === "suggested") return SUGGESTED_SECTION_PRIORITY;
   if (sectionOrder === "app-first") {

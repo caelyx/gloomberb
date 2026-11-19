@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { expect, test } from "bun:test";
 import { act } from "react";
 import { PaneFooterBar, PaneFooterProvider } from "../../../components/layout/pane/footer";
@@ -7,6 +8,7 @@ import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import type { AnalystRatingRecord, AnalystResearchData } from "../../../types/financials";
 import type { DataProvider } from "../../../types/data-provider";
 import { Box } from "../../../ui";
+import { createProviderMiss } from "../../../sources/provider-errors";
 import { AnalystResearchView } from "./analyst-pane";
 import { TestPaneProvider, createTestTicker, createTestPaneConfig } from "../../../test-support/pane";
 
@@ -79,11 +81,11 @@ function AnalystHarness({ provider, height }: { provider: DataProvider; height: 
   );
 }
 
-async function renderHarness(data: AnalystResearchData, height = HEIGHT): Promise<void> {
+async function renderHarness(data: AnalystResearchData | (() => Promise<AnalystResearchData>), height = HEIGHT): Promise<void> {
   const provider = {
     id: "test",
     name: "Test",
-    getAnalystResearch: async () => data,
+    getAnalystResearch: typeof data === "function" ? data : async () => data,
   } as unknown as DataProvider;
   await act(async () => {
     await tui.render(<AnalystHarness provider={provider} height={height} />, { width: WIDTH, height });
@@ -116,7 +118,7 @@ test("renders each rating's price target and only dashes the rows without one", 
   const noTargetRow = frame.split("\n").find((line) => line.includes("No Target"));
   expect(noTargetRow).toBeDefined();
   expect(noTargetRow).not.toMatch(/\$\d/);
-  expect(noTargetRow).toContain("-");
+  expect(noTargetRow).toContain(MISSING_VALUE);
 });
 
 /**
@@ -179,4 +181,58 @@ test("the selected action is the mean-target cursor, and a short pane keeps the 
   expect(lines[1]).toMatch(/^ ● Mean target [⠀-⣿]+\s*$/);
   expect(lines[2]).toContain("FIRM");
   expect(lines.filter((line) => line.includes("Raises")).length).toBeGreaterThanOrEqual(4);
+});
+
+/**
+ * Coverage that says why a firm acted puts that line beside the action, and
+ * the selected action's article is the footer's link. Actions no coverage
+ * explains show nothing there.
+ */
+test("a reason sits beside its action and the selected one links its article", async () => {
+  const ratings: AnalystRatingRecord[] = [
+    { ...research.ratings[0]!, reason: { text: "on margin pressure", url: "https://www.investing.com/news/a-93CH-1", source: "Investing.com" } },
+    research.ratings[2]!,
+  ];
+  await renderHarness({ ...research, ratings }, 16);
+  const frame = tui.frame();
+  expect(frame).toContain("REASON");
+  // The line takes the room the pane has left: at 96 columns, the start of it.
+  const reasoned = frame.split("\n").find((line) => line.includes("Truist Securities"));
+  expect(reasoned).toMatch(/Buy\s+on margin/);
+  const plain = frame.split("\n").find((line) => line.includes("No Target"));
+  expect(plain).not.toMatch(/on margin|REASON/);
+  expect(frame).toMatch(/source Investing\.com/);
+  expect(frame).toContain("pen");
+
+  await tui.emitKeypress({ name: "down", sequence: "\u001b[B" }, { frames: 2 });
+  await act(async () => { await Bun.sleep(50); await tui.setup().renderOnce(); });
+  expect(tui.frame()).not.toContain("source Investing.com");
+
+  // No reason anywhere: no column for one.
+  await renderHarness(research, 16);
+  expect(tui.frame()).not.toContain("REASON");
+});
+
+/**
+ * CENN, which no analyst covers, answered with the data service's empty
+ * status, and a source that failed with its reason code: the pane printed
+ * the code (UPSTREAM_ERROR) in its body and footer.
+ */
+test("a listing no analyst covers says so, and a source that failed says it in words", async () => {
+  await renderHarness(() => Promise.reject(createProviderMiss("NO_DATA")));
+  let frame = tui.frame();
+  expect(frame).toContain("No analyst coverage for NKE.");
+  expect(frame).not.toMatch(/NO_DATA|Consensus|upside vs|DATE/);
+
+  // Across the desktop bridge only the message is left.
+  await renderHarness(() => Promise.reject(new Error("NO_DATA")));
+  expect(tui.frame()).toContain("No analyst coverage for NKE.");
+
+  await renderHarness(() => Promise.reject(new Error("UPSTREAM_ERROR")));
+  frame = tui.frame();
+  expect(frame).toContain("Analyst research unavailable.");
+  // Said once: the body has nothing else, so the footer leaves it.
+  expect(frame.match(/did not answer/gi)).toHaveLength(1);
+  expect(frame).not.toContain("UPSTREAM_ERROR");
+  expect(frame).not.toContain("No analyst coverage");
 });

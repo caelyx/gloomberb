@@ -1,36 +1,86 @@
-import type { SupplyChainPayload, SupplyOptions, SupplyRole, SupplyRow } from "../../../api-client/supply-chain";
-import { SERIES_COLORS } from "../../../theme/series-colors";
-import { clipToDisplayWidth, displayWidth } from "../../../utils/format";
+import type { SupplyChainPayload, SupplyEvidenceItem, SupplyOptions, SupplyRole, SupplyRow } from "../../../api-client/supply-chain";
+import { currentThemeColorSet, SERIES_COLORS } from "../../../theme/series-colors";
+import { companyNameCase, shortCompanyName } from "../../../tickers/company-name";
+import { MISSING_VALUE, clipToDisplayWidth, displayWidth } from "../../../utils/format";
 import { revenueAmount } from "../revenue-breakdown/model";
 import { countOf, freePreviewNote } from "../shared/free-preview";
 import { entityTicker } from "./graph-model";
 import { activeRelationship, corroborationLabel, evidenceDate, evidenceLabel, isUnconfirmed, matchesSupplyOptions, trustTier } from "./trust";
 
-/** One colour per role from the shared series palette, the same in the table, the flow and the evidence. */
-export const ROLE_COLORS: Record<SupplyRole, string> = {
+/** Each role's slot of the shared series palette; the buildout pane's flow draws its suppliers, customers and competitors in the same. */
+export const ROLE_SLOTS: Readonly<Record<SupplyRole, string>> = {
   supplier: SERIES_COLORS[0], customer: SERIES_COLORS[1], partner: SERIES_COLORS[3], competitor: SERIES_COLORS[5], investee: SERIES_COLORS[7],
 };
+/**
+ * One colour per role, the same in the table, the flow, the graph and the
+ * evidence, as the drawing theme reads it: its colour-blind palette, and a
+ * shade that reads on a light page.
+ */
+export const ROLE_COLORS: Readonly<Record<SupplyRole, string>> = currentThemeColorSet(ROLE_SLOTS);
 
 /** A company, a customer the filer does not name, or a geographic or channel cohort that is not one company. */
 export type CounterpartyKind = "company" | "undisclosed" | "group";
-export const counterpartyKind = (row: SupplyRow): CounterpartyKind =>
+export const counterpartyKind = (row: Pick<SupplyRow, "counterparty">): CounterpartyKind =>
   row.counterparty.aggregate ? "group" : row.counterparty.anonymous ? "undisclosed" : "company";
 
 const GENERIC_WORDS = /\b(And|Of|The|Based|End|Customers?|Suppliers?|Vendors?|Channel|Partners?|Undisclosed|Other|Carriers?|Networks?|Cellular|Distributors?|Retailers?)\b/g;
 
+/**
+ * The measure a filer spells into an undisclosed customer's member ("Revenue Customer 1", "A/R Customer A"), which
+ * the share beside it already names: the label keeps what tells the customers apart.
+ */
+const MEASURE_PREFIX = /^(?:revenues?|net sales|sales|a\/r|ar|accounts receivables?|receivables?|trade receivables?)\s+(?=(?:customer|client|supplier|vendor)\b)/i;
+
 /** The counterparty's name without the kind spelled into it; the kind travels as its own label. */
-export function counterpartyLabel(row: SupplyRow): string {
+export function counterpartyLabel(row: Pick<SupplyRow, "counterparty" | "pctBasis">): string {
   const kind = counterpartyKind(row);
   if (kind === "company") return row.counterparty.name;
-  const name = counterpartyName(row).replace(/^Group: /, "").replace(/\s*\(undisclosed\)$/i, "");
+  const name = counterpartyName(row).replace(/^Group: /, "").replace(/\s*\(undisclosed\)$/i, "")
+    .replace(row.pctBasis ? MEASURE_PREFIX : /^$/, "");
   // Cohort labels arrive in title case from XBRL member names; generic words read lower case, names keep theirs.
   return name.replace(GENERIC_WORDS, (word) => word.toLowerCase()).replace(/^./, (first) => first.toUpperCase());
 }
+/**
+ * A related-party (connected) trade the report prints: the counterparty is
+ * the company's parent, its group or a company under the same control. The
+ * server labels a row one only when every disclosure behind it is one.
+ */
+export const isRelatedParty = (row: Pick<SupplyRow, "relatedParty">) => row.relatedParty === true;
+/** A company and its subsidiaries ("X及其子公司"): the figure is the group's, not X's alone. */
+const namedGroup = (row: SupplyRow) => row.entityScope === "group" && !row.counterparty.aggregate;
+/**
+ * What the counterparty is beside its name, the same in the table, the flow
+ * and the graph: a cohort group, an undisclosed name, a related party (so a
+ * parent's group never reads as a plain supplier or customer), and a company
+ * with its subsidiaries as a group. `short` for a narrow column.
+ */
 export const counterpartyKindLabel = (row: SupplyRow, short = false) => {
   const kind = counterpartyKind(row);
-  if (short) return kind === "group" ? "group" : kind === "undisclosed" ? "undisclosed" : null;
-  return kind === "group" ? `${row.role} group` : kind === "undisclosed" ? `undisclosed ${row.role}` : null;
+  if (kind === "group") return short ? "group" : `${row.role} group`;
+  if (kind === "undisclosed") return short ? "undisclosed" : `undisclosed ${row.role}`;
+  if (isRelatedParty(row)) return namedGroup(row) ? short ? "related group" : "related-party group" : "related party";
+  return namedGroup(row) ? short ? "group" : "corporate group" : null;
 };
+/**
+ * A row's role as the company it is read for sees it. An investee row runs
+ * from the holder to the company held, so read inbound its counterparty is
+ * the holder: Sinopec, whose interim report holds CATL shares, is CATL's
+ * investor, not its investee.
+ */
+export const rowRoleLabel = (row: Pick<SupplyRow, "role"> & { direction?: SupplyRow["direction"] }) =>
+  row.role === "investee" && row.direction === "in" ? "Investor" : roleLabel(row.role);
+/** The relationship in words: "Related-party supplier" for a related-party trade, else the role. */
+export const relationshipLabel = (row: Pick<SupplyRow, "role" | "relatedParty"> & { direction?: SupplyRow["direction"] }) =>
+  isRelatedParty(row) ? `Related-party ${rowRoleLabel(row).toLowerCase()}` : rowRoleLabel(row);
+
+/**
+ * The end of a counterparty's label that tells it apart, which a narrow column keeps whole while it cuts what comes
+ * before: the letter or number of an undisclosed customer ("Customer 1", "Customer A"). Null for a company's name.
+ */
+export function counterpartyLabelEnd(row: Pick<SupplyRow, "counterparty" | "pctBasis">): string | null {
+  if (counterpartyKind(row) !== "undisclosed") return null;
+  return / (?:\d{1,3}|[A-Z]|One|Two|Three|Four|Five|Six)$/i.exec(counterpartyLabel(row))?.[0] ?? null;
+}
 
 /** A filer's segment or product scope in plain words: "Compute And Networking Segment" reads "Compute & Networking". */
 export function scopeWords(scope: string): string {
@@ -46,26 +96,59 @@ export interface ShareParts {
   forms: readonly string[];
 }
 
+/** A word in lower case unless it is an initialism: "Gold" reads "gold", "LNG" stays. */
+const lowerFirst = (text: string) => text.replace(/^[A-Z](?=[a-z])/, (first) => first.toLowerCase());
+/** A company as a sentence names it: "Apple" for "Apple Inc.", "Newmont" for "NEWMONT Corp /DE/". */
+const companyWord = (entity: SupplyRow["reportingEntity"]) =>
+  shortCompanyName(companyNameCase(entity.name.replace(/\s*\/[A-Z]{2}\/\s*$/, ""))) || (entityTicker(entity) ?? entity.name);
+
 /**
  * A disclosed share and what it is a share of, in words. The denominator is
  * always the reporting company's: a supplier saying the focus company is 91%
- * of its revenue reads "of CRUS revenue", never as the focus company's.
+ * of its revenue reads "of CRUS revenue", never as the focus company's. A
+ * share of the company's own receivables says who is owed: "of receivables
+ * (owed to Apple)".
  */
 export function shareParts(row: SupplyRow, focusId?: string | null, { includeReporter = false }: { includeReporter?: boolean } = {}): ShareParts | null {
   if (row.pctOfRevenue === null || row.pctBasis === null || trustTier(row) !== 1 || isUnconfirmed(row) || !activeRelationship(row)) return null;
-  const reporter = includeReporter || (focusId && row.reportingEntity.id !== focusId) ? `${entityTicker(row.reportingEntity) ?? row.reportingEntity.name} ` : "";
+  const reverse = includeReporter || (!!focusId && row.reportingEntity.id !== focusId);
+  const reporter = reverse ? `${entityTicker(row.reportingEntity) ?? row.reportingEntity.name} ` : "";
   const scope = row.pctScope ? scopeWords(row.pctScope) : "";
   const basis = row.pctBasis === "cost" ? "cost of sales" : row.pctBasis;
   const value = `${Number(row.pctOfRevenue.toFixed(1))}%`;
-  // XBRL dimensions can qualify the numerator, denominator, or both. NVDA's
-  // NonUs fact is a share of total revenue, while TW omits a Data Center qualifier.
-  // Neither supports turning its dimensional member into an "of ..." claim.
-  if (row.sourceKind === "xbrl" && scope) return shareWords(value, [`${reporter}${basis} · context: ${scope}`, `${reporter}${basis}`]);
+  // A reverse share already names whose receivables they are.
+  const owed = row.pctBasis === "receivables" && !reverse ? ` (owed to ${companyWord(row.reportingEntity)})` : "";
   // A scope that names its own denominator ("Vendor non-trade receivables") is a description, read in lower case.
-  const scoped = scope && scope.toLowerCase().includes(basis) ? scope.replace(/^[A-Z](?=[a-z])/, (first) => first.toLowerCase()) : `${scope ? `${scope} ` : ""}${basis}`;
+  if (scope && scope.toLowerCase().includes(basis)) {
+    const scoped = lowerFirst(scope);
+    return shareWords(value, [`of ${reporter}${scoped}${owed}`, `of ${reporter}${scoped}`, `of ${reporter}${basis}`, `${reporter}${basis}`]);
+  }
+  // XBRL dimensions can qualify the numerator, denominator, or both. NVDA's
+  // NonUs fact is a share of total revenue, while TW omits a Data Center
+  // qualifier: a dimension reads in brackets after the basis, never as its
+  // denominator, and the narrowest form drops it whole. A product the filer
+  // measures against its revenue benchmark is a share of total revenue from
+  // that product's sales: Newmont's "27% of total revenue (gold sales)".
+  if (row.sourceKind === "xbrl" && scope) {
+    if (taggedDimension(row, "ProductOrService"))
+      return shareWords(value, [`of ${reporter}total ${basis} (${lowerFirst(scope)} sales)${owed}`, `of ${reporter}total ${basis}`, `${reporter}${basis}`]);
+    // A segment tag says where the revenue comes from or whose revenue it is a share of; the filing's sentence says
+    // which (`pctScopeBasis`): NVDA's 16% is of total revenue, from Compute & Networking; RPM's 24% of Consumer's own.
+    if (row.pctScopeBasis === "total")
+      return shareWords(value, [`of ${reporter}total ${basis}, from ${scope}${owed}`, `of ${reporter}total ${basis}`, `${reporter}${basis}`]);
+    if (row.pctScopeBasis === "segment")
+      return shareWords(value, [`of ${reporter}${scope} ${basis}${owed}`, `of ${reporter}segment ${basis}`, `${reporter}segment ${basis}`]);
+    // A segment tag not yet read is said as a tag, never as the share's base.
+    if (taggedDimension(row, "BusinessSegments") || /segment/i.test(row.pctScope ?? ""))
+      return shareWords(value, [`of ${reporter}${basis}, tagged ${scope}${owed}`, `of ${reporter}${basis}`, `${reporter}${basis}`]);
+    return shareWords(value, [`of ${reporter}${basis} (${scope})${owed}`, `${reporter}${basis}`]);
+  }
+  const scoped = `${scope ? `${scope} ` : ""}${basis}`;
   // Form alone does not identify a metric's duration: a 10-Q includes YTD facts.
-  return shareWords(value, [`of ${reporter}${scoped}`, `of ${reporter}${basis}`, `${reporter}${basis}`]);
+  return shareWords(value, [...(owed ? [`of ${reporter}${scoped}${owed}`] : []), `of ${reporter}${scoped}`, `of ${reporter}${basis}`, `${reporter}${basis}`]);
 }
+/** Whether a tagged XBRL fact carries this dimension: "ProductOrService=Gold". */
+const taggedDimension = (row: Pick<SupplyRow, "quote">, axis: string) => new RegExp(`(?:^|;)\\s*${axis}=`).test(row.quote);
 const shareWords = (value: string, forms: readonly string[]): ShareParts => {
   const distinct = forms.filter((form, index) => forms.indexOf(form) === index);
   return { value, basis: distinct[0]!, forms: distinct };
@@ -85,20 +168,24 @@ export const isTaggedFact = (row: Pick<SupplyRow, "sourceKind" | "quote">) => ro
 
 /**
  * What a disclosure says, in words. A sentence from the filing reads as it is;
- * a tagged XBRL fact reads as the kind of concentration it tags, its tagged
- * context and what the share is of: "Customer, Gold, revenue", never the
- * dimension names.
+ * a tagged XBRL fact reads as the kind of concentration it tags and its share
+ * in the Table's words: "Customer concentration: 27% of NEM total revenue
+ * (gold sales)", never the dimension names.
  */
-export function disclosureText(row: Pick<SupplyRow, "sourceKind" | "quote" | "pctScope" | "pctBasis">): string {
+export function disclosureText(row: SupplyRow): string {
   if (!isTaggedFact(row)) return row.quote;
   const type = /(?:^|;)\s*ConcentrationRiskByType=([^;]*)/.exec(row.quote)?.[1]?.replace(/^.*:/, "").replace(/ConcentrationRisk(Member)?$/, "") ?? "";
   const kind = type.replace(/([a-z])([A-Z])/g, "$1 $2").trim();
+  const label = kind ? `${kind[0]!.toUpperCase()}${kind.slice(1).toLowerCase()} concentration` : null;
+  // Read beside other sources, the share names the company it is a share of.
+  const share = shareParts(row, undefined, { includeReporter: true });
+  if (share) return label ? `${label}: ${share.value} ${share.basis}` : `${share.value} ${share.basis}`;
   const basis = row.pctBasis === "cost" ? "cost of sales" : row.pctBasis;
-  return [kind ? kind[0]!.toUpperCase() + kind.slice(1).toLowerCase() : null, row.pctScope ? scopeWords(row.pctScope) : null, basis]
+  return [label, row.pctScope ? scopeWords(row.pctScope) : null, basis]
     .filter((part): part is string => !!part).join(", ") || "Tagged in the filing";
 }
 
-export function counterpartyName(row: SupplyRow): string {
+export function counterpartyName(row: Pick<SupplyRow, "counterparty">): string {
   if (row.counterparty.aggregate) return `Group: ${row.counterparty.name.replace(/^Undisclosed customer \((.+)\)$/i, "$1")}`;
   if (!row.counterparty.anonymous) return row.counterparty.name;
   const name = row.counterparty.name;
@@ -108,6 +195,31 @@ export function counterpartyName(row: SupplyRow): string {
   return member ? `${member.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/\s*\(undisclosed\)/gi, "")} (undisclosed)` : name;
 }
 export const roleLabel = (role: SupplyRole) => role[0]!.toUpperCase() + role.slice(1);
+
+/** A listing code that reads as no word: 0700:HKEX, 1211.HK, 7203, and on SGX C38U:SGX or D05.SI, whose letters spell none either. */
+const numberedListing = (value: string) => /^\d[\dA-Z]*(?:[.:][A-Z]+)?$/i.test(value.trim()) || /^[A-Z]{1,2}\d[\dA-Z]*[.:](?:SGX|SI)$/i.test(value.trim());
+
+/**
+ * The focus company as the direction labels name it ("AAPL says"): its ticker
+ * when the ticker is a word, its short name when it is a number (Tencent for
+ * 0700:HKEX), and the code when no name is known.
+ */
+export function focusCompanyLabel(symbol: string, name?: string | null): string {
+  const company = name?.trim() ? shortCompanyName(companyNameCase(name.trim())) : "";
+  return company && numberedListing(symbol) ? company : symbol;
+}
+
+/**
+ * The focus company's name: the one its relationships are filed under, or on
+ * a numbered listing the listing's own, as the filed one is often its code or
+ * the exchange's short name there ("0700:HKEX", "MEITUAN-W").
+ */
+export function focusCompanyName(entityName: string | null | undefined, symbol: string, listingName?: string | null): string | null {
+  const filed = entityName?.trim() || null;
+  const listing = listingName?.trim() || null;
+  if (listing && (numberedListing(symbol) || !filed || numberedListing(filed))) return listing;
+  return filed;
+}
 
 const SUPPLY_ROLE_ORDER: readonly SupplyRole[] = ["customer", "supplier", "partner", "competitor", "investee"];
 export interface SupplyRoleCount { role: SupplyRole; counterparties: number; locked: number }
@@ -142,11 +254,59 @@ export function supplyRoleCounts(data: Pick<SupplyChainPayload, "says" | "names"
  */
 export const earlierRows = (data: Pick<SupplyChainPayload, "earlier">, view: "says" | "names"): SupplyRow[] => data.earlier?.[view] ?? [];
 
+/**
+ * The direction a table opens on before one is chosen: what the company says,
+ * unless its own reports name no one and others' name it (CATL: none of its
+ * own, ten from customers, competitors and a holder), not an empty table.
+ */
+export function openingSupplyView(data: Pick<SupplyChainPayload, "says" | "names" | "earlier">, options: Required<SupplyOptions>): "says" | "names" {
+  const shown = (rows: SupplyRow[]) => rows.some((row) => matchesSupplyOptions(row, options));
+  return !shown(data.says) && !shown(earlierRows(data, "says")) && shown(data.names) ? "names" : "says";
+}
+
 /** Disclosures a free preview withholds from these views: the server's counts less the rows it sent. */
 export function lockedDisclosures(data: Pick<SupplyChainPayload, "says" | "names" | "counts" | "earlier" | "earlierCounts">, views: readonly ("says" | "names")[]): number {
   const total = (counts: Record<SupplyRole, number> | undefined) => Object.values(counts ?? {}).reduce((a, b) => a + b, 0);
   return views.reduce((sum, view) => sum + Math.max(0, total(data.counts[view]) - data[view].length)
     + Math.max(0, total(data.earlierCounts?.[view]) - earlierRows(data, view).length), 0);
+}
+
+/** Countries whose companies' own filings SPLC reads (docs/supply-chain.md, Coverage and limitations). */
+const FILING_COUNTRIES = new Set(["US", "KR"]);
+/**
+ * Where SPLC reads companies' own annual reports from the exchange: Hong
+ * Kong (HKEX), mainland China (cninfo) and Singapore (SGXNet), by the
+ * company's country or its listing's exchange. A few reports are read at a
+ * time, so a company there may not have had its report read yet.
+ */
+const REPORT_COUNTRIES = new Set(["HK", "CN", "SG"]);
+const REPORT_EXCHANGES = new Set(["HKEX", "SSE", "SZSE", "SGX"]);
+
+/**
+ * What a company with no disclosed relationship at all reads instead of an
+ * empty table. The server gives an entity's country as an ISO code (`US`,
+ * `KR`, `TW`) or none. A company in a country whose filings SPLC does not
+ * read names the markets it does; one whose country is not known is never
+ * said to be outside them. All but a US or Korean company point to the side
+ * that can still name it: a customer's filings name their suppliers.
+ * `command` is how the reader opens another company's supply chain ("fn SPLC
+ * AAPL" in the CLI). Null when there are relationships.
+ */
+export function supplyEmptyText(data: Pick<SupplyChainPayload, "symbol" | "entity" | "says" | "names" | "earlier">, command = (symbol: string) => `SPLC ${symbol}`): string | null {
+  if (data.says.length || data.names.length || data.earlier?.says.length || data.earlier?.names.length) return null;
+  const code = data.entity?.country?.trim().toUpperCase() ?? "";
+  const country = /^[A-Z]{2}$/.test(code) ? code : null;
+  const exchange = data.entity?.exchange?.trim().toUpperCase() ?? "";
+  const customerSide = `A customer's filings name its suppliers: try the customer's side, such as ${command("AAPL")}.`;
+  // Not yet available, never an error: what is read so far names none.
+  const none = `Relationships for ${data.symbol} are not yet available:`;
+  if (country && FILING_COUNTRIES.has(country)) return `${none} no filing, announcement or call read so far names one.`;
+  if ((country && REPORT_COUNTRIES.has(country)) || REPORT_EXCHANGES.has(exchange)) {
+    return `${none} no annual report, announcement or call read so far names one. ${customerSide}`;
+  }
+  if (!country) return `${none} no filing, announcement or call read so far names one. ${customerSide}`;
+  return `${none} SPLC reads company filings from the US and Korea and annual reports from Hong Kong, mainland China `
+    + `and Singapore, plus announcements and calls, and none read so far names one. ${customerSide}`;
 }
 
 /** The lock line of a free preview, in the same words in the pane and `fn SPLC`. */
@@ -155,12 +315,49 @@ export function supplyPreviewNote(data: Pick<SupplyChainPayload, "previewRowsPer
     adds: locked > 0 ? `${locked.toLocaleString("en-US")} more` : null });
 }
 
-export const percentage = (row: SupplyRow) => row.pctOfRevenue === null || trustTier(row) !== 1 || isUnconfirmed(row) || !activeRelationship(row) ? "--" : `${Number(row.pctOfRevenue.toFixed(2))}% ${row.pctScope ? "scoped " : ""}${row.pctBasis ?? ""}`;
-export const dollars = (row: SupplyRow) => row.usd === null ? "--" : `${row.usdBasis === "derived" ? "≈ " : ""}$${revenueAmount(row.usd)} ${row.usdBasis}`;
-const scaleLabel = (scale: number) => scale === 1 ? "" : scale === 1_000 ? " thousand" : scale === 1_000_000 ? " million" : scale === 1_000_000_000 ? " billion" : ` ×${scale.toLocaleString("en-US")}`;
+export const percentage = (row: SupplyRow) => row.pctOfRevenue === null || trustTier(row) !== 1 || isUnconfirmed(row) || !activeRelationship(row) ? MISSING_VALUE : `${Number(row.pctOfRevenue.toFixed(2))}% ${row.pctScope ? "scoped " : ""}${row.pctBasis ?? ""}`;
+export const dollars = (row: SupplyRow) => row.usd === null ? MISSING_VALUE : `${row.usdBasis === "derived" ? "≈ " : ""}$${revenueAmount(row.usd)} ${row.usdBasis}`;
+/** A disclosed scale in words, as the filing prints it: 万元 is ten thousand yuan, 亿元 a hundred million. */
+const SCALE_WORDS: ReadonlyMap<number, string> = new Map([[1, ""], [1_000, " thousand"], [10_000, " ten thousand"], [1_000_000, " million"], [100_000_000, " hundred million"], [1_000_000_000, " billion"]]);
+const scaleLabel = (scale: number) => SCALE_WORDS.get(scale) ?? ` ×${scale.toLocaleString("en-US")}`;
+/** A source value's printed unit as its multiplier: "ten_thousands" (万元) is 10,000. */
+const UNIT_SCALES: Readonly<Record<string, number>> = { units: 1, thousands: 1_000, ten_thousands: 10_000, millions: 1_000_000, hundred_millions: 100_000_000, billions: 1_000_000_000 };
+/** What a source value measures, in words: "related_party_group_purchases" reads "Related-party purchases". */
+export function sourceValueLabel(kind: string | null): string {
+  if (!kind) return "Source value";
+  const related = /^related_party_(?:group_)?(sales|purchases)$/.exec(kind);
+  if (related) return `Related-party ${related[1]}`;
+  const words = kind.replace(/_/g, " ").trim();
+  return words ? words[0]!.toUpperCase() + words.slice(1) : "Source value";
+}
+/**
+ * A source value in its currency and printed unit, as a row's value reads:
+ * "26,909,758,882.26 CNY", "12,345 CNY ten thousand", "4.5%". An amount in a
+ * unit of a currency takes the row's currency when its own line names none,
+ * and is not shown without one: "9,771,378 ten thousand" says nothing.
+ */
+export function sourceValueText(item: Pick<SupplyEvidenceItem, "value" | "valueUnit" | "currency">, rowCurrency?: string | null): string | null {
+  if (item.value === null) return null;
+  const scale = item.valueUnit ? UNIT_SCALES[item.valueUnit] : undefined;
+  const amount = printedAmount(item.value, scale);
+  if (scale !== undefined) {
+    const currency = item.currency || rowCurrency;
+    return currency ? `${amount} ${currency}${scaleLabel(scale)}` : null;
+  }
+  if (item.valueUnit === "percent" || item.valueUnit === "per cent") return `${amount}%`;
+  return [amount, item.currency, item.valueUnit].filter(Boolean).join(" ");
+}
+/**
+ * An amount as printed, in its unit. One in units of the currency with a
+ * fraction is in cents, to two places: a related-party total of
+ * 822,340,444.90 never reads 822,340,444.9.
+ */
+function printedAmount(value: number, scale: number | undefined): string {
+  return value.toLocaleString("en-US", { maximumFractionDigits: 12, minimumFractionDigits: scale === 1 && !Number.isInteger(value) ? 2 : 0 });
+}
 /** Retain the original currency and disclosed scale; never imply an FX conversion. */
 export const nativeValue = (row: SupplyRow) => row.nativeAmount == null || !row.nativeCurrency || !row.nativeScale ? null
-  : `${row.nativeAmount.toLocaleString("en-US", { maximumFractionDigits: 12 })} ${row.nativeCurrency}${scaleLabel(row.nativeScale)}`;
+  : `${printedAmount(row.nativeAmount, row.nativeScale)} ${row.nativeCurrency}${scaleLabel(row.nativeScale)}`;
 export const disclosedValue = (row: SupplyRow) => nativeValue(row) ?? dollars(row);
 const QUOTE_LANGUAGES: Record<string, string> = { ko: "Korean", ja: "Japanese", zh: "Chinese", "zh-TW": "Chinese", "zh-Hant": "Chinese", "zh-Hans": "Chinese", en: "English" };
 export const quoteLanguageLabel = (row: Pick<SupplyRow, "quoteLanguage">) => QUOTE_LANGUAGES[row.quoteLanguage ?? ""] ?? row.quoteLanguage ?? "original language";
@@ -170,18 +367,31 @@ export const quoteLanguageLabel = (row: Pick<SupplyRow, "quoteLanguage">) => QUO
  * when the source does not say; a form or a period label never does.
  */
 function periodLength(months: number | null | undefined): string | null {
-  if (months == null) return null;
-  return months === 0 ? "instant" : months === 3 ? "quarter" : months === 6 ? "half" : months === 12 ? "year" : `${months} month${months === 1 ? "" : "s"}`;
+  if (months == null || months === 0) return null;
+  return months === 3 ? "quarter" : months === 6 ? "half" : months === 12 ? "year" : `${months} month${months === 1 ? "" : "s"}`;
 }
-/** The period end with its length when the source states it: 2026-07-31 half. */
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+/** A period end as the reports print a day, "26 Sep 2026"; a label that is no calendar day stays as the source wrote it. */
+export function periodDate(period: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(period);
+  const month = match ? MONTHS[Number(match[2]) - 1] : undefined;
+  return match && month ? `${Number(match[3])} ${month} ${match[1]}` : period;
+}
+/**
+ * The period end with its length when the source states it: "year to 31 Dec
+ * 2025", "half to 31 Jul 2026", and a balance such as receivables "as of 26
+ * Sep 2026".
+ */
 export const periodText = (row: Pick<SupplyRow, "period" | "periodMonths">) => {
+  const day = periodDate(row.period);
+  if (row.periodMonths === 0) return `as of ${day}`;
   const length = periodLength(row.periodMonths);
-  return length ? `${row.period} ${length}` : row.period;
+  return length ? `${length} to ${day}` : day;
 };
 export const sourceLabel = (row: SupplyRow) => row.sourceKind === "xbrl" ? "XBRL" : row.sourceKind === "filing_text" ? row.form ?? "Filing" : row.sourceKind === "call" ? "Call" : row.sourceKind === "news" ? "News" : row.sourceKind === "press_release" ? "Release" : row.sourceKind === "web" ? "Web" : "Disclosure";
 export function cellText(row: SupplyRow, column: string): string {
-  return column === "name" ? counterpartyName(row) : column === "ticker" ? entityTicker(row.counterparty) ?? "--"
-    : column === "role" ? roleLabel(row.role) : column === "direction" ? row.direction === "in" ? "In" : row.direction === "out" ? "Out" : "Both"
+  return column === "name" ? counterpartyName(row) : column === "ticker" ? entityTicker(row.counterparty) ?? MISSING_VALUE
+    : column === "role" ? rowRoleLabel(row) : column === "direction" ? row.direction === "in" ? "In" : row.direction === "out" ? "Out" : "Both"
     : column === "pct" ? percentage(row) : column === "usd" ? disclosedValue(row) : column === "fy" ? periodText(row)
     : column === "publisher" ? row.evidence?.find((item) => item.status === "active")?.publisher ?? row.reportingEntity.name
     : column === "corroboration" ? corroborationLabel(row)

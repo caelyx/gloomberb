@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { CompositeChart, DataTableView, EmptyState, PaneStatusBody, QueryBar, StatGrid, statGridRows, usePaneFooter,
   usePaneNoticeFooter, usePaneTabs, usePaneTicker, type DataTableCell, type DataTableColumn, type StatItem } from "../../../components";
@@ -23,7 +24,7 @@ export const LOOKBACK_OPTIONS = [{ value: "5", label: "5Y" }, { value: "10", lab
 /** The move that tints a cell at full strength: a month of ±10%, a year of ±30%, an average session of ±0.5%. */
 const MONTH_SCALE = 0.1, YEAR_SCALE = 0.3, SESSION_SCALE = 0.005;
 function pct(value: number | null | undefined, digits = 1): string {
-  if (value == null) return "--";
+  if (value == null) return MISSING_VALUE;
   const fixed = (value * 100).toFixed(digits);
   // A return that rounds to zero reads 0.0%, never -0.0%.
   return /[1-9]/.test(fixed) ? `${value > 0 ? "+" : ""}${fixed}%` : `${(0).toFixed(digits)}%`;
@@ -49,7 +50,7 @@ function tableRows(model: SeasonalityModel): Row[] {
 
 function hitCell(value: number | null, quiet = false): DataTableCell {
   const heat = resolveHeatCellColors(value == null ? null : (value - 0.5) * 2, { quiet });
-  return { text: value == null ? "--" : `${Math.round(value * 100)}%`, value: value == null ? null : value * 100,
+  return { text: value == null ? MISSING_VALUE : `${Math.round(value * 100)}%`, value: value == null ? null : value * 100,
     backgroundColor: heat.background, color: heat.foreground };
 }
 
@@ -131,7 +132,7 @@ function monthStats(model: SeasonalityModel): StatItem[] {
   const current = model.years[0]!;
   return [
     { id: "month-avg", label: `${MONTH_LABELS[month]} avg`, value: pct(stat.mean), tone: tone(stat.mean) },
-    { id: "month-hit", label: `${MONTH_LABELS[month]} up`, value: stat.count ? `${Math.round(stat.hitRate! * 100)}%` : "--",
+    { id: "month-hit", label: `${MONTH_LABELS[month]} up`, value: stat.count ? `${Math.round(stat.hitRate! * 100)}%` : MISSING_VALUE,
       detail: stat.count ? `${Math.round(stat.hitRate! * stat.count)} of ${stat.count} yrs` : undefined },
     ...(current.partial ? [{ id: "ytd", label: `${current.year} YTD`, value: pct(current.total), tone: tone(current.total) }] : []),
   ];
@@ -161,7 +162,7 @@ export function SeasonalityPane({ width, height, focused }: PaneProps) {
   });
   useEffect(() => () => controller.current?.abort(), [loader]);
   useAutoRefresh(history.updatedAt, history.load);
-  usePaneRefreshKey(() => { void history.reload(); }, { focused });
+  usePaneRefreshKey(() => { history.reload(); }, { focused });
 
   const lookbackYears = Number(lookback) || 10;
   const model = useMemo(() => history.data && cadence === "monthly"
@@ -177,8 +178,10 @@ export function SeasonalityPane({ width, height, focused }: PaneProps) {
 
   usePaneNoticeFooter({ registrationId: "seasonality-notices", focused,
     notices: [...new Set([identityError, history.error, history.data?.error].filter((value): value is string => !!value))] });
-  const closes = model?.asOf ? `monthly closes to ${model.asOf.toISOString().slice(0, 7)}`
-    : weekdayModel?.start ? `daily closes ${weekdayModel.start} to ${weekdayModel.asOf}` : null;
+  const rolls = history.data?.rollNote ? ` · ${history.data.rollNote}` : "";
+  // From the first month on record when the lookback reaches before it.
+  const closes = model?.asOf ? `monthly closes ${model.historyStart ? `${model.historyStart} ` : ""}to ${model.asOf.toISOString().slice(0, 7)}${rolls}`
+    : weekdayModel?.start ? `daily closes ${weekdayModel.start} to ${weekdayModel.asOf}${rolls}` : null;
   usePaneFooter("seasonality", () => ({ info: [
     ...(history.loading ? [{ id: "loading", parts: [{ text: "loading history", tone: "muted" as const }] }] : []),
     ...(history.data?.stale ? [{ id: "stale", parts: [{ text: "stale history", tone: "warning" as const }] }] : []),
@@ -218,7 +221,8 @@ export function SeasonalityPane({ width, height, focused }: PaneProps) {
               formatCursor: (ratio) => new Date(Date.UTC(OVERLAY_YEAR, 0, 1) + ratio * 365 * 86_400_000).toISOString().slice(5, 10) }}
             colors={{ background: palette.bgColor, grid: palette.gridColor, crosshair: palette.crosshairColor, text: colors.text,
               textDim: palette.axisColor, negative: colors.negative }} />
-          : <DataTableView<Row> focused={focused} columns={COLUMNS} items={rows} rootWidth={width} rootHeight={contentHeight}
+          // January to December: the grid is a calendar.
+          : <DataTableView<Row> focused={focused} columns={COLUMNS} columnReorder={false} items={rows} rootWidth={width} rootHeight={contentHeight}
             getItemKey={(row) => row.id} emptyStateTitle="No monthly returns." sortColumnId={null} sortDirection="desc"
             selection={{ kind: "id", selectedId: selectedRow, getId: (row) => row.id, onChange: (id) => setSelectedRow(id) }}
             getExportMetadata={() => [["symbol", model.symbol], ["as of", model.asOf?.toISOString()], ["units", "percent, local-price close to close"]]}

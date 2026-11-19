@@ -3,9 +3,10 @@ import { canonicalTimeSeriesFieldId, isMarketFieldId } from "./field-catalog";
 import type { QuoteSubscriptionTarget } from "../types/data-provider";
 import type { Quote } from "../types/financials";
 import type { ChartSeriesSpec, ChartSpec, SecuritySeriesSource } from "./types";
-import { activeStudyInputSeriesIds } from "./studies";
+import { activeStudyInputSeriesIds } from "./studies/resolve";
+import { withFormulaNextMonths } from "./formula-months";
 import { valuationSeriesUsesLiveQuote } from "./fundamentals";
-import { hasValidQuoteObservationTime } from "../market-data/quotes/freshness";
+import { hasValidQuoteObservationTime, quoteStampBucket } from "../market-data/quotes/freshness";
 import type { InstrumentRef } from "../market-data/request-types";
 import type { QueryEntry } from "../market-data/result-types";
 import { buildQuoteKey, instrumentFromQuoteTarget, resolveEntryData } from "../market-data/selectors";
@@ -41,12 +42,15 @@ function supportsLiveQuote(
 /**
  * Displayed or study-required quote-sensitive instruments, deduplicated by
  * routing identity. `visible: false` marks a chart that is not on screen, so
- * its quotes arrive at the off-screen cadence.
+ * its quotes arrive at the off-screen cadence. A formula priced in one
+ * delivery month follows its legs' next months too (RB2 beside RB=F), so its
+ * latest value is in one month between the rolls, as its settled ones are.
  */
 export function getLiveChartQuoteTargets(
-  spec: ChartSpec,
+  chart: ChartSpec,
   priority: { selected?: boolean; visible?: boolean } = {},
 ): QuoteSubscriptionTarget[] {
+  const spec = withFormulaNextMonths(chart);
   const targets = new Map<string, QuoteSubscriptionTarget>();
   const activeStudyInputs = activeStudyInputSeriesIds(spec.studies);
   for (const series of spec.series) {
@@ -101,19 +105,13 @@ function isNewerQuote(next: Quote, current: Quote | undefined): boolean {
     && (next.stale === true) !== (current.stale === true));
 }
 
-/** Every chart bar boundary, intraday or calendar, is a whole minute. */
-const QUOTE_TIME_BUCKET_MS = 60_000;
-
-function quoteTimeBucket(quote: Quote): number {
-  return Number.isFinite(quote.lastUpdated) ? Math.floor(quote.lastUpdated / QUOTE_TIME_BUCKET_MS) : Number.NaN;
-}
-
 function hasResolutionRelevantChange(next: Quote, current: Quote | undefined): boolean {
   if (!current) return true;
   // Bid/ask updates restamp a quote many times a second without moving its
   // price or volume. The stamp alone matters only when it crosses into
   // another minute, where it can open a bar at the same price.
-  return !Object.is(quoteTimeBucket(next), quoteTimeBucket(current))
+  // Every chart bar boundary, intraday or calendar, is a whole minute (quoteStampBucket).
+  return !Object.is(quoteStampBucket(next), quoteStampBucket(current))
     || next.price !== current.price
     || next.volume !== current.volume
     || next.stale !== current.stale

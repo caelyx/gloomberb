@@ -1,13 +1,14 @@
 import { apiClient } from "../../../api-client";
-import type { FundFactsPayload, FundLeverage, FundMetalHoldings } from "../../../api-client/fund-facts";
+import type { FundCoinHoldings, FundFactsPayload, FundLeverage, FundMetalHoldings, FundNoteFacts, FundStructure } from "../../../api-client/fund-facts";
 import type { StatItem } from "../../../components/ui/stat-grid";
 import { leverageFactorLabel } from "../../../time-series/leverage";
 import { t, tf } from "../../../i18n";
 import { createPluginCache } from "../../../data/plugin-cache";
 import type { HeadlessPaneEntry } from "../../../types/plugin";
 import { errorMessage } from "../../../utils/errors";
-import { formatCompact } from "../../../utils/format";
-import { bondClassText, bondFigures, isBondFactsShape } from "../../../market-data/bond-funds";
+import { MISSING_VALUE, formatCompact, formatCurrency } from "../../../utils/format";
+import { bondClassText, bondFigures, DV01_FROM_DURATION, durationDv01PerShare, formatDv01PerShare } from "../../../market-data/bond-funds";
+import { readFundFacts, validateFundFacts } from "../../../market-data/fund-facts";
 import { cachedCloudResource, loadCloudResource, unavailableOnServer } from "../shared/cloud-resource";
 
 /** Sponsors publish once a day, in the US evening; a copy younger than this is not asked for again. */
@@ -16,28 +17,6 @@ export const fundFactsCache = createPluginCache<FundFactsPayload>({
 });
 
 type Client = Pick<typeof apiClient, "getFundFacts">;
-
-const fact = (value: unknown) => value === null || (typeof value === "object" && value !== null && "value" in value && "source" in value);
-const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
-
-function isMetalHoldingsShape(value: FundFactsPayload["metalHoldings"]): boolean {
-  return value == null || ((value.metal === "gold" || value.metal === "silver") && typeof value.asOf === "string" && finite(value.ounces)
-    && (value.tonnes === null || finite(value.tonnes)) && typeof value.source?.publisher === "string"
-    && (value.change === null || (typeof value.change?.since === "string" && finite(value.change.ounces))));
-}
-
-/** Absent from servers before it; otherwise a dated factor with its reset period. */
-const leverageShape = (value: FundFactsPayload["leverage"]) => value === undefined || value === null
-  || (fact(value) && typeof value.value === "number" && Number.isFinite(value.value) && (value.reset === "daily" || value.reset === "monthly"));
-
-function validateFundFacts(data: FundFactsPayload): FundFactsPayload {
-  if (!data || typeof data.ticker !== "string" || typeof data.covered !== "boolean"
-    || ![data.expenseRatio, data.nav, data.premiumDiscount, data.netAssets, data.sponsor, data.inception, data.index].every(fact)
-    || !isBondFactsShape(data.bond) || !leverageShape(data.leverage) || !isMetalHoldingsShape(data.metalHoldings)) {
-    throw new Error("Unreadable fund facts response");
-  }
-  return data;
-}
 
 export const FUND_FACTS_UNAVAILABLE = "Fund facts are not available on this server yet.";
 
@@ -54,7 +33,7 @@ export function fundFactsErrorLine(error: unknown): string {
 }
 
 export async function fetchFundFacts(ticker: string, client: Client = apiClient, signal?: AbortSignal): Promise<FundFactsPayload> {
-  try { return validateFundFacts(await (signal ? client.getFundFacts(ticker, { signal }) : client.getFundFacts(ticker))); } catch (error) { throw unavailableOnServer(error, FUND_FACTS_UNAVAILABLE); }
+  try { return await readFundFacts(ticker, client, signal); } catch (error) { throw unavailableOnServer(error, FUND_FACTS_UNAVAILABLE); }
 }
 const cacheKey = (ticker: string) => ticker.trim().toUpperCase();
 export const cachedFundFacts = (ticker: string) => cachedCloudResource(fundFactsCache, cacheKey(ticker), validateFundFacts);
@@ -76,9 +55,62 @@ function formatNav(value: number): string {
   return `$${value.toFixed(value < 1 ? 4 : 2)}`;
 }
 
+/**
+ * A NAV or closing price in the fund's own currency: a Hong Kong counter's
+ * (HK$5.2842, $0.6736) to the four decimals its issuer states, a US fund's
+ * as before.
+ */
+function fundPrice(facts: Pick<FundFactsPayload, "currency">, value: number): string {
+  return facts.currency ? formatCurrency(value, facts.currency, 4) : formatNav(value);
+}
+
+/** Units in issue per coin held, whole (`3,262`), under the label that names the coin. */
+const unitsPerCoinText = (holdings: FundCoinHoldings) => Math.round(holdings.unitsPerCoin).toLocaleString("en-US");
+
+/** `Units per ETH`, `Units per BTC`. */
+const unitsPerCoinLabel = (holdings: FundCoinHoldings) => tf("Units per {asset}", { asset: holdings.asset });
+
+/** Coins held as the issuer states them: `18,453 ETH`. */
+const coinsText = (holdings: FundCoinHoldings) =>
+  `${holdings.coins.toLocaleString("en-US", { maximumFractionDigits: 4 })} ${holdings.asset}`;
+
 function formatNetAssets(value: number): string {
   return `$${formatCompact(value)}`;
 }
+
+/** A NAV the sponsor published as a range: `$4.12 to $4.22`. */
+const estimateRange = (estimate: { low: number; high: number }) => `${formatNav(estimate.low)} to ${formatNav(estimate.high)}`;
+
+/** Shares created less redeemed, signed: `+12.35M`, `-3.1M`. */
+const signedCompact = (value: number) => `${value > 0 ? "+" : value < 0 ? "-" : ""}${formatCompact(Math.abs(value))}`;
+
+/** A month's flows in dollars, when every day had a NAV to value them at. */
+const flowsValue = (value: number) => `${value < 0 ? "-" : value > 0 ? "+" : ""}$${formatCompact(Math.abs(value))}`;
+
+/** A closed-end fund's NAV is a month end's (a sponsor's estimate, or the filing's period end): its normal cadence, not a lag. */
+const monthEndNav = (facts: FundFactsPayload) => facts.nav?.period === "month-end";
+
+/** The session of the close a premium was computed from, when it is before the NAV's date: a month end on a weekend. */
+const closeSession = (facts: FundFactsPayload) => {
+  const close = facts.closingPrice?.asOf;
+  const premium = facts.premiumDiscount?.asOf;
+  return close && premium && close < premium ? close : null;
+};
+
+/** A registered closed-end fund or a BDC: its NAV is a month end's or a filing's, and its price trades at its own premium to it. */
+const closedEnd = (structure: FundFactsPayload["structure"]) => structure === "closed-end" || structure === "bdc";
+
+/** Each structure by its own name in a report; one a newer server adds, by its own key rather than another's name. */
+const STRUCTURE_LABELS: Record<FundStructure, string> = {
+  registered: "Registered fund",
+  trust: "Trust or pool, not an open-end fund",
+  "closed-end": "Closed-end fund",
+  bdc: "Business development company (BDC)",
+};
+const structureLabel = (structure: FundStructure) => STRUCTURE_LABELS[structure] ?? String(structure);
+
+/** The pane's shorter names, for the funds whose figures read unlike an ETF's. */
+const PANE_STRUCTURE: Partial<Record<FundStructure, string>> = { "closed-end": "Closed-end fund", bdc: "BDC" };
 
 /** Ounces and tonnes as the sponsor publishes them, to its own decimals (34,085,936.5; 1,060.18). */
 const metalFigure = (value: number, signed = false) =>
@@ -94,7 +126,8 @@ const metalLabel = (holdings: FundMetalHoldings) => holdings.metal === "gold" ? 
  * call a fee a sponsor fee.
  */
 function expenseRatioLabel(facts: Pick<FundFactsPayload, "expenseRatio">): string {
-  return facts.expenseRatio?.kind === "sponsor-fee" ? "Sponsor fee" : "Expense ratio";
+  const kind = facts.expenseRatio?.kind;
+  return kind === "sponsor-fee" ? "Sponsor fee" : kind === "management-fee" ? "Management fee" : "Expense ratio";
 }
 
 function feeBasis(facts: FundFactsPayload): "net" | "gross" | null {
@@ -129,6 +162,12 @@ function leverageObjectiveText(leverage: Pick<FundLeverage, "value" | "reset">):
   return `${leverageFactorLabel(leverage.value)} ${leverage.reset}, ${leverage.value < 0 ? "inverse" : "long"}`;
 }
 
+/** A premium's price when not the counter's own trade, after its date in a pane: ` · 3042:HKEX` (its traded counter's close), ` · nominal`. */
+function premiumPriceNote(premium: NonNullable<FundFactsPayload["premiumDiscount"]>): string {
+  const price = premium.price;
+  return price?.kind === "counter" ? ` · ${price.ticker}` : price?.kind === "nominal" ? ` · ${t("nominal")}` : "";
+}
+
 /**
  * How each dated figure reads beside the NAV, the date the sheet is about.
  * Every figure says its own date. One that is older than it looks is marked:
@@ -156,9 +195,19 @@ function datedFigures(facts: FundFactsPayload): Record<"nav" | "premium" | "fee"
   const prospectus = facts.expenseRatio?.document === "prospectus";
   const nport = assets?.document === "N-PORT";
   return {
-    nav: { detail: nav ? (facts.stale ? tf("{date} stale", { date: nav }) : nav) : undefined, marked: facts.stale },
+    nav: {
+      detail: nav
+        ? facts.stale ? tf("{date} stale", { date: nav }) : monthEndNav(facts) ? tf("{date} month-end", { date: nav }) : nav
+        : undefined,
+      marked: facts.stale,
+    },
     premium: {
-      detail: premium?.asOf ? (premium.basis === "computed" ? tf("{date} close", { date: premium.asOf }) : premium.asOf) : undefined,
+      // A computed premium is dated by its close's session (a weekend month end's Friday), and says when it is an estimate's.
+      detail: premium?.asOf
+        ? premium.basis === "computed"
+          ? `${tf("{date} close", { date: closeSession(facts) ?? premium.asOf })}${premium.estimate ? ` · ${t("est.")}` : ""}${premiumPriceNote(premium)}`
+          : premium.asOf
+        : undefined,
       marked: facts.stale || (!!premium?.asOf && !!nav && premium.asOf !== nav),
     },
     fee: {
@@ -192,14 +241,41 @@ export function fundFactItems(facts: FundFactsPayload): StatItem[] {
   const cell = (id: string, label: string, value: string, figure: DatedFigure): StatItem => ({
     id, label, value, ...(figure.detail ? { detail: figure.detail } : {}), ...(figure.marked ? { tone: "warning" as const } : {}),
   });
-  if (facts.nav) items.push(cell("nav", "NAV", formatNav(facts.nav.value), dated.nav));
+  if (facts.nav) {
+    // A sponsor's estimate is a range: its midpoint is the figure, the range follows its date.
+    const estimate = facts.nav.estimate;
+    const nav = estimate && dated.nav.detail
+      ? { ...dated.nav, detail: `${dated.nav.detail} · ${tf("est. {range}", { range: estimateRange(estimate) })}` } : dated.nav;
+    items.push(cell("nav", "NAV", fundPrice(facts, facts.nav.value), nav));
+  }
   if (facts.premiumDiscount) items.push(cell("premium", "Premium/discount", formatPremiumPercent(facts.premiumDiscount.value), dated.premium));
   if (facts.expenseRatio) items.push(cell("fee", expenseRatioLabel(facts), formatFeePercent(facts.expenseRatio.value), dated.fee));
   if (facts.netAssets) items.push(cell("assets", wholeFund(facts) ? "Fund net assets" : "Net assets", formatNetAssets(facts.netAssets.value), dated.netAssets));
+  // Shares outstanding as the sponsor states them, then the month's creations less redemptions.
+  if (facts.sharesOutstanding) {
+    items.push(cell("shares", "Shares outstanding", formatCompact(facts.sharesOutstanding.value),
+      { detail: facts.sharesOutstanding.asOf ?? undefined, marked: facts.stale }));
+  }
+  // A spot coin fund's units per coin, with the coins it holds that day.
+  const coins = facts.coinHoldings;
+  if (coins) {
+    items.push(cell("units-per-coin", unitsPerCoinLabel(coins), unitsPerCoinText(coins),
+      { detail: `${coinsText(coins)} · ${coins.asOf}`, marked: facts.stale }));
+  }
+  if (facts.flows) {
+    // In dollars with the shares beside them; in shares alone when a day had no NAV to value them at.
+    const flows = facts.flows;
+    const shares = tf("{count} shares", { count: signedCompact(flows.shares) });
+    const since = tf("since {date}", { date: flows.from });
+    items.push(cell("flows", "1M flows", flows.value === null ? shares : flowsValue(flows.value),
+      { detail: flows.value === null ? since : `${shares} · ${since}`, marked: facts.stale }));
+  }
   // A bond fund's yields and duration, each dated by its sponsor.
   for (const figure of facts.bond ? bondFigures(facts.bond) : []) {
     items.push(cell(figure.key, figure.label, figure.text, { detail: figure.date, marked: facts.stale }));
   }
+  const dv01 = fundDv01(facts);
+  if (dv01) items.push(cell("dv01", "DV01", formatDv01PerShare(dv01.value), { detail: DV01_FROM_DURATION, marked: facts.stale }));
   // A metal trust's metal in trust, in tonnes as the market quotes it and ounces as the trust counts it, then its day's change.
   const metal = facts.metalHoldings;
   if (metal) {
@@ -212,6 +288,9 @@ export function fundFactItems(facts: FundFactsPayload): StatItem[] {
         { detail: metal.change.tonnes == null ? tf("since {date}", { date: metal.change.since }) : `${change} · ${tf("since {date}", { date: metal.change.since })}`, marked: metal.stale }));
     }
   }
+  // A closed-end fund or BDC says which: its figures read unlike an ETF's.
+  const structure = facts.structure ? PANE_STRUCTURE[facts.structure] : undefined;
+  if (structure) items.push({ id: "structure", label: "Structure", value: t(structure) });
   if (facts.sponsor) items.push({ id: "sponsor", label: "Sponsor", value: facts.sponsor.value });
   if (facts.inception) items.push({ id: "inception", label: "Inception", value: facts.inception.value });
   // A leveraged or inverse fund's objective, dated by the sponsor page it was read from, beside its benchmark.
@@ -220,6 +299,18 @@ export function fundFactItems(facts: FundFactsPayload): StatItem[] {
   }
   if (facts.index) items.push({ id: "index", label: BENCHMARK_LABEL, value: facts.index.value, wide: true });
   return items;
+}
+
+/**
+ * A bond fund's DV01 per share, derived from its duration at the closing
+ * price (NAV without one), with the price it was read at.
+ */
+function fundDv01(facts: FundFactsPayload): { value: number; price: string } | null {
+  const price = facts.closingPrice ?? facts.nav;
+  const value = durationDv01PerShare(price?.value, facts.bond);
+  if (value == null || !price) return null;
+  const date = price.asOf ? ` ${price.asOf}` : "";
+  return { value, price: facts.closingPrice ? `closing price${date}` : `NAV${date}` };
 }
 
 /** A DES figure: `warn` when it is older than it looks, which DES draws in the warning colour. */
@@ -246,7 +337,7 @@ export function fundFactOverviewFields(facts: FundFactsPayload): FundFactOvervie
     const forms = figure.detail ? [figure.detail, withoutYear(figure.detail), ...(short ? [short, withoutYear(short)] : [])] : [];
     return { label, value, ...(forms.length ? { detail: [...new Set(forms)] } : {}), ...(figure.marked ? { warn: true } : {}) };
   };
-  if (facts.nav) fields.push(field("NAV", formatNav(facts.nav.value), dated.nav));
+  if (facts.nav) fields.push(field("NAV", fundPrice(facts, facts.nav.value), dated.nav));
   if (facts.premiumDiscount) fields.push(field("Prem/Disc", formatPremiumPercent(facts.premiumDiscount.value), dated.premium, facts.premiumDiscount.asOf ?? undefined));
   if (facts.netAssets) {
     // N-PORT's long form gives way to the month end alone before the bare date.
@@ -254,11 +345,26 @@ export function fundFactOverviewFields(facts: FundFactsPayload): FundFactOvervie
     fields.push(field(wholeFund(facts) ? "Fund Assets" : "Net Assets", formatNetAssets(facts.netAssets.value), dated.netAssets, monthEnd));
   }
   if (facts.expenseRatio) {
-    const fee = facts.expenseRatio.kind === "sponsor-fee";
-    fields.push(field(fee ? "Sponsor Fee" : "Exp Ratio", formatFeePercent(facts.expenseRatio.value), dated.fee, facts.expenseRatio.asOf ?? undefined));
+    const kind = facts.expenseRatio.kind;
+    const label = kind === "sponsor-fee" ? "Sponsor Fee" : kind === "management-fee" ? "Mgmt Fee" : "Exp Ratio";
+    fields.push(field(label, formatFeePercent(facts.expenseRatio.value), dated.fee, facts.expenseRatio.asOf ?? undefined));
   }
   if (facts.inception) fields.push({ label: "Inception", value: facts.inception.value });
   return fields;
+}
+
+/**
+ * What a computed premium is measured from, for text reports: the closing
+ * price, another counter's traded close at the NAVs' rate when this
+ * counter's was nominal (`3042:HKEX close HK$9.18 at the NAVs' rate vs
+ * NAV`), or the nominal close when no counter traded.
+ */
+function premiumBasis(premium: NonNullable<FundFactsPayload["premiumDiscount"]>): string | null {
+  if (premium.basis !== "computed") return null;
+  if (premium.estimate) return "closing price vs NAV estimate midpoint";
+  const price = premium.price;
+  if (price?.kind === "counter") return `${price.ticker} close ${formatCurrency(price.close, price.currency, 4)} at the NAVs' rate vs NAV`;
+  return price?.kind === "nominal" ? "nominal closing price vs NAV" : "closing price vs NAV";
 }
 
 /** Where a figure came from and when, for text reports: `2026-10-16 · iShares`. */
@@ -276,27 +382,47 @@ export function fundFactEntries(facts: FundFactsPayload): HeadlessPaneEntry[] {
   const add = (key: string, label: string, value: unknown, formatted: string, unit?: string) =>
     entries.push({ key, label, value, formatted, ...(unit ? { unit } : {}) });
   if (facts.name) add("name", "Name", facts.name, facts.name);
-  if (facts.structure) add("structure", "Structure", facts.structure,
-    facts.structure === "trust" ? "Trust or pool, not an open-end fund" : "Registered fund");
+  if (facts.structure) add("structure", "Structure", facts.structure, structureLabel(facts.structure));
   if (facts.expenseRatio) {
     const kind = feeBasis(facts);
     const date = facts.expenseRatio.asOf && facts.expenseRatio.document === "prospectus" ? `${facts.expenseRatio.asOf} prospectus` : facts.expenseRatio.asOf;
     add("expenseRatioPercent", expenseRatioLabel(facts), facts.expenseRatio.value,
       provenance(`${formatFeePercent(facts.expenseRatio.value)}${kind ? ` ${kind}` : ""}`, date, facts.expenseRatio.source), "%");
   }
-  if (facts.nav) add("nav", "NAV", facts.nav.value, provenance(formatNav(facts.nav.value), facts.nav.asOf, facts.nav.source), "USD");
+  if (facts.nav) {
+    const date = facts.nav.asOf && monthEndNav(facts) ? `${facts.nav.asOf} month-end` : facts.nav.asOf;
+    const estimate = facts.nav.estimate ? `estimate ${estimateRange(facts.nav.estimate)}` : null;
+    add("nav", "NAV", facts.nav.value, provenance(fundPrice(facts, facts.nav.value), date, estimate, facts.nav.source), facts.currency ?? "USD");
+  }
   if (facts.closingPrice) add("closingPrice", "Closing price", facts.closingPrice.value,
-    provenance(formatNav(facts.closingPrice.value), facts.closingPrice.asOf, facts.closingPrice.source), "USD");
+    provenance(fundPrice(facts, facts.closingPrice.value), facts.closingPrice.asOf, facts.closingPrice.nominal ? "nominal, no trades" : null,
+      facts.closingPrice.source), facts.currency ?? "USD");
   if (facts.premiumDiscount) {
-    const basis = facts.premiumDiscount.basis === "computed" ? "closing price vs NAV" : null;
     add("premiumDiscountPercent", "Premium/discount", facts.premiumDiscount.value,
-      provenance(formatPremiumPercent(facts.premiumDiscount.value), facts.premiumDiscount.asOf, basis, facts.premiumDiscount.source), "%");
+      provenance(formatPremiumPercent(facts.premiumDiscount.value), facts.premiumDiscount.asOf, premiumBasis(facts.premiumDiscount),
+        facts.premiumDiscount.source), "%");
   }
   if (facts.netAssets) {
     const scope = wholeFund(facts) ? "all share classes" : null;
     const date = facts.netAssets.asOf && facts.netAssets.period === "month-end"
       ? `${facts.netAssets.asOf} month-end${facts.netAssets.document ? ` ${facts.netAssets.document}` : ""}` : facts.netAssets.asOf;
     add("netAssets", "Net assets", facts.netAssets.value, provenance(formatNetAssets(facts.netAssets.value), date, scope, facts.netAssets.source), "USD");
+  }
+  if (facts.sharesOutstanding) {
+    add("sharesOutstanding", "Shares outstanding", facts.sharesOutstanding.value,
+      provenance(facts.sharesOutstanding.value.toLocaleString("en-US"), facts.sharesOutstanding.asOf, facts.sharesOutstanding.source), "shares");
+  }
+  if (facts.coinHoldings) {
+    const holdings = facts.coinHoldings;
+    add("unitsPerCoin", `Units per ${holdings.asset}`, holdings.unitsPerCoin,
+      provenance(unitsPerCoinText(holdings), holdings.asOf, holdings.source), `units per ${holdings.asset}`);
+    add("coinsHeld", "Coins held", holdings.coins, provenance(coinsText(holdings), holdings.asOf, holdings.source), holdings.asset);
+  }
+  if (facts.flows) {
+    // JSON keeps the dollar figure (null when a day had no NAV); `fundFacts.flows` has the shares.
+    const flows = facts.flows;
+    add("flows1M", "1M flows", flows.value, provenance(flows.value === null ? null : flowsValue(flows.value),
+      `${signedCompact(flows.shares)} shares`, `${flows.from} to ${flows.asOf}`, flows.source), "USD");
   }
   const metal = facts.metalHoldings;
   if (metal) {
@@ -305,7 +431,7 @@ export function fundFactEntries(facts: FundFactsPayload): HeadlessPaneEntry[] {
       metal.tonnes == null ? null : `${metalFigure(metal.tonnes)} tonnes`, metal.stale ? `${metal.asOf} stale` : metal.asOf, metal.source.publisher), "troy oz");
     add("metalChangeOunces", "Day change", metal.change?.ounces ?? null, metal.change
       ? provenance(`${metalFigure(metal.change.ounces, true)} troy oz`, metal.change.tonnes == null ? null : `${metalFigure(metal.change.tonnes, true)} tonnes`, `since ${metal.change.since}`)
-      : `-- · ${metal.asOf} is the first day stored`, "troy oz");
+      : `${MISSING_VALUE} · ${metal.asOf} is the first day stored`, "troy oz");
   }
   if (facts.bond) {
     add("bondClass", "Bond fund", facts.bond.kind, bondClassText(facts.bond));
@@ -314,6 +440,8 @@ export function fundFactEntries(facts: FundFactsPayload): HeadlessPaneEntry[] {
       add(keys[figure.key], figure.key === "secYield" ? "30-day SEC yield" : figure.label, figure.value,
         provenance(figure.text, figure.date, figure.source), figure.key === "duration" ? "years" : "%");
     }
+    const dv01 = fundDv01(facts);
+    if (dv01) add("dv01PerShare", "DV01", dv01.value, provenance(formatDv01PerShare(dv01.value), DV01_FROM_DURATION, dv01.price), "USD per bp");
   }
   if (facts.sponsor) add("sponsor", "Sponsor", facts.sponsor.value, facts.sponsor.value);
   if (facts.inception) add("inception", "Inception", facts.inception.value, facts.inception.value);
@@ -323,8 +451,48 @@ export function fundFactEntries(facts: FundFactsPayload): HeadlessPaneEntry[] {
   }
   if (facts.index) add("index", BENCHMARK_LABEL, facts.index.value, provenance(facts.index.value, facts.index.source));
   const url = facts.nav?.url ?? facts.expenseRatio?.url ?? facts.netAssets?.url;
-  if (url) add("url", "Sponsor page", url, url);
+  // The figures' own page: the sponsor's, or the SEC filing they were read from (a prospectus, an N-PORT, an 8-K).
+  if (url) add("url", /^https:\/\/www\.sec\.gov\//.test(url) ? "SEC filing" : facts.expenseRatio?.kind === "management-fee" ? "Issuer page" : "Sponsor page", url, url);
   return entries;
+}
+
+/** What an exchange-traded note is, in one line: whose debt, and that it is no fund. */
+function noteStructureText(note: Pick<FundNoteFacts, "issuer">): string {
+  return `Exchange-traded note: an unsecured note of ${note.issuer}, not a fund`;
+}
+
+/** The supplement a note's terms come from: `2026-02-13 pricing supplement (424B2)`. */
+const noteSupplement = (note: FundNoteFacts) => `${note.filing.filedAt} pricing supplement (${note.filing.form})`;
+
+/**
+ * An exchange-traded note's terms as report entries: its issuer, yearly fee
+ * and index, each beside the pricing supplement it was read from, and the
+ * supplement itself on EDGAR.
+ */
+export function fundNoteEntries(note: FundNoteFacts): HeadlessPaneEntry[] {
+  const entries: HeadlessPaneEntry[] = [];
+  const add = (key: string, label: string, value: unknown, formatted: string, unit?: string) =>
+    entries.push({ key, label, value, formatted, ...(unit ? { unit } : {}) });
+  if (note.name) add("name", "Name", note.name, note.name);
+  add("structure", "Structure", "etn", noteStructureText(note));
+  add("issuer", "Issuer", note.issuer, note.issuer);
+  if (note.yearlyFee != null) {
+    add("yearlyFeePercent", "Yearly fee", note.yearlyFee, provenance(formatFeePercent(note.yearlyFee), noteSupplement(note), "SEC EDGAR"), "%");
+  }
+  if (note.index) add("index", "Index", note.index, provenance(note.index, noteSupplement(note)));
+  add("url", "SEC filing", note.filing.url, note.filing.url);
+  return entries;
+}
+
+/** The same terms as the pane's summary sheet, the fee dated by its supplement. */
+export function fundNoteItems(note: FundNoteFacts): StatItem[] {
+  return [
+    { id: "structure", label: "Structure", value: tf("Exchange-traded note: an unsecured note of {issuer}, not a fund", { issuer: note.issuer }), wide: true },
+    ...note.yearlyFee != null
+      ? [{ id: "fee", label: "Yearly fee", value: formatFeePercent(note.yearlyFee), detail: tf("{date} pricing supplement", { date: note.filing.filedAt }) }]
+      : [],
+    ...note.index ? [{ id: "index", label: "Index", value: note.index, wide: true }] : [],
+  ];
 }
 
 /** Names as a sentence lists them: `A`, `A and B`, `A, B and C`. */
@@ -338,8 +506,9 @@ export function listNames(names: readonly string[]): string {
  * the consolidated close cites Gloom Cloud on its own line, not here.
  */
 export function fundFactPublishers(facts: FundFactsPayload): string[] {
-  return [...new Set([...[facts.nav, facts.expenseRatio, facts.netAssets, facts.leverage, facts.index, facts.bond?.secYield, facts.bond?.yieldToWorst, facts.bond?.duration]
-    .flatMap((value) => value ? [value.source] : []), ...facts.metalHoldings ? [facts.metalHoldings.source.publisher] : []])];
+  return [...new Set([...[facts.nav, facts.expenseRatio, facts.netAssets, facts.sharesOutstanding, facts.flows, facts.leverage, facts.index, facts.bond?.secYield, facts.bond?.yieldToWorst, facts.bond?.duration]
+    .flatMap((value) => value ? [value.source] : []), ...facts.metalHoldings ? [facts.metalHoldings.source.publisher] : [],
+    ...facts.coinHoldings ? [facts.coinHoldings.source] : []])];
 }
 
 /** The newest NAV is stale: one line saying since when, as the report's note says it. */
@@ -350,6 +519,25 @@ export function fundFactsStaleNote(symbol: string, facts: FundFactsPayload): str
 /** The stale note, translated for the pane. */
 export function fundFactsStaleText(symbol: string, facts: FundFactsPayload): string | null {
   return fundFactsStaleNote(symbol, facts) ? tf("{symbol}'s newest NAV is from {date}; its sponsor has not published one since.", { symbol, date: facts.nav!.asOf! }) : null;
+}
+
+/**
+ * Why a covered fund has no NAV, in one line, translated for the pane: what
+ * Gloom reads for it and what that leaves out, as the server's `navReason`
+ * says it. Null when it has a NAV, and from servers before the reason.
+ */
+export function fundFactsNavReasonText(symbol: string, facts: FundFactsPayload): string | null {
+  if (!facts.covered || facts.nav || !facts.navReason) return null;
+  // A sponsor that publishes the fund's other figures.
+  const sponsor = fundFactPublishers(facts).find((publisher) => publisher !== "SEC EDGAR");
+  if (sponsor) return tf("No NAV for {symbol}: {publisher} publishes figures for it, but no NAV.", { symbol, publisher: sponsor });
+  if (closedEnd(facts.structure)) {
+    return tf("No NAV for {symbol}: its SEC filings state net assets but no NAV per share, and its sponsor's NAV is not one Gloom reads.", { symbol });
+  }
+  if (facts.structure === "trust") {
+    return tf("No NAV for {symbol}: its sponsor's site is not one Gloom reads, and a trust files no NAV with the SEC's fund data sets.", { symbol });
+  }
+  return tf("No NAV for {symbol}: its sponsor's site is not one Gloom reads, and the SEC's prospectus and N-PORT data sets state no NAV.", { symbol });
 }
 
 /**
@@ -376,9 +564,13 @@ export function fundFactsEmptyText(symbol: string, facts: FundFactsPayload | nul
     if (facts.structure === "registered") {
       return tf("No figures for {symbol}: its sponsor's site is not one Gloom reads, and the SEC's prospectus and N-PORT data sets list none for it yet.", { symbol });
     }
+    if (closedEnd(facts.structure)) {
+      return tf("No figures for {symbol}: it files with the SEC as a closed-end fund or BDC, but neither the filings Gloom reads nor its sponsor's site state any for it yet.", { symbol });
+    }
     return tf("No figures for {symbol}: it lists as a fund, but the SEC's lists do not name it yet and its sponsor's site is not one Gloom reads.", { symbol });
   }
   if (facts.status === "not-a-fund") return tf("No fund facts for {symbol}: it is not on the SEC's lists of US-listed funds.", { symbol });
+  if (facts.status === "etn") return tf("{symbol} is an exchange-traded note, not a fund.", { symbol });
   // A server before statuses: what the SEC's lists make of it.
   if (facts.structure === "trust") {
     return tf("{symbol} files with the SEC as a trust or pool, not as an open-end fund; its sponsor's daily figures are not collected yet.", { symbol });

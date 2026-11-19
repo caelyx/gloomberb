@@ -1,4 +1,5 @@
 import { coinSearchName } from "../utils/crypto-pair";
+import { formatShortDate } from "../utils/datetime-format";
 import { canonicalExchange, normalizeSymbol } from "../utils/exchanges";
 import type { NewsCapability } from "../capabilities";
 import type { NewsArticle, NewsFeed, NewsQuery, NewsQueryState } from "./types";
@@ -92,6 +93,7 @@ export function createIdleNewsQueryState(): NewsQueryState {
     sourceIds: [],
     nextCursor: null,
     loadingMore: false,
+    access: null,
   };
 }
 
@@ -243,4 +245,105 @@ export function filterNewsArticlesForQuery(items: NewsArticle[], query: NewsQuer
   }
   // Page size is a fetch hint. Accumulated load-more results keep MAX_ARTICLES.
   return filtered.slice(0, MAX_ARTICLES);
+}
+
+/** Words that carry no news of their own: a summary made of them and the headline's words says nothing new. */
+const FILLER_WORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for", "from", "by", "with", "as", "into", "onto",
+  "over", "through", "about", "after", "amid", "than", "that", "this", "these", "those", "it", "its", "their", "his",
+  "her", "they", "is", "are", "was", "were", "be", "been", "being", "has", "have", "had", "will", "would", "could",
+  "may", "might", "can", "also", "which", "who", "while", "more", "some",
+]);
+
+/** A word cut to its stem, near enough to match its other forms: seeking and seeks, restricts and restrictions. */
+function wordStem(word: string): string {
+  const bare = word.replace(/['\u2019]s$/, "");
+  let stem = bare.length > 5 ? bare.replace(/(?:ing|ed)$/, "") : bare;
+  stem = stem.length > 3 ? stem.replace(/e?s$/, "") : stem;
+  return stem.length >= 3 ? stem : bare;
+}
+
+function newsWordStems(text: string): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}]+(?:['\u2019][\p{L}]+)?/gu) ?? [])
+    .filter((word) => !FILLER_WORDS.has(word))
+    .map(wordStem);
+}
+
+/** How much of a summary may be words its headline lacks and the summary still only restate it. */
+const RESTATED_NEW_WORDS = 1 / 3;
+
+/**
+ * Whether a story's summary only says its headline again, in other words or
+ * not: at most a third of its words (fillers aside) are words the headline
+ * lacks, in any of their forms. "Apple is seeking to raise about $7 billion
+ * through a bond sale, Bloomberg News reports." restates "Apple seeks about $7
+ * billion from bond sale, Bloomberg News reports"; a summary that adds the
+ * why or the numbers does not.
+ */
+export function summaryRestatesHeadline(title: string, summary: string): boolean {
+  const headline = newsWordStems(title);
+  const words = newsWordStems(summary);
+  if (words.length === 0) return true;
+  const known = (word: string) => headline.some((stem) => stem === word
+    || (Math.min(stem.length, word.length) >= 4 && (stem.startsWith(word) || word.startsWith(stem))));
+  return words.filter((word) => !known(word)).length <= words.length * RESTATED_NEW_WORDS;
+}
+
+/**
+ * What a company feed's row of routine notices stands for, after its headline: "8 notices since 30 Oct"
+ * (a buy-back's daily "Transaction in own shares", folded into its latest). Null for any other row.
+ */
+function routineNoticesText(article: Pick<NewsArticle, "routine" | "publishedAt">): string | null {
+  const routine = article.routine;
+  if (!routine || routine.notices < 2) return null;
+  // A day kept as text (a pane's state restored from disk) is read as one; an unreadable one names none.
+  const since = routine.since instanceof Date ? routine.since : new Date(String(routine.since));
+  if (Number.isNaN(since.getTime())) return `${routine.notices} notices`;
+  // The year is named only when the run began in another year than its latest notice.
+  const latest = article.publishedAt instanceof Date ? article.publishedAt : new Date(String(article.publishedAt));
+  const sameYear = since.getUTCFullYear() === latest.getUTCFullYear();
+  return `${routine.notices} notices since ${formatShortDate(since, { year: sameYear ? false : "numeric", utc: true })}`;
+}
+
+/** The headline a list shows: with the notices a folded row stands for ("Transaction in own shares (8 notices since 30 Oct)"). */
+export function listedHeadline(article: Pick<NewsArticle, "title" | "routine" | "publishedAt">): string {
+  const notices = routineNoticesText(article);
+  return notices ? `${article.title} (${notices})` : article.title;
+}
+
+/** The fields an exported row keeps of the notices a folded row stands for: none for any other row. */
+export function routineNoticeFields(article: Pick<NewsArticle, "routine">) {
+  const routine = article.routine;
+  const since = routine ? (routine.since instanceof Date ? routine.since : new Date(String(routine.since))) : null;
+  return routine && since && !Number.isNaN(since.getTime()) ? {
+    routineKind: routine.kind,
+    routineNotices: routine.notices,
+    routineSince: since.toISOString(),
+    routineProgramme: routine.programme,
+  } : {};
+}
+
+/**
+ * A text table's headline from an exported row: its title, with the notices a folded row stands for
+ * (`routineNoticeFields`) after it. Exports keep the title and the count apart.
+ */
+export function listedRowHeadline(title: unknown, row: Record<string, unknown>): string {
+  const text = String(title ?? "");
+  if (typeof row.routineNotices !== "number" || typeof row.routineSince !== "string") return text;
+  return listedHeadline({
+    title: text,
+    routine: { kind: String(row.routineKind ?? ""), notices: row.routineNotices, since: new Date(row.routineSince), programme: null },
+    publishedAt: new Date(String(row.publishedAt ?? row.routineSince)),
+  });
+}
+
+/**
+ * A story's summary as one line under its row in a text list (`news`,
+ * `fn CN`): its whitespace and line breaks run together, null when it has
+ * none or only restates the headline (summaryRestatesHeadline).
+ */
+export function newsSummaryLine(article: Pick<NewsArticle, "title" | "summary">): string | null {
+  const summary = article.summary?.replace(/\s+/g, " ").trim();
+  if (!summary || summaryRestatesHeadline(article.title, summary)) return null;
+  return summary;
 }

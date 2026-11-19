@@ -8,6 +8,7 @@ import {
   getPluginCommandShortcutArgKind,
   type RootShortcutArgKind,
 } from "../routes/root/shortcuts";
+import { logFailure } from "../../../utils/log-failure";
 
 /** Server cap on `/assist/command` inventories. */
 const ASSIST_INVENTORY_LIMIT = 150;
@@ -40,8 +41,8 @@ function readArgOptions(
     return values
       .filter((option) => typeof option?.value === "string" && typeof option?.label === "string")
       .map(({ value, label }) => ({ value, label }));
-  } catch {
-    return undefined;
+  } catch (error) {
+    return logFailure("command-bar.assist", "Read command argument options failed")(error);
   }
 }
 
@@ -119,7 +120,8 @@ export function buildAssistCommandInventory({
       prefixes: normalizePrefixes(command.shortcut ? [command.shortcut] : []),
     })),
     ...paneTemplates.map((template) => ({
-      descriptor: describe(
+      // An unlisted function keeps its codes, so nothing else takes them, but is never suggested.
+      descriptor: template.listed === false ? null : describe(
         template.shortcut?.prefix ?? "",
         getPaneTemplateDisplayLabel(template),
         template.shortcut?.aliases?.length ? `${template.description} Also ${template.shortcut.aliases.join(", ")}.` : template.description,

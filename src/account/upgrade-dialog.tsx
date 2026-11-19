@@ -23,8 +23,6 @@ import {
   monthsFreeYearly,
   trialDaysOf,
 } from "./billing";
-import { useUpgradePersonalization } from "./upgrade-personalization";
-import { upgradeTickerList } from "./upgrade-tickers";
 
 const CONTENT_WIDTH = 64;
 /** Border plus padding the terminal dialog host draws around the content. */
@@ -57,8 +55,11 @@ export function upgradeDialogCopy(
   interval: CloudBillingInterval,
   now: Date,
 ): UpgradeDialogCopy {
+  // What Pro gets them, not the plan's name: the same title while it loads, with
+  // or without a trial, so only the terms under it change.
+  const title = t("One better trade pays for Pro");
   if (!offer) {
-    return { title: t("Upgrade to Pro"), subtitle: t("Loading…"), confirmLabel: t("Start free trial"), showPlan: true };
+    return { title, subtitle: t("Loading…"), confirmLabel: t("Start free trial"), showPlan: true };
   }
   if (offer.paymentFailed) {
     return {
@@ -73,8 +74,9 @@ export function upgradeDialogCopy(
     const days = trialDaysOf(offer.pricing);
     const firstCharge = formatTrialEnd(new Date(now.getTime() + days * MS_PER_DAY));
     return {
-      title: tf("Try Pro free for {days} days", { days }),
-      subtitle: tf("$0 today, then {price} from {date}. Card required. Cancel before and you pay nothing.", {
+      title,
+      subtitle: tf("Pro is free for {days} days. $0 today, then {price} from {date}. Card required. Cancel before and you pay nothing.", {
+        days,
         price,
         date: firstCharge ?? "",
       }),
@@ -83,7 +85,7 @@ export function upgradeDialogCopy(
     };
   }
   return {
-    title: t("Upgrade to Pro"),
+    title,
     subtitle: offer.trialAvailable === false
       ? tf("{price}, billed today. Cancel anytime.", { price })
       : tf("{price}. Cancel anytime.", { price }),
@@ -117,13 +119,6 @@ export function proStepCopy(offer: UpgradeOffer | null): ProStepCopy {
   };
 }
 
-/** The Pro step's first feature; with tickers it names the account's own holdings. */
-export function proStepRealtimeTitle(tickers: readonly string[] | null): string {
-  return tickers?.length
-    ? tf("Real-time quotes for {tickers}", { tickers: upgradeTickerList(tickers) })
-    : t("Real-time market data");
-}
-
 /** Ranked like the onboarding Pro step: the data first, then what reads it. */
 const PRO_FEATURES: Array<{ label: string; value: string }> = [
   { label: "Real-time data", value: "Free runs 15 min behind on quotes, 12 h on news" },
@@ -132,18 +127,9 @@ const PRO_FEATURES: Array<{ label: string; value: string }> = [
   { label: "Flow and X", value: "Options flow, the X feed and sentiment" },
 ];
 
-/**
- * The feature list, translated. With tickers (the `upgrade_personalized`
- * arm) the real-time row names the account's own tickers; without
- * them it is exactly the generic list.
- */
-export function proFeatureRows(tickers: readonly string[] | null): Array<{ label: string; value: string }> {
-  return PRO_FEATURES.map((feature, index) => ({
-    label: feature.label,
-    value: index === 0 && tickers?.length
-      ? tf("{tickers} quotes, not 15 min behind", { tickers: upgradeTickerList(tickers) })
-      : t(feature.value),
-  }));
+/** The feature list, translated. */
+function proFeatureRows(): Array<{ label: string; value: string }> {
+  return PRO_FEATURES.map((feature) => ({ label: feature.label, value: t(feature.value) }));
 }
 
 /** Pricing and this account's trial and billing state; never rejects, unknowns come back null. */
@@ -175,18 +161,17 @@ function UpgradeDialog({
   useAppLanguage();
   const [interval, setBillingInterval] = useState<CloudBillingInterval>(initialInterval);
   const [offer, setOffer] = useState<UpgradeOffer | null>(null);
-  const personalTickers = useUpgradePersonalization("upgrade-sheet", offer !== null && !offer.paymentFailed);
 
   useEffect(() => {
     let live = true;
-    void loadOffer()
-      .catch((error): UpgradeOffer => {
-        logFailure("account-upgrade", "Upgrade offer request failed")(error);
-        return { pricing: null, trialAvailable: null, paymentFailed: false };
-      })
-      .then((loaded) => {
-        if (live) setOffer(loaded);
-      });
+    const show = (loaded: UpgradeOffer) => {
+      if (live) setOffer(loaded);
+    };
+    // A failed request still opens the dialog, with list prices.
+    loadOffer().then(show, (error: unknown) => {
+      logFailure("account-upgrade", "Upgrade offer request failed")(error);
+      show({ pricing: null, trialAvailable: null, paymentFailed: false });
+    });
     return () => {
       live = false;
     };
@@ -233,7 +218,7 @@ function UpgradeDialog({
               shortcutScope={dialogId}
             />
             <Box height={1} />
-            {proFeatureRows(personalTickers).map((feature) => (
+            {proFeatureRows().map((feature) => (
               <KeyValueRow
                 key={feature.label}
                 label={feature.label}

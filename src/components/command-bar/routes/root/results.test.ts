@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { PaneTemplateDef } from "../../../../types/plugin";
 import type { Command } from "../../commands/registry";
+import { resolveRowBadge } from "../../list/badge";
 import { orderListResults, type ResultItem } from "../../list/model";
 import { PLUGIN_INSTALL_CATEGORY } from "../../view-model";
 import { mergePlainRootTickerResults } from "../ticker-search/results";
 import { buildRootResultModel, type RootResultModelOptions } from "./results";
+
+/** The AI's rows, as the assist model files them. */
+const ASSIST_CATEGORY = "Ask AI";
 
 function rootOptions(overrides: Partial<RootResultModelOptions>): RootResultModelOptions {
   const empty = () => [] as ResultItem[];
@@ -156,6 +160,38 @@ describe("provider rows in the root result model", () => {
     }));
 
     expect(orderListResults(items).map((item) => item.id)).toEqual(["template", chatRow("general", "#general").id]);
+  });
+
+  test("a function's code typed alone that is a ticker too is offered as the ticker under the function", () => {
+    // CATL is Catalysts and Contemporary Amperex Technology's own name for itself.
+    const opened: Array<[string, string | undefined]> = [];
+    const catalysts = { ...paneRow, id: "pane-template:catalysts", label: "Catalysts" };
+    const intent = (argText: string) => ({
+      kind: "partial" as const,
+      source: "pane-template" as const,
+      prefix: "CATL",
+      label: "Catalysts",
+      description: "",
+      argKind: "ticker" as const,
+      argText,
+      completionQuery: null,
+      template: { id: "catalysts" } as unknown as PaneTemplateDef,
+    });
+    const build = (rootQuery: string, commands: Command[]) => buildRootResultModel(rootOptions({
+      rootQuery,
+      availableCommands: commands,
+      createPaneTemplateItem: () => catalysts,
+      openModeRoute: (screen, query) => { opened.push([screen, query]); },
+      rootShortcutIntent: intent(rootQuery.split(" ")[1] ?? ""),
+    })).items;
+    const des = { id: "security-description", prefix: "DES", name: "Security Description" } as Command;
+    const items = build("CATL", [des]);
+    expect(items.map((item) => item.id)).toEqual(["pane-template:catalysts", "ticker-code:CATL"]);
+    items[1]!.action?.();
+    expect(opened).toEqual([["ticker-search", "CATL"]]);
+    // With a ticker after it, or no security search to open, the code is the function alone.
+    expect(build("CATL 3750", [des]).map((item) => item.id)).toEqual(["pane-template:catalysts"]);
+    expect(build("CATL", []).map((item) => item.id)).toEqual(["pane-template:catalysts"]);
   });
 });
 
@@ -418,7 +454,7 @@ describe("Start Here in the empty bar", () => {
     category: "Search",
   } as Command;
 
-  test("follows Suggested in plain words with the code on the right, each row running its code's own row", () => {
+  test("follows Suggested in plain words with the code in the badge column, each row running its code's own row", () => {
     const ran: string[] = [];
     const templateRow = (entry: PaneTemplateDef): ResultItem => ({
       id: `pane-template:${entry.id}:`,
@@ -455,13 +491,89 @@ describe("Start Here in the empty bar", () => {
       ["Compare stocks", "RV"],
       ["Check the economy", "ECO"],
     ]);
-    expect(startHere.every((item) => item.shortcutOnRight)).toBe(true);
+    expect(startHere.map((item) => resolveRowBadge(item)?.text)).toEqual(["DES", "GP", "RV", "ECO"]);
 
     startHere[0]?.action();
     startHere[1]?.action();
     expect(ran).toEqual(["ticker-search", "graph-price"]);
-    // Everything the bar listed before is still listed after the group.
-    for (const entry of templates) expect(ordered.some((item) => item.id === `pane-template:${entry.id}:`)).toBe(true);
-    expect(ordered.some((item) => item.id === "security-description")).toBe(true);
+  });
+
+  /**
+   * Review, 12 Nov 2026: a recent CHAT and PF were listed in Suggested and
+   * again in Panes, and Start Here's PF again below it.
+   */
+  test("lists a function once, in the first group that runs it as its code does", () => {
+    const chart = { ...template("graph-price", "GP"), shortcut: { prefix: "GP", argKind: "ticker" } } as PaneTemplateDef;
+    const all = [chart, ...templates.slice(1), template("new-chat-pane", "CHAT"), template("new-collection-pane", "PF")];
+    const templateRow = (entry: PaneTemplateDef): ResultItem => ({
+      id: `pane-template:${entry.id}:`,
+      label: entry.label,
+      detail: "",
+      category: "Panes",
+      kind: "action",
+      right: entry.shortcut?.prefix,
+      shortcutQuery: entry.shortcut?.prefix,
+      action: () => {},
+    });
+    const { items } = buildRootResultModel(rootOptions({
+      availableCommands: [describeCommand],
+      state: {
+        config: {
+          watchlists: [],
+          portfolios: [],
+          commandBarOpens: 1,
+          recentCommands: [{ id: "pane-template:new-chat-pane" }, { id: "pane-template:graph-price", arg: "NVDA" }],
+        },
+        recentTickers: [],
+        focusedPaneId: null,
+      } as unknown as RootResultModelOptions["state"],
+      getRecentPaneTemplate: (id) => all.find((entry) => entry.id === id),
+      getAvailablePaneShortcutTemplates: (query) => all.filter((entry) => entry.shortcut?.prefix === query),
+      createPaneTemplateItem: templateRow,
+      paneShortcutItems: () => all.map(templateRow),
+      openModeRoute: () => {},
+    }));
+    const codes = orderListResults(items).map((item) => `${item.category} ${item.shortcutQuery ?? item.id}`);
+
+    expect(codes.filter((row) => row.endsWith(" CHAT"))).toEqual(["Suggested CHAT"]);
+    expect(codes.filter((row) => row.endsWith(" PF"))).toEqual(["Start Here PF"]);
+    expect(codes.filter((row) => row.endsWith(" DES"))).toEqual(["Start Here DES"]);
+    // GP NVDA is a chart of NVDA, not what GP alone opens, so GP keeps its rows.
+    expect(codes.filter((row) => row.endsWith(" GP"))).toEqual(["Suggested GP", "Start Here GP"]);
+  });
+});
+
+describe("a pasted list in the root result model", () => {
+  const assist = { enabled: true, auto: true, state: { status: "idle" as const }, onAsk: () => {}, onSignUp: () => {}, onRunCandidate: () => {} };
+
+  test("a list the bar flattened leads with adding its symbols, Bloomberg's cells whole, and the AI is still offered", () => {
+    // 2 Nov 2026: a pasted list offered Ask AI only.
+    const added: Array<[string, string | undefined]> = [];
+    const { items } = buildRootResultModel(rootOptions({
+      rootQuery: "NFE US Equity RAD US Equity TUP US Equity CZR",
+      assist,
+      executeCollectionCommand: (commandId, rawInput) => { added.push([commandId, rawInput]); },
+    }));
+    const ordered = orderListResults(items);
+    expect([ordered[0]?.label, ordered[0]?.detail]).toEqual(["Add 4 symbols to a watchlist", "NFE US Equity, RAD US Equity, TUP US Equity, CZR"]);
+    expect(ordered.some((item) => item.category === ASSIST_CATEGORY)).toBe(true);
+    ordered[0]!.action();
+    expect(added).toEqual([["add-watchlist", "NFE US Equity, RAD US Equity, TUP US Equity, CZR"]]);
+    for (const rootQuery of ["NFE, RAD", "Apple, Microsoft, Nvidia", "NFE RAD TUP", "0700 9988 1810"]) {
+      const { items: rows } = buildRootResultModel(rootOptions({ rootQuery }));
+      expect(rows.some((item) => item.id.startsWith("pasted-list:")), rootQuery).toBe(true);
+    }
+  });
+
+  test("a sentence with a comma or a name in capitals is no list, and the AI keeps its rows", () => {
+    // Review of the first cut: these led with "Add N symbols" and the AI's rows were gone.
+    for (const rootQuery of [
+      "how did NVDA do today, and why?", "NEW FORTRESS ENERGY INC", "BANK OF AMERICA", "Hello, world",
+      "palo alto networks", "AAPL MSFT", "what is NFE", "NFE US Equity", "SAP SE SIEMENS AG",
+    ]) {
+      const { items: rows } = buildRootResultModel(rootOptions({ rootQuery, assist }));
+      expect(rows.some((item) => item.id.startsWith("pasted-list:")), rootQuery).toBe(false);
+      expect(rows.some((item) => item.category === ASSIST_CATEGORY), rootQuery).toBe(true);
+    }
   });
 });

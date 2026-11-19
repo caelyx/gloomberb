@@ -33,9 +33,10 @@ import type { Quote } from "../../../types/financials";
 import type { QueryEntry } from "../../../market-data/result-types";
 import type { PaneProps } from "../../../types/plugin";
 import { publicTickerKey } from "../../../utils/exchanges";
-import { formatCompact, formatCompactAmount } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatCompactAmount } from "../../../utils/format";
 import { SERIES_COLORS } from "../../../theme/series-colors";
 import { usePluginPaneState, usePluginTickerActions } from "../../runtime";
+import { useCommandTab } from "../shared/command-tab";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
 import { INITIAL_STREAM_RANGE, streamWindowRows } from "../shared/use-quote-board";
@@ -54,14 +55,18 @@ import {
   formatOffPeg,
   nextCryptoSort,
   offPegSeverity,
+  readCryptoSort,
   sortCryptoRows,
   withCryptoSupply,
   type CryptoColumn,
   type CryptoRow,
   type CryptoSortPreference,
   type CryptoTab,
+  utcCloseAsOfText,
 } from "./model";
-import { stackedSupply, SUPPLY_RANGES, supplyByCode, supplyFailure, type SupplyRangeId } from "./supply";
+import {
+  STABLECOIN_SUPPLY_PUBLISHER, stackedSupply, SUPPLY_RANGES, supplyByCode, supplyFailure, supplyHistoryStart, type SupplyRangeId,
+} from "./supply";
 
 /**
  * The board is the price for every row without a live stream: coins the live
@@ -73,11 +78,15 @@ const CRYPTO_BOARD_REFRESH_MS = 15_000;
 const CRYPTO_BOARD_STREAMING_REFRESH_MS = 60_000;
 
 const NO_QUOTES = new Map<string, QueryEntry<Quote>>();
+const CRYPTO_TAB_VALUES = CRYPTO_TABS.map((tab) => tab.value);
 
 /** Supply moves once a day; the server reads its source daily, so half-hourly is plenty. */
 const SUPPLY_REFRESH_MS = 30 * 60_000;
 
 const SUPPLY_RANGE_OPTIONS = SUPPLY_RANGES.map(({ value, label }) => ({ value, label }));
+
+/** The most of the stablecoin tab the supply chart takes, under the rows. */
+const STABLECOIN_SUPPLY_CHART_SHARE = 1 / 3;
 
 const cryptoTickerKey = (row: CryptoRow) => publicTickerKey(row.asset.symbol, "CCC");
 
@@ -101,6 +110,7 @@ function renderCryptoCell(row: CryptoRow, column: CryptoColumn, logos: boolean):
     text: formatCryptoPercent(value),
     color: value == null ? colors.textDim : priceColor(value),
   });
+  const widenedTone = (widened: boolean) => (widened ? { color: colors.warning, keepColorWhenSelected: true } : {});
   switch (column.id) {
     case "rank":
       return { text: String(row.rank), color: colors.textDim };
@@ -124,11 +134,11 @@ function renderCryptoCell(row: CryptoRow, column: CryptoColumn, logos: boolean):
         content: <PriceSparkline priceHistory={row.history} width={column.width} period="1M" />,
       };
     case "volume24h":
-      return { text: row.volume24h == null ? "—" : formatCompact(row.volume24h, { fixedDecimals: true }), color: colors.textDim };
+      return { text: row.volume24h == null ? MISSING_VALUE : formatCompact(row.volume24h, { fixedDecimals: true }), color: colors.textDim };
     case "marketCap":
-      return { text: row.marketCap == null ? "—" : formatCompact(row.marketCap, { fixedDecimals: true }), color: colors.textDim };
+      return { text: row.marketCap == null ? MISSING_VALUE : formatCompact(row.marketCap, { fixedDecimals: true }), color: colors.textDim };
     case "pegText":
-      return { text: row.pegText || "—", color: row.peg?.accrues || (row.peg && row.peg.currency !== "USD") ? colors.text : colors.textDim };
+      return { text: row.pegText || MISSING_VALUE, color: row.peg?.accrues || (row.peg && row.peg.currency !== "USD") ? colors.text : colors.textDim };
     case "offPegBp": {
       const severity = offPegSeverity(row.offPegBp);
       return {
@@ -138,16 +148,24 @@ function renderCryptoCell(row: CryptoRow, column: CryptoColumn, logos: boolean):
         keepColorWhenSelected: severity !== "none",
       };
     }
+    // An extreme the row's own exchange price set, outside the composite's range, is flagged in the warning color.
     case "low24h":
-      return { text: row.low24hText, value: row.low24h };
+      return { text: row.low24hText, value: row.low24h, ...widenedTone(row.low24hWidened) };
     case "high24h":
-      return { text: row.high24hText, value: row.high24h };
+      return { text: row.high24hText, value: row.high24h, ...widenedTone(row.high24hWidened) };
+    case "priceVenueText":
+      // A price held back is said on its own row, in the warning color; an exchange's own or the composite is dim.
+      return { text: row.priceVenueText, color: row.delayed ? colors.warning : colors.textDim };
+    case "low24hVenueText":
+      return { text: row.low24hVenueText, color: row.low24hWidened ? colors.warning : colors.textDim };
+    case "high24hVenueText":
+      return { text: row.high24hVenueText, color: row.high24hWidened ? colors.warning : colors.textDim };
     case "low24hAt":
       return { text: formatDayRangeTime(row.low24hAt), value: row.low24hAt == null ? null : new Date(row.low24hAt), color: colors.textDim };
     case "high24hAt":
       return { text: formatDayRangeTime(row.high24hAt), value: row.high24hAt == null ? null : new Date(row.high24hAt), color: colors.textDim };
     case "supply":
-      return { text: row.supply == null ? "—" : formatCompact(row.supply, { fixedDecimals: true }) };
+      return { text: row.supply == null ? MISSING_VALUE : formatCompact(row.supply, { fixedDecimals: true }) };
     case "supply7dPercent":
       return signed(row.supply7dPercent);
     case "supply30dPercent":
@@ -157,13 +175,13 @@ function renderCryptoCell(row: CryptoRow, column: CryptoColumn, logos: boolean):
     case "supply30d":
       return signedAmount(row.supply30d);
     case "supplyShare":
-      return { text: row.supplyShare == null ? "—" : `${row.supplyShare.toFixed(2)}%`, color: colors.textDim };
+      return { text: row.supplyShare == null ? MISSING_VALUE : `${row.supplyShare.toFixed(2)}%`, color: colors.textDim };
   }
 }
 
 function signedAmount(value: number | null): DataTableCell {
   return {
-    text: value == null ? "—" : formatCompactAmount(value, { signed: true }),
+    text: value == null ? MISSING_VALUE : formatCompactAmount(value, { signed: true }),
     color: value == null ? colors.textDim : priceColor(value),
   };
 }
@@ -175,7 +193,7 @@ function supplyChangeFigure(id: string, label: string, amount: number | null, pe
   return {
     id,
     label,
-    value: amount == null ? "—" : formatCompactAmount(amount, { signed: true }),
+    value: amount == null ? MISSING_VALUE : formatCompactAmount(amount, { signed: true }),
     detail: formatCryptoPercent(percent),
     ...(amount == null ? {} : { color: priceColor(amount) }),
   };
@@ -188,9 +206,15 @@ export function CryptoBoardPane({ width, height, focused }: PaneProps) {
   const data = resource.data?.payload;
   const { pinTicker } = usePluginTickerActions();
   const liveStreaming = useLiveStreamingSetting();
-  const [activeTab, setActiveTab] = usePluginPaneState<CryptoTab>("activeTab", "coin");
+  // `CRYP stablecoin` and `CRYP tvl` open on that list, again each time either is typed.
+  const [activeTab, setActiveTab] = useCommandTab<CryptoTab>("crypto-board", "activeTab", CRYPTO_TAB_VALUES, "coin");
   const [selectedId, setSelectedId] = usePluginPaneState<string | null>("selected", null);
-  const [sort, setSort] = useState<CryptoSortPreference>(DEFAULT_CRYPTO_SORT);
+  // Kept with the pane, so `shot CRYP --sort offpeg` opens on the order it asked for.
+  const [savedSort, setSavedSort] = usePluginPaneState<unknown>("sort", DEFAULT_CRYPTO_SORT);
+  const sort = useMemo(() => readCryptoSort(savedSort), [savedSort]);
+  const setSort = useCallback((update: (current: CryptoSortPreference) => CryptoSortPreference) => (
+    setSavedSort((current: unknown) => update(readCryptoSort(current)))
+  ), [setSavedSort]);
   const [visibleRange, setVisibleRange] = useState(INITIAL_STREAM_RANGE);
   const paneVisible = usePaneVisible();
   const reloadBoard = resource.load;
@@ -250,7 +274,7 @@ export function CryptoBoardPane({ width, height, focused }: PaneProps) {
   const boardRefreshMs = allStreamedLive ? CRYPTO_BOARD_STREAMING_REFRESH_MS : CRYPTO_BOARD_REFRESH_MS;
   useEffect(() => {
     if (!paneVisible || defi) return;
-    const timer = setInterval(() => void reloadBoard(false), boardRefreshMs);
+    const timer = setInterval(() => reloadBoard(false), boardRefreshMs);
     return () => clearInterval(timer);
   }, [boardRefreshMs, defi, paneVisible, reloadBoard]);
   useEffect(() => {
@@ -267,12 +291,18 @@ export function CryptoBoardPane({ width, height, focused }: PaneProps) {
     label: "Price freshness",
     getMetadata: () => ({ ...CRYPTO_BOARD_FRESHNESS, observations }),
   } : null);
-  const statusLine = useMemo(() => observations.length
-    ? paneStatusLine(deriveHeadlessFreshness({ shape: "rows" }, { rows: observations, freshness: CRYPTO_BOARD_FRESHNESS }, now))
-    : null, [now, observations]);
   // Supply columns join only once there is supply to show; an outage leaves the price columns as they are.
   const hasSupply = !!supplyRows && supplyRows.size > 0;
   const columns = useMemo(() => buildCryptoColumns(width, assetKind, hasSupply), [assetKind, hasSupply, width]);
+  // A row held back says so in its own VENUE cell, and the footer then dates the board without claiming a delay for
+  // all of it. Too narrow for that column, the footer says the delay as it did.
+  const venueShown = columns.some((column) => column.id === "priceVenueText");
+  const statusLine = useMemo(() => observations.length
+    ? paneStatusLine(deriveHeadlessFreshness({ shape: "rows" }, {
+      rows: venueShown ? observations.map((row) => row.dataSource === "delayed" ? { quoteTime: row.quoteTime } : row) : observations,
+      freshness: CRYPTO_BOARD_FRESHNESS,
+    }, now))
+    : null, [now, observations, venueShown]);
 
   // Other is muted against the theme it is drawn on; the coins take the shared series palette, which the chart themes.
   const otherColor = useThemeColors().textMuted;
@@ -287,23 +317,27 @@ export function CryptoBoardPane({ width, height, focused }: PaneProps) {
   const supplyFigures = useMemo<StatItem[]>(() => {
     const total = supply?.total;
     if (!stablecoins || !total) return [];
+    const since = supplyHistoryStart(supply);
     return [
-      { id: "total", label: "Total supply", value: formatSupply(total.supply), ...(supply.asOf ? { detail: `as of ${supply.asOf}` } : {}) },
+      { id: "total", label: "Total supply", value: formatSupply(total.supply), ...(supply.asOf ? { detail: utcCloseAsOfText(supply.asOf) } : {}) },
       supplyChangeFigure("change-7d", "7D change", total.change7d, total.change7dPercent),
       supplyChangeFigure("change-30d", "30D change", total.change30d, total.change30dPercent),
+      // Its publisher and where the count starts, as the DeFi tab's source says them: ALL draws from that day's few coins.
+      { id: "source", label: "Source", value: STABLECOIN_SUPPLY_PUBLISHER, ...(since ? { detail: `daily since ${since}` } : {}) },
     ];
   }, [stablecoins, supply]);
   const supplyError = !supply && supplyResource.error ? supplyResource.error : null;
 
-  const tabItems = CRYPTO_TABS.map((tab) => ({
+  // Kept between quotes, so the tab strip skips the renders a board update gives the pane.
+  const tabItems = useMemo(() => CRYPTO_TABS.map((tab) => ({
     label: tab.label,
     value: tab.value,
-  }));
-  const selectTab = (value: string) => {
+  })), []);
+  const selectTab = useCallback((value: string) => {
     setActiveTab(value as CryptoTab);
     setSelectedId(null);
     setVisibleRange(INITIAL_STREAM_RANGE);
-  };
+  }, [setActiveTab, setSelectedId]);
   const { strip: tabStrip } = usePaneTabs({ tabs: tabItems, activeValue: activeTab, onSelect: selectTab, focused, compact: true, variant: "bare" });
 
   usePaneNoticeFooter({
@@ -341,8 +375,8 @@ export function CryptoBoardPane({ width, height, focused }: PaneProps) {
   const renderCell = useCallback((row: CryptoRow, column: CryptoColumn) => renderCryptoCell(row, column, logos), [logos]);
   const handleKeyDown = useCallback((event: DataTableKeyEvent) => (
     handleRefreshKey(event, () => {
-      void resource.reload();
-      if (stablecoins) void reloadSupply();
+      resource.reload();
+      if (stablecoins) reloadSupply();
     }, { stopPropagation: true })
   ), [reloadSupply, resource.reload, stablecoins]);
 
@@ -394,7 +428,8 @@ export function CryptoBoardPane({ width, height, focused }: PaneProps) {
           renderCell={renderCell}
           selectedTextOverridesCellColor
           emptyStateTitle="No crypto assets returned."
-          rootBefore={stablecoins ? (
+          // The pegs are what the tab is read for: the rows come first, the supply under them in at most a third.
+          rootAfter={stablecoins ? (
             <ChartTableHeader
               width={width}
               height={bodyHeight}
@@ -409,6 +444,7 @@ export function CryptoBoardPane({ width, height, focused }: PaneProps) {
                 remoteKind: "stablecoin-supply-history",
                 loading: supplyResource.loading && !supply,
                 empty: supplyError ? "Stablecoin supply is unavailable right now." : "No stablecoin supply history yet.",
+                maxShare: STABLECOIN_SUPPLY_CHART_SHARE,
               }}
             />
           ) : undefined}

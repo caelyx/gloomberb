@@ -1,7 +1,8 @@
+import type { CompanyFrom } from "../types/company-from";
 import { logFailure } from "../utils/log-failure";
 import type { NewsCapability } from "../capabilities";
-import type { ConnectionHealthRegistry } from "../core/connection-health";
-import type { NewsArticle, NewsQuery, NewsQueryState } from "./types";
+import { recoversDataRequests, type ConnectionHealthRegistry } from "../core/connection-health";
+import type { NewsAccess, NewsArticle, NewsQuery, NewsQueryState } from "./types";
 import { isAppVisible, subscribeAppVisibility } from "../state/app/activity";
 import {
   DEFAULT_GLOBAL_QUERY,
@@ -16,6 +17,7 @@ import {
   normalizeNewsFeed,
   normalizeNewsQuery,
 } from "./news-model";
+import { storyIdMatches } from "./story-id";
 
 export { buildNewsQueryKey } from "./news-model";
 
@@ -28,6 +30,18 @@ export interface NewsServiceOptions {
   connectionHealth?: ConnectionHealthRegistry;
   /** Defaults to the app's visibility; injectable for tests. */
   visibility?: { isVisible(): boolean; subscribe(listener: () => void): () => void };
+  /**
+   * The session the sources read news with. Its key changes when what the
+   * service answers changes: a session restored at launch, a sign-in or
+   * sign-out, an upgrade. Every open query is then read again and its stories
+   * replaced, so a feed read without the session is not left on screen.
+   */
+  session?: NewsSessionSignal;
+}
+
+export interface NewsSessionSignal {
+  key(): string;
+  subscribe(listener: () => void): () => void;
 }
 
 export type NewsQueryListener = (state: NewsQueryState) => void;
@@ -50,15 +64,29 @@ interface SourceFetchResult {
   failedSourceIds: string[];
   errors: string[];
   nextCursor: string | null;
+  access: NewsAccess | null;
+  companyFrom?: CompanyFrom | null;
 }
 
 interface NewsQueryEntry {
   query: NewsQuery;
   state: NewsQueryState;
   inFlight: Promise<NewsQueryState> | null;
+  /** The session generation the read in flight went out under. */
+  inFlightGeneration: number;
   loadMoreInFlight: Promise<void> | null;
+  loadMoreGeneration: number;
+  /** The session generation the stories on screen were read under. */
+  generation: number;
   refs: number;
   lastAccessedAt: number;
+}
+
+/** Held back beats live: one source the service held back is enough to say the list is not the live wire. */
+function combineNewsAccess(values: ReadonlyArray<NewsAccess | null | undefined>): NewsAccess | null {
+  if (values.includes("delayed")) return "delayed";
+  if (values.includes("realtime")) return "realtime";
+  return null;
 }
 
 function newsCapabilityPriority(source: NewsCapability): number {
@@ -85,6 +113,13 @@ export class NewsService {
   private readonly visibility: NonNullable<NewsServiceOptions["visibility"]>;
   private lastPollAt = 0;
   private unsubscribeVisibility: (() => void) | null = null;
+  private unsubscribeRecovery: (() => void) | null = null;
+  private readonly session?: NewsSessionSignal;
+  private sessionKey: string | null = null;
+  /** Bumped when the session changes; a read from an older generation is dropped. */
+  private sessionGeneration = 0;
+  private sessionRefetchQueued = false;
+  private unsubscribeSession: (() => void) | null = null;
 
   constructor(options: NewsServiceOptions = {}) {
     const pollInterval = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -94,6 +129,7 @@ export class NewsService {
     this.now = options.now ?? Date.now;
     this.connectionHealth = options.connectionHealth;
     this.visibility = options.visibility ?? { isVisible: isAppVisible, subscribe: subscribeAppVisibility };
+    this.session = options.session;
   }
 
   register(source: NewsCapability): () => void {
@@ -125,6 +161,18 @@ export class NewsService {
       this.clearPollTimer();
       this.scheduleNextPoll();
     });
+    if (this.session) {
+      this.sessionKey = this.session.key();
+      this.unsubscribeSession = this.session.subscribe(() => this.handleSessionChange());
+    }
+    // A list that failed while the data service (or the desktop bridge) gave no answer is read again once it answers, not at the next poll.
+    this.unsubscribeRecovery = this.connectionHealth?.subscribeRecovery((sourceId) => {
+      if (!recoversDataRequests(sourceId) || !this.polling) return;
+      for (const entry of this.queries.values()) {
+        // A list missing some of its sources is read again too, keeping what it shows meanwhile.
+        if (entry.refs > 0 && entry.state.error != null) this.refreshQuery(entry.query, entry.state.phase === "error");
+      }
+    }) ?? null;
     this.scheduleNextPoll();
   }
 
@@ -132,7 +180,46 @@ export class NewsService {
     this.polling = false;
     this.unsubscribeVisibility?.();
     this.unsubscribeVisibility = null;
+    this.unsubscribeSession?.();
+    this.unsubscribeSession = null;
+    this.unsubscribeRecovery?.();
+    this.unsubscribeRecovery = null;
     this.clearPollTimer();
+  }
+
+  /**
+   * A new session answers with other news: the live wire once a Pro session
+   * is in place, the held-back one after signing out. Reads still out under
+   * the old session are dropped, open queries are read again and replace
+   * their stories rather than merge into them, and closed ones are forgotten.
+   * A token and its user arrive as separate changes, so the reads wait for
+   * the end of the tick and go out once.
+   */
+  private handleSessionChange(): void {
+    if (!this.session) return;
+    const key = this.session.key();
+    if (key === this.sessionKey) return;
+    this.sessionKey = key;
+    this.sessionGeneration++;
+    if (this.sessionRefetchQueued) return;
+    this.sessionRefetchQueued = true;
+    queueMicrotask(() => {
+      this.sessionRefetchQueued = false;
+      if (!this.polling) return;
+      let dropped = false;
+      for (const [queryKey, entry] of this.queries) {
+        if (entry.refs > 0) continue;
+        this.queries.delete(queryKey);
+        dropped = true;
+      }
+      if (dropped) {
+        this.rebuildArticlePool();
+        this.notify();
+      }
+      for (const entry of this.queries.values()) {
+        this.refreshQuery(entry.query, true);
+      }
+    });
   }
 
   private pollInFlight = false;
@@ -176,7 +263,7 @@ export class NewsService {
     const unsubscribe = this.subscribe(emit);
     // Show loading before emitting: the fetch below starts immediately, and an
     // idle first frame paints an empty pane instead of a loading one.
-    void this.refreshQuery(normalized, true);
+    this.refreshQuery(normalized, true);
     emit();
 
     let disposed = false;
@@ -213,10 +300,16 @@ export class NewsService {
   }
 
   async load(query: NewsQuery): Promise<NewsQueryState> {
-    return this.refreshQuery(normalizeNewsQuery(query), true);
+    return this.refreshQueryAndWait(normalizeNewsQuery(query), true);
   }
 
-  async loadMore(query: NewsQuery): Promise<void> {
+  /** Asks for the next page. A failed page clears `loadingMore`; anything else is logged. */
+  loadMore(query: NewsQuery): void {
+    this.loadMoreAndWait(query).catch(logFailure("news.aggregator", "Loading more news failed"));
+  }
+
+  /** `loadMore` for a caller that waits until the page or its failure is in state. */
+  async loadMoreAndWait(query: NewsQuery): Promise<void> {
     const normalized = normalizeNewsQuery(query);
     const entry = this.queries.get(buildNewsQueryKey(normalized));
     if (!entry || entry.loadMoreInFlight || !entry.state.nextCursor || entry.state.loadingMore) return;
@@ -226,6 +319,7 @@ export class NewsService {
       return;
     }
 
+    const generation = this.sessionGeneration;
     const request = (async () => {
       entry.state = { ...entry.state, loadingMore: true };
       this.notify();
@@ -234,6 +328,12 @@ export class NewsService {
           ...normalized,
           cursor: entry.state.nextCursor ?? undefined,
         });
+        // An older page from another session must not join the list the new session read.
+        if (generation !== this.sessionGeneration || entry.generation !== generation) {
+          entry.state = { ...entry.state, loadingMore: false };
+          this.notify();
+          return;
+        }
         entry.state = {
           ...entry.state,
           loadingMore: false,
@@ -253,6 +353,7 @@ export class NewsService {
       }
     })();
     entry.loadMoreInFlight = request;
+    entry.loadMoreGeneration = generation;
     await request;
   }
 
@@ -260,16 +361,17 @@ export class NewsService {
     const sources = this.enabledSources({ feed: "latest" })
       .filter((source) => !!source.provider.fetchNewsStory);
 
+    // A short id (`6067684e`, as `news` prints it) names the story whose id starts with it.
     const requestedRevisions = new Map<NewsQueryEntry, string>();
     for (const entry of this.queries.values()) {
-      const article = entry.state.articles.find((article) => article.id === storyId);
+      const article = entry.state.articles.find((article) => storyIdMatches(article.id, storyId));
       if (article) requestedRevisions.set(entry, newsArticleRevision(article));
     }
     let failed = false;
     let olderDetail: NewsArticle | null = null;
     const commitDetail = (article: NewsArticle) => {
       this.mergeStoryDetail(article, requestedRevisions);
-      return this.articles.find((current) => current.id === storyId) ?? article;
+      return this.articles.find((current) => current.id === article.id) ?? article;
     };
     for (const source of sources) {
       try {
@@ -279,8 +381,9 @@ export class NewsService {
           () => source.provider.fetchNewsStory?.(storyId) ?? Promise.resolve(null),
         );
         if (!article) continue;
-        if (article.id !== storyId) throw new Error("Story detail identity mismatch.");
-        const current = this.articles.find((current) => current.id === storyId);
+        // The source answers a short id with the full id of the story it starts.
+        if (!storyIdMatches(article.id, storyId)) throw new Error("Story detail identity mismatch.");
+        const current = this.articles.find((current) => current.id === article.id);
         if (current && article.publishedAt < current.publishedAt) {
           if (!olderDetail || article.publishedAt > olderDetail.publishedAt) olderDetail = article;
           continue;
@@ -301,7 +404,7 @@ export class NewsService {
   }
 
   async poll(query: NewsQuery = DEFAULT_GLOBAL_QUERY): Promise<void> {
-    await this.refreshQuery(normalizeNewsQuery(query), false);
+    await this.refreshQueryAndWait(normalizeNewsQuery(query), false);
   }
 
   private async pollActiveQueries(): Promise<void> {
@@ -310,15 +413,22 @@ export class NewsService {
       .filter((entry) => entry.refs > 0)
       .map((entry) => entry.query);
     if (queries.length === 0) return;
-    await Promise.allSettled(queries.map((query) => this.refreshQuery(query, false)));
+    await Promise.allSettled(queries.map((query) => this.refreshQueryAndWait(query, false)));
   }
 
-  private async refreshQuery(
+  /** A read nobody waits on. A failed read lands in the query's state; anything else is logged. */
+  private refreshQuery(query: NewsQuery, showLoading: boolean): void {
+    this.refreshQueryAndWait(query, showLoading).catch(logFailure("news.aggregator", "Refreshing a news query failed"));
+  }
+
+  private async refreshQueryAndWait(
     query: NewsQuery,
     showLoading: boolean,
   ): Promise<NewsQueryState> {
     const entry = this.getOrCreateQueryEntry(query);
-    if (entry.inFlight) return entry.inFlight;
+    const generation = this.sessionGeneration;
+    // A read that went out under an older session answers for that session: a new one goes out beside it.
+    if (entry.inFlight && entry.inFlightGeneration === generation) return entry.inFlight;
 
     const current = entry.state;
     if (showLoading) {
@@ -333,14 +443,17 @@ export class NewsService {
     const promise = (async () => {
       try {
         const result = await this.fetchFromSources(query);
+        if (generation !== this.sessionGeneration) return this.currentRead(entry);
         if (result.sourceIds.length === 0 && result.failedSourceIds.length > 0) {
           throw new Error("News sources unavailable.");
         }
-        if (entry.loadMoreInFlight) return entry.state;
+        if (entry.loadMoreInFlight && entry.loadMoreGeneration === generation) return entry.state;
         const incoming = filterNewsArticlesForQuery(dedupeNewsArticles(result.articles), query);
+        // Stories read under another session are another feed (held back, or live): the new read replaces them.
+        const sameSession = entry.generation === generation;
         // The stories a coin's fallback found are not the pair's own: once stories are filed under it, they replace them.
-        const existing = incoming.length > 0 && entry.state.articles.length > 0
-          && (incoming[0]!.searchedFor ?? null) !== (entry.state.articles[0]!.searchedFor ?? null)
+        const existing = !sameSession || (incoming.length > 0 && entry.state.articles.length > 0
+          && (incoming[0]!.searchedFor ?? null) !== (entry.state.articles[0]!.searchedFor ?? null))
           ? []
           : entry.state.articles;
         const incomingIds = new Set(incoming.map((article) => article.id));
@@ -363,13 +476,18 @@ export class NewsService {
           sourceIds: result.sourceIds,
           nextCursor: hasOlderPages ? entry.state.nextCursor : result.nextCursor,
           loadingMore: entry.state.loadingMore,
+          // A page that does not say keeps what this session's earlier answer said.
+          access: result.access ?? (sameSession ? entry.state.access ?? null : null),
+          companyFrom: result.companyFrom ?? null,
         };
         entry.state = state;
+        entry.generation = generation;
         entry.lastAccessedAt = this.now();
         this.rebuildArticlePool();
         this.notify();
         return state;
       } catch (error) {
+        if (generation !== this.sessionGeneration) return this.currentRead(entry);
         const state: NewsQueryState = {
           ...current,
           phase: "error",
@@ -380,13 +498,19 @@ export class NewsService {
         this.notify();
         return state;
       } finally {
-        entry.inFlight = null;
+        if (entry.inFlightGeneration === generation) entry.inFlight = null;
         this.pruneInactiveQueries();
       }
     })();
 
     entry.inFlight = promise;
+    entry.inFlightGeneration = generation;
     return promise;
+  }
+
+  /** What a dropped read answers its caller: the current session's read when one is out, else the state as it is. */
+  private currentRead(entry: NewsQueryEntry): Promise<NewsQueryState> | NewsQueryState {
+    return entry.inFlight && entry.inFlightGeneration === this.sessionGeneration ? entry.inFlight : entry.state;
   }
 
   private getOrCreateQueryEntry(query: NewsQuery): NewsQueryEntry {
@@ -402,7 +526,10 @@ export class NewsService {
       query,
       state: createIdleNewsQueryState(),
       inFlight: null,
+      inFlightGeneration: this.sessionGeneration,
       loadMoreInFlight: null,
+      loadMoreGeneration: this.sessionGeneration,
+      generation: this.sessionGeneration,
       refs: 0,
       lastAccessedAt: now,
     };
@@ -451,7 +578,7 @@ export class NewsService {
   private async readSourcePage(
     source: NewsCapability,
     query: NewsQuery,
-  ): Promise<{ articles: NewsArticle[]; nextCursor: string | null; error?: string | null }> {
+  ): Promise<{ articles: NewsArticle[]; nextCursor: string | null; error?: string | null; access?: NewsAccess | null; companyFrom?: CompanyFrom | null }> {
     if (source.provider.fetchNewsPage) {
       const page = await this.trackSourceRequest(
         source,
@@ -462,6 +589,8 @@ export class NewsService {
         articles: page.articles.map((article) => markDetailCapableArticle(source, article)),
         nextCursor: page.nextCursor ?? null,
         error: page.error,
+        access: page.access,
+        companyFrom: page.companyFrom ?? null,
       };
     }
     const articles = (await this.trackSourceRequest(
@@ -484,6 +613,8 @@ export class NewsService {
           failedSourceIds,
           errors: page.error ? [page.error] : [],
           nextCursor: page.nextCursor,
+          access: page.access ?? null,
+          companyFrom: page.companyFrom ?? null,
         };
         if (page.articles.length > 0) return result;
         firstEmpty ??= result;
@@ -491,7 +622,7 @@ export class NewsService {
         failedSourceIds.push(newsCapabilitySourceId(source));
       }
     }
-    return firstEmpty ?? { articles: [], sourceIds: [], failedSourceIds, errors: [], nextCursor: null };
+    return firstEmpty ?? { articles: [], sourceIds: [], failedSourceIds, errors: [], nextCursor: null, access: null };
   }
 
   private async fetchMergedNews(query: NewsQuery, sources: NewsCapability[]): Promise<SourceFetchResult> {
@@ -505,6 +636,7 @@ export class NewsService {
     const errors: string[] = [];
     const sourceIds: string[] = [];
     const failedSourceIds: string[] = [];
+    const access: Array<NewsAccess | null | undefined> = [];
     let nextCursor: string | null = null;
     settled.forEach((result, index) => {
       if (result.status !== "fulfilled") {
@@ -515,9 +647,10 @@ export class NewsService {
       articles.push(...result.value.page.articles);
       if (result.value.page.error) errors.push(result.value.page.error);
       sourceIds.push(newsCapabilitySourceId(result.value.source));
+      access.push(result.value.page.access);
       nextCursor ??= result.value.page.nextCursor;
     });
-    return { articles, sourceIds, failedSourceIds, errors, nextCursor };
+    return { articles, sourceIds, failedSourceIds, errors, nextCursor, access: combineNewsAccess(access) };
   }
 
   private trackSourceRequest<T>(
@@ -550,6 +683,8 @@ export class NewsService {
         sourceIds: [...new Set([...entry.state.sourceIds, newsCapabilitySourceId(source)])],
         nextCursor: entry.state.nextCursor,
         loadingMore: false,
+        access: entry.state.access ?? null,
+        companyFrom: entry.state.companyFrom ?? null,
       };
       changed = true;
     }

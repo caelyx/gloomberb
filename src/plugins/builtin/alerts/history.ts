@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { apiClient } from "../../../api-client";
 import { formatPremium, RESEARCH_LABELS } from "./research-builder";
 import { isResearchAlertKind } from "./research-rules";
@@ -38,7 +39,8 @@ export interface AlertHistory {
 const KIND_LABELS: Record<string, string> = {
   catalyst: "Catalyst",
   price: "Price",
-  pe: "P/E", ps: "P/S", rsi: "RSI", ma_cross: "MA crossover", close_ma: "Close vs MA",
+  move: "Move",
+  pe: "P/E", ps: "P/S", rsi: "RSI", ma_cross: "MA crossover", close_ma: "Close vs MA", rs_ratio: "Ratio", rrg: "RRG quadrant",
   breaking_news: "Breaking news",
   earnings: "Earnings",
   chat: "Chat",
@@ -70,7 +72,7 @@ export async function fetchAlertHistory(offset = 0) {
 
 /** "1.84 x prior 20-session volume · 97 pctl · 2026-09-21", or why there is no reading. */
 export function ruleStateText(state: AlertRuleState | undefined): string {
-  if (!state) return "--";
+  if (!state) return MISSING_VALUE;
   if (state.value == null || !state.asOf) return state.warning ?? "Waiting for a source observation";
   // Options flow keeps its latest matching print: premium and when it traded.
   if (state.unit === "USD") {

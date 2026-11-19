@@ -1,4 +1,5 @@
-import { INDEX_POINTS_EXPORT_UNIT, INDEX_POINTS_LABEL, isIndexLevel } from "../market-data/market/index-level";
+import { INDEX_POINTS_EXPORT_UNIT, INDEX_POINTS_LABEL, isIndexLevel, YIELD_INDEX_EXPORT_UNIT } from "../market-data/market/index-level";
+import { isYieldIndexSymbol } from "../tickers/index-roots";
 import type { PricePoint } from "../types/financials";
 import { formatPriceObservation, marketPriceFractionDigitCeiling, resolveAssetDisplayKind } from "../market-data/market/format";
 import { TIME_RANGES, type TimeRange } from "../time-series/range";
@@ -12,15 +13,27 @@ import {
 import { classifyInstrumentType } from "../tickers/instrument-kind";
 import { isRoundTheClockCoin } from "../utils/crypto-pair";
 import { currencyPairCode } from "../utils/currency-pair";
-import { currencyUnitLabel } from "../utils/currency-units";
-import { getPricePointTimestamp } from "../utils/price-history";
-import { latestTradeIndex, missingVolumeNotice, pricePointIntegrityFlags, pricePointValues } from "../utils/price-history-integrity";
+import { currencyUnitLabel, resolveCurrencyUnit } from "../utils/currency-units";
+import { dailyBarDate, getPricePointTimestamp } from "../utils/price-history";
+import {
+  CLOSE_COPIED_FLAG, CLOSE_REBUILT_FLAG, isWickFlag, latestTradeIndex, missingVolumeNotice, OPEN_WITHHELD_FLAG, priceHistoryIntegrityNotice,
+  pricePointIntegrityFlags, pricePointOpenWithheld, pricePointValues, pricePointWickFlags,
+} from "../utils/price-history-integrity";
 import { formatUtcTime } from "../utils/utc-time";
+import { maxDrawdown, type DrawdownScale, type MaxDrawdown } from "../utils/max-drawdown";
 import { historyCoverageNotice } from "../sources/history-coverage";
 import { barLastSession, barPeriodToDate, type BarPeriodToDate } from "../market-data/market/bar-period";
 import { barSizeFromGap, medianBarGap } from "../time-series/bar-spacing";
 import { isRegularSessionTime, sessionCalendarTimeZone } from "../market-data/market/freshness";
 import { zonedDateKey } from "../utils/zoned-date-time";
+import { cleanFloat32Price, decimalPlaces } from "../utils/float32-price";
+import { futuresBoardContract } from "../market-data/futures-board";
+import { isFuturesInstrument } from "../market-data/futures-contract";
+import { contractPriceUnit } from "../time-series/price-units";
+import { DEMERGER_FLAG } from "./history-demergers";
+
+/** A float32 price as the decimal it is, which a quote's dated close is cleaned with too (utils/float32-price). */
+export { cleanFloat32Price };
 
 const PRICE_KEYS = ["open", "high", "low", "close"] as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -32,8 +45,11 @@ const LATE_START_MIN_MS = 10 * DAY_MS;
 const LATE_START_MIN_BARS = 3;
 /** A close more than this many times the close before it, or less than its hundredth, follows a jump. */
 const BREAK_JUMP_RATIO = 100;
-/** Flag codes for a break before a bar, whose prices stay as served; every other code blanks them. */
-const BREAK_FLAGS: ReadonlySet<string> = new Set(["gap", "jump"]);
+/**
+ * Flag codes for a break before a bar, whose prices stay as served; every other code blanks them. A demerger is one:
+ * the bar trades without a business the closes before it held.
+ */
+const BREAK_FLAGS: ReadonlySet<string> = new Set(["gap", "jump", DEMERGER_FLAG]);
 const FIRST_MONDAY_MS = Date.UTC(1970, 0, 5);
 
 export const BAR_INTERVAL_LABELS: Record<ManualChartResolution, string> = {
@@ -72,13 +88,50 @@ export interface HistoryRow {
   filled?: true;
   /** A future's session has closed but its settlement is not confirmed yet: the close is the last trade. */
   unsettled?: true;
+  /** An index session's closing print, its daily close, as its last intraday bar. */
+  sessionClose?: true;
+  /** An index session's last intraday bar, ending before its close, whose print was not at hand. */
+  beforeClose?: true;
   /** What the volume counts, when the history says: a coin's is traded value in its quote currency (`USD`). */
   volumeUnit?: string;
   /** Why a coin's bar has no volume: `day in progress`, `rebuilt from hourly bars`, `latest trade` (not a bar), `not reported`. */
   volumeNote?: string;
   /** A bar without the market's volume: the trades of one venue alone (`volumeVenue`), never its volume. */
   venueVolume?: number;
+  /**
+   * `history --currency`: the units of the currency asked for one unit of
+   * the listing's buys at the FX close of `fxDate`, which the prices were
+   * converted at; null where no close was in the week before the bar.
+   */
+  fxRate?: number | null;
+  /** The UTC day of that FX close: the bar's, or the last before it (a Sunday bar on Tadawul). */
+  fxDate?: string | null;
+  /** The bar's close in the listing's own currency, before it was converted. */
+  localClose?: number | null;
   volumeVenue?: string;
+  /**
+   * What the bar's volume counts, where the source says: `aggregate` across venues on a coin's daily bar,
+   * `3 spot venues` on its intraday bar, whose volume is summed over those venues.
+   */
+  volumeBasis?: string;
+  /** A continuous future's bar (NG=F): the contract it closes on (NGZ26), where the source says. */
+  contract?: string;
+  /** The first bar on a contract after another's: the series rolled into `contract` at this bar. */
+  roll?: true;
+  /** The bar traded far below the bars around it (THIN_VOLUME_SHARE of their median): a price on few trades. */
+  thin?: true;
+  /**
+   * A continuous future's bar that is its contract's settlement alone, with no
+   * open, high or low: the source no longer charts the contract (PL=F's
+   * September 2026 bars, October platinum, after it expired).
+   */
+  settleOnly?: true;
+  /**
+   * A monthly bar whose prices contradict each other (`flag`) keeps its close;
+   * its open, high and low were rebuilt from the month's daily bars
+   * (withDailyRebuiltBars), else they are blank.
+   */
+  rebuilt?: "daily bars";
 }
 
 /** A coin's volume: traded value in its quote currency, per UTC day on daily bars. */
@@ -86,27 +139,40 @@ export interface HistoryVolume {
   unit: string;
 }
 
-function decimalPlaces(value: number): number {
-  const [mantissa = "", exponent = "0"] = Math.abs(value).toString().split("e");
-  return Math.max(0, (mantissa.split(".")[1]?.length ?? 0) - Number(exponent));
+/**
+ * The finest step a venue that quotes in a sub-unit prices in, in decimals of
+ * that unit: a ten-thousandth of a penny, the smallest tick London's tick
+ * tables use (for its lowest-priced shares).
+ */
+const SUB_UNIT_TICK_DECIMALS = 4;
+/** The decimals of that sub-unit a table of bars shows: a tenth of a penny, 638.5p as 6.385. */
+const SUB_UNIT_SHOWN_DECIMALS = 1;
+
+/**
+ * A bar's price as the decimal it is (`cleanFloat32Price`). A price served in
+ * a sub-unit and divided into its currency (`divisor` 100: a London line's
+ * pence, as pounds) carries the float32 noise of the pence it was quoted in
+ * (623.59998p is 6.2359998), so it is cleaned in pence, kept to the venue's
+ * finest tick there, then divided: 6.236.
+ */
+export function cleanBarPrice(value: number, divisor = 1): number {
+  if (!(divisor > 1) || !Number.isFinite(divisor) || !Number.isFinite(value) || value === 0) return cleanFloat32Price(value);
+  const subUnit = cleanFloat32Price(value * divisor);
+  const places = Math.min(SUB_UNIT_TICK_DECIMALS, decimalPlaces(subUnit));
+  const unitPlaces = Math.round(Math.log10(divisor));
+  return Number((Number(subUnit.toFixed(places)) / divisor).toFixed(places + unitPlaces));
 }
 
 /**
- * Providers serve prices as float32: The feed sends the exact float
- * (340.33 arrives as 340.3299865722656) and the cloud a float already rounded
- * to a few decimals (254.42999). Return the shortest decimal that is the same
- * float32. Values with fewer than five decimals are left alone, and a precise
- * double only moves within float32 precision (about seven significant digits).
+ * How many of the unit a quote's prices were served in make one of the
+ * currency it shows them in: 100 for a London line priced in pence and shown
+ * in pounds, 1 for any other. A quote in a sub-unit itself (`GBp`) shows the
+ * prices as served: they are cleaned as they are.
  */
-export function cleanFloat32Price(value: number): number {
-  if (!Number.isFinite(value) || value === 0 || decimalPlaces(value) < 5) return value;
-  const target = Math.fround(value);
-  for (let digits = 1; digits <= 9; digits++) {
-    const candidate = Number(value.toPrecision(digits));
-    if (Math.fround(candidate) !== target) continue;
-    return candidate.toString().length < value.toString().length ? candidate : value;
-  }
-  return value;
+export function quotedPriceDivisor(quote: { currency?: string; providerPriceDivisor?: number } | null | undefined): number {
+  const divisor = quote?.providerPriceDivisor;
+  if (resolveCurrencyUnit(quote?.currency).divisor > 1) return 1;
+  return divisor != null && Number.isFinite(divisor) && divisor > 1 ? divisor : 1;
 }
 
 function isUtcMidnight(time: number): boolean {
@@ -217,10 +283,145 @@ function flagCodes(row: Pick<HistoryRow, "flag">): string[] {
   return row.flag ? row.flag.split(",") : [];
 }
 
+const finiteOrNull = (value: number | undefined | null) => typeof value === "number" && Number.isFinite(value) ? value : null;
+
+/** Whether a contradictory monthly bar's close can stand: a positive number. */
+function keptMonthlyClose(point: PricePoint): boolean {
+  return typeof point.close === "number" && Number.isFinite(point.close) && point.close > 0;
+}
+
+/**
+ * A bar's prices as `history` and HP show them (pricePointValues). A monthly
+ * bar whose prices contradict each other keeps its close and volume: a
+ * continuous future's month (ZC=F's September 2000) can join one contract's
+ * open to another's range. Every other contradictory bar is blanked whole.
+ */
+export function historyBarValues(point: PricePoint, monthly: boolean): ReturnType<typeof pricePointValues> {
+  const values = pricePointValues(point);
+  return monthly && values.integrity && keptMonthlyClose(point)
+    ? { ...values, close: point.close!, volume: finiteOrNull(point.volume) } : values;
+}
+
+/**
+ * What HP says of its bars whose prices contradict each other: one left
+ * blank whole as every price view says it ("1 bar has contradictory prices;
+ * left blank."), a month that keeps its close as `history` says it
+ * (historyFlagNote, with no daily bars read). Undefined when none.
+ */
+export function priceTableIntegrityNotice(rows: readonly { flag?: string | null; close: number | null; integrity?: unknown }[]): string | undefined {
+  const blanked = rows.filter((row) => row.integrity && row.close == null).length;
+  const kept = historyFlagNote(rows.map((row) => ({ flag: row.integrity && row.close != null ? row.flag ?? null : null, close: row.close })),
+    { dailyRebuild: false });
+  return [priceHistoryIntegrityNotice(blanked), kept].filter(Boolean).join(" ") || undefined;
+}
+
+/**
+ * What a bar is flagged with, as `history` and HP flag it: each way its prices contradict each other, an open withheld
+ * as outside the range the rest of the bar agrees on (`open withheld`), and a withheld wick.
+ */
+export function historyBarFlags(point: PricePoint): string[] {
+  return [
+    ...pricePointIntegrityFlags(point), ...pricePointOpenWithheld(point) ? [OPEN_WITHHELD_FLAG] : [],
+    ...pricePointWickFlags(point), ...rescaleFlags(point),
+    // A pair's close its source repeated from the open: rebuilt from the next session's open, or a copy nothing rebuilt.
+    ...point.closeRebuilt ? [CLOSE_REBUILT_FLAG] : [], ...point.closeCopied ? [CLOSE_COPIED_FLAG] : [],
+  ];
+}
+
+/** Whether a flag code marks a close its source repeated from the open (CLOSE_REBUILT_FLAG, CLOSE_COPIED_FLAG), whose prices stay. */
+const isCopiedCloseFlag = (code: string) => code === CLOSE_REBUILT_FLAG || code === CLOSE_COPIED_FLAG;
+
+/** Days a month's daily bars may leave out at either end or between two of them and still say its range: a week. */
+const REBUILD_MAX_HOLE_DAYS = 7;
+
+/** Flagged months a few apart are read in one span of daily bars: the months between cost less than another read. */
+const REBUILD_SPAN_GAP_MONTHS = 3;
+/** The longest span one read of daily bars covers: a year. */
+const REBUILD_SPAN_MONTHS = 12;
+
+const monthIndex = (month: string) => Number(month.slice(0, 4)) * 12 + Number(month.slice(5, 7)) - 1;
+
+/**
+ * The spans of daily bars that rebuild the flagged `months` (YYYY-MM), each
+ * read once: neighbouring months, up to REBUILD_SPAN_GAP_MONTHS apart, share
+ * a span of at most a year, so ZC=F's twelve flagged months since 2000 take
+ * six reads rather than twelve.
+ */
+export function dailyRebuildSpans(months: readonly string[]): Array<{ from: string; to: string }> {
+  const spans: Array<{ from: string; to: string }> = [];
+  for (const month of [...new Set(months)].filter((value) => /^\d{4}-\d{2}$/.test(value)).sort()) {
+    const span = spans.at(-1);
+    if (span && monthIndex(month) - monthIndex(span.to) <= REBUILD_SPAN_GAP_MONTHS
+      && monthIndex(month) - monthIndex(span.from) < REBUILD_SPAN_MONTHS) span.to = month;
+    else spans.push({ from: month, to: month });
+  }
+  return spans;
+}
+
+/**
+ * Monthly bars whose prices contradict each other, their close kept
+ * (historyRows), with open, high and low rebuilt from the month's daily bars:
+ * the first open, the highest high and the lowest low. A month is rebuilt
+ * only when its daily bars cover it, no week of it without one, and their
+ * range holds the kept close; otherwise its open, high and low stay blank.
+ * Daily bars whose own prices contradict each other are not read. A daily
+ * bar's day is the one the listing's `exchange` trades it on (dailyBarDate):
+ * a Sydney session stamped 23:00 UTC the evening before is still the 1st.
+ */
+export function withDailyRebuiltBars(rows: readonly HistoryRow[], daily: readonly PricePoint[], priceDivisor = 1, exchange = ""): HistoryRow[] {
+  const byMonth = new Map<string, Array<{ day: number; open: number | null; high: number; low: number }>>();
+  for (const point of daily) {
+    const time = getPricePointTimestamp(point);
+    const values = pricePointValues(point);
+    if (!Number.isFinite(time) || values.high == null || values.low == null) continue;
+    const date = dailyBarDate(time, exchange);
+    const days = byMonth.get(date.slice(0, 7)) ?? [];
+    days.push({ day: Date.parse(`${date}T00:00:00Z`) / DAY_MS, open: values.open, high: values.high, low: values.low });
+    byMonth.set(date.slice(0, 7), days);
+  }
+  return rows.map((row) => {
+    if (row.interval !== "1mo" || row.close == null || row.open != null || blankingCodes(row).length === 0) return row;
+    const days = [...(byMonth.get(row.date.slice(0, 7)) ?? [])].sort((left, right) => left.day - right.day);
+    const first = Date.parse(`${row.date.slice(0, 7)}-01T00:00:00Z`) / DAY_MS;
+    const start = new Date(first * DAY_MS);
+    const last = Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + 1, 0) / DAY_MS;
+    const stops = [first - 1, ...days.map((entry) => entry.day), last + 1];
+    if (days.length === 0 || stops.slice(1).some((day, index) => day - stops[index]! > REBUILD_MAX_HOLE_DAYS)) return row;
+    const open = days[0]!.open;
+    const high = cleanBarPrice(Math.max(...days.map((entry) => entry.high)), priceDivisor);
+    const low = cleanBarPrice(Math.min(...days.map((entry) => entry.low)), priceDivisor);
+    if (open == null || row.close > high || row.close < low) return row;
+    return { ...row, open: cleanBarPrice(open, priceDivisor), high, low, rebuilt: "daily bars" as const };
+  });
+}
+
+/** The codes of a bar left blank for prices that contradict each other: not a break before it, nor a withheld wick or open. */
+function blankingCodes(row: Pick<HistoryRow, "flag">): string[] {
+  return flagCodes(row).filter((code) => !BREAK_FLAGS.has(code) && !isWickFlag(code) && !isRescaleFlag(code) && code !== OPEN_WITHHELD_FLAG
+    && !isCopiedCloseFlag(code));
+}
+
+/**
+ * A bar the source served in the wrong unit, scaled back to the bars around it: `rescaled*10` when its prices were a
+ * tenth of themselves (and its volume ten times), `rescaled/10` when ten times. It keeps the prices as scaled.
+ */
+function rescaleFlags(point: Pick<PricePoint, "rescaled">): string[] {
+  const factor = point.rescaled;
+  if (factor == null || !Number.isFinite(factor) || factor <= 0 || factor === 1) return [];
+  return [factor > 1 ? `rescaled*${Math.round(factor)}` : `rescaled/${Math.round(1 / factor)}`];
+}
+
+/** Whether a flag code marks a bar scaled back from the wrong unit (rescaleFlags), whose prices stay. */
+export function isRescaleFlag(code: string): boolean {
+  return code.startsWith("rescaled");
+}
+
 /**
  * Intraday bars keep their UTC time; daily and longer bars are trading dates.
  * A bar whose prices contradict each other is blanked exactly as HP blanks it,
- * and says why in `flag`. A bar after a gap or a jump in the series keeps its
+ * and says why in `flag`. A low or high too far from the open and close to
+ * have traded is left blank, the rest of the bar kept, flagged `low<close/2`
+ * or `high>2*open`. A bar after a gap or a jump in the series keeps its
  * prices and is flagged `gap` or `jump`.
  */
 export function historyRows(
@@ -229,6 +430,8 @@ export function historyRows(
   currency: string | null = null,
   unit: string | null = null,
   volume: HistoryVolume | null = null,
+  /** The listing's `quotedPriceDivisor`: prices served in pence are cleaned in pence. */
+  priceDivisor = 1,
 ): HistoryRow[] {
   const times = points.map(getPricePointTimestamp);
   const intraday = resolution ? isIntradayResolution(resolution) : looksIntraday(times);
@@ -238,9 +441,9 @@ export function historyRows(
   const rows = points.map((point, index) => {
     const time = times[index]!;
     const iso = Number.isFinite(time) ? new Date(time).toISOString() : "";
-    const values = pricePointValues(point);
-    const flags = pricePointIntegrityFlags(point);
-    const price = (value: number | null) => value == null ? null : cleanFloat32Price(value);
+    const flags = historyBarFlags(point);
+    const values = historyBarValues(point, interval === "1mo");
+    const price = (value: number | null) => value == null ? null : cleanBarPrice(value, priceDivisor);
     return {
       date: intraday ? iso.replace(".000Z", "Z") : iso.slice(0, 10),
       open: price(values.open),
@@ -255,10 +458,13 @@ export function historyRows(
       ...(point.partial ? { partial: true as const } : {}),
       ...(point.filled ? { filled: true as const } : {}),
       ...(point.unsettled ? { unsettled: true as const } : {}),
+      ...(point.sessionClose ? { sessionClose: true as const } : {}),
+      ...(point.beforeClose ? { beforeClose: true as const } : {}),
       ...(volume ? { volumeUnit: volume.unit } : {}),
       ...(values.volume == null && point.venueVolume
         ? { venueVolume: point.venueVolume.volume, volumeVenue: point.venueVolume.venue }
         : {}),
+      ...(values.volume != null && point.volumeBasis ? { volumeBasis: point.volumeBasis } : {}),
       // A coin trades every day, so a bar without volume says why.
       ...(volume && values.volume == null
         ? {
@@ -269,10 +475,169 @@ export function historyRows(
     };
   });
   const breaks = historyBreakFlags(times, rows.map((row) => row.close), interval);
+  const thin = thinVolumeBars(rows.map((row, index) => ({ ...row, contract: points[index]!.contract })));
+  let contract: string | null = null;
   return rows.map((row, index) => {
     const flags = [...flagCodes(row), ...breaks[index]!];
-    return flags.length > 0 ? { ...row, flag: flags.join(",") } : row;
+    const own = points[index]!.contract;
+    // A roll is a change between two known contracts; a bar naming none (before the source knew) is no roll.
+    const rolled = !!own && contract != null && own !== contract;
+    if (own) contract = own;
+    // A contract's bar with a close and nothing else is its settlement; one still closing on its last trade says unsettled.
+    const settleOnly = !!own && row.close != null && row.open == null && row.high == null && row.low == null
+      && blankingCodes({ flag: flags.join(",") || null }).length === 0 && !row.unsettled && !row.partial;
+    const marked = {
+      ...row,
+      ...(own ? { contract: own } : {}),
+      ...(rolled ? { roll: true as const } : {}),
+      ...(thin[index] ? { thin: true as const } : {}),
+      ...(settleOnly ? { settleOnly: true as const } : {}),
+    };
+    return flags.length > 0 ? { ...marked, flag: flags.join(",") } : marked;
   });
+}
+
+/** Bars a volume step is read from, how many of them must have one, and the newest bars that may differ from it. */
+const VOLUME_STEP_BARS = 20;
+const VOLUME_STEP_MIN_BARS = 5;
+const VOLUME_STEP_NEWEST = 2;
+
+/**
+ * The volumes a text table prints at the step the rest of the column is in, by bar date: daily or longer bars whose
+ * source serves volume in whole hundreds (round lots) and the newest one or two as exact counts (the session's own
+ * feed) print those at the hundred too, so the column reads at one precision, never 6,764,700 above 4,650,114.
+ * Only the text rounds: the rows, `--json` and `--csv` keep every count as served. Empty for bars of another step
+ * and for intraday bars.
+ */
+export function historyTextVolumes(rows: ReadonlyArray<{ date: string; volume: number | null }>, intraday: boolean): Map<string, number> {
+  const shown = new Map<string, number>();
+  if (intraday) return shown;
+  const recent = rows.slice(-VOLUME_STEP_BARS);
+  const older = recent.slice(0, -VOLUME_STEP_NEWEST).flatMap((row) => row.volume != null && row.volume > 0 ? [row.volume] : []);
+  if (older.length < VOLUME_STEP_MIN_BARS || !older.every((volume) => volume % 100 === 0)) return shown;
+  for (const row of rows.slice(-VOLUME_STEP_NEWEST)) {
+    if (row.volume != null && row.volume % 100 !== 0) shown.set(row.date, Math.round(row.volume / 100) * 100);
+  }
+  return shown;
+}
+
+/** Bars on each side of a bar whose volumes it is held against. */
+const THIN_NEIGHBOURS = 5;
+/** A bar under this share of its neighbours' median volume traded thin. */
+const THIN_VOLUME_SHARE = 0.05;
+
+/**
+ * For each bar of a continuous future, whether it traded far below the bars
+ * around it: a volume under THIN_VOLUME_SHARE of the median of up to
+ * THIN_NEIGHBOURS bars either side that have one (at least four). NG=F's
+ * 2026-10-28 bar on 15 lots between days of 150,000 is a price few trades
+ * made. Only a bar naming its contract is judged, against others that do: a
+ * stock's or a coin's quiet day is not a contract's thin one. A bar still
+ * forming, or with no trade at all (no volume, or 0), is not judged.
+ */
+function thinVolumeBars(rows: readonly (Pick<HistoryRow, "volume" | "partial"> & { contract?: string })[]): boolean[] {
+  const judged = (row: (typeof rows)[number]): row is (typeof rows)[number] & { volume: number } =>
+    !!row.contract && !row.partial && row.volume != null && Number.isFinite(row.volume) && row.volume > 0;
+  return rows.map((row, index) => {
+    if (!judged(row)) return false;
+    const around = [...rows.slice(Math.max(0, index - THIN_NEIGHBOURS), index), ...rows.slice(index + 1, index + 1 + THIN_NEIGHBOURS)]
+      .filter(judged)
+      .map((other) => other.volume)
+      .sort((left, right) => left - right);
+    if (around.length < 4) return false;
+    const middle = around.length / 2;
+    const median = around.length % 2 ? around[Math.floor(middle)]! : (around[middle - 1]! + around[middle]!) / 2;
+    return median > 0 && row.volume < THIN_VOLUME_SHARE * median;
+  });
+}
+
+/** A roll of a continuous future: the bar it rolled at, and the contracts either side. */
+export interface HistoryRoll {
+  date: string;
+  from: string;
+  to: string;
+}
+
+/** Every roll in a history's bars (`roll`), oldest first. */
+export function historyRolls(rows: readonly Pick<HistoryRow, "date" | "contract" | "roll">[]): HistoryRoll[] {
+  let contract: string | null = null;
+  const rolls: HistoryRoll[] = [];
+  for (const row of rows) {
+    if (row.roll && contract && row.contract) rolls.push({ date: row.date, from: contract, to: row.contract });
+    if (row.contract) contract = row.contract;
+  }
+  return rolls;
+}
+
+/**
+ * A history's bars split at every roll, each run one contract's, oldest
+ * first: what a drawdown or a change is read within, never across a roll.
+ * One run, named by no contract, for a history that names none.
+ */
+function historyContractRuns<Row extends Pick<HistoryRow, "contract" | "roll">>(rows: readonly Row[]): Array<{ contract: string | null; rows: Row[] }> {
+  const runs: Array<{ contract: string | null; rows: Row[] }> = [];
+  for (const row of rows) {
+    const current = runs.at(-1);
+    if (!current || row.roll) runs.push({ contract: row.contract ?? null, rows: [row] });
+    else {
+      current.rows.push(row);
+      current.contract ??= row.contract ?? null;
+    }
+  }
+  return runs;
+}
+
+/**
+ * The largest drawdown of a history's bars within one contract: each run
+ * between rolls read on its own (historyContractRuns), the deepest kept and
+ * named by its contract when the bars roll. A history naming no contract is
+ * one run, its drawdown `maxDrawdown`'s.
+ */
+export function historyContractDrawdown(
+  rows: readonly Pick<HistoryRow, "date" | "close" | "contract" | "roll">[],
+  scale: DrawdownScale = "return",
+): { drawdown: MaxDrawdown; contract: string | null } | null {
+  const runs = historyContractRuns(rows);
+  let deepest: { drawdown: MaxDrawdown; contract: string | null } | null = null;
+  const depth = (drawdown: MaxDrawdown) => drawdown.bp ?? drawdown.drawdown;
+  for (const run of runs) {
+    const drawdown = maxDrawdown(run.rows, scale);
+    if (drawdown && (!deepest || depth(drawdown) < depth(deepest.drawdown))) deepest = { drawdown, contract: runs.length > 1 ? run.contract : null };
+  }
+  return deepest;
+}
+
+/**
+ * "NG=F is the front month: rolled from NGX26 to NGZ26 on 2026-10-26 (marked
+ * roll)": the rolls a continuous future's bars make, the latest few by date,
+ * the rest counted. A symbol that follows the most traded month (`mostTraded`,
+ * GC=F) is "the most traded month", as its quote's roll says. Null without one.
+ */
+export function historyRollNote(
+  symbol: string,
+  rows: readonly Pick<HistoryRow, "date" | "contract" | "roll">[],
+  { mostTraded = false }: { mostTraded?: boolean } = {},
+): string | null {
+  const rolls = historyRolls(rows);
+  if (rolls.length === 0) return null;
+  const shown = rolls.slice(-LISTED_GAPS);
+  const earlier = rolls.length - shown.length;
+  const listed = shown.map((roll) => `from ${roll.from} to ${roll.to} on ${historyDate(roll.date)}`);
+  return `${symbol} is the ${mostTraded ? "most traded" : "front"} month: ${earlier > 0 ? `${earlier} earlier ${earlier === 1 ? "roll" : "rolls"}, then ` : ""}`
+    + `rolled ${listItems(listed)} (marked roll); drawdowns are read within one contract`;
+}
+
+/**
+ * "2026-10-28 traded thin: under 5% of the volume of the bars around it", the
+ * bars marked `thin`, the latest few by date. Null without one.
+ */
+export function historyThinNote(rows: readonly Pick<HistoryRow, "date" | "thin">[]): string | null {
+  const thin = rows.filter((row) => row.thin).map((row) => historyDate(row.date));
+  if (thin.length === 0) return null;
+  const shown = thin.slice(-LISTED_GAPS);
+  const earlier = thin.length - shown.length;
+  const dates = listItems([...earlier > 0 ? [`${earlier} earlier ${earlier === 1 ? "bar" : "bars"}`] : [], ...shown]);
+  return `${dates} traded thin: under ${THIN_VOLUME_SHARE * 100}% of the volume of the bars around ${thin.length === 1 ? "it" : "them"}`;
 }
 
 /**
@@ -322,9 +687,34 @@ export function historyVolume(
   return coin && unit.kind === "currency" && unit.currency ? { unit: unit.currency } : null;
 }
 
-/** `volume in USD per UTC day` for a coin's daily bars; `volume in USD` for others. */
-export function historyVolumeText(volume: HistoryVolume, interval: ManualChartResolution | null): string {
-  return interval === "1d" ? `volume in ${volume.unit} per UTC day` : `volume in ${volume.unit}`;
+/**
+ * `volume in USD per UTC day` for a coin's daily bars, `volume in USD` for others, with what it counts when every bar
+ * with a volume says the same (`historyVolumeBasis`): `volume in USD per UTC day, aggregate across venues`, `volume in
+ * USD summed over 3 spot venues`.
+ */
+function historyVolumeText(volume: HistoryVolume, interval: ManualChartResolution | null, basis: string | null = null): string {
+  const text = interval === "1d" ? `volume in ${volume.unit} per UTC day` : `volume in ${volume.unit}`;
+  if (!basis) return text;
+  return basis === "aggregate" ? `${text}, aggregate across venues` : `${text} summed over ${basis}`;
+}
+
+/**
+ * What the status line says of a history's volume: a coin's unit and basis
+ * (historyVolumeText), or, for bars whose volume has no unit to state, what
+ * it counts when the history says (`volume basis: daily total` on an index's
+ * daily bars, `volume basis: intraday count` on its hourly ones, which sum
+ * below the day's). Null when neither is known.
+ */
+export function historyVolumeNote(volume: HistoryVolume | null, interval: ManualChartResolution | null, basis: string | null): string | null {
+  if (volume) return historyVolumeText(volume, interval, basis);
+  return basis ? `volume basis: ${basis}` : null;
+}
+
+/** What the volume of every bar that has one counts, when they all say the same; null otherwise. */
+export function historyVolumeBasis(rows: readonly Pick<HistoryRow, "volume" | "volumeBasis">[]): string | null {
+  const bases = new Set(rows.filter((row) => row.volume != null).map((row) => row.volumeBasis ?? null));
+  const [basis] = bases.size === 1 ? [...bases] : [null];
+  return basis ?? null;
 }
 
 function listDates(dates: readonly string[]): string {
@@ -355,7 +745,7 @@ export function venueTradingDay(venue: string | undefined, now: number): string 
  * partial bar is then still forming.
  */
 export function historyBarStatusNote(
-  rows: readonly Pick<HistoryRow, "date" | "partial" | "filled" | "unsettled" | "volume" | "interval">[],
+  rows: readonly Pick<HistoryRow, "date" | "partial" | "filled" | "unsettled" | "sessionClose" | "beforeClose" | "volume" | "interval">[],
   options: { tradingDay?: string | null } = {},
 ): string | null {
   // A day's bar the data service still marks partial once its session has closed: its own daily bar is not in yet.
@@ -366,6 +756,8 @@ export function historyBarStatusNote(
   const latest = rows[latestTradeIndex(rows.map((row) => Date.parse(row.date)))];
   const filled = rows.filter((row) => row.filled);
   const unsettled = rows.filter((row) => row.unsettled);
+  const closes = rows.filter((row) => row.sessionClose);
+  const beforeClose = rows.filter((row) => row.beforeClose);
   const notes = [
     partial.length > 0
       ? `${listDates(partial.map((row) => row.date))} ${partial.length === 1 ? "is" : "are"} still forming (partial)`
@@ -382,6 +774,15 @@ export function historyBarStatusNote(
     unsettled.length > 0
       ? `${listDates(unsettled.map((row) => row.date))} ${unsettled.length === 1 ? "closes" : "close"} on the last trade until the`
         + ` settlement is confirmed (unsettled)`
+      : null,
+    // The data service adds a past session's closing print to its intraday bars, as the source sends only the latest one.
+    closes.length > 0
+      ? `${listDates(closes.map((row) => row.date))} ${closes.length === 1 ? "is its session's" : "are their sessions'"} closing print,`
+        + ` the day's close (close)`
+      : null,
+    beforeClose.length > 0
+      ? `${listDates(beforeClose.map((row) => row.date))} ${beforeClose.length === 1 ? "ends" : "end"} before the closing auction:`
+        + ` the day's close is on its daily bar (before close)`
       : null,
     // Its blank volume beside bars that have one, said once rather than counted as a bar without volume.
     latest && latest.volume == null && historyReportsVolume(rows)
@@ -410,7 +811,7 @@ export function historyMissingVolumeNote(
   if (!historyReportsVolume(rows)) return null;
   const latestTrade = latestTradeIndex(rows.map((row) => Date.parse(row.date)));
   const missing = rows.filter((row, index) => row.volume == null && row.venueVolume == null && !row.partial && !row.filled
-    && !flagCodes(row).some((code) => !BREAK_FLAGS.has(code)) && index !== latestTrade).length;
+    && blankingCodes(row).length === 0 && index !== latestTrade).length;
   return missingVolumeNotice(missing, rows.length) ?? null;
 }
 
@@ -440,8 +841,14 @@ function neededDecimals(value: number, cap: number): number {
  * row. A known asset kind caps it with the app's price display rules; without
  * one, the largest price sets a seven significant digit ceiling (BTC keeps
  * cents, FX keeps pips, sub-cent coins keep their digits). Cents at least above 1.
+ * Prices served in a sub-unit (`priceDivisor` 100, a London line's pence) may
+ * keep a tenth of it too: 6.385 for 638.5p. Finer ticks stay in the export.
  */
-export function historyPriceDecimals(rows: readonly Pick<HistoryRow, typeof PRICE_KEYS[number]>[], assetCategory?: string): number {
+export function historyPriceDecimals(
+  rows: readonly Pick<HistoryRow, typeof PRICE_KEYS[number]>[],
+  assetCategory?: string,
+  priceDivisor = 1,
+): number {
   const values = rows.flatMap((row) => PRICE_KEYS.flatMap((key) => {
     const value = row[key];
     return value != null && Number.isFinite(value) && value !== 0 ? [Math.abs(value)] : [];
@@ -450,9 +857,12 @@ export function historyPriceDecimals(rows: readonly Pick<HistoryRow, typeof PRIC
   const largest = values.reduce((max, value) => Math.max(max, value), 0);
   const magnitude = Math.floor(Math.log10(largest));
   const significantCap = largest >= 1 ? Math.max(2, 6 - magnitude) : 6 - magnitude;
-  const cap = resolveAssetDisplayKind({ assetCategory }) === "other"
+  // A line priced in pence is a share or a fund on its exchange, whatever kind its row was saved as.
+  const subUnit = priceDivisor > 1;
+  const kind = subUnit && resolveAssetDisplayKind({ assetCategory }) === "other" ? "EQUITY" : assetCategory;
+  const cap = resolveAssetDisplayKind({ assetCategory: kind }) === "other"
     ? significantCap
-    : Math.min(significantCap, marketPriceFractionDigitCeiling(largest, { assetCategory }));
+    : Math.min(significantCap, marketPriceFractionDigitCeiling(largest, { assetCategory: kind }) + (subUnit ? SUB_UNIT_SHOWN_DECIMALS : 0));
   const needed = values.map((value) => neededDecimals(value, cap)).sort((left, right) => left - right);
   const decimals = needed[Math.floor(0.9 * (needed.length - 1))]!;
   return largest >= 1 ? Math.max(2, decimals) : decimals;
@@ -470,23 +880,19 @@ interface BarPrices {
  * The decimals one table of bars prints its prices with (`history`, HP's pane
  * and `fn HP`): historyPriceDecimals over the float32-cleaned prices, so a
  * feed's 4013.39990234 reads as the 4013.4 it is and the count follows the
- * asset's display rules (two for gold, three for silver, cents for a US equity).
+ * asset's display rules (two for gold, three for silver, cents for a US equity,
+ * and a London line's pence: 6.385 for 638.5p, with `priceDivisor` 100).
  */
-export function barPriceDecimals(bars: readonly BarPrices[], assetCategory?: string): number {
-  const clean = (value: number | null | undefined) => value == null ? null : cleanFloat32Price(value);
+export function barPriceDecimals(bars: readonly BarPrices[], assetCategory?: string, priceDivisor = 1): number {
+  const clean = (value: number | null | undefined) => value == null ? null : cleanBarPrice(value, priceDivisor);
   return historyPriceDecimals(bars.flatMap((bar) => bar.close == null ? [] : [{
     date: "", open: clean(bar.open), high: clean(bar.high), low: clean(bar.low), close: clean(bar.close)!, volume: null,
-  }]), assetCategory);
+  }]), assetCategory, priceDivisor);
 }
 
 /** A price at the table's decimal count (barPriceDecimals), within `maxWidth` when the pane gives one. */
 export function formatBarPrice(value: number, decimals: number, maxWidth?: number): string {
   return formatPriceObservation(Number(value.toFixed(Math.min(20, decimals))), { minimumFractionDigits: decimals, maxWidth });
-}
-
-/** How far back ALL reaches, in whole years, from the window a history request for it asks for. */
-export function historyAllRangeYears(now = new Date()): number {
-  return Math.round((now.getTime() - subtractTimeRange(now, "ALL").getTime()) / (365.25 * DAY_MS));
 }
 
 /** "1D 5-minute, 1W hourly, 1M to 1Y daily, 5Y weekly, ALL monthly", from the table history requests use. */
@@ -504,7 +910,8 @@ export function historyIntervalsByRange(): string {
 }
 
 export interface HistoryUnit {
-  kind: "currency" | "pair" | "points" | "unknown";
+  /** `contract`: a future's price in its contract's unit, `US cents / bushel`, the spelling FUT and G use. */
+  kind: "currency" | "pair" | "points" | "contract" | "unknown";
   /** Currency code of the prices; null for index points or when no source says. */
   currency: string | null;
   /** What one price is: "USD", "ILA (agorot, 1/100 ILS)", "ZAR per USD", "index points"; null when unknown. */
@@ -518,17 +925,33 @@ export interface HistoryUnit {
  * named as such. Without one the unit is unknown rather than guessed from the
  * exchange.
  */
-export function historyUnit(listing: string, quote: { currency?: string; instrumentType?: string } | null | undefined): HistoryUnit {
+export function historyUnit(
+  listing: string,
+  quote: { currency?: string; instrumentType?: string } | null | undefined,
+  /** A future's unit from its contract terms (`US cents / bushel`), else the futures catalog's. */
+  priceUnit?: string | null,
+): HistoryUnit {
   const pair = currencyPairCode(listing.trim().toUpperCase());
   if (pair) {
     const [base, counter] = [pair.slice(0, 3), pair.slice(3)];
     return { kind: "pair", currency: counter, unit: `${counter} per ${base}` };
   }
+  // A Cboe yield index is a yield in percent, the unit `quote` exports it in, not index points.
+  if (isYieldIndexSymbol(listing)) return { kind: "points", currency: null, unit: YIELD_INDEX_EXPORT_UNIT };
   if (isIndexLevel(quote?.instrumentType)) return { kind: "points", currency: null, unit: INDEX_POINTS_EXPORT_UNIT };
   const code = quote?.currency?.trim();
+  // A future is priced in its contract's unit, spelled one way in the text, CSV and JSON.
+  const future = !!code && isFuturesInstrument(listing, quote?.instrumentType);
+  const contractUnit = future ? contractPriceUnit(priceUnit ?? futuresBoardContract(listing.trim().toUpperCase())?.unit, code) : null;
+  if (code && contractUnit) return { kind: "contract", currency: code, unit: contractUnit };
   return code
     ? { kind: "currency", currency: code, unit: currencyUnitLabel(code, { ofMajor: true }) }
     : { kind: "unknown", currency: null, unit: null };
+}
+
+/** The unit an export names for a history's prices: a pair's quote currency per base (`JPY per USD`), else its currency or unit. */
+export function historyExportUnit(unit: HistoryUnit): string | null {
+  return unit.kind === "pair" || unit.kind === "contract" ? unit.unit : unit.currency ?? unit.unit;
 }
 
 function historyDate(value: string): string {
@@ -552,7 +975,8 @@ export function historyFacts(unit: HistoryUnit, rows: readonly Pick<HistoryRow, 
   const interval = rows[0]?.interval;
   const unbroken = historyUnbrokenFrom(rows);
   return [
-    unit.kind === "pair" ? unit.unit! : unit.kind === "points" ? INDEX_POINTS_LABEL : `Currency ${unit.unit ?? "unknown"}`,
+    unit.kind === "pair" ? unit.unit! : unit.kind === "points" ? unit.unit === YIELD_INDEX_EXPORT_UNIT ? "Yield, percent" : INDEX_POINTS_LABEL
+      : unit.kind === "contract" ? `Unit ${unit.unit}` : `Currency ${unit.unit ?? "unknown"}`,
     interval ? `${BAR_INTERVAL_LABELS[interval]} bars` : "",
     first && last ? (first === last ? historyDate(first) : `${historyDate(first)} to ${historyDate(last)}`) : "",
     `${rows.length} ${rows.length === 1 ? "bar" : "bars"}`,
@@ -569,7 +993,7 @@ function startsLate(range: TimeRange, interval: ManualChartResolution | null, fi
 
 /**
  * Where an ALL history starts when that is its source's first bar, well
- * after the window ALL reaches back to (historyAllRangeYears): BTC-USD's
+ * after the window ALL asks for (fifty years): BTC-USD's
  * monthly bars start 2014-09, though it traded from 2010. A monthly bar's
  * month, otherwise its day. Null for other ranges, and for a history the
  * window cuts.
@@ -782,18 +1206,112 @@ export function historyGapNote(
 /**
  * "37 of 251 bars have high below open or close in the source data; ...", or
  * null when every bar agrees. Bars flagged only for a gap or jump before them
- * keep their prices and are not counted.
+ * keep their prices and are not counted. Without `dailyRebuild` (HP, which
+ * reads no daily bars for them) a kept close's open, high and low are just
+ * blank.
  */
-export function historyFlagNote(rows: readonly Pick<HistoryRow, "flag">[]): string | null {
-  const contradictions = (row: Pick<HistoryRow, "flag">) => flagCodes(row).filter((code) => !BREAK_FLAGS.has(code));
-  const flagged = rows.filter((row) => contradictions(row).length > 0);
+export function historyFlagNote(
+  rows: readonly Pick<HistoryRow, "flag" | "close" | "rebuilt">[],
+  { dailyRebuild = true }: { dailyRebuild?: boolean } = {},
+): string | null {
+  const flagged = rows.filter((row) => blankingCodes(row).length > 0);
   if (flagged.length === 0) return null;
-  const codes = new Set(flagged.flatMap(contradictions));
+  const codes = new Set(flagged.flatMap(blankingCodes));
   const kinds = [
     codes.has("high<open") || codes.has("high<close") ? "high below open or close" : "",
     codes.has("low>open") || codes.has("low>close") ? "low above open or close" : "",
     codes.has("low>high") ? "low above high" : "",
   ].filter(Boolean);
   const count = `${flagged.length} of ${rows.length} ${flagged.length === 1 && rows.length === 1 ? "bar" : "bars"}`;
-  return `${count} ${flagged.length === 1 ? "has" : "have"} ${kinds.join(", or ")} in the source data; their prices are left blank`;
+  const said = `${count} ${flagged.length === 1 ? "has" : "have"} ${kinds.join(", or ")} in the source data`;
+  // A monthly bar keeps its close; its open, high and low come from the month's daily bars where they cover it.
+  const kept = flagged.filter((row) => row.close != null);
+  if (kept.length === 0) return `${said}; ${flagged.length === 1 ? "its" : "their"} prices are left blank`;
+  const rebuilt = kept.filter((row) => row.rebuilt).length;
+  const blank = flagged.length - kept.length;
+  const keep = blank > 0 ? `${kept.length} keep their close` : flagged.length === 1 ? "it keeps its close" : "they keep their close";
+  const ohl = !dailyRebuild ? "; open, high and low are blank"
+    : rebuilt === kept.length ? ", with open, high and low from the month's daily bars"
+    : rebuilt > 0 ? `; open, high and low come from the month's daily bars for ${rebuilt} and are blank for ${kept.length - rebuilt}, whose daily bars do not cover the month without contradiction`
+      : `; open, high and low are blank, the month's daily bars not covering ${kept.length === 1 ? "it" : "them"} without contradiction`;
+  return `${said}; ${keep}${ohl}${blank > 0 ? `; ${blank} ${blank === 1 ? "is" : "are"} left blank` : ""}`;
+}
+
+/**
+ * "2026-03-30 and 2026-03-31 came from the source at 1/10 of their price and 10x their volume; shown scaled back": the
+ * bars flagged `rescaled*N` or `rescaled/N` (rescaleFlags), or null when none is.
+ */
+export function historyRescaleNote(rows: readonly Pick<HistoryRow, "date" | "flag">[]): string | null {
+  const byCode = new Map<string, string[]>();
+  for (const row of rows) {
+    for (const code of flagCodes(row).filter(isRescaleFlag)) byCode.set(code, [...byCode.get(code) ?? [], row.date]);
+  }
+  if (byCode.size === 0) return null;
+  const parts = [...byCode].map(([code, dates]) => {
+    const factor = code.slice("rescaled".length + 1);
+    const up = code.startsWith("rescaled*");
+    const listed = dates.length <= LISTED_GAPS ? listItems(dates) : `${dates.length} bars`;
+    const their = dates.length === 1 ? "its" : "their";
+    return `${listed} came from the source at ${up ? `1/${factor} of` : `${factor}x`} ${their} price and ${up ? `${factor}x` : `1/${factor} of`} ${their} volume`;
+  });
+  return `${parts.join("; ")}; shown scaled back (flag rescaled)`;
+}
+
+/**
+ * "The open of 2026-10-30 is outside its high and low in the source data;
+ * withheld, the rest of the bar kept (flag open withheld)", or null when no
+ * bar's open is (pricePointOpenWithheld). Three or more bars are counted.
+ */
+export function historyOpenNote(rows: readonly Pick<HistoryRow, "date" | "flag">[]): string | null {
+  const flagged = rows.filter((row) => flagCodes(row).includes(OPEN_WITHHELD_FLAG));
+  if (flagged.length === 0) return null;
+  const kept = `withheld, the rest of ${flagged.length === 1 ? "the bar" : "each bar"} kept (flag ${OPEN_WITHHELD_FLAG})`;
+  if (flagged.length === 1) return `The open of ${flagged[0]!.date} is outside its high and low in the source data; ${kept}`;
+  const dates = flagged.length <= LISTED_GAPS ? ` (${listItems(flagged.map((row) => row.date))})` : "";
+  return `${flagged.length} of ${rows.length} bars have an open outside their high and low in the source data${dates}; ${kept}`;
+}
+
+/**
+ * What a pair's history says of the closes its source repeated from the open
+ * (EUR/USD's 5 Jul 2022 came as open and close 1.043319 on a day that closed
+ * near 1.026): the ones rebuilt from the next session's open (flag close
+ * rebuilt), and the ones nothing could rebuild (the last session of their
+ * week, or a next open over 5% away), which returns leave out
+ * (flag close copied). Three or more of either are counted. Null when no bar
+ * is either.
+ */
+export function historyCopiedCloseNote(rows: readonly Pick<HistoryRow, "date" | "flag">[]): string | null {
+  const dated = (code: string) => rows.filter((row) => flagCodes(row).includes(code)).map((row) => row.date);
+  const listed = (dates: readonly string[]) => dates.length <= LISTED_GAPS ? listItems(dates) : `${dates.length} bars`;
+  const rebuilt = dated(CLOSE_REBUILT_FLAG);
+  const copied = dated(CLOSE_COPIED_FLAG);
+  const notes = [
+    rebuilt.length > 0 ? `The source repeated the open of ${listed(rebuilt)} as ${rebuilt.length === 1 ? "its" : "their"} close; `
+      + `${rebuilt.length === 1 ? "it closes" : "they close"} at the next session's open (flag ${CLOSE_REBUILT_FLAG})` : null,
+    copied.length > 0 ? `the source repeated the open of ${listed(copied)} as ${copied.length === 1 ? "its" : "their"} close, which `
+      + `no next open in the week rebuilds (none, or one over 5% away): no day's close, `
+      + `left out of returns (flag ${CLOSE_COPIED_FLAG})` : null,
+  ].filter((note): note is string => note != null);
+  const text = notes.join("; ");
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : null;
+}
+
+/**
+ * "The low of 2021-11-29 is under half its open and close, too far to have
+ * traded; left blank and out of ranges", or null when no bar has such a wick
+ * (pricePointWickFlags). Three or more bars are counted.
+ */
+export function historyWickNote(rows: readonly Pick<HistoryRow, "date" | "flag">[]): string | null {
+  const flagged = rows.filter((row) => flagCodes(row).some(isWickFlag));
+  if (flagged.length === 0) return null;
+  const sides = new Set(flagged.flatMap((row) => flagCodes(row).filter(isWickFlag).map((code) => code.slice(0, code.indexOf(code.startsWith("low") ? "<" : ">")))));
+  const reason = "too far to have traded; left blank and out of ranges";
+  const only = flagged[0]!;
+  if (flagged.length === 1 && sides.size === 1) {
+    return sides.has("low") ? `The low of ${only.date} is under half its open and close, ${reason}`
+      : `The high of ${only.date} is over twice its open and close, ${reason}`;
+  }
+  const kinds = [sides.has("low") ? "a low under half" : "", sides.has("high") ? "a high over twice" : ""].filter(Boolean).join(" or ");
+  const dates = flagged.length <= LISTED_GAPS ? ` (${listItems(flagged.map((row) => row.date))})` : "";
+  return `${flagged.length} of ${rows.length} bars have ${kinds} their open and close${dates}, ${reason}`;
 }

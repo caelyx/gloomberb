@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CREDIT_SERIES, normalizeCreditSeries } from "./model";
+import { CREDIT_SERIES, creditRegion, creditSeriesIn, normalizeCreditSeries } from "./model";
 
 function payload(overrides: Record<string, unknown> = {}, observations: Array<{ date: string; value: number | null }> = [
   { date: "2026-08-17", value: 0.81 },
@@ -36,6 +36,13 @@ describe("normalizeCreditSeries", () => {
     });
   });
 
+  test("carries the publisher's history cap only when the series' notes state it", () => {
+    const capped = "Starting in April 2026, this series will only include 3 years of observations.";
+    expect(normalizeCreditSeries(CREDIT_SERIES[0]!, payload({ notes: capped })).historyLimit)
+      .toBe("History limited to 3 years by the publisher.");
+    expect(normalizeCreditSeries(CREDIT_SERIES[0]!, payload()).historyLimit).toBeNull();
+  });
+
   test("ranks the latest spread within the year before it, not the whole fetched history", () => {
     const row = normalizeCreditSeries(CREDIT_SERIES[0]!, payload({}, [
       { date: "2025-08-01", value: 3 },
@@ -53,4 +60,15 @@ describe("normalizeCreditSeries", () => {
     expect(() => normalizeCreditSeries(CREDIT_SERIES[0]!, payload({ title: "Corporate Effective Yield" }))).toThrow("unexpected FRED metadata");
     expect(() => normalizeCreditSeries(CREDIT_SERIES[0]!, payload({ id: "BAMLH0A0HYM2" }))).toThrow("unexpected FRED metadata");
   });
+});
+
+test("a region or a comma list of them lists their indexes, emerging markets taking in Asia", () => {
+  const labels = (value: unknown) => creditSeriesIn(creditRegion(value)).map((series) => series.label);
+  expect(labels("asia")).toEqual(["Asia EM"]);
+  expect(labels("em")).toEqual(["EM Corp", "EM IG", "EM HY", "Asia EM", "LatAm EM", "EMEA EM"]);
+  expect(labels("asia,us")).toEqual(["US IG", "AAA", "AA", "A", "BBB", "US HY", "BB", "B", "CCC", "Asia EM"]);
+  expect(labels("asia,em")).toEqual(labels("em"));
+  // A setting this version does not know lists every index.
+  expect(labels("mars")).toHaveLength(CREDIT_SERIES.length);
+  expect(labels(undefined)).toHaveLength(CREDIT_SERIES.length);
 });

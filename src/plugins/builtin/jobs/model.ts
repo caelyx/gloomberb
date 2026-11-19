@@ -7,7 +7,7 @@ import type {
   CloudJobsPosting,
   CloudJobsSummaryPayload,
 } from "../../../api-client/types";
-import { formatCompact, formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatNumber } from "../../../utils/format";
 import { compareSortValues } from "../../../utils/sort-values";
 import { formatSalaryRange, postingTitle } from "../shared/job-posting";
 
@@ -50,6 +50,12 @@ const SENIORITY_SHORT: Record<string, string> = {
   director: "Director",
   executive: "Exec",
 };
+
+/** What JOBS says while the server looks for a company's careers system: a first read takes minutes, not a load. */
+export function pendingJobsTitle(symbol: string): string {
+  return `Looking for ${symbol}'s careers system.`;
+}
+export const PENDING_JOBS_MESSAGE = "Roles show here once it is read, usually within a few minutes. This pane checks again on its own.";
 
 export function functionLabel(id: string | null | undefined): string {
   if (!id) return "Unclassified";
@@ -97,7 +103,7 @@ export function buildAgeBars(summary: Pick<CloudJobsSummaryPayload, "ageBuckets"
 }
 
 export function formatChange(change: CloudJobsChange | null | undefined): string {
-  if (!change) return "-";
+  if (!change) return MISSING_VALUE;
   const sign = change.count > 0 ? "+" : "";
   const percent = change.percent != null ? ` (${sign}${formatNumber(change.percent, 1)}%)` : "";
   return `${sign}${change.count}${percent}`;
@@ -266,10 +272,10 @@ export function buildMoverRows(movers: readonly CloudJobsMoverPayload[]): MoverR
     mover,
     ticker: mover.ticker,
     company: mover.companyName ?? "",
-    open: formatCompact(mover.openCount),
+    open: formatCompact(mover.openCount, { fixedDecimals: true }),
     change: mover.change30d ? formatChange(mover.change30d) : "",
     changeValue: mover.change30d?.percent ?? mover.change30d?.count ?? null,
-    posted30d: mover.posted30d != null ? formatCompact(mover.posted30d) : "",
+    posted30d: mover.posted30d != null ? formatCompact(mover.posted30d, { fixedDecimals: true }) : "",
     posted30dValue: mover.posted30d ?? null,
     new7d: mover.new7d > 0 ? String(mover.new7d) : "",
     function: functionLabel(mover.topFunction),

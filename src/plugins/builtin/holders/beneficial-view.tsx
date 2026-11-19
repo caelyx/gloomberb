@@ -9,7 +9,9 @@ import {
   type DataTableCell,
   type DataTableKeyEvent,
 } from "../../../components";
+import { useCompanyDataFooter } from "../../../components/layout/pane/status-footer";
 import { handleRefreshKey, loadingErrorFooterInfo } from "../../../components/data-table/table-pane";
+import { STALE_SEGMENT } from "../../../components/layout/pane/status-footer";
 import type { IssuerListingParams } from "../../../api-client/paths";
 import { useAsyncResource } from "../../../react/async-resource";
 import { useAutoRefresh } from "../../../react/auto-refresh";
@@ -41,8 +43,6 @@ import {
 } from "./beneficial-model";
 import type { Holder13FMatch } from "./thirteenf-match";
 import type { HolderRow } from "./types";
-
-const STALE_SEGMENT = { id: "stale", parts: [{ text: "stale", tone: "warning" as const }] };
 
 /**
  * A table line: a filer's row, or the line beneath it giving the same shares
@@ -141,7 +141,7 @@ export function BeneficialOwnersView({
   }, [rendererHost, selectedRow]);
 
   const refresh = useCallback(() => {
-    void resource.reload();
+    resource.reload();
     onRefreshHolders();
   }, [onRefreshHolders, resource]);
 
@@ -233,6 +233,8 @@ export function BeneficialOwnersView({
     focused,
     title: "13D/13G coverage",
   });
+  // A foreign line's owners are its company's, read from the home line.
+  useCompanyDataFooter(payload?.companyFrom);
   usePaneFooter("holders-13dg", () => ({
     info: [
       ...(payload?.asOf ? [{ id: "as-of", parts: [{ text: `as of ${payload.asOf.slice(0, 10)}`, tone: "muted" as const }] }] : []),

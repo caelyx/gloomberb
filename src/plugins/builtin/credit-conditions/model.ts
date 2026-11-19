@@ -1,22 +1,29 @@
 import type { CloudFredSeriesPayload } from "../../../api-client";
 import { historyStatistics } from "../../../components/chart/curve/model";
+import { fredHistoryLimitNotice } from "../../../time-series/economic";
 import { ICE_SPREAD_SERIES, type IceCreditSeries } from "../../../time-series/ice-credit";
 
 export type CreditSeriesDefinition = Pick<IceCreditSeries, "seriesId" | "label" | "region">;
 
-/** US investment grade and high yield by rating, then euro high yield. */
+/** US investment grade and high yield by rating, euro high yield, then emerging markets corporates by grade and region. */
 export const CREDIT_SERIES: readonly CreditSeriesDefinition[] = ICE_SPREAD_SERIES
   .map(({ seriesId, label, region }) => ({ seriesId, label, region }));
 
-const CREDIT_REGIONS = ["all", "us", "euro"] as const;
+const CREDIT_REGIONS = ["all", "us", "euro", "em", "asia"] as const;
 type CreditRegion = typeof CREDIT_REGIONS[number];
 
-export function creditRegion(value: unknown): CreditRegion {
-  return CREDIT_REGIONS.includes(value as CreditRegion) ? value as CreditRegion : "all";
+/** The regions to list, from a setting or `--region` (one, or a comma list such as `asia,us`); every one when none is known. */
+export function creditRegion(value: unknown): readonly CreditRegion[] {
+  const regions = typeof value === "string"
+    ? [...new Set(value.split(",").map((part) => part.trim().toLowerCase()))].filter((part): part is CreditRegion => CREDIT_REGIONS.includes(part as CreditRegion))
+    : [];
+  return regions.length === 0 || regions.includes("all") ? ["all"] : regions;
 }
 
-export function creditSeriesIn(region: CreditRegion): readonly CreditSeriesDefinition[] {
-  return region === "all" ? CREDIT_SERIES : CREDIT_SERIES.filter((series) => series.region === region);
+/** The series in the regions, in the board's order: emerging markets take in Asia, its biggest region. */
+export function creditSeriesIn(regions: readonly CreditRegion[]): readonly CreditSeriesDefinition[] {
+  if (regions.includes("all")) return CREDIT_SERIES;
+  return CREDIT_SERIES.filter((series) => regions.includes(series.region) || (series.region === "asia" && regions.includes("em")));
 }
 
 export interface CreditConditionRow {
@@ -30,6 +37,8 @@ export interface CreditConditionRow {
   dailyChangeBp: number | null;
   date: string;
   stale: boolean;
+  /** The publisher's cap on how far back the series goes, when FRED states one. */
+  historyLimit: string | null;
   /** Observations in the year to `date`, in basis points, oldest first. */
   history: Array<{ date: string; valueBp: number }>;
   /** Midrank of the latest spread within that year. */
@@ -85,6 +94,7 @@ export function normalizeCreditSeries(
     dailyChangeBp: previous ? roundTenth((latest.value - previous.value) * 100) : null,
     date: latest.date,
     stale,
+    historyLimit: fredHistoryLimitNotice(definition.seriesId, info),
     history,
     // One observation ranks nothing.
     percentile1Y: year.count >= 2 ? year.percentile : null,

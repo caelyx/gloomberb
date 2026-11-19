@@ -9,6 +9,7 @@ import { createDefaultConfig } from "../../types/config";
 import type {
   CachedAssetArgs,
   CachedAssetMethod,
+  BatchedReadMethod,
   CachedFinancialsTarget,
   DataProvider,
   MarketDataRequestContext,
@@ -28,10 +29,13 @@ import type { NewsArticle, NewsQuery } from "../../news/types";
 import type { BrokerContractRef, InstrumentSearchResult } from "../../types/instrument";
 import type { TickerChanges } from "../../types/ticker-changes";
 import type { IssuerListings } from "../../types/issuer-listings";
-import type { TimeRange } from "../../time-series/range";
+import { assertTimeRange, type TimeRange } from "../../time-series/range";
 import type { ChartResolutionSupport, ManualChartResolution } from "../../time-series/resolution";
 import { debugLog } from "../../utils/debug-log";
 import { errorMessage } from "../../utils/errors";
+import { isProviderBusy, isRateLimited, isSourceFailure } from "../provider-errors";
+import { isNetworkFailure } from "../../utils/network-failure";
+import { isPastPreCloseRefetch } from "../../utils/exchange-rate-snapshot";
 import { ProviderRouterBatchRoutes } from "./batches";
 import { createSignedInRealtimeCloudAccess, type RealtimeCloudAccess } from "./realtime-access";
 import { mapListingTargets, publicListingExchange } from "../listing-target";
@@ -50,9 +54,11 @@ import {
   type ProviderRouterCachePolicyKey,
 } from "./cache";
 import { ProviderRouterSearchRoutes } from "./search";
-import { collectCapabilityRouteSources, normalizeRouteSource } from "./sources";
+import { collectCapabilityRouteSources, mergeRouteSourcesById, normalizeRouteSource } from "./sources";
 import type { ProviderRouterCoreDeps } from "./route-types";
 import { withProviderConnectionHealth } from "./connection-health";
+import { withFiledTrailingEps } from "../../time-series/filed-trailing-eps";
+import { withShareMultiples } from "../../utils/share-multiples";
 import {
   contextFromCachedTarget,
   getBrokerCandidates,
@@ -62,6 +68,13 @@ import {
   withBrokerTimeout,
   type BrokerCandidate,
 } from "./brokers";
+
+/**
+ * One trailing EPS and P/E for every view of a listing: the filed quarters', as PEB and GE read them
+ * (withFiledTrailingEps), and none where the price over it is no multiple of the share (withShareMultiples).
+ */
+const withTrailingMultiples = <T extends Parameters<typeof withFiledTrailingEps>[0] & Parameters<typeof withShareMultiples>[0]>(financials: T): T =>
+  withShareMultiples(withFiledTrailingEps(financials));
 
 const providerLog = debugLog.createLogger("asset-data-router");
 
@@ -213,7 +226,7 @@ export class AssetDataRouter implements DataProvider {
     for (const target of valid) {
       const key = target.symbol.toUpperCase();
       const financials = cached.get(key);
-      if (financials) cached.set(key, this.knownFinancials(financials, listingOf(target, contextFromCachedTarget(target))));
+      if (financials) cached.set(key, withTrailingMultiples(this.knownFinancials(financials, listingOf(target, contextFromCachedTarget(target)))));
     }
     return cached;
   }
@@ -248,7 +261,11 @@ export class AssetDataRouter implements DataProvider {
     // Error into {} and its reason into "[object Object]" on the board.
     return targets.map((target) => {
       const result = restored.get(target) ?? { target, quote: null };
-      return result.error == null ? result : { ...result, error: errorMessage(result.error) };
+      if (result.error == null) return result;
+      // The request limit is no moment's failure: asked again it is more of what was refused (`isRateLimited`).
+      const transient = !isRateLimited(result.error)
+        && (isSourceFailure(result.error) || isNetworkFailure(result.error) || isProviderBusy(result.error));
+      return { ...result, error: errorMessage(result.error), ...transient ? { transient } : {} };
     });
   }
 
@@ -263,8 +280,9 @@ export class AssetDataRouter implements DataProvider {
     const dated = await this.datedAnswers(quoted, options.datesChangeBasis);
     let next = 0;
     const results = answered.map((result) => {
-      if (!result.financials?.quote) return result;
-      const financials = this.withDatedQuote(result.financials, dated[next++]!, listingOfResult(result));
+      if (!result.financials) return result;
+      const quoted = result.financials.quote ? this.withDatedQuote(result.financials, dated[next++]!, listingOfResult(result)) : result.financials;
+      const financials = withTrailingMultiples(quoted);
       return financials === result.financials ? result : { ...result, financials };
     });
     const restored = new Map(results.map((result) => {
@@ -279,10 +297,11 @@ export class AssetDataRouter implements DataProvider {
     const { context, datesChangeBasis } = splitDating(requestContext);
     exchange = this.resolvePublicExchange(ticker, exchange, context);
     const financials = await this.financialRoutes.getTickerFinancials(ticker, exchange, context);
-    if (!financials.quote) return financials;
+    if (!financials.quote) return withTrailingMultiples(financials);
     const listing = listingOf({ symbol: ticker, exchange }, context);
     const [quote] = await this.datedAnswers([{ quote: financials.quote, listing }], datesChangeBasis);
-    return this.withDatedQuote(financials, quote!, listing);
+    // One trailing EPS and P/E for every view of the listing: the filed quarters', as PEB and GE read them.
+    return withTrailingMultiples(this.withDatedQuote(financials, quote!, listing));
   }
 
   async getQuote(ticker: string, exchange?: string, requestContext?: MarketDataRequestContext): Promise<Quote> {
@@ -358,7 +377,12 @@ export class AssetDataRouter implements DataProvider {
   }
 
   async getExchangeRate(fromCurrency: string, context?: Pick<MarketDataRequestContext, "cacheMode">): Promise<number> {
-    return (await this.getCachedQuery("getExchangeRate", [fromCurrency]).load({ force: context?.cacheMode === "refresh", background: this.revalidateInBackground })).value;
+    const query = this.getCachedQuery("getExchangeRate", [fromCurrency]);
+    // A rate read before the FX week closed is no close: once the close is out, wait for it instead of showing
+    // the old rate while it is read again, which the caller would then hold as read now.
+    const cached = query.getSnapshot().result;
+    const background = this.revalidateInBackground && !(cached && isPastPreCloseRefetch(cached));
+    return (await query.load({ force: context?.cacheMode === "refresh", background })).value;
   }
 
   async search(query: string, context?: SearchRequestContext): Promise<InstrumentSearchResult[]> {
@@ -383,6 +407,10 @@ export class AssetDataRouter implements DataProvider {
 
   searchBatch(queries: string[], options?: { limit?: number; signal?: AbortSignal }): Promise<Map<string, InstrumentSearchResult[]> | null> {
     return this.searchRoutes.searchBatch(queries, options);
+  }
+
+  knownUsStock(symbol: string): boolean {
+    return this.providersInPriorityOrder().some((provider) => provider.knownUsStock?.(symbol) === true);
   }
 
   /** The first source that answers a batch of symbol changes; null when none can or it fails. */
@@ -442,11 +470,13 @@ export class AssetDataRouter implements DataProvider {
   }
 
   async getPriceHistory(ticker: string, exchange: string, range: TimeRange, context?: MarketDataRequestContext): Promise<PricePoint[]> {
+    assertTimeRange(range);
     exchange = this.resolvePublicExchange(ticker, exchange, context) ?? "";
     return this.historyRoutes.getPriceHistory(ticker, exchange, range, context);
   }
 
   async getPriceHistoryWithMetadata(ticker: string, exchange: string, range: TimeRange, context?: MarketDataRequestContext): Promise<PriceHistoryResult> {
+    assertTimeRange(range);
     exchange = this.resolvePublicExchange(ticker, exchange, context) ?? "";
     return this.historyRoutes.getPriceHistoryWithMetadata(ticker, exchange, range, context);
   }
@@ -458,6 +488,7 @@ export class AssetDataRouter implements DataProvider {
     resolution: ManualChartResolution,
     context?: MarketDataRequestContext,
   ): Promise<PricePoint[]> {
+    assertTimeRange(bufferRange);
     exchange = this.resolvePublicExchange(ticker, exchange, context) ?? "";
     return this.historyRoutes.getPriceHistoryForResolution(ticker, exchange, bufferRange, resolution, context);
   }
@@ -469,6 +500,7 @@ export class AssetDataRouter implements DataProvider {
     resolution: ManualChartResolution,
     context?: MarketDataRequestContext,
   ): Promise<PriceHistoryResult> {
+    assertTimeRange(bufferRange);
     exchange = this.resolvePublicExchange(ticker, exchange, context) ?? "";
     return this.historyRoutes.getPriceHistoryForResolutionWithMetadata(ticker, exchange, bufferRange, resolution, context);
   }
@@ -608,7 +640,7 @@ export class AssetDataRouter implements DataProvider {
         ...this.registry.getEnabledCapabilities("news"),
       ]));
     }
-    return sources
+    return mergeRouteSourcesById(sources)
       .filter((source) => source.id !== this.id && source.id !== this.fallbackSource?.id)
       .sort((a, b) => routeSourcePriority(a) - routeSourcePriority(b));
   }
@@ -626,6 +658,18 @@ export class AssetDataRouter implements DataProvider {
    */
   primaryMarketSourceName(): string | null {
     return this.providersInPriorityOrder()[0]?.name ?? null;
+  }
+
+  /**
+   * Whether reads of `method` asked together go out as batch requests: only
+   * when every source the router could ask for them does, each broker that
+   * reads them and each provider. A caller asking many at once then never
+   * sends them one by one to a source that takes them one by one.
+   */
+  batchesReads(method: BatchedReadMethod): boolean {
+    if (this.getBrokerCandidatesForContext(undefined, false).some(({ broker }) => typeof broker[method] === "function")) return false;
+    const providers = this.providersInPriorityOrder().filter((provider) => typeof provider[method] === "function");
+    return providers.length > 0 && providers.every((provider) => provider.batchesReads?.(method) === true);
   }
 
   private providersInPriorityOrder(): DataProvider[] {

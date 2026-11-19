@@ -8,8 +8,9 @@ import {
   listTimeSeriesFields,
 } from "../../../time-series/field-catalog";
 import {
-  CANONICAL_EXCHANGE_ALIASES,
   canonicalExchange,
+  canonicalTickerKey,
+  isKnownExchangeCode,
   publicTickerKey,
 } from "../../../utils/exchanges";
 import { MAX_CHART_COMPOSER_SERIES } from "./chart-spec";
@@ -73,7 +74,8 @@ export function normalizeInstrument(
   if (parts.length !== 2) return null;
   const symbol = normalizeBaseSymbol(parts[0]!);
   const exchangeToken = parts[1]!.trim().toUpperCase();
-  const knownExchange = Object.prototype.hasOwnProperty.call(CANONICAL_EXCHANGE_ALIASES, exchangeToken);
+  // Every venue the app names, as a listing's key writes it (BDI:NEO, Cboe Canada), not only the spellings it reads as another.
+  const knownExchange = isKnownExchangeCode(exchangeToken);
   if (!symbol || !/^[A-Z0-9._-]{1,24}$/.test(exchangeToken) || (!knownExchange && !allowUnknownExchange)) {
     return null;
   }
@@ -149,8 +151,9 @@ export function parseSeriesExpression(value: string): ParsedSeriesExpression | n
       instrument = normalizeInstrument(parts[0]!);
       fieldId = candidateFieldId;
     } else {
-      // A known public exchange suffix is unambiguously a qualified ticker.
-      instrument = normalizeInstrument(trimmed);
+      // A known public exchange suffix is unambiguously a qualified ticker; so is any after an index's ^ (^NDX:NIM),
+      // whose key names the venue code its publisher has, which is no exchange the app lists.
+      instrument = normalizeInstrument(trimmed, trimmed.startsWith("^"));
     }
   } else if (parts.length === 3) {
     const candidateFieldId = resolveChartFieldAlias(parts[2]);
@@ -164,7 +167,8 @@ export function parseSeriesExpression(value: string): ParsedSeriesExpression | n
   return { kind: "security", ...instrument, fieldId };
 }
 
-const SERIES_FORMS = "Use SYMBOL, SYMBOL:field, FUT:code, UST:maturity, FRED:series, GEO:series, or CAP:capability-id:series-id.";
+const SERIES_FORMS = "Use SYMBOL, SYMBOL:field, FUT:code, UST:maturity, FRED:series, GEO:series, CAP:capability-id:series-id, "
+  + "a catalog series' id or name (gloom catalog lists them), or a formula of series such as \"42*HO=F - CL=F\".";
 
 /** A word that reads as a series, not an operator or a number of a formula. */
 const LIST_WORD = /^[A-Za-z^][\w.^=:/~-]*$/;
@@ -265,7 +269,8 @@ export function chartSeriesLabel(series: ChartSeriesSpec): string {
   const generic = getTimeSeriesField(series.source.fieldId)?.unitGroup === "price"
     ? futuresGenericListing(series.source.instrument.symbol, series.source.instrument.exchange) : null;
   if (generic) return futuresGenericCaption(generic);
-  const instrument = publicTickerKey(
+  // The venue's own code (9992:HKEX), as the series' resolved label names it (instrumentLabel).
+  const instrument = canonicalTickerKey(
     series.source.instrument.symbol,
     series.source.instrument.exchange,
   );

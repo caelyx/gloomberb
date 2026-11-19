@@ -2,9 +2,14 @@ import { listingSuffixExchange } from "../sources/listing-symbols";
 import { kindFromListingSyntax } from "../tickers/instrument-kind";
 import { macroReleaseTopic } from "../plugins/builtin/shared/macro-releases";
 import { parsePublicTickerKey } from "../utils/exchanges";
+import { commandWord } from "../utils/shell-word";
 import { listingAbroadVenue } from "../utils/sec";
 import { nimCommand } from "./bank-section";
-import { treasuryYieldLine, treasuryYieldTenor } from "./treasury-yields";
+import { treasuryBillLine, treasuryYieldLine, treasuryYieldTenor } from "./treasury-yields";
+import { namedCurrencyPair } from "./currency-name-hint";
+import { dollarPairListing } from "../utils/currency-pair";
+import { currencyCodeTyped } from "../utils/currency-names";
+import { uncarriedIndexFor, uncarriedIndexLine } from "../tickers/index-roots";
 
 /**
  * What a listing is to a sub-minute ask: a US listing, which has a tape; one
@@ -70,9 +75,9 @@ export function isSubMinuteInterval(value: string): boolean {
  * (checked 2026-10-19).
  */
 export const MUNI_LINE = "Municipal bonds: no AAA muni curve (MMD and BVAL are licensed). Muni bond funds: MUB, VTEB, TFI (national), SUB (short-term), "
-  + "CMF, VTEC (California), NYF, MUNY (New York). SEC yield, distribution yield, yield to worst and duration: gloom fn DVD <fund> or "
-  + "gloom fundamentals <fund>; tax-equivalent yield and muni/Treasury ratio: add --tax-rate 40.8 (with --state-rate 13.3 --state CA for a "
-  + "single-state fund).";
+  + "CMF, VTEC (California), NYF, MUNY (New York). SEC yield, distribution yield, yield to worst and duration: gloom fn DVD <fund>, fn ETF <fund>, "
+  + "fn DES <fund> or gloom fundamentals <fund>; tax-equivalent yield and muni/Treasury ratio: add --tax-rate 40.8, as in gloom fn DVD MUB --tax-rate 40.8 "
+  + "(with --state-rate 13.3 --state CA for a single-state fund), and gloom fn DVD MUB VTEB SUB LQD --tax-rate 40.8 ranks several.";
 
 /**
  * Data people look for under a name search cannot find: where the app has it,
@@ -87,8 +92,22 @@ export const MUNI_LINE = "Municipal bonds: no AAA muni curve (MMD and BVAL are l
  * `tickers` are terms that are also a real ticker (BDI is Black Diamond Group):
  * a query that is only that word still gets the line, but `quote` adds it only
  * to the exchange question or the failure of the bare symbol, never to a quote.
+ *
+ * An entry with `words` matches on tokens, not only the whole query: a query
+ * holding one of its terms, every other word a term or one of `words`
+ * ("panamax rates", "bulk freight", "freight cost"). A word outside both keeps
+ * it a different question ("freight forwarder stocks", "ocean freight
+ * carriers"). An entry without `words` matches the whole query alone, since
+ * its terms are words of company names too ("carbon", "second").
  */
-const KNOWN_GAPS: ReadonlyArray<{ terms: readonly string[]; tickers?: readonly string[]; message: string }> = [
+const KNOWN_GAPS: ReadonlyArray<{
+  terms: readonly string[];
+  words?: readonly string[];
+  tickers?: readonly string[];
+  /** A price the terminal has none of: where a ticker goes, the query answers this line rather than a company's name holding its words. */
+  unquoted?: boolean;
+  message: string;
+}> = [
   {
     terms: ["EUA", "EUAs", "EU ETS", "EU allowance", "EU allowances", "EU carbon", "carbon", "carbon allowance", "carbon allowances",
       "carbon price", "carbon prices", "carbon credits", "emission allowances", "emissions allowances"],
@@ -100,6 +119,16 @@ const KNOWN_GAPS: ReadonlyArray<{ terms: readonly string[]; tickers?: readonly s
     message: "European gas storage: EPWR GAS, or EPWR GAS DE for one country; chart CAP:gas-storage:eu. US storage is NGS.",
   },
   {
+    // The Hong Kong Association of Banks licenses its HIBOR fixings for non-commercial use only; HKMA's own bill yields stand in.
+    terms: ["HIBOR", "HKD HIBOR", "HIBOR fixing", "HIBOR fixings", "HIBOR rate", "HIBOR rates", "Hong Kong Interbank Offered Rate",
+      "Hong Kong interbank rate", "Hong Kong interbank rates"],
+    message: "HIBOR is not licensed for redistribution. For HKD short rates, BTMM's Hong Kong tab shows HKMA's Exchange Fund Bill yields: fn BTMM --tab hk.",
+  },
+  {
+    terms: ["LIBOR", "USD LIBOR", "LIBOR rate", "LIBOR rates", "London Interbank Offered Rate"],
+    message: "LIBOR is no longer published: USD LIBOR ended in June 2023 and SOFR replaced it. SOFR is in BTMM: fn BTMM.",
+  },
+  {
     terms: ["tick", "ticks", "tick data", "tick bars", "tick by tick", "second", "seconds", "second bars", "1s", "1 second",
       "1 second bars", "sub-minute", "sub minute bars", "subsecond"],
     message: subMinuteDataMessage(),
@@ -107,11 +136,34 @@ const KNOWN_GAPS: ReadonlyArray<{ terms: readonly string[]; tickers?: readonly s
   {
     terms: ["Baltic", "Baltic Dry", "Baltic Dry Index", "Baltic Exchange", "Baltic index", "Baltic indices", "BDI", "BDIY", "freight",
       "freight rate", "freight rates", "freight index", "freight futures", "freight forward", "freight forwards", "freight forward agreement",
-      "freight forward agreements", "FFA", "FFAs", "capesize", "panamax", "supramax", "charter rate", "charter rates", "dry bulk",
-      "dry bulk rates", "dry bulk freight"],
+      "freight forward agreements", "FFA", "FFAs", "capesize", "panamax", "supramax", "handysize", "kamsarmax", "newcastlemax",
+      "charter rate", "charter rates", "dry bulk", "dry bulk rates", "dry bulk freight", "shipping rate", "shipping rates", "shipping cost",
+      "shipping costs", "time charter", "TCE"],
+    words: ["rate", "rates", "cost", "costs", "price", "prices", "index", "indices", "indexes", "level", "levels", "chart", "charts",
+      "history", "historical", "data", "spot", "today", "current", "latest", "daily", "weekly", "market", "markets", "bulk", "dry",
+      "bulker", "bulkers", "vessel", "vessels", "ship", "ships", "route", "routes", "earnings", "equivalent", "futures", "the", "of", "for"],
     tickers: ["BDI"],
     message: "Baltic indices (BDI, Capesize, Panamax, Supramax) and freight forwards (FFA) are not covered. Traded proxies: BDRY (freight futures ETF), "
       + "SBLK, GNK, DSX (dry-bulk shipowners); chokepoint transits: fn CHOKE; news \"dry bulk\".",
+  },
+  {
+    // Live iron ore futures (SGX, DCE, CME) are licensed; the IMF's monthly world price is the one the terminal has.
+    // "iron ore" typed for a quote was Kumba Iron Ore's stock, which its own name still finds.
+    terms: ["iron ore", "iron ore price", "iron ore prices", "iron ore futures", "iron ore 62", "62% Fe", "iron ore 62% Fe",
+      "iron ore fines", "SGX iron ore", "DCE iron ore", "iron ore spot"],
+    words: ["price", "prices", "futures", "future", "spot", "62", "fe", "cfr", "china", "fines", "monthly", "chart", "today",
+      "current", "latest", "live", "quote", "the", "of"],
+    unquoted: true,
+    message: "Iron ore: no live price (SGX, DCE and CME iron ore futures are licensed). The IMF's monthly world price: gloom fred PIORECRUSDM. "
+      + "Producers: VALE, RIO, BHP, KIO:JSE (Kumba Iron Ore).",
+  },
+  {
+    // Urea, DAP and potash futures (CME, MIAX) are licensed and no fertiliser price series is carried; `catalog
+    // fertiliser` read as PSD's crop balances, and `catalog urea` found nothing.
+    terms: ["fertiliser", "fertilisers", "fertilizer", "fertilizers", "urea", "DAP", "diammonium phosphate", "potash"],
+    words: ["price", "prices", "futures", "future", "spot", "index", "chart", "today", "current", "latest", "granular", "nola",
+      "the", "of"],
+    message: "Fertiliser (urea, DAP, potash): no price series yet. Producers: NTR, CF, MOS, YAR.OL (Yara); news: gloom news fertilizer.",
   },
   {
     // What the terminal has for munis, and what it does not: the AAA curve every muni ratio quotes is licensed.
@@ -142,8 +194,8 @@ const BANK_FIGURES_TOPIC = {
  * command or a function. One example, writing a file.
  */
 function exportLine(symbol = "LMT"): string {
-  return `Export: add --csv or --json to any command to print its result as CSV or JSON, e.g. gloom history ${symbol} --csv > ${
-    symbol.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.csv`;
+  return `Export: add --csv or --json to any command to print its result as CSV or JSON, and --output <file> to write it to a file in UTF-8, e.g. gloom history ${
+    commandWord(symbol)} --csv --output ${symbol.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}.csv`;
 }
 
 const EXPORT_POINTER = {
@@ -196,6 +248,14 @@ const TOPIC_POINTERS: ReadonlyArray<{
 }> = [
   BANK_FIGURES_TOPIC,
   {
+    // CRPR's agency ratings are licensed by the agencies; the tape's grade of each bond is the nearest public read.
+    topic: "Agency credit ratings and rating history",
+    availability: "not carried (the agencies license them)",
+    phrases: ["crpr", "agency rating", "agency ratings", "credit rating history", "credit ratings history", "rating agency",
+      "rating agencies", "moody's rating", "moodys rating", "fitch rating"],
+    closest: [["TRACE", "each bond's grade, investment grade or high yield: gloom fn TRACE <ticker>"], ["CRD", "spreads by rating"]],
+  },
+  {
     topic: "defense budget",
     phrases: ["defense budget", "defence budget", "defense spending", "defence spending", "dod", "department of defense",
       "military budget", "military spending", "pentagon budget", "pentagon spending"],
@@ -221,6 +281,17 @@ const TOPIC_POINTERS: ReadonlyArray<{
       "shanghai rebar", "shanghai steel", "shanghai metals"],
     closestLabel: "COMEX curves",
     closest: [["CTM", "gloom fn CTM HG for copper, gloom fn CTM ALI for aluminium"]],
+  },
+  {
+    // No source serves a jet fuel (kerosene) price. Heating oil, NY Harbor ULSD, is what airlines hedge it with and
+    // analysts read it by; the EIA's weekly US stocks are a catalog series (checked 2026-10-29: quote HO=F,
+    // fn COT HO and fn G CAP:doe:jet all answer).
+    topic: "Jet fuel (kerosene)",
+    availability: "no price series; heating oil (NY Harbor ULSD) is the usual proxy, its price: gloom quote HO=F. "
+      + "US jet fuel stocks (EIA, weekly): gloom fn G CAP:doe:jet",
+    phrases: ["jet fuel", "jet fuels", "kerosene", "kerosine", "jet kerosene", "aviation fuel", "aviation fuels", "avtur"],
+    closestLabel: "positioning",
+    closest: [["COT", "heating oil, the usual jet fuel proxy: gloom fn COT HO"]],
   },
   {
     // "exchange reserves" alone reads as crypto's; "foreign exchange reserves" is a central bank's, so only whole.
@@ -284,6 +355,16 @@ const COMMAND_POINTERS: ReadonlyArray<{
   SHEETS_POINTER,
   EXPORT_POINTER,
   {
+    // A port's ships, not PORT's portfolio: "port" names both, and "port throughput" found Portfolio alone.
+    names: ["port", "ports", "seaport", "seaports", "harbor", "harbors", "harbour", "harbours", "throughput", "shipping"],
+    words: ["call", "calls", "volume", "volumes", "traffic", "activity", "congestion", "cargo", "container", "containers",
+      "tanker", "tankers", "vessel", "vessels", "ship", "ships", "arrivals", "imports", "exports", "tonnes", "tons",
+      "weekly", "data", "by", "country", "freight", "trade", "busiest", "world"],
+    line: "Port calls, tanker and container calls and cargo tonnes by port, with the change on the week before: gloom fn MAP ports "
+      + "(one country's: --query China); chokepoint transits: gloom fn CHOKE",
+    leads: true,
+  },
+  {
     names: ["theme", "themes", "light", "dark", "colorblind", "colourblind", "blind"],
     words: ["mode", "color", "colour", "colors", "colours", "high", "contrast", "change", "switch", "set", "setting", "settings"],
     line: "Themes: gloom config themes",
@@ -301,13 +382,25 @@ const COMMAND_POINTERS: ReadonlyArray<{
   },
   {
     // A currency forward, not a forward rate on a yield curve, forward guidance, a forward P/E or the forward
-    // inflation series: a query that says more than "forward" has to name FX.
-    names: ["forward", "forwards", "fwd", "fwds"],
-    words: ["rate", "rates", "implied", "hedge", "hedging", "cost", "costs", "premium", "interest", "1w", "2w", "30d", "1m", "3m",
+    // inflation series: a query that says more than "forward" has to name FX. A hedge or a carry alone is the
+    // forward's too (a hedge fund or a carry cost is not).
+    names: ["forward", "forwards", "fwd", "fwds", "hedge", "hedging", "carry"],
+    words: ["rate", "rates", "implied", "cost", "costs", "premium", "interest", "1w", "2w", "30d", "1m", "3m",
       "6m", "1y"],
-    qualifiers: ["fx", "currency", "currencies", "point", "points", "pips", "cip", "covered", "parity", "outright",
-      "usd", "mxn", "eur", "gbp", "usdmxn", "eurusd", "gbpusd", "eurmxn", "peso", "dollar", "euro", "sterling"],
-    line: "FX forwards implied by both currencies' short rates (covered interest parity), with forward points and the hedge cost: gloom fx USD/MXN --forward 30d",
+    qualifiers: ["fx", "currency", "currencies", "point", "points", "pips", "cip", "covered", "parity", "outright", "trade",
+      "usd", "mxn", "eur", "gbp", "zar", "try", "usdmxn", "eurusd", "gbpusd", "eurmxn", "usdzar", "usdtry", "peso", "dollar", "euro",
+      "sterling", "rand", "lira"],
+    line: "FX forwards implied by both currencies' short rates (covered interest parity), with forward points, the hedge cost and, for an amount, the carry and who earns it: gloom fx 5000000 USD/MXN --forward 30d",
+  },
+  {
+    // A fund that hedges its currency beside one that does not is the hedged view; FXC's crosses are not one, and a
+    // single stock has no hedged series. Each fund named is one `quote` answers (2026-11-09).
+    names: ["hedged", "unhedged"],
+    words: ["yen", "jpy", "currency", "fx", "japan", "japanese", "nikkei", "topix", "etf", "etfs", "fund", "funds", "return", "returns",
+      "vs", "versus", "and", "or", "against", "view", "equity", "equities", "stocks", "performance", "compare", "comparison", "chart"],
+    line: "Hedged against unhedged: gloom fn CMP DXJ HEWJ EWJ --total-return true (DXJ and HEWJ hedge the yen, EWJ does not); "
+      + "add --currency <your currency> for each fund's return in it, EWJ then carrying the yen's move and DXJ and HEWJ only the dollar's.",
+    leads: true,
   },
   {
     names: ["defi", "tvl", "tvls", "total value locked", "on-chain", "onchain", "aave", "lido", "eigenlayer", "morpho"],
@@ -315,11 +408,67 @@ const COMMAND_POINTERS: ReadonlyArray<{
       "change", "ranking", "rankings", "dashboard", "lending", "staking"],
     line: "DeFi TVL, top protocols and chains with 7D and 30D change: gloom fn CRYP --list defi (by chain: --by chain)",
   },
+  {
+    // A morning on the German and European markets: `catalog dax` found no function. The index quotes, beside WEI, GC
+    // and CMP, which the same words find by their keywords. Each symbol is one `quote` answers (2026-11-13).
+    names: ["dax", "xetra", "stoxx", "eurostoxx", "germany", "german", "european"],
+    words: ["index", "indices", "indexes", "euro", "50", "600", "europe", "equity", "equities", "stock", "stocks", "market", "markets",
+      "quote", "quotes", "level", "levels", "close", "today", "yesterday", "morning", "dax", "xetra", "stoxx", "germany", "german"],
+    line: "European index quotes: gloom quote ^GDAXI ^STOXX50E ^STOXX ^FTSE ^FCHI (DAX, EURO STOXX 50, STOXX Europe 600, FTSE 100, CAC 40); "
+      + "the world board: gloom fn WEI; the Bund curve: gloom fn GC bund; the DAX beside its members: gloom fn CMP ^GDAXI SIE:XETRA VOW3:XETRA",
+  },
+  {
+    // Ahead of DIST, which "difficulty" finds by its description; the four series are listed after it.
+    names: ["hashrate", "hash rate", "hashprice", "hash price", "difficulty", "retarget", "mining", "miner", "miners"],
+    words: ["bitcoin", "btc", "network", "crypto", "stock", "stocks", "equities", "listed", "next",
+      "estimate", "adjustment", "chart", "history"],
+    line: "Bitcoin network: gloom fn G hashrate, difficulty or hashprice; listed miners: gloom fn THEM crypto",
+    leads: true,
+  },
 ];
 
-/** The command for a query that names a setting ("light theme") or a portfolio report ("drip"), else null. */
+/** The command for a query that names a setting ("light theme"), a portfolio report ("drip"), a currency ("yen") or a perpetual ("btc perp"), else null. */
 export function commandPointer(query: string): string | null {
-  return findCommandPointer(query)?.line ?? null;
+  return findCommandPointer(query)?.line ?? currencyPointer(query) ?? perpPointer(query);
+}
+
+const PERP_WORDS = new Set(["perp", "perps", "perpetual", "perpetuals"]);
+/** Words a perpetual query says about the contract, not which coin: "btc perpetual funding rate on binance". */
+const PERP_FILLER = new Set(["futures", "future", "contract", "contracts", "swap", "swaps", "funding", "rate", "rates", "open", "interest", "oi",
+  "premium", "basis", "price", "prices", "on", "venue", "venues", "binance", "bybit", "okx", "hyperliquid", "usdt", "usdc", "usd", "crypto"]);
+
+/** A perpetual that is no futures contract: a perpetual bond or preferred share has a coupon, not funding. */
+const PERPETUAL_SECURITIES = new Set(["bond", "bonds", "preferred", "preferreds", "pref", "prefs", "preference", "note", "notes", "coco", "cocos", "at1",
+  "debt", "capital", "annuity", "annuities", "subordinated", "hybrid", "hybrids"]);
+
+/**
+ * `fn PERP` for a query that asks for a perpetual contract: with the market it names, "btc perpetual" reads
+ * `fn PERP BTC`; with none ("perpetual funding rates"), the board. A query that names several things besides, or a
+ * perpetual bond or preferred, is left to search.
+ */
+function perpPointer(query: string): string | null {
+  const asked = words(query);
+  if (!asked.some((word) => PERP_WORDS.has(word)) || asked.some((word) => PERPETUAL_SECURITIES.has(word))) return null;
+  const named = asked.filter((word) => !PERP_WORDS.has(word) && !PERP_FILLER.has(word));
+  if (named.length > 1) return null;
+  // A symbol reads in capitals; a name (bitcoin) as typed, which PERP reads as the market it stands for.
+  const word = named[0];
+  const market = word && word.length <= 5 ? word.toUpperCase() : word;
+  const title = market && `${market[0]!.toUpperCase()}${market.slice(1)}`;
+  return market ? `${title} perpetuals by venue, with funding, open interest and premium: gloom fn PERP ${market}`
+    : "Perpetual markets by venue, with funding, open interest and premium: gloom fn PERP";
+}
+
+/**
+ * `fx` for a query that is one currency, by its code (`jpy`, `CHF`) or its
+ * name (`yen`, `swiss franc`): its rate and its pair. A code that is also an
+ * English word counts only in capitals (`TRY`, not "try"). Null for the
+ * dollar, which has no pair of its own, and for anything else.
+ */
+function currencyPointer(query: string): string | null {
+  const code = currencyCodeTyped(query) ?? namedCurrencyPair(query)?.code;
+  if (!code || code === "USD") return null;
+  return `The ${code} rate: gloom fx ${code}; its pair's history: gloom history ${dollarPairListing(code)}`;
 }
 
 /**
@@ -328,6 +477,22 @@ export function commandPointer(query: string): string | null {
  */
 export function commandPointerLeads(query: string): boolean {
   return findCommandPointer(query)?.leads === true;
+}
+
+/** The app's Send Feedback command (FB, FEEDBACK, BUG), which no function or CLI command does. */
+const FEEDBACK_NAMES = new Set(["fb", "feedback", "bug", "bugs", "idea", "ideas"]);
+const FEEDBACK_WORDS = new Set(["send", "report", "file", "submit", "give", "suggest", "a", "an"]);
+
+/**
+ * The line `catalog` prints for a command of the app's command bar that is no
+ * function: `catalog FB`, `catalog feedback` and `catalog report bug` name
+ * Send Feedback, which the command bar opens as FB. Null for any other query.
+ * `search` leaves it out: FB there is a ticker.
+ */
+export function appCommandPointer(query: string): string | null {
+  const asked = words(query);
+  if (!asked.some((word) => FEEDBACK_NAMES.has(word)) || !asked.every((word) => FEEDBACK_NAMES.has(word) || FEEDBACK_WORDS.has(word))) return null;
+  return "Send Feedback: open the app (gloom) and run it from the command bar (Ctrl+P, FB), or open an issue at https://github.com/gloom-sh/gloomberb/issues";
 }
 
 /**
@@ -362,9 +527,24 @@ function findCommandPointer(query: string): (typeof COMMAND_POINTERS)[number] | 
  */
 export function bankFigurePointer(name: string, arg: string): { message: string; details: string } | null {
   if (findTopicPointer(name) !== BANK_FIGURES_TOPIC && findCommandPointer(name) !== BANK_FIGURES_POINTER) return null;
+  return bankFiguresAnswer(`${name} is not a function: a bank's figures are in the Bank section of fundamentals.`, arg);
+}
+
+/**
+ * The answer to `fn BANK JPM`: BANK opens CBR, the central banks' rates, which
+ * takes no ticker; with one it asks for that bank's figures, which the Bank
+ * section of `fundamentals` has. Null for any other name, and with no ticker.
+ */
+export function bankWordPointer(name: string, arg: string | null | undefined): { message: string; details: string } | null {
+  const ticker = arg?.trim() ?? "";
+  if (!/^banks?$/i.test(name.trim()) || !/^[A-Za-z0-9.:^-]+$/.test(ticker)) return null;
+  return bankFiguresAnswer(`${name.trim().toUpperCase()} opens central bank rates; a bank's own figures are in the Bank section of fundamentals.`, ticker);
+}
+
+function bankFiguresAnswer(message: string, arg: string): { message: string; details: string } {
   const symbol = /^[A-Za-z0-9.:^-]+$/.test(arg.trim()) ? arg.trim().toUpperCase() : "";
   return {
-    message: `${name} is not a function: a bank's figures are in the Bank section of fundamentals.`,
+    message,
     details: [
       `Deposits, uninsured share, CRE / capital and the lead bank: gloom fundamentals ${symbol || "<ticker>"}`,
       `Net interest margin (Pro): ${symbol ? nimCommand(symbol) : "gloom fn EQS --metric kpiNimPercent"}`,
@@ -387,7 +567,34 @@ export function knownGapForTicker(symbol: string): string | null {
 }
 
 /**
- * The line for a query that names a known subject as a whole ("carbon allowances", "EUA"), a Treasury yield
+ * Whether a query names a known subject: as a whole ("Baltic Dry", "dry-bulk"), or, for an entry with `words`,
+ * by a term among words that only qualify it ("panamax rates", "bulk freight").
+ */
+function namesKnownGap(gap: (typeof KNOWN_GAPS)[number], query: string): boolean {
+  const key = lookupKey(query);
+  if (gap.terms.some((term) => lookupKey(term) === key)) return true;
+  if (!gap.words) return false;
+  const asked = words(query);
+  const named = new Set(gap.terms.flatMap((term) => {
+    const parts = words(term);
+    return containsWords(asked, parts) ? parts : [];
+  }));
+  return named.size > 0 && asked.every((word) => named.has(word) || gap.words!.includes(word));
+}
+
+/**
+ * The line for a price the terminal has none of, typed where a ticker goes ("iron ore"), so it is never read as the
+ * company whose name holds its words (Kumba Iron Ore), and for an index no source carries (TOPIX), which names the
+ * funds that track it rather than reading as an outage; null for anything else.
+ */
+export function unquotedGapMessage(query: string): string | null {
+  const index = uncarriedIndexFor(query);
+  if (index) return uncarriedIndexLine(index);
+  return KNOWN_GAPS.find((gap) => gap.unquoted && namesKnownGap(gap, query))?.message ?? null;
+}
+
+/**
+ * The line for a query that names a known subject ("carbon allowances", "EUA", "panamax rates"), a Treasury yield
  * typed as a ticker (US10Y), a topic with no function ("defense budget"), or a macro release no series carries
  * ("ISM manufacturing", "GDPNow"), else null.
  */
@@ -395,8 +602,10 @@ export function knownGapMessage(query: string): string | null {
   const key = lookupKey(query);
   if (!key) return null;
   const tenor = treasuryYieldTenor(query);
-  return KNOWN_GAPS.find((gap) => gap.terms.some((term) => lookupKey(term) === key))?.message
-    ?? (tenor ? treasuryYieldLine(tenor) : null)
+  const index = uncarriedIndexFor(query);
+  if (index) return uncarriedIndexLine(index);
+  return KNOWN_GAPS.find((gap) => namesKnownGap(gap, query))?.message
+    ?? (tenor ? treasuryBillLine(query, tenor) ?? treasuryYieldLine(tenor) : null)
     ?? topicPointer(query)?.message
     ?? macroReleaseTopic(query)?.line ?? null;
 }

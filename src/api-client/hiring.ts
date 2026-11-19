@@ -1,3 +1,4 @@
+import type { CompanyFrom } from "../types/company-from"
 /** HIRING is an observed requisition series, not headcount or job creation. */
 interface HiringCompany {
   entityId: string
@@ -76,6 +77,8 @@ export interface HiringSummary extends HiringCompany {
 export interface HiringPayload extends HiringSummary {
   generatedAt: string
   requestedSymbol?: string
+  /** The company's home line the data is read from, when not the listing asked (a receipt, a foreign line). */
+  companyFrom?: CompanyFrom
   proRequired: true
   preview: boolean
   locked: { history: number; evidence: number; peers: number; signals: number; mix: number }
@@ -96,6 +99,8 @@ export interface HiringPayload extends HiringSummary {
     classifiedShare: number | null
     remoteKnownShare: number | null
     comparability: string
+    /** When the careers board read covers part of the company (one country or unit), which part, in a sentence; absent otherwise and from older servers. */
+    boardScope?: string
   }
 }
 

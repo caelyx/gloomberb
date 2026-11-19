@@ -39,6 +39,8 @@ export class ASKGTransportError extends Error {
       retryable?: boolean;
       retryAfterMs?: number;
       status?: number;
+      /** The plan tier a daily cap counted (`standard` or `pro`), when the server said. */
+      tier?: string;
     } = {},
   ) {
     super(message);
@@ -85,6 +87,8 @@ export interface ASKGConversationTool {
   rowCount?: number;
   elapsedMs?: number;
   note?: string;
+  /** The number the answer cites this read by. */
+  ref?: number;
 }
 
 interface ASKGConversationMessage {
@@ -353,8 +357,9 @@ export function classifyASKGRequestError(error: unknown): ASKGTransportError {
       );
     }
     if (error.status === 429) {
+      const tier = error.details?.tier;
       return new ASKGTransportError(
-        rateLimitCode(error.message),
+        error.details?.code === "daily_turn_cap" ? "daily_turn_cap" : rateLimitCode(error.message),
         error.message || "Too many requests.",
         {
           retryable: true,
@@ -362,6 +367,7 @@ export function classifyASKGRequestError(error: unknown): ASKGTransportError {
             ? { retryAfterMs: error.retryAfterMs }
             : {}),
           status: error.status,
+          ...(typeof tier === "string" ? { tier } : {}),
         },
       );
     }

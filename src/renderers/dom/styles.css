@@ -54,6 +54,10 @@ input, textarea, [contenteditable]:not([contenteditable="false"]) {
   user-select: text;
 }
 input, textarea { cursor: text; }
+/* One placeholder colour for every field (ui-tokens placeholderColour). A
+   field on a surface of its own, such as the command bar's prompt, sets
+   --gloom-placeholder to the same role lifted for that surface. */
+input::placeholder, textarea::placeholder { color: var(--gloom-placeholder); opacity: 1; }
 /* Selectable text: what a person may want to copy by hand. A host Text takes
    the selectable prop; a block of text (a reader, markdown, a chat message, a
    log) carries this attribute on its container, and everything inside it that
@@ -176,6 +180,21 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
   border: 0;
   border-radius: 0;
 }
+/* Docked panes sit a small gap apart (the shell's dock geometry). Each one
+   rules the sides that face another pane across it, in the colour of the line
+   that ran between them, so the gap reads in every theme. */
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges]::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 0 solid var(--gloom-border);
+  pointer-events: none;
+  z-index: 100;
+}
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges~="left"]::after { border-left-width: 1px; }
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges~="right"]::after { border-right-width: 1px; }
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges~="top"]::after { border-top-width: 1px; }
+[data-gloom-role="pane-window"][data-floating="false"][data-dock-edges~="bottom"]::after { border-bottom-width: 1px; }
 [data-gloom-role="pane-window"][data-floating="false"][data-focused="true"] {
   box-shadow: inset 0 0 0 1px var(--pane-border-color, var(--gloom-border-focused));
 }
@@ -300,6 +319,14 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 [data-gloom-role="status-bar"] span {
   line-height: var(--cell-h);
 }
+/* The returning-user strip and the new Pro payer's row under the header: one row of shell chrome each, ruled off from the layout. */
+[data-gloom-role="since-last-visit"],
+[data-gloom-role="pro-welcome"] {
+  flex: none;
+  align-items: center;
+  border-bottom: 1px solid var(--gloom-hairline);
+  font-size: var(--gloom-type-ui);
+}
 [data-gloom-role="pane-body"] {
   overflow: hidden;
 }
@@ -359,16 +386,8 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 [data-gloom-role="pane-footer"][data-empty="true"] {
   border-top-color: transparent;
 }
-[data-gloom-role="pane-footer"] span,
-[data-gloom-role="pane-hint"] span {
+[data-gloom-role="pane-footer"] span {
   line-height: var(--cell-h);
-}
-[data-gloom-role="pane-hint"] {
-  cursor: pointer;
-  border-radius: var(--gloom-radius-md);
-}
-[data-gloom-role="pane-hint"]:hover {
-  background: var(--gloom-hover-fill);
 }
 [data-gloom-role="resize-handle"] {
   cursor: nwse-resize;
@@ -517,6 +536,9 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
   /* Header colour left above a box, and the box's line: the header rule's width. */
   --pane-tab-top-gap: 2px;
   --pane-tab-rule: 1px;
+  /* The strip hangs this far past the rule into the pane (pane/header.tsx says
+     why), and only the active tab reaches into it: the others end on the rule. */
+  padding-bottom: var(--pane-tab-overhang, 0px);
 }
 [data-gloom-role="tab-list"][data-gloom-variant="header"] > [data-gloom-role="tab-button"] {
   height: calc(100% - var(--pane-tab-top-gap));
@@ -535,6 +557,10 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 }
 [data-gloom-role="tab-list"][data-gloom-variant="header"] > [data-gloom-role="tab-button"]::after { content: none; }
 [data-gloom-role="tab-list"][data-gloom-variant="header"] > [data-gloom-role="tab-button"][data-active="true"] {
+  /* Past the rule into the pane, with the label where it was. */
+  height: calc(100% - var(--pane-tab-top-gap) + var(--pane-tab-overhang, 0px));
+  margin-bottom: calc(-1 * var(--pane-tab-overhang, 0px));
+  padding-bottom: calc(var(--pane-tab-top-gap) + 2 * var(--pane-tab-rule) - var(--pane-tab-top-inset, 0px) + var(--pane-tab-overhang, 0px));
   background-color: var(--pane-tab-active-bg, var(--gloom-bg));
   border-color: var(--pane-tab-border, var(--gloom-hairline));
 }
@@ -580,6 +606,14 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 [data-gloom-scrollbar-active="true"] {
   scrollbar-color: color-mix(in srgb, var(--gloom-text) 26%, transparent) transparent;
 }
+/* A table wider than its pane keeps its scrollbars drawn at rest, quieter
+   than while it scrolls: the horizontal bar is what says columns run past the
+   edge, and with a mouse it is how they are reached. With a clear thumb,
+   macOS (whose WebKit reads scrollbar-color since Safari 26.2) showed only an
+   empty strip where the bar was. */
+[data-gloom-role="data-table-body-scroll"][data-gloom-scrollbar-x="visible"]:not([data-gloom-scrollbar-active]) {
+  scrollbar-color: color-mix(in srgb, var(--gloom-text) 20%, transparent) transparent;
+}
 [data-gloom-scrollbar-x]::-webkit-scrollbar,
 [data-gloom-scrollbar-y]::-webkit-scrollbar {
   width: 8px;
@@ -607,6 +641,11 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 [data-gloom-scrollbar-active="true"]::-webkit-scrollbar-thumb,
 [data-gloom-scrollbar-active="true"]::-webkit-scrollbar-thumb:hover {
   background: color-mix(in srgb, var(--gloom-text) 24%, transparent);
+  background-clip: content-box;
+}
+/* The same where WebKit draws the -webkit- bar instead (before Safari 18.2). */
+[data-gloom-role="data-table-body-scroll"][data-gloom-scrollbar-x="visible"]:not([data-gloom-scrollbar-active])::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--gloom-text) 20%, transparent);
   background-clip: content-box;
 }
 [data-gloom-scrollbar-x]::-webkit-scrollbar-corner,
@@ -663,10 +702,59 @@ button, [data-gloom-interactive="true"] { cursor: pointer; }
 [data-gloom-role="dock-divider"] {
   background: transparent !important;
 }
+/* Where a moving pane can land and where it will: one look for all of it
+   (shell/drag/drop-zones.ts, shell/drag/overlays.tsx). The accent outlines a
+   tint of itself, 12% at rest and 40% under the pointer. The landing preview
+   is the exact rectangle the pane takes (a split, a tab, an edge of the
+   layout, a floating window's tab or half, window mode's keyboard move),
+   see-through so the panes under it still show. A strip along each edge of
+   the window is see-through too, and thinner. A square of the target on the
+   pane under the pointer sits raised and opaque over it. */
+[data-gloom-role="drop-preview"],
+[data-gloom-role="window-mode-drop-preview"],
+[data-gloom-role="drop-strip"],
+[data-gloom-role="drop-zone"] {
+  --drop-tint: 12%;
+  --drop-under: transparent;
+  border: 2px solid var(--gloom-accent);
+  border-radius: var(--gloom-radius-md);
+  background: color-mix(in srgb, var(--gloom-accent) var(--drop-tint), var(--drop-under));
+}
+[data-gloom-role="drop-strip"] {
+  border-width: 1px;
+  border-radius: var(--gloom-radius-sm);
+}
+[data-gloom-role="drop-zone"] {
+  --drop-under: var(--gloom-bg);
+  box-shadow: var(--gloom-elevation);
+}
+[data-gloom-role="drop-strip"][data-active="true"],
+[data-gloom-role="drop-zone"][data-active="true"] {
+  --drop-tint: 40%;
+}
+/* Inside a square, the part of the pane the moving one takes: all of it for a tab, a half for a side. */
+[data-gloom-role="drop-zone"]::before {
+  content: "";
+  position: absolute;
+  inset: var(--gloom-space-xs);
+  border-radius: var(--gloom-radius-sm);
+  background: var(--gloom-accent);
+  opacity: .5;
+}
+[data-gloom-role="drop-zone"][data-side="left"]::before { right: 50%; }
+[data-gloom-role="drop-zone"][data-side="right"]::before { left: 50%; }
+[data-gloom-role="drop-zone"][data-side="top"]::before { bottom: 50%; }
+[data-gloom-role="drop-zone"][data-side="bottom"]::before { top: 50%; }
+[data-gloom-role="drop-zone"][data-active="true"]::before { opacity: 1; }
+/* The gap between the panes is the divider at rest; its line shows while it
+   is dragged or resized from the keyboard. */
 [data-gloom-role="dock-divider"]::before {
   content: "";
   position: absolute;
   background: var(--divider-color);
+  opacity: 0;
+}
+[data-gloom-role="dock-divider"][data-active="true"]::before {
   opacity: .9;
 }
 [data-gloom-role="dock-divider"][data-axis="horizontal"] {
@@ -996,7 +1084,6 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 .gloom-qb-search-icon { width: 11px; height: 11px; flex: none; }
 .gloom-qb-search[data-active="true"] .gloom-qb-search-icon { color: var(--gloom-border-focused); }
 .gloom-qb-search-input { flex: 1; min-width: 0; display: flex; align-items: center; }
-.gloom-qb-search-input input::placeholder { color: var(--gloom-text-muted); }
 /* The one key cap (dialog-actions.tsx WebKeycap): mixed from the text colour it
    sits with, so it reads on a filled button, a plain one and in every theme. */
 .gloom-qb-kbd,
@@ -1020,6 +1107,26 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   background: color-mix(in srgb, currentColor 10%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 30%, transparent);
 }
+/* The one key hint (dialog-actions.tsx WebKeyHint): a pane footer's, a
+   dialog's and the command bar prompt's. The key in a keycap before the
+   whole words, the words in the muted tone and the keycap a step brighter,
+   nothing bold; a hint that runs its action brightens under the pointer. */
+.gloom-hint {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--gloom-space-xs);
+  white-space: nowrap;
+  font-weight: var(--gloom-weight-regular);
+  color: var(--gloom-key-hint-words, var(--gloom-text-muted));
+}
+.gloom-hint > .gloom-keycap { color: var(--gloom-key-hint-key, var(--gloom-text-dim)); }
+.gloom-hint[data-interactive="true"] { cursor: pointer; }
+.gloom-hint[data-interactive="true"]:hover {
+  --gloom-key-hint-words: var(--gloom-text);
+  --gloom-key-hint-key: var(--gloom-text-bright);
+}
+.gloom-hint[data-disabled="true"] { --gloom-key-hint-key: var(--gloom-text-muted); }
 .gloom-qb-filters { display: flex; align-items: stretch; flex: none; }
 .gloom-qb-filters .gloom-popover-anchor { display: flex; align-items: stretch; }
 .gloom-qb-chip { cursor: pointer; }
@@ -1059,14 +1166,18 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   box-shadow: inset 1px 0 0 var(--qb-hairline);
 }
 .gloom-qb-inline .gloom-qb-view { margin-left: 0; box-shadow: none; align-self: stretch; }
-/* A long inline choice (an expiry strip) scrolls by itself, as the terminal's
+/* A nested tab strip's choices start the bar, where the terminal's tab row starts. */
+.gloom-qb-view[data-placement="start"] { margin-left: 0; box-shadow: none; }
+/* A long inline list (an expiry strip) scrolls by itself, as the terminal's
    does, so its label and the controls beside it stay in view. It narrows with
-   its group and has no floor of its own: a floor wider than the room the bar
-   gives it drew its next choice under the control beside it. */
+   its group down to its label and one whole choice clear of its fades
+   (--qb-strip-floor, measured in query-bar.tsx) and no further: the rest of
+   the bar gives way first, and a bar narrower than that scrolls instead of
+   drawing one control over the next. */
 .gloom-qb-filters[data-strip="true"],
-.gloom-qb-inline[data-strip="true"] { flex: 0 1 auto; min-width: 0; }
+.gloom-qb-inline[data-strip="true"] { flex: 0 1 auto; }
+.gloom-qb-inline[data-strip="true"] { display: grid; grid-template-columns: auto minmax(var(--qb-strip-floor, 0px), max-content); }
 .gloom-qb-inline[data-strip="true"] .gloom-qb-segments {
-  flex: 0 1 auto;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
@@ -1074,6 +1185,21 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 .gloom-qb-inline[data-strip="true"] .gloom-qb-segments::-webkit-scrollbar { display: none; }
 .gloom-qb-inline[data-strip="true"] .gloom-qb-segments > button { flex: none; white-space: nowrap; }
 .gloom-qb-filters[data-strip="true"] > :not([data-strip="true"]) { flex: none; }
+/* A bar short of room drops an inline choice's label (query-bar.tsx): its
+   first choice starts where the label did (the band's first-text inset below). */
+.gloom-qb-inline[data-bare="true"],
+.gloom-qb-scroll > .gloom-qb-filters:first-child > .gloom-qb-inline[data-bare="true"]:first-child { padding-left: 0; }
+/* A folded view: its menu chip in the view's place at the right. */
+.gloom-qb-fold {
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+  flex: none;
+  box-shadow: inset 1px 0 0 var(--qb-hairline);
+}
+.gloom-qb-fold .gloom-popover-anchor { display: flex; align-items: stretch; }
+.gloom-qb-fold .gloom-qb-chip { box-shadow: none; }
+.gloom-qb-meta + .gloom-qb-fold { margin-left: 0; }
 /* Inline choices are tabs (the tab rule above): text only, the active one
    bright and bold on the accent underline. */
 .gloom-qb-view button {
@@ -1106,6 +1232,12 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   color: var(--gloom-text-muted);
 }
 .gloom-qb-meta + .gloom-qb-view { margin-left: 0; }
+/* Cut to a sliver of a word, it is not drawn (query-bar.tsx); its box stays. */
+.gloom-qb-meta[data-sliver] { visibility: hidden; }
+/* The as-of keeps its width: inline filters collapse to menus first (query-bar.tsx),
+   and the context after it gives way before it. */
+.gloom-qb-meta.gloom-qb-asof { flex: none; }
+.gloom-qb-asof + .gloom-qb-meta { margin-left: 0; }
 
 .gloom-qb-leading {
   flex: 0 0 auto;
@@ -1222,8 +1354,8 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 
 
 /* Detail header of a list/detail stack: the same band as the query bar, so
-   Back and the item title read as the pane's toolbar. Grows when a long title
-   wraps rather than hiding it. */
+   Back and the item title read as the pane's toolbar. The title stays on one
+   line at any width and ends in an ellipsis; the full title is its tooltip. */
 .gloom-stack-bar {
   --qb-hairline: var(--gloom-hairline);
   --qb-fill: var(--gloom-hover-fill);
@@ -1262,7 +1394,9 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   line-height: var(--cell-h);
   font-weight: var(--gloom-weight-bold);
   color: var(--gloom-text-bright);
-  overflow-wrap: break-word;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .gloom-stack-hint { flex: none; align-self: center; padding: 0 var(--gloom-space-sm); color: var(--gloom-text-muted); white-space: nowrap; }
 /* Back and the title when a detail's query bar has taken the stack header. */
@@ -1288,6 +1422,7 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
    overflow clip without changing the layout size. */
 [data-gloom-role="pane-header"] [data-gloom-role="pane-title"],
 [data-gloom-role="pane-header-tabs"] [data-gloom-role="tab-label"],
+[data-gloom-role="pane-stack-tabs"] [data-gloom-role="tab-label"],
 .gloom-qb-label,
 .gloom-qb-value,
 .gloom-qb-text,
@@ -1298,8 +1433,10 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 }
 [data-gloom-role="pane-header"] [data-gloom-role="pane-title"],
 [data-gloom-role="pane-header-tabs"] [data-gloom-role="tab-label"],
+[data-gloom-role="pane-stack-tabs"] [data-gloom-role="tab-label"],
 .gloom-qb-title,
-.gloom-qb-meta {
+.gloom-qb-meta,
+.gloom-stack-title {
   padding-block: var(--gloom-space-xs);
   margin-block: calc(-1 * var(--gloom-space-xs));
 }
@@ -1441,6 +1578,10 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   box-shadow: inset -1px 0 0 var(--sg-hairline);
 }
 [data-gloom-role="stat-grid-cell"][data-wide="true"] { grid-column: 1 / -1; box-shadow: none; }
+/* A whole-row cell too narrow for its value and detail on one line: the label
+   stays on the first line, the value and the detail run down beside it. */
+[data-gloom-role="stat-grid-cell"][data-wrapped="true"] { align-items: flex-start; }
+[data-gloom-role="stat-grid-cell"][data-wrapped="true"] [data-gloom-role="stat-grid-detail"] { flex: none; }
 /* Column grid text whose track can be narrower than it, and the grid itself: clipped
    without a scroll container where the engine has `overflow: clip`. A text box sets its
    own overflow inline, hence !important. The margin keeps the antialiased edge of a glyph
@@ -1506,13 +1647,13 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 /* ===== Chrome: title-bar tab overflow, query bar edges, quick-add band ===== */
 
 /* Title-bar tabs that do not fit: a chevron after the strip lists them all.
-   The strip hangs over the header's rules; the padding puts the chevron back
-   on the header's centre line. */
+   The strip hangs over the header's rules and past the bottom one; the
+   padding puts the chevron back on the header's centre line. */
 .gloom-tab-overflow {
   flex: none;
   display: flex;
   align-items: center;
-  padding: var(--pane-tab-top-inset, 0px) 0 1px 2px;
+  padding: var(--pane-tab-top-inset, 0px) 0 calc(1px + var(--pane-tab-overhang, 0px)) 2px;
 }
 
 /* A search with nothing beside it takes the room filters would have used. */
@@ -1521,8 +1662,10 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
 /* Band text starts one cell in, on the same edge as the table columns and
    body text below it; segments after the first keep their 8px (--gloom-space-sm). */
 .gloom-qb-scroll > :is(.gloom-stack-back, .gloom-qb-search, .gloom-player-toggle):first-child,
+.gloom-qb-scroll > .gloom-qb-view[data-placement="start"]:first-child > button:first-child,
 .gloom-qb-scroll > .gloom-qb-filters:first-child > :first-child:not(.gloom-popover-anchor),
 .gloom-qb-scroll > .gloom-qb-filters:first-child > .gloom-popover-anchor:first-child > *,
+.gloom-qb-scroll > .gloom-qb-filters:first-child > .gloom-qb-inline[data-bare="true"]:first-child > .gloom-qb-segments > button:first-child,
 .gloom-stack-bar > .gloom-stack-back,
 [data-gloom-role="field-grid-cell"]:first-child:not([data-kind="action"]) {
   padding-left: var(--cell-w);
@@ -1552,7 +1695,6 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   background: var(--qb-fill);
   box-shadow: inset -1px 0 0 var(--qb-hairline), inset 0 -2px 0 var(--gloom-border-focused);
 }
-[data-gloom-role="inline-quick-add"][data-band="true"] [data-gloom-role="inline-quick-add-field"] input::placeholder { color: var(--gloom-text-muted); }
 [data-gloom-role="inline-quick-add"][data-band="true"] [data-gloom-role="inline-quick-add-preview"] { padding: 0 var(--gloom-space-sm); }
 
 /* ===== Data table: sortable headers ===== */
@@ -1587,6 +1729,28 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   color: var(--gloom-text) !important;
 }
 
+/* A header that moves its column takes the grab cursor, as a tab that
+   reorders does. Dragged, it takes the hover fill and its label brightens,
+   and an accent line through the header and rows marks the gap it drops
+   into (renderers/dom/data-table/column-drag.ts). */
+[data-gloom-role="data-table-header-cell"][data-gloom-movable="true"] { cursor: grab; }
+[data-gloom-role="data-table-header-cell"][data-gloom-dragging="true"] {
+  background-image: linear-gradient(var(--gloom-hover-fill), var(--gloom-hover-fill));
+}
+[data-gloom-role="data-table-header-cell"][data-gloom-dragging="true"] > * {
+  color: var(--gloom-text-bright) !important;
+}
+[data-gloom-role="data-table-drop-indicator"] {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-50%);
+  z-index: 4;
+  pointer-events: none;
+  background: var(--gloom-accent);
+}
+
 /* A link is the text around it, underlined (external-link.tsx); the pointer or keyboard focus brightens it. */
 [data-gloom-link="true"] { text-underline-offset: 2px; }
 [data-gloom-link="true"]:is(:hover, :focus-visible) { color: var(--gloom-link-hover) !important; }
@@ -1598,10 +1762,16 @@ html[data-gloom-screenshot="true"] [data-gloom-role="chart-watermark"] {
   outline-offset: 1px;
 }
 
-/* Keycaps on buttons and in dialog hints are for a keyboard; a touch screen
-   has none to press them with. A note beside them (a deadline) stays. */
+/* Keycaps on buttons and in dialog hints, and the keys the command bar and
+   the layout tabs name, are for a keyboard; a touch screen has none to press
+   them with. A note beside them (a deadline) stays, and so do the words of
+   a pane footer's hints, which a tap runs. Text set whole with its key (a
+   layout tab's `⌘1 Research`) has the same words without the key beside
+   it, shown only where the key hint goes. */
+.gloom-without-keys { display: none; }
 @media (hover: none) and (pointer: coarse) {
   .gloom-keycap, .gloom-key-hint { display: none !important; }
+  .gloom-without-keys { display: inline; }
 }
 
 /* Reading columns (src/components/reader) set their type from their own

@@ -1,7 +1,9 @@
+import { notesPluginMeta } from "../builtin-plugin-meta";
 import { apiClient } from "../../../api-client";
 import type { GloomPlugin } from "../../../types/plugin";
 import { teamStore } from "../../../team/store";
 import { notesCliCommand } from "./cli";
+import { NOTES_FRESHNESS, notesHeadless } from "./headless";
 import { exportNotesToDirectory, exportNotice, exportSourceLabel } from "./export";
 import { NotesFiles } from "./files";
 import { migrateLocalNotes, notesMigratedAt } from "./migration";
@@ -12,11 +14,7 @@ import { createNotesTab } from "./ticker-notes-tab";
 let disposeNotes: (() => void) | null = null;
 
 export const notesPlugin: GloomPlugin = {
-  id: "notes",
-  name: "Notes",
-  version: "2.0.0",
-  description: "Markdown notes on tickers and on their own, personal or shared with a team.",
-  toggleable: true,
+  ...notesPluginMeta,
   cliCommands: [notesCliCommand],
 
   setup(ctx) {
@@ -79,7 +77,7 @@ export const notesPlugin: GloomPlugin = {
 
     ctx.registerPane({
       id: "quick-notes",
-      reportFreshness: { source: "Your notes", status: "not-a-feed", basis: "your notes" },
+      reportFreshness: NOTES_FRESHNESS,
       name: "Notes",
       personalData: "messages",
       icon: "N",
@@ -96,6 +94,7 @@ export const notesPlugin: GloomPlugin = {
       description: "Open a general-purpose notes scratchpad",
       keywords: ["notes", "quick", "scratchpad", "memo"],
       shortcut: { prefix: "NOTE" },
+      headless: notesHeadless,
       createInstance: () => ({ placement: "floating" }),
     });
 

@@ -13,6 +13,8 @@ import { useTableBodyScrollActivity } from "../../../components/table-view-share
 import { createDomTestHarness } from "../test-utils";
 import { WEB_CELL_HEIGHT } from "../../../theme/font-scale";
 import { WebDataTable } from ".";
+import { colors } from "../../../theme/colors";
+import { selectedCellColor } from "../../../theme/tone-contrast";
 
 const { window: testWindow, render } = createDomTestHarness();
 const items = Array.from({ length: 100 }, (_, index) => index);
@@ -129,7 +131,8 @@ test("controlled centering keeps following late quotes until the user scrolls", 
   expect(body.scrollTop).toBe(0);
 });
 
-test("an opted-in table draws the selected row in selection text unless a cell keeps its tone", async () => {
+// HP's selected row (today, -6.31%) lost its red on colorblind-light: an opted-in table drew its CHG in selection text.
+test("an opted-in table draws the selected row in selection text unless a cell keeps its tone or is an up or down figure", async () => {
   const state = createInitialState(createDefaultConfig("/tmp/gloom-table-test"));
   function Harness() {
     const headerScrollRef = useRef<ScrollBoxRenderable | null>(null);
@@ -141,6 +144,7 @@ test("an opted-in table draws the selected row in selection text unless a cell k
           columns={[
             { id: "name", label: "Name", width: 6 },
             { id: "pnl", label: "P&L", width: 6, align: "right" },
+            { id: "chg", label: "Chg", width: 6, align: "right" },
           ]}
           sortColumnId={null}
           sortDirection="asc"
@@ -153,6 +157,7 @@ test("an opted-in table draws the selected row in selection text unless a cell k
           onSelect={() => {}}
           renderCell={(item, column) => column.id === "pnl"
             ? { text: "+1", color: "#00ff00", keepColorWhenSelected: true }
+            : column.id === "chg" ? { text: "-6.31%", color: colors.negative }
             : { text: item, color: "#999999" }}
           selectedTextOverridesCellColor
           emptyStateTitle="No rows"
@@ -166,9 +171,10 @@ test("an opted-in table draws the selected row in selection text unless a cell k
   const colorsByRow = [...container.querySelectorAll('[data-gloom-role="data-table-row"]')].map((row) => (
     [...row.querySelectorAll("span")].map((span) => (span as HTMLElement).style.color)
   ));
+  // The down move keeps its tone on the band, as the theme lifts it there.
   expect(colorsByRow).toEqual([
-    ["var(--gloom-selected-text)", "#00ff00"],
-    ["#999999", "#00ff00"],
+    ["var(--gloom-selected-text)", "#00ff00", selectedCellColor(colors.negative, colors)],
+    ["#999999", "#00ff00", colors.negative],
   ]);
 });
 
@@ -221,6 +227,45 @@ test("artwork before a label is hidden decoration: the text keeps its selection 
   const art = container.querySelector('[data-art="row-b"]')!;
   await act(async () => { art.dispatchEvent(new testWindow.MouseEvent("mousedown", { bubbles: true, cancelable: true }) as unknown as Event); });
   expect(selected).toEqual(["b"]);
+});
+
+test("a cell's kept end never shrinks: the ellipsis cuts what comes before it, and the cell reads whole", async () => {
+  const state = createInitialState(createDefaultConfig("/tmp/gloom-table-test"));
+  const text = "Brent Crude Oil Last Day Financial Jan 2027";
+  function Harness() {
+    const headerScrollRef = useRef<ScrollBoxRenderable | null>(null);
+    const scrollRef = useRef<ScrollBoxRenderable | null>(null);
+    return (
+      <AppContext value={createStaticAppStore(state)}>
+        <WebDataTable
+          items={["BZ"]}
+          columns={[{ id: "name", label: "Contract", width: 20 }]}
+          sortColumnId={null}
+          sortDirection="asc"
+          headerScrollRef={headerScrollRef}
+          scrollRef={scrollRef}
+          syncHeaderScroll={() => {}}
+          onBodyScrollActivity={() => {}}
+          getItemKey={String}
+          isSelected={() => false}
+          onSelect={() => {}}
+          renderCell={() => ({ text, keepEnd: " Jan 2027" })}
+          emptyStateTitle="No rows"
+          virtualize={false}
+        />
+      </AppContext>
+    );
+  }
+
+  const container = await render(<Harness />);
+  const cell = container.querySelector('[data-gloom-role="data-table-cell"]')!;
+  expect(cell.textContent).toBe(text);
+  const [lead, end] = [...cell.querySelectorAll("span[title] > span")] as HTMLElement[];
+  expect(lead!.textContent).toBe("Brent Crude Oil Last Day Financial");
+  expect(lead!.style.textOverflow).toBe("ellipsis");
+  expect(end!.textContent).toBe(" Jan 2027");
+  expect(end!.style.flexShrink).toBe("0");
+  expect(end!.style.whiteSpace).toBe("pre");
 });
 
 test("the pane scroll keys scroll a table body, as they do in the terminal", async () => {

@@ -1,19 +1,24 @@
 import { Buffer } from "node:buffer";
-import { ContextMenu, Utils } from "electrobun/bun";
+import { ContextMenu, Utils, type BrowserWindow } from "electrobun/bun";
 import { buildSoundCommand } from "../../../../notifications/app-notifier";
 import type {
   DesktopBackendRequestResponse,
   DesktopHostRequest,
   DesktopWindowControlAction,
+  DesktopWindowResizeEdge,
 } from "../../shared/protocol";
 import { safeExternalUrl } from "../../../../utils/external-url";
 import { getContextMenuRequestId, normalizeContextMenuItems } from "../context-menu/normalize";
 import { MAIN_WINDOW_RPC_KEY } from "../window/focus";
 import { applyDesktopWindowControl } from "../window/controls";
+import { measureNativeCall } from "../window/native-timing";
+import { startSystemWindowMove, startSystemWindowResize } from "../window/windows-native";
 import { saveTextFileToDownloads } from "../../../../utils/save-text-file";
 import { setAppBadge } from "./app-badge";
 import { desktopBootFramePath, saveDesktopBootFrame } from "../window/boot-frame";
+import { saveDesktopViewIds } from "./view-ids";
 import type { DesktopBackend, DesktopRpc } from "./backend";
+import { logFailure } from "../../../../utils/log-failure";
 
 function normalizeText(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -34,6 +39,10 @@ function playNotificationSound(sound: string | undefined): void {
   }
 }
 
+function windowForRpcKey(backend: DesktopBackend, windowKey: string | undefined): BrowserWindow | null {
+  return backend.nativeWindow(windowKey);
+}
+
 /**
  * Electrobun has no fullscreen event, so the view asks after every resize.
  * A runtime whose native library cannot answer reports windowed, which is the
@@ -41,9 +50,17 @@ function playNotificationSound(sound: string | undefined): void {
  */
 function isWindowFullscreen(backend: DesktopBackend, windowKey: string | undefined): boolean {
   try {
-    return backend.windowForRpcKey(windowKey)?.isFullScreen?.() === true;
-  } catch {
-    return false;
+    return windowForRpcKey(backend, windowKey)?.isFullScreen?.() === true;
+  } catch (error) {
+    return logFailure("desktop-window", "Could not read the window's fullscreen state", false)(error);
+  }
+}
+
+function isWindowMaximized(backend: DesktopBackend, windowKey: string | undefined): boolean {
+  try {
+    return windowForRpcKey(backend, windowKey)?.isMaximized?.() === true;
+  } catch (error) {
+    return logFailure("desktop-window", "Could not read the window's maximized state", false)(error);
   }
 }
 
@@ -52,13 +69,23 @@ function controlWindow(
   windowKey: string | undefined,
   action: DesktopWindowControlAction,
 ): boolean {
-  const targetWindow = backend.windowForRpcKey(windowKey);
+  const targetWindow = windowForRpcKey(backend, windowKey);
   if (!targetWindow) return false;
   if (action !== "close") {
     backend.detachedWindows.suppressAutoDockForRpcKey(windowKey);
   }
   applyDesktopWindowControl(targetWindow, action);
   return true;
+}
+
+/** Exiting closes every window and the services, then quits. */
+function exitDesktopApp(backend: DesktopBackend): void {
+  backend.quit();
+}
+
+function normalizeWindowResizeEdge(edge: unknown): DesktopWindowResizeEdge {
+  if (edge === "top" || edge === "top-left" || edge === "top-right") return edge;
+  throw new Error("host.startWindowResize requires a top edge or corner.");
 }
 
 function normalizeWindowControlAction(action: unknown): DesktopWindowControlAction {
@@ -75,13 +102,13 @@ export async function handleDesktopHostRequest(
 ): Promise<DesktopBackendRequestResponse<DesktopHostRequest["method"]>> {
   switch (request.method) {
     case "host.exit":
-      backend.exitApp();
+      exitDesktopApp(backend);
       return null;
     case "host.windowControl": {
       const action = normalizeWindowControlAction(request.payload.action);
       const windowKey = backend.rpcs.getRpcWindowKey(rpc);
       if (action === "close" && windowKey === MAIN_WINDOW_RPC_KEY) {
-        backend.exitApp();
+        exitDesktopApp(backend);
         return null;
       }
       if (!controlWindow(backend, windowKey, action)) {
@@ -91,29 +118,46 @@ export async function handleDesktopHostRequest(
     }
     case "host.windowFullscreen":
       return isWindowFullscreen(backend, backend.rpcs.getRpcWindowKey(rpc));
+    case "host.windowMaximized":
+      return isWindowMaximized(backend, backend.rpcs.getRpcWindowKey(rpc));
+    case "host.startWindowDrag": {
+      const targetWindow = windowForRpcKey(backend, backend.rpcs.getRpcWindowKey(rpc));
+      if (!targetWindow?.ptr || !startSystemWindowMove(targetWindow.ptr)) {
+        throw new Error("This window cannot be moved by the system.");
+      }
+      return null;
+    }
+    case "host.startWindowResize": {
+      const edge = normalizeWindowResizeEdge(request.payload.edge);
+      const targetWindow = windowForRpcKey(backend, backend.rpcs.getRpcWindowKey(rpc));
+      if (!targetWindow?.ptr || !startSystemWindowResize(targetWindow.ptr, edge)) {
+        throw new Error("This window cannot be resized by the system.");
+      }
+      return null;
+    }
     case "host.openExternal": {
       if (typeof request.payload.url !== "string") {
         throw new Error("host.openExternal requires a URL.");
       }
       const externalUrl = safeExternalUrl(request.payload.url);
-      return externalUrl ? Utils.openExternal(externalUrl) !== false : false;
+      return externalUrl ? measureNativeCall("utils.open-external", () => Utils.openExternal(externalUrl)) !== false : false;
     }
     case "host.copyText":
-      Utils.clipboardWriteText(normalizeText(request.payload.text) ?? "");
+      measureNativeCall("utils.clipboard-write-text", () => Utils.clipboardWriteText(normalizeText(request.payload.text) ?? ""));
       return null;
     case "host.focusWindow": {
       const windowKey = backend.rpcs.getRpcWindowKey(rpc);
-      if (windowKey) backend.focusWindowForRpcKey(windowKey);
+      backend.focusWindow(windowKey);
       return null;
     }
     case "host.copyPngImage": {
       const pngBase64 = normalizeText(request.payload.pngBase64);
       if (!pngBase64) throw new Error("host.copyPngImage requires PNG data.");
-      Utils.clipboardWriteImage(new Uint8Array(Buffer.from(pngBase64, "base64")));
+      measureNativeCall("utils.clipboard-write-image", () => Utils.clipboardWriteImage(new Uint8Array(Buffer.from(pngBase64, "base64"))));
       return null;
     }
     case "host.readText":
-      return Utils.clipboardReadText() ?? "";
+      return measureNativeCall("utils.clipboard-read-text", () => Utils.clipboardReadText()) ?? "";
     case "host.saveTextFile": {
       if (typeof request.payload.name !== "string" || typeof request.payload.text !== "string") {
         throw new Error("host.saveTextFile requires a name and text.");
@@ -122,19 +166,25 @@ export async function handleDesktopHostRequest(
     }
     case "host.notify":
       playNotificationSound(normalizeText(request.payload.sound));
-      Utils.showNotification({
+      measureNativeCall("utils.show-notification", () => Utils.showNotification({
         title: normalizeText(request.payload.title) ?? "Gloom",
         body: normalizeText(request.payload.body),
         subtitle: normalizeText(request.payload.subtitle),
         silent: true,
-      });
+      }));
       return null;
     case "host.showContextMenu": {
       const menu = normalizeContextMenuItems(request.payload.menu);
       if (menu.length === 0) return false;
       const requestId = getContextMenuRequestId(menu);
       if (requestId) backend.trackContextMenuRequest(requestId, rpc);
-      ContextMenu.showContextMenu(menu as never);
+      // On Windows the menu opens on a thread of its own (context-menu-thread.ts)
+      // and this returns at once. Where that thread failed, the menu holds
+      // this thread until it closes, the freeze the thread removes: a stall.
+      // Elsewhere a menu that holds the thread waits on the person.
+      measureNativeCall("context-menu.show", () => ContextMenu.showContextMenu(menu as never), {
+        waitsOnPerson: process.platform !== "win32",
+      });
       return true;
     }
     case "host.saveBootFrame":
@@ -142,6 +192,12 @@ export async function handleDesktopHostRequest(
         mainWindow: backend.rpcs.getRpcWindowKey(rpc) === MAIN_WINDOW_RPC_KEY,
         session: backend.config !== null,
       });
+      return null;
+    case "host.saveViewIds":
+      // The main window's view keeps them; its popped-out panes share its storage.
+      if (backend.rpcs.getRpcWindowKey(rpc) === MAIN_WINDOW_RPC_KEY && backend.config) {
+        saveDesktopViewIds(backend.config.dataDir, request.payload.ids);
+      }
       return null;
     case "host.setAppBadge":
       // One badge for the app, from the main window; a popped-out pane's view

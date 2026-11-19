@@ -3,6 +3,7 @@ import { matchesKeybindingAction, useKeybindings, type KeyChordEventLike } from 
 import { t } from "../../i18n";
 import { useRemoteUiNode } from "../../remote/semantic-tree";
 import { useThemeColors } from "../../theme/theme-context";
+import { placeholderText } from "../../theme/colors";
 import {
   Box,
   Text,
@@ -87,7 +88,7 @@ function FormTextarea({
       try {
         onChangeRef.current(textarea.editBuffer.getText());
       } catch {
-        // The buffer can go away with the dialog.
+        // Intentional ignore: a buffer destroyed with its dialog has no text left to report.
       }
     };
     return () => {
@@ -124,7 +125,7 @@ function FormTextarea({
         placeholder={field.placeholder ? t(field.placeholder) : ""}
         focused={focused}
         textColor={colors.text}
-        placeholderColor={colors.textDim}
+        placeholderColor={placeholderText(colors)}
         // On the desktop the frame's sunken fill shows through.
         backgroundColor={desktop ? "transparent" : colors.panel}
         flexGrow={1}
@@ -201,6 +202,7 @@ export function FormFieldRow({
       case "number":
         return (
           <NumberField
+            remoteHidden
             value={coerceFieldString(value)}
             placeholder={placeholder}
             focused={inputFocused}
@@ -214,6 +216,7 @@ export function FormFieldRow({
       case "password":
         return (
           <TextField
+            remoteHidden
             type={field.type === "password" ? "password" : "text"}
             value={coerceFieldString(value)}
             placeholder={placeholder}

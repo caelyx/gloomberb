@@ -2,12 +2,13 @@ import { useLayoutEffect, useState } from "react";
 import { t, tf } from "../../../i18n";
 import { useThemeColors } from "../../../theme/theme-context";
 import { Box, Text, TextAttributes } from "../../../ui";
-import { truncateToDisplayWidth } from "../../../utils/format";
-import { Button } from "../../ui";
+import { displayWidth, truncateToDisplayWidth } from "../../../utils/format";
+import { Button, terminalButtonColumns } from "../../ui";
 import type { ListScreenState } from "../list/model";
 import { CommandBarListBody } from "../list/view";
 import { ThemePicker } from "../theme-picker";
 import type { CommandBarRoute } from "../workflow/types";
+import { HEADER_MARKET_TITLE, isHeaderMarketRoute } from "../routes/header-market";
 import { NATIVE_COMMAND_SURFACE, nativeCommandSurfaceBorder } from "./native-surface";
 import { useCommandBarPalette } from "./palette";
 import { publishCommandBarPrompt } from "./prompt-binding";
@@ -18,6 +19,13 @@ import type { CommandBarPanelProps } from "./types";
 
 const COMMAND_BAR_OVERLAY_Z_INDEX = 2_147_483_646;
 const COMMAND_BAR_PANEL_Z_INDEX = 2_147_483_647;
+const NEW_PANE_LABEL = "New pane";
+
+/** Ticker search's title when Enter changes a pane: the pane's name gives way first. */
+function changeTickerTitle(pane: string, width: number): string {
+  const full = tf("Change ticker · {pane}", { pane });
+  return displayWidth(full) <= width ? full : truncateToDisplayWidth(t("Change ticker"), width);
+}
 
 /**
  * The root screen keeps the closed prompt's own words. Opening the bar puts the
@@ -31,7 +39,7 @@ function resolvePromptPlaceholder(listState: ListScreenState, example: string | 
   if (listState.kind === "root") {
     return example ? tf("Try: {example}", { example }) : t("Search or run a command");
   }
-  if (listState.title === "Security Description") return t("Search tickers");
+  if (listState.title === "Security Description" || listState.title === HEADER_MARKET_TITLE) return t("Search tickers");
   return t("Filter");
 }
 
@@ -68,9 +76,13 @@ export function CommandBarPanel({
   themePickerFilter,
   themePickerRef,
   trailingWidth,
+  tickerSearchTarget = null,
+  onRunSecondary,
+  selectionKeyHints = null,
   visibleListState,
 }: CommandBarPanelProps) {
   const colors = useThemeColors();
+  const newPaneColumns = terminalButtonColumns({ label: NEW_PANE_LABEL, shortcut: "Shift+Enter", compact: true });
   const palette = useCommandBarPalette(nativePaneChrome);
   // The count already includes this opening, so this reads the same until the bar closes.
   const intro = useAppSelector((state) => showsCommandBarIntro(state.config));
@@ -101,9 +113,10 @@ export function CommandBarPanel({
       query: visibleListState.query,
       placeholder: resolvePromptPlaceholder(visibleListState, example),
       ghostSuffix: visibleListState.kind === "root" ? rootGhostSuffix : null,
+      keyHints: selectionKeyHints,
       onQueryChange,
     });
-  }, [example, onQueryChange, rootGhostSuffix, visibleListState]);
+  }, [example, onQueryChange, rootGhostSuffix, selectionKeyHints, visibleListState]);
   useLayoutEffect(() => () => publishCommandBarPrompt(null), []);
 
   useLayoutEffect(() => {
@@ -122,6 +135,8 @@ export function CommandBarPanel({
   return (
     // The click-away overlay starts where the sheet does: the header above it
     // holds the bar's input, and a click there must reach it, not close the bar.
+    // It draws nothing: the panes beside and below the sheet stay as they are,
+    // a chart image among them too, and only the sheet covers them.
     <Box
       position="absolute"
       top={panelBounds.y}
@@ -191,8 +206,25 @@ export function CommandBarPanel({
                     />
                     <Box width={2} />
                     <Text fg={palette.text} attributes={TextAttributes.BOLD}>
-                      {truncateToDisplayWidth(t(getCommandBarPanelTitle(currentRoute)), Math.max(1, queryDisplayWidth - 8))}
+                      {tickerSearchTarget
+                        ? changeTickerTitle(tickerSearchTarget, Math.max(1, queryDisplayWidth - 8 - newPaneColumns - 2))
+                        : truncateToDisplayWidth(t(getCommandBarPanelTitle(currentRoute)), Math.max(1, queryDisplayWidth - 8))}
                     </Text>
+                    {tickerSearchTarget && (
+                      <>
+                        <Box flexGrow={1} />
+                        {/* Enter changes the pane; opening another one is the secondary action. */}
+                        <Button
+                          label={NEW_PANE_LABEL}
+                          variant="plain"
+                          compact
+                          flush
+                          stopPropagation
+                          shortcut="Shift+Enter"
+                          onPress={onRunSecondary}
+                        />
+                      </>
+                    )}
                   </>
                 ) : rootShortcutFeedback ? (
                   // Says what Enter runs, and a click on it runs the same.
@@ -254,7 +286,7 @@ export function CommandBarPanel({
 function getCommandBarPanelTitle(route: CommandBarRoute): string {
   if (route.kind === "mode") {
     if (route.screen === "layout") return "Layout Actions";
-    return "Security Description";
+    return isHeaderMarketRoute(route.payload) ? HEADER_MARKET_TITLE : "Security Description";
   }
   return route.title;
 }

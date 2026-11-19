@@ -8,8 +8,8 @@ import type { BrokerConnectionStatus } from "../../../../types/broker";
 import type { TickerFinancials } from "../../../../types/financials";
 import type { Portfolio, TickerRecord } from "../../../../types/ticker";
 import type { BrokerAccount, BrokerCashBalance } from "../../../../types/trading";
-import { formatShortDate } from "../../../../utils/datetime-format";
-import { displayWidth, formatPercentRaw } from "../../../../utils/format";
+import { formatClockTime, formatShortDate } from "../../../../utils/datetime-format";
+import { MISSING_VALUE, displayWidth, formatPercentRaw } from "../../../../utils/format";
 import { getBrokerInstance } from "../../../../utils/broker-instances";
 import {
   resolvePortfolioAccountMetrics,
@@ -20,7 +20,7 @@ import {
 } from "../account-metrics";
 import { formatPortfolioAmount, type PortfolioSummaryTotals } from "./totals";
 import { formatAllocationDrift, formatAllocationWeight, type PortfolioCashLine } from "../../../../portfolio/allocation";
-import { getMostRecentQuoteUpdate } from "../../../../market-data/quotes/time";
+import { quoteSourceFooterSegment } from "../../shared/source-footer";
 import { fxStatusLabel, type FxRateStatus } from "../../../../utils/fx-status";
 import { t } from "../../../../i18n";
 import type { PortfolioValuationBasis } from "../../../../portfolio/valuation-basis";
@@ -42,6 +42,11 @@ export interface PortfolioSummarySegment {
     bold?: boolean;
   }>;
   length: number;
+  /**
+   * What the segment reads when it ends the row, the next one having no room:
+   * Val with its basis note, which the Day after it says otherwise.
+   */
+  alone?: PortfolioSummarySegment;
 }
 
 export interface PortfolioSummaryAccountState {
@@ -110,6 +115,10 @@ export function fitSummarySegments(candidates: PortfolioSummarySegment[], widthB
     fitted.push(segment);
     used = nextUsed;
   }
+  const last = fitted.at(-1);
+  if (last?.alone && fitted.length < candidates.length && used - last.length + last.alone.length <= widthBudget) {
+    fitted[fitted.length - 1] = last.alone;
+  }
   return fitted;
 }
 
@@ -124,7 +133,7 @@ function formatSourceBadge(account: BrokerAccount, liveGateway: boolean): { labe
       label: !syncedAt
         ? "Synced"
         : today
-          ? `Synced ${syncedAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })}`
+          ? `Synced ${formatClockTime(syncedAt)}`
           : `Synced ${formatShortDate(syncedAt, { year: false })}`,
       kind: "cloud",
     };
@@ -245,8 +254,21 @@ export function buildPortfolioSummarySegments({
   manualCash = null,
   brokerPortfolio = false,
   valuationBasis,
+  period = null,
+  cashInTable = false,
+  otherCurrencies = false,
 }: {
   totals: PortfolioSummaryTotals;
+  /** The book holds a currency other than its own: its amounts name theirs ($1,179,156), a bare one beside HK$ prices being unclear. */
+  otherCurrencies?: boolean;
+  /** The table shows the cash as its own row (with its target and trade), so the header leaves it out. */
+  cashInTable?: boolean;
+  /**
+   * P&L between two closes (the pane's P&L From) in place of P&L since cost:
+   * its label names the closes, the total takes in the FX line, and the
+   * percent is its share of the book. Null figures while the closes load.
+   */
+  period?: { label: string; total: number | null; contribution: number | null } | null;
   /** What the values are priced at, said beside the value; left out when absent. */
   valuationBasis?: PortfolioValuationBasis;
   accountState: PortfolioSummaryAccountState | null;
@@ -260,9 +282,9 @@ export function buildPortfolioSummarySegments({
   /** The app's base currency: amounts are bare only when both are USD. */
   baseCurrency?: string;
   /** Cash entered by hand, in the totals currency, with the total it is weighed against. */
-  manualCash?: (PortfolioCashLine & { total: number | null }) | null;
+  manualCash?: (Pick<PortfolioCashLine, "value" | "weight" | "targetWeight" | "drift"> & { total: number | null }) | null;
 }): PortfolioSummarySegment[] {
-  const money = (value: number | undefined, signed = false) => formatPortfolioAmount(value, currency, { signed, baseCurrency });
+  const money = (value: number | undefined, signed = false) => formatPortfolioAmount(value, currency, { signed, baseCurrency, named: otherCurrencies });
   if (!isPortfolioTab) {
     return totals.watchlistCount > 0
       ? [createSummarySegment("avg-day", [
@@ -309,14 +331,17 @@ export function buildPortfolioSummarySegments({
   }
 
   // Which price the value uses goes with it, so a narrow row never shows one without the other.
-  candidates.push(createSummarySegment("val", [
+  const dayNamesBasis = !accountMetrics.brokerDay && Number.isFinite(accountMetrics.dailyPnl);
+  const valParts: PortfolioSummarySegment["parts"] = [
     { text: broker || totals.hasShorts ? "Gross" : "Val", tone: "label" },
     { text: money(totalMarketValue), tone: "value", bold: true },
-    ...(valuationBasis ? [{
-      text: valuationBasis === "regular-close" && totals.hasFutures ? PRICED_AT_SETTLE_TEXT : PRICED_AT_TEXT[valuationBasis],
-      tone: "muted" as const,
-    }] : []),
-  ]));
+  ];
+  const noted = valuationBasis ? createSummarySegment("val", [...valParts, {
+    text: valuationBasis === "regular-close" && totals.hasFutures ? PRICED_AT_SETTLE_TEXT : PRICED_AT_TEXT[valuationBasis],
+    tone: "muted",
+  }]) : createSummarySegment("val", valParts);
+  candidates.push(noted);
+  const valIndex = candidates.length - 1;
 
   if (totals.hasShorts && totals.netMktValue != null) {
     candidates.push(createSummarySegment("net-value", [
@@ -326,12 +351,12 @@ export function buildPortfolioSummarySegments({
   }
 
   // A broker account always states its cash, so a missing balance reads as unknown rather than zero.
-  if (broker && !manualCash) candidates.push(accountValue("cash", "Cash", account?.totalCashValue ?? Number.NaN)!);
-  if (manualCash) {
+  if (broker && !manualCash && !cashInTable) candidates.push(accountValue("cash", "Cash", account?.totalCashValue ?? Number.NaN)!);
+  if (manualCash && !cashInTable) {
     const drift = formatAllocationDrift(manualCash.drift);
     candidates.push(createSummarySegment("cash", [
       { text: "Cash", tone: "label" },
-      { text: money(manualCash.value), tone: "value", bold: true },
+      { text: money(manualCash.value ?? Number.NaN), tone: "value", bold: true },
       ...(manualCash.weight != null ? [{ text: `(${formatAllocationWeight(manualCash.weight)})`, tone: "muted" as const }] : []),
       ...(manualCash.targetWeight != null && manualCash.drift != null
         ? [{ text: drift, tone: "muted" as const, color: /[1-9]/.test(drift) ? priceColor(manualCash.drift) : undefined }]
@@ -339,20 +364,35 @@ export function buildPortfolioSummarySegments({
     ]));
   }
 
+  // The period the pane was asked for comes before the day's move, so a narrow header keeps it.
+  if (period) {
+    candidates.push(createSummarySegment("pnl", [
+      { text: period.label, tone: "label" },
+      { text: money(period.total ?? Number.NaN, true), tone: "value", color: period.total == null ? undefined : priceColor(period.total), bold: true },
+      { text: `(${formatPercentRaw(period.contribution ?? Number.NaN)})`, tone: "muted", color: period.contribution == null ? undefined : shownPriceColor(period.contribution, 2) },
+    ]));
+  }
+  // Beside cash entered by hand, which the Total counts, each percent says what it is of: the holdings, and their cost.
+  const holdingsOnly = !!manualCash && !broker;
   candidates.push(createSummarySegment("day", [
     { text: "Day", tone: "label" },
     { text: money(accountMetrics.dailyPnl, true), tone: "value", color: priceColor(accountMetrics.dailyPnl), bold: true },
-    { text: `(${formatPercentRaw(accountMetrics.dailyPnlPct)})`, tone: "muted", color: shownPriceColor(accountMetrics.dailyPnlPct, 2) },
+    { text: `(${formatPercentRaw(accountMetrics.dailyPnlPct)}${holdingsOnly ? " ex cash" : ""})`, tone: "muted", color: shownPriceColor(accountMetrics.dailyPnlPct, 2) },
     // The broker's own day is from its account's close, not the quotes': it names none.
-    ...(accountMetrics.brokerDay || !Number.isFinite(accountMetrics.dailyPnl) ? [] : dayBasisPart(totals)),
+    ...(dayNamesBasis ? dayBasisPart(totals) : []),
   ]));
-  candidates.push(createSummarySegment("pnl", [
+  // Right after Val, a Day that names its extended-hours print ("AH vs Tue 10 Nov close") says what the value is
+  // priced at: Val leaves its note to it, and keeps it on a row with no room for the Day.
+  if (valuationBasis === "latest-print" && totals.dayAtExtendedPrint && dayNamesBasis && valIndex === candidates.length - 2) {
+    candidates[valIndex] = { ...createSummarySegment("val", valParts), alone: noted };
+  }
+  if (!period) candidates.push(createSummarySegment("pnl", [
     { text: !Number.isFinite(account?.unrealizedPnl)
       && totals.unrealizedPnlBasis === "broker-snapshot" ? "Broker P&L"
       : !Number.isFinite(account?.unrealizedPnl)
         && totals.unrealizedPnlBasis === "mixed" ? "Mixed P&L" : "P&L", tone: "label" },
     { text: money(accountMetrics.unrealizedPnl, true), tone: "value", color: priceColor(accountMetrics.unrealizedPnl), bold: true },
-    { text: `(${formatPercentRaw(accountMetrics.unrealizedPnlPct)})`, tone: "muted", color: shownPriceColor(accountMetrics.unrealizedPnlPct, 2) },
+    { text: `(${formatPercentRaw(accountMetrics.unrealizedPnlPct)}${holdingsOnly ? " on cost" : ""})`, tone: "muted", color: shownPriceColor(accountMetrics.unrealizedPnlPct, 2) },
   ]));
 
   // A book with shorts splits its gross into the two sides, after the headline numbers.
@@ -453,13 +493,11 @@ export function buildPortfolioFooterSegments({
   if (savedAt != null) return [...accountStatus, savedCopyFooterSegment("refresh", savedAt)];
   if (isPortfolioTab ? !totals.hasPositions && !accountStatusText : totals.watchlistCount === 0) return [];
 
-  const lastRefreshTimestamp = getMostRecentQuoteUpdate(quotes);
-  const refreshText = refreshingSize > 0
-    ? "Refreshing..."
-    : lastRefreshTimestamp != null
-      ? new Date(lastRefreshTimestamp).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
-      : "-";
-  return [...accountStatus, { id: "refresh", parts: [{ text: refreshText, tone: "muted" }] }];
+  // Where the quotes are from and the newest's time, as `quote` ends (`Gloom Cloud · 14:44 UTC · markets open`):
+  // a bare local time ("Thu 12:25") named neither.
+  const quoted = refreshingSize > 0 ? null : quoteSourceFooterSegment(quotes, { id: "refresh" });
+  const refresh: PaneFooterSegment = quoted ?? { id: "refresh", parts: [{ text: refreshingSize > 0 ? "Refreshing..." : MISSING_VALUE, tone: "muted" }] };
+  return [...accountStatus, refresh];
 }
 
 const MAX_NOTICE_SYMBOLS = 12;
@@ -513,7 +551,9 @@ export function renderSummarySegments(segments: PortfolioSummarySegment[], width
         <Box key={segment.id} flexDirection="row">
           {segmentIndex > 0 && <Text fg={colors.textDim}>{"  "}</Text>}
           {segment.parts.map((part, partIndex) => (
-            <Box key={`${segment.id}:${partIndex}`} flexDirection="row">
+            // A row too narrow for its segment cuts the muted basis ("vs Thu 5 Nov close"), never the
+            // label or the figure: "Avg +1." read as a different number than +1.02%.
+            <Box key={`${segment.id}:${partIndex}`} flexDirection="row" flexShrink={part.tone === "muted" ? 1 : 0}>
               {partIndex > 0 && <Text fg={colors.textDim}>{" "}</Text>}
               <Text
                 fg={part.color ?? (part.tone === "label" || part.tone === "muted" ? colors.textDim : colors.text)}

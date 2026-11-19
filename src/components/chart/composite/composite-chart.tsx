@@ -1,4 +1,14 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ComponentProps,
+  type ReactNode,
+} from "react";
 import { useCompositeChartKeyboard } from "./use-composite-chart-keyboard";
 import { useCompositeViewport } from "./use-composite-viewport";
 import { CompositePanelSurface } from "./panel-surface";
@@ -27,6 +37,7 @@ import { usePaneFocused } from "../../../state/app/activity";
 import { useTabCursorLink } from "../../../state/app/tab-cursor";
 import { useThemeColors, useThemeId } from "../../../theme/theme-context";
 import { themedSeriesColor, themeSeriesColors } from "../../../theme/series-colors";
+import { themeKeysDirection } from "../../../theme/themes";
 import { assignSeriesLineCues, type SeriesLineCue } from "./series-cues";
 import { chartSurfaceBackground, usePaneSurface } from "../../layout/pane/surface";
 import { CHART_WATERMARK_ROLE } from "../../../utils/screenshot-watermark";
@@ -37,8 +48,15 @@ import { reuseResolvedSeriesList } from "./panel-series";
 import { consumeChartMouseEvent, type ChartMouseEvent } from "../core/pointer";
 import { useChartViewResetListener } from "../core/view-reset";
 import { useShowChartTextFallback } from "../native/use-chart-text-fallback";
-import { StaticXAxisLabels, StaticXMarkerLabels, StaticXMarkerOverlay } from "./axis-overlays";
+import { EventCaptions, StaticXAxisLabels, StaticXMarkerLabels, StaticXMarkerOverlay } from "./axis-overlays";
+import { layoutEventCaptions } from "./event-captions";
 import { formatCompositeCursorAxisDate } from "./format";
+import {
+  createCompositeCursorSource,
+  createValueStore,
+  useCursorScene,
+  type CompositeCursorSource,
+} from "./cursor-source";
 import {
   resolveCompositeWheelPan,
   resolveCompositeWheelZoom,
@@ -47,13 +65,11 @@ import {
 } from "./interactions";
 import { NO_VALUE_SCALES, resolveAxisDragSpanFactor } from "./value-scale";
 import { useCompositeValueScales } from "./use-composite-value-scales";
-import { COMPOSITE_RIGHT_OFFSET_RATIO } from "./time-scale";
+import { COMPOSITE_RIGHT_OFFSET_RATIO, projectCompositeTimestamp } from "./time-scale";
 import {
   allocateCompositePanelHeights,
-  applyCompositeChartCursor,
   buildCompositeChartScene,
   compositeCursorAsOf,
-  compositeLinkedCursorTime,
   resizeCompositePanel,
   resolveAdjacentCompositeCursorDate,
 } from "./scene";
@@ -62,12 +78,14 @@ import type {
   CompositeChartColors,
   CompositeChartProps,
   CompositeChartScene,
+  CompositeChartEvent,
   CompositeChartXMarker,
+  CompositeEventGuide,
   CompositePanelScene,
 } from "./types";
 
-// Wordmark cell grid at scale 1 (27 columns of 8px, 4 rows of 12px).
-const WATERMARK_BASE_WIDTH_PX = 216;
+// Wordmark cell grid at scale 1 (15 columns of 8px, 4 rows of 12px).
+const WATERMARK_BASE_WIDTH_PX = 120;
 const WATERMARK_BASE_HEIGHT_PX = 48;
 
 /** The most lines a legend wraps to, and the plot rows each panel keeps when it does. */
@@ -90,8 +108,15 @@ function chartWatermarkScale(plotWidthPx: number, plotHeightPx: number): number 
 
 const NO_LINE_CUES: ReadonlyMap<string, SeriesLineCue> = new Map();
 const NO_X_MARKERS: readonly CompositeChartXMarker[] = [];
+const NO_EVENTS: readonly CompositeChartEvent[] = [];
+const NO_PROJECTED_EVENTS: readonly { event: CompositeChartEvent; guide: CompositeEventGuide }[] = [];
 const subscribeToNothing = () => () => {};
 const holdsNothing = () => false;
+
+function finiteTimestampOrNull(date: Date | null | undefined): number | null {
+  const timestamp = date?.getTime() ?? null;
+  return timestamp !== null && Number.isFinite(timestamp) ? timestamp : null;
+}
 
 /**
  * Desktop: the rows below the plot span the chart's box and their labels the
@@ -184,8 +209,12 @@ function ThemedCompositeChart({
   colors,
   interactive = true,
   navigable = true,
+  enterable = false,
+  panelRules = !navigable,
   formatAxisValue,
   xAxis,
+  events,
+  mergeEventCaptions,
   remoteKind,
   allowHistoricalBackfill = false,
   axisWidth = 9,
@@ -212,10 +241,13 @@ function ThemedCompositeChart({
   onChartLayoutChange,
 }: CompositeChartProps & { chartLayout: ChartLayoutPrefs; onChartLayoutChange: ChartLayoutUpdate }) {
   const activeThemeColors = useThemeColors();
+  const keysDirection = themeKeysDirection(useThemeId());
   const { cellWidthPx = 8, cellHeightPx = 18, pixelRatio = 1, fractionalViewport = false } = useUiCapabilities();
   const isDesktopWeb = useUiCapabilities().nativePaneChrome === true;
   const showTextFallback = useShowChartTextFallback();
-  const [internalCursorDate, setInternalCursorDate] = useState<Date | null>(null);
+  // The chart's own cursor, in epoch ms. A pointer move sets it without
+  // rendering the chart: only what draws the crosshair renders (see `cursorSource`).
+  const [ownCursor] = useState(() => createValueStore<number | null>(null));
   const [toolSpan, setToolSpan] = useState<ChartToolSpan | null>(null);
   const [pointerDragging, setPointerDragging] = useState(false);
   const paneFocused = usePaneFocused();
@@ -255,8 +287,7 @@ function ThemedCompositeChart({
   // pointer moves it as on any chart, and the pointer leaving returns it.
   const restingCursor = cursorDate !== undefined && !onCursorDateChange;
   const ownsCursor = cursorDate === undefined || restingCursor;
-  const resolvedCursorDate = cursorDate === undefined ? internalCursorDate
-    : restingCursor ? internalCursorDate ?? cursorDate : cursorDate;
+  const ownerCursorTimestamp = finiteTimestampOrNull(cursorDate);
   const totalWidth = Math.max(1, Math.floor(width));
   const totalHeight = Math.max(1, Math.floor(height));
   const seriesIdentityRef = useRef<ResolvedSeries[]>([]);
@@ -314,8 +345,16 @@ function ThemedCompositeChart({
   // The pane's range control asks for this when its selected range is chosen again.
   useChartViewResetListener(resetView, interactive);
   const timeAxisRows = showTimeAxis ? 1 : 0;
-  const xMarkers = xAxis?.markers ?? NO_X_MARKERS;
-  const xMarkerRows = xMarkers.some((marker) => marker.label) ? 1 : 0;
+  const axisMarkers = xAxis?.markers ?? NO_X_MARKERS;
+  // Events in the view; their captions' row is kept whenever the chart has any, so panning never moves the plot.
+  const viewStart = effectiveViewport?.start.getTime() ?? null;
+  const viewEnd = effectiveViewport?.end.getTime() ?? null;
+  const timedEvents = !xAxis && events?.length ? events : NO_EVENTS;
+  const eventsInView = useMemo(() => (
+    timedEvents.length === 0 || viewStart === null || viewEnd === null ? NO_EVENTS
+      : timedEvents.filter((event) => event.time <= viewEnd && (event.endTime ?? event.time) >= viewStart)
+  ), [timedEvents, viewEnd, viewStart]);
+  const xMarkerRows = axisMarkers.some((marker) => marker.label) || timedEvents.some((event) => event.captions?.length) ? 1 : 0;
   const panelCount = new Set(panelSeries.map((entry) => entry.panelId)).size;
   // One legend line, or up to a few when its entries cannot share one and each
   // panel keeps a readable plot: the legend says how many it needs while no
@@ -471,22 +510,46 @@ function ThemedCompositeChart({
     1,
     Math.round(plotWidth * cellWidthPx * Math.max(1, pixelRatio)),
   );
+  // An event is a guide at its time on the scale the bars are drawn on, so it sits on its bar.
+  const projectedEvents = useMemo(() => {
+    if (eventsInView.length === 0 || !projectedScene) return NO_PROJECTED_EVENTS;
+    const projected = eventsInView.flatMap((event) => {
+      const ratio = projectCompositeTimestamp(projectedScene.timeScale, event.time)?.ratio;
+      const end = event.endTime === undefined ? undefined : projectCompositeTimestamp(projectedScene.timeScale, event.endTime)?.ratio;
+      if (ratio == null || event.endTime !== undefined && end == null) return [];
+      if (end === undefined ? ratio < 0 || ratio > 1 : end! < 0 || ratio > 1) return [];
+      const guide: CompositeEventGuide = { xRatio: ratio, ...(end !== undefined ? { endXRatio: end! } : {}), dotted: event.dotted === true };
+      return [{ event, guide }];
+    });
+    return projected.length > 0 ? projected : NO_PROJECTED_EVENTS;
+  }, [eventsInView, projectedScene]);
   const baseScene = useMemo<CompositeChartScene | null>(() => {
     if (!projectedScene || !layoutPanels) return null;
+    const eventGuides = projectedEvents.length > 0 ? projectedEvents.map(({ guide }) => guide) : null;
     const laidOut: CompositeChartScene = {
       ...projectedScene,
       width: plotWidth,
       height: layoutPanels.reduce((sum, panel) => sum + panel.height, 0),
-      panels: layoutPanels,
+      panels: eventGuides ? layoutPanels.map((panel) => ({ ...panel, eventGuides })) : layoutPanels,
       // A panel with the whole plot still leaves the legend every series' value.
       ...(maximizedPanelId ? { cursorPanels: projectedScene.panels } : {}),
     };
     return downsampleCompositeChartScene(laidOut, downsampleWidth);
-  }, [downsampleWidth, layoutPanels, maximizedPanelId, plotWidth, projectedScene]);
-  const resolvedCursorTimestamp = resolvedCursorDate?.getTime() ?? null;
-  const normalizedCursorTimestamp = resolvedCursorTimestamp !== null && Number.isFinite(resolvedCursorTimestamp)
-    ? resolvedCursorTimestamp
-    : null;
+  }, [downsampleWidth, layoutPanels, maximizedPanelId, plotWidth, projectedEvents, projectedScene]);
+  // The events' captions, in the row under the axis, each beside its guide.
+  const eventCaptions = useMemo(() => {
+    if (projectedEvents.length === 0) return [];
+    const column = (ratio: number) => Math.round(Math.min(1, Math.max(0, ratio)) * Math.max(0, plotWidth - 1));
+    return layoutEventCaptions(projectedEvents.map(({ event, guide }) => ({
+      event, from: column(guide.xRatio), to: column(guide.endXRatio ?? guide.xRatio),
+    })), plotWidth, mergeEventCaptions);
+  }, [mergeEventCaptions, plotWidth, projectedEvents]);
+  // The cursor shown: the chart's own, or else the owner's.
+  const currentCursorTimestamp = useCallback(
+    () => (ownsCursor ? ownCursor.get() : null) ?? ownerCursorTimestamp,
+    [ownCursor, ownerCursorTimestamp, ownsCursor],
+  );
+  const normalizedCursorTimestamp = currentCursorTimestamp();
   // A custom x axis is not time, so there is no time to share. Otherwise an
   // interactive chart in a pane shares its crosshair with every chart in the
   // pane's layout tab, its siblings in the pane included: each chart is its
@@ -506,43 +569,40 @@ function ThemedCompositeChart({
   const sharedTime = link?.time;
   // Charts sharing a cursor show one: another chart's while it holds it, in
   // place of this one's own. An owner's resting cursor, such as a table's
-  // selected row, comes back when it clears. A chart renders again when the
-  // bar the shared cursor lands on here changes, not on every move: a daily
-  // chart under a 30-minute one's cursor moves once a session.
+  // selected row, comes back when it clears. Whether one shows renders the
+  // chart; where it is renders only what draws it (see `cursorSource`).
   const showsSharedCursor = useSyncExternalStore(subscribeToLink, useCallback(() => sharedTime?.() != null, [sharedTime]));
-  const sharedCursorBar = useSyncExternalStore(subscribeToLink, useCallback(() => {
-    const time = sharedTime?.() ?? null;
-    return time === null || !baseScene ? null : compositeLinkedCursorTime(baseScene, time);
-  }, [baseScene, sharedTime]));
   const holdsSharedCursor = useSyncExternalStore(subscribeToLink, link?.held ?? holdsNothing);
   const pinnedCursor = useSyncExternalStore(subscribeToLink, link?.pinned ?? holdsNothing);
   const publishCursor = link?.publish;
-  const scene = useMemo(() => {
-    if (!baseScene) return null;
-    if (showsSharedCursor) {
-      return applyCompositeChartCursor(baseScene, sharedCursorBar === null ? null : new Date(sharedCursorBar), "linked");
-    }
-    return applyCompositeChartCursor(
-      baseScene,
-      normalizedCursorTimestamp === null ? null : new Date(normalizedCursorTimestamp),
-    );
-  }, [baseScene, normalizedCursorTimestamp, sharedCursorBar, showsSharedCursor]);
+  const cursorSource = useMemo<CompositeCursorSource | null>(() => baseScene ? createCompositeCursorSource({
+    baseScene,
+    own: ownsCursor ? ownCursor : null,
+    fallback: ownerCursorTimestamp,
+    link,
+  }) : null, [baseScene, link, ownCursor, ownerCursorTimestamp, ownsCursor]);
   const lastCursorTimestampRef = useRef<number | null>(normalizedCursorTimestamp);
   const renderedCursorTimestampRef = useRef<number | null>(normalizedCursorTimestamp);
-  if (renderedCursorTimestampRef.current !== normalizedCursorTimestamp) {
-    renderedCursorTimestampRef.current = normalizedCursorTimestamp;
-    lastCursorTimestampRef.current = normalizedCursorTimestamp;
-  }
+  // The cursor last shown, which a move to the same time does not report
+  // again. It follows the chart's own cursor as it moves, between renders.
+  const syncShownCursor = useCallback(() => {
+    const shown = currentCursorTimestamp();
+    if (renderedCursorTimestampRef.current === shown) return;
+    renderedCursorTimestampRef.current = shown;
+    lastCursorTimestampRef.current = shown;
+  }, [currentCursorTimestamp]);
+  syncShownCursor();
+  useEffect(() => ownCursor.subscribe(syncShownCursor), [ownCursor, syncShownCursor]);
 
   const updateCursor = useCallback((date: Date | null) => {
     const timestamp = date?.getTime() ?? null;
     const nextTimestamp = timestamp !== null && Number.isFinite(timestamp) ? timestamp : null;
     if (lastCursorTimestampRef.current === nextTimestamp) return;
     lastCursorTimestampRef.current = nextTimestamp;
-    if (ownsCursor) setInternalCursorDate(date);
+    if (ownsCursor) ownCursor.set(nextTimestamp);
     onCursorDateChange?.(date);
     publishCursor?.(date && baseScene && nextTimestamp !== null ? compositeCursorAsOf(baseScene, date) : null);
-  }, [baseScene, onCursorDateChange, ownsCursor, publishCursor]);
+  }, [baseScene, onCursorDateChange, ownCursor, ownsCursor, publishCursor]);
   // Another chart taking the cursor, or clearing it, takes it from this one,
   // so it does not come back here later. Read live: a move since the render
   // makes this chart's cursor the shared one again.
@@ -570,12 +630,15 @@ function ThemedCompositeChart({
   // The last time sits in a ref, so a moving crosshair costs no extra render,
   // and the footer's pin is there from the start: a hint appearing mid-hover
   // would move the plot under the pointer.
-  const cursorAt = scene?.cursorDate?.getTime() ?? null;
   const lastCursorAtRef = useRef<{ time: number; shared: boolean } | null>(null);
-  if (cursorAt !== null) {
-    const shared = showsSharedCursor ? sharedTime?.() ?? null : null;
+  const noteShownCursor = useCallback(() => {
+    const cursorAt = cursorSource?.scene().cursorDate?.getTime() ?? null;
+    if (cursorAt === null) return;
+    const shared = sharedTime?.() ?? null;
     lastCursorAtRef.current = shared !== null ? { time: shared, shared: true } : { time: cursorAt, shared: false };
-  }
+  }, [cursorSource, sharedTime]);
+  noteShownCursor();
+  useEffect(() => cursorSource?.subscribe(noteShownCursor), [cursorSource, noteShownCursor]);
   const pinnable = !!link?.pin;
   const togglePin = useCallback(() => {
     if (!link?.pin) return;
@@ -605,15 +668,9 @@ function ThemedCompositeChart({
   const patchLayout = useCallback((patch: ChartLayoutPrefs | ((layout: ChartLayoutPrefs) => ChartLayoutPrefs)) => {
     layoutStateRef.current.onChartLayoutChange((layout) => patchChartLayout(layout, typeof patch === "function" ? patch(layout) : patch));
   }, []);
-  // The tool in hand, read when the bar is toggled (the keyboard hook below holds it).
-  const toolInHandRef = useRef<{ armed: boolean; putDown: () => void }>({ armed: false, putDown: () => {} });
-  // Shift+T and the chevrons act on the bar as it shows: a bar open only for
-  // the tool in hand folds again, the tool put down, and stays hidden.
+  // Shift+T and the bar's own button keep it open, or let it fold to the tool in hand again.
   const toggleToolbar = useCallback(() => {
-    const tool = toolInHandRef.current;
-    const hidden = layoutStateRef.current.chartLayout.toolbarHidden === true && !tool.armed;
-    if (!hidden && tool.armed) tool.putDown();
-    patchLayout({ toolbarHidden: !hidden });
+    patchLayout({ toolbarPinned: layoutStateRef.current.chartLayout.toolbarPinned !== true });
   }, [patchLayout]);
   const toggleLegendCollapsed = useCallback(() => patchLayout((layout) => ({ legendCollapsed: !layout.legendCollapsed })), [patchLayout]);
   const resetPanelHeights = useCallback(() => {
@@ -660,7 +717,7 @@ function ThemedCompositeChart({
   const legendCollapsed = legendCollapsible && chartLayout.legendCollapsed === true;
   const projectedPanelCount = projectedScene?.panels.length ?? 0;
   const layoutControls = useMemo(() => ({
-    toolbarHidden: chartLayout.toolbarHidden === true,
+    toolbarPinned: chartLayout.toolbarPinned === true,
     toggleToolbar,
     legendCollapsible,
     legendCollapsed,
@@ -673,7 +730,7 @@ function ThemedCompositeChart({
     restorePanels: resetPanelMaximized,
   }), [
     chartLayout.panelWeights,
-    chartLayout.toolbarHidden,
+    chartLayout.toolbarPinned,
     layoutPanels?.length,
     legendCollapsed,
     legendCollapsible,
@@ -701,9 +758,12 @@ function ThemedCompositeChart({
     focused,
     interactive,
     navigable,
+    enterable,
     showLegend,
-    scene,
+    scene: baseScene,
+    cursor: cursorSource,
     cursorDate,
+    restingCursor,
     updateCursor: updateKeyboardCursor,
     pin: pinnable ? { pinned: pinnedCursor, toggle: togglePin } : null,
     onActivate,
@@ -730,7 +790,6 @@ function ThemedCompositeChart({
     pickDrawColor,
     layout: layoutControls,
   });
-  toolInHandRef.current = { armed: armedTool !== null, putDown: () => armTool(null) };
   const pressFromPointer = useCallback(() => {
     onPress?.();
     activateFromPointer();
@@ -882,7 +941,7 @@ function ThemedCompositeChart({
     () => baseScene && showTimeAxis ? buildCompositeTimeAxisLayout(baseScene, plotWidth) : null,
     [baseScene, plotWidth, showTimeAxis],
   );
-  const emptyTimeAxisLayout = !scene && showTimeAxis && effectiveViewport
+  const emptyTimeAxisLayout = !baseScene && showTimeAxis && effectiveViewport
     ? buildCompositeViewportTimeAxisLayout(effectiveViewport, plotWidth)
     : null;
 
@@ -898,7 +957,7 @@ function ThemedCompositeChart({
     ? { width: "auto", height: "auto", right: `calc(${rightPadding} * var(--cell-w))`, bottom: `calc(${timeAxisRows + xMarkerRows} * var(--cell-h))` }
     : undefined;
 
-  if (!scene) {
+  if (!baseScene || !cursorSource) {
     const emptyPlotHeight = Math.max(0, totalHeight - legendRows - timeAxisRows - xMarkerRows);
     return (
       <Box
@@ -981,34 +1040,21 @@ function ThemedCompositeChart({
   // drawing. A chart outside a pane (a share page) keeps them.
   const toolbarWanted = paneFocused !== false || armedTool !== null || pointerDragging || toolSpan !== null;
   const showToolbar = interactive && navigable && toolbarWanted && plotWidth > CHART_TOOLBAR_WIDTH + 4;
-  // Hidden, the bar folds to the button that brings it back, and opens again
-  // while a tool picked from the keys is in hand, so the plot says which one.
-  const toolbarFolded = showToolbar && chartLayout.toolbarHidden === true && armedTool === null;
   // Bars shorter than a day carry a time of day the cursor reads out.
-  const intradayBars = scene.timeZone !== undefined || visibleSeries.some((entry) => (
+  const intradayBars = baseScene.timeZone !== undefined || visibleSeries.some((entry) => (
     !!entry.historyResolution && isIntradayResolution(entry.historyResolution)
   ));
-  const timeAxisCursorColumn = scene.cursorXRatio === null
-    ? null
-    : scene.cursorXRatio * Math.max(plotWidth - 1, 0);
-  const timeAxisCursorPixelX = timeAxisCursorColumn === null
-    ? null
-    : timeAxisCursorColumn * cellWidthPx;
-  const timeAxisCursorLabel = xAxis?.formatCursor && scene.cursorXRatio !== null
-    ? xAxis.formatCursor(scene.cursorXRatio)
-    : scene.cursorDate
-      ? formatCompositeCursorAxisDate(scene.cursorDate, scene.startTime, scene.endTime, scene.timeZone, intradayBars)
-      : null;
   // The crosshair labels the moving end, so the axis only adds the anchor.
   const timeAxisMarkers = toolSpan
     ? [{
       ratio: toolSpan.startXRatio,
       label: formatCompositeCursorAxisDate(
         new Date(toolSpan.startTime),
-        scene.startTime,
-        scene.endTime,
-        scene.timeZone,
+        baseScene.startTime,
+        baseScene.endTime,
+        baseScene.timeZone,
         intradayBars,
+        isDesktopWeb,
       ),
       color: toolSpan.color,
     }]
@@ -1028,14 +1074,16 @@ function ThemedCompositeChart({
       data-gloom-data={navigationFrame ? `${navigationFrame.dataStart}:${navigationFrame.dataEnd}` : undefined}
     >
       {showLegend ? (
-        <CompositeLegend
+        <CursorLegend
           // Every series' value at the crosshair, the latest ones when the
           // pointer leaves; the price and the time under it sit on the axes.
-          scene={scene}
+          cursor={cursorSource}
           series={visibleLegendSeries}
           visibleSeriesIds={visibleSeriesIds}
           lineCues={lineCues}
           cellPlot={showTextFallback && !isDesktopWeb}
+          // A color-blind safe theme's blue and vermillion are no convention: a candle series keys them.
+          directionDownColor={keysDirection ? resolvedColors.negative : null}
           width={totalWidth}
           accessory={legendAccessory}
           accessoryWidth={legendAccessoryWidth}
@@ -1063,8 +1111,9 @@ function ThemedCompositeChart({
           drawColor={drawColor}
           showColors={isDrawingTool(armedTool) || !!selectedDrawingId}
           levelTool={levelsEditable}
-          folded={toolbarFolded}
-          onToggleFolded={() => {
+          maxWidth={plotWidth}
+          pinned={chartLayout.toolbarPinned === true}
+          onTogglePinned={() => {
             pressFromPointer();
             toggleToolbar();
           }}
@@ -1120,11 +1169,12 @@ function ThemedCompositeChart({
           onRestore={setDrawings}
         />
       ) : null}
-      {scene.panels.map((panel, index) => (
+      {baseScene.panels.map((panel, index) => (
         <CompositePanelSurface
           key={panel.id}
           panel={panel}
-          scene={scene}
+          scene={baseScene}
+          cursor={cursorSource}
           plotWidth={plotWidth}
           leftAxisWidth={leftAxisWidth}
           rightAxisWidth={rightAxisWidth}
@@ -1162,6 +1212,7 @@ function ThemedCompositeChart({
           valueScalable={interactive}
           onSetValueScale={setValueScale}
           onResetValueScale={resetPanelValueScale}
+          ruleAbove={index > 0 && panelRules}
           dividerAbove={index > 0 && panelDividerGestures
             ? { active: resizingPanelIndex === index, gestures: panelDividerGestures(index) }
             : null}
@@ -1183,10 +1234,10 @@ function ThemedCompositeChart({
           style={plotInsetStyle}
           data-gloom-role={CHART_WATERMARK_ROLE}
         >
-          <AsciiText text="Gloomberb" font="wordmark" scale={watermarkScale} color={resolvedColors.textDim} />
+          <AsciiText text="Gloom" font="wordmark" scale={watermarkScale} color={resolvedColors.textDim} />
         </Box>
       ) : null}
-      {xMarkers.length > 0 ? (
+      {axisMarkers.length > 0 ? (
         <Box
           position="absolute"
           left={leftPadding}
@@ -1197,7 +1248,7 @@ function ThemedCompositeChart({
           style={isDesktopWeb ? { ...plotInsetStyle, pointerEvents: "none" } : undefined}
         >
           <StaticXMarkerOverlay
-            markers={xMarkers}
+            markers={axisMarkers}
             width={plotWidth}
             height={plotHeight}
             fallbackColor={resolvedColors.textDim}
@@ -1215,14 +1266,15 @@ function ThemedCompositeChart({
           data-gloom-role="composite-chart-time-scale"
         >
           {leftPadding > 0 ? <Box width={leftPadding} /> : null}
-          <StaticXAxisLabels
+          <CursorTimeAxis
+            cursor={cursorSource}
+            formatCursor={xAxis?.formatCursor}
+            intradayBars={intradayBars}
+            cellWidthPx={cellWidthPx}
             labels={xAxis?.ticks ? [] : xAxis?.labels ? [...xAxis.labels] : [timeAxisLayout.text]}
             positionedLabels={xAxis?.ticks ?? (xAxis?.labels ? undefined : timeAxisLayout.ticks)}
             width={plotWidth}
             color={resolvedColors.textDim}
-            cursorColumn={timeAxisCursorColumn}
-            cursorPixelX={timeAxisCursorPixelX}
-            cursorLabel={timeAxisCursorLabel}
             cursorColor={resolvedColors.crosshair}
             cursorBackgroundColor={resolvedColors.background}
             extraMarkers={timeAxisMarkers}
@@ -1233,14 +1285,60 @@ function ThemedCompositeChart({
       {xMarkerRows > 0 ? (
         <Box flexDirection="row" width={totalWidth} height={1} style={isDesktopWeb ? DESKTOP_FULL_ROW : undefined}>
           {leftPadding > 0 ? <Box width={leftPadding} /> : null}
-          <StaticXMarkerLabels
-            markers={xMarkers}
-            width={plotWidth}
-            fallbackColor={resolvedColors.textDim}
-          />
+          {axisMarkers.length > 0 ? (
+            <StaticXMarkerLabels
+              markers={axisMarkers}
+              width={plotWidth}
+              fallbackColor={resolvedColors.textDim}
+            />
+          ) : (
+            <EventCaptions captions={eventCaptions} width={plotWidth} color={resolvedColors.textDim} />
+          )}
           {rightPadding > 0 ? <Box width={rightPadding} /> : null}
         </Box>
       ) : null}
     </Box>
+  );
+}
+
+/** The legend, rendering with the crosshair: its values are the series' at the cursor. */
+function CursorLegend({ cursor, ...props }: Omit<ComponentProps<typeof CompositeLegend>, "scene"> & {
+  cursor: CompositeCursorSource;
+}) {
+  return <CompositeLegend {...props} scene={useCursorScene(cursor)} />;
+}
+
+/** The time axis, rendering with the crosshair: its label sits at the cursor, and the ticks under it step aside. */
+function CursorTimeAxis({
+  cursor,
+  formatCursor,
+  intradayBars,
+  cellWidthPx,
+  width,
+  ...props
+}: Omit<ComponentProps<typeof StaticXAxisLabels>, "cursorColumn" | "cursorPixelX" | "cursorLabel"> & {
+  cursor: CompositeCursorSource;
+  formatCursor?: (ratio: number) => string;
+  intradayBars: boolean;
+  cellWidthPx: number;
+}) {
+  const scene = useCursorScene(cursor);
+  const words = useUiCapabilities().nativePaneChrome === true;
+  const cursorColumn = scene.cursorXRatio === null
+    ? null
+    : scene.cursorXRatio * Math.max(width - 1, 0);
+  const cursorLabel = formatCursor && scene.cursorXRatio !== null
+    ? formatCursor(scene.cursorXRatio)
+    : scene.cursorDate
+      ? formatCompositeCursorAxisDate(scene.cursorDate, scene.startTime, scene.endTime, scene.timeZone, intradayBars, words)
+      : null;
+  return (
+    <StaticXAxisLabels
+      {...props}
+      width={width}
+      cursorColumn={cursorColumn}
+      cursorPixelX={cursorColumn === null ? null : cursorColumn * cellWidthPx}
+      cursorLabel={cursorLabel}
+    />
   );
 }

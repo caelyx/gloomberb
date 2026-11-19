@@ -5,6 +5,8 @@ import { renderAsciiText } from "../../ui/ascii-font";
 import { scrollBoxScrollsVertically } from "../../ui/scroll-box-axis";
 import { OpenTuiImageSurface } from "./image/surface";
 import { OpenTuiChartSurface } from "./chart-surface";
+import { joinPastedLines } from "../../utils/pasted-lines";
+import { withoutControlCharacters } from "../../utils/untrusted-text";
 
 interface OpenTuiPrimitiveProps {
   children?: ReactNode;
@@ -125,20 +127,43 @@ function mapColor(color: unknown): unknown {
   return typeof color === "string" ? RGBA.fromHex(color) : color;
 }
 
+/**
+ * Every string drawn in the terminal goes through here: a chat message, a
+ * name, a headline or a share reaches the screen as the text it is, without
+ * control characters (withoutControlCharacters). Colour and weight come from
+ * styled chunks, so no text needs an escape sequence of its own.
+ */
 function mapTextContent(content: unknown): unknown {
-  if (!content || typeof content === "string") return content;
+  if (!content) return content;
+  if (typeof content === "string") return withoutControlCharacters(content);
   if (
     typeof content === "object"
     && Array.isArray((content as { chunks?: unknown }).chunks)
   ) {
     return new OpenTuiStyledText((content as { chunks: Array<Record<string, unknown>> }).chunks.map((chunk) => ({
       ...chunk,
+      text: typeof chunk.text === "string" ? withoutControlCharacters(chunk.text) : chunk.text,
       fg: mapColor(chunk.fg),
       bg: mapColor(chunk.bg),
       attributes: mapTextAttributes(chunk.attributes as number | undefined),
     })) as any);
   }
   return content;
+}
+
+/** The text children of a text element, as mapTextContent draws a string. Elements in them map their own. */
+function plainTextChildren(children: ReactNode): ReactNode {
+  if (typeof children === "string") return withoutControlCharacters(children);
+  if (!Array.isArray(children)) return children;
+  let plain: ReactNode[] | null = null;
+  for (let index = 0; index < children.length; index += 1) {
+    const child = children[index] as ReactNode;
+    const mapped = plainTextChildren(child);
+    if (mapped === child) continue;
+    plain ??= [...children];
+    plain[index] = mapped;
+  }
+  return plain ?? children;
 }
 
 const OpenTuiBox = createOpenTuiPrimitive("box");
@@ -150,10 +175,32 @@ const OpenTuiScrollBox = forwardRef<unknown, OpenTuiPrimitiveProps>(function Ope
 });
 const OpenTuiInputPrimitive = createOpenTuiPrimitive("input");
 
-/** Pasted lines as one line: each break is a space, so `AAPL` over `MSFT` stays two words. */
-function joinPastedLines(text: string): string {
-  return text.replace(/^[\r\n]+|[\r\n]+$/g, "").replace(/[ \t]*[\r\n]+[ \t]*/g, " ").replace(/\t+/g, " ");
+/**
+ * A field's placeholder in the terminal's dim role: faint as well as in the
+ * placeholder colour, so an example value (`10`, `USD`) does not read as one
+ * typed, nor as the hint under the field in the same muted colour (review,
+ * 12 Nov 2026: AP's placeholders and hints were one grey). The desktop draws
+ * its placeholder inside a sunken field and keeps the colour alone.
+ */
+function dimPlaceholder(props: OpenTuiPrimitiveProps): OpenTuiPrimitiveProps {
+  const { placeholder, placeholderColor } = props as { placeholder?: unknown; placeholderColor?: unknown };
+  if (typeof placeholder !== "string" || placeholder.length === 0) return props;
+  // One styled text per placeholder and colour, so a re-render does not hand the field a new one to apply.
+  const key = `${typeof placeholderColor === "string" ? placeholderColor : ""}\u0000${placeholder}`;
+  let styled = dimPlaceholders.get(key);
+  if (!styled) {
+    if (dimPlaceholders.size >= 256) dimPlaceholders.clear();
+    styled = new OpenTuiStyledText([{
+      __isChunk: true,
+      text: withoutControlCharacters(placeholder),
+      fg: typeof placeholderColor === "string" ? RGBA.fromHex(placeholderColor) : undefined,
+      attributes: OpenTuiTextAttributes.DIM,
+    }] as any);
+    dimPlaceholders.set(key, styled);
+  }
+  return { ...props, placeholder: styled };
 }
+const dimPlaceholders = new Map<string, OpenTuiStyledText>();
 
 interface PasteEventLike {
   bytes: Uint8Array;
@@ -162,22 +209,26 @@ interface PasteEventLike {
 /**
  * A one-line field drops the line breaks of a paste, which fuses a pasted
  * column of symbols into one word; a browser's field turns each break into a
- * space. `joinPastedLines` does the same here, for the fields that read a list.
+ * space. `joinPastedLines` does the same here, for the fields that read a
+ * list, or with `"list"` keeps each line an entry (`PastedLines`).
  */
 const OpenTuiInput = forwardRef<unknown, OpenTuiPrimitiveProps>(function OpenTuiInput({ joinPastedLines: join, onPaste, ...props }, ref) {
   const handlePaste = typeof onPaste === "function" ? onPaste as (event: PasteEventLike) => void : null;
   return createElement(OpenTuiInputPrimitive, {
-    ...props,
+    ...dimPlaceholder(props),
     ref,
-    onPaste: join === true || handlePaste
+    onPaste: join === true || join === "list" || handlePaste
       ? (event: PasteEventLike) => {
-        if (join === true) event.bytes = new TextEncoder().encode(joinPastedLines(new TextDecoder().decode(event.bytes)));
+        if (join === true || join === "list") event.bytes = new TextEncoder().encode(joinPastedLines(new TextDecoder().decode(event.bytes), join));
         handlePaste?.(event);
       }
       : undefined,
   });
 });
-const OpenTuiTextarea = createOpenTuiPrimitive("textarea");
+const OpenTuiTextareaPrimitive = createOpenTuiPrimitive("textarea");
+const OpenTuiTextarea = forwardRef<unknown, OpenTuiPrimitiveProps>(function OpenTuiTextarea(props, ref) {
+  return createElement(OpenTuiTextareaPrimitive, { ...dimPlaceholder(props), ref });
+});
 const OpenTuiMediaSurface = createOpenTuiPrimitive("box");
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -205,7 +256,7 @@ const OpenTuiText = forwardRef<unknown, TextProps>(function OpenTuiText({ childr
     ref,
     content: mapTextContent(textProps.content),
     attributes: mapTextAttributes(props.attributes as number | undefined, props),
-  }, children as ReactNode);
+  }, plainTextChildren(children as ReactNode));
 });
 
 const OpenTuiSpan = forwardRef<unknown, TextProps>(function OpenTuiSpan({ children, ...props }, ref) {
@@ -213,15 +264,15 @@ const OpenTuiSpan = forwardRef<unknown, TextProps>(function OpenTuiSpan({ childr
     ...stripTextProps(props),
     ref,
     attributes: mapTextAttributes(props.attributes as number | undefined, props),
-  }, children as ReactNode);
+  }, plainTextChildren(children as ReactNode));
 });
 
 const OpenTuiStrong = forwardRef<unknown, TextProps>(function OpenTuiStrong({ children, ...props }, ref) {
-  return createElement("strong" as any, { ...stripTextProps(props), ref }, children as ReactNode);
+  return createElement("strong" as any, { ...stripTextProps(props), ref }, plainTextChildren(children as ReactNode));
 });
 
 const OpenTuiUnderline = forwardRef<unknown, TextProps>(function OpenTuiUnderline({ children, ...props }, ref) {
-  return createElement("u" as any, { ...stripTextProps(props), ref }, children as ReactNode);
+  return createElement("u" as any, { ...stripTextProps(props), ref }, plainTextChildren(children as ReactNode));
 });
 
 export const openTuiUiHost: UiHost = {

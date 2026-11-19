@@ -27,7 +27,7 @@ import type { GloomPlugin, PaneProps, PaneSettingField } from "../../../types/pl
 import type { TickerRecord } from "../../../types/ticker";
 import { t, tf } from "../../../i18n";
 import { priceColor } from "../../../theme/colors";
-import { clipToDisplayWidth, displayWidth, formatCompact, formatCurrency, formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, clipToDisplayWidth, displayWidth, formatCompact, formatCurrency, formatPercentRaw } from "../../../utils/format";
 import { isPlainKey } from "../../../utils/keyboard";
 import { useAppSelector, usePaneAppConfig, usePaneSettingValue, usePaneStateValue } from "../../../state/app/context";
 import { usePluginTickerActions } from "../../runtime";
@@ -70,6 +70,7 @@ import {
   type HeatmapSizeBy,
 } from "./portfolio";
 import { useAutoRefresh, useUpdatedAgo } from "../../../react/auto-refresh";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
 import {
   LIVE_STREAMING_QUICK_SETTING,
   useLiveStreamingSetting,
@@ -100,6 +101,7 @@ import {
   overlayScreenerQuoteEntries,
   resolveScreenerQuoteFeedStatus,
 } from "../../../market-data/quotes/screener-live-quotes";
+import { logFailure } from "../../../utils/log-failure";
 
 const NO_ASSETS: HeatmapBoardAsset[] = [];
 const NO_TARGETS: QuoteSubscriptionTarget[] = [];
@@ -143,11 +145,11 @@ function loadCollectionSnapshots(
     const instrument = instrumentFromTicker(ticker, ticker.metadata.ticker, instrumentOptions);
     return instrument ? [instrument] : [];
   });
-  if (instruments.length > 0) void coordinator.loadSnapshotsBatch(instruments, { forceRefresh }).catch(() => {});
+  if (instruments.length > 0) void coordinator.loadSnapshotsBatch(instruments, { forceRefresh }).catch(logFailure("market-heatmap", "Load heatmap collection snapshots failed"));
 }
 
 function formatMoneyCompact(value: number | null | undefined, currency: string): string {
-  if (value == null) return "—";
+  if (value == null) return MISSING_VALUE;
   if (currency.toUpperCase() === "USD") return `$${formatCompact(value)}`;
   return `${formatCompact(value)} ${currency}`;
 }
@@ -169,7 +171,7 @@ function sessionMark(asset: HeatmapBoardAsset): string | null {
 
 function formatMove(asset: HeatmapBoardAsset, change: number | null): string {
   const mark = sessionMark(asset);
-  return change == null ? "—" : mark ? `${formatPercentRaw(change)} ${mark}` : formatPercentRaw(change);
+  return change == null ? MISSING_VALUE : mark ? `${formatPercentRaw(change)} ${mark}` : formatPercentRaw(change);
 }
 
 /**
@@ -635,6 +637,13 @@ function MarketHeatmapPane({ focused, width, height }: PaneProps) {
   useAutoRefresh(board?.checkedAt ?? null, autoRefresh, { intervalMs: heatmapCheckIntervalMs(board) });
 
   usePaneStatusFooter({ registrationId: "market-heatmap-retained", stale: hasBoard && stale && !portfolioTab });
+  // Signed out or free, a market board is the delayed one, and the holdings' quotes are delayed ones.
+  const quoteDelay = useQuoteDelayFooter(
+    portfolioTab
+      ? Array.from(financials.values(), (entry) => entry?.quote)
+      : shownBoard ? [{ dataSource: shownBoard.access === "realtime" ? "live" as const : "delayed" as const }] : [],
+    "heatmap-delay",
+  );
   usePaneNoticeFooter({
     registrationId: "market-heatmap-omitted",
     notices: portfolioTab && portfolioBoard.omitted > 0
@@ -649,7 +658,7 @@ function MarketHeatmapPane({ focused, width, height }: PaneProps) {
       parts: [
         { text: selectedAsset.symbol, tone: "label" as const },
         {
-          text: heatmapMove(selectedAsset) == null ? "—" : formatPercentRaw(heatmapMove(selectedAsset)!),
+          text: heatmapMove(selectedAsset) == null ? MISSING_VALUE : formatPercentRaw(heatmapMove(selectedAsset)!),
           tone: "value" as const,
           color: heatmapMove(selectedAsset) == null ? undefined : priceColor(heatmapMove(selectedAsset)!),
           bold: true,
@@ -677,7 +686,7 @@ function MarketHeatmapPane({ focused, width, height }: PaneProps) {
     // The caption takes the room the rest leaves, with "loading" counted in
     // always, so a refresh never squeezes the row; a narrow pane drops its
     // least important parts rather than truncating every segment.
-    const others = [...selected, ...failed, ...feed];
+    const others = [...selected, ...failed, ...feed, ...(quoteDelay ? [quoteDelay] : [])];
     const room = width - others.reduce((total, segment) => total + footerSegmentWidth(segment) + 1, 0) - LOADING_FOOTER_WIDTH - 1;
     const caption = shownBoard ? heatmapBoardCaption(shownBoard, { now: Date.now(), checked, failed: failed.length > 0, maxWidth: room }) : null;
     return {
@@ -687,9 +696,10 @@ function MarketHeatmapPane({ focused, width, height }: PaneProps) {
         ...(caption ? [{ id: "board", parts: [{ text: caption, tone: "muted" as const }] }] : []),
         ...feed,
         ...loadingSegment,
+        ...(quoteDelay ? [quoteDelay] : []),
       ],
     };
-  }, [checked, feedStatus, hasBoard, loadError, loading, portfolioTab, selectedAsset, shownBoard, width]);
+  }, [checked, feedStatus, hasBoard, loadError, loading, portfolioTab, quoteDelay, selectedAsset, shownBoard, width]);
 
   return (
     <Box flexDirection="column" width={width} height={height}>

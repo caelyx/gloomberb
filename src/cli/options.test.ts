@@ -1,7 +1,22 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { mkdtemp, readFile, rm } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 import { parseCliGlobalArgs } from "./options";
 import { inferCliErrorOptions } from "./errors";
 import { cliPlainEnabled, plainByDefault, setCliColorEnabledOverride, setCliPlainOverride, setCliWidthOverride } from "../utils/cli-output";
+
+describe("--decimal", () => {
+  test("names a CSV's decimal mark for one run, and is refused without --csv", () => {
+    expect(parseCliGlobalArgs(["fn", "RV", "V", "--csv", "--decimal", "comma"]).options.decimal).toBe("comma");
+    expect(parseCliGlobalArgs(["quote", "V", "--csv", "--decimal=dot"]).options.decimal).toBe("dot");
+    expect(parseCliGlobalArgs(["fn", "RV", "V", "--csv", "--decimal", "comma"]).args).toEqual(["fn", "RV", "V"]);
+    expect(() => parseCliGlobalArgs(["quote", "V", "--csv", "--decimal", "semicolon"])).toThrow("--decimal takes comma or dot");
+    // Text and JSON keep the dot: the flag says what it is for rather than doing nothing.
+    expect(() => parseCliGlobalArgs(["quote", "V", "--decimal", "comma"])).toThrow("--decimal sets the decimal mark of a CSV export: add --csv");
+    expect(() => parseCliGlobalArgs(["quote", "V", "--json", "--decimal", "comma"])).toThrow("add --csv");
+  });
+});
 
 describe("parseCliGlobalArgs", () => {
   test("extracts global output and execution flags anywhere before --", () => {
@@ -93,6 +108,39 @@ describe("parseCliGlobalArgs", () => {
       expect(() => parseCliGlobalArgs(["quote", "AAPL", "--width", bad])).toThrow("--width must be a whole number of columns");
     }
     expect(() => parseCliGlobalArgs(["quote", "AAPL", "--width"])).toThrow("--width must be");
+  });
+
+  test("--output saves any command's export to a UTF-8 file; fn and shot keep their own, and a text report is refused", async () => {
+    // A redirect is UTF-16 in Windows PowerShell 5.1 (`financials MSFT --csv > msft.csv`); --output writes UTF-8 anywhere.
+    expect(parseCliGlobalArgs(["financials", "MSFT", "--csv", "--output", "msft.csv"])).toMatchObject({ args: ["financials", "MSFT"], options: { output: "msft.csv" } });
+    expect(parseCliGlobalArgs(["--out=q.json", "--json", "quote", "SAP"]).options.output).toBe("q.json");
+    for (const command of ["fn RV NVDA", "shot HP AAPL"]) {
+      const parsed = parseCliGlobalArgs([...command.split(" "), "--csv", "--output", "x.csv"]);
+      expect(parsed.options.output).toBeUndefined();
+      expect(parsed.args).toEqual([...command.split(" "), "--output", "x.csv"]);
+    }
+    expect(() => parseCliGlobalArgs(["quote", "NVDA", "--output", "x.txt"])).toThrow("--output writes an export: add --csv, --json or --ndjson");
+    expect(() => parseCliGlobalArgs(["quote", "NVDA", "--csv", "--output"])).toThrow("--output needs a file to write");
+
+    const folder = await mkdtemp(join(tmpdir(), "gloom-output-"));
+    const path = join(folder, "nested", "version.csv");
+    const printed: string[] = [];
+    const write = spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => { printed.push(String(chunk)); return true; });
+    try {
+      const { dispatchCli } = await import("./index");
+      await dispatchCli(["version", "--csv", "--output", path]);
+    } finally {
+      write.mockRestore();
+      setCliPlainOverride(null);
+      setCliColorEnabledOverride(null);
+      setCliWidthOverride(null);
+    }
+    // The rows are the file's, not stdout's, which says where they went.
+    const bytes = await readFile(path);
+    expect(bytes.subarray(0, 2).toString("hex")).not.toBe("fffe");
+    expect(bytes.toString("utf8")).toStartWith("version,bun,platform,arch,dataDir,export_notes\n");
+    expect(printed.join("")).toBe(`Saved ${path}\n`);
+    await rm(folder, { recursive: true, force: true });
   });
 
   test("takes --tail like --limit, and rejects bad counts or both together", () => {

@@ -2,11 +2,11 @@ import { useCallback, useMemo, useRef } from "react";
 import { isAccessDenied } from "../../../api-client/errors";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import type { AwardAggregate, AwardCompanyLeader, AwardFilter, AwardRow, AwardType, AwardsPayload } from "../../../api-client/awards";
-import { Badge, ChartTableHeader, DataTableView, PageStackView, PaneStatusBody, QueryBar, useChartTableSelection, usePagedRows,
+import { Badge, ChartTableHeader, DataTableView, Notice, PageStackView, PaneStatusBody, QueryBar, useChartTableSelection, usePagedRows,
   usePaneNoticeFooter, usePaneStatusFooter, usePaneTabs, useQueryBarSearch, useTableLoadMore, type DataTableColumn, type PaneHint, type QueryBarFilter } from "../../../components";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { formatCompactAxis } from "../../../components/chart-table";
-import { missingCell, shareCell, withoutQuietColumns } from "../shared/research-cells";
+import { missingCell, shareCell } from "../shared/research-cells";
 import { useAsyncResource, useAutoRefresh, usePaneSettingValue, usePluginAppActions, usePluginPaneState } from "../../../public/react";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
 import { useThemeColors } from "../../../theme/theme-context";
@@ -14,7 +14,8 @@ import type { PaneProps } from "../../../types/plugin";
 import { Box, Text, TextAttributes, useRendererHost, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { withCountryFlag } from "../../../components/ui/country-flag";
 import { publicTickerKey } from "../../../utils/exchanges";
-import { truncateToDisplayWidth } from "../../../utils/format";
+import { MISSING_VALUE, truncateToDisplayWidth } from "../../../utils/format";
+import { wrapTextLines } from "../../../utils/text-wrap";
 import { SignInWall } from "../cloud/auth-actions";
 import { CLOUD_PLAN_KEY, useCloudUpgradeAction } from "../shared/cloud-upgrade";
 import { useOpenDescription } from "../shared/open-description";
@@ -24,8 +25,9 @@ import { AwardDetail } from "./detail";
 import { useAwardAlerts } from "./alerts";
 import { AWARDS_UNAVAILABLE, fetchAwards, loadAward, loadAwards, validateAwards } from "./client";
 import { useAwardsEvidence } from "./evidence";
-import { AWARD_TABS, aggregateId, awardHistorySeries, awardPercent, awardPeriod, awardScope, awardsCoverageNotes, awardsPreviewNote, awardTab, awardTypeLabel, futureAwardDatesNote, money,
-  rankedAggregates } from "./model";
+import { AWARD_TABS, aggregateId, amountWithheld, awardHistorySeries, awardPercent, awardPeriod, awardsAmountNotices, awardsAttributions, awardScope, awardsCoverageNotes, awardsPreviewNote,
+  awardTab, awardTypeLabel, futureAwardDatesNote, money, rankedAggregates, WITHHELD_AMOUNT } from "./model";
+import { logFailure } from "../../../utils/log-failure";
 
 type Item = { kind: "award"; row: AwardRow } | { kind: "aggregate"; row: AwardAggregate } | { kind: "leader"; row: AwardCompanyLeader } | { kind: "locked"; id: string }
   | { kind: "section"; id: string; label: string; count: number } | { kind: "note"; id: string; text: string };
@@ -47,18 +49,20 @@ const rowDate = (row: AwardRow) => new Date(`${row.awardDate}T00:00:00Z`);
 const COLUMN = {
   date: { id: "date", label: "Date", width: 11, align: "left" }, recipient: { id: "recipient", label: "Awardee", width: 26, flexGrow: 1, align: "left" },
   ticker: { id: "ticker", label: "Ticker", width: 10, align: "left" }, currency: { id: "currency", label: "CCY", width: 5, align: "left" },
-  value: { id: "value", label: "Value", width: 11, align: "right" }, obligated: { id: "obligated", label: "Obligated", width: 11, align: "right" },
-  ceiling: { id: "ceiling", label: "Ceiling", width: 11, align: "right" }, agency: { id: "agency", label: "Agency", width: 24, align: "left" },
+  value: { id: "value", label: "Value", width: 11, align: "right", omitWhenEmpty: true }, obligated: { id: "obligated", label: "Obligated", width: 11, align: "right", omitWhenEmpty: true },
+  ceiling: { id: "ceiling", label: "Ceiling", width: 11, align: "right", omitWhenEmpty: true }, agency: { id: "agency", label: "Agency", width: 24, align: "left" },
   country: { id: "country", label: "Country", width: 8, align: "left" }, period: { id: "period", label: "Performance period", width: 24, align: "left" },
   title: { id: "title", label: "Contract", width: 36, flexGrow: 1, align: "left" },
   dateBasis: { id: "dateBasis", label: "Date basis", width: 14, align: "left" },
 } satisfies Record<string, DataTableColumn>;
 // Who won, what for, from whom and how much come first, so a 1280-wide pane
-// shows the contract; the period and date basis follow.
+// shows the contract; the period and date basis follow. The feed is newest
+// first across sources, so a screen of notices without an obligation or
+// ceiling (UK, EU, Japan) can sit above older awards that report one: each
+// amount shows while a row in view has it.
 const FEED_COLUMNS: DataTableColumn[] = [COLUMN.date, COLUMN.recipient, COLUMN.ticker, COLUMN.title, COLUMN.agency, COLUMN.currency,
-  COLUMN.value, COLUMN.obligated, COLUMN.ceiling, COLUMN.country, COLUMN.period, COLUMN.dateBasis];
-/** Amounts a source never reports (UK and EU notices have no obligation or ceiling) leave a column of dashes. */
-const QUIET_AMOUNTS = { obligated: ["--"], ceiling: ["--"] } as const;
+  ...[COLUMN.value, COLUMN.obligated, COLUMN.ceiling].map((column) => ({ ...column, omitWhenEmpty: "visible" as const })),
+  COLUMN.country, COLUMN.period, COLUMN.dateBasis];
 const EVENT_COLUMNS: DataTableColumn[] = [COLUMN.date, COLUMN.recipient, COLUMN.ticker,
   { id: "ratio", label: "% revenue", width: 11, align: "right" }, COLUMN.currency, { ...COLUMN.value, label: "Compared value" },
   { id: "revenue", label: "Annual revenue", width: 14, align: "right" }, { id: "basis", label: "Value basis", width: 13, align: "left" },
@@ -66,8 +70,8 @@ const EVENT_COLUMNS: DataTableColumn[] = [COLUMN.date, COLUMN.recipient, COLUMN.
 // The share leads the figures: concentration is what these views are for.
 const AGG_COLUMNS: DataTableColumn[] = [
   { id: "label", label: "Agency", width: 30, flexGrow: 1, align: "left" }, { id: "currency", label: "CCY", width: 5, align: "left" },
-  { id: "share", label: "Share %", width: 24, align: "right" }, { id: "obligated", label: "Obligated", width: 12, align: "right" }, { id: "value", label: "Value", width: 12, align: "right" },
-  { id: "ceiling", label: "Ceiling", width: 12, align: "right" },
+  { id: "share", label: "Share %", width: 24, align: "right" }, { ...COLUMN.obligated, width: 12 }, { ...COLUMN.value, width: 12 },
+  { ...COLUMN.ceiling, width: 12 },
   { id: "contracts", label: "Awards", width: 8, align: "right" },
   { id: "scope", label: "Scope", width: 27, align: "left" },
 ];
@@ -116,7 +120,7 @@ function AwardsView({ width, height, focused, symbol }: PaneProps & { symbol: st
   const [selectedId, setSelected] = usePluginPaneState<string | null>(`awards:selection:${tab}`, null);
   const search = useQueryBarSearch(), tickerSearch = useQueryBarSearch();
   const [snapshotSetting] = usePaneSettingValue<AwardsPayload | null>("awardsSnapshot", null);
-  const snapshot = useMemo(() => { try { return snapshotSetting ? validateAwards(snapshotSetting) : null; } catch { return null; } }, [snapshotSetting]);
+  const snapshot = useMemo(() => { try { return snapshotSetting ? validateAwards(snapshotSetting) : null; } catch (error) { return logFailure("awards.pane", "Validate awards snapshot failed", null)(error); } }, [snapshotSetting]);
   const filter = useMemo<AwardFilter>(() => ({ ticker: ticker.trim().toUpperCase() || undefined, query: query.trim() || undefined,
     jurisdiction: jurisdiction || undefined, currency: currency || undefined, source: source || undefined, awardType, agency: agency || undefined, sector: sector || undefined, parentId: parentId || undefined,
     from: parentId ? undefined : range === "all" ? from || undefined : new Date(Date.now() - Number(range) * 86_400_000).toISOString().slice(0, 10), to: parentId ? undefined : to || undefined, limit: 100,
@@ -190,11 +194,17 @@ function AwardsView({ width, height, focused, symbol }: PaneProps & { symbol: st
     // The same coverage notes `fn AWARDS` prints: what the awards shown may be missing.
     ...(data ? awardsCoverageNotes(data) : []),
     ...(loaded?.refreshError ? [loaded.refreshError] : []),
-    ...(data?.truncated && Object.values(data.truncated).some(Boolean) ? ["Some aggregate history exceeds this response's limit. Narrow the date range or scope."] : []),
+    ...(data?.truncated && Object.values(data.truncated).some(Boolean) ? ["Some breakdowns list only their first entries; narrow the date range or scope to see the rest."] : []),
     ...(tab === "company" && currencies.length > 1 && !currency ? [`Chart in ${chartCurrency}; select a currency to inspect other obligations.`] : []),
     ...(tab === "company" && scopes.length > 1 && !source ? [`Chart covers ${awardScope(chartSource).toLowerCase()}; select a scope to inspect other contracts.`] : []),
     ...(data && (tab === "feed" || tab === "company") ? [futureAwardDatesNote(rows, data.generatedAt)].filter((note): note is string => !!note) : []),
   ] });
+  // A licence's statement under the awards it covers, while any is shown.
+  const shown = tab === "company" && !ticker ? [] : items;
+  const attribution = awardsAttributions(data, shown.flatMap((item) => item.kind === "award" || item.kind === "aggregate" || item.kind === "leader" ? [item.row.source] : [])).join(" ");
+  const attributionRows = attribution ? wrapTextLines(attribution, Math.max(1, width - 2)).length : 0;
+  const openAttribution = openRow ? awardsAttributions(data, [openRow.source]).join(" ") : "";
+  const openAmountNotice = openRow ? awardsAmountNotices(data, [openRow.source]).join(" ") : "";
   const { strip, rows: tabRows } = usePaneTabs(!denied ? { tabs: [...AWARD_TABS], activeValue: tab, onSelect: (value) => { setTab(value); setOpen(null); }, focused, dense: true } : null);
   const bodyHeight = Math.max(3, height - tabRows);
   const filters: QueryBarFilter[] = [
@@ -212,7 +222,7 @@ function AwardsView({ width, height, focused, symbol }: PaneProps & { symbol: st
     view={tab === "sectors" ? { value: leaderView, options: [{ value: "companies", label: "Companies" }, { value: "sectors", label: "Sectors" }], onChange: setLeaderView } : undefined} />;
   const columns = showLeaders ? LEADER_COLUMNS.filter((column) => column.id !== "scope" && column.id !== "currency")
     : aggregated ? AGG_COLUMNS.filter((column) => column.id !== "scope" && column.id !== "currency").map((column) => column.id === "label" ? { ...column, label: tab === "agencies" ? "Agency" : "Sector" } : column)
-    : tab === "events" ? EVENT_COLUMNS : withoutQuietColumns(FEED_COLUMNS, rows, (row, id) => (id === "obligated" ? row.obligatedAmount : row.ceilingAmount) ?? "--", QUIET_AMOUNTS);
+    : tab === "events" ? EVENT_COLUMNS : FEED_COLUMNS;
   const maxShare = Math.max(0, ...items.map((item) => item.kind === "aggregate" || item.kind === "leader" ? item.row.sharePercent ?? 0 : 0));
   // A preview's cohorts are the latest of any company, so they never chart as the ticker's.
   const charted = data?.locked ? [] : series;
@@ -224,7 +234,7 @@ function AwardsView({ width, height, focused, symbol }: PaneProps & { symbol: st
   return <Box width={width} height={height} flexDirection="column">
     {strip}
     <PageStackView focused={focused} detailOpen={!!openId} onBack={() => setOpen(null)} detailTitle={openRow ? truncateToDisplayWidth(openRow.title, Math.max(20, width - 16)) : "Award evidence"}
-        detailContent={openRow ? <AwardDetail key={openRow.id} row={openRow} accessKey={accessKey} width={width} height={bodyHeight - 1} focused={focused} openAward={setOpen} openUpgrade={openUpgrade}
+        detailContent={openRow ? <AwardDetail key={openRow.id} row={openRow} accessKey={accessKey} width={width} height={bodyHeight - 1} focused={focused} openAward={setOpen} openUpgrade={openUpgrade} attribution={openAttribution} amountNotice={openAmountNotice}
           openChildren={(type) => { setParentId(openRow.id); setTicker(""); setSource(""); setQuery(""); setAgency(""); setSector(""); setCurrency(""); setJurisdiction(""); setRange("all"); setType(type); setOpen(null); setTab("feed"); }} />
           : <PaneStatusBody loading={detail.loading} error={detail.error} empty={!detail.loading && !detail.error} emptyTitle="Award no longer available." subject="award evidence" />}
         rootContent={<DataTableView<Item> columns={columns} items={tab === "company" && !ticker ? [] : items} rootWidth={width} rootHeight={bodyHeight}
@@ -232,7 +242,7 @@ function AwardsView({ width, height, focused, symbol }: PaneProps & { symbol: st
           status={data ? undefined : { loading: paged.loading, error: failed?.message !== AWARDS_UNAVAILABLE ? failed?.message : null,
             empty: failed?.message === AWARDS_UNAVAILABLE, emptyTitle: AWARDS_UNAVAILABLE, subject: "government awards" }}
           focused={focused && !openId && !search.active && !tickerSearch.active} scrollRef={tableScrollRef} onBodyScrollActivity={loadMore}
-          rootBefore={<ChartTableHeader width={width} height={bodyHeight} tableRows={items.length} tableColumns={columns} query={queryBar} chart={data ? chart : null}
+          rootBefore={<ChartTableHeader width={width} height={bodyHeight - attributionRows} tableRows={items.length} tableColumns={columns} query={queryBar} chart={data ? chart : null}
             figures={tab === "company" && ticker && latest ? [{ id: "total", label: `Obligated ${chartCurrency}`, value: money(latest.cumulativeObligatedAmount) },
               { id: "period", label: "Latest cohort", value: latest.month.slice(0, 7), detail: awardScope(chartSource) }] : undefined} />}
           selection={{ kind: "id", selectedId: selected ? itemId(selected) : null, getId: itemId, onChange: setSelected }} getItemKey={itemId}
@@ -254,7 +264,9 @@ function AwardsView({ width, height, focused, symbol }: PaneProps & { symbol: st
             if (column.id === "currency") return { text: row.currency, color: colors.textDim };
             if (["value", "obligated", "ceiling"].includes(column.id)) {
               const value = column.id === "value" ? tab === "events" && item.kind === "award" ? item.row.revenueComparison?.awardAmount : row.awardAmount : column.id === "obligated" ? row.obligatedAmount : row.ceilingAmount;
-              return value == null ? missingCell(colors) : { text: money(value), value, color: column.id === "obligated" || column.id === "value" ? colors.textBright : colors.text };
+              if (value == null) return column.id === "value" && item.kind === "award" && tab !== "events" && amountWithheld(item.row)
+                ? { text: WITHHELD_AMOUNT, value: null, color: colors.textMuted } : missingCell(colors);
+              return { text: money(value), value, color: column.id === "obligated" || column.id === "value" ? colors.textBright : colors.text };
             }
             if (item.kind === "aggregate" || item.kind === "leader") {
               if (column.id === "label") return { text: item.row.label, color: colors.textBright };
@@ -278,9 +290,10 @@ function AwardsView({ width, height, focused, symbol }: PaneProps & { symbol: st
             if (column.id === "ratio") return { text: awardPercent(award), value: award.revenueComparison?.percent ?? null, color: colors.warning, attributes: TextAttributes.BOLD, keepColorWhenSelected: true };
             if (column.id === "revenue") return { text: money(award.revenueComparison?.annualRevenue), value: award.revenueComparison?.annualRevenue ?? null };
             if (column.id === "basis") return { text: award.revenueComparison?.basis === "obligated" ? "Obligated" : "Award value", color: colors.textDim };
-            return { text: award.revenueComparison?.periodEnd ?? "--", color: colors.textDim };
+            return { text: award.revenueComparison?.periodEnd ?? MISSING_VALUE, color: colors.textDim };
           }}
           emptyStateTitle={tab === "company" && !ticker ? "Enter a company ticker." : tab === "events" ? "No revenue-comparable awards in this scope." : "No awards match these filters."}
+          rootAfter={attribution ? <Box paddingX={1} height={attributionRows} flexShrink={0}><Notice tone="muted">{attribution}</Notice></Box> : undefined}
           bodyAfter={data?.locked && desktop ? <LockedOverlay rows={3} text="Upgrade for complete awards and history" onPress={openUpgrade} /> : undefined} />} />
   </Box>;
 }

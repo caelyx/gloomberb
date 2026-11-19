@@ -1,6 +1,22 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { describe, expect, test } from "bun:test";
 import type { AnalystResearchData } from "../../../types/financials";
-import { buildEventRows, eventSourceNotice, formatEventMetric, type EventFinancials } from "./event-model";
+import { buildEventRows, eventSourceNotice, formatEventMetric, sourceErrorText, type EventFinancials } from "./event-model";
+import { NOT_MEANINGFUL_TONE } from "../../../utils/growth";
+import { fiscalPeriodText } from "../earnings/fiscal-quarter";
+
+test("a statement ending in the following month does not rename the earnings calendar's quarter", () => {
+  const rows = buildEventRows({ symbol: "TEST", dividends: [], splits: [], earnings: [
+    { date: "2025-11-19", fiscalPeriod: "2025-10", epsActual: 1.5 },
+    { date: "2026-11-18", fiscalPeriod: "2026-10", epsEstimate: 1.6 },
+  ] }, null, { quarterlyStatements: [{ date: "2025-11-01", eps: 1.5, totalRevenue: 100 }] }, "USD");
+  const earnings = rows.filter((row) => row.status === "Earnings").sort((left, right) => left.date.localeCompare(right.date));
+  expect(earnings.map((row) => row.period)).toEqual([fiscalPeriodText("2025-10"), fiscalPeriodText("2026-10")]);
+  expect(earnings[0]?.fiscalPeriodEnd).toBe("2025-11-01");
+  expect(earnings.map((row) => row.period)).toEqual(["Oct 2025", "Oct 2026"]);
+  expect(fiscalPeriodText("2026-10", { fiscalYear: 2027, fiscalQuarter: 3 })).toBe("Q3 FY2027");
+  expect(fiscalPeriodText(null)).toBe(MISSING_VALUE);
+});
 
 test("ADR reported EPS and company revenue keep their distinct currencies", () => {
   const rows = buildEventRows({ symbol: "TSM", currency: "USD", dividends: [], splits: [],
@@ -17,7 +33,7 @@ test("pending RIVN earnings show consensus without borrowing prior-quarter actua
   const [row] = buildEventRows({ symbol: "RIVN", currency: "USD", dividends: [], splits: [],
     earnings: [{ date: "2026-11-03", dateType: "announcement", epsEstimate: -0.73, currency: "USD", time: "AMC" }],
   }, null, { quarterlyStatements: [{ date: "2026-06-30", currency: "USD", eps: -0.63, totalRevenue: 1_658_000_000 }] }, "USD");
-  expect(row).toMatchObject({ date: "2026-11-03", period: "-", reportTime: "AMC", detail: "Pending, AMC", qEps: -0.73, epsCurrency: "USD" });
+  expect(row).toMatchObject({ date: "2026-11-03", period: MISSING_VALUE, reportTime: "AMC", detail: "Pending, AMC", qEps: -0.73, epsCurrency: "USD" });
   expect(row?.qRevenue).toBeUndefined();
   expect(row?.revenueCurrency).toBeUndefined();
 });
@@ -107,6 +123,13 @@ test("an upcoming report takes the currency its reported quarters agree on", () 
     .find((row) => row.earningsState === "pending");
   expect(pending(earnings)?.epsCurrency).toBe("USD");
   expect(pending([...earnings, { date: "2026-03-31", dateType: "fiscal-period-end", epsActual: 4.27, currency: "EUR" }])?.epsCurrency).toBeUndefined();
+  // An unlabelled old quarter takes it only where the company's own EPS is in it too.
+  const old = [...earnings, { date: "2023-11-02", epsActual: 1.46 }];
+  const oldCurrency = (financials: EventFinancials | null) => buildEventRows({ symbol: "MSFT", currency: "USD", dividends: [], splits: [], earnings: old },
+    null, financials, "USD").find((row) => row.date === "2023-11-02")?.epsCurrency;
+  expect(oldCurrency({ quarterlyStatements: [], financialCurrency: "USD", fundamentals: { epsCurrency: "USD" } })).toBe("USD");
+  expect(oldCurrency({ quarterlyStatements: [], financialCurrency: "AUD", fundamentals: { epsCurrency: "AUD" } })).toBeUndefined();
+  expect(oldCurrency(null)).toBeUndefined();
 });
 
 test("partial and stale corporate data are not described as an empty event history", () => {
@@ -114,6 +137,25 @@ test("partial and stale corporate data are not described as an empty event histo
     actions: { symbol: "RIVN", dividends: [], splits: [], earnings: [], coverage: { earnings: "unavailable", dividends: "available" }, stale: true },
   });
   expect(notice).toEqual({ text: "Unavailable: earnings   Corporate actions stale", failed: true });
+});
+
+test("a failed source reads as one short line in words, never its reason code (AIOK)", () => {
+  // Declared, payable ahead of today whenever the test runs.
+  const ahead = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
+  const actions = { symbol: "AIOK", dividends: [], splits: [], earnings: [], coverage: { earnings: "unavailable" as const, dividends: "available" as const },
+    declaredDividends: [{ exDate: ahead(30), amount: 3.5, declarationDate: ahead(-5), recordDate: ahead(5), payDate: ahead(28), special: true as const }] };
+  const state = { variant: "corporate-actions" as const, symbol: "AIOK", actionsError: null, estimates: null, actions };
+  expect(eventSourceNotice({ ...state, estimatesError: "UPSTREAM_ERROR" })).toEqual({
+    text: "Unavailable: earnings, analyst estimates (the source did not answer)", failed: true });
+  expect(eventSourceNotice({ ...state, actions: { ...actions, coverage: {} }, estimatesError: "TIMEOUT" })).toEqual({
+    text: "Analyst estimates unavailable: the source timed out", failed: true });
+  expect(eventSourceNotice({ ...state, actions: null, actionsError: "UPSTREAM_ERROR", estimatesError: null })?.text).toBe(
+    "Corporate actions unavailable: the source did not answer");
+  // A sentence stands as it is.
+  expect(sourceErrorText("Analyst source timed out")).toBe("Analyst source timed out");
+  // The declared special dividend is a row of its own while the rest failed.
+  const rows = buildEventRows(actions, null, null, "USD");
+  expect(rows).toEqual([expect.objectContaining({ id: `div-declared:${ahead(30)}`, date: ahead(30), detail: `Declared special, payable ${ahead(28)}`, value: "$3.50" })]);
 });
 
 test("EE ignores dividends, adjustments and pending announcements when assessing reported earnings coverage", () => {
@@ -156,7 +198,7 @@ test("a resolved quarter shows ERN's figure, basis and fiscal quarter, and a pen
   ] }, null, { financialCurrency: "USD", quarterlyStatements: [["2025-09-30", -0.22], ["2025-12-31", -0.89], ["2026-03-31", -1.4], ["2026-06-30", -1.14]]
     .map(([date, eps]) => ({ date: date as string, eps: eps as number, totalRevenue: 2e9 })) }, "USD");
   expect(rows.find((row) => row.date === "2026-08-11")).toMatchObject({ period: "Jun 2026", qEps: -1.32, qRevenue: 2e9, epsBasis: "adjusted",
-    detail: "adj, +0.20 vs est", value: "+13.16%", tone: "positive", fiscalPeriodEnd: "2026-06-30" });
+    detail: "adj, +0.20 vs est", value: "N/M", tone: NOT_MEANINGFUL_TONE, fiscalPeriodEnd: "2026-06-30", surpriseNotMeaningful: true });
   expect(rows.find((row) => row.date === "2026-11-09")).toMatchObject({ earningsState: "pending", qEps: -1.52697, epsAnalysts: 18,
     dateStatus: "projected", detail: "projected, 18 analysts" });
   // With no trailing figure served, the TTM row is the statements' diluted EPS; all four quarters above it
@@ -176,7 +218,7 @@ test("an earnings row's period is its fiscal quarter, never the time of day; a r
   expect(rows.find((row) => row.date === "2027-01-14"))
     .toMatchObject({ period: "Dec 2026", reportTime: "Pre Market", detail: "confirmed, Pre Market, 17 analysts" });
   expect(rows.find((row) => row.date === "2026-10-13")).toMatchObject({ period: "Sep 2026", reportTime: "Pre Market" });
-  expect(rows.find((row) => row.date === "2017-07-14")).toMatchObject({ period: "-", reportTime: "After Hours" });
+  expect(rows.find((row) => row.date === "2017-07-14")).toMatchObject({ period: MISSING_VALUE, reportTime: "After Hours" });
   expect(rows.find((row) => row.date === "2017-07-14")?.detail).not.toContain("After Hours");
 });
 
@@ -240,11 +282,47 @@ test("a press release's figure reads provisional until the calendar's replaces i
   expect(settled?.epsProvisional).toBeUndefined();
 });
 
-test("a beat against a negative estimate reads as a beat", () => {
+test("a beat against a negative estimate: its surprise N/M, in N/M's tone, and the difference says it beat", () => {
   const [row] = buildEventRows({ symbol: "CRWV", dividends: [], splits: [], earnings: [
     { date: "2026-08-11", dateType: "announcement", epsEstimate: -1.47, epsActual: -1.14, difference: 0.33, surprisePercent: -22.45 },
   ] }, null, null, "USD");
-  expect(row).toMatchObject({ surprisePercent: 22.45, value: "+22.45%", tone: "positive", detail: "+0.33 vs est" });
+  // A loss narrower than expected is no percentage of the loss expected: the source's -22.45% is not shown either.
+  expect(row).toMatchObject({ value: "N/M", tone: NOT_MEANINGFUL_TONE, detail: "+0.33 vs est", surpriseNotMeaningful: true });
+  expect(row!.surprisePercent).toBeUndefined();
+  const [miss] = buildEventRows({ symbol: "CRWV", dividends: [], splits: [], earnings: [
+    { date: "2026-05-07", dateType: "announcement", epsEstimate: -1.17, epsActual: -1.38, difference: -0.21 },
+  ] }, null, null, "USD");
+  expect(miss).toMatchObject({ value: "N/M", tone: NOT_MEANINGFUL_TONE, detail: "-0.21 vs est" });
+  const [zero] = buildEventRows({ symbol: "X", dividends: [], splits: [], earnings: [
+    { date: "2026-05-07", dateType: "announcement", epsEstimate: 0, epsActual: 0.02 },
+  ] }, null, null, "USD");
+  expect(zero).toMatchObject({ value: "N/M", tone: NOT_MEANINGFUL_TONE });
+  const [positive] = buildEventRows({ symbol: "X", dividends: [], splits: [], earnings: [
+    { date: "2026-05-07", dateType: "announcement", epsEstimate: 0.5, epsActual: 0.55 },
+  ] }, null, null, "USD");
+  expect(positive).toMatchObject({ surprisePercent: 10, value: "+10.00%", tone: "positive" });
+});
+
+test("an estimate's growth off a year-ago loss or zero is N/M, whatever the source worked out", () => {
+  const rows = buildEventRows(null, {
+    symbol: "CRWV",
+    recommendations: [],
+    ratings: [],
+    earningsEstimates: [
+      // A year-ago loss of 0.40 against an estimated profit of 0.10: the source's +125% is no growth of the loss.
+      { date: "2027-03-31", period: "current_quarter", average: 0.1, yearAgo: -0.4, growth: 1.25, analysts: 12 },
+      { date: "2027-12-31", period: "next_year", average: 1.2, yearAgo: 0, analysts: 14 },
+      { date: "2026-12-31", period: "current_year", average: 0.8, yearAgo: 0.5, growth: 0.6, analysts: 15 },
+    ],
+    revenueEstimates: [],
+  }, null, "USD");
+  const quarter = rows.find((row) => row.status === "Q Est");
+  expect(quarter).toMatchObject({ value: "N/M", tone: NOT_MEANINGFUL_TONE, estimateGrowthMetric: "eps", estimateGrowthNotMeaningful: true });
+  expect(quarter?.estimateGrowth).toBeUndefined();
+  const years = rows.filter((row) => row.status === "FY Est");
+  expect(years.find((row) => row.annualEps === 1.2)).toMatchObject({ value: "N/M", estimateGrowthNotMeaningful: true });
+  expect(years.find((row) => row.annualEps === 0.8)).toMatchObject({ value: "+60.00%", tone: "positive", estimateGrowth: 0.6 });
+  expect(years.find((row) => row.annualEps === 0.8)?.estimateGrowthNotMeaningful).toBeUndefined();
 });
 
 test("missing or ambiguous fiscal periods and announcements cannot borrow a previous quarter's revenue", () => {
@@ -267,6 +345,11 @@ test("spinoff adjustment factors are not presented as verified share splits", ()
   expect(row).toMatchObject({ status: "Factor", value: "1253:1000", adjustmentFactor: 1.253,
     detail: "Split/adjustment", providerDescription: "1253:1000 split" });
   expect(row?.qEps).toBeUndefined();
+  // DBS's 1-for-10 bonus issue of 2024 is a factor of whole share counts: a split, in its terms.
+  const [bonus] = buildEventRows({ symbol: "D05", earnings: [], dividends: [],
+    splits: [{ date: "2024-04-22", fromFactor: 10, toFactor: 11, ratio: 1.1, description: "11:10" }],
+  }, null, null, "SGD");
+  expect(bonus).toMatchObject({ status: "Split", value: "11:10", detail: "11-for-10, 1 new share for every 10 held" });
 
 });
 
@@ -436,7 +519,8 @@ describe("event rows", () => {
     expect(rows).toMatchObject([
       { id: "div:2026-02-10", status: "Dividend", value: "$0.26" },
       { id: "earn:2026-01-30", status: "Earnings" },
-      { id: "split:2025-12-01:4-for-1 split", status: "Factor", value: "4:1" },
+      // Whole share counts are a split, in its terms.
+      { id: "split:2025-12-01:4-for-1 split", status: "Split", value: "4:1", detail: "4-for-1" },
     ]);
     expect(rows[0]?.qEps).toBeUndefined();
     expect(rows[0]?.annualEps).toBeUndefined();
@@ -487,4 +571,15 @@ describe("event source notice", () => {
       failed: false,
     });
   });
+});
+
+test("a fund lists its distributions but no earnings or estimates, whatever a feed sends for its symbol", () => {
+  const actions = { symbol: "SPY", currency: "USD", splits: [], dividends: [{ exDate: "2026-09-18", amount: 1.889 }],
+    earnings: [{ date: "2026-07-29", dateType: "announcement" as const, epsActual: 1.35, epsEstimate: 1.19 }] };
+  const estimates = { symbol: "SPY", recommendations: [], ratings: [], revenueEstimates: [],
+    earningsEstimates: [{ date: "2027-03-31", period: "next quarter", average: 4, growth: 0.25, currency: "USD" }] };
+  const statuses = (financials: EventFinancials) => buildEventRows(actions, estimates, financials, "USD").map((row) => row.status);
+  expect(statuses({ quarterlyStatements: [], quote: { currency: "USD", instrumentType: "ETF" } })).toEqual(["Dividend"]);
+  expect(statuses({ quarterlyStatements: [], quoteMetadata: { instrumentType: "ETF" } })).toEqual(["Dividend"]);
+  expect(statuses({ quarterlyStatements: [], quote: { currency: "USD", instrumentType: "EQUITY" } })).toEqual(expect.arrayContaining(["Earnings", "Q Est"]));
 });

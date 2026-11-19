@@ -1,31 +1,42 @@
-import { Box, Span, Text, TextAttributes, useUiCapabilities } from "../../../../ui";
+import { Box, Span, Text, TextAttributes, useShortcutLabel, useUiCapabilities } from "../../../../ui";
 import { useRef } from "react";
 import { colors, blendHex } from "../../../../theme/colors";
 import { t } from "../../../../i18n";
 import { ShortcutHint } from "../../../ui/shortcut-hint";
+import { keyHintWords } from "../../../ui/key-hint-words";
 import { Button } from "../../../ui/button";
 import { ChoiceDialog } from "../../../ui/choice-dialog";
 import { Icon, IconButton } from "../../../ui/icon";
-import { useRemoteUiNode } from "../../../../remote/semantic-tree";
+import { RemoteUiScope, useRemoteUiNode } from "../../../../remote/semantic-tree";
 import { useOptionalDialog, type PromptContext } from "../../../../ui/dialog";
 import { nativePaneFooterRows } from "../sizing";
 import {
   EMPTY_FOOTER,
+  desktopHintMetrics,
+  PANE_FOOTER_SEPARATOR,
   fitPaneFooterInfo,
+  separatesPaneFooterSegments,
   hasPaneFooterContent,
   layoutPaneFooterHintRow,
+  paneFooterInfoWidth,
+  paneHintTitle,
+  terminalHintMetrics,
   totalHintsWidth,
   type CombinedPaneFooter,
   type PaneFooterPart,
   type PaneFooterSegment,
   type PaneHint,
 } from "./model";
+import { logFailure } from "../../../../utils/log-failure";
 
 export {
+  ageFooterSegment,
+  companyDataFooterSegment,
   datesPaneData,
   DELAYED_SEGMENT,
   delayedFooterSegment,
   hasPaneFooterContent,
+  savedCopyFooterInfo,
   savedCopyFooterSegment,
   splitDelayedStatus,
   type CombinedPaneFooter,
@@ -40,6 +51,9 @@ export {
   usePaneFooter,
   usePaneMenuItems,
 } from "./registration";
+
+/** Terminal: blank cells between a framed footer's last hint and the frame's end. */
+const FOOTER_FRAME_GAP = 1;
 
 function footerToneColor(part: PaneFooterPart): string {
   if (part.color) return part.color;
@@ -76,10 +90,11 @@ function terminalSegmentKey(segment: PaneFooterSegment, focused: boolean): strin
     : "";
 }
 
-/** Columns an icon segment keeps when hints crowd the footer. */
+/** Columns an icon segment keeps when hints crowd the footer: in the terminal, what it draws (`◷15m`, `⚠[!]`). */
 function iconSegmentReserve(segment: PaneFooterSegment, focused: boolean, nativePaneChrome: boolean): number {
   if (!segment.icon) return 0;
-  return nativePaneChrome ? 3 : Math.max(3, 1 + terminalSegmentKey(segment, focused).length);
+  if (nativePaneChrome) return 3;
+  return Math.max(3, paneFooterInfoWidth([segment]) + terminalSegmentKey(segment, focused).length);
 }
 
 function SegmentView({ segment, focused }: { segment: PaneFooterSegment; focused: boolean }) {
@@ -151,6 +166,8 @@ function SegmentView({ segment, focused }: { segment: PaneFooterSegment; focused
       onMouseDown={interactive ? startSegmentPress : undefined}
       onMouseUp={interactive ? finishSegmentPress : undefined}
       {...(interactive ? { "data-gloom-interactive": "true" } : {})}
+      // A capture reads the pane's state from its body: the notes about its data are not that state.
+      {...(!segment.icon && segment.notes?.length ? { "data-gloom-role": "pane-footer-notes" } : {})}
     >
       {[
         ...segment.parts.map((part, index) => (
@@ -182,6 +199,7 @@ function usePaneHintRemoteNode(hint: PaneHint) {
       id: hint.id,
       key: hint.key,
       label: hint.label,
+      ...(hint.remoteScope ? { scope: hint.remoteScope } : {}),
     },
   });
 }
@@ -192,6 +210,7 @@ function HintView({ hint, prefixSpace }: { hint: PaneHint; prefixSpace: boolean 
     <ShortcutHint
       hotkey={hint.key}
       label={hint.label}
+      words={keyHintWords(hint)}
       prefix={prefixSpace ? " " : ""}
       disabled={hint.disabled}
       dataGloomRole="pane-hint"
@@ -200,32 +219,44 @@ function HintView({ hint, prefixSpace }: { hint: PaneHint; prefixSpace: boolean 
   );
 }
 
+/** What sets a footer's hints apart on the desktop and the web: the gap a dialog's hints keep. */
+const DESKTOP_HINT_GAP_STYLE = { marginLeft: "var(--gloom-space-md)" };
+
 /** A hint behind More stays a remote control target, as it was when it only clipped. */
 function OverflowHintNode({ hint }: { hint: PaneHint }) {
   usePaneHintRemoteNode(hint);
   return null;
 }
 
-function FooterOverflowMenu({ hints, width, label }: { hints: PaneHint[]; width: number; label: string }) {
+function FooterOverflowMenu({ hints, width, label, nativePaneChrome }: { hints: PaneHint[]; width: number; label: string; nativePaneChrome: boolean }) {
   const dialog = useOptionalDialog();
+  const keyLabel = useShortcutLabel();
   const open = () => {
     if (!dialog || hints.length === 0) return;
+    // A list that holds a prompt's answers (Ask Gloom's Approve) is that
+    // prompt's as a whole, so no assistant's UI call picks from it.
+    const scope = hints.find((hint) => hint.remoteScope)?.remoteScope;
     void dialog.prompt<string>({
       closeOnClickOutside: true,
-      content: (context: PromptContext<string>) => (
-        <ChoiceDialog
-          {...context}
-          title={t("Pane actions")}
-          choices={hints.map((hint, index) => ({
-            id: String(index),
-            label: `[${hint.key}]${hint.label}`,
-            disabled: !hint.onPress,
-          }))}
-        />
-      ),
+      content: (context: PromptContext<string>) => {
+        const choices = (
+          <ChoiceDialog
+            {...context}
+            title={t("Pane actions")}
+            // The desktop names each action as its menu does, with the key after it, never inside the word.
+            choices={hints.map((hint, index) => ({
+              id: String(index),
+              label: nativePaneChrome ? paneHintTitle(hint) : `[${keyLabel(hint.key)}]${hint.label}`,
+              ...(nativePaneChrome ? { detail: keyLabel(hint.key) } : {}),
+              disabled: !hint.onPress,
+            }))}
+          />
+        );
+        return scope ? <RemoteUiScope scope={scope}>{choices}</RemoteUiScope> : choices;
+      },
     }).then((selected) => {
       if (selected) hints[Number(selected)]?.onPress?.();
-    }, () => {});
+    }, logFailure("layout.pane-footer", "Open pane actions menu failed"));
   };
   return (
     <>
@@ -241,12 +272,15 @@ function FooterContent({
   width,
   showBackground = true,
   nativePaneChrome = false,
+  trailingGap = 0,
 }: {
   footer: CombinedPaneFooter;
   focused: boolean;
   width?: number;
   showBackground?: boolean;
   nativePaneChrome?: boolean;
+  /** Blank cells of the band after the hints, past `width`, so they never touch the frame. */
+  trailingGap?: number;
 }) {
   const hasInfo = footer.info.length > 0;
   const actionableHints = focused ? footer.hints.filter((hint) => !hint.disabled) : [];
@@ -254,19 +288,25 @@ function FooterContent({
   const backgroundColor = showBackground ? blendHex(colors.bg, dividerColor, focused ? 0.12 : 0.06) : undefined;
   const availableWidth = width && width > 0 ? Math.floor(width) : null;
   const iconReserve = footer.info.reduce((total, segment) => total + iconSegmentReserve(segment, focused, nativePaneChrome), 0);
+  // Measured as the keys show: `[⌃S]` on a Mac takes fewer cells than `[Ctrl+S]`, and
+  // on the desktop and the web as a keycap and the whole words, on the live grid.
+  const keyLabel = useShortcutLabel();
+  const { cellWidthPx = 8 } = useUiCapabilities();
+  const metrics = nativePaneChrome ? desktopHintMetrics(cellWidthPx) : terminalHintMetrics(keyLabel);
+  // A segment with shorter forms takes the longest that fits beside the hints, gaps and terminal keys included.
+  const keysWidth = nativePaneChrome ? 0 : footer.info.reduce((total, segment) => total + terminalSegmentKey(segment, focused).length, 0);
   const row = availableWidth !== null
-    ? layoutPaneFooterHintRow({ ...footer, hints: actionableHints }, availableWidth, iconReserve)
+    ? layoutPaneFooterHintRow({ ...footer, hints: actionableHints }, availableWidth, iconReserve, metrics, { terminal: !nativePaneChrome, keysWidth })
     : null;
   const shownHints = row?.hints ?? actionableHints;
   const overflowHints = row?.overflow ?? [];
   const hasHints = shownHints.length > 0 || overflowHints.length > 0;
-  const hintsWidth = hasHints ? (row?.hintsWidth ?? totalHintsWidth(shownHints)) : 0;
+  const hintsWidth = hasHints ? (row?.hintsWidth ?? totalHintsWidth(shownHints, metrics)) : 0;
   const infoWidth = availableWidth !== null && hasInfo
     ? (row?.infoWidth ?? Math.max(0, availableWidth - hintsWidth))
     : undefined;
-  // A segment with shorter forms takes the longest that fits beside the hints, gaps and terminal keys included.
-  const keysWidth = nativePaneChrome ? 0 : footer.info.reduce((total, segment) => total + terminalSegmentKey(segment, focused).length, 0);
-  const info = infoWidth != null ? fitPaneFooterInfo(footer.info, infoWidth - keysWidth, { besideHints: hasHints }) : footer.info;
+  const info = infoWidth != null ? fitPaneFooterInfo(footer.info, infoWidth - keysWidth, { besideHints: hasHints, terminal: !nativePaneChrome }) : footer.info;
+  const lastTextIndex = info.findLastIndex((segment) => !segment.icon);
 
   if (!hasInfo && !hasHints) {
     return <Box flexGrow={1} height={1} />;
@@ -282,6 +322,7 @@ function FooterContent({
       flexDirection="row"
       justifyContent="space-between"
       overflow="hidden"
+      paddingRight={trailingGap > 0 ? trailingGap : undefined}
       backgroundColor={backgroundColor}
     >
       {hasInfo && (
@@ -291,12 +332,24 @@ function FooterContent({
           flexShrink={1}
           {...(infoWidth != null ? { width: infoWidth } : {})}
         >
-          {info.map((segment, index) => (
-            // An icon is a few cells that mean nothing cut: the text beside it gives way first.
-            <Box key={segment.id} flexDirection="row" flexShrink={segment.icon ? 0 : undefined} marginRight={index === info.length - 1 ? 0 : 1}>
-              <SegmentView segment={segment} focused={focused} />
-            </Box>
-          ))}
+          {info.map((segment, index) => {
+            // Every pane's segments are set apart the same way, so two never read as one sentence.
+            const separated = index > 0 && separatesPaneFooterSegments(info[index - 1]!, segment);
+            return (
+              <Box
+                key={segment.id}
+                flexDirection="row"
+                overflow="hidden"
+                // A row too narrow cuts from its end: the last text segment gives way, then the row clips the
+                // one before it. An icon is a few cells that mean nothing cut, and earlier text says more.
+                flexShrink={!segment.icon && index === lastTextIndex ? 1 : 0}
+                marginLeft={index > 0 && !separated ? 1 : 0}
+              >
+                {separated && <Box flexShrink={0}><Text fg={colors.textMuted}>{PANE_FOOTER_SEPARATOR}</Text></Box>}
+                <SegmentView segment={segment} focused={focused} />
+              </Box>
+            );
+          })}
         </Box>
       )}
       {hasHints && (
@@ -310,13 +363,18 @@ function FooterContent({
             {...(availableWidth !== null ? { width: hintsWidth } : { flexGrow: 1 })}
           >
             {shownHints.map((hint, index) => (
-              <Box key={hint.id} flexDirection="row">
+              <Box key={hint.id} flexDirection="row" {...(nativePaneChrome ? { flexShrink: 0, ...(index > 0 ? { style: DESKTOP_HINT_GAP_STYLE } : {}) } : {})}>
                 <HintView hint={hint} prefixSpace={index > 0} />
               </Box>
             ))}
             {overflowHints.length > 0 && row && (
-              <Box marginLeft={shownHints.length > 0 ? 1 : 0} flexShrink={0}>
-                <FooterOverflowMenu hints={overflowHints} width={row.moreWidth} label={row.moreLabel} />
+              <Box
+                flexShrink={0}
+                {...(nativePaneChrome
+                  ? (shownHints.length > 0 ? { style: DESKTOP_HINT_GAP_STYLE } : {})
+                  : { marginLeft: shownHints.length > 0 ? 1 : 0 })}
+              >
+                <FooterOverflowMenu hints={overflowHints} width={row.moreWidth} label={row.moreLabel} nativePaneChrome={nativePaneChrome} />
               </Box>
             )}
           </Box>
@@ -381,16 +439,21 @@ export function PaneFooterBar({
   }
 
   if (focused || showBorder) {
-    const contentWidth = Math.max(0, Math.floor(width) - 1 - reservedRight - (reservedRight > 0 ? 0 : 1));
+    // The row ends as the title bar does (` x ─┐`): the last hint, a blank, then the rule's last dash
+    // and the corner, or the floating pane's `─◢` in the cells it reserves. A hint against the dash
+    // read as one word (`ticker─`).
+    const ruleEnd = reservedRight > 0 ? "" : "─┘";
+    const rowWidth = Math.max(0, Math.floor(width) - 1 - reservedRight - ruleEnd.length);
+    const contentWidth = Math.max(0, rowWidth - FOOTER_FRAME_GAP);
     return (
       <Box height={1} width={width} flexDirection="row" data-gloom-role="pane-footer" data-focused={focused ? "true" : "false"} data-empty={empty ? "true" : "false"}>
         <Text fg={borderColor} selectable={false}>└</Text>
-        <Box width={contentWidth} height={1} overflow="hidden">
+        <Box width={rowWidth} height={1} overflow="hidden">
           {empty
-            ? <Text fg={borderColor} selectable={false}>{"─".repeat(contentWidth)}</Text>
-            : <FooterContent footer={resolvedFooter} focused={focused} width={contentWidth} />}
+            ? <Text fg={borderColor} selectable={false}>{"─".repeat(rowWidth)}</Text>
+            : <FooterContent footer={resolvedFooter} focused={focused} width={contentWidth} trailingGap={rowWidth - contentWidth} />}
         </Box>
-        {reservedRight === 0 && <Text fg={borderColor} selectable={false}>┘</Text>}
+        {ruleEnd && <Text fg={borderColor} selectable={false}>{ruleEnd}</Text>}
       </Box>
     );
   }

@@ -39,6 +39,21 @@ test("Cloud daily risk history rejects currency, listing, gap and duplicate ambi
     ),
   ).toThrow("timestamp");
 });
+test("today's bar is in the window once the listing's session closed, and out while it still trades", () => {
+  // 2026-09-22's bar beside the history through the 21st: ARCA closes at 16:00 New York, 20:00 UTC.
+  const withToday = () => {
+    const history = riskHistory();
+    history.data!.push({ date: "2026-09-22T00:00:00.000Z", open: 120, high: 120, low: 120, close: 120, volume: 100 });
+    return history;
+  };
+  const at = (time: string) => {
+    const moment = new Date(time);
+    return validateRiskHistory(withToday(), instrument, { ...riskQuote(), lastUpdated: moment.getTime() - 60_000 }, moment).latestClose.date.slice(0, 10);
+  };
+  expect(at("2026-09-22T19:30:00Z")).toBe("2026-09-21");
+  expect(at("2026-09-22T23:10:00Z")).toBe("2026-09-22");
+});
+
 test("partial Cloud source failures stay local; permission rejection escapes the shared load", async () => {
   const client = {
     getCloudQuotesBatch: async (
@@ -85,6 +100,40 @@ test("partial Cloud source failures stay local; permission rejection escapes the
   ).rejects.toThrow("Denied");
 });
 
+test("a holding that is a factor proxy shares the proxy's history however its venue is named", async () => {
+  // SPY held without its venue was read again beside the factor's ARCA:SPY, and the TRY pair once per reader.
+  const reads: string[] = [];
+  const client = {
+    getCloudQuotesBatch: async (requested: Array<{ symbol: string; exchange: string }>) => ({
+      status: "success",
+      data: { items: requested.map((row) => ({ ...row, status: "success", data: riskQuote(row.symbol, "ARCA") })) },
+    }),
+    getCloudHistory: async (symbol: string, exchange: string) => {
+      reads.push(`${exchange}:${symbol}`);
+      const history = riskHistory();
+      history.providerMeta!.normalizedSymbol = symbol;
+      history.providerMeta!.normalizedExchange = "ARCA";
+      return history;
+    },
+    getCloudFredSeries: async () => {
+      throw new Error("FRED unavailable");
+    },
+    getCloudExchangeRate: async () => ({ status: "success", data: { rate: 0.0237 } }),
+  };
+  await fetchPortfolioRiskMarket(
+    [{ symbol: "SPY", exchange: "", quantity: 10 }, { symbol: "IWM", exchange: "NYSEARCA", quantity: 5 }],
+    client as any,
+    now,
+    undefined,
+    "TRY",
+  );
+  const counts = new Map<string, number>();
+  for (const read of reads) counts.set(read.split(":")[1]!, (counts.get(read.split(":")[1]!) ?? 0) + 1);
+  expect([...counts].filter(([, count]) => count > 1)).toEqual([]);
+  expect(counts.get("SPY")).toBe(1);
+  expect(counts.get("IWM")).toBe(1);
+});
+
 test("without a current quote a dated USD history marks the holding at its latest close", () => {
   const history = riskHistory();
   const resolved = validateRiskHistory(history, instrument, null, now);
@@ -99,10 +148,11 @@ test("without a current quote a dated USD history marks the holding at its lates
   expect(() => validateRiskHistory(unlabelled, { symbol: "SPY", exchange: "LSE" }, null, now)).toThrow("Current USD listing identity unavailable");
 });
 
-test("a cancelled load stops requesting histories and passes the signal to each request", async () => {
+test("a cancelled load stops requesting histories and passes the signal to each request, batched histories too", async () => {
   const controller = new AbortController();
   const requested: string[] = [];
   const signals: Array<AbortSignal | undefined> = [];
+  const batched: Array<boolean | undefined> = [];
   const client = {
     getCloudQuotesBatch: async (
       targets: Array<{ symbol: string; exchange: string }>,
@@ -116,10 +166,11 @@ test("a cancelled load stops requesting histories and passes the signal to each 
       symbol: string,
       _exchange: string,
       _params: unknown,
-      options?: { signal?: AbortSignal },
+      options?: { signal?: AbortSignal; batch?: boolean; sharedWindow?: boolean },
     ) => {
       requested.push(symbol);
       signals.push(options?.signal);
+      batched.push(options?.batch && options.sharedWindow);
       // The turn is cancelled while the first history is loading.
       controller.abort();
       return riskHistory();
@@ -133,7 +184,9 @@ test("a cancelled load stops requesting histories and passes the signal to each 
 
   await expect(fetchPortfolioRiskMarket(holdings, client as any, now, controller.signal)).rejects.toThrow();
 
-  // Four workers each had one request in flight; none started another.
-  expect(requested.length).toBeLessThanOrEqual(4);
+  // The factor proxies' histories go out with the quotes; once cancelled, no holding's history is asked for.
+  expect(requested.filter((symbol) => /^H\d+$/.test(symbol))).toEqual([]);
+  expect(requested.length).toBeLessThanOrEqual(RISK_FACTOR_INSTRUMENTS.length);
   expect(signals.every((signal) => signal === controller.signal)).toBe(true);
+  expect(batched.every(Boolean)).toBe(true);
 });

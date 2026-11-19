@@ -1,101 +1,166 @@
 # Building Plugins
 
-Gloom is built on a plugin architecture — top-level product areas such as Portfolio and Ticker Research are plugins themselves. You can extend the app by writing your own.
+Most of Gloom is plugins: Portfolio, Ticker Research and every other product area are built the same way yours would be. A plugin can add panes, commands, data sources, broker connections and CLI commands.
+
+## Your first pane
+
+Start from the reference plugin, [gloom-hackernews](https://github.com/gloom-sh/gloom-hackernews): one pane, its API client and a test, in about 400 lines. With [Bun](https://bun.sh) and Gloom installed:
+
+```bash
+git clone https://github.com/gloom-sh/gloom-hackernews my-plugin
+cd my-plugin
+bun install
+gloom plugin link .             # Gloom loads this checkout
+gloom plugin doctor my-plugin   # checks it the way the terminal, desktop and web will
+```
+
+Start Gloom, press `Ctrl+P`, type `HN` and press Enter. Then rename the ids in `types.ts`, point `client.ts` at your own API and reshape `pane.tsx`; Gloom loads an edit when it restarts. [Its README](https://github.com/gloom-sh/gloom-hackernews#readme) says what each file shows. The rest of this guide is the reference, from [Plugin structure](#plugin-structure) on.
 
 ## Installing plugins
 
-The Plugins pane (`PL` in the command bar) installs, updates, removes, enables,
-and sets up plugins without leaving the app, and a plugin installed or updated
-there is registered in the running session: its panes and commands exist as
-soon as the install finishes. The same operations exist as CLI commands:
+Open the Plugins pane (`PL` in the command bar) to install, update, remove, turn on or off and set up plugins. A plugin it installs works at once, with no restart. The same from a shell:
 
 ```bash
-gloom install user/repo        # from GitHub shorthand
-gloom install https://github.com/user/repo  # from full URL
+gloom install user/repo        # or https://github.com/user/repo
+gloom plugins                  # list installed plugins (--check asks for updates)
+gloom update [my-plugin]       # update all, or one
+gloom remove my-plugin
+gloom plugin enable my-plugin  # or disable, without removing it
 ```
 
-Manage installed plugins:
+Each command takes the plugin's id or its folder, which `install` names for the repository: `gloom-sh/gloom-hackernews` installs `hackernews` in `gloom-hackernews`. `gloom plugins` lists both.
 
-```bash
-gloom plugins                  # list installed plugins
-gloom update                   # update all plugins
-gloom update my-plugin         # update a specific plugin
-gloom remove my-plugin         # remove a plugin
-gloom plugin enable my-plugin  # turn one on or off without removing it
-gloom plugin disable my-plugin
-```
+Plugins live in the `plugins` folder of your [data folder](docs/installation.md#where-your-data-lives) (`~/.gloomberb/plugins/` by default); `gloom plugins` prints it.
 
-Plugins are installed to `~/.gloomberb/plugins/`, or under `$GLOOMBERB_HOME/plugins/` when that variable relocates the folder. A new Linux install without `~/.gloomberb` uses `~/.local/share/gloomberb/plugins/` (see [Where your data lives](docs/installation.md#where-your-data-lives)); `gloom plugins` prints the folder in use.
+A plugin listed at [gloom.sh/plugins](https://gloom.sh/plugins) installs and updates at the tag or commit the registry pins, and the installer checks that the checkout matches a pinned commit. A listing is not a review or an endorsement. Without a pin, including when the registry cannot be read, installs and updates follow the repository's default branch. A plugin that builds on another (IBKR Gateway on Interactive Brokers) brings that one along.
 
-A plugin listed at [gloom.sh/plugins](https://gloom.sh/plugins) uses the
-registry's published tag or commit when available. If the registry supplies a
-commit hash, the installer checks that the checkout matches it. `update` uses
-the same pin. A registry listing does not mean a plugin has been reviewed or
-endorsed unless explicitly stated. Without a registry pin, including when
-the registry cannot be read and there is no cached listing, installation and
-updates follow the remote's default branch. A plugin that builds on another,
-such as IBKR Gateway on Interactive Brokers, brings that one along from the
-registry, from the Plugins pane and the CLI alike.
-
-Either way the Plugins pane says when an update is waiting. For a pinned
-plugin that is the registry's commit; otherwise, including for a private
-repository, the pane asks the checkout's own remote where its default branch
-is, which is exactly where `update` would land it. `gloom plugins --check`
-answers the same question from the terminal. The check needs whatever
-credentials the clone needs: a private repository without them is reported as
-nothing new rather than as an error, and it never blocks on a prompt.
-
-Official plugins, the registry entries published under
-[github.com/gloom-sh](https://github.com/gloom-sh), update themselves: once
-shortly after Gloom starts on a new version, then at most once a day, and
-at startup for one that failed to load because it uses something this
-Gloom does not have. They take the same steps as `update`, forward only
-and never to code this Gloom is too old for, peers first. A linked
-checkout, one with local edits, and one whose dependencies need `bun` when it
-is not on `PATH` are left alone, and the debug log says why. A plugin split
-across several files finishes updating at the next launch, and a single toast
-says "Plugins updated. Restart to finish." Third-party plugins, and anything
-installed from a repository the registry does not list, update only when you
-ask. Turn this off with **Update official plugins automatically** in the
-Plugins pane's settings.
+The Plugins pane says when an update is waiting, as `gloom plugins --check` does. Official plugins, the registry entries under [github.com/gloom-sh](https://github.com/gloom-sh), update themselves shortly after Gloom starts on a new version and then at most once a day, forward only and never to code this Gloom is too old for. A linked checkout or one with local edits is left alone. **Update official plugins automatically** in the Plugins pane's settings turns this off. Other plugins update only when you ask.
 
 ### Official plugins that need Git
 
-These official plugins live in their own repositories and install from GitHub
-with `git` when the app starts: TV, Substack, Interactive Brokers, IBKR
-Gateway, Public, Robinhood, SimpleFIN, Polls, Prediction Markets and BYOK AI.
-Windows does not ship `git`: install
-[Git for Windows](https://git-scm.com/download/win), then restart Gloom.
-Without it the app starts without them and says so at each launch, and
-`gloom doctor` names them; offline, it says once that it tries again at
-the next launch. Git runs quietly: a failure reports git's last line.
+TV, Substack, Interactive Brokers, IBKR Gateway, Public, Robinhood, SimpleFIN, Polls, Prediction Markets and BYOK AI live in their own repositories and install from GitHub with `git`. On first start Gloom clones the ones a profile is missing; a clone that hangs for a minute is stopped and retried at the next launch. Windows does not ship `git`: install [Git for Windows](https://git-scm.com/download/win) and restart Gloom. Until then Gloom starts without them, says so, and `gloom doctor` names them.
 
 ## Developing a plugin
 
-Work on a plugin from its own checkout rather than editing under
-`~/.gloomberb/plugins`:
+Work from your own checkout, not under the plugins folder:
 
 ```bash
-gloom plugin link ./my-plugin  # symlink the checkout into the plugins folder
-gloom plugin doctor my-plugin  # check it the way the app and the desktop build will
+gloom plugin link ./my-plugin    # symlink the checkout into the plugins folder
+gloom plugin doctor my-plugin    # check it the way the app and the desktop build will
 ```
 
-A linked plugin loads like an installed one, shows as `linked` in the Plugins
-pane, is never reported as behind the registry, and is skipped by `update`.
-Removing it removes the link and leaves the checkout alone.
+A linked plugin loads like an installed one, shows as `linked` in the Plugins pane, and is skipped by `update`. Removing it removes the link and leaves the checkout alone. Every plugin command takes a linked plugin's id as well as its folder, with or without a `gloom.json`: a checkout in `./riskwatch` whose export is `risk-watch` answers to both.
 
-Removal stops the plugin before deleting its files. If cleanup fails, the
-files stay in place and the Plugins pane asks you to restart Gloom before
-trying again; restarting is needed when cleanup left background work uncertain.
+`gloomberb` and `react` are peer dependencies: Gloom serves its own copies to every plugin. List `gloomberb` as a devDependency too, with a current `@types/node`, as the reference plugin does, so `bun test` and `tsc` resolve its imports in a fresh clone; installs leave devDependencies out.
 
-`doctor` runs the checks that otherwise surface as a `failed` row in the pane
-or as a broken pane on the desktop: the entry file resolves, the Gloom the
-plugin declares is not newer than this one, it imports nothing the host has
-removed or deprecated, the module evaluates, the export is a `GloomPlugin`,
-the id is not reserved, the targets are real, the hosts the source reaches are
-declared, and the browser build the desktop view and the web app need actually
-compiles. Run it before publishing; it exits non-zero on a failure so it can
-sit in CI.
+`doctor` checks that the entry resolves, the Gloom it declares is not newer than this one, it imports nothing removed or deprecated, it evaluates and exports a `GloomPlugin`, its id is not reserved, its targets are real, it declares the hosts it reaches (see [Network access](#network-access)), and its browser build (which the desktop and web apps need) compiles. It exits non-zero on a failure, so it can run in CI.
+
+## Example: a custom signal
+
+A plugin that adds a CLI command reading Gloom's market data: it flags a quote
+feed that has stopped and scores today's move against thirty years of daily
+bars. Two files in a folder of their own, `riskwatch/`:
+
+`gloom.json`, the id and the oldest Gloom it runs on, which `plugin doctor` asks for:
+
+```json
+{ "id": "risk-watch", "name": "Risk Watch", "minGloom": "0.20.7" }
+```
+
+`index.ts`:
+
+```typescript
+import type { GloomPlugin } from "gloomberb/types/plugin";
+import { canonicalExchange } from "gloomberb/utils";
+
+const YEARS = 30;
+// The US listing venues, where a delayed quote runs 15 minutes behind. Other venues set their own delay.
+const US_VENUES = new Set(["NASDAQ", "NYSE", "AMEX", "ARCA", "BATS"]);
+
+export default {
+  id: "risk-watch",
+  name: "Risk Watch",
+  version: "1.0.0",
+  cliCommands: [{
+    name: "riskwatch",
+    description: "Flag a stalled quote feed and score today's move against daily history",
+    help: { usage: ["riskwatch <symbol>"], examples: ["riskwatch TTEK", "riskwatch TTEK --json"] },
+    async execute(args, ctx) {
+      const symbol = args[0]?.toUpperCase();
+      if (!symbol) ctx.fail("Usage: gloom riskwatch <symbol>");
+      const { dataProvider, destroy } = await ctx.initServices();
+      try {
+        const quote = await dataProvider.getQuote(symbol!);
+        const now = Date.now();
+        // A delayed US quote's last trade is about 15 minutes old by design; more than that in the
+        // regular session is a stall. Elsewhere the delay is the venue's own, so no verdict is given.
+        const exchange = quote.listingExchangeName ?? "";
+        const baselineMinutes = quote.dataSource !== "delayed" ? 0 : US_VENUES.has(canonicalExchange(exchange)) ? 15 : null;
+        const tradeAge = quote.lastTradeTime ? (now - quote.lastTradeTime) / 60_000 : null;
+        const stalled = baselineMinutes != null && quote.marketState === "REGULAR" && tradeAge != null && tradeAge > baselineMinutes + 5;
+
+        // Daily bars by date: years of them in one call, split into reads by the host.
+        const from = new Date(now - YEARS * 365.25 * 86_400_000);
+        const history = await dataProvider.getDetailedPriceHistoryWithMetadata!(symbol!, exchange, from, new Date(now), "1d");
+        const closes = history.points.map((point) => point.close).filter((close) => close > 0);
+        const returns = closes.slice(1).map((close, index) => Math.log(close / closes[index]!));
+        const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+        const sd = Math.sqrt(returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / (returns.length - 1));
+        const move = quote.previousClose ? Math.log(quote.price / quote.previousClose) : null;
+
+        ctx.printResult({
+          data: {
+            symbol,
+            price: quote.price,
+            lastTrade: quote.lastTradeTime ? new Date(quote.lastTradeTime).toISOString() : null,
+            retrieved: quote.retrievedAt ? new Date(quote.retrievedAt).toISOString() : null,
+            savedCopy: quote.stale === true,
+            feed: stalled ? `stalled, last trade ${Math.round(tradeAge!)} min ago` : baselineMinutes == null ? "venue delay unknown" : "ok",
+            sigma: move != null && sd > 0 ? Number((move / sd).toFixed(2)) : null,
+            firstBar: history.points[0] ? new Date(history.points[0].date).toISOString().slice(0, 10) : null,
+            bars: history.points.length,
+            ...(history.truncatedBefore ? { cutBefore: history.truncatedBefore } : {}),
+          },
+        });
+      } finally {
+        destroy();
+      }
+    },
+  }],
+} satisfies GloomPlugin;
+```
+
+Link it, check it, run it:
+
+```bash
+gloom plugin link ./riskwatch
+gloom plugin doctor risk-watch
+gloom riskwatch TTEK          # --json for the record as data
+```
+
+`ctx.initServices()` loads the services a command reads from:
+
+| Field | What it is |
+|-------|------------|
+| `dataProvider` | The asset-data router: `getQuote`, `getQuotesBatch`, `getPriceHistoryWithMetadata`, `getPriceHistoryForResolutionWithMetadata`, `getDetailedPriceHistoryWithMetadata`, `getTickerFinancials`, `getCorporateActions`, `getEarningsCalendar`, `search` and the rest of the [asset-data domain](#capabilities). `gloom api get asset-data.asset-data-router` lists every operation with its input |
+| `config` | The app config, as `ctx.getConfig()` returns it in a pane |
+| `dataDir` | The profile's data folder |
+| `persistence` | The profile's database: cached resources and plugin state |
+| `store` | The saved tickers |
+| `services` | The rest of the app's services: `pluginRegistry` (with its `capabilities`), `newsService` |
+| `destroy()` | Closes them; call it in `finally` so the command exits |
+
+What a quote says about its own time:
+
+| Field | Meaning |
+|-------|---------|
+| `lastTradeTime` | When the last trade printed (epoch ms). `lastUpdated` is the time the price is as of, the same for a trade |
+| `retrievedAt` | When the quote was fetched from its source (epoch ms). For a quote Gloom Cloud serves, that is the service's own fetch time, and a copy it kept, a `stale` one included, keeps the time that copy was fetched. So a recent `retrievedAt` with an old `lastTradeTime` is a feed that has not printed, and an old `retrievedAt` is a copy |
+| `stale` | `true` when the refresh failed and the last good copy answered instead |
+| `dataSource` | `live`, `delayed` or `snapshot`. Gloom Cloud quotes for an account without Pro are delayed. For a US listing the delay is 15 minutes: that is the baseline a delayed quote's `lastTradeTime` sits behind while the market is open. A listing on another venue runs behind by that venue's own delay, which can be longer |
+| `marketState` | The listing's session: `PREPRE` (overnight, before the pre-market opens), `PRE` (pre-market), `REGULAR`, `POST` (after hours), `POSTPOST` (overnight, after the after-hours session closes) or `CLOSED`. Outside `REGULAR`, an old last trade is the last session's print, not a stall |
+
+Price history comes three ways. `getPriceHistoryWithMetadata(symbol, exchange, range)` takes a range (`1D`, `1W`, `1M`, `3M`, `6M`, `1Y`, `5Y`, `ALL`; anything else is an error) in the bar size the range comes in: `ALL` is the whole stored history in monthly bars. `getPriceHistoryForResolutionWithMetadata(symbol, exchange, range, "1d")` is the same range in the bar size asked for, so `ALL` at `1d` is every daily bar kept. `getDetailedPriceHistoryWithMetadata(symbol, exchange, from, to, "1d")` is the bars between two dates. Long daily reads are split into several requests by the host; when one of the older ones fails, the result's `truncatedBefore` is the date the bars start at instead of the whole span. `gloom history <symbol> --range ALL --interval daily` shows the same bars from a shell, and a window before a listing's first bar says where its daily bars start.
 
 ## Plugin compatibility
 
@@ -110,7 +175,7 @@ the plugin starts using something a release added:
 { "id": "my-plugin", "minGloom": "0.15.0" }
 ```
 
-A `>=0.15.0` range on `gloom` in `peerDependencies` works too; `gloom.json`
+A `>=0.15.0` range on `gloomberb` in `peerDependencies` works too; `gloom.json`
 wins when both are set, and anything else is ignored. An older Gloom does
 not import the plugin at all: the Plugins pane shows `needs 0.15.0` on its row,
 and `gloom plugins` says why it is not loaded. A linked checkout is loaded
@@ -136,8 +201,12 @@ The plugin API changes by these rules:
   declared, so an old checkout is refused with a reason instead of
   misbehaving.
 - CI compares every runtime export with a reviewed snapshot, and compiles each
-  plugin the registry lists, at the ref it would install, against every pull
-  request.
+  plugin the registry lists, at the commit the registry reviewed or else the
+  ref it would install, against every pull request. It also loads each of them
+  in the compiled terminal binary and in the desktop's bundled terminal, which
+  serve React and the `gloomberb/*` modules from inside the process. Release
+  and nightly builds repeat the load in each binary and in the macOS app they
+  build, in a job of its own with no secrets, before anything is published.
 
 `update` only moves a plugin forward. When the registry's published tag is older
 than what is checked out (an install from the default branch can be ahead of
@@ -189,10 +258,19 @@ code are still yours to catch and log.
 
 ## Plugin structure
 
-A plugin implements the `GloomPlugin` interface:
+A plugin implements the `GloomPlugin` interface. This one adds a pane that `HELLO` opens from the command bar:
 
-```typescript
-import type { GloomPlugin } from "gloomberb/types/plugin";
+```tsx
+import type { GloomPlugin, PaneProps } from "gloomberb/types/plugin";
+import { Box, Text } from "gloomberb/ui";
+
+function HelloPane({ width, height }: PaneProps) {
+  return (
+    <Box width={width} height={height}>
+      <Text>Hello from My Plugin</Text>
+    </Box>
+  );
+}
 
 export const myPlugin: GloomPlugin = {
   id: "my-plugin",
@@ -200,14 +278,10 @@ export const myPlugin: GloomPlugin = {
   version: "1.0.0",
   description: "What it does",
   toggleable: true, // let users enable/disable from settings
-  cliCommands: [
-    {
-      name: "my-plugin",
-      description: "Run a plugin-owned CLI command",
-      async execute(args, ctx) {
-        console.log(`args: ${args.join(" ")}`);
-      },
-    },
+  panes: [{ id: "my-plugin", name: "My Plugin", component: HelloPane, defaultPosition: "right" }],
+  // Makes the pane a command-bar function.
+  paneTemplates: [
+    { id: "my-plugin-pane", paneId: "my-plugin", label: "My Plugin", description: "Say hello", shortcut: { prefix: "HELLO" } },
   ],
 
   setup(ctx) {
@@ -224,11 +298,18 @@ export default myPlugin;
 
 External plugins export one `GloomPlugin`. The `PluginModule` objects some built-ins compose internally are not a second plugin API; see [Built-in plugins](CONTRIBUTING.md#built-in-plugins).
 
+Save it as `index.tsx` beside a `gloom.json`, which `plugin doctor` asks for:
+
+```json
+{ "id": "my-plugin", "name": "My Plugin", "minGloom": "0.15.0" }
+```
+
 An external plugin is a directory in `~/.gloomberb/plugins/`:
 
 ```
 ~/.gloomberb/plugins/my-plugin/
-  index.ts          # export default myPlugin
+  index.tsx         # export default myPlugin
+  gloom.json        # what the plugin directory lists, and the oldest Gloom it runs on
   index.browser.ts  # optional, see below
   package.json      # optional, for dependencies
   icon.svg          # optional, 64x64, shown in the plugin directory
@@ -275,6 +356,14 @@ are browser contexts: their copy of the plugin is compiled with Bun's browser
 target, which **rejects `node:*` imports even behind a dynamic `import()`**. A
 plugin that opens a socket or resolves DNS therefore fails to compile for the
 view, and the marketplace shows it as broken.
+
+`process` is the one exception: a plugin that reads it still loads in the view
+and the browser app. It gets its own stand-in with `env` (only `NODE_ENV`,
+never the host's environment, so keep settings in the plugin's config), the
+`platform` of the window, an empty `argv`, `cwd()`, `nextTick`, `hrtime` and
+no-op listeners. `process.exit`, `kill`, `chdir` and the memory and CPU readings
+throw an error naming the plugin, and everything else is `undefined`. It does
+not exist as a global, only inside the plugin's own bundle.
 
 Ship a second, renderer-safe entry for that case:
 
@@ -357,8 +446,16 @@ To be bundled, a plugin has to be web-capable in practice, not just in its
 
 Bundling one is a change to this repository: add the plugin as a devDependency,
 add its package name to `WEB_BUNDLED_PLUGIN_PACKAGES`, and run
-`bun run web:proxy-hosts` so the worker allowlist covers its hosts. The web
-build fails rather than shipping a pane that cannot fetch.
+`bun run web:proxy-hosts` so the worker allowlist covers its hosts. Then list
+in `SIGNED_OUT_ROUTES` (`src/renderers/cloudflare/http-proxy.ts`) the
+methods and paths a signed-out visitor's pane sends to each new host. A host
+with no routes there works on the web only after sign-in. A host
+that answers https://term.gloom.sh with CORS headers can go in
+`WEB_DIRECT_HOSTS` (`src/utils/plugin-proxy-hosts.ts`) instead, so the browser
+calls it directly with no proxy round trip or response size cap. The web
+build fails rather than shipping a pane that cannot fetch, and its bundle
+audit fails on any host the shipped code names that the page cannot reach
+and that is not listed as a link in `scripts/web-link-hosts.ts`.
 
 ## What plugins can do
 
@@ -458,9 +555,9 @@ Headless loaders must stay isomorphic. Do not import React, DOM APIs, Electrobun
 The four supported shapes cover the pane catalog:
 
 - `rows`: `{ columns?, rows }` for one table
-- `bundle`: `{ sections: [{ title, columns?, rows, unit? } | { title, entries, textEntries? }] }` for dashboards such as VAL and ECST. A row section's `unit` fills the `currency_or_unit` column of its exported rows. An entry's `unit` exports its number whole with the unit beside the label, and `textEntries` are the lines the text report prints instead of `entries` when the pane says in one line what the export keeps apart (a range, a level with its distance)
+- `bundle`: `{ sections: [{ title, textTitle?, columns?, rows, unit? } | { title, entries, textEntries? }] }` for dashboards such as VAL and ECST. A row section's `unit` fills the `currency_or_unit` column of its exported rows, and its `textTitle` is the heading the text report prints in place of `title` when it says more than an export's section name should (the scale its amounts are printed in); JSON, CSV and NDJSON keep `title`. An entry's `unit` exports its number whole with the unit beside the label, and `textEntries` are the lines the text report prints instead of `entries` when the pane says in one line what the export keeps apart (a range, a level with its distance)
 - `series`: `{ series: [{ id, label, points, unit?, symbol?, interval? }], stats? }` for charts and derived statistics. `unit`, `symbol` (what the series was asked as) and `interval` (the bars or frequency served) fill the `currency_or_unit`, `symbol_or_series` and `interval` columns every exported row ends with
-- `snapshot`: `{ asOf, items }` for a point-in-time view of a stream
+- `snapshot`: `{ asOf, items, empty? }` for a point-in-time view of a stream. `empty` is what the text report says in place of `No data.` when there are no items (the stream is still starting or warming up, nothing matches), and JSON carries it as `empty`
 
 All shapes may include `errors`, `metadata`, and `unavailableSymbols`. An error that names what Gloom Pro unlocks (`Full history requires Gloom Pro`) is a lock, not a failure: the text report prints it under `Pro:` and keeps `Errors:` for the rest, and a bundle section that is empty because of it sets `empty: "Locked: Gloom Pro"` in place of the default `No data.`. Set `unavailableSymbols` for partially missing inputs even when another symbol returns data; otherwise a partial report can incorrectly appear complete. Set `symbols` when the loader expands an expression or adds an implicit peer. Set `warnings` when the report could not do what was asked and did something else instead, such as a bar size the source does not serve for the range: `fn` prints each on stderr and lists them under `warnings` in JSON. Rows and items should contain raw structured values. Put display formatting in column `format` callbacks, or use an entry's `formatted` field, so JSON keeps the raw value while text stays readable.
 
@@ -686,7 +783,7 @@ Available CLI context helpers:
 |------|---------------|
 | `ctx.initConfigData()` | Load config, persistence, and ticker storage |
 | `ctx.initMarketData()` | Load config plus the plugin-aware asset-data router |
-| `ctx.initServices()` | Load the full headless service set, including config, persistence, ticker repository, asset-data router, news service, plugin registry, and capability registry |
+| `ctx.initServices()` | Load the full headless service set: `dataProvider` (the asset-data router), `config`, `dataDir`, `persistence`, `store` (the ticker repository), `services` (plugin registry, capability registry, news) and `destroy()`. [Example: a custom signal](#example-a-custom-signal) uses it and lists each field |
 | `ctx.cliOptions` | Parsed global flags such as output format, `--limit`, `--refresh`, `--dry-run`, and `--yes` |
 | `ctx.printResult(...)` | Render text, JSON, CSV, or NDJSON through the shared CLI result contract |
 | `ctx.fail(...)` | Print an error and exit |
@@ -763,6 +860,8 @@ Plugins contribute data and services through capabilities. A capability declares
 - `news` for ticker and global news feeds.
 - `chart-series` for searchable provider-owned time series that resolve into normal chart data. To put a series in the data catalog, register it as a [data catalog series](#data-catalog-series) instead; the registry gives it a `chart-series` capability of its own. A raw `chartSeriesProvider` is for an index too large to list, such as the map's place series, whose entries are found by search.
 - `plugin-service` for narrow renderer-safe service escape hatches.
+
+To connect your own entitled feed API, see [Bring your own licensed market data](docs/market-data-plugins.md): one synthetic quote adapter, contract/venue mapping, fallback and an isolated CLI check.
 
 Capability operations can also include CLI manifest metadata. This is what makes the operation understandable to automation without plugin-specific documentation:
 
@@ -857,7 +956,9 @@ export default {
 | `unit` | `%`, `bp`, `x`, `ratio`, `index`, `score` or `points`; a quantity (`count`, `shares`, `contracts`, `people`, `barrels`, ...) or a currency code, optionally after `thousand`, `million`, `billion` or `trillion`; or a currency per unit (`USD/barrel`). `describeSeriesUnits()` lists them all. Series in the same unit share a chart axis. |
 | `frequency` | `intraday`, `daily`, `weekly`, `monthly`, `quarterly`, `annual` or `irregular`. |
 | `group`, `tags`, `description` | The catalog tab the series is listed under, extra search words, and one sentence for search and automation. |
+| `aliases` | Up to four lower-case words `fn G` charts the series by where a ticker goes (`fn G hashrate`): only when no listing answers to the word, the quote source says it is not a ticker, and no other series claims it. Not for a series with an `input`. |
 | `publisher`, `url` | The official body publishing public data (a statistics agency, a central bank, a regulator) and its page for the series. |
+| `limitation` | One sentence on a limit the publisher sets on the data, such as a cap on how far back its history goes (`History limited to 3 years by the publisher.`). The catalog shows it as a warning on the selected series. |
 | `input` | `ticker`, `option` or `crypto`: the series is one per symbol. The catalog asks for the symbol, typing a ticker in the catalog fills it in, and `load` receives it as `ticker`. |
 | `placement` | Where a chart draws the series when it is added: `price` over its ticker's price, on the price's axis (a moving average, a band; needs `input: "ticker"` and is in the ticker's currency, unit `currency`), or `panel` in a panel of its own under the price (an oscillator). CAT then opens the ticker's price with the series placed. Without it, the series joins the main panel when it fits. |
 | `load(request)` | Returns the points from `request.start` to `request.end` (either may be absent), as an array of `{ date, value }` or `{ points, warning, attribution }`. `request.resolution` is the bar size the chart draws prices in (`1d`, `1wk`, `5m`), so a series computed from a ticker's bars can use the same bars. When the chart builds its bars from shorter ones (`4h` from `1h`, `2d` from `1d`), `request.resolution` is the size it loads and `request.barSize` the size it draws; `aggregatePriceBars` from `gloomberb/time-series` builds them the same way, from the session's open, and a series that ignores `barSize` still gets bars it knows. `request.signal` aborts when the chart no longer needs the load; for a series with `lines`, once none of its lines does. `attribution: { source, publisher? }` names the dataset a report of the series alone cites (`FRED series ECBDFR`, published by the European Central Bank) in place of Gloom Cloud. Dates may be `Date`s, `YYYY-MM-DD` strings or epoch milliseconds; a `null` value is a gap. More history than asked for is fine. |
@@ -959,7 +1060,8 @@ await ctx.teamState.delete("shortlist");
 
 Values are JSON, and every member of the team can read them, so never store
 credentials there. A write without `expectRevision` overwrites whatever is
-there.
+there. Strings in a value, keys included, are stored without control
+characters other than line breaks and tabs.
 
 ### Navigation
 
@@ -1116,7 +1218,7 @@ ctx.registerPane({
 });
 ```
 
-Settings can also be dynamic — pass a function instead of an object to compute fields based on current state:
+Settings can also be dynamic: pass a function instead of an object to compute fields based on current state:
 
 ```typescript
 settings: (context) => ({
@@ -1164,7 +1266,7 @@ An `action` field is a row with a button (`actionLabel`) that runs `action(conte
 
 Give a long `multi-select` or `ordered-multi-select` (dozens of options) `searchable: true`: its dialog gets a filter box that narrows rows by label and description, shows each option's `description` beside its label and, when ordered, each selection's position. Arrows move, Space picks and `[` / `]` reorder while the box has focus.
 
-Every pane also gets a built-in **Lock Pane** toggle, so a pane with no `settings` of its own still opens a settings dialog. A locked pane stays in the layout when the close shortcut (`CmdOrCtrl+W`, `CmdOrCtrl+Alt+W`, or double `Esc`) is pressed; explicit closes still work. It is also offered in the pane action menu next to Close Pane. It is stored on the pane instance under the reserved `pane.locked` key, never in pane settings, so `applyValue` never sees it and a published layout never carries it. Do not register a field with a `pane.`-prefixed key.
+Every pane also gets a built-in **Lock Pane** toggle, so a pane with no `settings` of its own still opens a settings dialog. A locked pane stays in the layout when the close shortcut (`CmdOrCtrl+W`, `CmdOrCtrl+Alt+W`, or double `Esc`) is pressed; explicit closes still work. It is also offered in the pane action menu next to Close Pane. It is stored on the pane instance under the reserved `pane.locked` key, never in pane settings, so `applyValue` never sees it and a published layout never carries it. Do not register a field or keep a value with a `pane.`-prefixed key: the `pane.` prefix is the app's. The kit keeps the column order readers drag into a pane's tables in its settings under `pane.columnOrder`.
 
 Imperative pane settings access is available on the plugin context:
 
@@ -1372,6 +1474,8 @@ ctx.registerPaneTemplate({
 
 A shortcut that sets neither `argKind` nor `argPlaceholder` takes the argument the template's `headless` definition declares, so the command bar reads `PF Family` as `gloom fn PF Family` does. `shortcut.argError(arg, context)` says why a typed argument opens nothing, or returns null: for `PF Nope` it returns `{ message: 'No portfolio or watchlist named "Nope"', detail: "Try Main Portfolio or Family" }`. The bar shows the message in place of the function's row, disabled, with the function's code where its row has it and the detail on the line under it, and the pane does not open for that argument.
 
+If `createInstance` fetches live data or has side effects, set `catalogSettings` to the settings the catalog should describe, or `{}` when they depend on the user's argument. Catalog discovery reads that object without opening the pane; actual launches still call `createInstance`. Without `catalogSettings`, discovery derives settings by calling `createInstance` with a sample argument.
+
 Create pane instances programmatically:
 
 ```typescript
@@ -1427,13 +1531,17 @@ Use `Box` and `ScrollBox` to arrange content. A `ScrollBox` scrolls vertically u
 
 `Button` supports a compact layout and a separate `displayLabel` for short/icon actions; `label` remains the full accessible and automation name. Use `stopPropagation` for actions nested inside a row. `ActionRow` owns an expandable row's interaction and disclosure affordance. `SelectButton` opens the kit menu on the desktop and a choice dialog in the terminal; a `SelectControl` ref can open it without knowing the renderer.
 
+Long select menus can give each option a `group` label. Consecutive options with the same label share a non-selectable heading in `SelectButton`, `SelectField`, `ChoiceDialog` and a `QueryBar` select filter; keyboard navigation skips the headings, and the menu scrolls within its surface. Leave `group` out for choices before the first heading.
+
 A pane's primary tab strip goes through `usePaneTabs({ tabs, activeValue, onSelect, focused })`, called above any early return. It takes every `Tabs` prop and returns `{ strip, rows }`: on the desktop the strip moves into the pane title bar and `strip` is null; the terminal gets the `Tabs` row to draw first. Subtract `rows` from heights. `queryBarWidth` turns the strip into a `QueryBar` view on the desktop when the pane sits under another title-bar strip (a Ticker Research tab). `usePaneHeaderTabs` is the lower-level hook underneath, for a pane that lays the body strip out itself.
 
-Everything that narrows or reorders a list sits in one `QueryBar` above it: `search`, `filters` (`select` with an optional `defaultValue` that marks the unfiltered state, `inline` for four or fewer short options, `multi`, `toggle`, `text`) and one `view` for sort, range or interval (the one that picks a chart's range sets `chartRange`, so choosing the selected range again sends the pane's charts back to it, as `0` does). It is one row in the terminal, scrolls sideways when the pane is narrow, and gives a changed filter a reset. Do not lay out `SelectButton`s or search fields in a row yourself. `useQueryBarSearch()` holds whether the search owns the keyboard: spread its `searchProps` into `search`, and call `focus` from a footer hint or an up-arrow handoff. The bar already binds `/`, so a pane binds it again only to add a condition.
+Everything that narrows or reorders a list sits in one `QueryBar` above it: `search`, `filters` (`select` with an optional `defaultValue` that marks the unfiltered state, `inline` for four or fewer short options, `multi`, `toggle`, `text`) and one `view` for sort, range or interval (the one that picks a chart's range sets `chartRange`, so choosing the selected range again sends the pane's charts back to it, as `0` does). It is one row in the terminal and gives a changed filter a reset. On the desktop a bar short of room drops its inline filters' labels, shows each toggle's `short` label, then folds the view and the inline filters into menu chips (name the view with `label`, as "Interval", for its menu and a screen reader), and scrolls sideways only when even that does not fit; an inline list meant to run past the edge (expiries) sets `scrolls` and scrolls by itself instead, keeping its label and its chosen choice in view. Do not lay out `SelectButton`s or search fields in a row yourself. `useQueryBarSearch()` holds whether the search owns the keyboard: spread its `searchProps` into `search`, and call `focus` from a footer hint or an up-arrow handoff. The bar already binds `/`, so a pane binds it again only to add a condition.
 
 A pane's summary figures (a VWAP, a spread, a percentile, a range) go in a `StatGrid` directly under the `QueryBar`: one band of label, value and muted detail cells that the desktop draws like the query bar, so the title-bar tab, the bar and the figures read as one surface. Use it at the top of a stack detail too. Do not stack `KeyValueRow`s or text lines above a table for this. `statGridRows(items, width)` gives the rows it takes for terminal height budgeting.
 
 Table header labels are uppercased by the kit; `SectionHeading` titles use title case. Pass `onHeaderClick` only when the table sorts; without it the headers are not interactive.
+
+Readers move a table's columns by dragging a header sideways, and the pane remembers the order in its settings (under the reserved `pane.columnOrder`); a click still sorts. The kit does this for every table in a pane, a plugin's included, so most panes pass nothing. On a table whose columns move, a header sorts when the button comes up on it, not when it goes down, since the press may become a drag; a test that presses a header sends the release too. Pass `columnReorder={false}` when the columns are one ordered axis or a fixed format (fiscal periods, months, tenors, strikes, a matrix whose columns mirror its rows): its columns stay put and its headers sort on the press, as before. A pane whose settings already choose and order its columns passes them as `columnReorder={{ control: { order, defaultOrder, onChange } }}`, so a drag rewrites that setting; `defaultOrder` is the list the pane shows with the setting unset, and a list that comes back to it reaches `onChange` as `undefined`, to remove the setting so columns added to the defaults later still show. The column that names the row stays first, with any narrow mark before it; `anchored` keeps more in place, and `key` separates two tables in one pane that name their rows with the same column but are otherwise unrelated.
 
 A pane that computes an answer from inputs (a calculator, a sizer) puts its mode switches in a `QueryBar` (inline filters) and its inputs in a `FieldGrid`: one aligned sheet of label, value and unit cells. The pane owns which field is active; while one is being edited the grid walks its cells with Tab and leaves on Esc. Icon-only actions use `IconButton` with a name from the shared icon set; never draw an SVG or glyph button yourself.
 
@@ -1444,14 +1552,14 @@ Every menu, dropdown and pop-up list uses `MenuPopover` (or `Menu` inside a `Pop
 ```tsx
 <PaneStatusBody loading={loading && !data} error={!data ? error : null}
   empty={!loading && !error && !data} subject="research" align="center"
-  retry={{ onRetry: reload }}>
+  retry={{ onRetry: reloadAndWait }}>
   <Section title="Valuation">
     <KeyValueRow label="P/E" value={formattedPE} />
   </Section>
 </PaneStatusBody>
 ```
 
-`retry` draws the Retry button first in the state, so it answers Enter. While the check runs (the promise `onRetry` returns, or `pending`, such as the resource's `loading`) the button says "Retrying..." and ignores presses; when the same empty or failed state comes back, a line under it says "Checked just now." or "Tried again just now.", so a press that changes nothing still shows it ran. Pass `pending` when the old answer stays on screen while asking again, and `label`, `pendingLabel` and `unchanged` when the check has a better verb: `{ onRetry: reload, pending: loading, label: "Look again", pendingLabel: "Looking again...", unchanged: "Still no careers system." }`.
+`retry` draws the Retry button first in the state, so it answers Enter. While the check runs (the promise `onRetry` returns, or `pending`, such as the resource's `loading`) the button says "Retrying..." and ignores presses; when the same empty or failed state comes back, a line under it says "Checked just now." or "Tried again just now.", so a press that changes nothing still shows it ran. Pass `pending` when the old answer stays on screen while asking again, and `label`, `pendingLabel` and `unchanged` when the check has a better verb: `{ onRetry: reloadAndWait, pending: loading, label: "Look again", pendingLabel: "Looking again...", unchanged: "Still no careers system." }`.
 
 A built-in pane whose body cannot render until the account is right renders `SignInWall` from `src/plugins/builtin/cloud/auth-actions.tsx` rather than its own prompt. The pane passes only the phrase that finishes the headline (`action="browse earnings call transcripts"`) plus `needsVerification` when the session exists but the address is unconfirmed; the component owns the copy, the actions, and the verification branch.
 
@@ -1472,7 +1580,7 @@ const updatedAgo = useUpdatedAgo(updatedAt);
 usePaneStatusFooter({ registrationId: "my-pane", loading, error });
 ```
 
-The loader receives `force` so a manual reload can bypass the plugin's own cache; `initialData` seeds the pane from that cache before the first fetch resolves. A new loader (another ticker, a new window) starts from no data; `keepPreviousData: true` leaves the last answer up until the new one arrives. Pass `stale` to `usePaneStatusFooter` while the pane shows cached data a refresh could not replace, and the footer carries the shared `stale` warning.
+The loader receives `force` so a manual reload can bypass the plugin's own cache; `initialData` seeds the pane from that cache before the first fetch resolves. `load(force?)` and `reload()` (a forced load) start a load and return nothing: a failure lands in `error`. `reloadAndWait()` is the same reload for a caller that waits on it, such as a Retry button that stays busy until the answer is in; it never rejects. A new loader (another ticker, a new window) starts from no data; `keepPreviousData: true` leaves the last answer up until the new one arrives. Pass `stale` to `usePaneStatusFooter` while the pane shows cached data a refresh could not replace, and the footer carries the shared `stale` warning.
 
 `useAutoRefresh` refreshes one configured interval after the data landed, rests while the pane cannot be seen, and refreshes at once when stale data comes back into view. Data that moves faster than research data passes its own cadence: `useAutoRefresh(updatedAt, load, { intervalMs: 60_000 })`.
 
@@ -1501,7 +1609,9 @@ const rows = useLiveTickerFinancialsMap(tickers, { visible: false });
 
 `usePaneTickerIdentity()` returns the pane's symbol, ticker and contract without its financials; `usePaneTicker()` also re-renders on every quote tick of the symbol, so a pane that only needs the symbol (news, filings, holders) uses the identity hook.
 
-A pane that shows one ticker through these hooks can set `tickerFollower: true` on its `PaneDef`. Its pane menu then offers **Link to** each visible watchlist, portfolio, scanner, or other single-ticker pane, and once linked it follows that pane's selection, with **Unlink from** pinning it on the ticker it shows. A function decides per instance, for a pane that is single-ticker only in some setups (a price chart of one security, not a comparison or a fundamental graph). A linked pane changes ticker while mounted, so key the view by symbol and keep saved choices that only make sense for one ticker (an expiry, a strike) per symbol. Never write the pane's own `cursorSymbol`: it would win over the link.
+A pane that shows one ticker through these hooks can set `tickerFollower: true` on its `PaneDef`. Its pane menu then offers **Link to** each visible watchlist, portfolio, scanner, or other single-ticker pane, and once linked it follows that pane's selection, with **Unlink from** pinning it on the ticker it shows. The host writes the link state in the pane's title (`OPX NVDA  ⧉ Linked to Watchlist`, `OPX NVDA  ⧉ Unlinked`); the pane draws none of its own. A function decides per instance, for a pane that is single-ticker only in some setups (a price chart of one security, not a comparison or a fundamental graph). A linked pane changes ticker while mounted, so key the view by symbol and keep saved choices that only make sense for one ticker (an expiry, a strike) per symbol. Never write the pane's own `cursorSymbol`: it would win over the link.
+
+Such a pane also takes a new ticker from ticker search: the backtick, or a click on the ticker in its title on the desktop and the web, pins it (or the pane it follows) on the chosen ticker. The host sets the binding and the title. A pane that keeps its ticker somewhere else as well, such as a chart's series, sets `retargetTicker(pane, symbol, previous)` to return the instance with that moved too.
 
 `createPluginCache` keeps the last good payload in plugin persistence with a TTL, so the pane has something to show before its first fetch after a restart. Table panes get `compareSortValues`, `nextHeaderSort` (header clicks) and `cycleSortPreference` (the keyboard equivalent) from `gloomberb/utils` so mixed columns sort like the host's.
 
@@ -1559,9 +1669,23 @@ const response = await sendRemoteControlRequest(
 
 It reads the endpoint file from the data directory, so it is native only: a renderer bundle that imports it fails to compile, which is the correct answer for a browser context.
 
+When no app takes the request it throws a `RemoteAppError`, exported beside it, with a `code` and `details` saying what to do:
+
+- `app_not_running` (`RemoteAppNotRunningError`): no app of this profile runs. An endpoint file left by an app that exited without quitting is removed once its process is gone and its port refuses.
+- `app_ambiguous` (`RemoteAppAmbiguousError`): both apps run and neither is the one started last; pass `appKind`.
+- `app_unreachable` (`RemoteAppUnreachableError`): the file names an app whose port does not answer from here, and nothing proves it gone, as inside a sandbox that blocks localhost. The file is kept.
+
+The client asks the port's `/health` first and sends the token only to a Gloom app that answers it.
+
 ### Network access
 
-List every third-party host a plugin fetches from in its `hosts` field, as bare domains. The terminal and desktop reach anything, so there it is documentation and what the plugin directory shows. On the web, the browser cannot call a host without CORS headers, and the hosted app proxies exactly the hosts that the plugins in its build, built-in or bundled, declare. A host left out works on the desktop and fails on the web.
+List every third-party host a plugin fetches from in its `hosts` field, as bare domains. The terminal and desktop reach anything, so there it is documentation. On the web, the browser cannot call a host without CORS headers, and the hosted app proxies exactly the hosts that the plugins in its build, built-in or bundled, export in `hosts`. A host left out works on the desktop and fails on the web.
+
+List the same hosts in `gloom.json`: the plugin directory shows those, and `plugin doctor` warns when the two lists differ. A host the plugin only opens as a link, such as a story's page, is not fetched; list it in `linkHosts` in `gloom.json` so doctor does not ask for it:
+
+```json
+{ "hosts": ["hacker-news.firebaseio.com"], "linkHosts": ["news.ycombinator.com"] }
+```
 
 Pane footers show changing status such as loading, errors, stale data, or live/delayed feeds. Preserve existing pane-specific action shortcuts instead of duplicating them in body toolbars. Do not repeat the pane title, fixed labels, row counts, or generic keyboard hints:
 
@@ -1575,7 +1699,7 @@ usePaneFooter("my-pane", () => ({
 
 Methodology and recurring usage explanations belong in user documentation. Keep pane content for data, units, source dates, and active failures; do not add standing explanatory paragraphs or duplicate action rows.
 
-For non-blocking data limitations, use `usePaneNoticeFooter({ registrationId, notices, focused })` from `gloomberb/components`. It registers one conditional warning indicator in the existing footer; mouse activation or `!` opens the full details. Pass only notices for the current data and disable the registration when its view is inactive. Empty notices remove the indicator. Preserve units and source dates beside the affected values, and keep blocking empty/error states in the body. Do not use this control for permanent methodology or generic usage instructions.
+For non-blocking data limitations, use `usePaneNoticeFooter({ registrationId, notices, focused })` from `gloomberb/components`. It registers one conditional warning indicator in the existing footer; mouse activation or `!` opens the full details, after which the indicator stays muted (remembered by the notice text, across panes and restarts) until a notice is new or changed. Pass only notices for the current data and disable the registration when its view is inactive. Empty notices remove the indicator. Preserve units and source dates beside the affected values, and keep blocking empty/error states in the body. Do not use this control for permanent methodology or generic usage instructions.
 
 For data a source delivers late, put `delayedFooterSegment({ id, detail, delay })` from `gloomberb/components` in the footer info instead of words such as "15m delayed". The desktop shows a yellow clock with `detail` as its tooltip, and the terminal shows `◷15m`. Use `DELAYED_SEGMENT` when the data is delayed by no single figure. `splitDelayedStatus(segment)` turns a status that starts with `15m delayed · ` into the clock and the rest of the text.
 
@@ -1664,6 +1788,8 @@ ctx.registerTickerResearchTab({
 
 A tab that would open on an empty state for most tickers should not be visible for them: company filings are `["equity"]`, distributions and 13F ownership `["equity", "fund"]`.
 
+Set `proOnly: true` on a tab that shows its upgrade screen to every account without Gloom Cloud Pro. A Ticker Research pane restored on such a tab for an account without Pro opens on Overview, and the tab (with its upgrade screen) shows once someone picks it; the pane keeps the tab saved for when the account has Pro. Leave it off a tab that shows a free preview without Pro.
+
 ## Example: adding a Ticker Research tab
 
 The simplest plugin type. This adds a new tab to the Ticker Research pane:
@@ -1725,15 +1851,17 @@ export default {
 
 Every pane has to work with no mouse, in the terminal and on the desktop. Most of it comes from the kit, as long as the pane uses it:
 
-- **Footer hints are key bindings.** `usePaneFooter("my-pane", () => ({ hints: [{ id: "add", key: "a", label: "dd", onPress: add }] }), [add])` both draws `[a]dd` and binds `a` while the pane is focused and no field owns the keyboard. A pane does not bind a hinted key a second time. If it must (the key does something slightly different in one mode), its handler calls `event.preventDefault()` when it acts, or the footer fires the hint again. Keys use the keybinding grammar: `a`, `!`, `/`, `Enter`, `Ctrl+S`.
+- **Footer hints are key bindings.** `usePaneFooter("my-pane", () => ({ hints: [{ id: "add", key: "a", label: "dd", onPress: add }] }), [add])` both draws the hint and binds `a` while the pane is focused and no field owns the keyboard. `label` is what the terminal writes after `[key]`: the rest of the word when the key is its first letter (`label: "dd"` is `[a]dd`), and a space and the words when it is not (`{ key: "x", label: " remove" }` is `[x] remove`); a key that is not one letter (`Enter`, `Esc`, `/`, `Ctrl+S`) is followed by its words (`label: "pick"`). The desktop app and the web draw the key in a keycap before the whole words, "add" and "remove", read from that label. A whole word right after a letter key (`{ key: "m", label: "re-arm" }`) needs a `title` or an `id` that names it (`title: "Re-arm"`, or `id: "rearm"`), or it reads "mre-arm". A pane does not bind a hinted key a second time. If it must (the key does something slightly different in one mode), its handler calls `event.preventDefault()` when it acts, or the footer fires the hint again. Keys use the keybinding grammar: `a`, `!`, `/`, `Enter`, `Ctrl+S`.
 - **The pane menu lists everything.** `.`, `Shift+F10` or the Menu key (and the `...` button) open the focused pane's menu: every enabled footer hint with its key, then entries the pane's kit controls add, the zap quick settings as toggles, then Settings, Fullscreen, Move to New Layout (or Move Back), Float, Lock, Close and the window actions. Give a hint a `title` when its key is not the first letter of the action (`{ key: "x", label: "port all", title: "Export All" }`); otherwise the menu reads `[a]dd` as "Add".
 - **Actions without a key** go in the pane menu with `usePaneMenuItems(id, () => items, deps)`. The items follow `PaneFooterScope` like hints, so an inactive tab's items drop out.
-- **Kit controls register themselves.** A focused `DataTableView` whose headers sort (it has `onHeaderClick`) offers "Sort by…" and "Reverse Sort" (`isColumnSortable` leaves out a column its header click ignores; `onSortChange` makes Reverse Sort flip a header that also cycles through unsorted), and moves its cursor on `Home`/`End`/`PageUp`/`PageDown`. A `QueryBar` binds `/` to its search and lists every filter, the view and "Clear Filters". A focused `Tabs` strip lists New/Close/Move Tab for the handlers it has. The first kit `Button` in an `EmptyState` or `PaneStatusBody` `actions` answers `Enter` and shows it; every action there is in the pane menu.
+- **Kit controls register themselves.** A focused `DataTableView` whose headers sort (it has `onHeaderClick`) offers "Sort by…" and "Reverse Sort" (`isColumnSortable` leaves out a column its header click ignores; `onSortChange` makes Reverse Sort flip a header that also cycles through unsorted), one whose columns move offers "Move Column…" and, once the reader has moved one, "Reset Columns", and it moves its cursor on `Home`/`End`/`PageUp`/`PageDown`. A `QueryBar` binds `/` to its search and lists every filter, the view and "Clear Filters". A focused `Tabs` strip lists New/Close/Move Tab for the handlers it has. The first kit `Button` in an `EmptyState` or `PaneStatusBody` `actions` answers `Enter` and shows it; every action there is in the pane menu.
 - An inline action that has to stay a body button (an action beside a failure) goes in `ButtonActionScope`, which gives its first kit `Button` Enter and lists every one in the pane menu. Links and ticker badges in a detail go in `PaneLinkMenu`, which lists each as "Open …" in the pane menu.
 - `onRootKeyDown` and `onDetailKeyDown` return `true` for a key they handled; the table marks it handled.
 - A stack detail that reads like a document goes in a `DetailScrollBody` (`resetScrollKey` is the open item's id, so the next item starts at the top). Pass its ref to `DataTableStackView` as `detailScrollRef` and j/k and the arrows step it a line at a time instead of a quarter page.
+- **Esc and closing.** Esc Esc closes the focused pane, and one Esc nothing took closes a floating window. A pane keeps its Esc by handling it (`event.preventDefault()`); one that closes a menu of its own also calls `keepEscapeFromClosing(event)`, and one that leaves an empty field calls `countEscapeTowardClose(event)`. A pane holding something Esc would throw away (a draft that goes with the pane, an answer still coming in) calls `usePaneUnsentWork(holds)`, and no Esc closes it. All three come from `gloomberb/react`; [docs/pane-conventions.md](docs/pane-conventions.md) has the rules.
 - **Dialogs**: `useDialogKeyboard` for keys, Enter submits, Esc closes. Dialogs stack on both hosts, so a field editor opened from a dialog returns to it. On the desktop, Tab and Shift+Tab walk a dialog's controls unless the dialog handles Tab itself (a settings list or form ring moves its own cursor), and a focused control shows a ring.
 - `useActionShortcut("pane-menu")` from `gloomberb/ui` returns the key the host advertises for an action (or `plugin:<id>`), for a tooltip or a `Button`/`IconButton` `shortcut`. Desktop `IconButton` tooltips show the shortcut.
+- **Key labels follow the host.** On a Mac (the desktop app and a Mac browser) keys read in Apple's notation, `⇧⌘F`, `⌃S`, `⇧↩`; the terminal, Windows and Linux spell them out, `Ctrl+Shift+F`. Write keys in the keybinding grammar (`Ctrl+S`, `Shift+Enter`, `CmdOrCtrl+F`): footer hints, `Button` and `IconButton` shortcuts, menu accelerators and dialog key hints show them in the host's notation. A key named inside a sentence goes through `useShortcutLabel()` from `gloomberb/ui`: `` `press ${useShortcutLabel()("Ctrl+S")} to save` ``. Never write `Cmd+` or `Ctrl+` into copy.
 - Pane keys are single unmodified letters that the app has not reserved. The reserved keys are listed in [pane conventions](docs/pane-conventions.md#8-sidebars-loading-input).
 
 ## UI guidelines for plugins
@@ -1912,7 +2040,7 @@ A broker whose terms restrict redistributing its market data sets `localMarketDa
 ## Tips
 
 - Look at the built-in plugins in `src/plugins/builtin/` for real-world examples
-- Use `order` on Ticker Research tabs to control position (core tabs use 10, 20, 30)
+- A plugin's Ticker Research tab gets a top tab of its own after the built-in groups (Overview through Notes); `order` sorts plugin tabs among themselves
 - Toggleable plugins can be enabled/disabled by users from settings (`Ctrl+,`)
 - The terminal renderer is backed by [OpenTUI](https://opentui.com/) packages such as `@opentui/core` and `@opentui/react`; plugin UI should stay on `gloomberb/ui` and `gloomberb/components`
 - Use `ctx.persistence` for cached resources, `ctx.resume` for state panes render, `ctx.configState` for configuration, and `ctx.teamState` for data shared with a team

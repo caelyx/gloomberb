@@ -125,6 +125,25 @@ export async function performEmailAuth(mode: AccountMode, email: string, passwor
   } else {
     user = await apiClient.signIn(email, password);
   }
+  return finishAccountSignIn(user);
+}
+
+/**
+ * Signs in, or up, with the ID token Google One Tap returned on the hosted
+ * terminal, then finishes the way an email login does. Google has verified
+ * the address, so no verification email goes out.
+ */
+export async function performGoogleOneTapAuth(idToken: string): Promise<AuthUser> {
+  return finishAccountSignIn(await apiClient.signInWithGoogle(idToken));
+}
+
+/**
+ * What every sign-in does once the server said yes: the captured session goes
+ * to the chat controller (and so to plugin persistence), an unverified account
+ * gets its verification email, the visitor's attribution and experiment arms
+ * join the account, and the session is refreshed.
+ */
+async function finishAccountSignIn(user: AuthUser): Promise<AuthUser> {
   if (apiClient.getCurrentUser()?.id !== user.id) throw new Error("Another sign-in replaced this request.");
   const sessionToken = apiClient.getSessionToken();
   if (sessionToken) {
@@ -137,8 +156,30 @@ export async function performEmailAuth(mode: AccountMode, email: string, passwor
     throw new Error("Another sign-in replaced this request.");
   }
   identifyResearchUser();
-  await chatController.refreshSession().catch(logFailure("account-auth", "Session refresh after email authentication failed"));
+  await chatController.refreshSession().catch(logFailure("account-auth", "Session refresh after authentication failed"));
   return user;
+}
+
+/**
+ * Changes the account's password. The service signs every other device out
+ * and moves this one to a new session, whose cookie the API client takes
+ * from the answer. That session goes to the session owner here, as a
+ * sign-in's does, so a restart stays signed in. An answer that is an error
+ * can still carry it (the password changed, but not every other device
+ * could be signed out), and it is kept then too.
+ */
+export async function changeAccountPassword(currentPassword: string, newPassword: string): Promise<void> {
+  const before = apiClient.getSessionToken();
+  try {
+    await apiClient.changePassword(currentPassword, newPassword);
+  } finally {
+    const after = apiClient.getSessionToken();
+    const user = apiClient.getCurrentUser();
+    if (after && after !== before && user) {
+      chatController.adoptSession(after, user);
+      await chatController.refreshSession().catch(logFailure("account-auth", "Session refresh after a password change failed"));
+    }
+  }
 }
 
 export interface AccountFormState {

@@ -18,6 +18,8 @@ import {
   type StatItem,
 } from "../../../components";
 import { spanDigits } from "../../../components/chart-table";
+import { savedCopyFooterInfo } from "../../../components/layout/pane/footer";
+import { isPermanentClientError } from "../../../api-client/errors";
 import { getTableWidth, hasMeaningfulTableHorizontalOverflow } from "../../../components/ui/table-layout";
 import type { CompositeAxisDomain } from "../../../components/chart/composite/types";
 import {
@@ -28,14 +30,17 @@ import {
 } from "../../../sources/gloomberb-cloud/fred-series";
 import { colors } from "../../../theme/colors";
 import { Box, Text } from "../../../ui";
-import { displayWidth, truncateToDisplayWidth } from "../../../utils/format";
+import { MISSING_VALUE, displayWidth, truncateToDisplayWidth } from "../../../utils/format";
 import { useOpenTickerChoice } from "../shared/ticker-choice";
 import { resolveFredMapping, projectFredHistory, fredHistoryUnits } from "./fred-series-map";
-import { actualColor, CALENDAR_TIME_ZONE_LABEL, timeLabel } from "./calendar-model";
+import { actualColor, CALENDAR_TIME_ZONE_LABEL, econEventName, figureGap, figureGapText, timeLabel } from "./calendar-model";
+import { figureWithCurrency } from "./figures";
 import { hasNoStatedTime, isAllDayEvent, type EconEvent } from "./types";
 
 interface EconDetailViewProps {
   event: EconEvent;
+  /** The calendar the event is listed in: another row of its release with its figure says the source has none for it. */
+  calendar?: readonly EconEvent[];
   width: number;
   height: number;
   focused: boolean;
@@ -74,7 +79,7 @@ function formatHistoryValue(value: number, units: string): string {
 
 /** A move in a percentage is in points, so it never reads as a relative change. */
 function formatHistoryChange(change: number | null, units: string): string {
-  if (change == null) return "--";
+  if (change == null) return MISSING_VALUE;
   const text = isPercent(units)
     ? `${Math.abs(change).toFixed(2)}pp`
     : Math.abs(change).toLocaleString("en-US", { maximumFractionDigits: 1 });
@@ -119,10 +124,12 @@ function SourceLine({ source, kind, width }: { source: NonNullable<EconEvent["so
 const historyKey = (row: HistoryRow) => row.date;
 const historyDate = (row: HistoryRow) => new Date(`${row.date}T00:00:00Z`);
 
-export function EconDetailView({ event, width, height, focused }: EconDetailViewProps) {
+export function EconDetailView({ event, calendar, width, height, focused }: EconDetailViewProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [freshnessWarning, setFreshnessWarning] = useState<string | null>(null);
+  // The history's refresh failed and the copy saved at this time (ms) answered instead.
+  const [savedAt, setSavedAt] = useState<number | null>(null);
   const [data, setData] = useState<FredSeriesData | null>(null);
   // Null follows the latest period.
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
@@ -146,6 +153,7 @@ export function EconDetailView({ event, width, height, focused }: EconDetailView
       setLoading(false);
       setError(null);
       setFreshnessWarning(null);
+      setSavedAt(null);
       return;
     }
 
@@ -156,6 +164,7 @@ export function EconDetailView({ event, width, height, focused }: EconDetailView
         setLoading(false);
         setError(null);
         setFreshnessWarning(null);
+        setSavedAt(null);
         return;
       }
     } else {
@@ -165,6 +174,7 @@ export function EconDetailView({ event, width, height, focused }: EconDetailView
     setLoading(true);
     setError(null);
     setFreshnessWarning(null);
+    setSavedAt(null);
 
     loadCachedFredSeries(
       request,
@@ -174,12 +184,18 @@ export function EconDetailView({ event, width, height, focused }: EconDetailView
       }),
     )
       .then((entry) => {
+        // A refusal or a reply that fails validation is thrown by the load, never covered by a saved copy.
+        const saved = entry.source === "stale-fallback";
         setData(entry.data);
-        setFreshnessWarning(entry.stale
-          ? `Cached ${new Date(entry.fetchedAt).toISOString().slice(0, 10)} · refresh failed`
+        // A copy a failed refresh left says when it was saved, in the footer as every pane does;
+        // a series its source has not updated since is a note.
+        setSavedAt(saved ? entry.fetchedAt : null);
+        setFreshnessWarning(entry.stale && !saved
+          ? `Source not updated since ${new Date(entry.fetchedAt).toISOString().slice(0, 10)}.`
           : null);
       })
       .catch((err) => {
+        if (isPermanentClientError(err)) setData(null);
         setError(err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
@@ -199,6 +215,7 @@ export function EconDetailView({ event, width, height, focused }: EconDetailView
   // which asks which one when there are several.
   const openTickerChoice = useOpenTickerChoice();
   const relatedTickers = useMemo(() => mapping?.relatedTickers ?? [], [mapping]);
+  usePaneFooter("econ-detail:saved", () => ({ info: savedCopyFooterInfo([savedAt]) }), [savedAt]);
   usePaneFooter("econ-detail:related", () => relatedTickers.length > 0 ? {
     hints: [{
       id: "related",
@@ -213,10 +230,14 @@ export function EconDetailView({ event, width, height, focused }: EconDetailView
 
   // The stack bar names the event; the detail opens on the release figures,
   // the outcome first so a short detail keeps it.
+  const gap = event.actual ? null : figureGap(event, Date.now(), calendar);
   const releaseItems: StatItem[] = [
-    ...(event.actual ? [{ id: "actual", label: "Actual", value: event.actual, color: actualColor(event.actual, event.forecast) }] : []),
-    ...(event.forecast ? [{ id: "forecast", label: "Forecast", value: event.forecast }] : []),
-    ...(event.prior ? [{ id: "prior", label: "Prior", value: event.prior }] : []),
+    // An amount with its currency beside it (-556.5B JPY), where the server says it.
+    ...(event.actual ? [{ id: "actual", label: "Actual", value: figureWithCurrency(event.actual, event.currency)!, color: actualColor(event.actual, event.forecast) }]
+      // Past its time with no figure in yet: when it was due, or that the source has none.
+      : gap ? [{ id: "actual", label: "Actual", value: figureGapText(event, gap), color: colors.warning }] : []),
+    ...(event.forecast ? [{ id: "forecast", label: "Forecast", value: figureWithCurrency(event.forecast, event.currency)! }] : []),
+    ...(event.prior ? [{ id: "prior", label: "Prior", value: figureWithCurrency(event.prior, event.currency)! }] : []),
     // The date the prior rate was observed, labelled as Central Bank Rates labels it.
     ...(event.prior && event.priorAsOf ? [{ id: "priorAsOf", label: "As of", value: event.priorAsOf }] : []),
     // A bank that states no time has none here, and says so; a publisher's own clock sits under the time.
@@ -238,7 +259,7 @@ export function EconDetailView({ event, width, height, focused }: EconDetailView
   const rows = useMemo<HistoryRow[]>(() => projected
     .map((obs, index) => ({ date: obs.date, value: obs.value, change: index > 0 ? obs.value - projected[index - 1]!.value : null }))
     .reverse(), [projected]);
-  const label = event.event;
+  const label = econEventName(event);
   const series = useMemo(() => [staticSeries(
     projected.map((obs) => scalarPoint(new Date(`${obs.date}T00:00:00Z`), obs.value)),
     { id: "fred-history", label, color: colors.positive, calendarSpaced: true },
@@ -308,14 +329,13 @@ export function EconDetailView({ event, width, height, focused }: EconDetailView
         </>
       ) : undefined}
       getItemKey={historyKey}
-      renderCell={(row, column, _index, state) => {
-        const selected = state.selected ? colors.selectedText : undefined;
-        return column.id === "date"
-          ? { text: row.date, color: selected ?? colors.textDim }
-          : column.id === "value"
-            ? { text: formatHistoryValue(row.value, units), color: selected ?? (row.value < 0 ? colors.negative : colors.text) }
-            : { text: formatHistoryChange(row.change, units), color: selected ?? changeColor(row.change, units) };
-      }}
+      // The table draws the selected row in the selection's text colour; a change keeps its up or down tone.
+      renderCell={(row, column) => column.id === "date"
+        ? { text: row.date, color: colors.textDim }
+        : column.id === "value"
+          ? { text: formatHistoryValue(row.value, units), color: row.value < 0 ? colors.negative : colors.text }
+          : { text: formatHistoryChange(row.change, units), color: changeColor(row.change, units) }}
+      selectedTextOverridesCellColor
       sortColumnId={null}
       sortDirection="desc"
       emptyStateTitle="No observations."

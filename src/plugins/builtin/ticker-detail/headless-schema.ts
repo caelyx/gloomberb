@@ -5,6 +5,11 @@ import { HISTORY_DEFAULT_RANGE } from "./data-panes/history-bars";
 import { RETURN_INTERVAL_VALUES, RETURN_RANGES } from "./data-panes/returns-model";
 import { PRICE_WINDOW_FROM_HELP, PRICE_WINDOW_TO_HELP } from "../../../utils/price-window";
 import type { HeadlessPaneOptionDef } from "../../../types/headless";
+import { QUOTE_MONITOR_MAX_TICKERS } from "../../../tickers/list";
+import { STATEMENT_CURRENCY_OPTION } from "../shared/statement-currency";
+
+/** The most tickers one FA report reads: each is a full statements load. */
+const FINANCIAL_REPORT_MAX_TICKERS = 10;
 
 /** `--from 2007 --to 2009`: the report's bars for those dates. The pane keeps its range, so a capture refuses them. */
 const WINDOW_OPTIONS: HeadlessPaneOptionDef[] = [
@@ -18,9 +23,15 @@ type PaneSchema = Pick<HeadlessPaneDefinition, "argument" | "options" | "discove
 
 export const paneSchemas = {
   "financial-analysis-pane": {
-    argument: { kind: "ticker" },
+    // A ticker, or several in one long table; the pane, and so `shot`, shows one.
+    argument: {
+      kind: "tickers", maximum: FINANCIAL_REPORT_MAX_TICKERS, placeholder: "ticker",
+      description: `Company ticker, or up to ${FINANCIAL_REPORT_MAX_TICKERS} in one long table (Ticker, Period, Period End, Metric, Value, Unit).`,
+      examples: ["V MCO CPRT --statement profitability"],
+    },
     options: [
       FINANCIAL_PERIOD_OPTION,
+      { ...STATEMENT_CURRENCY_OPTION, shot: { reportOnly: "compares converted statement rows; GF charts converted figures" } },
       {
         key: "statement",
         description: "Statement or ratio tab to display.",
@@ -38,19 +49,39 @@ export const paneSchemas = {
         ],
         defaultValue: "income",
       },
+      {
+        key: "layout",
+        description: "wide: one ticker's periods as columns, as the pane shows them. long: a row per ticker, fiscal period and metric, each with its period end and unit, for pasting several companies into one table. Default wide for one ticker, long for several.",
+        type: "enum",
+        values: [{ value: "wide" }, { value: "long", aliases: ["tidy", "rows"] }],
+        example: "--layout long --csv",
+        shot: { reportOnly: "lays the report's rows out a row per period and metric" },
+      },
     ],
     discovery: {
       id: "financial-statements",
       aliases: ["financials", "financial statement", "income statement", "balance sheet", "cash flow statement", "financial ratios"],
+      // What a memo asks for by name: `catalog roic` and `catalog "operating margin"` find FA, and `fn ROIC V` opens
+      // the tab with it, as `fn runway VKTX` is the liquidity view, where cash + ST investments, burn and runway are.
+      intents: [
+        "ROIC (return on invested capital), ROE, ROA and gross, operating and net margins, with NOPAT and invested capital",
+        "Capex, capex as a share of revenue, free cash flow and reinvestment rate by fiscal year",
+      ],
+      opens: [
+        { words: ["runway", "cash runway", "burn", "cash burn", "months of cash"], argument: "", options: { statement: "liquidity" } },
+        { words: ["roic", "return on invested capital", "nopat", "operating margin", "gross margin", "net margin", "margins"], argument: "",
+          options: { statement: "profitability" } },
+        { words: ["capex", "capital expenditure", "capital expenditures", "reinvestment rate"], argument: "", options: { statement: "cashflow" } },
+      ],
       limitations: [
-        "One company per invocation; use GF for cross-company metric comparisons.",
+        "Several companies come as one long table, a row per figure; GF charts one metric across companies over more years.",
         "Excludes bank regulatory capital (CET1, risk-weighted assets) and REIT FFO/AFFO.",
       ],
       screenshotReadiness: "ready",
     },
   },
   "quote-monitor-pane": {
-    argument: { kind: "tickers" },
+    argument: { kind: "tickers", maximum: QUOTE_MONITOR_MAX_TICKERS },
     options: [],
     discovery: {
       id: "quote-comparison",
@@ -92,11 +123,18 @@ export const paneSchemas = {
       },
       {
         key: "interval",
-        description: "Bar size of each return; a range it does not reach uses the nearest longer bar the source keeps.",
+        description: "Bar size of each return; a range it does not reach uses the nearest longer bar the source keeps. Default: hourly to 1W, daily to 1Y, weekly for 5Y, monthly for ALL.",
         type: "enum",
         aliases: ["bar", "granularity", "resolution"],
         values: RETURN_INTERVAL_VALUES,
-        defaultValue: "1h",
+        pluginState: { pluginId: "ticker-research" },
+      },
+      {
+        key: "view",
+        description: "Rendered pane view: the table of returns, or a chart of a bar per interval. The report lists the rows either way.",
+        type: "enum",
+        values: [{ value: "table" }, { value: "chart", aliases: ["bars"] }],
+        defaultValue: "table",
         pluginState: { pluginId: "ticker-research" },
       },
       ...WINDOW_OPTIONS,
@@ -104,7 +142,8 @@ export const paneSchemas = {
     discovery: {
       id: "returns",
       aliases: ["returns", "interval returns", "cumulative return", "performance", "max drawdown"],
-      // A capture is read from the rendered table, as before the report existed.
+      // A capture is read from the rendered pane, as before the report existed:
+      // the table's rows, or the bars the chart view drew.
       screenshotReadiness: "live-dom",
     },
   },

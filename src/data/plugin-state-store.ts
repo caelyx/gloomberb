@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
+import { createSqliteAccess, type SqliteAccess } from "./sqlite/access";
 import { safeParseJson, serializeJson } from "./sqlite/json";
-import { withSqliteBusyRetry } from "./sqlite/retry";
 
 const DEFAULT_PLUGIN_STATE_SCHEMA_VERSION = 1;
 
@@ -24,14 +24,77 @@ interface CachedPluginStateRecord {
   rawValue: string;
 }
 
+/** A stored plugin state row this build cannot read: damaged JSON, or written under another schema version. */
+class UnreadablePluginStateError extends Error {
+  constructor() {
+    super("Stored plugin state could not be read.");
+    this.name = "UnreadablePluginStateError";
+  }
+}
+
+/** What a row holds for a reader: its record, nothing, or content this build cannot read (queued or stored). */
+type PluginStateLookup<T> =
+  | { record: PluginStateRecord<T> }
+  | { absent: true }
+  | { unreadable: "queued" | "stored" };
+
+const ABSENT = { absent: true } as const;
+
+/** A queued write's record (null for a delete), one object per write. */
+interface PendingPluginState {
+  pluginId: string;
+  key: string;
+  record: CachedPluginStateRecord | null;
+}
+
+function stateKey(pluginId: string, key: string): string {
+  return `${pluginId}:${key}`;
+}
+
+/** A queued write's row, unambiguous where ids and keys hold colons. */
+function rowKey(pluginId: string, key: string): string {
+  return `${pluginId}\u0000${key}`;
+}
+
 export class PluginStateStore {
   private readonly cache = new Map<string, CachedPluginStateRecord>();
+  /** Writes queued behind another program's lock, read back until they land. */
+  private readonly pending = new Map<string, PendingPluginState>();
 
-  constructor(private readonly db: Database) {}
+  constructor(
+    private readonly db: Database,
+    private readonly access: SqliteAccess = createSqliteAccess(db),
+  ) {}
 
   get<T>(pluginId: string, key: string, schemaVersion = DEFAULT_PLUGIN_STATE_SCHEMA_VERSION): PluginStateRecord<T> | null {
-    const cacheKey = `${pluginId}:${key}`;
-    const row = withSqliteBusyRetry("load plugin state", () => (
+    const found = this.lookup<T>(pluginId, key, schemaVersion);
+    if ("record" in found) return found.record;
+    // A stored row this build cannot read is dropped; a queued write in another version is left to land.
+    if ("unreadable" in found && found.unreadable === "stored") this.delete(pluginId, key);
+    return null;
+  }
+
+  /**
+   * Like `get`, except that a row this build cannot read throws `UnreadablePluginStateError` and stays stored,
+   * instead of being dropped and read as absent. Null still means nothing is stored.
+   */
+  getStrict<T>(pluginId: string, key: string, schemaVersion = DEFAULT_PLUGIN_STATE_SCHEMA_VERSION): PluginStateRecord<T> | null {
+    const found = this.lookup<T>(pluginId, key, schemaVersion);
+    if ("record" in found) return found.record;
+    if ("unreadable" in found) throw new UnreadablePluginStateError();
+    return null;
+  }
+
+  private lookup<T>(pluginId: string, key: string, schemaVersion: number): PluginStateLookup<T> {
+    const cacheKey = stateKey(pluginId, key);
+    const pending = this.pending.get(rowKey(pluginId, key));
+    if (pending) {
+      if (!pending.record) return ABSENT;
+      return pending.record.schemaVersion === schemaVersion
+        ? { record: pending.record as PluginStateRecord<T> }
+        : { unreadable: "queued" };
+    }
+    const row = this.access.run("load plugin state", () => (
       this.db
         .query<{ schema_version: number; value: string; updated_at: number }, [string, string]>(
           "SELECT schema_version, value, updated_at FROM plugin_state WHERE plugin_id = ? AND key = ?",
@@ -40,24 +103,22 @@ export class PluginStateStore {
     ));
     if (!row) {
       this.cache.delete(cacheKey);
-      return null;
+      return ABSENT;
     }
     if (row.schema_version !== schemaVersion) {
       this.cache.delete(cacheKey);
-      this.delete(pluginId, key);
-      return null;
+      return { unreadable: "stored" };
     }
 
     const cached = this.cache.get(cacheKey);
     if (cached && cached.schemaVersion === row.schema_version && cached.updatedAt === row.updated_at && cached.rawValue === row.value) {
-      return cached as PluginStateRecord<T>;
+      return { record: cached as PluginStateRecord<T> };
     }
 
     const value = safeParseJson<T>(row.value);
     if (value == null) {
       this.cache.delete(cacheKey);
-      this.delete(pluginId, key);
-      return null;
+      return { unreadable: "stored" };
     }
 
     const record: CachedPluginStateRecord = {
@@ -67,7 +128,7 @@ export class PluginStateStore {
       rawValue: row.value,
     };
     this.cache.set(cacheKey, record);
-    return record as PluginStateRecord<T>;
+    return { record: record as PluginStateRecord<T> };
   }
 
   set(pluginId: string, key: string, value: unknown, schemaVersion = DEFAULT_PLUGIN_STATE_SCHEMA_VERSION): void {
@@ -77,46 +138,42 @@ export class PluginStateStore {
   setMany(entries: PluginStateSetEntry[]): void {
     if (entries.length === 0) return;
     const updatedAt = Date.now();
-    const records = entries.map((entry) => ({
+    const writes: PendingPluginState[] = entries.map((entry) => ({
       pluginId: entry.pluginId,
       key: entry.key,
-      value: entry.value,
-      schemaVersion: entry.schemaVersion ?? DEFAULT_PLUGIN_STATE_SCHEMA_VERSION,
-      rawValue: serializeJson(entry.value),
+      record: {
+        value: entry.value,
+        schemaVersion: entry.schemaVersion ?? DEFAULT_PLUGIN_STATE_SCHEMA_VERSION,
+        updatedAt,
+        rawValue: serializeJson(entry.value),
+      },
     }));
 
-    withSqliteBusyRetry("save plugin state", () => {
+    this.write("save plugin state", writes, writes.length === 1, () => {
       const insert = this.db.query(
         `INSERT OR REPLACE INTO plugin_state (plugin_id, key, schema_version, value, updated_at)
          VALUES (?, ?, ?, ?, ?)`,
       );
       const tx = this.db.transaction(() => {
-        for (const record of records) {
-          insert.run(record.pluginId, record.key, record.schemaVersion, record.rawValue, updatedAt);
+        for (const { pluginId, key, record } of writes) {
+          insert.run(pluginId, key, record!.schemaVersion, record!.rawValue, updatedAt);
         }
       });
       tx();
     });
 
-    for (const record of records) {
-      this.cache.set(`${record.pluginId}:${record.key}`, {
-        value: record.value,
-        schemaVersion: record.schemaVersion,
-        updatedAt,
-        rawValue: record.rawValue,
-      });
-    }
+    for (const { pluginId, key, record } of writes) this.cache.set(stateKey(pluginId, key), record!);
   }
 
   delete(pluginId: string, key: string): void {
-    withSqliteBusyRetry("delete plugin state", () => {
+    this.write("delete plugin state", [{ pluginId, key, record: null }], true, () => {
       this.db.query("DELETE FROM plugin_state WHERE plugin_id = ? AND key = ?").run(pluginId, key);
     });
-    this.cache.delete(`${pluginId}:${key}`);
+    this.cache.delete(stateKey(pluginId, key));
   }
 
   keys(pluginId: string): string[] {
-    return withSqliteBusyRetry("list plugin state keys", () => (
+    const stored = this.access.run("list plugin state keys", () => (
       this.db
         .query<{ key: string }, [string]>(
           "SELECT key FROM plugin_state WHERE plugin_id = ? ORDER BY key",
@@ -124,10 +181,18 @@ export class PluginStateStore {
         .all(pluginId)
         .map((row) => row.key)
     ));
+    if (this.pending.size === 0) return stored;
+    const keys = new Set(stored);
+    for (const entry of this.pending.values()) {
+      if (entry.pluginId !== pluginId) continue;
+      if (entry.record) keys.add(entry.key);
+      else keys.delete(entry.key);
+    }
+    return [...keys].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   }
 
   pluginIds(): string[] {
-    return withSqliteBusyRetry("list plugin state ids", () => (
+    const stored = this.access.run("list plugin state ids", () => (
       this.db
         .query<{ plugin_id: string }, []>(
           "SELECT DISTINCT plugin_id FROM plugin_state ORDER BY plugin_id",
@@ -135,10 +200,19 @@ export class PluginStateStore {
         .all()
         .map((row) => row.plugin_id)
     ));
+    if (this.pending.size === 0) return stored;
+    const ids = new Set(stored);
+    for (const { pluginId } of this.pending.values()) {
+      if (this.keys(pluginId).length > 0) ids.add(pluginId);
+      else ids.delete(pluginId);
+    }
+    return [...ids].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   }
 
   clear(pluginId: string): void {
-    withSqliteBusyRetry("clear plugin state", () => {
+    const cleared = this.keys(pluginId).map((key): PendingPluginState => ({ pluginId, key, record: null }));
+    // Deletes rows this store may not know of: never one row's write.
+    this.write("clear plugin state", cleared, false, () => {
       this.db.query("DELETE FROM plugin_state WHERE plugin_id = ?").run(pluginId);
     });
     for (const cacheKey of this.cache.keys()) {
@@ -146,5 +220,24 @@ export class PluginStateStore {
         this.cache.delete(cacheKey);
       }
     }
+  }
+
+  /**
+   * Runs `statement` through the write queue, reading `entries` back until it
+   * lands. A write of exactly one row (`oneRow`) replaces a queued write of
+   * the same row.
+   */
+  private write(operationName: string, entries: PendingPluginState[], oneRow: boolean, statement: () => void): void {
+    for (const entry of entries) this.pending.set(rowKey(entry.pluginId, entry.key), entry);
+    const only = oneRow && entries.length === 1 ? entries[0] : undefined;
+    this.access.write(operationName, statement, {
+      ...(only ? { key: `plugin_state\u0000${rowKey(only.pluginId, only.key)}` } : {}),
+      settled: () => {
+        for (const entry of entries) {
+          const pendingKey = rowKey(entry.pluginId, entry.key);
+          if (this.pending.get(pendingKey) === entry) this.pending.delete(pendingKey);
+        }
+      },
+    });
   }
 }

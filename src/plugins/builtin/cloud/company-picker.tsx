@@ -44,15 +44,13 @@ import { useToastHost } from "../../../ui/toast";
 import { debugLog } from "../../../utils/debug-log";
 import { isPlainKey } from "../../../utils/keyboard";
 import type { PluginRegistry } from "../../registry";
-import { STARTER_SYMBOLS } from "../../../tickers/starter-symbols";
+import { SEEDED_LIST_MIN_STARTERS, STARTER_SYMBOLS } from "../../../tickers/starter-symbols";
 
 const log = debugLog.createLogger("company-picker");
 
 const MIN_COMPANY_PICKS = 2;
 /** Only accounts this new are asked; nobody who has used Gloom for a while. */
 const NEW_ACCOUNT_MS = 24 * 60 * 60 * 1000;
-/** The seeded lists hold 7 (web first run) or 12 (startup) starter tickers. */
-const SEEDED_LIST_MIN_STARTERS = 7;
 const SEARCH_DEBOUNCE_MS = 250;
 const SEARCH_RESULTS = 6;
 const GRID_COLUMNS = 4;
@@ -189,7 +187,7 @@ function LogoTile({ symbol, assetCategory, size }: { symbol: string; assetCatego
     return <Box alignItems="center" justifyContent="center" style={tile}>{letter}</Box>;
   }
   return (
-    <ImageSurface src={src} alt={symbol} objectFit="contain" alignItems="center" justifyContent="center" style={tile}>
+    <ImageSurface src={src} alt={symbol} objectFit="contain" fallbackWhileLoading alignItems="center" justifyContent="center" style={tile}>
       {letter}
     </ImageSurface>
   );
@@ -579,13 +577,15 @@ export function CompanyPicker({
 /**
  * Mounted next to the onboarding. Opens once per session, when a brand-new
  * account is signed in with only the seeded lists and the onboarding is not
- * running.
+ * running. It waits for an open command bar to close: the card takes every
+ * key, so what the user was typing there would go nowhere.
  */
 export function CompanyPickerHost({ pluginRegistry }: { pluginRegistry: PluginRegistry }) {
   const dispatch = useAppDispatch();
   const stateRef = useAppStateRef();
   const toast = useToastHost();
   const onboardingDone = useAppSelector((state) => state.config.onboardingComplete && !state.config.onboardingProgress);
+  const commandBarOpen = useAppSelector((state) => state.commandBarOpen);
   const [user, setUser] = useState<AuthUser | null>(() => apiClient.getCurrentUser());
   const [open, setOpen] = useState(false);
   const askedRef = useRef(false);
@@ -593,12 +593,12 @@ export function CompanyPickerHost({ pluginRegistry }: { pluginRegistry: PluginRe
   useEffect(() => apiClient.subscribeCurrentUser(() => setUser(apiClient.getCurrentUser())), []);
 
   useEffect(() => {
-    if (askedRef.current || !onboardingDone || !isNewAccount(user)) return;
+    if (askedRef.current || !onboardingDone || commandBarOpen || !isNewAccount(user)) return;
     const watchlistId = stateRef.current.config.watchlists[0]?.id;
     if (!needsCompanyPicks(stateRef.current.tickers.values(), watchlistId)) return;
     askedRef.current = true;
     setOpen(true);
-  }, [onboardingDone, stateRef, user]);
+  }, [commandBarOpen, onboardingDone, stateRef, user]);
 
   const searchCompanies = useCallback<SearchCompanies>(
     (query) => pluginRegistry.marketData.search(query),

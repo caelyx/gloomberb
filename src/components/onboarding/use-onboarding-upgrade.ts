@@ -6,14 +6,13 @@ import { chatController } from "../../plugins/builtin/chat/controller";
 import type { CloudBillingInterval } from "../../account/billing";
 import { loadUpgradeOffer, type UpgradeOffer } from "../../account/upgrade-dialog";
 import { useCloudUpgradeAction } from "../../plugins/builtin/shared/cloud-upgrade";
-import { useUpgradePersonalization } from "../../account/upgrade-personalization";
 import { usePlanAccess } from "../../api-client/plan-access";
+import { logFailure } from "../../utils/log-failure";
 
 export function useOnboardingUpgrade({
-  stage, progress, saveProgressInBackground, persistProgress, shown,
+  stage, progress, saveProgressInBackground, persistProgress,
 }: {
   stage: OnboardingStage;
-  shown: boolean;
   progress: OnboardingProgress;
   saveProgressInBackground: (patch: Partial<OnboardingProgress> & Pick<OnboardingProgress, "stage">, baseConfig?: AppConfig | undefined) => void;
   persistProgress: (patch: Partial<OnboardingProgress> & Pick<OnboardingProgress, "stage">, baseConfig?: AppConfig | undefined) => Promise<AppConfig>;
@@ -25,17 +24,16 @@ export function useOnboardingUpgrade({
   const appActive = useAppActive();
   const planAccess = usePlanAccess();
   const openUpgrade = useCloudUpgradeAction("onboarding-pro");
-  // The step lists the features from its first frame, so that is when it is shown.
-  const personalTickers = useUpgradePersonalization("onboarding-pro", shown && stage === "upgrade");
   // The price and whether this account still has its trial, asked again for
   // whichever account reaches the step.
   const accountId = planAccess.signedIn ? apiClient.getCurrentUser()?.id ?? null : null;
   useEffect(() => {
     if (stage !== "upgrade") return;
     let live = true;
-    void loadUpgradeOffer().then((loaded) => {
+    // A failed request answers an offer without prices; anything else is logged.
+    loadUpgradeOffer().then((loaded) => {
       if (live) setOffer(loaded);
-    });
+    }, logFailure("onboarding.upgrade", "Loading the upgrade offer failed"));
     return () => {
       live = false;
     };
@@ -44,7 +42,7 @@ export function useOnboardingUpgrade({
     if (stage !== "upgrade" || !progress.checkoutOpenedAt || !appActive) return;
     void apiClient.getSession()
       .then(() => chatController.refreshSession())
-      .catch(() => {});
+      .catch(logFailure("onboarding.upgrade", "Refresh session after checkout failed"));
   }, [appActive, progress.checkoutOpenedAt, stage]);
 
   useEffect(() => {
@@ -64,7 +62,7 @@ export function useOnboardingUpgrade({
           stage: "upgrade",
           accountStatus: progress.accountStatus,
           checkoutOpenedAt: new Date().toISOString(),
-        }).catch(() => {});
+        }).catch(logFailure("onboarding.upgrade", "Save checkout progress failed"));
       },
     });
   }, [billingInterval, openUpgrade, persistProgress, progress.accountStatus]);
@@ -82,6 +80,6 @@ export function useOnboardingUpgrade({
   }, [progress.accountStatus, saveProgressInBackground]);
 
   return {
-    offer, pricing, billingInterval, setBillingInterval, planAccess, primaryUpgradeAction, continueFree, personalTickers,
+    offer, pricing, billingInterval, setBillingInterval, planAccess, primaryUpgradeAction, continueFree,
   };
 }

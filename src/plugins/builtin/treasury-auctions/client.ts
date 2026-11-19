@@ -1,3 +1,5 @@
+import { MISSING_VALUE } from "../../../utils/format";
+import { ApiRequestError } from "../../../api-client/errors";
 import { createThrottledFetch } from "../../../utils/throttled-fetch";
 import type { TreasuryAuction, TreasuryAuctionRaw } from "./types";
 
@@ -13,6 +15,7 @@ const FIELDS = [
   "high_investment_rate",
   "high_yield",
   "avg_med_yield",
+  "low_yield",
   "high_price",
   "low_price",
   "avg_med_price",
@@ -28,6 +31,7 @@ const FIELDS = [
   "high_discnt_margin",
   "high_discnt_rate",
   "avg_med_discnt_rate",
+  "low_discnt_rate",
 ].join(",");
 
 export const AUCTION_HISTORY_DAYS = 120;
@@ -62,9 +66,13 @@ export interface AuctionQuery {
   pageSize?: number;
 }
 
+// A query that has not answered in 15 s does not answer the second time
+// either: the source stalls for a minute at a time. The board then stands on
+// TreasuryDirect and the saved copy (cache.ts) at once, not after 48 s of retries.
 const TREASURY_FETCH = createThrottledFetch({
   requestsPerMinute: 20,
   maxRetries: 2,
+  retryTimeouts: false,
   timeoutMs: 15_000,
   backoffBaseMs: 800,
   defaultHeaders: { Accept: "application/json" },
@@ -122,6 +130,33 @@ function toNumber(value: string | undefined | null): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/**
+ * A high and low in the order the auction cleared them. Fiscal Data has some
+ * early rows the other way round (the 30-year bond of 1982-02-04: high 14.47%,
+ * median 14.56%, low 14.61%; about 420 bills of 1979-83): a high below its low
+ * is read swapped when the median sits between them, and dropped when it does
+ * not, so neither reaches the stop-out as a negative spread. Prices follow a
+ * swapped pair. A bill's investment rate restates its high discount rate as
+ * the source had it, so once that pair is swapped or dropped the investment
+ * rate is blank rather than disagree with the discount rate beside it.
+ */
+export function inClearingOrder(auction: TreasuryAuction): TreasuryAuction {
+  let next = auction;
+  for (const [high, median, low] of [["highYield", "avgMedYield", "lowYield"], ["highDiscountRate", "avgMedDiscountRate", "lowDiscountRate"]] as const) {
+    const top = next[high], bottom = next[low], middle = next[median];
+    if (top == null || bottom == null || top >= bottom) continue;
+    const investment = high === "highDiscountRate" ? { highInvestmentRate: null } : {};
+    if (middle != null && middle >= top && middle <= bottom) {
+      const prices = next.highPrice != null && next.lowPrice != null && next.highPrice > next.lowPrice
+        ? { highPrice: next.lowPrice, lowPrice: next.highPrice } : {};
+      next = { ...next, [high]: bottom, [low]: top, ...prices, ...investment };
+    } else {
+      next = { ...next, [high]: null, [low]: null, ...investment };
+    }
+  }
+  return next;
+}
+
 export function normalizeAuction(raw: unknown): TreasuryAuction | null {
   if (!raw || typeof raw !== "object") return null;
   const record = raw as TreasuryAuctionRaw;
@@ -131,7 +166,7 @@ export function normalizeAuction(raw: unknown): TreasuryAuction | null {
   const cusip = (record.cusip ?? "").trim();
   if (!secType || !auctionDate) return null;
 
-  return {
+  return inClearingOrder({
     // A reopening reuses its original CUSIP but is auctioned on its own date,
     // so CUSIP plus date is what keeps reopenings from collapsing into one row.
     id: cusip ? `${cusip}|${auctionDate}` : `${secType}|${auctionDate}|${securityTerm}`,
@@ -139,14 +174,16 @@ export function normalizeAuction(raw: unknown): TreasuryAuction | null {
     // TIPS and FRNs are auctioned under the Note/Bond security type; their
     // yields are real yields and discount margins, not nominal yields.
     secType: record.inflation_index_security === "Yes" ? "TIPS" : record.floating_rate === "Yes" ? "FRN" : secType,
-    securityTerm: securityTerm || "—",
+    securityTerm: securityTerm || MISSING_VALUE,
     auctionDate,
     highInvestmentRate: toNumber(record.high_investment_rate),
     highDiscountRate: toNumber(record.high_discnt_rate),
     avgMedDiscountRate: toNumber(record.avg_med_discnt_rate),
+    lowDiscountRate: toNumber(record.low_discnt_rate),
     highDiscountMargin: toNumber(record.high_discnt_margin),
     highYield: toNumber(record.high_yield),
     avgMedYield: toNumber(record.avg_med_yield),
+    lowYield: toNumber(record.low_yield),
     highPrice: toNumber(record.high_price),
     lowPrice: toNumber(record.low_price),
     avgMedPrice: toNumber(record.avg_med_price),
@@ -157,7 +194,7 @@ export function normalizeAuction(raw: unknown): TreasuryAuction | null {
     primaryDealerAccepted: toNumber(record.primary_dealer_accepted),
     totalAccepted: toNumber(record.total_accepted),
     offeringAmount: toNumber(record.offering_amt),
-  };
+  });
 }
 
 export function parseTreasuryAuctionsPayload(body: unknown): TreasuryAuction[] {
@@ -222,9 +259,8 @@ export async function fetchTreasuryAuctions(
 ): Promise<TreasuryAuction[]> {
   return fetchAuctionPages(async (page) => {
     const response = await TREASURY_FETCH.fetch(buildAuctionsUrl(query, page));
-    if (!response.ok) {
-      throw new Error(`Treasury Fiscal Data request failed (${response.status})`);
-    }
+    // The status stays: an overloaded server is a failure a saved board may answer for, a refusal is not.
+    if (!response.ok) throw new ApiRequestError(`Treasury Fiscal Data request failed (${response.status})`, response.status);
     return response.json();
   });
 }

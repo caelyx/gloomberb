@@ -11,9 +11,17 @@ import {
 } from "../../../../telemetry/update-failures";
 import type { UpdateProgress } from "../../../../updater";
 import { writeLegacyDesktopFiles } from "../../../../../scripts/write-legacy-desktop-files";
-import { createElectrobunDesktopUpdater, firstTarPath, removeUpdateAsides, type ElectrobunUpdaterApi } from "./update";
+import { createElectrobunDesktopUpdater, firstTarPath, isWholeTar, removeUpdateAsides, type ElectrobunUpdaterApi } from "./update";
 
 type UpdateInfo = ReturnType<ElectrobunUpdaterApi["updateInfo"]>;
+
+let bsdtar: boolean | undefined;
+
+/** The system tar's name for `format`: bsdtar (macOS, Windows) writes GNU tar's `gnu` format as `gnutar`. */
+function tarFormat(format: string): string {
+  bsdtar ??= Bun.spawnSync(["tar", "--version"]).stdout.toString().includes("bsdtar");
+  return format === "gnu" && bsdtar ? "gnutar" : format;
+}
 
 function status(entry: Pick<UpdateStatusEntry, "status"> & Partial<UpdateStatusEntry>): UpdateStatusEntry {
   return { message: entry.status, timestamp: 0, ...entry };
@@ -420,6 +428,26 @@ describe("desktop update channels", () => {
     // A stable install takes the same manifest as before channels existed.
     await expect(desktop.check("0.17.0", "stable")).resolves.toMatchObject({ kind: "available", release: { version: "0.18.0" } });
   });
+
+  // Electrobun compares build hashes only. A stable install whose build is not
+  // the published one of its own version (or a latest release that lags
+  // behind it) was offered its own version, or an older one, and downloaded
+  // the whole app again at launch.
+  test.each([
+    ["the version it runs", "0.18.0"],
+    ["an older version", "0.17.9"],
+    ["a version that does not compare", "latest"],
+  ])("stable never downloads %s, and says it is current", async (_, manifestVersion) => {
+    const { updater, calls } = createFakeUpdater({ manifestVersion });
+    const desktop = createElectrobunDesktopUpdater(updater, { runningVersion: "0.18.0" });
+
+    await expect(desktop.check("0.18.0", "stable")).resolves.toEqual({ kind: "current" });
+    const { progress, onProgress } = collect();
+    await desktop.download(STABLE, onProgress);
+
+    expect(calls).toEqual(["check", "check"]);
+    expect(progress.at(-1)).toEqual({ phase: "done", message: "Already on the latest version" });
+  });
 });
 
 // It deletes folders beside the installed app, so it must take only the
@@ -488,7 +516,7 @@ describe("update archives from before the rename", () => {
     const stage = mkdtempSync(join(folder, "stage-"));
     mkdirSync(join(stage, file, ".."), { recursive: true });
     writeFileSync(join(stage, file), "{}");
-    const packed = Bun.spawnSync(["tar", `--format=${format}`, "-cf", join(folder, `${name}.tar`), entry], { cwd: stage });
+    const packed = Bun.spawnSync(["tar", `--format=${tarFormat(format)}`, "-cf", join(folder, `${name}.tar`), entry], { cwd: stage });
     if (packed.exitCode !== 0) throw new Error(packed.stderr.toString());
     rmSync(stage, { recursive: true });
     return join(folder, `${name}.tar`);
@@ -504,6 +532,24 @@ describe("update archives from before the rename", () => {
       if (format !== "ustar") expect(firstTarPath(readFileSync(tar(folder, "long", long, format, long)))).toBe(long);
       expect(firstTarPath(readFileSync(short).subarray(0, 100))).toBeNull();
       expect(firstTarPath(new Uint8Array(1024))).toBeNull();
+    } finally {
+      rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  test("skips a macOS extended-attributes sidecar ahead of the entry", () => {
+    const folder = mkdtempSync(join(tmpdir(), "gloom-update-tar-"));
+    try {
+      const stage = mkdtempSync(join(folder, "stage-"));
+      mkdirSync(join(stage, "Gloomberb", "Resources"), { recursive: true });
+      writeFileSync(join(stage, "Gloomberb", "Resources", "version.json"), "{}");
+      // macOS writes `._Gloomberb` beside `Gloomberb` and lists it first. The
+      // sidecar is packed as itself, with no sidecar of its own.
+      writeFileSync(join(stage, "._Gloomberb"), "metadata");
+      const packed = Bun.spawnSync(["tar", "--format=ustar", "-cf", "sidecar.tar", "._Gloomberb", "Gloomberb"],
+        { cwd: stage, env: { ...process.env, COPYFILE_DISABLE: "1" } });
+      if (packed.exitCode !== 0) throw new Error(packed.stderr.toString());
+      expect(firstTarPath(readFileSync(join(stage, "sidecar.tar")))).toBe("Gloomberb/");
     } finally {
       rmSync(folder, { recursive: true, force: true });
     }
@@ -548,6 +594,156 @@ describe("update archives from before the rename", () => {
       expect(seenAtDownload).toEqual(["from-the-new-name.tar", "hash.patch", "mac-new.tar", "other.tar"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// Electrobun takes `<hash>.tar` in its `self-extraction` folder as the update
+// already downloaded, without reading it. A decompress that failed partway
+// left part of one there, and every later download took it as done and every
+// install failed to unpack it ("ReadError"), with no way out but deleting the
+// folder by hand.
+describe("a damaged update archive", () => {
+  /** A release's archive as Electrobun unpacks it from the download, and the first half of it. */
+  async function releaseTar(): Promise<{ whole: Uint8Array; cut: Uint8Array }> {
+    const whole = await new Bun.Archive({
+      "Gloom.app/Contents/Resources/version.json": "{}",
+      "Gloom.app/Contents/MacOS/bun": new Uint8Array(64 * 1024).fill(7),
+    }).bytes();
+    return { whole, cut: whole.subarray(0, Math.floor(whole.length / 2)) };
+  }
+
+  /**
+   * Electrobun's staging as 1.18.1 ships it, before this app's patch: a
+   * download that finds `new.tar` takes it as done, a full download writes it
+   * (`nextDownload`: whole, or the part a decompress that failed left), and the
+   * install unpacks it for real.
+   */
+  async function stagingUpdater(root: string) {
+    const fake = createFakeUpdater({ applyStatuses: RELAUNCH });
+    const { updater, calls } = fake;
+    const extraction = join(root, "self-extraction");
+    const staged = join(extraction, "new.tar");
+    const { whole, cut } = await releaseTar();
+    const state = { fetches: 0, nextDownload: "whole" as "whole" | "cut" | "cut-silently" };
+    mkdirSync(extraction, { recursive: true });
+    const relaunch = updater.applyUpdate;
+    updater.appDataFolder = async () => root;
+    updater.downloadUpdate = async () => {
+      calls.push("download");
+      const info = updater.updateInfo();
+      if (!existsSync(staged)) {
+        state.fetches += 1;
+        writeFileSync(staged, state.nextDownload === "whole" ? whole : cut);
+        if (state.nextDownload === "cut") info.error = "zig-zstd failed with exit code 1";
+        state.nextDownload = "whole";
+      }
+      info.updateReady = existsSync(staged);
+    };
+    updater.applyUpdate = async () => {
+      await new Bun.Archive(readFileSync(staged)).extract(mkdtempSync(join(root, "unpacked-")));
+      await relaunch();
+    };
+    return { updater, staged, state, cut };
+  }
+
+  async function withRoot(run: (root: string) => Promise<void>) {
+    const root = mkdtempSync(join(tmpdir(), "gloom-update-damaged-"));
+    try {
+      await run(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const INSTALLED = { phase: "done", message: "Update installed, restarting..." };
+
+  test("one already there is fetched again rather than installed", () => withRoot(async (root) => {
+    const { updater, staged, state, cut } = await stagingUpdater(root);
+    writeFileSync(staged, cut);
+    const desktop = createElectrobunDesktopUpdater(updater, { runningVersion: "0.17.0" });
+    const { progress, onProgress } = collect();
+
+    await desktop.download(STABLE, onProgress);
+    await desktop.apply(onProgress);
+
+    expect(state.fetches).toBe(1);
+    expect(progress.filter((entry) => entry.phase === "error")).toEqual([]);
+    expect(progress.at(-1)).toEqual(INSTALLED);
+  }));
+
+  test.each([
+    ["with zig-zstd's error", "cut"],
+    ["as if whole", "cut-silently"],
+  ] as const)("one a download leaves %s is a damaged download, and the retry fetches it again", (_, nextDownload) => withRoot(async (root) => {
+    const { reports } = collectReports();
+    const { updater, state } = await stagingUpdater(root);
+    state.nextDownload = nextDownload;
+    const desktop = createElectrobunDesktopUpdater(updater, { runningVersion: "0.17.0" });
+    const first = collect();
+
+    await desktop.download(STABLE, first.onProgress);
+    expect(first.progress.at(-1)).toMatchObject({ phase: "error", failure: { phase: "verify", code: "corrupt" } });
+    expect(reports).toMatchObject([{ phase: "verify", code: "corrupt", targetVersion: "0.18.0" }]);
+
+    const retry = collect();
+    await desktop.download(STABLE, retry.onProgress);
+    await desktop.apply(retry.onProgress);
+    expect(state.fetches).toBe(2);
+    expect(retry.progress.at(-1)).toEqual(INSTALLED);
+  }));
+
+  test("one that does not unpack at the restart is named, removed, and fetched again", () => withRoot(async (root) => {
+    const { updater, staged, state, cut } = await stagingUpdater(root);
+    const desktop = createElectrobunDesktopUpdater(updater, { runningVersion: "0.17.0" });
+    await desktop.download(STABLE, () => {});
+    // Damaged on disk while it waited for the restart.
+    writeFileSync(staged, cut);
+    const restart = collect();
+
+    await desktop.apply(restart.onProgress);
+    expect(restart.progress.at(-1)).toEqual({
+      phase: "error",
+      error: "ReadError",
+      failure: { phase: "apply", code: "corrupt" },
+    });
+    expect(existsSync(staged)).toBe(false);
+
+    const retry = collect();
+    await desktop.download(STABLE, retry.onProgress);
+    await desktop.apply(retry.onProgress);
+    expect(state.fetches).toBe(2);
+    expect(retry.progress.at(-1)).toEqual(INSTALLED);
+  }));
+
+  // It decides which archives are deleted, so a whole one it rejected would
+  // fail every update.
+  test.each(["ustar", "pax", "gnu"])("reads a %s tar as whole, and no part of it short of its end", async (format) => {
+    const folder = mkdtempSync(join(tmpdir(), "gloom-update-whole-tar-"));
+    try {
+      const stage = join(folder, "stage");
+      const deep = join(stage, "Gloom", ..."deep/".repeat(30).split("/").filter(Boolean));
+      mkdirSync(deep, { recursive: true });
+      writeFileSync(join(stage, "Gloom", "version.json"), "{}");
+      writeFileSync(join(deep, "bun"), crypto.getRandomValues(new Uint8Array(5000)));
+      const path = join(folder, "whole.tar");
+      const packed = Bun.spawnSync(["tar", `--format=${tarFormat(format)}`, "-cf", path, "Gloom"], { cwd: stage });
+      if (packed.exitCode !== 0) throw new Error(packed.stderr.toString());
+      expect(await isWholeTar(path)).toBe(true);
+
+      // Every cut before the last entry ends, down to nothing.
+      const bytes = readFileSync(path);
+      const contentEnd = bytes.findLastIndex((byte) => byte !== 0);
+      const cutPath = join(folder, "cut.tar");
+      for (let length = 0; length <= contentEnd; length += 251) {
+        writeFileSync(cutPath, bytes.subarray(0, length));
+        if (await isWholeTar(cutPath)) throw new Error(`${length} of ${bytes.length} bytes read as whole`);
+      }
+      writeFileSync(cutPath, crypto.getRandomValues(new Uint8Array(4096)));
+      expect(await isWholeTar(cutPath)).toBe(false);
+      expect(await isWholeTar(join(folder, "missing.tar"))).toBe(false);
+    } finally {
+      rmSync(folder, { recursive: true, force: true });
     }
   });
 });

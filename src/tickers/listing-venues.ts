@@ -2,7 +2,7 @@ import { logFailure } from "../utils/log-failure";
 import type { DataProvider } from "../types/data-provider";
 import { quoteTradingExchange } from "../market-data/quotes/metadata";
 import type { TickerRecord } from "../types/ticker";
-import { AmbiguousContractError, AmbiguousTickerError, LISTING_SEARCH_LIMIT, listingChoiceQuery, listingExchange, resolveTickerSearch } from "./search";
+import { AmbiguousContractError, AmbiguousTickerError, LISTING_SEARCH_LIMIT, listingChoiceQuery, listingExchange, otherNamesOf, resolveTickerSearch } from "./search";
 import {
   canonicalExchange,
   exchangeCodeVenues,
@@ -13,6 +13,9 @@ import {
 } from "../utils/exchanges";
 import { currencyPairSpelling } from "../utils/currency-pair";
 import { savedAbroadForBareSymbol } from "./search/bare-symbol";
+import { parseListingWithdrawal, withdrawalLabel } from "../market-data/quotes/delisting";
+import type { ListingWithdrawal } from "../types/financials";
+import { isRateLimited, isTransientServiceFailure } from "../sources/provider-errors";
 
 export interface ListingStore {
   loadTicker(symbol: string): Promise<TickerRecord | null>;
@@ -28,6 +31,50 @@ export interface ListingVenue {
   /** Canonical code. */
   exchange: string;
   name: string;
+  /**
+   * The listing's own symbol there, when search lists it under another
+   * spelling than the one asked for: BP for `BP.` (London's code for it).
+   */
+  symbol?: string;
+  /** The exchange withdrew the listing (Hang Seng Bank's 0011 on HKEX): it is on record, and nothing trades there. */
+  withdrawal?: ListingWithdrawal;
+  /**
+   * The company the line belongs to, as the data service identifies it: two
+   * venues are different companies only when their ids differ, however each
+   * names the company (DHL Group AG on Xetra, Deutsche Post AG in Vienna).
+   */
+  companyId?: string;
+  /** The data service marks the line as its company's home line: its main listing. */
+  home?: true;
+  /**
+   * The other names the line's company answers to, as the data service sends
+   * them (a former name, a trade name): DHL Group's rows carry "Deutsche Post
+   * AG", the name it had, which a venue that never renamed its line still shows.
+   */
+  aliases?: string[];
+}
+
+/** A search row's company id and home mark, as a venue carries them. */
+function identityOf(companyId: unknown, home: boolean, aliases: readonly string[] = []): Pick<ListingVenue, "companyId" | "home" | "aliases"> {
+  return {
+    ...typeof companyId === "string" && companyId ? { companyId } : {},
+    ...home ? { home: true as const } : {},
+    ...aliases.length > 0 ? { aliases: [...aliases] } : {},
+  };
+}
+
+/** A search row's name, and its withdrawal with the day it went beside the name, as a choice between listings names it. */
+function withdrawnOf(name: string, value: unknown): Pick<ListingVenue, "name" | "withdrawal"> {
+  const withdrawal = parseListingWithdrawal(value);
+  return withdrawal
+    ? { name: [name, withdrawalLabel({ ...withdrawal, reason: null })].filter(Boolean).join(" · "), withdrawal }
+    : { name };
+}
+
+/** The venue's own symbol, when it is not `asked` (ignoring case). */
+function ownSymbol(listed: string | undefined, asked: string): { symbol: string } | Record<string, never> {
+  const symbol = listed?.trim().toUpperCase();
+  return symbol && symbol !== asked.trim().toUpperCase() ? { symbol } : {};
 }
 
 /**
@@ -36,7 +83,15 @@ export interface ListingVenue {
  * every command names; whether a venue it leaves out trades the symbol is the
  * listing's own quote's to say (`quotedOnVenue`).
  */
-export async function listingVenues(symbol: string, { store, dataProvider }: ListingDeps): Promise<ListingVenue[]> {
+export async function listingVenues(
+  symbol: string,
+  { store, dataProvider }: ListingDeps,
+  /**
+   * Throw a search failure that says nothing of the symbol (a busy moment, the
+   * request limit, no connection) rather than answer that no venue lists it.
+   */
+  { failTransient = false }: { failTransient?: boolean } = {},
+): Promise<ListingVenue[]> {
   const query = `${symbol}:`;
   if (!listingChoiceQuery(query)) return [];
   const tickers = new Map((await store.loadAllTickers()).map((ticker) => [ticker.metadata.ticker.toUpperCase(), ticker] as const));
@@ -49,15 +104,22 @@ export async function listingVenues(symbol: string, { store, dataProvider }: Lis
       : resolved.kind === "local" ? { exchange: resolved.ticker.metadata.exchange, name: resolved.ticker.metadata.name }
       : {
         exchange: resolved.result.exchange === "SMART" ? resolved.result.primaryExchange ?? "" : resolved.result.exchange || resolved.result.primaryExchange || "",
-        name: resolved.result.name,
+        ...withdrawnOf(resolved.result.name, resolved.result.withdrawal),
+        ...ownSymbol(parsePublicTickerKey(resolved.result.symbol).symbol, symbol),
+        ...identityOf(resolved.result.companyId, resolved.result.homeListing === true, otherNamesOf(resolved.result)),
       };
-    venues = only?.exchange ? [{ exchange: canonicalExchange(only.exchange), name: only.name }] : [];
+    venues = only?.exchange ? [{ ...only, exchange: canonicalExchange(only.exchange) }] : [];
   } catch (error) {
+    if (failTransient && (isTransientServiceFailure(error) || isRateLimited(error))) throw error;
     // One listing settles the picker; several are its choices.
     if (!(error instanceof AmbiguousTickerError) || error instanceof AmbiguousContractError) return [];
     venues = error.listings.flatMap((listing) => {
-      const exchange = parsePublicTickerKey(listing).exchange;
-      return exchange ? [{ exchange, name: error.listingNames[listing] ?? "" }] : [];
+      const key = parsePublicTickerKey(listing);
+      return key.exchange ? [{
+        exchange: key.exchange, name: error.listingNames[listing] ?? "", ...ownSymbol(key.symbol, symbol),
+        ...(error.listingWithdrawals[listing] ? { withdrawal: error.listingWithdrawals[listing] } : {}),
+        ...identityOf(error.listingCompanies[listing], error.listingHomes.includes(listing), error.listingAliases[listing]),
+      }] : [];
     });
   }
   return venues.filter((venue, index) => venues.findIndex((other) => other.exchange === venue.exchange) === index);

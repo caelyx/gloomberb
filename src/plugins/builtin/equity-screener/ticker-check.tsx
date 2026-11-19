@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Box } from "../../../ui";
 import {
@@ -18,6 +19,7 @@ import { isAccessDenied } from "../../../api-client/errors";
 import type { ScreenDefinition } from "../../../api-client/equity-screener";
 import { useThemeColors } from "../../../theme/theme-context";
 import { fetchScreenCheck } from "./client";
+import { screenNotices } from "./footer";
 import { checkRows, screenCheckSummary } from "./screen-check";
 
 interface ScreenTickerCheckProps {
@@ -57,10 +59,10 @@ export function ScreenTickerCheck({
     const next = value.trim();
     if (!next) return;
     search.blur();
-    if (next === ticker) void resource.reload();
+    if (next === ticker) resource.reload();
     else setTicker(next);
   };
-  usePaneRefreshKey(() => { void resource.reload(); }, { focused, enabled: !!ticker && !search.active });
+  usePaneRefreshKey(() => { resource.reload(); }, { focused, enabled: !!ticker && !search.active });
   usePaneFooter("equity-screener:check", () => ({
     info: [
       ...(loading ? [{ id: "loading", parts: [{ text: "checking ticker", tone: "muted" as const }] }] : []),
@@ -80,7 +82,7 @@ export function ScreenTickerCheck({
   usePaneNoticeFooter({
     registrationId: "equity-screener:check-notices",
     focused,
-    notices: [...(data?.warnings ?? []), ...(error ? [error] : [])],
+    notices: [...screenNotices(data?.warnings), ...(error ? [error] : [])],
   });
   const rows = data ? checkRows(data) : [];
   const columns: DataTableColumn[] = [
@@ -134,7 +136,7 @@ export function ScreenTickerCheck({
           emptyTitle: "Enter a ticker to check this screen.",
         }}
         renderCell={(row, column) => ({
-          text: column.id === "reason" ? row.reason ?? "--" : row[column.id as "criterion" | "value" | "result" | "asOf" | "state"],
+          text: column.id === "reason" ? row.reason ?? MISSING_VALUE : row[column.id as "criterion" | "value" | "result" | "asOf" | "state"],
           color: column.id === "result"
             ? row.passes === null ? colors.textMuted : row.passes ? colors.positive : colors.negative
             : column.id === "reason" || column.id === "state" || column.id === "asOf" ? colors.textMuted : colors.text,

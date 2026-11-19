@@ -5,9 +5,12 @@ import type {
   PaneTemplateDef,
   ShortcutArgError,
 } from "../../../types/plugin";
+import { glossaryNamesFunction } from "../../../cli/glossary";
 import { fuzzyFilter } from "../../../utils/fuzzy-search";
+import { discoveryOpening } from "../../../utils/lookup-token";
 import { summarizeError } from "../helpers";
 import type { ResultItem } from "../list/model";
+import { tickerFirstQuery } from "../routes/root/ticker-first";
 
 type LogErrorFn = (message: string, details: Record<string, unknown>) => void;
 
@@ -107,18 +110,24 @@ export function getAvailablePaneTemplatesForState(options: {
 }
 
 /**
- * "ETF flows" spells out ETFF (Crypto ETF Flows), not ETF for a ticker called
- * FLOWS: a query that is word for word a keyword of a template whose own code
- * extends the typed one is no ticker argument, and is left to the search,
- * which ranks that template first. "JOBS DAY" stays Jobs for Dayforce, since
- * the template that lists "jobs day" (MDAY) does not extend JOBS.
+ * "ETF flows", "etf flows bitcoin" and "bitcoin etf" spell out ETFF (Crypto
+ * ETF Flows), not ETF for a ticker called FLOWS or BITCOIN: a query whose
+ * words are all words of one keyword, in any order, of a template whose own
+ * code extends the typed one is no ticker argument, and is left to the
+ * search, which ranks that template first. "ETF IBIT" stays Fund Facts for
+ * IBIT, since no keyword of ETFF holds both words, and "JOBS DAY" stays Jobs
+ * for Dayforce, since the template that lists "jobs day" (MDAY) does not
+ * extend JOBS.
  */
 function spellsOutLongerCode(query: string, code: string, templates: readonly PaneTemplateDef[]): boolean {
-  const phrase = query.toLowerCase().replace(/\s+/g, " ");
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
   return templates.some((template) => {
     const longer = template.shortcut?.prefix?.trim().toUpperCase() ?? "";
     return longer.length > code.length && longer.startsWith(code)
-      && !!template.keywords?.some((keyword) => keyword.toLowerCase() === phrase);
+      && !!template.keywords?.some((keyword) => {
+        const keywordWords = new Set(keyword.toLowerCase().split(/\s+/));
+        return words.every((word) => keywordWords.has(word));
+      });
   });
 }
 
@@ -129,13 +138,28 @@ export function getAvailablePaneShortcutTemplatesForQuery(options: {
   query: string;
   logError?: LogErrorFn;
 }): PaneTemplateDef[] {
-  const trimmed = options.query.trim();
-  const upper = trimmed.toUpperCase();
   const disabledPluginIds = new Set(options.disabledPlugins);
   const enabled = [...options.pluginRegistry.paneTemplates.values()].filter((template) => {
     const pluginId = options.pluginRegistry.getPaneTemplatePluginId(template.id);
     return !pluginId || !disabledPluginIds.has(pluginId);
   });
+  const typed = matchingShortcutTemplates(options, enabled, options.query.trim());
+  if (typed.length > 0) return typed;
+  // Bloomberg's order, the ticker first (`NFE CDS`), is the code's with that ticker.
+  const reordered = tickerFirstQuery(options.query, (code) => enabled.some((template) => {
+    const argKind = getPaneTemplateArgKind(template);
+    return (argKind === "ticker" || argKind === "ticker-list" || (argKind === "text" && template.shortcut?.focusedIssuer === true))
+      && paneTemplateShortcutPrefixes(template).some((prefix) => prefix.toUpperCase() === code);
+  }));
+  return reordered ? matchingShortcutTemplates(options, enabled, reordered) : [];
+}
+
+function matchingShortcutTemplates(
+  options: { context: PaneTemplateContext; query: string; logError?: LogErrorFn },
+  enabled: readonly PaneTemplateDef[],
+  trimmed: string,
+): PaneTemplateDef[] {
+  const upper = trimmed.toUpperCase();
   return enabled.filter((template) => {
     const argKind = getPaneTemplateArgKind(template);
     // The longest matching mnemonic wins, so an alias sharing a stem cannot shadow the typed one.
@@ -157,7 +181,7 @@ export function getAvailablePaneShortcutTemplatesForQuery(options: {
     } catch (error) {
       options.logError?.("Pane shortcut canCreate failed", {
         templateId: template.id,
-        query: options.query,
+        query: trimmed,
         error: summarizeError(error),
       });
       return false;
@@ -174,7 +198,7 @@ export function buildPaneTemplateItem(options: {
   shortcutExecution?: boolean;
   /** Why `createOptions.arg` opens nothing; the row then says so instead of opening the pane. */
   argError?: ShortcutArgError | null;
-  runPaneTemplateShortcut: (template: PaneTemplateDef, rawArg?: string) => void;
+  runPaneTemplateShortcut: (template: PaneTemplateDef, rawArg?: string, preset?: PaneTemplateCreateOptions["preset"]) => void;
   shouldOpenTemplateConfig: (template: PaneTemplateDef, arg?: string) => boolean;
   openPaneTemplateWorkflow: (template: PaneTemplateDef, options?: { arg?: string }) => void;
   openPaneTemplateDirect: (
@@ -200,6 +224,7 @@ export function buildPaneTemplateItem(options: {
     shortcutLabel || "",
     ...aliases,
     pluginName || "",
+    ...paneTemplateDiscoveryWords(options.template, options.pluginRegistry),
   ].filter(Boolean).join(" ");
 
   if (options.argError) {
@@ -227,7 +252,7 @@ export function buildPaneTemplateItem(options: {
       options.template.shortcut
       && (options.shortcutExecution || getPaneTemplateArgKind(options.template) === "ticker")
     ) {
-      options.runPaneTemplateShortcut(options.template, arg);
+      options.runPaneTemplateShortcut(options.template, arg, options.createOptions?.preset);
       return;
     }
     if (options.shouldOpenTemplateConfig(options.template, arg)) {
@@ -250,9 +275,52 @@ export function buildPaneTemplateItem(options: {
   };
 }
 
+/**
+ * The words `gloom catalog` also finds a function by, beyond its keywords and
+ * description: its headless discovery aliases, the words it is suggested for,
+ * those that open one of its cases (CTM's "vix futures") and its intents. The
+ * bar's row carries them, so the same words find the same function.
+ */
+function paneTemplateDiscoveryWords(template: PaneTemplateDef, registry: Pick<PluginRegistry, "panes">): string[] {
+  const discovery = paneTemplateDiscovery(template, registry);
+  if (!discovery) return [];
+  return [
+    ...discovery.aliases ?? [],
+    ...discovery.suggestFor ?? [],
+    ...discovery.opens?.flatMap((opening) => opening.words) ?? [],
+    ...discovery.intents ?? [],
+  ];
+}
+
+function paneTemplateDiscovery(template: PaneTemplateDef, registry: Pick<PluginRegistry, "panes">) {
+  return (template.headless ?? registry.panes?.get(template.paneId)?.headless)?.discovery;
+}
+
+/**
+ * A row found by a query that is, whole, a term its function shows (`var`,
+ * `value at risk` for MARS and PORT), as `catalog` finds it, where the row's
+ * own words do not carry the query already; those rank as they did. A word of
+ * a longer query, or a loose alias, finds nothing.
+ */
+function withShownTerm(item: ResultItem, template: PaneTemplateDef, query: string): ResultItem {
+  const codes = [template.shortcut?.prefix, ...template.shortcut?.aliases ?? []];
+  if (!codes.some((code) => !!code && glossaryNamesFunction(code, query))) return item;
+  const own = `${item.label} ${item.searchText ?? ""} ${item.detail} ${item.right ?? ""}`.toLowerCase();
+  if (query.toLowerCase().split(/\s+/).every((word) => own.includes(word))) return item;
+  return { ...item, searchText: `${query} ${item.searchText ?? ""}` };
+}
+
 export function buildPaneShortcutItems(options: {
   templates: readonly PaneTemplateDef[];
   filterQuery?: string;
+  /**
+   * A typed query, filtered by the caller: it also finds the functions kept
+   * out of the browse list (CTM, a tab of the futures workspace), as the
+   * catalog does. A `filterQuery` is one too.
+   */
+  searchedQuery?: string;
+  /** Where a template's headless discovery is found, for a query that names one of its cases. */
+  registry?: Pick<PluginRegistry, "panes">;
   createOptions?: PaneTemplateCreateOptions;
   createItem: (template: PaneTemplateDef, options?: {
     category?: string;
@@ -260,13 +328,24 @@ export function buildPaneShortcutItems(options: {
     showShortcut?: boolean;
   }) => ResultItem;
 }): ResultItem[] {
+  const query = options.searchedQuery?.trim() || options.filterQuery?.trim() || "";
+  // An unlisted template (`listed: false`) still opens when its code is typed, which is resolved apart from these rows.
   const items = options.templates
-    .filter((template) => template.shortcut && template.shortcut.showInBrowse !== false)
-    .map((template) => options.createItem(template, {
-      category: "Panes",
-      createOptions: options.createOptions,
-      showShortcut: true,
-    }));
+    .filter((template) => template.shortcut && (query || template.shortcut.showInBrowse !== false) && template.listed !== false)
+    .map((template) => {
+      // A query naming one of the function's cases opens it on that case, as `fn` runs it: `vix futures` is CTM VIX.
+      const opening = query && options.registry ? discoveryOpening(paneTemplateDiscovery(template, options.registry), query) : null;
+      const item = options.createItem(template, {
+        category: "Panes",
+        // Its preset options too, as `fn` applies them: `PDUFA` is CATL on PDUFA dates, not every catalyst.
+        createOptions: opening
+          ? { ...options.createOptions, arg: opening.argument, ...(opening.options ? { preset: opening.options } : {}) }
+          : options.createOptions,
+        showShortcut: true,
+      });
+      const named = opening && opening.argument && !item.disabled ? { ...item, name: opening.argument } : item;
+      return query ? withShownTerm(named, template, query) : named;
+    });
 
   return options.filterQuery
     ? fuzzyFilter(items, options.filterQuery, (item) => `${item.label} ${item.searchText || ""} ${item.detail} ${item.right || ""}`)
@@ -279,7 +358,7 @@ export function buildNonShortcutPaneTemplateItems(options: {
   createItem: (template: PaneTemplateDef, options?: { category?: string }) => ResultItem;
 }): ResultItem[] {
   const items = options.templates
-    .filter((template) => !template.shortcut)
+    .filter((template) => !template.shortcut && template.listed !== false)
     .map((template) => options.createItem(template, { category: "Panes" }));
 
   return options.filterQuery

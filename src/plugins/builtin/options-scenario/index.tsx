@@ -1,8 +1,6 @@
 import type { PluginModule } from "../plugin-module";
 import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
-import { OptionsScenarioPane } from "./pane";
 import { optionsScenarioHeadless } from "./headless";
-import { CspScreenPane } from "./csp-screen-pane";
 import { cspScreenHeadless } from "./csp-screen-headless";
 
 const scenarioSettingKeys = ["legs", "strategy", "strike", "delta", "putStrike", "callStrike", "shares", "expiration", "spot", "rate", "dividendYield", "currency", "asOf", "date", "volShift",
@@ -10,7 +8,7 @@ const scenarioSettingKeys = ["legs", "strategy", "strike", "delta", "putStrike",
 
 export const optionsScenarioModule: PluginModule = {
   panes: [{
-    id: "options-scenario", name: "Options Scenario", icon: "V", component: OptionsScenarioPane,
+    id: "options-scenario", name: "Options Scenario", icon: "V", get component(): typeof import("./pane").OptionsScenarioPane { const { OptionsScenarioPane } = require("./pane"); return OptionsScenarioPane; },
     defaultPosition: "right", defaultMode: "floating", defaultFloatingSize: { width: 126, height: 36 },
     tableExport: true, headless: optionsScenarioHeadless,
     settings: {
@@ -26,24 +24,26 @@ export const optionsScenarioModule: PluginModule = {
       ],
     },
   }, {
-    id: "csp-screen", name: "Cash-Secured Put Screen", icon: "V", component: CspScreenPane,
+    id: "csp-screen", name: "Options Strategy Screen", icon: "V", get component(): typeof import("./csp-screen-pane").CspScreenPane { const { CspScreenPane } = require("./csp-screen-pane"); return CspScreenPane; },
     defaultPosition: "right", defaultMode: "floating", defaultFloatingSize: { width: 144, height: 24 },
     tableExport: true, headless: cspScreenHeadless,
     settings: {
-      title: "Cash-Secured Put Screen",
+      title: "Options Strategy Screen",
       fields: [
         { key: "symbols", label: "Symbols", type: "text", placeholder: "JPM, GS, KO" },
         { key: "maxSpread", label: "Wide spread over (%)", type: "text", placeholder: "10",
-          description: "A put whose bid/ask spread is over this percent of its mid is marked wide. It is still ranked." },
+          description: "A trade whose bid/ask spread is over this percent of its mid is marked wide. It is still ranked." },
       ],
     },
   }],
   paneTemplates: [{
-    id: "csp-screen-pane", paneId: "csp-screen", label: "Cash-Secured Put Screen",
-    description: "Cash-secured puts across a list, ranked by annualised yield at the bid, with % OTM, delta, IV rank, spread and an earnings flag.",
-    // The put-selling phrases lead here first, then to OSA for one name.
+    id: "csp-screen-pane", paneId: "csp-screen", label: "Options Strategy Screen",
+    description: "Cash-secured puts, covered calls, verticals, iron condors, straddles, strangles and calendars across a list, ranked, "
+      + "with max gain and loss, break-evens, probability of profit, IV rank, spread and an earnings flag.",
+    // The put-selling phrases lead here first, then to OSA for one name; so do the strategies it screens.
     keywords: ["csp", "cash secured put", "cash-secured puts", "put selling", "selling puts", "sell put", "sell puts", "short put", "wheel",
-      "put screen", "premium yield"],
+      "put screen", "premium yield", "strategy screen", "options screener", "covered call", "covered calls", "iron condor", "strangle",
+      "straddle screen", "calendar spread", "bull put spread", "bear call spread", "vertical spread"],
     shortcut: { prefix: "CSP", argKind: "ticker-list" as const }, headless: cspScreenHeadless,
     createInstance: (_context, options) => ({
       title: "CSP", placement: "floating" as const,

@@ -1,15 +1,17 @@
 import { useMemo } from "react";
 import {
   DELAYED_SEGMENT,
-  PaneStatusBody, type DataTableCell,
+  PaneStatusBody, RowNote, type DataTableCell,
   type DataTableColumn,
   type PaneFooterSegment
 } from "../../../components";
 import { useAsyncResource } from "../../../react/async-resource";
+import { Box } from "../../../ui";
+import { wrapTextLines } from "../../../utils/text-wrap";
 import { usePaneSettingValue } from "../../../state/app/context";
 import { colors } from "../../../theme/colors";
 import type { PaneProps } from "../../../types/plugin";
-import { formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatNumber } from "../../../utils/format";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { usePaneStatusFooter } from "../../../components/layout/pane/status-footer";
 import { SeriesListDetail, useSeriesList } from "../shared/series-list-detail";
@@ -20,6 +22,7 @@ import { INDICATORS } from "./indicators";
 import { RANGE_OPTIONS, VALUATION_DEFAULTS } from "./settings";
 import { formatSigma } from "../shared/trend";
 import {
+  readingPeriodEnd,
   selectValuationViews,
   type IndicatorViewModel
 } from "./view";
@@ -66,6 +69,13 @@ function buildColumns(width: number, stacked: boolean): Column[] {
   ];
 }
 
+/** A link to the pane names the indicator its chart shows, with its reading. */
+function indicatorShareItem(row: IndicatorRow) {
+  const cells = cellsFor(row);
+  const reading = row.view?.zone ? [cells.value.text, row.view.zone.label].filter(Boolean).join(" · ") : null;
+  return { title: row.indicator.label, excerpt: reading };
+}
+
 // Stable table adapters so memoized rows survive pane re-renders.
 const indicatorKey = (row: IndicatorRow) => row.indicator.id;
 const renderIndicatorCell = (row: IndicatorRow, column: Column) => cellsFor(row)[column.id];
@@ -75,11 +85,11 @@ function cellsFor(row: IndicatorRow): Record<ColumnId, DataTableCell> {
   if (!view || view.current.ratio == null || !view.zone) {
     return {
       name: { text: row.indicator.shortLabel, color: colors.textBright },
-      value: { text: "--", color: colors.textDim },
+      value: { text: MISSING_VALUE, color: colors.textDim },
       zone: { text: "Unavailable", color: colors.warning },
-      percentile: { text: "--", color: colors.textDim },
-      since: { text: view?.historyStart?.slice(0, 4) ?? "--", color: colors.textDim },
-      sigma: { text: "--", color: colors.textDim },
+      percentile: { text: MISSING_VALUE, color: colors.textDim },
+      since: { text: view?.historyStart?.slice(0, 4) ?? MISSING_VALUE, color: colors.textDim },
+      sigma: { text: MISSING_VALUE, color: colors.textDim },
     };
   }
   return {
@@ -88,10 +98,21 @@ function cellsFor(row: IndicatorRow): Record<ColumnId, DataTableCell> {
     zone: { text: shortZoneLabel(view.zone.id), color: view.zone.color },
     // Restated so a high number always means expensive, whichever way the
     // underlying measure runs, otherwise the column cannot be read down.
-    percentile: { text: view.richPercentile == null ? "--" : formatNumber(view.richPercentile, 0), color: colors.text },
-    since: { text: view.historyStart?.slice(0, 4) ?? "--", color: colors.textMuted },
+    percentile: { text: view.richPercentile == null ? MISSING_VALUE : formatNumber(view.richPercentile, 0), color: colors.text },
+    since: { text: view.historyStart?.slice(0, 4) ?? MISSING_VALUE, color: colors.textMuted },
     sigma: { text: formatSigma(view.richSigma), color: colors.textMuted },
   };
+}
+
+/** The selected indicator, its own limitation (a stale or missing latest reading) said above its chart. */
+function SelectedIndicatorDetail({ view, note, width, height, focused }: {
+  view: IndicatorViewModel; note: string | null; width: number; height: number; focused?: boolean;
+}) {
+  const noteRows = note ? wrapTextLines(note, Math.max(1, width - 2)).length : 0;
+  return <Box flexDirection="column" width={width} height={height}>
+    <RowNote>{note}</RowNote>
+    <IndicatorDetail view={view} width={width} height={Math.max(1, height - noteRows)} focused={focused} />
+  </Box>;
 }
 
 export function MarketValuationPane({ focused, width, height }: PaneProps) {
@@ -124,23 +145,24 @@ export function MarketValuationPane({ focused, width, height }: PaneProps) {
     onSelect: setIndicatorId,
     reload: refresh,
     range: { value: range, options: RANGE_VIEW_OPTIONS, onChange: setRange, chartRange: true },
+    shareItem: indicatorShareItem,
   });
   const { selected } = list;
   const selectedView = selected?.view;
 
-  const basisErrors = new Set(INDICATORS.flatMap((indicator) => {
-    const reason = indicatorUnavailableReason(indicator);
-    return reason ? [`${indicator.label}: ${reason}`] : [];
-  }));
-  const sourceError = bundle?.errors.find((entry) => !basisErrors.has(entry));
-  const unavailableCount = bundle?.errors.filter((entry) => basisErrors.has(entry)).length ?? 0;
+  // The footer says what concerns the whole board: a failure no indicator owns, else how many cannot be read. An
+  // indicator's own reason is its row's ("Unavailable") and its detail's.
+  const ownedByRow = (entry: string) => rows.some(({ indicator }) => [indicator.label, ...indicatorSeries(indicator).map((def) => def.key)]
+    .some((prefix) => entry.startsWith(`${prefix}:`)));
+  const sourceError = bundle?.errors.find((entry) => !ownedByRow(entry));
+  const unavailableCount = rows.filter((row) => row.error && !row.view).length;
   const bodyError = resource.error ?? sourceError ?? null;
-  const error = bodyError ?? selected?.error
-    ?? (unavailableCount ? `${unavailableCount} unavailable` : null);
+  const error = bodyError ?? (unavailableCount ? `${unavailableCount} unavailable` : null);
   const footerInfo = useMemo<PaneFooterSegment[]>(() => {
     if (!selectedView) return [];
     const info: PaneFooterSegment[] = [
-      { id: "as-of", parts: [{ text: `as of ${selectedView.asOf}`, tone: "muted" }] },
+      // The day the reading's period ends, as FA dates a period.
+      { id: "as-of", parts: [{ text: `as of ${readingPeriodEnd(selectedView.asOf, selectedView.periodicity)}`, tone: "muted" }] },
       ...(width >= 80 ? [DELAYED_SEGMENT] : []),
     ];
     if (selectedView.observationStale) {
@@ -186,7 +208,7 @@ export function MarketValuationPane({ focused, width, height }: PaneProps) {
       getRowId={indicatorKey}
       renderCell={renderIndicatorCell}
       emptyStateTitle={list.normalizedQuery ? "No indicator matches." : error ?? "No indicators."}
-      renderDetail={(size) => selectedView ? <IndicatorDetail view={selectedView} {...size} /> : (
+      renderDetail={(size) => selectedView ? <SelectedIndicatorDetail view={selectedView} note={selected.error} {...size} /> : (
         <PaneStatusBody
           error={selected.error ?? "No data."}
           errorTitle={`${selected.indicator.label} unavailable`}

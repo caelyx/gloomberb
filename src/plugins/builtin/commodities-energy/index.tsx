@@ -18,9 +18,7 @@ import { curveTitle, normalizeCurveRoot, paneCurveRoot } from "../futures-curve/
 import { JodiPane } from "../jodi/pane";
 import { jodiModule } from "../jodi";
 import type { PluginModule } from "../plugin-module";
-import { COMMODITIES_VIEW_STATE } from "./view-state";
-
-const COMMODITIES_ENERGY_PANE_ID = "commodities-energy";
+import { COMMODITIES_ENERGY_PANE_ID, COMMODITIES_VIEW_STATE } from "./view-state";
 const COMMODITIES_ENERGY_TITLE = "Commodities & Energy";
 const TAB_STATE_KEY = "commodities-energy:tab";
 
@@ -59,7 +57,7 @@ const TAB_ELSEWHERE: Readonly<Record<string, string>> = {
 const TAB_REPORT_OPTION: PaneReportOptionDef = {
   key: "tab",
   type: "enum",
-  description: "The board to open on: futures markets, EIA inventories, CFTC positioning or USDA crop balances.",
+  description: "The board to open on: futures markets, EIA inventories, COT positioning or USDA crop balances.",
   values: [{ value: "markets" }, { value: "inventories" }, { value: "positioning" }, { value: "crops" }],
   example: "--tab inventories",
   exampleWithoutArgument: true,
@@ -107,11 +105,34 @@ function workspaceTemplate(
       const requested = createInstance?.(context, createOptions);
       const existing = reusableWorkspace(context);
       // One window for every tab, titled by the tab it opens on: the old functions' titles (CFTC Positioning) would outlive their tab.
-      const reuse = (instance: PaneTemplateInstanceConfig | null) => instance
-        ? { ...instance, instanceId: existing?.instanceId ?? instance.instanceId, title: workspaceTitle(tab, instance) }
-        : null;
+      const reuse = (instance: PaneTemplateInstanceConfig | null) => {
+        if (!instance) return null;
+        const commanded = createOptions?.arg?.trim() ? commandedInstance(tab, instance) : instance;
+        return { ...commanded, instanceId: existing?.instanceId ?? commanded.instanceId,
+          title: workspaceTitle(tab, mergedInstance(existing, commanded)) };
+      };
       return requested instanceof Promise ? requested.then(reuse) : reuse(requested ?? {});
     },
+  };
+}
+
+/**
+ * A root the command names (`CTM VX`) is the curve's root: written over the one
+ * the Markets board's search or pick left in the setting, which the body reads
+ * before the command's params, so the window never draws XAZ under `CTM VX`.
+ * Only a root the curve lists is written: a bare `CTM`, or one naming no root,
+ * keeps the root the window shows.
+ */
+function commandedInstance(tab: WorkspaceTab, instance: PaneTemplateInstanceConfig): PaneTemplateInstanceConfig {
+  const root = tab === "curve" ? normalizeCurveRoot(instance.params?.root) : null;
+  return root ? { ...instance, settings: { ...instance.settings, root } } : instance;
+}
+
+/** The workspace as the command leaves it, the reused window's settings and params under the command's, which the title reads as the body does. */
+function mergedInstance(existing: ReturnType<typeof reusableWorkspace>, instance: PaneTemplateInstanceConfig) {
+  return {
+    params: { ...existing?.params, ...instance.params },
+    settings: { ...existing?.settings, ...instance.settings },
   };
 }
 
@@ -148,6 +169,14 @@ const workspaceTemplates = [
   workspaceTemplate(cropsTemplate, "crops", { browse: false }),
   workspaceTemplate(jodiTemplate, "balances", { browse: false }),
 ];
+
+/** Each tab's own function, the first template that opens it (FUT, CTM, COT, DOE, PSD, JODI): its `?` explains that tab. */
+const TAB_FUNCTIONS = new Map<WorkspaceTab, string>();
+for (const [template, tab] of [[futuresTemplate, "markets"], [curveTemplate, "curve"], [cotTemplate, "positioning"],
+  [doeTemplate, "inventories"], [cropsTemplate, "crops"], [jodiTemplate, "balances"]] as const) {
+  const prefix = template.shortcut?.prefix;
+  if (prefix && !TAB_FUNCTIONS.has(tab)) TAB_FUNCTIONS.set(tab, prefix);
+}
 
 /** The tab a saved workspace shows: its last one, else the one it was opened on. */
 function savedTab(pane: { settings?: Record<string, unknown>; params?: Record<string, string> }): WorkspaceTab {
@@ -223,6 +252,7 @@ export const commoditiesEnergyModule: PluginModule = {
     shotFitsRows: (pane) => savedTab(pane) === "markets",
     settings: activeSettings,
     instanceTitle: (pane) => workspaceTitle(savedTab(pane), pane),
+    helpFunction: (pane) => TAB_FUNCTIONS.get(savedTab(pane)) ?? null,
   }],
   paneTemplates: workspaceTemplates,
 };

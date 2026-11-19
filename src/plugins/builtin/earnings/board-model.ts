@@ -5,9 +5,12 @@ import type { EarningsEvent } from "../../../types/data-provider";
 import type { EarningsDateStatus, EarningsEpsBasis, Quote } from "../../../types/financials";
 import type { TickerRecord } from "../../../types/ticker";
 import { earningsDateStatus, earningsEpsBasis, isProvisionalActual } from "../shared/earnings-report";
-import { calendarStatus } from "../shared/earnings-calendar";
-import { coherentEarningsValue } from "../shared/earnings-estimate-basis";
-import { shortDate, surprise, weekday } from "./format";
+import { calendarReport } from "../shared/earnings-calendar";
+import { listingSuffixCandidate } from "../../../sources/listing-symbols";
+import { isUsListingExchange, parsePublicTickerKey } from "../../../utils/exchanges";
+import { listingAbroadVenue } from "../../../utils/sec";
+import { sameHistoryListing } from "./client";
+import { shortDate, surprise, weekday, type Surprise } from "./format";
 
 /** A held name is in a portfolio; a watched one only in watchlists. */
 export type Ownership = "held" | "watched";
@@ -31,12 +34,22 @@ export interface BoardReport {
   provisional: boolean;
   /** Null when the reported figure's basis cannot be determined. */
   epsBasis: EarningsEpsBasis | null;
-  /** Actual over estimate minus one. */
-  epsSurprise: number | null;
+  /** Actual over estimate minus one: N/M against a loss or zero estimate. */
+  epsSurprise: Surprise;
   revenueEstimate: number | null;
   impliedMove: number | null;
   averageMove: number | null;
+  /** The move on a report already out: the close after it over the close before, signed. Null until both closes are in. */
+  realizedMove: number | null;
   owned: Ownership | null;
+  /** ISO currency of the EPS and sales figures; null when the report has none. The market cap is always dollars. */
+  currency?: string | null;
+  /**
+   * A listing abroad's lines on its markets, the one shown first; on a US line
+   * the board shows instead of its listing abroad (BABA, the day 9988:HKEX
+   * reports too), that listing's. Absent for other US listings.
+   */
+  listings?: readonly string[];
 }
 
 export type BoardRow =
@@ -145,42 +158,102 @@ export function boardReport(report: EarningsCalendarReport, owned: ReadonlyMap<s
     revenueEstimate: report.revenueEstimate,
     impliedMove: report.implied?.move ?? null,
     averageMove: report.averageReports >= MIN_AVERAGE_REPORTS ? report.averageMove : null,
+    realizedMove: report.realized?.move ?? null,
     owned: owned.get(report.symbol) ?? null,
+    // The board's US reports are in dollars; a listing abroad's say their own.
+    currency: report.currency ?? "USD",
+    ...report.listings?.length ? { listings: report.listings } : {},
   };
 }
 
-/** A company the stored calendar does not carry (a listing abroad, a date past its horizon) from the per-ticker calendar. */
+/**
+ * A listing as the board and Gloom Cloud's earnings history key it, however it
+ * was typed: a vendor's suffix as the venue it names (0700.HK, 700.HK and
+ * 00700.HK are 0700:HKEX, VOD.L is VOD:LSE), a venue by its own code
+ * (0700:XHKG is 0700:HKEX), a Hong Kong code by its four digits, and a US
+ * listing by its ticker (AAPL:NASDAQ is AAPL). Any other key stays as typed.
+ */
+export function boardKey(symbol: string): string {
+  const typed = symbol.trim().toUpperCase();
+  const suffixed = listingSuffixCandidate(typed);
+  const key = suffixed ? `${suffixed.symbol}:${suffixed.exchange}` : typed;
+  const parsed = parsePublicTickerKey(key);
+  if (parsed.exchange && isUsListingExchange(parsed.exchange)) return parsed.symbol;
+  const venue = listingAbroadVenue(key);
+  if (!venue) return key;
+  const code = venue === "HKEX" && /^\d{1,5}$/.test(parsed.symbol) && Number(parsed.symbol) > 0
+    ? String(Number(parsed.symbol)).padStart(4, "0") : parsed.symbol;
+  return `${code}:${venue}`;
+}
+
+/** The venues abroad whose listings' own reports Gloom Cloud reads: their exchange's results calendar and announcements. */
+const HISTORY_VENUES_ABROAD: ReadonlySet<string> = new Set(["HKEX", "SGX", "SSE", "SZSE"]);
+
+/**
+ * How ERN reads a symbol's past reports: by its listing's key, however it was
+ * typed (`boardKey`: 0700.HK is 0700:HKEX). A US listing's are the US
+ * board's, where SAN is not SAN:EPA's company; a Hong Kong, Singapore or
+ * China A listing has its own (`ownAbroad`), which Gloom Cloud reads from its
+ * exchange's results calendar and announcements, in their currency. Any other
+ * listing abroad has none (`abroad`) and shows its next report. A server that
+ * reads only Hong Kong's refuses the others (`noHistoryAbroad`), which then
+ * show their next report as before.
+ */
+export function historyListing(symbol: string): { listing: string; abroad: boolean; ownAbroad: boolean } {
+  const listing = boardKey(symbol);
+  const venue = listingAbroadVenue(listing);
+  const own = venue != null && HISTORY_VENUES_ABROAD.has(venue);
+  return { listing, abroad: venue != null && !own, ownAbroad: own };
+}
+
+/**
+ * Whether a board row is the listing named: its own line, or another of its
+ * company's (0939:HKEX for 601939:SSE, 9988:HKEX for BABA the day both report).
+ */
+export function boardRowOf(entry: Pick<BoardReport, "symbol" | "listings">, named: string): boolean {
+  const symbol = boardKey(named);
+  const [bare = symbol, venue] = symbol.split(":");
+  // A US ticker is a US row's bare symbol, never a listing abroad's.
+  if (!venue || isUsListingExchange(venue)) return !entry.symbol.includes(":") && entry.symbol.toUpperCase() === bare;
+  return [entry.symbol, ...entry.listings ?? []].some((line) => sameHistoryListing(line, symbol));
+}
+
+/**
+ * A company the stored calendar does not carry (a listing abroad, a date past
+ * its horizon) from the per-ticker calendar, read as every earnings surface
+ * reads its report (shared/earnings-calendar): a date gone by is reported, and
+ * keeps a consensus only when it is that report's, not the next quarter's.
+ */
 export function fallbackReport(event: EarningsEvent, owned: ReadonlyMap<string, Ownership>, today: string): BoardReport {
-  const date = event.earningsDate.toISOString().slice(0, 10);
-  const timing = event.timing === "BMO" ? "bmo" : event.timing === "AMC" ? "amc" : null;
+  const report = calendarReport(event, today);
   // Estimates in another currency would read as dollars beside the rest.
   const dollars = (field: "epsEstimate" | "revenueEstimate") => {
     const currency = event.estimateBasis?.[field]?.currency;
-    return currency && currency !== "USD" ? null : coherentEarningsValue(event, field);
+    return currency && currency !== "USD" ? null : report[field];
   };
   const epsEstimate = dollars("epsEstimate");
   return {
-    key: `${event.symbol}:${date}`,
+    key: `${event.symbol}:${report.date}`,
     symbol: event.symbol,
     name: event.name || event.symbol,
-    date,
-    timing,
+    date: report.date,
+    timing: report.timing,
     expectedTiming: false,
-    // A date gone by is reported, as every earnings surface reads it (shared/earnings-calendar).
-    dateStatus: calendarStatus(event, today),
+    dateStatus: report.dateStatus,
     marketCap: null,
     epsEstimate,
-    // The count belongs to the estimate beside it.
-    epsAnalysts: epsEstimate == null ? null : coherentEarningsValue(event, "epsAnalysts"),
+    // The count and the basis belong to the estimate beside them.
+    epsAnalysts: epsEstimate == null ? null : report.epsAnalysts,
     epsActual: null,
     provisional: false,
-    // The estimate's basis goes with it.
-    epsBasis: epsEstimate == null ? null : earningsEpsBasis(event.epsBasis),
+    epsBasis: epsEstimate == null ? null : report.epsBasis,
     epsSurprise: null,
     revenueEstimate: dollars("revenueEstimate"),
     impliedMove: null,
     averageMove: null,
+    realizedMove: null,
     owned: owned.get(event.symbol) ?? null,
+    currency: epsEstimate != null || dollars("revenueEstimate") != null ? "USD" : null,
   };
 }
 
@@ -203,6 +276,14 @@ export function reportMove(report: Pick<BoardReport, "date" | "dateStatus" | "ti
       ? traded?.session === "PRE" ? traded.changePercent : null
       : getRegularSessionMoveDisplay(quote)?.changePercent;
   return percent != null && Number.isFinite(percent) ? percent / 100 : null;
+}
+
+/**
+ * The MOVE a board row shows: the move so far on a report out today
+ * (reportMove), else the move across a report already out (`realizedMove`).
+ */
+export function boardMove(report: BoardReport, quote: Quote | null | undefined, today: string): number | null {
+  return reportMove(report, quote, today) ?? report.realizedMove;
 }
 
 function compare(left: BoardReport, right: BoardReport, sort: BoardSort): number {

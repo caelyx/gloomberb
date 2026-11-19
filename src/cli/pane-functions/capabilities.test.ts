@@ -194,7 +194,7 @@ describe("pane function capabilities", () => {
   test("an option a function does not take is refused by the code the user typed, not its pane or capability id", () => {
     const comparison = capabilityFor("comparison-chart-pane");
     expect(() => normalizeCapabilityOptions(comparison, { tab: "cashflow" }, { code: "COMP" }))
-      .toThrow("COMP does not support --tab. Supported options: --range-preset, --axis-mode, --chart-resolution.");
+      .toThrow("COMP does not support --tab. Supported options: --range-preset, --axis-mode, --from, --to, --total-return, --currency, --chart-resolution, --extended-hours.");
     // A flag is named as it is typed, not as the parser keys it (`--as-of` reads as `asOf`).
     expect(() => normalizeCapabilityOptions(comparison, { asOf: "2026-10-14" }, { code: "COMP" }))
       .toThrow("COMP does not support --as-of.");
@@ -214,6 +214,10 @@ describe("pane function capabilities", () => {
     expect(() => normalizeCapabilityOptions(returns, { window: "1M", from: "2007" }, { code: "RETURN" })).toThrow("--from replaces --window; give one of them.");
     expect(() => normalizeCapabilityOptions(capabilityFor("historical-prices-pane"), { range: "5Y", from: "2007" }, { code: "HP" }))
       .toThrow("--from replaces --range; give one of them.");
+    // CMP too: `fn CMP IAG:LSE LHA:XETRA --from 2019-12-31` was refused.
+    const comparison = capabilityFor("comparison-chart-pane");
+    expect(normalizeCapabilityOptions(comparison, { from: "2019-12-31" }, { code: "CMP" })).toMatchObject({ from: "2019-12-31" });
+    expect(() => normalizeCapabilityOptions(comparison, { range: "5Y", from: "2019" }, { code: "CMP" })).toThrow("--from replaces --range; give one of them.");
   });
 
   test("a word after a function that takes none is answered with its options, and runs as the option whose value it is", () => {
@@ -357,6 +361,21 @@ describe("pane catalog search", () => {
     }
   });
 
+  test("the jobs report's names list the calendar, the statistics and the release-day reaction first", async () => {
+    const context = { config: createDefaultConfig("/tmp/capabilities-test") } as MarketContext;
+    const registry = await createPaneCatalog(context, getLoadablePlugins());
+    try {
+      const entries = await buildPaneCatalogEntries(registry, context);
+      // "jobs report" listed JOBS (hiring), FDA, CG and EE, and nfp found MDAY alone.
+      for (const query of ["jobs report", "nfp", "payrolls", "nonfarm"]) {
+        const { shown } = selectPaneCatalogMatches(filterPaneCatalogEntries(entries, query), query, 10);
+        expect(shown.slice(0, 3).map(({ token }) => token).sort(), query).toEqual(["ECO", "ECST", "MDAY"]);
+      }
+    } finally {
+      registry.destroy();
+    }
+  });
+
   test("Buffett, overlap, copying a basket and active share searches list 13F first, one word or several", async () => {
     const context = { config: createDefaultConfig("/tmp/capabilities-test") } as MarketContext;
     const registry = await createPaneCatalog(context, getLoadablePlugins());
@@ -432,10 +451,15 @@ describe("pane catalog search", () => {
         const ranked = filterPaneCatalogEntries(entries, query);
         expect(selectPaneCatalogMatches(ranked, query, 10).shown.map(({ token }) => token), query).toEqual(["G"]);
         expect(findCatalogSeries(plugins, query).map(({ unit, expression }) => `${unit} ${expression}`).sort(), query).toEqual([
-          "USD/barrel (2*42*RB=F + 42*HO=F - 3*CL=F)/3",
-          "USD/barrel 42*HO=F - BZ=F",
-          "USD/barrel 42*HO=F - CL=F",
+          // Priced in one delivery month, each charts by its id: the bare formula would mix months.
+          "USD/barrel fut:crack-321",
+          "USD/barrel fut:crack-ho-brent",
+          "USD/barrel fut:crack-ho-wti",
         ]);
+      }
+      // The 3-2-1 crack is found however its ratio is written, by search as by catalog.
+      for (const query of ["3-2-1 crack", "321 crack", "3:2:1"]) {
+        expect(findCatalogSeries(plugins, query, "names").map(({ id }) => id), query).toEqual(["fut:crack-321"]);
       }
     } finally {
       registry.destroy();
@@ -545,6 +569,59 @@ describe("pane catalog search", () => {
     // --all lists every match.
     expect(select(some, "price date", Number.POSITIVE_INFINITY)).toMatchObject({ hidden: 0, loose: false });
     expect(select(some, "price date", Number.POSITIVE_INFINITY).shown).toHaveLength(7);
+  });
+
+  test("with no function carrying every word, the ones a word names lead the few closest, ahead of mentions in keywords and flags", () => {
+    const entry = (token: string, label: string, description: string, keywords: string[] = [], options: PaneCatalogEntry["capability"]["options"] = []) => ({
+      token,
+      label,
+      description,
+      paneId: token.toLowerCase(),
+      paneName: label,
+      shortcut: token,
+      aliases: [],
+      keywords,
+      defaultSettings: {},
+      capability: { ...capabilityFor(`${token.toLowerCase()}-pane`), aliases: keywords, options },
+    });
+    const flag = (key: string, description: string) => ({ key, type: "string" as const, description });
+    // Alphabetical order puts the weak matches first: a mention of each word, one in a keyword and one in a flag, matches both words.
+    const entries = [
+      entry("AAA", "Receipts", "A receipt beside its home listing.", ["implied fx"], [flag("size", "Share volume")]),
+      entry("BBB", "Alerts", "Alerts on a move.", ["fx rate"], [flag("kind", "Volume spike")]),
+      entry("FXC", "FX Cross Rates", "Currency cross-rate matrix.", ["fx"]),
+      entry("SURF", "Volatility Surface", "Implied smiles and skew.", ["vol"]),
+      entry("VOLS", "Cross-asset Volatility", "Index closes."),
+    ];
+    const { shown, loose, hidden } = selectPaneCatalogMatches(filterPaneCatalogEntries(entries, "fx vol"), "fx vol", 25);
+    expect(loose).toBe(true);
+    // Each of the three is named by a word; the two mentions come after them, so none is lost to the limit.
+    expect(shown.slice(0, 3).map(({ token }) => token).sort()).toEqual(["FXC", "SURF", "VOLS"]);
+    expect(shown.slice(3).map(({ token }) => token).sort()).toEqual(["AAA", "BBB"]);
+    expect(hidden).toBe(0);
+  });
+
+  test("fx vol lists the functions named for fx or vol without --all, volatility before volume", async () => {
+    const context = { config: createDefaultConfig("/tmp/capabilities-test") } as MarketContext;
+    const registry = await createPaneCatalog(context, getLoadablePlugins());
+    try {
+      const entries = await buildPaneCatalogEntries(registry, context);
+      const { shown, loose } = selectPaneCatalogMatches(filterPaneCatalogEntries(entries, "fx vol"), "fx vol", 25);
+      const tokens = shown.map(({ token }) => token);
+      expect(loose).toBe(true);
+      // Not ADR (a fund's implied FX rate), ALRT (volume alerts) or ATS (OTC volume), which only mention a word.
+      expect(tokens).toEqual(expect.arrayContaining(["FXC", "OVDV", "VOLS", "HVT", "VCA"]));
+      expect(tokens).not.toEqual(expect.arrayContaining(["ADR"]));
+      expect(tokens).not.toContain("ALRT");
+      expect(tokens).not.toContain("ATS");
+      // One word: the volatility functions before the two about volume.
+      const vol = filterPaneCatalogEntries(entries, "vol").map(({ token }) => token);
+      for (const volatility of ["VOLS", "OVDV", "HVT", "VCA"]) {
+        expect(vol.indexOf(volatility), volatility).toBeLessThan(Math.min(vol.indexOf("ATS"), vol.indexOf("SIV"), vol.indexOf("ALRT")));
+      }
+    } finally {
+      registry.destroy();
+    }
   });
 
   test("an alias opens its function even when other functions contain the same letters", () => {

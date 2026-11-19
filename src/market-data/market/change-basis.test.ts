@@ -6,10 +6,13 @@ import {
   changeBasisLabel,
   changeBasisNote,
   combinedChangeBasisLabel,
+  dayMoveBasisLabel,
+  futuresQuoteFromSettle,
   quoteChangeBasis,
   quotePreviousCloseDate,
+  quoteSettleText,
 } from "./change-basis";
-import { previousPublishedSession } from "./freshness";
+import { isRegularSessionTime, nextRegularSessionOpen, previousPublishedSession } from "./freshness";
 
 // Wed 21 Oct 2026, 01:30 UTC.
 const NOW = Date.parse("2026-10-21T01:30:00Z");
@@ -44,6 +47,24 @@ test("a move skipping a venue holiday names the close it is from and the day the
   expect(changeBasisLabel({ kind: "close", date: "2025-12-31" }, NOW)).toBe("vs Wed 31 Dec 2025 close");
 });
 
+test("a split in the move's session is said beside the close it is measured from, as Gloom Cloud adjusted it", () => {
+  // SOXX on Thu 5 Nov 2026, the first session of its 3-for-1 split: the source's close of 450.41 is 150.14 on the new basis.
+  const soxx = createTestQuote({ symbol: "SOXX", instrumentType: "ETF", listingExchangeName: "NASDAQ", exchangeName: "NASDAQ",
+    price: 148.94, change: -1.2, changePercent: -0.8, previousClose: 150.14, changeSessionDate: "2026-11-05", marketState: "REGULAR",
+    lastUpdated: Date.parse("2026-11-05T18:30:00Z"), sessionSplit: { exDate: "2026-11-05", priceFactor: 1 / 3, sourcePreviousClose: 450.41 } });
+  const now = Date.parse("2026-11-05T19:00:00Z");
+  const basis = quoteChangeBasis(soxx);
+  expect(basis).toEqual({ kind: "close", date: "2026-11-04", venue: "NASDAQ", closed: [], split: { exDate: "2026-11-05", priceFactor: 1 / 3 } });
+  expect(changeBasisLabel(basis!, now)).toBe("vs Wed 4 Nov close");
+  expect(changeBasisNote(basis, now)).toBe("3-for-1 split Thu 5 Nov, close adjusted");
+  // The day after, the move is a plain day's: the split is no longer the move's.
+  const friday = { ...soxx, changeSessionDate: "2026-11-06", lastUpdated: Date.parse("2026-11-06T18:30:00Z") };
+  expect(changeBasisNote(quoteChangeBasis(friday), now)).toBeNull();
+  // A reverse split reads as one.
+  expect(changeBasisNote({ ...basis!, split: { exDate: "2026-11-05", priceFactor: 10 } } as never, now))
+    .toBe("1-for-10 reverse split Thu 5 Nov, close adjusted");
+});
+
 test("a quote dated by when it was read, on a weekend or a holiday, holds the last session's move, from the session before", () => {
   // Read on Saturday 17 Oct with no session date: Friday's move, from Thursday's close.
   const saturday = Date.parse("2026-10-17T10:00:00Z");
@@ -55,9 +76,40 @@ test("a quote dated by when it was read, on a weekend or a holiday, holds the la
   const eurusd = createTestQuote({ symbol: "EURUSD=X", instrumentType: "CURRENCY", listingExchangeName: "CCY", price: 1.16, change: 0.002,
     changePercent: 0.17, previousClose: 1.158, changeSessionDate: "2026-10-17", lastUpdated: saturday });
   expect(quoteChangeBasis(eurusd)).toEqual({ kind: "close", date: "2026-10-15" });
+  // Undated, a pair's move is of the FX trading day of its print, which turns at 17:00 New York:
+  // a print stamped 17:00:00 is that day's close, one after it the next day's.
+  const undated = (lastUpdated: string) => ({ ...eurusd, changeSessionDate: undefined, lastUpdated: Date.parse(lastUpdated) });
+  expect(quoteChangeBasis(undated("2026-10-15T20:59:00Z"))).toEqual({ kind: "close", date: "2026-10-14" });
+  expect(quoteChangeBasis(undated("2026-10-15T21:00:00Z"))).toEqual({ kind: "close", date: "2026-10-14" });
+  expect(quoteChangeBasis(undated("2026-10-15T21:00:01Z"))).toEqual({ kind: "close", date: "2026-10-15" });
+  expect(quotePreviousCloseDate(undated("2026-10-16T20:59:00Z"))).toBe("2026-10-15");
+  expect(quotePreviousCloseDate(undated("2026-10-16T21:00:00Z"))).toBe("2026-10-15");
+  // A print made while FX is shut belongs to no trading day, so nothing dates its previous close.
+  for (const shut of ["2026-10-16T21:00:01Z", "2026-10-17T10:00:00Z", "2026-10-18T21:00:00Z"]) {
+    expect(quoteChangeBasis(undated(shut)), shut).toEqual({ kind: "previous close" });
+    expect(quotePreviousCloseDate(undated(shut)), shut).toBeNull();
+  }
   // HKEX's Monday holiday: a quote read that day holds Friday's move, from Thursday.
   expect(previousPublishedSession("HKEX", "2026-10-19")).toEqual({ date: "2026-10-15", closed: [] });
   expect(previousPublishedSession("HKEX", "2026-10-20")).toEqual({ date: "2026-10-16", closed: ["2026-10-19"] });
+});
+
+test("NSE's Sunday Muhurat session is a session: its move is from Friday's close, and it trades only its own hours", () => {
+  // Sun 8 Nov 2026: INFY:NSE traded the Diwali Muhurat session, 14:20 to 15:30 IST, -0.83% from Fri 6 Nov's 1,181.40.
+  const infy = createTestQuote({ symbol: "INFY", currency: "INR", listingExchangeName: "NSE", exchangeName: "NSE", price: 1171.6,
+    change: -9.8, changePercent: -0.83, previousClose: 1181.4, changeSessionDate: "2026-11-08", marketState: "CLOSED",
+    lastUpdated: Date.parse("2026-11-08T09:59:30Z") });
+  const evening = Date.parse("2026-11-08T14:05:00Z");
+  expect(quoteChangeBasis(infy)).toEqual({ kind: "close", date: "2026-11-06", venue: "NSE", closed: [] });
+  expect(changeBasisLabel(quoteChangeBasis(infy)!, evening)).toBe("vs Fri 6 Nov close");
+  // Monday's move is from the Muhurat session, BSE's too.
+  expect(previousPublishedSession("BSE", "2026-11-09")).toEqual({ date: "2026-11-08", closed: [] });
+  // Open from 14:20 IST (08:50 UTC) to the close with its auction, 16:00 IST; shut that morning and the Sunday after.
+  expect(isRegularSessionTime("NSE", Date.parse("2026-11-08T05:00:00Z"))).toBe(false);
+  expect(isRegularSessionTime("NSE", Date.parse("2026-11-08T09:00:00Z"))).toBe(true);
+  expect(isRegularSessionTime("NSE", Date.parse("2026-11-08T10:31:00Z"))).toBe(false);
+  expect(nextRegularSessionOpen("NSE", Date.parse("2026-11-07T10:00:00Z"))?.open).toBe(Date.parse("2026-11-08T08:50:00Z"));
+  expect(isRegularSessionTime("NSE", Date.parse("2026-11-15T09:00:00Z"))).toBe(false);
 });
 
 test("a venue without a published calendar keeps its previous close undated, never guessed", () => {
@@ -122,15 +174,39 @@ test("a future's move the Tuesday after Memorial Day is from Friday, the trade d
   expect(quoteChangeBasis(es({ changeSessionDate: "2026-05-25" }))).toEqual({ kind: "close", date: "2026-05-22" });
 });
 
+test("VX1, quoted at Cboe's settlement, moves from the CFE session before it, as CL=F does", () => {
+  // As Gloom Cloud quoted it on Sun 8 Nov 2026: Friday's 23.6945 settlement, made at 15:00 Chicago time.
+  const vx = createTestQuote({
+    symbol: "VX1", name: "VIX Futures 1st generic, now Nov 2026", instrumentType: "FUTURE", listingExchangeName: "CFE", exchangeName: "CFE",
+    price: 23.6945, change: -0.841, changePercent: -3.43, previousClose: 24.5355, previousCloseDate: "2026-11-05",
+    changeSessionDate: "2026-11-06", lastUpdated: Date.parse("2026-11-06T21:00:00Z"), priceBasis: "points",
+  });
+  const terms = { settlement: { price: 23.6945, date: "2026-11-06" }, spec: { tick: 0.05 }, deliveryMonth: "2026-11" };
+  const basis = quoteChangeBasis(vx, { terms });
+  expect(basis).toEqual({ kind: "settle", date: "2026-11-05" });
+  expect(changeBasisLabel(basis!, NOW)).toBe("vs Thu 5 Nov settle");
+  expect(quoteSettleText(vx, terms)).toBe("23.6945 (2026-11-06)");
+  // CFE had no trade date on Thanksgiving: the Friday after moves from Wednesday.
+  const friday = { ...vx, changeSessionDate: "2026-11-27", lastUpdated: Date.parse("2026-11-27T18:15:00Z") };
+  expect(quoteChangeBasis(friday, { terms: { ...terms, settlement: { price: 23.6945, date: "2026-11-27" } } }))
+    .toEqual({ kind: "settle", date: "2026-11-25" });
+});
+
 test("ICE's softs did not trade Good Friday, so Monday's coffee move is from Thursday", () => {
   const kc = createTestQuote({
-    symbol: "KC=F", currency: "USX", instrumentType: "FUTURE", listingExchangeName: "ICE FUTURES", exchangeName: "ICE FUTURES",
+    symbol: "KC=F", name: "Coffee May 26", currency: "USX", instrumentType: "FUTURE", listingExchangeName: "ICE FUTURES", exchangeName: "ICE FUTURES",
     price: 300, change: 3, changePercent: 1.01, previousClose: 297, changeSessionDate: "2026-04-06", marketState: "REGULAR",
     lastUpdated: Date.parse("2026-04-06T15:00:00Z"),
   });
-  const thursday = { settlement: { price: 297, date: "2026-04-02" }, spec: { tick: 0.05 } };
+  const thursday = { settlement: { price: 297, date: "2026-04-02" }, spec: { tick: 0.05 }, deliveryMonth: "2026-05" };
   expect(quoteChangeBasis(kc, { terms: thursday })).toEqual({ kind: "settle", date: "2026-04-02" });
-  expect(quoteChangeBasis({ ...kc, change: 3.5 }, { terms: thursday })).toEqual({ kind: "last trade", date: "2026-04-02" });
+  // A reference that is not Thursday's settlement of the same contract is measured again from it, and reads as it.
+  expect(quoteChangeBasis({ ...kc, change: 3.5 }, { terms: thursday })).toEqual({ kind: "previous close" });
+  expect(quoteChangeBasis(futuresQuoteFromSettle({ ...kc, change: 3.5 }, thursday), { terms: thursday })).toEqual({ kind: "settle", date: "2026-04-02" });
+  // Terms of July while the quote prices May: the source's move stands, from no named session.
+  const july = { ...thursday, deliveryMonth: "2026-07" };
+  expect(futuresQuoteFromSettle({ ...kc, change: 3.5 }, july)).toEqual({ ...kc, change: 3.5 });
+  expect(quoteChangeBasis({ ...kc, change: 3.5 }, { terms: july })).toEqual({ kind: "previous close" });
   expect(quoteChangeBasis(kc, { terms: { ...thursday, settlement: { price: 300.5, date: "2026-04-06" } } }))
     .toEqual({ kind: "close", date: "2026-04-02" });
   expect(quotePreviousCloseDate(kc)).toBe("2026-04-02");
@@ -142,13 +218,30 @@ test("ICE's softs did not trade Good Friday, so Monday's coffee move is from Thu
 });
 
 test("a future on a venue without a published calendar keeps its previous close undated", () => {
-  const vx = es({ symbol: "VX=F", listingExchangeName: "CFE", exchangeName: "CFE", price: 18.5, change: 0.5, previousClose: 18 });
+  // ICE Futures Europe has no calendar here: no listing Gloom Cloud quotes trades there.
+  const brent = es({ symbol: "B=F", listingExchangeName: "ICE FUTURES EUROPE", exchangeName: "ICE FUTURES EUROPE", price: 18.5, change: 0.5, previousClose: 18 });
   const terms = { settlement: { price: 18, date: "2026-05-22" }, spec: { tick: 0.05 } };
   // A settlement the move matches is dated by the terms, not by a calendar.
-  expect(quoteChangeBasis(vx, { terms })).toEqual({ kind: "settle", date: "2026-05-22" });
-  expect(quoteChangeBasis(vx, { terms: { ...terms, settlement: { price: 18.4, date: "2026-05-26" } } })).toEqual({ kind: "previous close" });
-  expect(quoteChangeBasis(vx)).toEqual({ kind: "previous close" });
-  expect(quotePreviousCloseDate(vx)).toBeNull();
+  expect(quoteChangeBasis(brent, { terms })).toEqual({ kind: "settle", date: "2026-05-22" });
+  expect(quoteChangeBasis(brent, { terms: { ...terms, settlement: { price: 18.4, date: "2026-05-26" } } })).toEqual({ kind: "previous close" });
+  expect(quoteChangeBasis(brent)).toEqual({ kind: "previous close" });
+  expect(quotePreviousCloseDate(brent)).toBeNull();
+});
+
+/** `quote HCI:JSE` in session on 30 Oct 2026 said "+0.59% vs prev close" where US and LSE rows named the day. */
+test("a JSE move names its close from the venue's calendar, without daily closes, across the election-day closure", () => {
+  const hci = createTestQuote({
+    symbol: "HCI", currency: "ZAR", instrumentType: "EQUITY", listingExchangeName: "JSE", exchangeName: "JSE",
+    price: 172, change: 1, changePercent: 0.59, previousClose: 171, changeSessionDate: "2026-10-30",
+    marketState: "REGULAR", lastUpdated: Date.parse("2026-10-30T10:00:00Z"),
+  });
+  expect(changeBasisLabel(quoteChangeBasis(hci)!, NOW)).toBe("vs Thu 29 Oct close");
+  // Wed 4 Nov is South Africa's local government election day, a public holiday the JSE closes for.
+  const thursday = { ...hci, changeSessionDate: "2026-11-05", lastUpdated: Date.parse("2026-11-05T10:00:00Z") };
+  const basis = quoteChangeBasis(thursday);
+  expect(basis).toEqual({ kind: "close", date: "2026-11-03", venue: "JSE", closed: ["2026-11-04"] });
+  expect(changeBasisLabel(basis!, NOW)).toBe("vs Tue 3 Nov close");
+  expect(changeBasisNote(basis, NOW)).toBe("JSE closed Wed 4 Nov, holiday");
 });
 
 test("an index quoted under its publisher names the venue whose days it trades in its holiday note", () => {
@@ -165,6 +258,64 @@ test("an index quoted under its publisher names the venue whose days it trades i
   expect(changeBasisNote(quoteChangeBasis(spx), NOW)).toBe("NYSE closed Thu 26 Nov, holiday");
 });
 
+test("an index quote naming no session is dated by the session of its home venue its last print sits in", () => {
+  // Sun 8 Nov 2026: the S&P 500's closing print at 16:37 New York and the Nikkei's at 15:45 Tokyo, both on Fri 6 Nov.
+  const now = Date.parse("2026-11-08T09:38:00Z");
+  const index = (symbol: string, venue: string, at: string) => createTestQuote({
+    symbol, instrumentType: "INDEX", listingExchangeName: venue, exchangeName: venue, price: 100, change: 1, changePercent: 1,
+    previousClose: 99, marketState: "CLOSED", lastUpdated: Date.parse(at),
+  });
+  const label = (quote: Quote) => changeBasisLabel(quoteChangeBasis(quote)!, now);
+  expect(label(index("^GSPC", "SNP", "2026-11-06T21:37:09Z"))).toBe("vs Thu 5 Nov close");
+  expect(label(index("^IXIC", "NASDAQ GIDS", "2026-11-06T22:15:59Z"))).toBe("vs Thu 5 Nov close");
+  expect(label(index("^N225", "OSAKA", "2026-11-06T06:45:02Z"))).toBe("vs Thu 5 Nov close");
+  // A print before the day's open, on a day the venue has no session, or from a venue with no published calendar, names none.
+  expect(label(index("^GSPC", "SNP", "2026-11-06T12:00:00Z"))).toBe("vs prev close");
+  expect(label(index("^GSPC", "SNP", "2026-11-07T15:00:00Z"))).toBe("vs prev close");
+  expect(label(index("^FTSE", "FTSE", "2026-11-06T16:35:00Z"))).toBe("vs prev close");
+});
+
+// `quote ^GDAXI ^STOXX50E ^STOXX ^FTSE` on Fri 13 Nov 2026: the DAX read "vs Wed 11 Nov close", the Euro Stoxx 50, the
+// Stoxx Europe 600 and the FTSE 100, quoted under their publishers with no session named, "vs prev close".
+test("an index under a publisher's venue with no calendar, or under Cboe's, is dated by its own sessions", () => {
+  const now = Date.parse("2026-11-13T02:45:00Z");
+  // Xetra's days of that week, 08:00 to 16:30 UTC, as Gloom Cloud sends them with the index.
+  const day = (date: string) => ({ start: Date.parse(`${date}T08:00:00Z`), end: Date.parse(`${date}T16:30:00Z`) });
+  const sx5e = createTestQuote({
+    symbol: "^STOXX50E", instrumentType: "INDEX", listingExchangeName: "ZURICH", exchangeName: "ZURICH", currency: "EUR",
+    price: 6_398.98, change: 5.59, changePercent: 0.09, previousClose: 6_393.39, marketState: "CLOSED", lastUpdated: Date.parse("2026-11-12T17:00:00Z"),
+    indexSession: {
+      timeZone: "Europe/Zurich",
+      regular: ["2026-11-06", "2026-11-09", "2026-11-10", "2026-11-11", "2026-11-12"].map(day), current: day("2026-11-13"),
+    },
+  });
+  expect(changeBasisLabel(quoteChangeBasis(sx5e)!, now)).toBe("vs Wed 11 Nov close");
+  // A print before the day's session opened sits in none of them, and stays undated.
+  expect(changeBasisLabel(quoteChangeBasis({ ...sx5e, lastUpdated: Date.parse("2026-11-12T06:00:00Z") })!, now)).toBe("vs prev close");
+  // The Russell 2000, quoted under Cboe's CHICAGO OPTIONS, is dated by its own New York sessions as well.
+  const nyDay = (date: string) => ({ start: Date.parse(`${date}T14:30:00Z`), end: Date.parse(`${date}T21:00:00Z`) });
+  const rut = createTestQuote({
+    symbol: "^RUT", instrumentType: "INDEX", listingExchangeName: "CHICAGO OPTIONS", exchangeName: "CHICAGO OPTIONS", currency: "USD",
+    price: 2_799.06, change: -47.2, changePercent: -1.66, previousClose: 2_846.26, marketState: "CLOSED", lastUpdated: Date.parse("2026-11-12T21:10:04Z"),
+    indexSession: { timeZone: "America/New_York", regular: ["2026-11-10", "2026-11-11", "2026-11-12"].map(nyDay), current: nyDay("2026-11-12") },
+  });
+  expect(changeBasisLabel(quoteChangeBasis(rut)!, now)).toBe("vs Wed 11 Nov close");
+});
+
+test("a Cboe yield index is never dated by its venue's equity calendar: NYSE trades through Veterans Day, the bond market does not", () => {
+  // Thu 12 Nov 2026: the 10-year yield moves from Tue 10 Nov's close; Wed 11 Nov was a bond holiday.
+  const now = Date.parse("2026-11-12T22:00:00Z");
+  const tnx = createTestQuote({ symbol: "^TNX", instrumentType: "INDEX", listingExchangeName: "CBOE INDICES", exchangeName: "CBOE INDICES",
+    price: 4.1, change: 0.03, changePercent: 0.74, previousClose: 4.07, marketState: "CLOSED", lastUpdated: Date.parse("2026-11-12T20:59:00Z") });
+  const label = (quote: Quote) => changeBasisLabel(quoteChangeBasis(quote)!, now);
+  // Neither its print nor its session names the day before; its own dated close does.
+  expect(label(tnx)).toBe("vs prev close");
+  expect(label({ ...tnx, changeSessionDate: "2026-11-12" })).toBe("vs prev close");
+  expect(label({ ...tnx, changeSessionDate: "2026-11-12", previousCloseDate: "2026-11-10" })).toBe("vs Tue 10 Nov close");
+  // ^VIX trades Cboe's equity days, Wednesday among them.
+  expect(label({ ...tnx, symbol: "^VIX", changeSessionDate: "2026-11-12" })).toBe("vs Wed 11 Nov close");
+});
+
 test("a total over moves from different closes says so instead of naming one", () => {
   const us = { kind: "close" as const, date: "2026-10-19", venue: "NASDAQ", closed: [] };
   const hkex = { kind: "close" as const, date: "2026-10-16", venue: "HKEX", closed: ["2026-10-19"] };
@@ -174,10 +325,53 @@ test("a total over moves from different closes says so instead of naming one", (
   expect(combinedChangeBasisLabel([null], NOW)).toBeNull();
 });
 
+test("a day's move priced at extended-hours prints names their session before the close it is from", () => {
+  const us = { kind: "close" as const, date: "2026-10-19", venue: "NASDAQ", closed: [] };
+  const hkex = { kind: "close" as const, date: "2026-10-16", venue: "HKEX", closed: ["2026-10-19"] };
+  expect(dayMoveBasisLabel([us, us], ["POST", null], { now: NOW })).toBe("after hours vs Mon 19 Oct close");
+  expect(dayMoveBasisLabel([us, us], ["POST", null], { marks: true, now: NOW })).toBe("AH vs Mon 19 Oct close");
+  expect(dayMoveBasisLabel([us], ["PRE"], { marks: true, now: NOW })).toBe("PM vs Mon 19 Oct close");
+  expect(dayMoveBasisLabel([us, hkex], ["PRE"], { now: NOW })).toBe("pre-market vs mixed closes");
+  expect(dayMoveBasisLabel([us, us], ["PRE", "OVERNIGHT"], { marks: true, now: NOW })).toBe("EXT vs Mon 19 Oct close");
+  expect(dayMoveBasisLabel([us, us], ["PRE", "OVERNIGHT"], { now: NOW })).toBe("extended hours vs Mon 19 Oct close");
+  // Regular-session prices name the close alone; no basis, no label.
+  expect(dayMoveBasisLabel([us, hkex], [null, undefined], { now: NOW })).toBe("vs mixed closes");
+  expect(dayMoveBasisLabel([null], ["POST"], { now: NOW })).toBeNull();
+});
+
 test("--json gives the basis beside the move: kind, dated session, closures, label and note", () => {
   expect(changeBasisJson(quoteChangeBasis(hk), NOW)).toEqual({
     kind: "close", date: "2026-10-16", closed: ["2026-10-19"], label: "vs Fri 16 Oct close", note: "HKEX closed Mon 19 Oct, holiday",
   });
   expect(changeBasisJson({ kind: "utc day" }, NOW)).toEqual({ kind: "utc day", date: null, label: "since 00:00 UTC" });
   expect(changeBasisJson(null, NOW)).toBeNull();
+});
+
+test("after the CME reopen the move is the source's, from the close of the session that has not settled yet, never two sessions", () => {
+  // ES=F on Wed 4 Nov 2026 at 23:18 UTC, eighteen minutes after Globex reopened for Thursday's trade date. Tuesday
+  // settled at 7,596.75; Wednesday's 7,720.50 close is not confirmed as its settlement until overnight.
+  const terms = { settlement: { price: 7596.75, date: "2026-11-03" }, spec: { tick: 0.25 }, deliveryMonth: "2026-12" };
+  const reopen = (changeSessionDate: string, previousCloseDate: string) => createTestQuote({
+    symbol: "ES=F", name: "E-Mini S&P 500 Dec 26", instrumentType: "FUTURE", listingExchangeName: "CME", exchangeName: "CME", marketState: "REGULAR",
+    price: 7734.5, change: 14, changePercent: 0.18, previousClose: 7720.5, previousCloseDate, changeSessionDate,
+    lastUpdated: Date.parse("2026-11-04T23:18:00Z"),
+  });
+  // The source still dates the move Wednesday's (it read "vs Tue 3 Nov last trade"), then Thursday's.
+  for (const quote of [reopen("2026-11-04", "2026-11-03"), reopen("2026-11-05", "2026-11-04")]) {
+    expect(futuresQuoteFromSettle(quote, terms)).toBe(quote);
+    const basis = quoteChangeBasis(quote, { terms })!;
+    expect(changeBasisLabel(basis, NOW)).toBe("vs Wed 4 Nov close");
+    expect(quotePreviousCloseDate(quote)).toBe("2026-11-04");
+  }
+  // Once Wednesday's settlement is confirmed the source's move matches it and stands.
+  const confirmed = { ...terms, settlement: { price: 7720.5, date: "2026-11-04" } };
+  const quote = reopen("2026-11-05", "2026-11-04");
+  expect(futuresQuoteFromSettle(quote, confirmed)).toBe(quote);
+  expect(quoteChangeBasis(quote, { terms: confirmed })).toEqual({ kind: "settle", date: "2026-11-04" });
+  // Confirmed at another price while the source still measures from the close: measured again from the settlement.
+  const other = { ...terms, settlement: { price: 7722.25, date: "2026-11-04" } };
+  const remeasured = futuresQuoteFromSettle(quote, other);
+  expect(remeasured).toMatchObject({ change: 12.25, previousClose: 7722.25, previousCloseDate: "2026-11-04" });
+  expect(changeBasisLabel(quoteChangeBasis(remeasured, { terms: other })!, NOW)).toBe("vs Wed 4 Nov settle");
+  expect(quotePreviousCloseDate(remeasured)).toBe("2026-11-04");
 });

@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import type { PricePoint, Quote } from "../../../types/financials";
 import { FUTURES_CONTRACTS } from "../../../market-data/futures-board";
-import { frontContractCandidates, frontContractReturns, pickFrontContract } from "./returns";
+import { frontContractCandidates, frontContractPeriodReturns, frontContractReturns, pickFrontContract } from "./returns";
+import { futuresReturnBaseText } from "./model";
 
 const contract = (code: string) => FUTURES_CONTRACTS.find((entry) => entry.code === code)!;
 const quote = (symbol: string, name: string, at = "2026-09-27T22:30:00Z"): Quote =>
@@ -37,8 +38,11 @@ describe("front contract", () => {
 
 describe("front contract returns", () => {
   const history = bars(
+    ["2025-09-26", 70],
     ["2025-12-30", 80],
     ["2025-12-31", 80],
+    ["2026-03-27", 85],
+    ["2026-06-26", 90],
     ["2026-08-27", 95],
     ["2026-08-28", 96],
     ["2026-09-18", 98],
@@ -52,6 +56,21 @@ describe("front contract returns", () => {
     // A month back is Aug 27.
     expect(returns["1M"]).toBeCloseTo((102 / 95 - 1) * 100, 10);
     expect(returns.YTD).toBeCloseTo((102 / 80 - 1) * 100, 10);
+    // The horizons only the JSON and CSV carry: back to the Friday on or before Jun 27, Mar 27 and Sep 27 2025.
+    expect(returns["3M"]).toBeCloseTo((102 / 90 - 1) * 100, 10);
+    expect(returns["6M"]).toBeCloseTo((102 / 85 - 1) * 100, 10);
+    expect(returns["1Y"]).toBeCloseTo((102 / 70 - 1) * 100, 10);
+  });
+
+  test("each return names the day of the close it runs from, for the board's JSON, CSV and report", () => {
+    const { values, bases } = frontContractPeriodReturns(history, 102, Date.parse("2026-09-27T22:30:00Z"));
+    expect(values["1M"]).toBeCloseTo((102 / 95 - 1) * 100, 10);
+    expect(bases).toEqual({ "1W": "2026-09-18", "1M": "2026-08-27", "3M": "2026-06-26", "6M": "2026-03-27", "1Y": "2025-09-26", YTD: "2025-12-31" });
+    // The report and the header's hover say it once when every row agrees.
+    const board = new Map([["CL=F", { loading: false, values, bases }], ["NG=F", { loading: false, values, bases }]]);
+    expect(futuresReturnBaseText("1M", board, Date.parse("2026-09-27T22:30:00Z"))).toBe("1M from Thu 27 Aug close");
+    const apart = new Map([...board, ["GC=F", { loading: false, values, bases: { ...bases, "1M": "2026-08-26" } }]]);
+    expect(futuresReturnBaseText("1M", apart, Date.parse("2026-09-27T22:30:00Z"))).toBe("1M from each contract's close on or before Thu 27 Aug");
   });
 
   test("without a live price the last close stands in", () => {

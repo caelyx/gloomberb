@@ -34,13 +34,23 @@ const MAX_LATE_GRACE_DAYS = 30;
 export const LATE_GRACE_DAYS = [...new Set(Object.values(REGULAR_CADENCE)
   .map((cadence) => Math.min(cadence.halfPeriodDays, MAX_LATE_GRACE_DAYS)))];
 
+/**
+ * How far past two years the cadence looks when those two years hold a single ex-date: an annual payer whose
+ * ex-date came a few days later than the year before (Moutai's June 25, 2021 and June 30, 2022) has one in
+ * them for those days, and read as no cadence its trailing cash fell to nothing until the late one went ex.
+ */
+export const CADENCE_GRACE_DAYS = MAX_LATE_GRACE_DAYS;
+
 /** Cadence of ex-dates in the two years ending at `asOf`, ignoring later payments. */
 export function inferCadence(payments: readonly Pick<CashDistribution, "exDate">[], asOf: Date): DistributionCadence | null {
-  const cutoff = calendarMonthsBefore(asOf, 24);
-  // Old suspensions or a former schedule must not redefine a fund's recent cadence.
-  const dates = [...new Set(payments.filter((payment) => payment.exDate > cutoff && payment.exDate <= asOf)
+  const within = (cutoff: Date) => [...new Set(payments.filter((payment) => payment.exDate > cutoff && payment.exDate <= asOf)
     .map((payment) => payment.exDate.getTime()))]
     .sort((a, b) => a - b);
+  const cutoff = calendarMonthsBefore(asOf, 24);
+  // Old suspensions or a former schedule must not redefine a fund's recent cadence.
+  let dates = within(cutoff);
+  // A single ex-date in two years: the one before it, if only days past them, says the cadence.
+  if (dates.length === 1) dates = within(new Date(cutoff.getTime() - CADENCE_GRACE_DAYS * DAY));
   if (dates.length < 2) return null;
   const avgGapDays = (dates.at(-1)! - dates[0]!) / (dates.length - 1) / DAY;
   if (Math.abs(avgGapDays - 30) < 8) return "monthly";
@@ -51,7 +61,9 @@ export function inferCadence(payments: readonly Pick<CashDistribution, "exDate">
 }
 
 /**
- * Trailing twelve-month cash as known at `asOf`, one payment per regular period.
+ * The payments trailing twelve-month cash is made of as known at `asOf`, one
+ * per regular period, and how many a year the issuer's cadence pays (null
+ * without a regular cadence).
  *
  * A fixed one-year ex-date window counts a fifth quarterly (or thirteenth
  * monthly) payment when this year's ex-date is a few days earlier than last
@@ -61,13 +73,13 @@ export function inferCadence(payments: readonly Pick<CashDistribution, "exDate">
  * the window holds fewer than one year of payments. Irregular cash uses the
  * plain window, so special distributions are neither dropped nor extended.
  */
-export function trailingCashAt<Payment extends CashDistribution>(payments: readonly Payment[], asOf: Date): number {
+export function trailingPayments<Payment extends CashDistribution>(payments: readonly Payment[], asOf: Date): { counted: Payment[]; perYear: number | null; cadence: DistributionCadence | null } {
   const known = payments.filter((payment) => payment.exDate <= asOf && Number.isFinite(payment.amount) && payment.amount > 0)
     .sort((a, b) => a.exDate.getTime() - b.exDate.getTime());
   const cutoff = calendarMonthsBefore(asOf, 12);
   const cadence = inferCadence(known, asOf);
   const regular = cadence ? REGULAR_CADENCE[cadence] : undefined;
-  if (!regular) return known.filter((payment) => payment.exDate > cutoff).reduce((sum, payment) => sum + payment.amount, 0);
+  if (!regular) return { counted: known.filter((payment) => payment.exDate > cutoff), perYear: null, cadence };
 
   const halfPeriod = regular.halfPeriodDays * DAY;
   const graceCutoff = new Date(cutoff.getTime() - Math.min(regular.halfPeriodDays, MAX_LATE_GRACE_DAYS) * DAY);
@@ -94,7 +106,54 @@ export function trailingCashAt<Payment extends CashDistribution>(payments: reado
   const late = candidates.filter((payment) => payment.exDate <= cutoff && payment.exDate > graceCutoff && !superseded.has(payment))
     .reverse()
     .slice(0, Math.max(0, regular.perYear - counted.length));
-  return [...counted, ...late].reduce((sum, payment) => sum + payment.amount, 0);
+  return { counted: [...counted, ...late], perYear: regular.perYear, cadence };
+}
+
+/** Trailing twelve-month cash as known at `asOf` (trailingPayments). */
+export function trailingCashAt<Payment extends CashDistribution>(payments: readonly Payment[], asOf: Date): number {
+  return trailingPayments(payments, asOf).counted.reduce((sum, payment) => sum + payment.amount, 0);
+}
+
+/** How many payments trailing cash counts against how many a year the issuer's cadence pays. */
+export interface TrailingPayments {
+  counted: number;
+  expected: number;
+  cadence: DistributionCadence;
+}
+
+/**
+ * The payments a regular payer's trailing cash counts when it is fewer than
+ * its cadence pays in a year: a hole in the history (ECC's monthly July to
+ * September 2026 distributions), a missed or late payment, or a fund under a
+ * year old. Null for a full year, an irregular payer and an issuer with no
+ * cadence, whose trailing cash is the plain window.
+ */
+export function trailingPaymentShortfall(payments: readonly CashDistribution[], asOf: Date): TrailingPayments | null {
+  const { counted, perYear, cadence } = trailingPayments(payments, asOf);
+  return perYear != null && cadence && counted.length < perYear ? { counted: counted.length, expected: perYear, cadence } : null;
+}
+
+/** Over this ratio between a regular payer's largest and smallest payment of a year, no one payment stands for the year. */
+const UNEVEN_PAYMENT_RATIO = 1.5;
+
+/**
+ * A regular payer's payments of the trailing year when they differ widely:
+ * exactly as many as its cadence pays, the largest more than 1.5 times the
+ * smallest (HSBC's final beside its interims, AstraZeneca's interim beside its
+ * final). Their total is the year's cash, where the latest one annualized is
+ * not (HSBA's interim read as 2.17% a year beside the 4.08% it paid). Null for
+ * an even year, one with a hole or an extra payment, an annual payer and an
+ * irregular one. `latest` is the newest payment's ex-date.
+ */
+export function unevenRegularPayments(payments: readonly CashDistribution[], asOf: Date): { total: number; latest: Date } | null {
+  const { counted, perYear } = trailingPayments(payments, asOf);
+  if (perYear == null || perYear < 2 || counted.length !== perYear) return null;
+  const amounts = counted.map((payment) => payment.amount);
+  if (Math.max(...amounts) <= UNEVEN_PAYMENT_RATIO * Math.min(...amounts)) return null;
+  return {
+    total: atSourcePrecision(amounts.reduce((sum, amount) => sum + amount, 0)),
+    latest: new Date(Math.max(...counted.map((payment) => payment.exDate.getTime()))),
+  };
 }
 
 /** A history row as a paid distribution; null when its date is not a calendar day or its amount is no cash. */

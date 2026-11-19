@@ -11,6 +11,7 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
+import { flushSync } from "react-dom";
 import { EmptyState } from "../../../components/ui/status";
 import { usePaneInstance } from "../../../state/app/context";
 import { useRegisterPaneScrollBox } from "../../../state/pane-scroll-registry";
@@ -26,6 +27,8 @@ import {
   buildTableGridTemplateColumns,
   getTableWidth,
   hasMeaningfulTableHorizontalOverflow,
+  hiddenTableColumnText,
+  tableFreezesFirstColumn,
 } from "../../../components/ui/table-layout";
 import { WEB_CELL_HEIGHT, WEB_CELL_WIDTH } from "../../../theme/font-scale";
 import { isLiveResizing, onLiveResizeEnd } from "../../../ui/live-resize";
@@ -42,6 +45,7 @@ import {
   useScrollbarState,
 } from "./dom";
 import { WebDataTableHeader, WebDataTableRow } from "./row";
+import { useWebColumnDrag } from "./column-drag";
 
 interface VirtualRow {
   index: number;
@@ -58,12 +62,12 @@ const OVERFLOW_FADE_PX = 28;
  * rather than as a mask on it so the vertical scrollbar stays crisp. The
  * header band fades into the header colour and the rows into the table's.
  */
-function overflowFadeStyle(side: "left" | "right", offsetPx: number, bottomPx: number): CSSProperties {
+function overflowFadeStyle(side: "left" | "right", offsetPx: number, bottomPx: number, topPx: number): CSSProperties {
   const direction = side === "left" ? "to left" : "to right";
   const headerPx = tableHeaderPx();
   return {
     position: "absolute",
-    top: 0,
+    top: topPx,
     bottom: bottomPx,
     [side]: offsetPx,
     width: OVERFLOW_FADE_PX,
@@ -82,6 +86,8 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
   sortColumnId,
   sortDirection,
   onHeaderClick,
+  onColumnMove,
+  anchoredColumns = 1,
   headerScrollRef,
   scrollRef,
   syncHeaderScroll: _syncHeaderScroll,
@@ -106,6 +112,7 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
   bodyAfter,
   emptyStateTitle,
   emptyStateHint,
+  emptyStateActions,
   virtualize = true,
   fitRows = false,
   overscan = 3,
@@ -113,7 +120,7 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
   horizontalPadding = 1,
   fillAvailableWidth = true,
   showHorizontalScrollbar = true,
-  freezeFirstColumn = false,
+  freezeFirstColumn: freezeFirstColumnProp,
   scrollToIndex,
   scrollToIndexAlign = "nearest",
   scrollToIndexVersion = 0,
@@ -121,6 +128,14 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
   const paneInstanceId = usePaneInstance()?.instanceId ?? null;
   const focusPane = useFocusOwningPane();
   const bodyElementRef = useRef<HTMLDivElement | null>(null);
+  const contentElementRef = useRef<HTMLDivElement | null>(null);
+  const { drag: columnDrag, startPress: pressMovableHeader } = useWebColumnDrag({
+    contentRef: contentElementRef,
+    bodyRef: bodyElementRef,
+    anchoredColumns,
+    onColumnMove,
+    onHeaderClick,
+  });
   const headerHorizontal = useScrollbarState(false);
   const headerVertical = useScrollbarState(false);
   const bodyHorizontal = useScrollbarState(showHorizontalScrollbar);
@@ -202,6 +217,17 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
   const bodyAfterHeight = bodyAfter ? WEB_CELL_HEIGHT * 6 : 0;
   const horizontalScrollEnabled = showHorizontalScrollbar
     && hasMeaningfulTableHorizontalOverflow(tableWidth, viewportWidth, columnGap);
+  const freezeFirstColumn = tableFreezesFirstColumn({
+    freezeFirstColumn: freezeFirstColumnProp, columns, columnGap, horizontalPadding, viewportWidth,
+    overflows: horizontalScrollEnabled,
+  });
+  // A table that pins by default pins once scrolled: unscrolled nothing is under
+  // its first column, so a pane dragged or resized at rest draws no sticky cells.
+  const pinned = freezeFirstColumn && (freezeFirstColumnProp === true || frozenScrollLeft > 0);
+  // Pinned from a scroll that came before it, it starts where the body is.
+  useLayoutEffect(() => {
+    if (freezeFirstColumn) setFrozenScrollLeft(bodyElementRef.current?.scrollLeft ?? 0);
+  }, [freezeFirstColumn]);
   const scrollContentWidth = horizontalScrollEnabled
     || !fillAvailableWidth
     ? Math.max(1, tableWidth * WEB_CELL_WIDTH)
@@ -320,12 +346,14 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
   }, [bodyHorizontal.bar, headerHorizontal.bar, horizontalScrollEnabled]);
 
   const overflowEdges = useHorizontalScrollEdges(bodyElementRef, [horizontalScrollEnabled]);
+  const hiddenColumns = items.length ? hiddenTableColumnText(columns) : null;
+  const disclosureHeight = hiddenColumns ? headerPx : 0;
   // A frozen first column already covers what scrolls under it, so the left
   // fade starts past it and its gap.
   const [frozenEdgePx, setFrozenEdgePx] = useState(0);
   useLayoutEffect(() => {
     const body = bodyElementRef.current;
-    const frozenCell = freezeFirstColumn && overflowEdges.start
+    const frozenCell = pinned && overflowEdges.start
       ? body?.querySelector<HTMLElement>('[data-gloom-role="data-table-header-cell"]')
       : null;
     // The gap after it is the next column's margin, as laid out.
@@ -336,7 +364,7 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
       : 0;
     // Set only on a change: a state update from a layout effect costs the render a second commit.
     if (next !== frozenEdgePx) setFrozenEdgePx(next);
-  }, [columnGap, columns, freezeFirstColumn, frozenEdgePx, overflowEdges.start, viewportWidth]);
+  }, [columnGap, columns, pinned, frozenEdgePx, overflowEdges.start, viewportWidth]);
 
   const rootStyle: CSSProperties = {
     position: "relative",
@@ -373,6 +401,11 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
 
   return (
     <div data-gloom-role="data-table" style={rootStyle}>
+      {hiddenColumns ? <div style={{ flex: `0 0 ${disclosureHeight}px`, lineHeight: `${disclosureHeight}px`,
+        paddingInline: "var(--gloom-space-sm)", color: CSS_TEXT_DIM,
+        backgroundColor: CSS_PANEL, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }} title={hiddenColumns}>
+        {hiddenColumns}
+      </div> : null}
       <div
         ref={bodyElementRef}
         data-gloom-role="data-table-body-scroll"
@@ -390,7 +423,12 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
         }}
         onScroll={(event) => {
           markScrollbarActive();
-          if (freezeFirstColumn) setFrozenScrollLeft(event.currentTarget.scrollLeft);
+          if (freezeFirstColumn) {
+            const left = event.currentTarget.scrollLeft;
+            // Pinning on the first scroll away draws before that frame shows the column leaving.
+            if (!pinned && left > 0) flushSync(() => setFrozenScrollLeft(left));
+            else setFrozenScrollLeft(left);
+          }
           const controlledOffset = controlledScrollOffsetRef.current;
           controlledScrollOffsetRef.current = null;
           if (controlledOffset
@@ -408,6 +446,7 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
         onTouchMove={() => { controlledScrollOffsetRef.current = null; }}
       >
         <div
+          ref={contentElementRef}
           data-gloom-role="data-table-scroll-content"
           style={{
             position: "relative",
@@ -418,22 +457,32 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
         >
           <WebDataTableHeader
             columns={columns}
-            freezeFirstColumn={freezeFirstColumn}
+            freezeFirstColumn={pinned}
             scrollLeft={frozenScrollLeft}
-            viewportWidth={freezeFirstColumn ? viewportWidth : 0}
+            viewportWidth={pinned && frozenScrollLeft > 0 ? viewportWidth : 0}
             columnGap={columnGap}
             horizontalPadding={horizontalPadding}
             focusPane={focusPane}
             onTableMouseDown={onTableMouseDown}
             gridTemplateColumns={gridTemplateColumns}
             onHeaderClick={onHeaderClick}
+            onMovableHeaderPress={onColumnMove ? pressMovableHeader : undefined}
+            anchoredColumns={anchoredColumns}
+            draggedColumn={columnDrag?.from ?? null}
             sortColumnId={sortColumnId}
             sortDirection={sortDirection}
           />
+          {columnDrag?.dropLeft != null ? (
+            <div
+              data-gloom-role="data-table-drop-indicator"
+              aria-hidden="true"
+              style={{ left: columnDrag.dropLeft }}
+            />
+          ) : null}
           {items.length === 0 ? (
             emptyContent ?? (
               <EmptyBody body={bodyElementRef}>
-                <EmptyState title={emptyStateTitle} hint={emptyStateHint} />
+                <EmptyState title={emptyStateTitle} hint={emptyStateHint} actions={emptyStateActions} />
               </EmptyBody>
             )
           ) : measurePerf(
@@ -453,11 +502,11 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
                     item={item}
                     itemKey={itemKey}
                     columns={columns}
-                    freezeFirstColumn={freezeFirstColumn}
+                    freezeFirstColumn={pinned}
                     scrollLeft={frozenScrollLeft}
-                    // Only a frozen first column places itself by it: every
+                    // Only a frozen first column scrolled past places itself by it: every
                     // other row stays memoized when the viewport changes width.
-                    viewportWidth={freezeFirstColumn ? viewportWidth : 0}
+                    viewportWidth={pinned && frozenScrollLeft > 0 ? viewportWidth : 0}
                     columnGap={columnGap}
                     horizontalPadding={horizontalPadding}
                     focusPane={focusPane}
@@ -505,15 +554,30 @@ export function WebDataTable<T, C extends DataTableColumn = DataTableColumn>({
         <div
           data-gloom-role="data-table-overflow-fade"
           data-gloom-edge="left"
-          style={overflowFadeStyle("left", frozenEdgePx, overflowEdges.scrollbarBottom)}
+          style={overflowFadeStyle("left", frozenEdgePx, overflowEdges.scrollbarBottom, disclosureHeight)}
         />
       ) : null}
       {horizontalScrollEnabled && overflowEdges.end ? (
         <div
           data-gloom-role="data-table-overflow-fade"
           data-gloom-edge="right"
-          style={overflowFadeStyle("right", overflowEdges.scrollbarRight, overflowEdges.scrollbarBottom)}
+          style={overflowFadeStyle("right", overflowEdges.scrollbarRight, overflowEdges.scrollbarBottom, disclosureHeight)}
         />
+      ) : null}
+      {horizontalScrollEnabled && overflowEdges.end && items.length ? (
+        <button type="button" aria-label="Show more columns" onClick={() => {
+          const body = bodyElementRef.current;
+          if (!body) return;
+          focusPane();
+          const bounds = body.getBoundingClientRect();
+          const visibleRight = bounds.left + body.clientWidth;
+          const next = [...body.querySelectorAll<HTMLElement>('[data-gloom-role="data-table-header-cell"]')]
+            .map((cell) => cell.getBoundingClientRect()).find((cell) => cell.right > visibleRight + 1 && cell.left > bounds.left + frozenEdgePx + 1);
+          body.scrollLeft += next ? next.left - bounds.left - frozenEdgePx : body.clientWidth - frozenEdgePx;
+        }} style={{ position: "absolute", insetInlineEnd: overflowEdges.scrollbarRight, top: disclosureHeight, zIndex: 4,
+          cursor: "pointer", border: 0, height: headerPx, background: CSS_PANEL, color: CSS_TEXT_DIM, font: "inherit" }}>
+          More
+        </button>
       ) : null}
     </div>
   );

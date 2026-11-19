@@ -125,8 +125,11 @@ export function useCommandBarPaneTemplateActions({
   const runPaneTemplateShortcut = useCallback(async (
     template: PaneTemplateDef,
     rawArg?: string,
+    /** A word's preset options (`PDUFA`'s type), kept on every way the pane opens. */
+    presetOptions?: PaneTemplateCreateOptions["preset"],
   ) => {
     const trimmedArg = rawArg?.trim() || "";
+    const preset = presetOptions && Object.keys(presetOptions).length > 0 ? { preset: presetOptions } : {};
     const argKind = template.shortcut?.argKind ?? template.shortcut?.argPlaceholder;
     // Required ticker panes use the instrument already in the command prompt
     // when nothing was typed. Optional panes stay unbound.
@@ -135,7 +138,7 @@ export function useCommandBarPaneTemplateActions({
       : commandPromptTicker(buildWorkflowDeps().getState())?.symbol ?? null;
     if (argKind === "ticker") {
       if (!trimmedArg && template.shortcut?.argOptional) {
-        await openPaneTemplateDirect(template);
+        await openPaneTemplateDirect(template, preset.preset ? preset : undefined);
         return;
       }
       const resolvedTicker = await resolveTickerInput(
@@ -154,6 +157,7 @@ export function useCommandBarPaneTemplateActions({
         openModeRoute("ticker-search", trimmedArg, {
           action: "pane-template",
           templateId: template.id,
+          ...preset,
         });
         return;
       }
@@ -163,6 +167,7 @@ export function useCommandBarPaneTemplateActions({
         ticker: resolvedTicker.ticker,
         ...(resolvedTicker.instrument !== undefined ? { instrument: resolvedTicker.instrument } : {}),
         ...(resolvedTicker.listing ? { listing: resolvedTicker.listing } : {}),
+        ...preset,
       });
       return;
     }
@@ -170,7 +175,7 @@ export function useCommandBarPaneTemplateActions({
     if (argKind === "ticker-list") {
       const trimmedList = trimmedArg || normalizeTickerInput(activeTickerSymbol, undefined) || "";
       if (!trimmedList && template.shortcut?.openWithoutArg) {
-        await openPaneTemplateDirect(template);
+        await openPaneTemplateDirect(template, preset.preset ? preset : undefined);
         return;
       }
       if (!trimmedList || /[,\n]\s*$/.test(trimmedList)) {
@@ -178,20 +183,25 @@ export function useCommandBarPaneTemplateActions({
         return;
       }
       try {
+        // A watchlist's name reads as its symbols, at most the function's maximum, and the bar says so.
+        const notes: string[] = [];
         const symbols = await resolveTickerListInput(
           trimmedList,
           activeCollectionId,
           buildWorkflowDeps(),
           template.shortcut?.keepArgToken,
+          { maximum: template.headless?.argument.maximum, notes },
         );
         const createOptions = {
           arg: trimmedList,
           symbols,
+          ...preset,
         };
         if (template.canCreate && !template.canCreate(getPaneTemplateContext(), createOptions)) {
           openPaneTemplateWorkflow(template, { arg: trimmedArg });
           return;
         }
+        if (notes.length > 0) notify(notes.join(" "), { type: "info" });
         await openPaneTemplateDirect(template, createOptions);
       } catch {
         openPaneTemplateWorkflow(template, { arg: trimmedArg });
@@ -203,12 +213,13 @@ export function useCommandBarPaneTemplateActions({
       openPaneTemplateWorkflow(template, { arg: trimmedArg });
       return;
     }
-    await openPaneTemplateDirect(template, trimmedArg ? { arg: trimmedArg } : undefined);
+    await openPaneTemplateDirect(template, trimmedArg || preset.preset ? { ...(trimmedArg ? { arg: trimmedArg } : {}), ...preset } : undefined);
   }, [
     activeCollectionId,
     activeTickerSymbol,
     buildWorkflowDeps,
     getPaneTemplateContext,
+    notify,
     openModeRoute,
     openPaneTemplateDirect,
     openPaneTemplateWorkflow,
@@ -224,6 +235,8 @@ export function useCommandBarPaneTemplateActions({
       const templateId = String(routePayload?.templateId ?? "");
       const template = pluginRegistry.paneTemplates.get(templateId);
       if (!template) return item;
+      const preset = routePayload?.preset && typeof routePayload.preset === "object"
+        ? { preset: routePayload.preset as Record<string, string> } : {};
       return {
         ...item,
         secondaryAction: undefined,
@@ -232,7 +245,7 @@ export function useCommandBarPaneTemplateActions({
             const ticker = await item.resolveTicker!();
             await openPaneTemplateDirect(template, {
               arg: ticker.metadata.ticker, symbol: ticker.metadata.ticker, ticker,
-              instrument: item.instrument, listing: item.listing,
+              instrument: item.instrument, listing: item.listing, ...preset,
             });
           } catch (error) {
             notify(error instanceof Error ? error.message : "Could not open the selected listing.", { type: "error" });
@@ -255,6 +268,12 @@ export function useCommandBarPaneTemplateActions({
           }
         },
       };
+    }
+    // Plain ticker search (the backtick, a pane header's ticker) changes the focused pane's ticker;
+    // a search DES opened keeps opening DES.
+    if (!routeAction && item.pickTicker) {
+      const pick = item.pickTicker;
+      return { ...item, action: () => pick("pane") };
     }
     return item;
   }, [executeCollectionCommand, notify, openPaneTemplateDirect, pluginRegistry.paneTemplates]);
@@ -313,16 +332,19 @@ export function useCommandBarPaneTemplateActions({
 
   const paneShortcutItems = useCallback((options?: {
     filterQuery?: string;
+    searchedQuery?: string;
     createOptions?: PaneTemplateCreateOptions;
     includePromptableTickerTemplates?: boolean;
   }): ResultItem[] => buildPaneShortcutItems({
     createItem: createPaneTemplateItem,
     createOptions: options?.createOptions,
     filterQuery: options?.filterQuery,
+    searchedQuery: options?.searchedQuery,
+    registry: pluginRegistry,
     templates: getAvailablePaneTemplates(options?.createOptions, {
       includePromptableTickerTemplates: options?.includePromptableTickerTemplates,
     }),
-  }), [createPaneTemplateItem, getAvailablePaneTemplates]);
+  }), [createPaneTemplateItem, getAvailablePaneTemplates, pluginRegistry]);
 
   const nonShortcutPaneTemplateItems = useCallback((filterQuery?: string): ResultItem[] => {
     return buildNonShortcutPaneTemplateItems({

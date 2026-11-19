@@ -1,11 +1,15 @@
+import { futuresContractByWord } from "../market-data/futures-board";
+import { venueOfDatedContract } from "../utils/futures-generic";
 import { notATickerSymbol } from "../sources/provider-errors";
+import { renamedListingFor, renamedListingHint } from "../tickers/renamed-listings";
 import { boardCoinFor } from "./board-coins";
+import { currencyNameHint } from "./currency-name-hint";
 import { splitSymbolArgs, splitSymbolWords } from "./symbol-args";
-import { treasuryYieldHint, treasuryYieldTenor } from "./treasury-yields";
+import { isTreasuryFredSeries, treasuryYieldHint, treasuryYieldTenor } from "./treasury-yields";
 
 // "Not a ticker: APPLE." as the router words it; the symbol ends at the sentence's own period.
-// One that already names what to try (a search, a FRED series, a yield, the pair search offered) is left alone.
-const NOT_A_TICKER_SENTENCE = /Not a ticker: ((?:(?!\.\s)[^\n`\x1b])+?)\.(?=\s|\x1b|$)(?! Try `gloom (?:search|fred|quote) | Did you mean )/g;
+// One that already names what to try (a search, a FRED series, a yield, a currency's rate, the pair search offered) is left alone.
+const NOT_A_TICKER_SENTENCE = /Not a ticker: ((?:(?!\.\s)[^\n`\x1b])+?)\.(?=\s|\x1b|$)(?! Try `gloom (?:search|fred|quote|fx) | Did you mean )/g;
 
 /**
  * The symbol as the user typed it on the command line (`Apple`), not as the router saw it (`APPLE`).
@@ -44,18 +48,53 @@ export type FredSeriesCheck = (seriesId: string) => boolean;
  * "APPLE" as AAPL:NASDAQ") is put back in the user's spelling too.
  */
 export function withSearchHints(text: string, args: readonly string[], isFredSeries: FredSeriesCheck = () => false): string {
-  const named = withTypedNames(text, args);
+  const named = withCoinHints(withTypedNames(text, args), args);
   return named.includes("Not a ticker: ")
     ? named.replace(NOT_A_TICKER_SENTENCE, (sentence, symbol: string) => {
       const typed = typedSymbol(symbol, args);
       const id = typed.toUpperCase();
-      if (/^[A-Z0-9]+$/.test(id) && isFredSeries(id)) return `${sentence} Try \`gloom fred ${id}\`.`;
+      if (/^[A-Z0-9]+$/.test(id) && (isFredSeries(id) || isTreasuryFredSeries(id))) return `${sentence} Try \`gloom fred ${id}\`.`;
+      // A listing that moved to a new symbol (ELET3 is AXIA3) points to it, never to a search for the dead one.
+      const renamed = renamedListingFor(typed);
+      if (renamed) return `${sentence} ${renamedListingHint(renamed)}`;
       const coin = boardCoinFor(id);
       if (coin) return `${sentence} Did you mean ${coin.symbol}${coin.name && coin.name.toUpperCase() !== coin.symbol ? ` (${coin.name})` : ""}?`;
+      // A dated contract typed without its venue (ZQZ26) is quoted with it: ZQZ26.CBT, as WIRP prints it.
+      const contract = venueOfDatedContract(id);
+      if (contract) return `${sentence} Did you mean ${contract}?`;
       const tenor = treasuryYieldTenor(typed);
-      return `${sentence} ${tenor ? treasuryYieldHint(tenor) : searchHint(typed)}`;
+      // A currency's name (`yen`) is its rate and its pair, not a ticker search could find; a commodity's word
+      // (`oil`, `brent`) is its future, which no search for the word finds first.
+      const future = futuresContractByWord(id);
+      const commodity = future ? `For ${future.name}, quote the future ${future.symbol}.` : null;
+      return `${sentence} ${tenor ? treasuryYieldHint(tenor) : currencyNameHint(typed) ?? commodity ?? searchHint(typed)}`;
     })
     : named;
+}
+
+// "Could not check USDT, FOOBARX: ..." as `quote` says the symbols the data service did not answer for, and "Could not
+// look up USDT: ..." as a command that resolves one says it; a hint already given is not given twice.
+const UNCHECKED_LINE = /^((?:.*?\b)?Could not (?:check|look up) ([^\s,]+(?:, [^\s,]+)*): [^\n]*?)(?<! Did you mean [^\n]*)$/gm;
+
+/**
+ * The coin a bare word the data service could not check may be, after the
+ * line that says so: "Did you mean USDT-USD (Tether USDt)?", "... for USDT"
+ * when the line names several. The coins come from the crypto board, or when
+ * it cannot be read either (the same service is down), the largest coins this
+ * build knows (`boardCoinFor`), so the hint stands in an outage.
+ */
+function withCoinHints(text: string, args: readonly string[]): string {
+  if (!text.includes("Could not ")) return text;
+  return text.replace(UNCHECKED_LINE, (line, _whole, list: string) => {
+    const symbols = list.split(",").map((symbol) => symbol.trim()).filter(Boolean);
+    const hints = symbols.flatMap((symbol) => {
+      const coin = boardCoinFor(typedSymbol(symbol, args).toUpperCase());
+      if (!coin) return [];
+      const name = coin.name && coin.name.toUpperCase() !== coin.symbol ? ` (${coin.name})` : "";
+      return [`${coin.symbol}${name}${symbols.length > 1 ? ` for ${symbol}` : ""}`];
+    });
+    return hints.length ? `${line}${/[.!?]$/.test(line) ? "" : "."} Did you mean ${hints.join(", or ")}?` : line;
+  });
 }
 
 // "Read "APPLE" as AAPL:NASDAQ (Apple Inc.)." as a list reads a one-word name, upper-cased like a symbol.

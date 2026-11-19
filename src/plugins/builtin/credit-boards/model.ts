@@ -2,12 +2,15 @@ import type {
   CdxBoardIndex,
   CreditBoardPoint,
   CreditIndexQuote,
+  CreditLevelKind,
   SovrBoardSovereign,
 } from "../../../api-client/credit-boards";
 import { spanAxisFormatter, formatBpAxis } from "../../../components/chart-table/axis";
 import { historyStatistics } from "../../../components/chart/curve/model";
 import type { MarketBoardRow } from "../../../components/market-board";
 import type { PricePoint } from "../../../types/financials";
+import type { HeadlessPaneColumn } from "../../../types/plugin";
+import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
 
 const YEAR_DAYS = 365;
 /** A level older than this is not the current market. */
@@ -94,6 +97,33 @@ function utcClock(instant: string): string | null {
 }
 
 /**
+ * How a level that is the day's settlement price, not its trades, is marked
+ * beside its date.
+ */
+export const SETTLEMENT_TEXT = "settlement";
+
+/**
+ * A report's mark for the levels that are settlement prices: blank for a
+ * level from the day's trades. Shown only when a row is one, and each row
+ * then carries `kind`.
+ */
+const levelKindColumn: HeadlessPaneColumn = {
+  key: "kind", header: "Level",
+  description: "Blank for a level from the day's trades. settlement for the day's end-of-day settlement price, which stands in "
+    + "on a day without enough agreeing trades; its prints are 0.",
+  format: (value) => value === "settlement" ? SETTLEMENT_TEXT : "",
+};
+
+/** `kind` on every row once one level is a settlement; nothing otherwise, so a report without one is unchanged. */
+export function levelKinds<T>(items: readonly T[], kindOf: (item: T) => CreditLevelKind | null | undefined) {
+  const shown = items.some((item) => kindOf(item) === "settlement");
+  return {
+    columns: shown ? [levelKindColumn] : [],
+    row: (item: T) => shown ? { kind: kindOf(item) ?? "traded" } : {},
+  };
+}
+
+/**
  * What a day still trading rests on: `so far, 38 prints, last 08:09 UTC`.
  * The print time is left out when the server does not say it.
  */
@@ -105,13 +135,13 @@ export function partialDayText(prints: number | null, lastPrintAt: string | null
 
 /** Spreads in bp with a decimal; prices as quoted, to the cent. */
 export function formatLevel(quote: CreditIndexQuote, value: number | null): string {
-  if (value == null || !Number.isFinite(value)) return "--";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   return quote === "spread" ? `${value.toFixed(1)}bp` : value.toFixed(2);
 }
 
 /** A move in the quote's unit: `+1.2bp`, or `-0.13` points of price. */
 export function formatMove(quote: CreditIndexQuote, value: number | null): string {
-  if (value == null || !Number.isFinite(value)) return "--";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   const digits = quote === "spread" ? 1 : 2;
   const rounded = Number(value.toFixed(digits));
   const sign = rounded > 0 ? "+" : "";
@@ -132,7 +162,7 @@ function adverseMove(quote: CreditIndexQuote): "up" | "down" {
   return quote === "spread" ? "up" : "down";
 }
 
-const formatPriceAxis = spanAxisFormatter((value, digits) => value.toFixed(digits));
+const formatPriceAxis = spanAxisFormatter((value, digits) => value.toFixed(digits), 2);
 
 export function axisFormatter(quote: CreditIndexQuote) {
   return quote === "spread" ? formatBpAxis : formatPriceAxis;
@@ -144,12 +174,54 @@ interface YearStatistics {
   high: number | null;
 }
 
-/** Where the latest level sits in its own year: midrank, with the range. */
-function yearStatistics(points: readonly CreditBoardPoint[], level: number | null, date: string | null): YearStatistics {
+/** Where the latest level sits in its own year: midrank, with the range, and no rank from fewer than `minCount` days. */
+function yearStatistics(points: readonly CreditBoardPoint[], level: number | null, date: string | null, minCount = 2): YearStatistics {
   if (level == null || !date) return { percentile: null, low: null, high: null };
   const year = historyStatistics(points.map((point) => ({ date: point.date, value: point.level })), level,
     { asOf: date, windowDays: YEAR_DAYS });
-  return { percentile: year.count >= 2 ? year.percentile : null, low: year.min, high: year.max };
+  return { percentile: year.count >= minCount ? year.percentile : null, low: year.min, high: year.max };
+}
+
+/** The fewest days of spreads in its year a CDX rank is read from: a month of trading; fewer leave it blank. */
+const MIN_SPREAD_RANK_POINTS = 20;
+
+/**
+ * What a credit rank ranks, so it always reads high = wide: the spread a row
+ * quotes; HY and EM's spread equivalent, each day's on its on-the-run
+ * contract; or, for a price with no spread beside it (CMBX), the price
+ * upside down, the lowest price ranking 100.
+ */
+type SpreadRankBasis = "spread" | "spread-eq" | "price-inverted";
+
+export interface SpreadRank {
+  percentile: number | null;
+  basis: SpreadRankBasis;
+}
+
+/**
+ * Where an index's spread sits in its own year, 100 the widest. A price
+ * quote ranks backwards (a falling price is a widening spread), so HY and EM
+ * rank their spread equivalent instead, and a price without one is ranked
+ * from the top. A spread rank needs a month of spreads in the year
+ * (MIN_SPREAD_RANK_POINTS); with fewer it is blank, never read off a handful.
+ */
+export function spreadRank(index: Pick<CdxBoardIndex, "quote" | "points" | "level" | "date" | "spreadBp">): SpreadRank {
+  if (index.quote === "spread") {
+    return { percentile: yearStatistics(index.points, index.level, index.date, MIN_SPREAD_RANK_POINTS).percentile, basis: "spread" };
+  }
+  const spreads = index.points.flatMap((point) => typeof point.spreadBp === "number" && Number.isFinite(point.spreadBp)
+    ? [{ ...point, level: point.spreadBp }] : []);
+  if (spreads.length > 0 && typeof index.spreadBp === "number") {
+    return { percentile: yearStatistics(spreads, index.spreadBp, index.date, MIN_SPREAD_RANK_POINTS).percentile, basis: "spread-eq" };
+  }
+  const price = yearStatistics(index.points, index.level, index.date).percentile;
+  return { percentile: price == null ? null : 100 - price, basis: "price-inverted" };
+}
+
+/** A spread rank as a detail line says it: `89 pctl 1Y`, and for a price ranked upside down, says so. */
+export function formatSpreadRank(rank: SpreadRank): string {
+  const text = formatPercentileRank(rank.percentile, "1Y");
+  return rank.basis === "price-inverted" && rank.percentile != null ? `${text}, price inverted` : text;
 }
 
 function daysBetween(from: string, to: string): number {
@@ -163,7 +235,7 @@ function stale(date: string | null, asOf: string | null): boolean {
 
 /** `2031-12-20` as `Dec 2031`, how the contract is named on a desk. */
 export function formatContract(maturity: string | null): string {
-  if (!maturity) return "--";
+  if (!maturity) return MISSING_VALUE;
   const date = new Date(`${maturity}T00:00:00Z`);
   return Number.isNaN(date.getTime())
     ? maturity
@@ -190,7 +262,10 @@ export function findSovereign<T extends { id: string; name: string }>(sovereigns
 
 export interface CdxRow extends MarketBoardRow {
   index: CdxBoardIndex;
+  /** The level's own year: its range, in the quote's unit. */
   year: YearStatistics;
+  /** The rank the board shows, high = wide whatever the quote. */
+  rank: SpreadRank;
   /** The latest day's standing and the moves between complete days. */
   day: CdxDay;
   /** The 1W and 1M moves as shown. */
@@ -201,6 +276,7 @@ export interface CdxRow extends MarketBoardRow {
 export function cdxRows(indexes: readonly CdxBoardIndex[], asOf: string | null, now = Date.now()): CdxRow[] {
   return indexes.map((index) => {
     const year = yearStatistics(index.points, index.level, index.date);
+    const rank = spreadRank(index);
     const day = cdxDay(index, now);
     return {
       id: index.id,
@@ -209,13 +285,14 @@ export function cdxRows(indexes: readonly CdxBoardIndex[], asOf: string | null, 
       valueText: formatLevel(index.quote, index.level),
       change: shown(index.quote, day.change1D),
       changeText: formatMove(index.quote, day.change1D),
-      percentile: year.percentile,
+      percentile: rank.percentile,
       asOf: index.date,
       history: pointHistory(index.points),
       status: index.level == null ? "unavailable" : stale(index.date, asOf) ? "stale" : day.partial ? "partial" : "available",
       adverseMove: adverseMove(index.quote),
       index,
       year,
+      rank,
       day,
       week: shown(index.quote, day.change1W),
       month: shown(index.quote, day.change1M),
@@ -259,7 +336,7 @@ export function sovrRows(
 
 /** `BRL -1.2%`; a dollar or dollar-pegged currency still shows its code. */
 export function formatCurrencyMove(currency: string, movePercent: number | null): string {
-  if (movePercent == null || !Number.isFinite(movePercent)) return `${currency} --`;
+  if (movePercent == null || !Number.isFinite(movePercent)) return `${currency} ${MISSING_VALUE}`;
   const rounded = Number(movePercent.toFixed(1));
   const sign = rounded > 0 ? "+" : "";
   return `${currency} ${sign}${rounded === 0 ? "0.0" : rounded.toFixed(1)}%`;

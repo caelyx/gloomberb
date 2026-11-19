@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useMemo, type ReactNode } from "react";
 import type { ThemeMember, ThemePeriod, ThemeSummary } from "../../../api-client/themes";
 import { splitDelayedStatus, DataTableStackView, DataTableView, PaneStatusBody, usePaneNoticeFooter, usePaneStatusFooter, type DataTableCell, type DataTableColumn } from "../../../components";
@@ -5,15 +6,15 @@ import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import type { ExtendedSession } from "../../../market-data/market/status";
 import { useAsyncResource, useAutoRefresh, usePluginPaneState, usePluginTickerActions, useUpdatedAgo } from "../../../public/react";
 import { usePaneInstance } from "../../../state/app/context";
-import { priceColor, shownPriceColor } from "../../../theme/colors";
+import { shownPriceColor } from "../../../theme/colors";
 import { useThemeColors } from "../../../theme/theme-context";
 import { Box, Text } from "../../../ui";
 import { nextHeaderSort } from "../../../utils/sort-values";
 import { useMembersMenu } from "../shared/members-menu";
 import { cachedMembers, cachedThemes, loadMembers, loadThemes } from "./client";
 import {
-  aggregateText, boardYtdBase, coverageWidth, DEFAULT_SORT, extendedMove, matchTheme, memberColumns, memberExtendedSessions, memberPrice, percent,
-  isLiveBoard, LIVE_BOARD_REFRESH_MS, SNAPSHOT_STALE_MS, snapshotFooterText, sortMembers, sortThemes, themeColumns, type ThemeSort,
+  aggregateText, boardYtdBase, coverageText, coverageWidth, DEFAULT_SORT, extendedMove, matchTheme, memberColumns, memberExtendedSessions, memberPrice, percent,
+  isLiveBoard, LIVE_BOARD_REFRESH_MS, SNAPSHOT_STALE_MS, snapshotFooterText, sortMembers, sortThemes, themeColumns, THEME_LISTING_SCOPE, type ThemeSort,
 } from "./model";
 
 const LIVE_LEAD = "live · ";
@@ -23,10 +24,10 @@ type SnapshotPayload = { asOf: string; stale: boolean; access?: "realtime" | "de
  * Refreshes a board on the user's interval, or every 15 seconds while it is
  * live: a Pro account's prices are renewed that often on the server.
  */
-function useBoardRefresh(resource: { updatedAt: number | null; load: (force?: boolean) => Promise<unknown>; data: { payload: SnapshotPayload } | null }) {
+function useBoardRefresh(resource: { updatedAt: number | null; load: (force?: boolean) => void; data: { payload: SnapshotPayload } | null }) {
   const live = isLiveBoard(resource.data?.payload);
   const { load } = resource;
-  useAutoRefresh(resource.updatedAt, live ? () => void load(true) : () => void load(), { intervalMs: live ? LIVE_BOARD_REFRESH_MS : null });
+  useAutoRefresh(resource.updatedAt, live ? () => load(true) : () => load(), { intervalMs: live ? LIVE_BOARD_REFRESH_MS : null });
 }
 
 function useSnapshotFooter(id: string, resource: { loading: boolean; error: string | null; data: { payload: SnapshotPayload; stale: boolean; refreshError: string | null } | null }, focused: boolean, enabled = true) {
@@ -69,13 +70,13 @@ function Members({ id, width, height, focused }: { id: string; width: number; he
   const columns = useMemo(() => memberColumns(width, extendedSessionsKey ? extendedSessionsKey.split(",") as ExtendedSession[] : [], ytdBase),
     [extendedSessionsKey, width, ytdBase]);
   useBoardRefresh(resource);
-  usePaneRefreshKey(() => void resource.reload(), { focused });
+  usePaneRefreshKey(() => resource.reload(), { focused });
   useSnapshotFooter("themes:members", resource, focused);
   const memberList = useMemo(() => data ? { title: data.theme.name, watchlistName: data.theme.name, members: rows } : null, [data, rows]);
   useMembersMenu("themes:members-menu", memberList);
   const renderCell = useCallback((row: ThemeMember, column: DataTableColumn): DataTableCell => {
     if (column.id === "symbol") return { text: row.symbol, color: colors.textBright };
-    if (column.id === "name") return { text: row.name ?? "--", color: colors.text };
+    if (column.id === "name") return { text: row.name ?? MISSING_VALUE, color: colors.text };
     if (column.id === "price") return { text: memberPrice(row.price), value: row.price };
     if (column.id === "preMarket" || column.id === "afterHours") {
       // The extended print's move from the close in Price.
@@ -127,22 +128,22 @@ export function ThemesBoard({ width, height, focused, tabStrip, tabRows = 0 }: T
   const columns = useMemo(() => themeColumns(width, data?.themes ?? [], data ? boardYtdBase(data) : null), [width, data]);
   const theme = opened && data ? matchTheme(data.themes, opened) : null;
   useBoardRefresh(resource);
-  usePaneRefreshKey(() => void resource.reload(), { focused, enabled: !opened });
+  usePaneRefreshKey(() => resource.reload(), { focused, enabled: !opened });
   useSnapshotFooter("themes:list", resource, focused, !opened || !data);
   const renderCell = useCallback((row: ThemeSummary, column: DataTableColumn): DataTableCell => {
     if (column.id === "name") return { text: row.name, color: colors.textBright };
     if (column.id === "memberCount") return { text: String(row.memberCount), value: row.memberCount, color: colors.textMuted };
     if (column.id === "best" || column.id === "worst") {
       const member = row[column.id];
-      return { text: member ? `${member.symbol} ${percent(member.changePercent)}` : "--", value: member?.changePercent ?? null,
-        color: member ? priceColor(member.changePercent, colors) : colors.textMuted };
+      return { text: member ? `${member.symbol} ${percent(member.changePercent)}` : MISSING_VALUE, value: member?.changePercent ?? null,
+        color: member ? shownPriceColor(member.changePercent, 2, colors) : colors.textMuted };
     }
     const breadth = column.id === "breadth";
     const metric = breadth ? row.breadth : row.returns[column.id as ThemePeriod];
     const suffixWidth = coverageWidth((data?.themes ?? []).map((theme) => breadth ? theme.breadth : theme.returns[column.id as ThemePeriod]));
-    const color = metric.value === null || breadth ? colors.textMuted : priceColor(metric.value, colors);
+    const color = metric.value === null || breadth ? colors.textMuted : shownPriceColor(metric.value, 2, colors);
     const valueText = breadth && metric.value !== null ? `${Math.round(metric.value)}%` : percent(metric.value);
-    const suffix = metric.covered < metric.total ? `${metric.covered}/${metric.total}` : "";
+    const suffix = coverageText(metric);
     return { text: aggregateText(metric, breadth), value: metric.value,
       color, content: suffixWidth ? <Box flexDirection="row" width={column.width} justifyContent="flex-end">
         <Text fg={color}>{valueText}</Text><Text fg={colors.textMuted}>{suffix.padStart(suffixWidth)}</Text>
@@ -154,7 +155,7 @@ export function ThemesBoard({ width, height, focused, tabStrip, tabRows = 0 }: T
       {data ? <DataTableStackView<ThemeSummary> columns={columns} items={rows} rootWidth={width} rootHeight={bodyHeight} focused={focused}
         selection={{ kind: "id", selectedId: selected, getId: (row) => row.id, onChange: setSelected }}
         getItemKey={(row) => row.id} onActivate={(row) => setOpened(row.id)}
-        detailOpen={!!opened} onBack={() => setOpened("")} detailTitle={theme?.name ?? opened}
+        detailOpen={!!opened} onBack={() => setOpened("")} detailTitle={theme ? `${theme.name} · ${THEME_LISTING_SCOPE}` : opened}
         detailContent={theme ? <Members key={theme.id} id={theme.id} width={width} height={Math.max(1, bodyHeight - 1)} focused={focused} />
           : <PaneStatusBody subject="theme" error="No matching theme. Return to the list to choose a basket." />}
         renderCell={renderCell} sortColumnId={sort.columnId} sortDirection={sort.direction}

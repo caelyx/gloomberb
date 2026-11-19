@@ -1,13 +1,13 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { act, useState } from "react";
-import { createInitialState } from "../../../state/app/context";
+import { appReducer, createInitialState, type AppAction, type AppState } from "../../../state/app/context";
 import { TestPaneFrame, TestPaneProvider, createTestPaneConfig, createTestTicker } from "../../../test-support/pane";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { setHttpFetchTransport } from "../../../utils/http-transport";
 import { DividendYieldPane } from "./pane";
 import { fetchDividendData } from "./client";
-import { chartResponse, marketTransport } from "./test-fixture";
+import { chartResponse, hsbcIssuerDividendRead, marketTransport } from "./test-fixture";
 
 const tui = createOpenTuiTestHarness();
 const realNow = Date.now;
@@ -37,6 +37,21 @@ async function frame() {
   });
   return tui.frame();
 }
+
+test.each([44, 60])("an ex-dated unfixed sterling declaration keeps its row, estimate labels and fixing date at %d columns", async (width) => {
+  setSystemTime(new Date("2026-11-17T06:00:00Z"));
+  setHttpFetchTransport(async () => Response.json({ status: "success", data: hsbcIssuerDividendRead() }));
+  let data: Awaited<ReturnType<typeof fetchDividendData>>;
+  try {
+    data = await fetchDividendData("HSBA", 13.38, "LSE", "GBP");
+  } finally {
+    setSystemTime();
+  }
+  const text = await renderLoaded(data, width, 24);
+  expect(text.split("\n").find((line) => line.includes("2026-11-05"))).toMatch(/2026-11-05\s+estimated 7\.5835p\s+\$0\.10/);
+  expect(text).toContain("2026-12-07");
+  expect(text).toContain("2026-12-17");
+});
 
 test("summary failures retain cash and recover dated payment information through refresh", async () => {
   const day = Math.floor(Date.now() / 86400_000) * 86400;
@@ -319,9 +334,10 @@ test("short dividend panes keep the yields and every payment row within reach", 
     metrics: { ...buildDividendMetrics(payments, null, 50), nextPayDate: new Date("2030-01-15T00:00:00Z") } }, 40, 9)).split("\n");
   // One row of figures, the strip, then the table with its header and rows.
   expect(lines[0]).toContain("7.32%");
-  expect(lines[1]).toContain("●");
-  expect(lines[2]).toContain("EX-DATE");
-  expect(lines[3]).toContain(latest);
+  expect(lines.join("\n")).toContain("Fwd yield");
+  expect(lines.join("\n")).toContain("2030-01-15");
+  expect(lines.join("\n")).toContain("EX-DATE");
+  expect(lines.join("\n")).toContain(latest);
   await tui.emitKeypress(Array.from({ length: 8 }, () => ({ name: "down" })), { trackPropagation: true });
   const moved = await frame();
   expect(moved.split("EX-DATE")[1]).not.toContain(latest);
@@ -344,7 +360,78 @@ test("the TTM dividend steps up at each raise and follows the selected payment",
   expect(await frame()).toContain("● TTM dividend $1.17");
 });
 
+test("cash paid again after a year of none reads N/M for its growth, never a percentage", async () => {
+  const data = await quarterlyIncome();
+  const resumed = { ...data, metrics: { ...data.metrics, growth1Y: null, growth1YNotMeaningful: true } };
+  const shown = await renderLoaded(resumed, 120, 26);
+  expect(shown).toMatch(/1Y growth\s+N\/M/);
+  expect(shown).not.toMatch(/1Y growth\s+n\/a/);
+});
+
+test.each([32, 46, 52, 60, 80, 120])("an undated payout keeps its label, value and basis detail without shortening unrelated labels at %d columns", async (width) => {
+  const data = await quarterlyIncome();
+  const shown = await renderLoaded({ ...data, metrics: { ...data.metrics, payoutRatio: 0.47 } }, width, 40);
+  expect(shown).toMatch(/Payout\s+47\.0%/);
+  expect(shown).toContain("Basis/date unstated");
+  expect(shown).not.toMatch(/Payout[^\n]*…/);
+  if (width >= 80) {
+    expect(shown).toContain("TTM/share");
+    expect(shown).toContain("Fwd/share");
+    expect(shown).toContain("1Y growth");
+  }
+});
+
 test("mixed-currency payments keep the currency column", async () => {
   const data = await quarterlyIncome((index) => index < 2 ? "USD" : "CAD");
   expect(await renderLoaded(data, 88, 26)).toContain("CCY");
+});
+
+test("DVD opened on several tickers ranks them by trailing yield as fn DVD does, and keeps a row for one it could not read", async () => {
+  const { dividendYieldModule } = await import("./index");
+  const template = dividendYieldModule.paneTemplates!.find((entry) => entry.id === "dividend-yield-pane")!;
+  const context = { activeTicker: null } as never;
+  // `shot DVD KO JNJ` passes the list; one ticker opens its own pane as before.
+  const ranked = (await template.createInstance!(context, { arg: "KO,JNJ,GONE", symbol: "KO", symbols: ["KO", "JNJ", "GONE"] }))!;
+  expect(ranked).toMatchObject({ title: "DVD KO, JNJ, GONE", binding: { kind: "none" }, settings: { rankSymbols: ["KO", "JNJ", "GONE"] } });
+  expect(template.createInstance!(context, { arg: "KO", symbol: "KO" })).toMatchObject({ binding: { kind: "fixed", symbol: "KO" } });
+
+  const { buildDividendMetrics, toDividendPayment } = await import("./client");
+  const income = (amount: number) => {
+    const now = new Date();
+    const payments = [0, 3, 6, 9].map((months) => toDividendPayment(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - months, 1))
+      .toISOString().slice(0, 10), amount, "USD")!);
+    return { payments, currency: "USD", price: 50, historyAvailable: true, metrics: buildDividendMetrics(payments, null, 50) };
+  };
+  const loadData = (async (symbol: string) => {
+    if (symbol === "GONE") throw new Error("No dividend data found for GONE");
+    return income(symbol === "KO" ? 0.5 : 0.75);
+  }) as unknown as typeof fetchDividendData;
+  const id = ranked.instanceId!;
+  const initial = createInitialState(createTestPaneConfig("/tmp/dividend-ranking", {
+    instanceId: id, paneId: "dividend-yield", binding: { kind: "none" }, settings: ranked.settings,
+  }));
+  const runtime = createTestPluginRuntime();
+  function Live() {
+    const [state, setState] = useState<AppState>(initial);
+    return <TestPaneProvider state={state} dispatch={(action: AppAction) => setState((current) => appReducer(current, action))}
+      paneId={id} pluginId="dividend-yield" runtime={runtime}>
+      <DividendYieldPane focused width={110} height={10} loadData={loadData} />
+    </TestPaneProvider>;
+  }
+  await act(async () => {
+    await tui.render(<Live />, { width: 110, height: 10 });
+  });
+  const lines = (await frame()).split("\n");
+  const header = lines.findIndex((line) => line.includes("TICKER"));
+  expect(lines[header]).toMatch(/TICKER +YIELD TTM ▼ +FWD YIELD +PAYOUT +1Y GROWTH +3Y CAGR +LAST EX +NEXT PAY +NOTE/);
+  // $3.00 and $2.00 a year over $50: JNJ first, then KO, and the ticker that failed last, marked not read.
+  expect(lines[header + 1]).toMatch(/^\s*JNJ +6\.00%/);
+  expect(lines[header + 2]).toMatch(/^\s*KO +4\.00%/);
+  expect(lines[header + 3]).toMatch(/^\s*GONE .*not read/);
+  // A header sorts by its column; a third click returns to the ranking.
+  for (const order of [["GONE", "JNJ", "KO"], ["KO", "JNJ", "GONE"], ["JNJ", "KO", "GONE"]]) {
+    await tui.clickFrameText("TICKER");
+    const sorted = (await frame()).split("\n");
+    expect(sorted.slice(header + 1, header + 4).map((line) => line.trim().split(/\s+/)[0])).toEqual(order);
+  }
 });

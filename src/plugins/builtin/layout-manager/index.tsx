@@ -2,7 +2,6 @@ import { findPaneInstance, type LayoutConfig } from "../../../types/config";
 import type { AppNotificationRequest, CommandResultDef, GloomPluginContext } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
 import type { AppAction } from "../../../state/app/context";
-import { LayoutMarketplacePane } from "../../../layout-marketplace/pane";
 import { apiClient } from "../../../api-client";
 import { resolvePlanAccess } from "../../../api-client/plan-access";
 import { getSharedRegistry } from "../../registry";
@@ -11,6 +10,7 @@ import {
   deskFunctions,
   DESKS,
   isDeskStock,
+  MORE_DESKS,
   pickDeskCompany,
   type Desk,
 } from "../../../layout/desks";
@@ -60,10 +60,11 @@ function getFocusedPane(layout: LayoutConfig, focusedPaneId: string | null) {
 }
 
 /** Desks whose key, name or one of whose functions matches what follows DESK. */
-function matchDesks(query: string): Desk[] {
+function matchDesks(query: string): Desk<string>[] {
   const needle = query.trim().toLowerCase();
-  if (!needle) return [...DESKS];
-  return DESKS.filter((desk) => (
+  const desks: Desk<string>[] = [...DESKS, ...MORE_DESKS];
+  if (!needle) return desks;
+  return desks.filter((desk) => (
     desk.key.startsWith(needle)
     || desk.label.toLowerCase().includes(needle)
     || desk.name.toLowerCase().includes(needle)
@@ -75,7 +76,7 @@ function matchDesks(query: string): Desk[] {
  * Opens the desk as a new tab after the others. Its company is the focused
  * pane's stock, else the most recent stock the user looked at.
  */
-async function addDesk(ctx: GloomPluginContext, desk: Desk): Promise<void> {
+async function addDesk(ctx: GloomPluginContext, desk: Desk<string>): Promise<void> {
   const registry = getSharedRegistry();
   if (!registry || !dispatchRef || !getStateRef) return;
   const config = ctx.getConfig();
@@ -110,8 +111,8 @@ export const layoutManagerModule: PluginModule = {
       id: "layout-marketplace",
       name: "Layouts",
       icon: "L",
-      component: LayoutMarketplacePane,
-      reportFreshness: { status: "not-a-feed", basis: "layout listings" },
+      get component(): typeof import("../../../layout-marketplace/pane").LayoutMarketplacePane { const { LayoutMarketplacePane } = require("../../../layout-marketplace/pane"); return LayoutMarketplacePane; },
+      reportFreshness: { status: "not-a-feed", basis: "layout listings", local: true },
       defaultPosition: "right",
       defaultMode: "floating",
       defaultFloatingSize: { width: 118, height: 34 },
@@ -128,7 +129,7 @@ export const layoutManagerModule: PluginModule = {
       label: "Add a Desk",
       description: "Add a ready-made desk for one kind of trading as a new layout tab",
       keywords: ["desk", "desks", "workspace", "starter", "equities", "stocks", "options", "volatility", "futures",
-        "commodities", "rates", "credit", "fx", "macro", "active trading", "day trading"],
+        "commodities", "rates", "credit", "fx", "macro", "active trading", "day trading", "buildout", "ai buildout", "data centers"],
       category: "config",
       shortcut: "DESK",
       shortcutArg: { placeholder: "desk", kind: "text", parse: (arg) => ({ query: arg.trim() }) },
@@ -144,7 +145,7 @@ export const layoutManagerModule: PluginModule = {
     ctx.registerCommand({
       id: "float-pane",
       label: "Float Pane",
-      description: "Detach a docked pane into a floating window",
+      description: "Take a pane out of the layout into a floating window",
       keywords: ["float", "detach", "undock", "window", "pane"],
       category: "config",
       execute: async () => {
@@ -153,7 +154,7 @@ export const layoutManagerModule: PluginModule = {
         const { layout, termWidth, termHeight, focusedPaneId } = getStateRef();
         const focusedPane = getFocusedPane(layout, focusedPaneId);
         if (!focusedPane || !isPaneDocked(layout, focusedPane.instanceId)) {
-          notify("Focus a docked pane to float it", { type: "info" });
+          notify("Focus a pane in the layout to float it", { type: "info" });
           return;
         }
 
@@ -166,9 +167,9 @@ export const layoutManagerModule: PluginModule = {
 
     ctx.registerCommand({
       id: "dock-pane",
-      label: "Dock Pane",
-      description: "Dock a floating pane back into the layout",
-      keywords: ["dock", "attach", "pin", "pane"],
+      label: "Return to Layout",
+      description: "Put a floating pane back into the layout",
+      keywords: ["return", "layout", "tile", "attach", "pin", "pane", "dock"],
       category: "config",
       execute: async () => {
         if (!getStateRef) return;
@@ -176,7 +177,7 @@ export const layoutManagerModule: PluginModule = {
         const { layout, focusedPaneId } = getStateRef();
         const focusedPane = getFocusedPane(layout, focusedPaneId);
         if (!focusedPane || !layout.floating.some((entry) => entry.instanceId === focusedPane.instanceId)) {
-          notify("Focus a floating pane to dock it", { type: "info" });
+          notify("Focus a floating pane to return it to the layout", { type: "info" });
           return;
         }
 
@@ -280,11 +281,11 @@ export const layoutManagerModule: PluginModule = {
         const focusedPane = getFocusedPane(layout, focusedPaneId);
         const dockedPaneIds = getDockedPaneIds(layout);
         if (dockedPaneIds.length < 2) {
-          notify("Need at least 2 docked panes to swap", { type: "info" });
+          notify("Need at least 2 panes in the layout to swap", { type: "info" });
           return;
         }
         if (!focusedPane || !isPaneDocked(layout, focusedPane.instanceId)) {
-          notify("Focus a docked pane to swap it", { type: "info" });
+          notify("Focus a pane in the layout to swap it", { type: "info" });
           return;
         }
 

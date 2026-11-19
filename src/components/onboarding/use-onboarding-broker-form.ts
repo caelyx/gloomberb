@@ -22,6 +22,7 @@ import type { PortfolioSub } from "./onboarding-steps";
 import { brokerSetupGuideUrl } from "./portfolio-step/broker-setup-panel";
 import type { useOnboardingBrokerSync } from "./wizard-broker-sync";
 import { getConnectableBrokerOptions, type BrokerOption } from "./wizard-model";
+import { logFailure } from "../../utils/log-failure";
 
 export function useOnboardingBrokerFields({
   pluginRegistry, language,
@@ -37,7 +38,7 @@ export function useOnboardingBrokerFields({
   const [brokerSelectIdx, setBrokerSelectIdx] = useState(0);
 
   useEffect(() => {
-    if (pluginRegistry.brokers.has(SIGNED_IN_BROKER_TYPE)) void refreshSignedInBrokers();
+    if (pluginRegistry.brokers.has(SIGNED_IN_BROKER_TYPE)) refreshSignedInBrokers();
   }, [pluginRegistry.brokers]);
   const signedInBrokers = useSyncExternalStore(subscribeSignedInBrokers, getSignedInBrokers, getSignedInBrokers);
   const brokerOptions = useMemo(
@@ -256,7 +257,7 @@ export function useOnboardingBrokerForm({
 
   const openBrokerGuide = useCallback(() => {
     const url = selectedBrokerId ? brokerSetupGuideUrl(selectedBrokerId, brokerValues) : null;
-    if (url) void rendererHost.openExternal(url).catch(() => {});
+    if (url) void rendererHost.openExternal(url).catch(logFailure("onboarding.broker-form", "Open broker setup guide failed"));
   }, [brokerValues, rendererHost, selectedBrokerId]);
 
   return {

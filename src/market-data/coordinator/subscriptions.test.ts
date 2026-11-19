@@ -418,7 +418,11 @@ describe("MarketDataCoordinator key subscriptions", () => {
       expect([price(msft), price(nvda)]).toEqual([200, 300]);
     }
 
+    // Due a second after the last apply, an off-screen key waits for a frame with visible quotes.
     clock.advance(500);
+    expect([price(msft), price(nvda)]).toEqual([200, 300]);
+    emitQuote(amd, quote("AMD", 106));
+    clock.advance(0);
     expect([price(msft), price(nvda)]).toEqual([205, 305]);
 
     // A held-back tick shows on the next frame once its row scrolls into view.
@@ -428,6 +432,36 @@ describe("MarketDataCoordinator key subscriptions", () => {
     coordinator.subscribeQuotes([{ instrument: msft, priority: { visible: true } }]);
     clock.advance(100);
     expect(price(msft)).toBe(206);
+  });
+
+  test("an off-screen tick comes with a frame that has visible quotes, or a moment after it is due, and never holds one back", () => {
+    const { clock, coordinator, emitQuote } = createFramedCoordinator();
+    const amd = { symbol: "AMD", exchange: "NASDAQ" };
+    const msft = { symbol: "MSFT", exchange: "NASDAQ" };
+    coordinator.subscribeQuotes([
+      { instrument: amd, priority: { visible: true } },
+      { instrument: msft, priority: { visible: false, weight: 10 } },
+    ]);
+    const price = (instrument: typeof amd) => coordinator.getQuoteEntry(instrument).data?.price;
+    emitQuote(amd, quote("AMD", 100));
+    emitQuote(msft, quote("MSFT", 200));
+    clock.advance(0);
+
+    // Due at 1,000 ms. A frame of its own there would space the next frame, and a visible tick just after it would wait out the interval.
+    clock.advance(900);
+    emitQuote(msft, quote("MSFT", 201));
+    clock.advance(105);
+    expect(price(msft)).toBe(200);
+    emitQuote(amd, quote("AMD", 101));
+    clock.advance(0);
+    expect([price(amd), price(msft)]).toEqual([101, 201]);
+
+    // With nothing visible ticking it still arrives, a quarter second after it falls due (at 2,005 ms).
+    emitQuote(msft, quote("MSFT", 202));
+    clock.advance(1_249);
+    expect(price(msft)).toBe(201);
+    clock.advance(1);
+    expect(price(msft)).toBe(202);
   });
 
   test("applies a frame's quotes and notifies their readers in one pass", () => {
@@ -584,6 +618,54 @@ describe("MarketDataCoordinator key subscriptions", () => {
         lastUpdated: firstTimestamp,
         receivedAt: firstTimestamp + 60_000,
       });
+    } finally {
+      Date.now = realDateNow;
+    }
+  });
+
+  test("holds a tick that only restamps the quote within its minute until the next receipt refresh", async () => {
+    const realDateNow = Date.now;
+    const { provider, emitQuote } = createProvider();
+    const coordinator = new MarketDataCoordinator(provider);
+    const nvda = { symbol: "NVDA", exchange: "NASDAQ" };
+    // Seconds into a minute, so the stamps below stay inside it until the last.
+    const first = 1_800_000_000_000 - (1_800_000_000_000 % 60_000) + 10_000;
+    const tick = (stamp: number) => quote("NVDA", 173.73, { lastUpdated: stamp, bid: 173.7, ask: 173.8, dataSource: "live", delivery: "stream" });
+    let calls = 0;
+
+    try {
+      coordinator.subscribeKeys([buildQuoteKey(nvda)], () => { calls += 1; });
+      coordinator.subscribeQuotes([{ instrument: nvda, priority: { visible: true } }]);
+
+      Date.now = () => first;
+      emitQuote(nvda, tick(first));
+      await flushCoordinator();
+      expect(calls).toBe(1);
+
+      for (const offset of [200, 1_000, 3_500]) {
+        Date.now = () => first + offset;
+        emitQuote(nvda, tick(first + offset));
+        await flushCoordinator();
+      }
+      expect(calls).toBe(1);
+      expect(coordinator.getQuoteEntry(nvda).data).toMatchObject({ lastUpdated: first, receivedAt: first });
+
+      // The receipt refresh stores it, with the stamp it carries.
+      Date.now = () => first + 6_000;
+      emitQuote(nvda, tick(first + 6_000));
+      await flushCoordinator();
+      expect(calls).toBe(2);
+      expect(coordinator.getQuoteEntry(nvda).data).toMatchObject({ lastUpdated: first + 6_000, receivedAt: first + 6_000 });
+
+      // A stamp in the next minute opens a bar, moves the as-of clock: stored at once, and so is any other change.
+      Date.now = () => first + 6_100;
+      emitQuote(nvda, tick(first + 60_000));
+      await flushCoordinator();
+      expect(calls).toBe(3);
+      Date.now = () => first + 6_200;
+      emitQuote(nvda, { ...tick(first + 60_100), bid: 173.71 });
+      await flushCoordinator();
+      expect(calls).toBe(4);
     } finally {
       Date.now = realDateNow;
     }

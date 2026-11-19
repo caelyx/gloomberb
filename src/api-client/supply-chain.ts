@@ -3,6 +3,8 @@ export type SupplyTier = 1 | 2 | 3 | 4 | 5 | 6;
 export type SupplyTierFilter = "sec" | "company" | "call" | "reported" | "unconfirmed";
 type SupplyClaim = "disclosed" | "company_confirmed" | "reported" | "rumored";
 export interface SupplyOptions { tiers?: SupplyTierFilter[]; includeLeads?: boolean; }
+/** A read of the disclosures: the trust filters, and the day they were known by (YYYY-MM-DD), when one is asked for. */
+export type SupplyRead = SupplyOptions & { asOf?: string };
 export interface SupplyEvidenceItem {
   id: string;
   tier: SupplyTier;
@@ -25,6 +27,8 @@ export interface SupplyEvidenceItem {
   value: number | null;
   valueUnit: string | null;
   currency: string | null;
+  /** A related-party (connected) trade the report prints, with its actual amount. Absent from older servers. */
+  relatedParty?: boolean;
 }
 export interface SupplyEntity {
   id: string;
@@ -45,6 +49,13 @@ export interface SupplyRow {
   direction: "in" | "out" | "mutual";
   pctOfRevenue: number | null;
   pctScope: string | null;
+  /**
+   * For a share tagged with a business segment, what the filing's sentence
+   * makes it a share of: "total" for the whole company's revenue the segment
+   * earns (NVDA's 16% of total revenue, from Compute & Networking), "segment"
+   * for the segment's own. Absent while unread, and from older servers.
+   */
+  pctScopeBasis?: "total" | "segment" | null;
   pctBasis: "revenue" | "receivables" | "cost" | "purchases" | null;
   usd: number | null;
   usdBasis: "disclosed" | "derived" | null;
@@ -54,6 +65,12 @@ export interface SupplyRow {
   nativeScale?: number | null;
   jurisdiction?: string | null;
   entityScope?: "entity" | "group" | "anonymous" | "aggregate" | null;
+  /**
+   * Every disclosure behind the row is a related-party (connected) trade: the
+   * counterparty is the company's parent, its group or a company under the
+   * same control, never a plain supplier or customer. Absent from older servers.
+   */
+  relatedParty?: boolean;
   period: string;
   /** Months every figure on the row covers: 0 a balance at the period end, 3 a quarter, 12 a year. Null or absent when the source does not say or the figures differ in length. */
   periodMonths?: number | null;

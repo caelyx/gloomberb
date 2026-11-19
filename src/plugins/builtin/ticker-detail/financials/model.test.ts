@@ -1,13 +1,21 @@
 import { describe, expect, test } from "bun:test";
 import type { TickerFinancials } from "../../../../types/financials";
+import type { FinancialStatement, ResultsStatementFill } from "../../../../types/financials";
 import {
   buildFinancialTableModel,
   computeGrowth,
   computeTTM,
+  financialColumnLabel,
+  financialPeriodWidth,
   formatFinancialCell,
   financialStatementCurrency,
+  FINANCIAL_SUB_TABS,
+  financialStatementPeriods,
+  notInYetNote,
   resolveFinancialPeriodOption,
   resolveFinancialSubTabKey,
+  selectFinancialStatements,
+  splitPeriodsNotInYet,
 } from "./model";
 import { createTestFinancials } from "../../../../test-support/data-provider";
 
@@ -27,11 +35,27 @@ function createFinancials(): TickerFinancials {
 }
 
 describe("financial statement table model", () => {
+  test("a terminal period holds its widest value and the widest growth whole, or its header where that is wider", () => {
+    const values = ["43.49", "-987.65", "1.2"];
+    const width = financialPeriodWidth(values, ["FY2024", "FY2023"]);
+    for (const value of values) {
+      // The longest growth a cell can show, at the period's width: nothing cut, nothing past the column.
+      const cell = formatFinancialCell(value, -1e20, width);
+      expect(cell.valueText.trim()).toBe(value);
+      expect(cell.growthText.trim()).toHaveLength(6);
+      expect(`${cell.valueText}${cell.growthText}`.length).toBe(width);
+    }
+    // The widest value ends the column against its growth, with no blank before it.
+    expect(formatFinancialCell("-987.65", 0.1, width).valueText).toBe("-987.65");
+    expect(financialPeriodWidth(["1.2"], ["Dec 2025 USD (restated)"])).toBe(23);
+    expect(financialPeriodWidth([], [])).toBe(7);
+  });
+
   test("large growth fits beside precise EPS without truncating its sign or percent unit", () => {
-    const growth = computeGrowth(0.004125, -0.00000254)!;
+    const growth = computeGrowth(0.004125, 0.00000254)!;
     const cell = formatFinancialCell("0.004125", growth);
     expect(cell.valueText.trim()).toBe("0.004125");
-    expect(cell.growthText.trim()).toBe("+163k%");
+    expect(cell.growthText.trim()).toBe("+162k%");
     expect(cell.valueText.length + cell.growthText.length).toBe(18);
     for (const rate of [-999.995, -100, 99.995, 9999.995, 1e12, -1e100, 1e100, -1e307, 1e307]) {
       const formatted = formatFinancialCell("0.004125", rate).growthText.trim();
@@ -40,8 +64,16 @@ describe("financial statement table model", () => {
       expect(formatted).toContain(rate < 0 ? "-" : formatted.startsWith(">") ? ">" : "+");
     }
     expect(computeGrowth(Number.MAX_VALUE, Number.MIN_VALUE)).toBeUndefined();
-    expect(computeGrowth(Number.MAX_VALUE, -Number.MAX_VALUE)).toBe(2);
     expect(computeGrowth(-Number.MAX_VALUE, Number.MAX_VALUE)).toBe(-2);
+    // Off a zero or negative base: not meaningful, and the cell says so.
+    expect(computeGrowth(Number.MAX_VALUE, -Number.MAX_VALUE)).toBe("not-meaningful");
+    expect(computeGrowth(5, -10)).toBe("not-meaningful");
+    expect(computeGrowth(-5, -10)).toBe("not-meaningful");
+    expect(computeGrowth(5, 0)).toBe("not-meaningful");
+    expect(formatFinancialCell("5", computeGrowth(5, -10)).growthText.trim()).toBe("N/M");
+    // An outflow grows as the money that went out: capex from -10 to -12 is a fifth more spent.
+    expect(computeGrowth(-12, -10, true)).toBeCloseTo(0.2, 10);
+    expect(computeGrowth(3, -10, true)).toBe("not-meaningful");
     expect(formatFinancialCell("1", Number.POSITIVE_INFINITY).growthText.trim()).toBe("");
   });
 
@@ -268,4 +300,296 @@ test("liabilities plus equity requires its own components and cannot copy total 
   expect(total.cells.map(({ value }) => value)).toEqual([undefined, 80, undefined, 95]);
   expect(total.cells[0]!.valueText.trim()).toBe("—");
   expect(table.rows.find(({ summaryKey }) => summaryKey === "totalAssets")!.cells.map(({ value }) => value)).toEqual([130, 120, 110, 100]);
+});
+
+test("a newest year with only some figures (an EPS alone) is left out of the pane's columns and named, so its first column is never all dashes", () => {
+  // Pop Mart on 2026-11-11: FY2025 carried its EPS but none of its statement.
+  const annual = [
+    { date: "2023-12-31", totalRevenue: 6.3e9, eps: 0.81 },
+    { date: "2024-12-31", totalRevenue: 13.04e9, eps: 2.35 },
+    { date: "2025-12-31", eps: 9.58 },
+  ];
+  const income = FINANCIAL_SUB_TABS.find((tab) => tab.key === "income")!;
+  const { statements } = selectFinancialStatements("annual", "income", annual, []);
+  expect(statements.map((statement) => statement.date)).toEqual(["2025-12-31", "2024-12-31", "2023-12-31"]);
+  const { shown, notInYet } = splitPeriodsNotInYet(statements, income);
+  expect(shown.map((statement) => statement.date)).toEqual(["2024-12-31", "2023-12-31"]);
+  expect(notInYetNote(notInYet, income, "annual", 12)).toBe("FY2025 is not in yet: only some of its figures are on file, not its revenue.");
+  // A table where no year has the lead line keeps them all: there is nothing newer to lead with.
+  expect(splitPeriodsNotInYet([{ date: "2025-12-31", eps: 1 }], income).shown).toHaveLength(1);
+});
+
+test("a quarter whose revenue Gloom Cloud left blank because the announcements count it otherwise is in", () => {
+  // HSBC's 3Q26: net income and EPS from its earnings release, its revenue left out (the source counts it otherwise).
+  const omitted = {
+    date: "2026-09-30", netIncome: 7.55e9, eps: 0.41,
+    filledFrom: { source: "results" as const, fields: ["netIncome" as const, "eps" as const], documents: [], lines: {}, omitted: ["totalRevenue" as const] },
+  };
+  const quarters = [omitted, { date: "2026-06-30", eps: 0.45 }, { date: "2026-03-31", totalRevenue: 19.13e9, netIncome: 7.34e9, eps: 0.4 }];
+  const income = FINANCIAL_SUB_TABS.find((tab) => tab.key === "income")!;
+  const { shown, notInYet } = splitPeriodsNotInYet(quarters, income);
+  expect(shown.map((statement) => statement.date)).toEqual(["2026-09-30", "2026-06-30", "2026-03-31"]);
+  expect(notInYet).toEqual([]);
+  expect(financialStatementPeriods(quarters, income).map(({ lead }) => lead)).toEqual([true, false, true]);
+  // Without the reason the newest quarter is not in yet, as before.
+  expect(splitPeriodsNotInYet([{ ...omitted, filledFrom: { ...omitted.filledFrom, omitted: [] } }, quarters[2]!], income).notInYet).toHaveLength(1);
+});
+
+test("a half-yearly reporter's TTM is Gloom Cloud's year plus the half, when it is newer than the year", () => {
+  const trailing = {
+    date: "2026-06-30", currency: "CNY", totalRevenue: 40.42e9, netIncome: 13.24e9,
+    trailing: {
+      method: "annual-plus-interim" as const, annual: "2025-12-31",
+      interim: { end: "2026-06-30", months: 6 }, priorInterim: { end: "2025-06-30", months: 6 },
+      basis: "FY to 2025-12-31 + 6 months to 2026-06-30 − 6 months to 2025-06-30",
+    },
+  };
+  const financials = createTestFinancials({
+    annualStatements: [{ date: "2025-12-31", currency: "CNY", totalRevenue: 37.12e9, netIncome: 12.78e9 }],
+    // Halves, not quarters: no four-quarter sum.
+    quarterlyStatements: [
+      { date: "2025-06-30", currency: "CNY", totalRevenue: 13.88e9 },
+      { date: "2026-06-30", currency: "CNY", totalRevenue: 17.17e9 },
+    ],
+    trailingStatement: trailing,
+  });
+  const table = buildFinancialTableModel(financials, { period: "annual", statement: "income" })!;
+  expect(table.statements.map(({ date }) => date)).toEqual(["TTM", "2025-12-31"]);
+  expect(table.statements[0]).toMatchObject({
+    totalRevenue: 40.42e9,
+    aggregation: { kind: "annual-plus-interim", periodEnd: "2026-06-30", basis: trailing.trailing.basis },
+  });
+  // Not on the balance sheet, and not once the year it runs to is on file.
+  expect(buildFinancialTableModel(financials, { period: "annual", statement: "balance" })!.statements.map(({ date }) => date)).not.toContain("TTM");
+  const later = { ...financials, annualStatements: [...financials.annualStatements, { date: "2026-06-30", currency: "CNY", totalRevenue: 40e9 }] };
+  expect(buildFinancialTableModel(later, { period: "annual", statement: "income" })!.statements.map(({ date }) => date)).not.toContain("TTM");
+});
+
+/** A half Gloom Cloud filled into the quarterly list from a results announcement. */
+function half(date: string, totalRevenue: number): FinancialStatement {
+  const filledFrom: ResultsStatementFill = {
+    source: "results", fields: ["totalRevenue"], periodMonths: 6,
+    documents: [{ source: "hkex", kind: "interim_results", title: "Interim Results", url: "https://www1.hkexnews.hk/x.pdf", publishedAt: `${date.slice(0, 4)}-08-20T08:30:00Z`, fetchedAt: "2026-11-11T00:00:00Z" }],
+    lines: { totalRevenue: { document: 0, page: 3 } },
+  };
+  return { date, currency: "CNY", totalRevenue, filledFrom };
+}
+
+const HALF_TRAILING = {
+  date: "2026-06-30", currency: "CNY", totalRevenue: 40.42e9,
+  trailing: {
+    method: "annual-plus-interim" as const, annual: "2025-12-31",
+    interim: { end: "2026-06-30", months: 6 }, priorInterim: { end: "2025-06-30", months: 6 },
+    basis: "FY to 2025-12-31 + 6 months to 2026-06-30 − 6 months to 2025-06-30",
+  },
+};
+
+test("a filled half is never summed as a quarter, compared with one, or headed as one", () => {
+  const quarters = [
+    { date: "2025-03-31", currency: "CNY", totalRevenue: 10 },
+    { date: "2025-06-30", currency: "CNY", totalRevenue: 20 },
+    { date: "2025-09-30", currency: "CNY", totalRevenue: 30 },
+    { date: "2025-12-31", currency: "CNY", totalRevenue: 40 },
+  ];
+  // Four quarters to December; the half after them is not a fifth.
+  expect(computeTTM([...quarters, half("2026-06-30", 170)])).toMatchObject({ totalRevenue: 100, aggregation: { periodEnd: "2025-12-31" } });
+  // Three quarters and a half are not four quarters.
+  expect(computeTTM([...quarters.slice(1), half("2026-03-31", 170)])).toBeNull();
+  const financials = createTestFinancials({
+    annualStatements: [{ date: "2025-12-31", currency: "CNY", totalRevenue: 100 }],
+    quarterlyStatements: [...quarters, half("2026-06-30", 170)],
+  });
+  const table = buildFinancialTableModel(financials, { period: "quarterly", statement: "income" })!;
+  expect(table.statements[0]!.date).toBe("2026-06-30");
+  expect(financialColumnLabel(table.statements[0]!, "quarterly", 12)).toBe("H1 FY26");
+  expect(financialColumnLabel(table.statements[1]!, "quarterly", 12)).toBe("Q4 FY25");
+  const revenue = table.rows.find(({ key, summaryKey }) => (key ?? summaryKey) === "totalRevenue")!;
+  // No change from the December quarter to the half; the quarters keep theirs.
+  expect(revenue.cells[0]!.growth).toBeUndefined();
+  expect(revenue.cells[1]!.growth).toBeCloseTo(40 / 30 - 1, 6);
+  // Not even one a quarter after it.
+  const offCycle = buildFinancialTableModel({ ...financials, quarterlyStatements: [...quarters, half("2026-03-31", 170)] }, { period: "quarterly", statement: "income" })!;
+  expect(financialColumnLabel(offCycle.statements[0]!, "quarterly", 12)).toBe("6M 2026-03-31");
+  expect(offCycle.rows.find(({ key, summaryKey }) => (key ?? summaryKey) === "totalRevenue")!.cells[0]!.growth).toBeUndefined();
+});
+
+test("the year plus the half: headed TTM H1, its growth only against twelve months to a year before", () => {
+  const annual = [
+    { date: "2024-12-31", currency: "CNY", totalRevenue: 13.04e9 },
+    { date: "2025-12-31", currency: "CNY", totalRevenue: 37.12e9 },
+  ];
+  const halves = createTestFinancials({
+    annualStatements: annual,
+    quarterlyStatements: [half("2025-06-30", 13.88e9), half("2026-06-30", 17.17e9)],
+    trailingStatement: HALF_TRAILING,
+  });
+  const table = buildFinancialTableModel(halves, { period: "annual", statement: "income" })!;
+  expect(table.statements[0]!.aggregation).toMatchObject({ kind: "annual-plus-interim", interimMonths: 6 });
+  expect(financialColumnLabel(table.statements[0]!, "annual", 12)).toBe("TTM H1 FY26");
+  const revenue = (model: typeof table) => model.rows.find(({ key, summaryKey }) => (key ?? summaryKey) === "totalRevenue")!;
+  // No twelve months to June 2025 on file: no growth, never against FY2025.
+  expect(revenue(table).cells[0]!.growth).toBeUndefined();
+  expect(revenue(table).cells[1]!.growth).toBeCloseTo(37.12 / 13.04 - 1, 6);
+  // Four quarters to June 2025 are the same window a year earlier.
+  const quarterly = createTestFinancials({
+    annualStatements: annual,
+    quarterlyStatements: [
+      { date: "2024-09-30", currency: "CNY", totalRevenue: 3e9 },
+      { date: "2024-12-31", currency: "CNY", totalRevenue: 4e9 },
+      { date: "2025-03-31", currency: "CNY", totalRevenue: 6e9 },
+      { date: "2025-06-30", currency: "CNY", totalRevenue: 7e9 },
+    ],
+    trailingStatement: HALF_TRAILING,
+  });
+  const withPrior = buildFinancialTableModel(quarterly, { period: "annual", statement: "income" })!;
+  expect(withPrior.statements[0]!.aggregation?.kind).toBe("annual-plus-interim");
+  expect(revenue(withPrior).cells[0]!.growth).toBeCloseTo(40.42 / 20 - 1, 6);
+});
+
+test("four quarters that would mix two definitions of revenue give way to the served year plus nine months", () => {
+  // A bank's latest quarters as it announces them (revenue before credit losses), its earlier ones as a source counts them.
+  const quarterlyStatements = [
+    { date: "2025-12-31", currency: "USD", totalRevenue: 17.72e9, netIncome: 4.94e9 },
+    { date: "2026-03-31", currency: "USD", totalRevenue: 19.13e9, netIncome: 7.34e9 },
+    { date: "2026-06-30", currency: "USD", totalRevenue: 19.12e9, netIncome: 7.91e9 },
+    { date: "2026-09-30", currency: "USD", totalRevenue: 18.62e9, netIncome: 7.55e9 },
+  ];
+  const trailing = {
+    date: "2026-09-30", currency: "USD", totalRevenue: 72.73e9, netIncome: 27.75e9,
+    trailing: {
+      method: "annual-plus-interim" as const, annual: "2025-12-31",
+      interim: { end: "2026-09-30", months: 9 }, priorInterim: { end: "2025-09-30", months: 9 },
+      basis: "FY to 2025-12-31 + 9 months to 2026-09-30 − 9 months to 2025-09-30",
+    },
+  };
+  const annualStatements = [{ date: "2025-12-31", currency: "USD", totalRevenue: 68.27e9, netIncome: 22.92e9 }];
+  const ttmRevenue = (served: typeof trailing & { trailing: { overQuarters?: string } }) => {
+    const table = buildFinancialTableModel(createTestFinancials({ annualStatements, quarterlyStatements, trailingStatement: served }), { period: "annual", statement: "income" })!;
+    return table.statements[0]!.totalRevenue;
+  };
+  // Summable quarters stand.
+  expect(ttmRevenue(trailing)).toBeCloseTo(74.59e9, -6);
+  // Told they are not, the served year plus nine months does.
+  expect(ttmRevenue({ ...trailing, trailing: { ...trailing.trailing, overQuarters: "the quarters count revenue otherwise" } })).toBe(72.73e9);
+});
+
+test("a margin over negative revenue reads N/M; a loss's growth reads N/M; capex grows as spending does", () => {
+  const financials = createTestFinancials({
+    annualStatements: [
+      { date: "2024-12-31", currency: "USD", totalRevenue: 50, grossProfit: 10, operatingIncome: -20, netIncome: -15, capitalExpenditure: -10, operatingCashFlow: 5, freeCashFlow: -5 },
+      // Revenue turned negative (a reversal of fair value gains, say): no margin over it means anything.
+      { date: "2025-12-31", currency: "USD", totalRevenue: -4, grossProfit: -9, operatingIncome: -30, netIncome: 6, capitalExpenditure: -12, operatingCashFlow: 8, freeCashFlow: -4 },
+    ],
+    quarterlyStatements: [],
+  });
+  const income = buildFinancialTableModel(financials, { period: "annual", statement: "income", expandAll: true })!;
+  const cell = (model: typeof income, id: string) => model.rows.find((row) => (row.key ?? row.summaryKey ?? row.id.split(":")[0]) === id)!.cells[0]!;
+  expect(cell(income, "gross-margin").valueText.trim()).toBe("N/M");
+  expect(cell(income, "net-margin").valueText.trim()).toBe("N/M");
+  // A year earlier, over positive revenue, the margins are numbers.
+  expect(income.rows.find((row) => row.id.startsWith("gross-margin"))!.cells[1]!.valueText.trim()).toBe("20.0%");
+  // Net income from a loss of 15 to a profit of 6: no percentage of the loss.
+  expect(cell(income, "netIncome").growthText.trim()).toBe("N/M");
+  expect(cell(income, "netIncome").growth).toBeUndefined();
+  // Revenue from 50 to -4 falls 108%: a positive base, so a number.
+  expect(cell(income, "totalRevenue").growth).toBeCloseTo(-54 / 50, 10);
+  const cashflow = buildFinancialTableModel(financials, { period: "annual", statement: "cashflow", expandAll: true })!;
+  expect(cell(cashflow, "capitalExpenditure").growth).toBeCloseTo(0.2, 10);
+  expect(cell(cashflow, "freeCashFlow").growthText.trim()).toBe("N/M");
+});
+
+test("a filled half's growth is against the same half a year earlier, never a quarter's", () => {
+  const halves = createTestFinancials({
+    annualStatements: [{ date: "2025-12-31", currency: "CNY", totalRevenue: 37.12e9 }],
+    quarterlyStatements: [half("2025-06-30", 13.88e9), half("2026-06-30", 17.17e9)],
+  });
+  const table = buildFinancialTableModel(halves, { period: "quarterly", statement: "income" })!;
+  const revenue = table.rows.find(({ key, summaryKey }) => (key ?? summaryKey) === "totalRevenue")!;
+  expect(table.statements.map(({ date }) => date)).toEqual(["2026-06-30", "2025-06-30"]);
+  expect(revenue.cells[0]!.growth).toBeCloseTo(17.17 / 13.88 - 1, 6);
+  // A quarter a year before the half is no half.
+  const quarter = buildFinancialTableModel({ ...halves, quarterlyStatements: [{ date: "2025-06-30", currency: "CNY", totalRevenue: 7e9 }, half("2026-06-30", 17.17e9)] },
+    { period: "quarterly", statement: "income" })!;
+  expect(quarter.rows.find(({ key, summaryKey }) => (key ?? summaryKey) === "totalRevenue")!.cells[0]!.growth).toBeUndefined();
+});
+
+test("a filled year's growth against the source's year before: the lines the server finds restated alike, every line where it does not say", () => {
+  // Pop Mart: FY2025 revenue and net income from the annual results, whose 2024 revenue is the source's 13,037.7m.
+  const fy2025 = (comparable?: ResultsStatementFill["comparable"]): FinancialStatement => ({
+    date: "2025-12-31", currency: "CNY", totalRevenue: 37.12e9, netIncome: 12.78e9,
+    filledFrom: {
+      source: "results", fields: ["totalRevenue", "netIncome"],
+      documents: [{ source: "hkex", kind: "annual_results", title: "Annual Results", url: "https://www1.hkexnews.hk/a.pdf", publishedAt: "2026-03-25T04:22:00Z", fetchedAt: "2026-11-11T00:00:00Z" }],
+      lines: { totalRevenue: { document: 0, page: 2 }, netIncome: { document: 0, page: 2 } },
+      ...(comparable ? { comparable } : {}),
+    },
+  });
+  const growth = (row: FinancialStatement, key: string) => buildFinancialTableModel(createTestFinancials({
+    annualStatements: [{ date: "2024-12-31", currency: "CNY", totalRevenue: 13.04e9, netIncome: 3.13e9 }, row],
+  }), { period: "annual", statement: "income" })!.rows.find((model) => (model.key ?? model.summaryKey) === key)!.cells[0]!.growth;
+  expect(growth(fy2025(["totalRevenue"]), "totalRevenue")).toBeCloseTo(37.12 / 13.04 - 1, 6);
+  // Net income is not restated alike: no growth across the two sources.
+  expect(growth(fy2025(["totalRevenue"]), "netIncome")).toBeUndefined();
+  expect(growth(fy2025([]), "totalRevenue")).toBeUndefined();
+  // A server that predates the check says nothing: the filled year has its year-on-year growth all the same.
+  expect(growth(fy2025(), "totalRevenue")).toBeCloseTo(37.12 / 13.04 - 1, 6);
+  expect(growth(fy2025(), "netIncome")).toBeCloseTo(12.78 / 3.13 - 1, 6);
+});
+
+test("a quarterly reporter missing a quarter's lines: the served TTM to the same day, not four quarters without them", () => {
+  // Meituan: no Q3 2025 revenue on file; Gloom Cloud's FY2025 + H1 2026 − H1 2025 runs to June too.
+  const trailing = {
+    date: "2026-06-30", currency: "CNY", totalRevenue: 382.84e9, netIncome: -38.45e9,
+    trailing: {
+      method: "annual-plus-interim" as const, annual: "2025-12-31",
+      interim: { end: "2026-06-30", months: 6 }, priorInterim: { end: "2025-06-30", months: 6 },
+      basis: "FY to 2025-12-31 + 6 months to 2026-06-30 − 6 months to 2025-06-30",
+    },
+  };
+  const quarters = [
+    { date: "2025-09-30", currency: "CNY", grossProfit: 10e9 },
+    { date: "2025-12-31", currency: "CNY", totalRevenue: 92.1e9, netIncome: -15.14e9 },
+    { date: "2026-03-31", currency: "CNY", totalRevenue: 91.04e9, netIncome: -6.83e9 },
+    { date: "2026-06-30", currency: "CNY", totalRevenue: 104.64e9, netIncome: 2.15e9 },
+  ];
+  const financials = createTestFinancials({
+    annualStatements: [{ date: "2025-12-31", currency: "CNY", totalRevenue: 364.8e9, netIncome: -23.4e9 }],
+    quarterlyStatements: quarters,
+    trailingStatement: trailing,
+  });
+  const table = buildFinancialTableModel(financials, { period: "annual", statement: "income" })!;
+  expect(table.statements[0]).toMatchObject({ date: "TTM", totalRevenue: 382.84e9, aggregation: { kind: "annual-plus-interim", periodEnd: "2026-06-30" } });
+  // With the quarter's lines on file, its four quarters as before.
+  const whole = buildFinancialTableModel({ ...financials, quarterlyStatements: [{ date: "2025-09-30", currency: "CNY", totalRevenue: 95.5e9, netIncome: 1e9 }, ...quarters.slice(1)] },
+    { period: "annual", statement: "income" })!;
+  expect(whole.statements[0]!.aggregation?.kind).toBe("trailing-four-quarters");
+  // A served TTM to a day a few days before the quarters' (2026-06-28 against 2026-06-30) is the same period:
+  // still the served one where the quarters lack revenue, not the newer-looking four.
+  const nearby = buildFinancialTableModel({ ...financials, trailingStatement: { ...trailing, date: "2026-06-28",
+    trailing: { ...trailing.trailing, interim: { end: "2026-06-28", months: 6 } } } }, { period: "annual", statement: "income" })!;
+  expect(nearby.statements[0]).toMatchObject({ date: "TTM", totalRevenue: 382.84e9, aggregation: { kind: "annual-plus-interim" } });
+});
+
+test("a cash flow table is in one unit, shows a line once, and works out capex intensity and the reinvestment rate", () => {
+  // Visa's FY2026 cash flow, in USD: depreciation and payables changes a thousandth of the rest, capex reported twice.
+  const year = (date: string, scale: number) => ({
+    date, currency: "USD", totalRevenue: 45.903e9 * scale, operatingIncome: 28.11e9 * scale, pretaxIncome: 28.093e9 * scale,
+    taxProvision: 4.589e9 * scale, freeCashFlow: 22.057e9 * scale, operatingCashFlow: 23.728e9 * scale, capitalExpenditure: -1.671e9 * scale,
+    purchaseOfPPE: -1.671e9 * scale, purchaseOfBusiness: -0.705e9 * scale, depreciationAndAmortization: 1.403e9 * scale,
+    changeInAccountPayable: 1e6 * scale, stockBasedCompensation: 0.928e9 * scale, netIncome: 23.504e9 * scale,
+  });
+  const model = buildFinancialTableModel(createTestFinancials({ annualStatements: [year("2025-09-30", 0.9), year("2026-09-30", 1)] }),
+    { period: "annual", statement: "cashflow", expandAll: true })!;
+  expect(model.unit).toBe("bn");
+  // No row names a unit of its own: the header's bn is every amount's.
+  expect(model.rows.filter((row) => /\((?:k|mn|bn|tn)\)$/.test(row.unitLabel)).map((row) => row.unitLabel)).toEqual([]);
+  const cell = (label: string) => model.rows.find((row) => row.label === label)?.cells[0]?.valueText.trim();
+  expect(cell("Stock-Based Comp")).toBe("0.928");
+  expect(cell("Acct Payable")).toBe("0.001");
+  // Operating cash flow is the Operating group's line, and Purchase PPE equals CapEx in every year: each is shown once.
+  expect(model.rows.filter((row) => row.label === "Operating CF" || row.label === "Purchase PPE")).toEqual([]);
+  expect(model.rows.filter((row) => row.label === "CapEx")).toHaveLength(1);
+  expect(cell("CapEx / Revenue")).toBe("3.6%");
+  // (1.671 + 0.705 - 1.403) / (28.11 x (1 - 4.589 / 28.093)) = 4.1%.
+  expect(cell("Reinvestment Rate")).toBe("4.1%");
 });

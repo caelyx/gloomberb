@@ -1,9 +1,13 @@
+import { memo } from "react";
 import { Box, Text, useUiCapabilities } from "../../../ui";
 import type { CompositeChartXMarker } from "./types";
+import type { EventCaptionPlacement } from "./event-captions";
 
 export interface StaticChartXAxisLabel {
   label: string;
   ratio: number;
+  /** An axis's name rather than a value: kept whole, and the ticks that would run into it give way. */
+  pinned?: boolean;
   /** Cells the label covers in the fixed-width axis text, end inclusive. */
   start?: number;
   end?: number;
@@ -30,6 +34,7 @@ function alignAxisLabel(label: string, width: number, index: number, count: numb
 interface LabelPlacement {
   start: number;
   end: number;
+  pinned?: boolean;
 }
 
 /**
@@ -44,10 +49,17 @@ const DESKTOP_LABEL_GAP = 0.5;
 /**
  * Neighbouring ticks that land within `gap` cells of each other would print as
  * one word ("930D", "1020"). Keep the first tick, then each one clear of the
- * last kept, holding room for the final tick.
+ * last kept, holding room for the final tick. A pinned label (an axis's name)
+ * always stays: the ticks that would run into it are dropped first.
  */
 function dropCollidingLabels<T extends LabelPlacement>(placements: readonly T[], gap: number): T[] {
-  const sorted = [...placements].sort((left, right) => left.start - right.start);
+  const pinned = placements.filter((placement) => placement.pinned);
+  const clear = (placement: T) => pinned.every((pin) => placement.start >= pin.end + 1 + gap || placement.end + 1 + gap <= pin.start);
+  const sorted = placements.filter((placement) => !placement.pinned && clear(placement)).sort((left, right) => left.start - right.start);
+  return [...keepApart(sorted, gap), ...pinned].sort((left, right) => left.start - right.start);
+}
+
+function keepApart<T extends LabelPlacement>(sorted: readonly T[], gap: number): T[] {
   const final = sorted[sorted.length - 1];
   const kept: T[] = [];
   let lastEnd = Number.NEGATIVE_INFINITY;
@@ -62,7 +74,7 @@ function dropCollidingLabels<T extends LabelPlacement>(placements: readonly T[],
 
 /**
  * The cursor and anchor badges print over the flow text, so every label they
- * touch, with a blank cell either side, is blanked whole rather than leaving
+ * touch, with blank cells either side, is blanked whole rather than leaving
  * its ends around the badge. A single fixed-width axis text is split by its
  * tick spans; evenly spread labels each count as one.
  */
@@ -101,6 +113,49 @@ export interface StaticXAxisMarker {
   label: string;
   color: string;
 }
+
+/** A time label at its place on the axis, which holds still while the cursor moves past. */
+const PositionedTimeLabel = memo(function PositionedTimeLabel({ label, color, left, right, transform }: {
+  label: string;
+  color: string | undefined;
+  left: number | string | undefined;
+  right: number | string | undefined;
+  transform: number | string | undefined;
+}) {
+  return (
+    <Text
+      fg={color}
+      selectable={false}
+      // The label against the right edge, which a floating pane's resize grip may cover.
+      data-gloom-edge={right !== undefined ? "end" : undefined}
+      style={{
+        position: "absolute",
+        top: 0,
+        whiteSpace: "pre",
+        pointerEvents: "none",
+        ...(left !== undefined ? { left } : {}),
+        ...(right !== undefined ? { right } : {}),
+        ...(transform !== undefined ? { transform } : {}),
+      }}
+    >
+      {label}
+    </Text>
+  );
+});
+
+/** A stretch of the axis text in the terminal, which renders only when its text does. */
+const TimeLabelSegment = memo(function TimeLabelSegment({ width, text, color, end }: {
+  width: number;
+  text: string;
+  color: string | undefined;
+  end: boolean;
+}) {
+  return (
+    <Box width={width} overflow="hidden" data-gloom-edge={end ? "end-segment" : undefined}>
+      <Text fg={color}>{text}</Text>
+    </Box>
+  );
+});
 
 export function StaticXAxisLabels({
   labels,
@@ -180,8 +235,11 @@ export function StaticXAxisLabels({
     const left = fractionalViewport ? ratio * width - label.length / 2 : extraMarkerLeft(label, ratio);
     badgeSpans.push([left, left + label.length]);
   }
+  // Two blank cells in the terminal: with one, a tick read as part of the
+  // crosshair's date (`2021 2023-12-25`, review, 12 Nov 2026).
+  const badgeClearance = isDesktop ? 1 : 2;
   const clearOfBadges = (start: number, end: number) => badgeSpans.every(([badgeStart, badgeEnd]) => (
-    end + 1 <= badgeStart || start >= badgeEnd + 1
+    end + badgeClearance <= badgeStart || start >= badgeEnd + badgeClearance
   ));
   const placedPositionedLabels = visiblePositionedLabels.flatMap((entry, index) => {
     const ratio = clampRatio(entry.ratio);
@@ -205,7 +263,7 @@ export function StaticXAxisLabels({
       edgeStyle = { left: `${ratio * 100}%`, transform: "translateX(-50%)" };
     }
     if (!clearOfBadges(start, start + labelWidth)) return [];
-    return [{ entry, index, edgeStyle, start, end: start + labelWidth - 1 }];
+    return [{ entry, index, edgeStyle, start, end: start + labelWidth - 1, pinned: entry.pinned }];
   });
   const positionedPlacements = dropCollidingLabels(placedPositionedLabels, isDesktop ? DESKTOP_LABEL_GAP : TERMINAL_LABEL_GAP);
   const segmentWidths = visibleLabels.map((_, index) => baseWidth + (index < remainder ? 1 : 0));
@@ -235,38 +293,27 @@ export function StaticXAxisLabels({
     >
       {visiblePositionedLabels.length > 0 && (isDesktop || visibleLabels.length === 0) ? (
         <Box position="absolute" left={0} top={0} width={width} height={1} style={isDesktop ? { width: "100%" } : undefined}>
-          {positionedPlacements.map(({ entry, index, edgeStyle }) => {
-            return (
-              <Text
-                key={`${entry.label}:${entry.ratio}:${index}`}
-                fg={color}
-                selectable={false}
-                // The label against the right edge, which a floating pane's resize grip may cover.
-                data-gloom-edge={"right" in edgeStyle ? "end" : undefined}
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  whiteSpace: "pre",
-                  pointerEvents: "none",
-                  ...edgeStyle,
-                }}
-              >
-                {entry.label}
-              </Text>
-            );
-          })}
+          {positionedPlacements.map(({ entry, index, edgeStyle }) => (
+            <PositionedTimeLabel
+              key={`${entry.label}:${entry.ratio}:${index}`}
+              label={entry.label}
+              color={color}
+              left={edgeStyle.left}
+              right={edgeStyle.right}
+              transform={edgeStyle.transform}
+            />
+          ))}
         </Box>
       ) : (
         <Box width={width} height={1} flexDirection="row">
           {visibleLabels.map((label, index) => (
-            <Box
+            <TimeLabelSegment
               key={`${label}:${index}`}
-              width={segmentWidths[index]}
-              overflow="hidden"
-              data-gloom-edge={index === visibleLabels.length - 1 && visibleLabels.length > 1 ? "end-segment" : undefined}
-            >
-              <Text fg={color}>{flowText[index]}</Text>
-            </Box>
+              width={segmentWidths[index]!}
+              text={flowText[index]!}
+              color={color}
+              end={index === visibleLabels.length - 1 && visibleLabels.length > 1}
+            />
           ))}
         </Box>
       )}
@@ -447,6 +494,27 @@ export function StaticXMarkerLabels({
           </Box>
         );
       })}
+    </Box>
+  );
+}
+
+/** Events' captions in the row under the axis, laid out by `layoutEventCaptions`. */
+export function EventCaptions({
+  captions,
+  width,
+  color,
+}: {
+  captions: readonly EventCaptionPlacement[];
+  width: number;
+  color?: string;
+}) {
+  return (
+    <Box position="relative" width={width} height={1}>
+      {captions.map(({ id, left, text }) => (
+        <Box key={id} position="absolute" left={left} top={0} width={text.length} height={1} overflow="hidden" zIndex={2}>
+          <Text fg={color}>{text}</Text>
+        </Box>
+      ))}
     </Box>
   );
 }

@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../../utils/format";
 import { describe, expect, test } from "bun:test";
 import { getLanguage, setLanguage } from "../../../../i18n";
 import { useRegularMarketSession } from "../../../../test-support/market-session";
@@ -17,6 +18,7 @@ import {
   layoutPortfolioSummaryHeader,
   resolvePortfolioAccountState,
 } from "./index";
+import { formatPortfolioAmount } from "./totals";
 
 describe("resolvePortfolioAccountState", () => {
   test("does not reuse a single cached broker account for a different explicit portfolio account", () => {
@@ -139,7 +141,7 @@ describe("resolvePortfolioAccountState", () => {
     });
 
     expect(accountState?.account.netLiquidation).toBe(123456);
-    expect(accountState?.sourceLabel).toBe("Flex May 14");
+    expect(accountState?.sourceLabel).toBe("Flex 14 May");
   });
 
   test("uses the account as-of date when choosing the freshest cached Flex account", () => {
@@ -195,9 +197,23 @@ describe("resolvePortfolioAccountState", () => {
     });
 
     expect(accountState?.account.netLiquidation).toBe(200000);
-    expect(accountState?.sourceLabel).toBe("Flex Jun 16");
+    expect(accountState?.sourceLabel).toBe("Flex 16 Jun");
   });
 
+});
+
+test("a book's totals read to the unit, never rounded to a hundred, and compact only from a billion", () => {
+  // $1,587.80 read Val 1.6k beside a Day of -101.10.
+  expect(formatPortfolioAmount(1587.8, "USD")).toBe("1,588");
+  expect(formatPortfolioAmount(-101.1, "USD", { signed: true })).toBe("-101.10");
+  expect(formatPortfolioAmount(999.996, "USD")).toBe("1,000");
+  expect(formatPortfolioAmount(-4_198_000, "USD", { signed: true })).toBe("-4,198,000");
+  expect(formatPortfolioAmount(1_234_000_000, "USD")).toBe("1.23B");
+  expect(formatPortfolioAmount(0.001, "USD", { signed: true })).toBe("0.00");
+  // A currency without a minor unit keeps none; another than the app's leads with its symbol.
+  expect(formatPortfolioAmount(950, "JPY", { baseCurrency: "JPY" })).toBe("¥950");
+  expect(formatPortfolioAmount(60_000, "AUD", { signed: true })).toBe("+A$60,000");
+  expect(formatPortfolioAmount(Number.NaN, "USD")).toBe("—");
 });
 
 describe("buildPortfolioSummarySegments", () => {
@@ -225,13 +241,49 @@ describe("buildPortfolioSummarySegments", () => {
     buyingPower: 24000,
   };
 
+  // A USD book of HK and Singapore lines read Val 1,179,156 beside HK$ and S$ prices, its currency unsaid.
+  test("a book holding other currencies names its own in the header's amounts, over a period too", () => {
+    const segments = buildPortfolioSummarySegments({
+      totals, accountState: null, otherCurrencies: true, period: { label: "30 Oct–6 Nov", total: -10_033, contribution: -0.85 },
+    });
+    const text = (id: string) => segments.find((segment) => segment.id === id)?.parts.map((part) => part.text).join("");
+    expect(text("val")).toContain("$125,000");
+    expect(segments.map((segment) => segment.parts.map((part) => part.text).join("")).join(" ")).toContain("-$10,033");
+    // A book in USD alone reads bare, as it always has.
+    expect(buildPortfolioSummarySegments({ totals, accountState: null }).find((segment) => segment.id === "val")?.parts.map((part) => part.text).join("")).not.toContain("$");
+  });
+
+  // A CAD book of NBIS and cash read TOTAL +4.49% with nothing to say it was on the holdings' cost, cash left out.
+  test("beside cash entered by hand, the day and P&L percents say what they are of", () => {
+    const segments = buildPortfolioSummarySegments({
+      totals, accountState: null, currency: "CAD", baseCurrency: "CAD",
+      manualCash: { value: 50_000, weight: 28.6, targetWeight: null, drift: null, total: 175_000 },
+    });
+    const percent = (id: string) => segments.find((segment) => segment.id === id)?.parts[2]?.text;
+    expect([percent("day"), percent("pnl")]).toEqual(["(+4.17% ex cash)", "(+25.00% on cost)"]);
+    // Without cash the holdings are the book: as it was.
+    expect(buildPortfolioSummarySegments({ totals, accountState: null }).find((segment) => segment.id === "pnl")?.parts[2]?.text).toBe("(+25.00%)");
+  });
+
   test("prioritizes net liquidation at narrow widths for broker portfolios", () => {
     const segments = fitSummarySegments(buildPortfolioSummarySegments({
       totals,
       accountState: { account, sourceLabel: "Live" },
-    }), 28);
+    }), 30);
 
     expect(segments.map((segment) => segment.id)).toEqual(["netliq", "val"]);
+  });
+
+  test("Val leaves what it is priced at to a Day that names its after-hours print, and keeps it when the Day has no room", () => {
+    const atPrint: PortfolioSummaryTotals = { ...totals, totalMktValue: 1587.8, dailyPnl: -101.1, dailyPnlPct: -5.99,
+      totalCostBasis: 1500, unrealizedPnl: 87.8, unrealizedPnlPct: 5.85, dayChangeBasis: "AH vs Tue 10 Nov close", dayAtExtendedPrint: true };
+    const fit = (width: number, value = atPrint) => fitSummarySegments(buildPortfolioSummarySegments({
+      totals: value, accountState: null, valuationBasis: "latest-print",
+    }), width).map((segment) => segment.parts.map((part) => part.text).join(" "));
+    expect(fit(120)).toEqual(["Val 1,588", "Day -101.10 (-5.99%) AH vs Tue 10 Nov close", "P&L +87.80 (+5.85%)"]);
+    expect(fit(30)).toEqual(["Val 1,588 (latest print)"]);
+    // A day at regular-session prices names no print, so Val says it.
+    expect(fit(120, { ...atPrint, dayChangeBasis: "vs Tue 10 Nov close", dayAtExtendedPrint: undefined })[0]).toBe("Val 1,588 (latest print)");
   });
 
   test("fits segments using translated terminal display widths", () => {
@@ -255,14 +307,14 @@ describe("buildPortfolioSummarySegments", () => {
       accountState: { account, sourceLabel: "Live" },
     });
 
-    expect(segments.find((segment) => segment.id === "val")?.parts[1]?.text).toBe("175.0k");
+    expect(segments.find((segment) => segment.id === "val")?.parts[1]?.text).toBe("175,000");
   });
 
   test("drops low-priority broker segments before required ones", () => {
     const segments = fitSummarySegments(buildPortfolioSummarySegments({
       totals,
       accountState: { account, sourceLabel: "Live" },
-    }), 112);
+    }), 118);
 
     expect(segments.map((segment) => segment.id)).toEqual([
       "netliq",
@@ -297,7 +349,7 @@ describe("buildPortfolioSummarySegments", () => {
       sortedTickers: [],
     });
 
-    expect(segments.map((segment) => segment.parts[0]?.text)).toEqual(["Acct missing", "-"]);
+    expect(segments.map((segment) => segment.parts[0]?.text)).toEqual(["Acct missing", MISSING_VALUE]);
   });
 });
 
@@ -316,22 +368,22 @@ describe("a margin account's header", () => {
 
   test("leads with the equity and labels the positions' sum as gross", () => {
     const { text } = header(marginQuotes(), createMarginAccount());
-    expect(text.slice(0, 3)).toEqual(["Net Liq 1.00M", "Gross 1.60M", "Cash -600.0k"]);
+    expect(text.slice(0, 3)).toEqual(["Net Liq 1,000,000", "Gross 1,600,000", "Cash -600,000"]);
     expect(text).toContain("Lev 1.6x");
   });
 
   test("live quotes for every position replace the gross, never the equity", () => {
     const { totals, text } = header(marginQuotes({ move: 10, option: true }), createMarginAccount());
     expect(totals.livePriced).toBe(true);
-    expect(text.slice(0, 2)).toEqual(["Net Liq 1.04M", "Gross 1.64M"]);
+    expect(text.slice(0, 2)).toEqual(["Net Liq 1,040,000", "Gross 1,640,000"]);
     // Without the broker's day, the quotes' day is a return on the equity, not on the positions,
     // from a NASDAQ, a XETRA and a CBOE close that need not be the same day's.
-    expect(text).toContain("Day +40.0k (+4.00%) vs mixed closes");
+    expect(text).toContain("Day +40,000 (+4.00%) vs mixed closes");
   });
 
   test("without its account, the equity and cash read as unknown beside the gross", () => {
     const { text } = header(marginQuotes(), null);
-    expect(text.slice(0, 3)).toEqual(["Net Liq —", "Gross 1.60M", "Cash —"]);
+    expect(text.slice(0, 3)).toEqual(["Net Liq —", "Gross 1,600,000", "Cash —"]);
     expect(text.some((segment) => segment.startsWith("Val") || segment.startsWith("Lev"))).toBe(false);
   });
 });

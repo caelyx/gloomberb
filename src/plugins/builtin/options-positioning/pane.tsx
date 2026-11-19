@@ -19,9 +19,15 @@ import {
   type DataTableCell,
   type DataTableColumn,
   type PaneFooterSegment,
+  type PaneHint,
   type QueryBarFilter,
   type StatItem,
 } from "../../../components";
+import { savedCopyFooterSegment } from "../../../components/layout/pane/footer";
+import { openFormModal } from "../../../components/form-modal";
+import { getSharedRegistry } from "../../registry/shared";
+import { usePluginAppActions } from "../../runtime";
+import type { CloudResource } from "../shared/cloud-resource";
 import { formatCompactAxis } from "../../../components/chart-table";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { usePaneStatusFooter } from "../../../components/layout/pane/status-footer";
@@ -33,7 +39,7 @@ import { useThemeColors } from "../../../theme/theme-context";
 import type { ResolvedSeries } from "../../../time-series/types";
 import type { PaneProps } from "../../../types/plugin";
 import { Box, Text } from "../../../ui";
-import { formatCompact } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact } from "../../../utils/format";
 import { formatStrikeLabel } from "../../../utils/options";
 import { parsePublicTickerKey } from "../../../utils/exchanges";
 import { isPlainKey } from "../../../utils/keyboard";
@@ -51,6 +57,7 @@ import {
 } from "./client";
 import {
   ALL_EXPIRIES,
+  axisRatioOfDate,
   chartWindow,
   expiryAxis,
   expiryLabel,
@@ -63,6 +70,8 @@ import {
   formatDistance,
   formatGamma,
   formatLevel,
+  flipAlertValues,
+  gammaTimesFigure,
   positioningSpotDetail,
   formatPayout,
   formatRatio,
@@ -160,13 +169,18 @@ interface PositioningChartProps {
 
 /** Columns across a numeric axis (strikes, or expiries one slot apart), with spot and the other levels as guide lines. */
 function PositioningChart(props: PositioningChartProps) {
+  // The legend's values are one column's, under the cursor (the last column's
+  // without one), not the totals the figures above show: it names the column.
+  const column = props.formatCursor(props.selection.cursorDate ? axisRatioOfDate(props.selection.cursorDate) : 1);
+  const legendSeries = useMemo(() => column
+    ? props.series.map((entry) => ({ ...entry, label: `${entry.label} at ${column}` })) : undefined, [column, props.series]);
   const xAxis = useMemo(() => ({
     ticks: props.ticks(Math.max(1, props.width - VALUE_GUTTER)),
     markers: props.markers.flatMap((marker) => marker.ratio != null && marker.ratio >= 0 && marker.ratio <= 1
       ? [{ id: marker.id, xRatio: marker.ratio, label: marker.label, color: marker.color }] : []),
     formatCursor: props.formatCursor,
   }), [props.formatCursor, props.markers, props.ticks, props.width]);
-  return <CompositeChart series={props.series} panels={PANELS} width={props.width} height={props.height}
+  return <CompositeChart series={props.series} legendSeries={legendSeries} panels={PANELS} width={props.width} height={props.height}
     focused={false} navigable={false} showLegend showTimeAxis xAxis={xAxis}
     formatValue={(value) => props.formatValue(value)} formatAxisValue={props.formatAxisValue}
     cursorDate={props.selection.cursorDate} onCursorDateChange={props.selection.onCursorDateChange}
@@ -210,14 +224,16 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
   const [gammaSort, setGammaSort] = useState<Sort>({ columnId: "strike", direction: "asc" });
 
   const openInterestLoader = useCallback(
-    (_force: boolean) => loadOpenInterest(symbol, requestedExpiry),
+    (force: boolean) => loadOpenInterest(symbol, requestedExpiry, { force }),
     [symbol, requestedExpiry],
   );
-  const openInterest = useAsyncResource<OpenInterestPayload>(openInterestLoader, { keepPreviousData: true });
+  const openInterestLoad = useAsyncResource<CloudResource<OpenInterestPayload>>(openInterestLoader, { keepPreviousData: true });
+  const openInterest = { ...openInterestLoad, data: openInterestLoad.data?.payload ?? null };
   const data = openInterest.data;
   const spot = data?.spot ?? null;
   const venue = data?.venue;
-  const spotStamp = useMemo(() => positioningSpotDetail(spot, data?.spotAsOf, venue), [spot, data?.spotAsOf, venue]);
+  const spotStamp = useMemo(() => positioningSpotDetail(spot, data?.spotAsOf, venue, data?.spotBasis),
+    [spot, data?.spotAsOf, data?.spotBasis, venue]);
   // A coin's options (Deribit's) count open interest in coins, to tenths.
   const coin = isCoinContract(data?.contract);
   const unit = coin ? ` ${data!.contract!.unit}` : "";
@@ -239,16 +255,17 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
   // Gamma prices every expiry's chain, so it loads only once a tab that shows it is open; a
   // single expiry waits for the listed expiries to say whether it is still there.
   const gammaLoader = useCallback(
-    (_force: boolean) => loadGamma(symbol, gammaScope === ALL_EXPIRIES ? null : gammaScope),
+    (force: boolean) => loadGamma(symbol, gammaScope === ALL_EXPIRIES ? null : gammaScope, { force }),
     [symbol, gammaScope],
   );
   const gammaReady = (tab === "gex" && (!!data || gammaExpiry === ALL_EXPIRIES)) || (tab === "expiries" && hasGamma);
-  const gamma = useAsyncResource<GammaPayload>(gammaReady ? gammaLoader : null, { keepPreviousData: true });
+  const gammaLoad = useAsyncResource<CloudResource<GammaPayload>>(gammaReady ? gammaLoader : null, { keepPreviousData: true });
+  const gamma = { ...gammaLoad, data: gammaLoad.data?.payload ?? null };
   useAutoRefresh(openInterest.updatedAt, openInterest.load, { intervalMs: OPEN_INTEREST_REFRESH_MS });
   useAutoRefresh(gamma.updatedAt, gamma.load, { intervalMs: gammaReady ? GAMMA_REFRESH_MS : null });
   usePaneRefreshKey(() => {
-    void openInterest.reload();
-    if (gammaReady) void gamma.reload();
+    openInterest.reload();
+    if (gammaReady) gamma.reload();
   }, { focused });
 
   // Expiry steps: [ and ] move through the expiries on Strikes and GEX.
@@ -290,23 +307,44 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
     delayLabel: "15m", focused, segmentId: "opx-access", shortcutScope: "opx:upgrade", placement: "opx-footer",
     degraded: (tab === "gex" ? gamma.data?.delayed : data?.delayed) ?? true,
   });
+  // Shown from copies saved before the service could not be reached: the footer says when, as other panes do.
+  const savedAts = [openInterestLoad.data?.savedAt, ...(tab === "gex" || (tab === "expiries" && gammaReady) ? [gammaLoad.data?.savedAt] : [])]
+    .filter((at): at is number => at != null);
+  const savedAt = savedAts.length ? Math.min(...savedAts) : null;
   const info = useMemo<PaneFooterSegment[]>(() => [
+    ...(savedAt != null ? [savedCopyFooterSegment("saved-copy", savedAt)] : []),
     ...(accessSegment ? [accessSegment] : []),
     ...(venue ? [{ id: "venue", parts: [{ text: venue, tone: "muted" as const }] }] : []),
     // A venue that publishes open interest live (Deribit) says when it was read.
     ...(venue && data?.oiAsOf ? [{ id: "oi-date", parts: [{ text: `OI live ${data.oiAsOf.slice(11, 16)} UTC`, tone: "muted" as const }] }]
       : data?.oiDate ? [{ id: "oi-date", parts: [{ text: `OI as of ${shortDate(data.oiDate)}`, tone: "muted" as const }] }] : []),
     ...(changes && tab !== "gex" ? [{ id: "oi-change", parts: [{ text: `chg since ${shortDate(data!.previousOiDate!)}`, tone: "muted" as const }] }] : []),
-  ], [accessSegment, changes, data?.oiAsOf, data?.oiDate, data?.previousOiDate, tab, venue]);
+  ], [accessSegment, changes, data?.oiAsOf, data?.oiDate, data?.previousOiDate, savedAt, tab, venue]);
   const activeResource = tab === "gex" ? gamma : openInterest;
   // Expiries' Net GEX column loads beside the open interest it sits with.
   const columnGamma = tab === "expiries" && gammaReady ? gamma : null;
+  // Alert at this flip: Add Alert filled in with a price alert crossing the flip shown, a fixed price on the
+  // reader's quotes that the app checks, which stays put when dealer positioning moves the flip.
+  const { notify } = usePluginAppActions();
+  const flip = tab === "gex" ? gamma.data?.flip ?? null : null;
+  const alertsOn = getSharedRegistry()?.commands.has("set-alert") === true;
+  const flipHint = useMemo<PaneHint | null>(() => {
+    if (flip == null || !Number.isFinite(flip) || !alertsOn) return null;
+    const level = formatLevel(flip);
+    return {
+      id: "flip-alert", key: "a", label: "lert at flip",
+      title: `Alert at this flip: a price alert when your quote crosses ${level}, checked while Gloom runs. A fixed price; it stays at ${level} when dealer positioning moves the flip.`,
+      onPress: () => {
+        if (!openFormModal({ kind: "plugin-command", commandId: "set-alert", values: flipAlertValues(symbol, flip) })) notify({ body: "Open this from the main window.", type: "info" });
+      },
+    };
+  }, [alertsOn, flip, notify, symbol]);
   usePaneStatusFooter({
     registrationId: "options-positioning",
     loading: activeResource.loading || !!columnGamma?.loading,
     error: activeResource.data ? activeResource.error ?? columnGamma?.error ?? null : null,
     info,
-    hints: upgradeHint ? [upgradeHint] : undefined,
+    hints: upgradeHint || flipHint ? [...upgradeHint ? [upgradeHint] : [], ...flipHint ? [flipHint] : []] : undefined,
   });
   const notices = useMemo(() => [
     ...(data?.warnings ?? []),
@@ -317,7 +355,7 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
   usePaneNoticeFooter({ registrationId: "options-positioning:notices", focused, notices });
 
   const expiryFilter = (value: string, options: { value: string; label: string }[], onChange: (value: string) => void): QueryBarFilter => ({
-    id: "expiry", label: "Exp", inline: true, value, onChange,
+    id: "expiry", label: "Exp", inline: true, scrolls: true, value, onChange,
     options: options.map((option, index) => ({
       ...option,
       hint: index === options.findIndex((entry) => entry.value === value) - 1 ? EXPIRY_PREVIOUS_KEY
@@ -352,7 +390,7 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
   ] : [], [colors.negative, colors.positive, strikeChart, strikeWindow]);
   const callTotal = expiries.find((row) => row.date === shownExpiry);
   const strikeFigures = useMemo<StatItem[]>(() => !callTotal ? [] : [
-    { id: "max-pain", label: "Max pain", value: maxPain == null ? "--" : formatStrikeLabel(maxPain), color: colors.warning,
+    { id: "max-pain", label: "Max pain", value: maxPain == null ? MISSING_VALUE : formatStrikeLabel(maxPain), color: colors.warning,
       detail: maxPain == null ? undefined : `${formatDistance(maxPain, spot)} vs spot` },
     { id: "spot", label: "Spot", value: formatLevel(spot), ...spotStamp },
     { id: "pc", label: "P/C OI", value: formatRatio(callTotal.putCallRatio) },
@@ -446,7 +484,7 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
       case "callWall":
       case "putWall": {
         const strike = expiryWalls?.get(row.date)?.[column.id] ?? null;
-        return { text: strike == null ? "--" : formatStrikeLabel(strike), value: strike, color: colors.textMuted };
+        return { text: strike == null ? MISSING_VALUE : formatStrikeLabel(strike), value: strike, color: colors.textMuted };
       }
       case "putCallRatio": return { text: formatRatio(row.putCallRatio), value: row.putCallRatio };
       case "change": {
@@ -454,7 +492,7 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
         return { text: formatCountChange(change), value: change,
           color: change == null || change === 0 ? colors.textMuted : change > 0 ? colors.positive : colors.negative };
       }
-      case "maxPain": return { text: row.maxPain == null ? "--" : formatStrikeLabel(row.maxPain), value: row.maxPain, color: colors.warning };
+      case "maxPain": return { text: row.maxPain == null ? MISSING_VALUE : formatStrikeLabel(row.maxPain), value: row.maxPain, color: colors.warning };
       case "distance": return {
         text: formatDistance(row.maxPain, spot),
         value: row.maxPain == null || spot == null ? null : Number(((row.maxPain / spot - 1) * 100).toFixed(4)),
@@ -496,19 +534,24 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
   const band = gammaData?.band;
   const shares = band ? `${Math.round(band.shareLow * 100)}-${Math.round(band.shareHigh * 100)}%` : "";
   const walls = useMemo(() => gammaWalls(gammaStrikes), [gammaStrikes]);
+  const gammaTimes = useMemo(() => gammaTimesFigure(gammaData?.gammaAsOf, gammaData?.quotesAsOf),
+    [gammaData?.gammaAsOf, gammaData?.quotesAsOf]);
   const gammaFigures = useMemo<StatItem[]>(() => !gammaData?.total ? [] : [
     { id: "net", label: "Net GEX", value: formatGamma(gammaData.total.net), detail: "$ per 1% move",
       color: gammaData.total.net >= 0 ? colors.positive : colors.negative },
     { id: "flip", label: "Flip", value: formatLevel(gammaData.flip),
       detail: gammaData.flip == null ? "none within 15%" : `${formatDistance(gammaData.flip, gammaSpot)} vs spot` },
     ...([["call-wall", "Call wall", walls.callWall], ["put-wall", "Put wall", walls.putWall]] as const).map(([id, label, strike]) => ({
-      id, label, value: strike == null ? "--" : formatStrikeLabel(strike),
+      id, label, value: strike == null ? MISSING_VALUE : formatStrikeLabel(strike),
       detail: strike == null ? undefined : `${formatDistance(strike, gammaSpot)} vs spot`,
     })),
     ...(band ? [{ id: "band", label: "Dealer range", value: `${formatGamma(band.low)} to ${formatGamma(band.high)}`,
       detail: `${shares} with dealers${gammaData.boxes?.length ? ", boxes out" : ""}` }] : []),
-    { id: "spot", label: "Spot", value: formatLevel(gammaSpot), ...positioningSpotDetail(gammaSpot, gammaData.spotAsOf, gammaData.venue) },
-  ], [band, colors.negative, colors.positive, gammaData, gammaSpot, shares, walls]);
+    { id: "spot", label: "Spot", value: formatLevel(gammaSpot),
+      ...positioningSpotDetail(gammaSpot, gammaData.spotAsOf, gammaData.venue, gammaData.spotBasis) },
+    // Gamma is evaluated at the spot's time; before the open its volatilities are the last session's.
+    ...(gammaTimes ? [{ id: "gamma-at", ...gammaTimes }] : []),
+  ], [band, colors.negative, colors.positive, gammaData, gammaSpot, gammaTimes, shares, walls]);
   // The assumption rides in the legend, where the numbers it changes are read; the
   // dealer range figure names its own share. It gives way before the series name does.
   const assumption = width >= 60 ? "dealers long calls, short puts" : width >= 48 ? "long calls, short puts" : null;
@@ -580,7 +623,8 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
       onHeaderClick={(id) => setExpirySort((current) => nextHeaderSort(current, id))}
       emptyStateTitle="No listed expiries."
       getExportMetadata={() => [["open interest as of", data?.oiDate ?? ""], ["change since", data?.previousOiDate ?? ""], ["spot", spot ?? ""],
-        ...(hasGamma ? [["net GEX unit", "dollars of dealer delta per 1% move"], ["quotes as of", netGammas ? gamma.data?.quotesAsOf ?? "" : ""]] : [])]}
+        ...(hasGamma ? [["net GEX unit", "dollars of dealer delta per 1% move"], ["gamma at", netGammas ? gamma.data?.gammaAsOf ?? "" : ""],
+          ["vols from", netGammas ? gamma.data?.quotesAsOf ?? "" : ""]] : [])]}
       rootBefore={<ChartTableHeader width={width} height={bodyHeight} figures={ladderFigures}
         tableRows={expiryRows.length} tableChromeRows={chartTableChromeRows(expiryColumnList, width)}
         chart={expiryChart ? {
@@ -619,7 +663,8 @@ function OptionsPositioningView({ width, height, focused, symbol }: PaneProps & 
                 ["range with boxes high", gammaData.bandWithBoxes.high],
                 ["box legs left out", (gammaData.boxes ?? []).map((leg) => `${leg.expiry} ${leg.strike} x${leg.contracts}`).join("; ")]] : []),
               ["flip", gammaData.flip ?? ""], ["call wall", walls.callWall ?? ""], ["put wall", walls.putWall ?? ""],
-              ["open interest as of", gammaData.oiDate ?? ""], ["quotes as of", gammaData.quotesAsOf ?? ""]]}
+              ["open interest as of", gammaData.oiDate ?? ""], ["gamma at", gammaData.gammaAsOf ?? ""],
+              ["vols from", gammaData.quotesAsOf ?? ""]]}
             rootBefore={<ChartTableHeader width={width} height={bodyHeight} query={query} figures={gammaFigures}
               tableRows={gammaRows.length} tableChromeRows={chartTableChromeRows(GAMMA_COLUMNS, width)}
               chart={gammaChart ? {

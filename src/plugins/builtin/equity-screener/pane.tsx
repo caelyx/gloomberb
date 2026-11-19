@@ -21,12 +21,14 @@ import {
   usePaneFooter,
   usePaneNoticeFooter,
   usePaneTabs,
+  useRowNotes,
   useTableLoadMore,
   type DataTableColumn,
   type DataTableVisibleRange,
   type SelectControl,
 } from "../../../components";
 import {
+  useAppSelector,
   useAsyncResource,
   useAutoRefresh,
   usePaneSettingValue,
@@ -39,21 +41,28 @@ import { useThemeColors } from "../../../theme/theme-context";
 import { priceColor, shownPriceColor } from "../../../theme/colors";
 import { apiClient } from "../../../api-client";
 import {
+  LETTER_GRADE_FIELDS,
   NUMERIC_FIELDS,
   type NumericField,
+  type ScreenCriterion,
   type ScreenDefinition,
   type ScreenField,
 } from "../../../api-client/equity-screener";
 import type { PaneProps } from "../../../types/plugin";
-import { formatPercentileRank, formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentileRank, formatPercentRaw } from "../../../utils/format";
+import { wrapTextLines } from "../../../utils/text-wrap";
 import { EXTENDED_SESSION_LABELS, extendedSessionStateLabel, type ExtendedSession } from "../../../market-data/market/status";
 import { useOpenDescription } from "../shared/open-description";
+import { useMembersMenu } from "../shared/members-menu";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
 import { INITIAL_STREAM_RANGE, streamWindowRows } from "../shared/use-quote-board";
 import { useSampledValue } from "../../../state/hooks/live-ticker-financials";
 import { usePlanAccess } from "../../../api-client/plan-access";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
 import { SignInWall } from "../cloud/auth-actions";
 import { CriterionEditor } from "./criterion-editor";
+import { ideaMetricSetting, SCREEN_IDEAS, screenIdea } from "./ideas";
+import { screenNotices, screenResultInfo } from "./footer";
 import { ScreenTickerCheck } from "./ticker-check";
 import {
   fetchSavedScreens,
@@ -68,19 +77,34 @@ import {
   dividendYieldBasis,
   formatScreenMetric,
   formatScreenValue,
+  GRADE_DISPLAY_FIELDS,
+  MAX_SYMBOL_VALUES,
+  gradeRankText,
   metricDate,
   parseScreenDefinition,
+  pickerFields,
   resultFields,
-  SIGN_COLORED,
+  screenMetricSetting,
   screenColumnLabel,
   screenCurrencyEmpty,
   screenDefinitionKey,
+  screenDetailValue,
   screenLabel,
   screenRowId,
+  screenSignValue,
+  screenListings,
+  listingReadNotes,
   screenYtdBase,
+  splitGradeReason,
+  firstScreenSortDirection,
+  pressedScreenSort,
 } from "./model";
+import { findNamedCollection, readWatchlistArgument } from "../../../portfolio/collection-name";
 import { useScreenResults } from "./results";
-import { overlayLiveScreenRows, screenExtendedMove, screenExtendedSessions, sortLiveScreenRows, type LiveScreenRow } from "./live";
+import { useRefreshAnchor } from "./refresh-anchor";
+import { screenWatchlistList } from "./watchlist";
+import { unmatchedCategoryText, unmatchedCategoryValues } from "./categories";
+import { liveScreenPlaces, overlayLiveScreenRows, placeLiveScreenRows, screenExtendedMove, screenExtendedSessions, type LiveScreenRow } from "./live";
 import { useLiveQuoteEntries } from "../../../state/hooks/quote-streaming";
 import { buildScreenerQuoteTargets } from "../../../market-data/quotes/screener-live-quotes";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
@@ -92,12 +116,13 @@ const TABS = [
   { value: "results", label: "Results" },
   { value: "criteria", label: "Criteria" },
   { value: "saved", label: "Saved" },
+  { value: "ideas", label: "Ideas" },
 ];
 const errorText = (error: unknown) =>
   error instanceof Error ? error.message : "Request failed.";
-const date = (value: string | null) => value?.slice(0, 10) ?? "--";
+const date = (value: string | null) => value?.slice(0, 10) ?? MISSING_VALUE;
 const rank = (value: number | null) =>
-  value == null ? "--" : value.toFixed(0);
+  value == null ? MISSING_VALUE : value.toFixed(0);
 
 const EXTENDED_COLUMN_PREFIX = "ext:";
 
@@ -115,8 +140,10 @@ export function resultColumns(
   asOf: boolean,
   extendedSessions: readonly ExtendedSession[] = [],
   ytdBase: string | null = null,
+  /** Other metrics `--metric` asked for, shown first after the focus metric. */
+  otherMetrics: readonly NumericField[] = [],
 ): DataTableColumn[] {
-  const [focus, ...others] = resultFields(definition, metric);
+  const [focus, ...others] = resultFields(definition, metric, otherMetrics);
   const metricColumn = (field: NumericField, form: "pane" | "compact"): DataTableColumn => {
     const label = screenColumnLabel(field, ytdBase, form);
     return { id: `m:${field}`, label, width: columnWidth(field, label), align: "right" };
@@ -161,6 +188,21 @@ export function resultColumns(
   return fits(named) ? named : build(compact.slice(0, shown), exchange, sector, "compact");
 }
 const loadFields = () => fetchScreenFields();
+const criterionRowId = (row: { id: string }) => row.id;
+const criterionSignature = (row: { criterion: ScreenCriterion }) => JSON.stringify(row.criterion);
+const DETAIL_LABEL_WIDTH = 24;
+/** A long note under a value, wrapped to the detail's width rather than cut: one row per line, the label on the first. */
+function WrappedDetailRows({ label, text, width }: { label: string; text: string; width: number }) {
+  // The detail's padding, the label column and the gap after it.
+  const lines = wrapTextLines(text, Math.max(16, width - 2 - DETAIL_LABEL_WIDTH - 1));
+  return (
+    <>
+      {lines.map((line, index) => (
+        <KeyValueRow key={index} label={index === 0 ? label : ""} labelWidth={DETAIL_LABEL_WIDTH} value={line} emphasis={false} />
+      ))}
+    </>
+  );
+}
 function ScreenDetail({
   row,
   width,
@@ -176,24 +218,30 @@ function ScreenDetail({
         <KeyValueRow
           label="Listing"
           value={`${row.symbol}:${row.exchange}`}
-          detail={[row.currency, row.sector, row.industry].filter(Boolean).join(" \u00b7 ") || "--"}
+          detail={[row.currency, row.sector, row.industry].filter(Boolean).join(" \u00b7 ") || MISSING_VALUE}
         />
         {NUMERIC_FIELDS.map((field) => {
           const metric = row.metrics[field];
           const stamp = metricDate(metric);
+          // A grade's company note (graded on another line of the company) is said once, above the grades.
+          const reason = GRADE_DISPLAY_FIELDS.has(field) ? splitGradeReason(metric.reason).own : metric.reason;
+          const company = field === LETTER_GRADE_FIELDS[0] ? splitGradeReason(metric.reason).company : null;
           const extended = field === "changePercent" ? row.extended : undefined;
           const basis = field === "dividendYieldPercent" ? dividendYieldBasis(metric) : null;
+          // A grade's rank in its sector and the inputs it read, and its notes: peers, N/M or stale inputs, its company.
+          const graded = GRADE_DISPLAY_FIELDS.has(field) && metric.value !== null ? gradeRankText(metric) : null;
           return (
             <Fragment key={field}>
+              {company ? <WrappedDetailRows label="Grades" text={company} width={width} /> : null}
               <KeyValueRow
                 label={screenLabel(field)}
                 labelWidth={24}
-                value={metric.value == null && metric.notMeaningful ? formatScreenMetric(field, metric) : `${formatScreenValue(field, metric.value)} ${metric.unit}`}
+                value={screenDetailValue(field, metric)}
                 detail={
                   metric.value === null
-                    ? (metric.reason ?? "unavailable")
+                    ? (reason ?? "unavailable")
                     : [
-                        metric.percentile.value == null ? null : formatPercentileRank(metric.percentile.value),
+                        graded || metric.percentile.value == null ? null : formatPercentileRank(metric.percentile.value),
                         stamp.collected ? `collected ${stamp.text}` : stamp.text,
                         metric.state === "available" ? null : metric.state,
                       ].filter(Boolean).join(" \u00b7 ")
@@ -209,6 +257,8 @@ function ScreenDetail({
                 />
               ) : null}
               {basis ? <KeyValueRow label="Yield basis" labelWidth={24} value={basis} /> : null}
+              {graded ? <WrappedDetailRows label="Ranked" text={graded} width={width} /> : null}
+              {graded && reason ? <WrappedDetailRows label="Note" text={reason} width={width} /> : null}
             </Fragment>
           );
         })}
@@ -222,9 +272,12 @@ export function EquityScreenerPane(props: PaneProps) {
     "definition",
     undefined,
   );
+  // A ready screen from Ideas (`--preset`), which opens on its own metric.
+  const [presetId] = usePaneSettingValue<string | undefined>("preset", undefined);
+  const preset = screenIdea(presetId);
   let initial: ScreenDefinition;
   try {
-    initial = seed ? parseScreenDefinition(JSON.parse(seed)) : DEFAULT_SCREEN;
+    initial = preset?.definition ?? (seed ? parseScreenDefinition(JSON.parse(seed)) : DEFAULT_SCREEN);
   } catch (error) {
     return (
       <PaneStatusBody subject="screen definition" error={errorText(error)} />
@@ -232,9 +285,11 @@ export function EquityScreenerPane(props: PaneProps) {
   }
   return (
     <EquityScreenView
-      key={`${seed ?? "default"}:${session.requestKey}`}
+      key={`${preset?.id ?? seed ?? "default"}:${session.requestKey}`}
       {...props}
       initial={initial}
+      initialMetric={preset?.metric ?? "marketCap"}
+      initialMetricSetting={preset ? ideaMetricSetting(preset) : undefined}
     />
   );
 }
@@ -243,7 +298,9 @@ function EquityScreenView({
   height,
   focused,
   initial,
-}: PaneProps & { initial: ScreenDefinition }) {
+  initialMetric,
+  initialMetricSetting,
+}: PaneProps & { initial: ScreenDefinition; initialMetric: NumericField; initialMetricSetting?: string }) {
   const colors = useThemeColors(),
     dialog = useDialog(),
     host = useRendererHost();
@@ -253,10 +310,12 @@ function EquityScreenView({
   const session = useResearchCloudSession(),
     access = usePlanAccess();
   const [definition, setDefinition] = usePluginPaneState("definition", initial);
-  const [metric, setMetric] = usePaneSettingValue<NumericField>(
+  const [metricSetting, setMetric] = usePaneSettingValue<string>(
     "metric",
-    "marketCap",
+    initialMetricSetting ?? initialMetric,
   );
+  // `--metric trailingPE,dividendYieldPercent` leads with the first and adds the others as columns.
+  const [metric, ...otherMetrics] = screenMetricSetting(metricSetting, initialMetric);
   const [mode, setMode] = usePluginPaneState("mode", "results");
   const [selectedId, setSelectedId] = usePluginPaneState<string | null>(
     "selected",
@@ -271,6 +330,10 @@ function EquityScreenView({
   const [savedSelectedId, setSavedSelectedId] = usePluginPaneState<
     string | null
   >("savedSelected", null);
+  const [ideaSelectedId, setIdeaSelectedId] = usePluginPaneState(
+    "ideaSelected",
+    SCREEN_IDEAS[0]!.id,
+  );
   const [currentSavedId, setCurrentSavedId] = usePluginPaneState<string | null>(
     "currentSaved",
     null,
@@ -318,17 +381,43 @@ function EquityScreenView({
     LIVE_ORDER_SAMPLE_MS,
     `${data?.snapshot?.id ?? ""}:${JSON.stringify(definition.sort)}:${snapshotRows.length}`,
   );
-  const rows = useMemo(() => {
-    const order = new Map(sortLiveScreenRows(orderRows, definition.sort).map((row, index) => [screenRowId(row), index]));
-    return liveRows
-      .map((row, index) => ({ row, index, place: order.get(screenRowId(row)) ?? Number.POSITIVE_INFINITY }))
-      .sort((a, b) => a.place - b.place || a.index - b.index)
-      .map(({ row }) => row);
-  }, [definition.sort, liveRows, orderRows]);
-  const opened = rows.find((row) => screenRowId(row) === openId);
+  const places = useMemo(() => liveScreenPlaces(orderRows, definition.sort), [definition.sort, orderRows]);
+  const rows = useMemo(() => placeLiveScreenRows(liveRows, places), [liveRows, places]);
+  const { anchor: refreshAnchor, release: releaseRefreshAnchor } = useRefreshAnchor(data?.snapshot?.id ?? null, rows, visibleRange.start);
+  const opened = openId ? rows.find((row) => screenRowId(row) === openId) : undefined;
   const selected =
     opened ?? rows.find((row) => screenRowId(row) === selectedId) ?? rows[0];
   const currentSaved = saved.data?.find((row) => row.id === currentSavedId);
+  // The pane menu's Save to Watchlist… takes the matches loaded, in the order shown (the first page is 100). A live
+  // quote changes the rows but not who they are, so the menu is rebuilt only when the order does.
+  const shownOrder = useMemo(() => [...places.keys()].join(" "), [places]);
+  const watchlistList = useMemo(
+    () => mode === "results" && !openId && data && screenDefinitionKey(data.definition) === screenDefinitionKey(definition)
+      ? screenWatchlistList({ definition, rows, matched: data.universe.matched, savedName: currentSaved?.name })
+      : null,
+    [currentSaved?.name, data, definition, mode, openId, shownOrder], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  useMembersMenu("equity-screener:watchlist", watchlistList);
+  // A watchlist's name typed for the symbol field reads as its symbols, as `fn EQS` reads it.
+  const watchlists = useAppSelector((state) => state.config.watchlists);
+  const tickers = useAppSelector((state) => state.tickers);
+  const readWatchlist = useCallback((typed: string) => {
+    const watchlist = findNamedCollection(watchlists, typed);
+    if (!watchlist) return null;
+    const members = screenListings([...tickers.values()]
+      .filter((ticker) => ticker.metadata.watchlists.includes(watchlist.id))
+      .map((ticker) => ticker.metadata));
+    return members.length ? readWatchlistArgument(typed, watchlist, members, MAX_SYMBOL_VALUES) : null;
+  }, [tickers, watchlists]);
+  // How a saved criterion read a watchlist's name stays on its row until the criterion changes.
+  const criterionRows = useMemo(
+    () => definition.criteria.map((criterion, index) => ({ id: String(index), criterion })),
+    [definition.criteria],
+  );
+  const criterionNotes = useRowNotes<(typeof criterionRows)[number], string>(criterionRows, {
+    key: criterionRowId,
+    signature: criterionSignature,
+  });
   const selectedSaved =
     saved.data?.find((row) => row.id === savedSelectedId) ?? saved.data?.[0];
   useEffect(() => {
@@ -340,7 +429,7 @@ function EquityScreenView({
       !results.loading &&
       !results.loadingMore
     )
-      void results.loadMore();
+      results.loadMore();
   }, [
     openId,
     data,
@@ -351,23 +440,34 @@ function EquityScreenView({
   ]);
   const tableScroll = useRef<ScrollBoxRenderable>(null);
   const queryControl = useRef<SelectControl>(null);
-  const loadMore = useTableLoadMore(
+  const loadMoreNearEnd = useTableLoadMore(
     tableScroll,
     !opened && !results.loading && !results.loadingMore && !!data?.nextCursor,
     results.loadMore,
   );
-  const metricFields =
-    fields.data?.fields.filter((field) => field.kind === "number") ?? [];
+  const loadMore = useCallback((source?: "programmatic" | "user") => {
+    if (source === "user") releaseRefreshAnchor();
+    loadMoreNearEnd();
+  }, [loadMoreNearEnd, releaseRefreshAnchor]);
+  const metricFields = pickerFields(
+    fields.data?.fields.filter((field) => field.kind === "number") ?? [],
+    [metric],
+  );
   // AS OF earns its column only when some row's focus metric is stale; the
   // snapshot decides, so a live quote freshening a row does not reflow the table.
-  const staleFocus = snapshotRows.some((row) => row.metrics[metric]?.state === "stale");
+  const staleFocus = useMemo(() => snapshotRows.some((row) => row.metrics[metric]?.state === "stale"), [metric, snapshotRows]);
   // A pre-market, after-hours or overnight column only while a row has such a print.
-  const extendedSessions = screenExtendedSessions(rows);
+  const extendedSessions = useMemo(() => screenExtendedSessions(rows), [rows]);
   // YTD names the close it is measured from, `31 Dec`.
-  const ytdBase = screenYtdBase(snapshotRows, data?.snapshot?.assembledAt);
+  const assembledAt = data?.snapshot?.assembledAt;
+  const ytdBase = useMemo(() => screenYtdBase(snapshotRows, assembledAt), [assembledAt, snapshotRows]);
   // A screen its currency emptied says so, not that no company matches.
   const currencyEmpty = data && data.rows.length === 0 ? screenCurrencyEmpty(data.definition, data.universe) : null;
-  const columns = resultColumns(width, definition, metric, staleFocus, extendedSessions, ytdBase);
+  // A criterion's name that matches nothing (`Utility`) says so with the names it was likely meant as.
+  const unmatchedNames = data && data.rows.length === 0
+    ? unmatchedCategoryValues(data.definition, data).map(unmatchedCategoryText).join(" ") || null
+    : null;
+  const columns = resultColumns(width, definition, metric, staleFocus, extendedSessions, ytdBase, otherMetrics);
   const apply = (next: ScreenDefinition) => {
     try {
       setDefinition(parseScreenDefinition(next));
@@ -436,7 +536,7 @@ function EquityScreenView({
       setSavedSelectedId(entry.id);
       setSaveForm(false);
       setMode("saved");
-      await saved.reload();
+      await saved.reloadAndWait();
       notify({ body: `Saved ${entry.name}`, type: "success" });
     } catch (error) {
       setActionError(errorText(error));
@@ -457,7 +557,7 @@ function EquityScreenView({
     setSaving(true);
     try {
       await screenerApi.remove(entry.id, entry.revision);
-      await saved.reload();
+      await saved.reloadAndWait();
       if (currentSavedId === entry.id) setCurrentSavedId(null);
       notify({ body: "Screen deleted", type: "success" });
     } catch (error) {
@@ -494,7 +594,7 @@ function EquityScreenView({
   useAutoRefresh(results.updatedAt, results.load);
   const openQueryControl = () => queryControl.current?.open();
   const hints =
-    saveForm || editing !== null || check
+    saveForm || editing !== null || check || mode === "ideas"
       ? []
       : mode === "criteria"
         ? [
@@ -560,6 +660,8 @@ function EquityScreenView({
                 disabled: !selected,
               },
             ];
+  // Signed out or free, the quotes streamed over the snapshot's rows are delayed ones.
+  const quoteDelay = useQuoteDelayFooter(Array.from(liveEntries.values(), (entry) => entry.data ?? entry.lastGoodData), "screener-delay");
   usePaneFooter(
     "equity-screener",
     () => check ? null : ({
@@ -579,22 +681,7 @@ function EquityScreenView({
               },
             ]
           : []),
-        ...(data?.snapshot
-          ? [
-              {
-                id: "asof",
-                parts: [
-                  {
-                    text: `${data.universe.matched.toLocaleString("en-US")} of ${data.universe.covered.toLocaleString("en-US")} covered`,
-                  },
-                  {
-                    text: `· ${data.definition.currency ?? "native currencies"} · snapshot ${data.snapshot.assembledAt.slice(0, 16).replace("T", " ")} UTC`,
-                    tone: "muted" as const,
-                  },
-                ],
-              },
-            ]
-          : []),
+        ...screenResultInfo(data),
         ...(saving || exporting
           ? [
               {
@@ -608,10 +695,12 @@ function EquityScreenView({
               },
             ]
           : []),
+        ...(quoteDelay ? [quoteDelay] : []),
       ],
       hints,
     }),
     [
+      quoteDelay,
       results.loading,
       results.loadingMore,
       data,
@@ -626,8 +715,8 @@ function EquityScreenView({
     focused,
     enabled: !check,
     notices: [
-      ...(data?.warnings ?? []),
-      ...(opened?.warnings ?? []),
+      ...screenNotices(data?.warnings),
+      ...screenNotices(opened?.warnings),
       ...[
         results.error,
         fields.error,
@@ -689,8 +778,8 @@ function EquityScreenView({
     }
     if (event.name === "r") {
       event.preventDefault();
-      void results.load();
-      if (mode === "saved") void saved.reload();
+      results.load();
+      if (mode === "saved") saved.reload();
       return;
     }
     // Hint keys are single unmodified letters.
@@ -783,16 +872,18 @@ function EquityScreenView({
               editing !== null ? (
                 <CriterionEditor
                   key={editing}
-                  fields={fields.data.fields}
+                  fields={pickerFields(fields.data.fields, editingCriterion ? [editingCriterion.field] : [])}
                   value={editingCriterion ?? null}
                   focused={focused}
                   width={width}
+                  readWatchlist={readWatchlist}
                   onCancel={() => setEditing(null)}
-                  onSave={(criterion) => {
+                  onSave={(criterion, note) => {
                     const criteria = [...definition.criteria];
                     if (editing < 0) criteria.push(criterion);
                     else criteria[editing] = criterion;
                     apply({ ...definition, criteria });
+                    criterionNotes.setNote(String(editing < 0 ? criteria.length - 1 : editing), note);
                     setEditing(null);
                   }}
                 />
@@ -838,10 +929,7 @@ function EquityScreenView({
                       align: "left",
                     },
                   ]}
-                  items={definition.criteria.map((criterion, index) => ({
-                    id: String(index),
-                    criterion,
-                  }))}
+                  items={criterionRows}
                   focused={focused && editing === null && !saveForm}
                   rootWidth={width}
                   rootHeight={bodyHeight - 1}
@@ -853,7 +941,15 @@ function EquityScreenView({
                     onChange: setSelectedCriterion,
                   }}
                   onActivate={(row) => setEditing(Number(row.id))}
-                  renderCell={(row) => ({ text: criterionText(row.criterion) })}
+                  renderCell={(row) => {
+                    // A symbol criterion also says which listed members the screener matched as another line, or not at all.
+                    const listed = row.criterion.field === "symbol" && data
+                      && screenDefinitionKey(data.definition) === screenDefinitionKey(definition)
+                      ? listingReadNotes(data.listings?.filter((read) => "value" in row.criterion && (row.criterion.value as readonly unknown[]).includes(read.value)), data.definition.currency)
+                      : [];
+                    const note = [criterionNotes.noteFor(row), ...listed].filter(Boolean).join(" ");
+                    return { text: criterionText(row.criterion), ...(note ? { note } : {}) };
+                  }}
                   sortColumnId={null}
                   sortDirection="asc"
                   emptyStateTitle="No criteria. All covered equities match."
@@ -863,6 +959,36 @@ function EquityScreenView({
           />
         ) : null}
       </PaneStatusBody>
+    ) : mode === "ideas" ? (
+      <DataTableView
+        columns={[
+          { id: "name", label: "SCREEN", width: 28, align: "left" },
+          { id: "criteria", label: "CRITERIA", width: 20, flexGrow: 1, align: "left" },
+        ]}
+        items={SCREEN_IDEAS}
+        focused={focused && !saveForm}
+        rootWidth={width}
+        rootHeight={bodyHeight}
+        getItemKey={(row) => row.id}
+        selection={{
+          kind: "id",
+          selectedId: ideaSelectedId,
+          getId: (row) => row.id,
+          onChange: setIdeaSelectedId,
+        }}
+        onActivate={(row) => {
+          setMetric(ideaMetricSetting(row));
+          apply(row.definition);
+          setCurrentSavedId(null);
+          setMode("results");
+        }}
+        renderCell={(row, column) => ({
+          text: column.id === "name" ? row.name : row.definition.criteria.map(criterionText).join("; "),
+        })}
+        sortColumnId={null}
+        sortDirection="asc"
+        emptyStateTitle="No ideas."
+      />
     ) : mode === "saved" ? (
       !access.emailVerified ? (
         <SignInWall
@@ -939,7 +1065,7 @@ function EquityScreenView({
                 setMetric(value as NumericField);
                 apply({
                   ...definition,
-                  sort: { field: value as NumericField, direction: "desc" },
+                  sort: { field: value as NumericField, direction: firstScreenSortDirection(value) },
                 });
               },
             }]}
@@ -958,6 +1084,9 @@ function EquityScreenView({
             rootHeight={bodyHeight - 1}
             scrollRef={tableScroll}
             onBodyScrollActivity={loadMore}
+            scrollToIndex={refreshAnchor?.index}
+            scrollToIndexAlign={refreshAnchor ? "start" : "nearest"}
+            scrollToIndexVersion={refreshAnchor?.version ?? 0}
             resetScrollKey={JSON.stringify(definition)}
             visibleRangeKey={JSON.stringify(definition)}
             onVisibleRangeChange={setVisibleRange}
@@ -986,7 +1115,7 @@ function EquityScreenView({
                 // The extended print's move from the close in PRICE and CHG%.
                 const move = screenExtendedMove(row, column.id.slice(EXTENDED_COLUMN_PREFIX.length) as ExtendedSession);
                 return move == null
-                  ? { text: "--", color: colors.textDim }
+                  ? { text: MISSING_VALUE, color: colors.textDim }
                   : { text: formatPercentRaw(move), color: shownPriceColor(move, 2, colors) };
               }
               const field = column.id.startsWith("m:")
@@ -994,10 +1123,9 @@ function EquityScreenView({
                 : null;
               if (field) {
                 const observation = row.metrics[field];
-                const change = SIGN_COLORED.has(field) && observation.value != null
-                  // A move that prints 0.0 stays neutral.
-                  ? priceColor(Math.abs(observation.value) < 0.05 ? 0 : observation.value, colors)
-                  : undefined;
+                // A move by its sign (one that prints 0.0 stays neutral), a grade by its side of the middle.
+                const sign = screenSignValue(field, observation.value);
+                const change = sign == null ? undefined : priceColor(sign, colors);
                 return {
                   text: formatScreenMetric(field, observation),
                   color: observation.state === "stale" ? colors.warning : change,
@@ -1010,8 +1138,8 @@ function EquityScreenView({
                 return focus.state === "stale"
                   ? { text: metricDate(focus).text, color: colors.warning }
                   : { text: "" };
-              if (column.id === "name") return withCompanyLogo({ text: row.name ?? "--" }, row.name ? row : null, logos);
-              return { text: String(row[column.id as "symbol"] ?? "--") };
+              if (column.id === "name") return withCompanyLogo({ text: row.name ?? MISSING_VALUE }, row.name ? row : null, logos);
+              return { text: String(row[column.id as "symbol"] ?? MISSING_VALUE) };
             }}
             sortColumnId={
               (NUMERIC_FIELDS as readonly string[]).includes(definition.sort.field)
@@ -1030,20 +1158,12 @@ function EquityScreenView({
               if (!field) return;
               if ((NUMERIC_FIELDS as readonly string[]).includes(field))
                 setMetric(field as NumericField);
-              apply({
-                ...definition,
-                sort: {
-                  field,
-                  direction:
-                    definition.sort.field === field &&
-                    definition.sort.direction === "desc"
-                      ? "asc"
-                      : "desc",
-                },
-              });
+              // The same column flips; another starts the way it ranks, a multiple cheapest first.
+              apply({ ...definition, sort: pressedScreenSort(definition.sort, field) });
             }}
-            emptyStateTitle={currencyEmpty?.title ?? "No equities match this screen."}
-            emptyStateHint={currencyEmpty ? `${currencyEmpty.detail} Choose ${currencyEmpty.base.currency} to screen in the base currency.` : undefined}
+            emptyStateTitle={(unmatchedNames ? null : currencyEmpty?.title) ?? "No equities match this screen."}
+            emptyStateHint={unmatchedNames
+              ?? (currencyEmpty ? `${currencyEmpty.detail} Choose ${currencyEmpty.base.currency} to screen in the base currency.` : undefined)}
           />
         </PaneStatusBody>
       </>

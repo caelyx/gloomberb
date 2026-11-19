@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { PricePoint, Quote } from "../types/financials";
+import { requestedBarSize } from "./bar-spacing";
 import { withSessionBar } from "./session-bar";
 
 // Fri 16 Oct 2026, 15:14 in New York: the session is open.
@@ -85,5 +86,56 @@ describe("withSessionBar", () => {
     });
     const monthly = daily(["2026-08-01", {}], ["2026-09-01", {}], ["2026-10-01", { open: 330, high: 348.15, low: 325.81, close: 342, volume: 395_112_692 }]);
     expect(withSessionBar(monthly, quote({ low: 320 }), { now: NOW }).at(-1)).toMatchObject({ low: 320, close: 340.91, volume: 395_112_692 });
+  });
+
+  test("a thin listing's daily bars a week or two apart stay daily, and a day's bar is final once its session has closed", () => {
+    // B95 on SGX: trades on 13 Oct, 22 Oct and 6 Nov, Friday's bar still flagged partial by the source on Sunday.
+    const thin = daily(["2026-10-13", { close: 1 }], ["2026-10-22", { close: 1.003 }],
+      ["2026-11-06", { open: 1.029, high: 1.029, low: 1.012, close: 1.012, volume: 3661, partial: true }]);
+    const sgx = quote({ symbol: "B95", price: 1.012, previousClose: 1.009, open: 1.029, high: 1.029, low: 1.012, volume: 3661,
+      currency: "SGD", lastUpdated: Date.parse("2026-11-06T01:01:00Z"), marketState: "CLOSED", changeSessionDate: "2026-11-06",
+      listingExchangeName: "SGX", instrumentType: "ETF" });
+    const sunday = Date.parse("2026-11-08T01:00:00Z");
+    const settled = withSessionBar(thin, sgx, { now: sunday, barSize: "1d" });
+    expect(settled.slice(0, 2)).toEqual(thin.slice(0, 2));
+    expect(settled[2]).toMatchObject({ close: 1.012, volume: 3661 });
+    expect(settled[2]!.partial).toBeUndefined();
+    // Within half an hour of the bell a delayed quote may still be catching up: the bar stays partial.
+    const justClosed = Date.parse("2026-11-06T09:30:00Z");
+    expect(withSessionBar(thin, sgx, { now: justClosed, barSize: "1d" }).at(-1)!.partial).toBe(true);
+    // On B3 a closed quote can end on a print after the closing call: its official close is the source's bar, waited for.
+    const b3 = { ...sgx, symbol: "PETR4", listingExchangeName: "B3", exchangeName: "B3", currency: "BRL", instrumentType: "Common Stock" };
+    expect(withSessionBar(thin, b3, { now: Date.parse("2026-11-08T12:00:00Z"), barSize: "1d" }).at(-1)!.partial).toBe(true);
+    // A quote from another session settles nothing.
+    expect(withSessionBar(thin, { ...sgx, changeSessionDate: "2026-11-05", lastUpdated: Date.parse("2026-11-05T08:00:00Z") },
+      { now: sunday, barSize: "1d" }).at(-1)!.partial).toBe(true);
+  });
+
+  test("a BIST share's day is final after Istanbul's close, read that night with New York still open", () => {
+    // GUBRF on Tue 10 Nov 2026: the source still flagged the day partial at 20:29Z, hours after the 18:10 close.
+    const bars = daily(["2026-11-09", { close: 307 }],
+      ["2026-11-10", { open: 308, high: 308, low: 287.5, close: 288, volume: 4_442_906, partial: true }]);
+    const gubrf = quote({ symbol: "GUBRF", price: 288, previousClose: 307, open: 308, high: 308, low: 287.5, volume: 4_442_906,
+      currency: "TRY", lastUpdated: Date.parse("2026-11-10T15:10:00Z"), marketState: "CLOSED", changeSessionDate: "2026-11-10",
+      listingExchangeName: "BIST" });
+    expect(withSessionBar(bars, gubrf, { now: Date.parse("2026-11-10T20:29:00Z"), barSize: "1d" }).at(-1)!.partial).toBeUndefined();
+    // The closing auction and trading at the close run to 18:10 (15:10Z), and a delayed copy lags half an hour after.
+    const at = (time: string) => withSessionBar(bars, gubrf, { now: Date.parse(time), barSize: "1d" }).at(-1)!.partial;
+    expect(at("2026-11-10T15:35:00Z")).toBe(true);
+    expect(at("2026-11-10T15:41:00Z")).toBeUndefined();
+  });
+
+  test("the size asked for, not the spacing, says what the bars are; spacing only shows bars coarser when each starts its period", () => {
+    const days = (...dates: string[]) => dates.map((date) => Date.parse(`${date}T00:00:00Z`));
+    expect(requestedBarSize(days("2026-10-13", "2026-10-22", "2026-11-06"), "1d")).toBe("1d");
+    // Four Mondays a week apart are weekly bars, the first of four months monthly ones, whatever was asked.
+    expect(requestedBarSize(days("2026-09-28", "2026-10-05", "2026-10-12", "2026-10-19"), "1d")).toBe("1wk");
+    expect(requestedBarSize(days("2026-07-01", "2026-08-01", "2026-09-01", "2026-10-01"), "1d")).toBe("1mo");
+    // Three are too few to say so: a thin listing can trade on three Mondays.
+    expect(requestedBarSize(days("2026-10-05", "2026-10-12", "2026-10-19"), "1d")).toBe("1d");
+    // The size the source says it served stands.
+    expect(requestedBarSize(days("2026-10-05", "2026-10-12", "2026-10-19"), "1d", "1wk")).toBe("1wk");
+    // Bars finer than asked are as served.
+    expect(requestedBarSize(days("2026-10-13", "2026-10-14", "2026-10-15"), "1wk")).toBe("1d");
   });
 });

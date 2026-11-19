@@ -1,15 +1,16 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { HeadlessPaneColumn, HeadlessPaneContext, HeadlessPaneDefinition, HeadlessPaneRow } from "../../../types/plugin";
 import { listedAbroad, subMinuteDataMessage } from "../../../cli/known-gaps";
 import type { TapeRange, TapeSnapshot } from "../../../api-client/tape";
 import { fetchTape } from "./client";
 import { newestFirst, quoteSpread, tapePrice, tapePriceDigits, tapeStatistics, tapeTimeKey } from "./model";
 import { REPORT_ROWS } from "../shared/headless-options";
-import { inTapeRange, normalizeTapeClock, parseTapeClock, servedWindow, sessionDay, tapeMoment, tapeWindowRange } from "./window";
+import { inTapeRange, lastSessionNote, normalizeTapeClock, parseTapeClock, servedWindow, sessionDay, tapeMoment, tapeWindowRange } from "./window";
 
 type Format = NonNullable<HeadlessPaneColumn["format"]>;
 const fixedPrice = (digits: number): Format => (value) => tapePrice(typeof value === "number" ? value : null, digits);
-const whole: Format = (value) => typeof value === "number" && Number.isFinite(value) ? value.toFixed(0) : "--";
-const bps: Format = (value) => typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "--";
+const whole: Format = (value) => typeof value === "number" && Number.isFinite(value) ? value.toFixed(0) : MISSING_VALUE;
+const bps: Format = (value) => typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : MISSING_VALUE;
 
 /** Every row key in order, with the pane's rounding where the report would otherwise print raw floats. */
 function formattedColumns(rows: readonly HeadlessPaneRow[], formats: Record<string, Format>): HeadlessPaneColumn[] {
@@ -28,6 +29,12 @@ function listedNote(range: TapeRange, served: number, listed: number): string[] 
 
 
 const WINDOW_OPTION = { reportOnly: "lists a window of the session in the text report" };
+
+/** What each low and high of the report is taken over; the session's is the rule quote and GIP read the day's range by. */
+function tapeRangeBasis(window: string): string {
+  return `${window} low and high: every print listed, odd lots included. Regular session low and high: consolidated prints that set a price, `
+    + "as quote and GIP read them; odd lots and special-condition prints set none.";
+}
 
 /**
  * The window `--from`/`--to` ask for, read against the session the latest tape
@@ -75,15 +82,17 @@ export const timeSalesHeadless: HeadlessPaneDefinition<"bundle"> = {
   ],
   discovery: { aliases: ["TAS", "QR"], dataRequirements: ["Gloom Cloud SIP trade and quote feed"],
     limitations: ["Bounded observed window, not a complete session.", "SIP is delayed fifteen minutes without realtime entitlement.", "Quote sizes are round lots.", "No Level 2 or inferred aggressor side."] },
-  describe: (args) => `Time and sales ${args.argument ?? ""}`,
+  // QR is the NBBO view of the same tape: its report leads with the quotes, named as such.
+  describe: (args, result) => `${result?.metadata?.view === "quotes" ? "Quote recap" : "Time and sales"} ${args.argument ?? ""}`,
   async load(args, ctx) {
     const symbol = args.symbols[0] ?? (typeof args.argument === "string" ? args.argument : "");
     const instrument = await ctx.resolveInstrument?.(symbol);
     if (listedAbroad(symbol, instrument?.exchange)) {
       // Say why the table is empty and where the finest bars for it are, rather than the tape's bare "unavailable".
+      const quotesView = ctx.settings?.tab === "quotes";
       return { complete: false, sections: [
-        { title: ctx.settings?.tab === "quotes" ? "NBBO" : "Trades", rows: [], empty: subMinuteDataMessage(symbol, "abroad") },
-      ] };
+        { title: quotesView ? "NBBO" : "Trades", rows: [], empty: subMinuteDataMessage(symbol, "abroad") },
+      ], ...(quotesView ? { metadata: { view: "quotes" } } : {}) };
     }
     const exchange = instrument?.exchange ?? "";
     const from = String(args.options.from ?? "").trim(), to = String(args.options.to ?? "").trim();
@@ -100,18 +109,29 @@ export const timeSalesHeadless: HeadlessPaneDefinition<"bundle"> = {
     const price = fixedPrice(tapePriceDigits(data.trades.map((row) => row.price)));
     const trades = ordered(data.trades).slice(0, limit).map((row) => ({ ...row, conditions: row.conditions.join(" ") }));
     const notes = windowed ? [...windowed.notes, ...listedNote(windowed.range, data.trades.length, trades.length)] : [];
+    const lastSession = lastSessionNote(data);
+    if (!windowed && lastSession) notes.unshift(lastSession);
+    if (!windowed && trades.length < data.trades.length) notes.push(`Listing the first ${trades.length} of ${data.trades.length} observed trades, newest first; --limit takes up to 1000.`);
     // SIP prints, real-time or fifteen minutes delayed by entitlement, dated by the newest print.
     const freshness = data.feed === "sip"
       ? { status: "live" as const, cadence: "daily" as const }
       : { status: "delayed" as const, delayMinutes: Math.round(data.delaySeconds / 60), cadence: "daily" as const };
-    return { freshness, ...(notes.length ? { notes } : {}), sections: [
+    const nbbo = { title: "NBBO", columns: formattedColumns(quotes, { bps }), rows: quotes };
+    const tape = [
       // The last price's rank among the window's prints, whole, as the pane shows it.
       { title: windowed ? "Window" : "Observed window", columns: formattedColumns(window, { vwap: price, low: price, high: price, pricePercentile: whole }), rows: window },
       { title: "Regular session", columns: formattedColumns([data.session], { high: price, low: price }), rows: [data.session] },
       { title: "Trades", columns: formattedColumns(trades, { price }), rows: trades },
-      { title: "NBBO", columns: formattedColumns(quotes, { bps }), rows: quotes },
-    ], errors: data.gaps, metadata: { source: data.source, feed: data.feed, delaySeconds: data.delaySeconds,
+    ];
+    // Each low says what it is the low of: the window's every print, the session's as quote and GIP read it.
+    const lows = [...notes, tapeRangeBasis(tape[0]!.title)];
+    const quotesView = ctx.settings?.tab === "quotes";
+    return { freshness, notes: lows, sections: quotesView ? [nbbo, ...tape] : [...tape, nbbo], errors: data.gaps, metadata: { source: data.source, feed: data.feed, delaySeconds: data.delaySeconds,
       asOf: data.asOf, observedFrom: data.observedFrom, generatedAt: data.generatedAt, status: data.status, ...(windowed ? { window: windowed.range } : {}),
-      complete: data.status === "available", capacity: data.capacity, dropped: data.dropped, corrections: data.corrections, cancels: data.cancels, connected: data.connected } };
+      complete: data.status === "available", capacity: data.capacity, dropped: data.dropped, corrections: data.corrections, cancels: data.cancels, connected: data.connected,
+      ...(quotesView ? { view: "quotes" } : {}) } };
   },
 };
+
+/** QR: the same tape, its NBBO first, named as such where it answers a listing abroad too. */
+export const quoteRecapHeadless: HeadlessPaneDefinition<"bundle"> = { ...timeSalesHeadless, usListingsOnly: "Quote recap" };

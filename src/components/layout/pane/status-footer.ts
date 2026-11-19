@@ -1,7 +1,10 @@
-import { useMemo } from "react";
-import { usePaneFooter, type PaneFooterSegment, type PaneHint } from "./footer";
+import { useId, useMemo } from "react";
+import { companyDataFooterSegment, usePaneFooter, type PaneFooterSegment, type PaneHint } from "./footer";
+import type { CompanyFrom } from "../../../types/company-from";
+import { useAppLanguage } from "../../../i18n/react";
 import { useExternalLinkFooter } from "../../use-external-link-footer";
 import { loadingErrorFooterInfo } from "../../data-table/table-pane";
+import { useRemoteUiNode } from "../../../remote/semantic-tree";
 
 const EMPTY_STATUS_INFO: PaneFooterSegment[] = [];
 
@@ -9,7 +12,8 @@ const EMPTY_STATUS_INFO: PaneFooterSegment[] = [];
 // has no per-pane footer hint. Do not reintroduce one. See PR #589. Panes bind
 // it with `usePaneRefreshKey`.
 
-const STALE_SEGMENT: PaneFooterSegment = { id: "stale", parts: [{ text: "stale", tone: "warning" }] };
+/** The shared warning for data on screen older than it should be, for a pane composing its own footer. */
+export const STALE_SEGMENT: PaneFooterSegment = { id: "stale", parts: [{ text: "stale", tone: "warning" }] };
 
 interface PaneStatusInfoOptions {
   loading?: boolean;
@@ -25,19 +29,69 @@ function buildPaneStatusInfo({
   stale = false,
   info = EMPTY_STATUS_INFO,
 }: PaneStatusInfoOptions): PaneFooterSegment[] {
-  return [...info, ...(stale ? [STALE_SEGMENT] : []), ...loadingErrorFooterInfo(loading, error)];
+  // A source line that already says its data is stale (`stale (23 days old)`) is not followed by a second `stale`.
+  const saysStale = info.some((segment) => segment.asOf && /\bstale\b/.test(segment.parts.map((part) => part.text).join("")));
+  return [...info, ...(stale && !saysStale ? [STALE_SEGMENT] : []), ...loadingErrorFooterInfo(loading, error)];
+}
+
+/**
+ * Where the company data note sits: after the warning indicator (-10) and
+ * before the pane's own status (0 and the ticker quote's -1), so it leads what
+ * the pane says about its data and a narrow footer cuts that status first.
+ */
+const COMPANY_DATA_ORDER = -5;
+
+/**
+ * A company pane on a receipt or a foreign line that shows its company's data
+ * from the home line says which: `company data from 000660 KRX · as of
+ * 2026-06-30`, before the pane's own status (after a warning). Nothing when
+ * the data is the listing's own. Every company pane registers it here, so it
+ * reads, looks and sits the same in each.
+ */
+export function useCompanyDataFooter(companyFrom: CompanyFrom | null | undefined, enabled = true) {
+  const language = useAppLanguage();
+  const segment = useMemo(() => companyDataFooterSegment(companyFrom), [
+    language,
+    companyFrom?.symbol,
+    companyFrom?.exchange,
+    companyFrom?.name,
+  ]);
+  // Its own registration, so a view nested in a pane (13D/G under holders) never clears the pane's.
+  const id = useId();
+  usePaneFooter(
+    `company-data:${id}`,
+    () => enabled && segment ? { order: COMPANY_DATA_ORDER, info: [segment] } : null,
+    [enabled, segment],
+  );
+}
+
+/**
+ * A load that failed, published for the pane's report (`gloom fn`): the
+ * footer says it in the app, and a report of a pane with nothing else to
+ * show fails with it, as the plain commands do, instead of reading back the
+ * empty body ("No events") as the data and dating it (`pane-load-error`).
+ */
+function usePaneLoadErrorNode(loading: boolean, error: string | null | undefined, enabled = true) {
+  const message = !loading && enabled ? error?.trim() ?? "" : "";
+  useRemoteUiNode(message ? {
+    role: "pane-load-error",
+    label: "Load failed",
+    getMetadata: () => ({ message }),
+  } : null);
 }
 
 export function usePaneStatusFooter({
   registrationId,
   loading = false,
   error,
+  emptyResult = false,
   stale = false,
   info = EMPTY_STATUS_INFO,
   hints,
   enabled = true,
 }: PaneStatusInfoOptions & {
   registrationId: string;
+  emptyResult?: boolean;
   hints?: PaneHint[];
   enabled?: boolean;
 }) {
@@ -45,6 +99,11 @@ export function usePaneStatusFooter({
     () => buildPaneStatusInfo({ loading, error, stale, info }),
     [error, info, loading, stale],
   );
+  usePaneLoadErrorNode(loading, error, enabled);
+  useRemoteUiNode(enabled && emptyResult && !loading && !error ? {
+    role: "pane-empty-result",
+    label: "No results",
+  } : null);
   usePaneFooter(
     registrationId,
     () => enabled && (statusInfo.length > 0 || (hints?.length ?? 0) > 0)
@@ -79,6 +138,7 @@ export function usePaneStatusLinkFooter({
     () => buildPaneStatusInfo({ loading, error, stale, info }),
     [error, info, loading, stale],
   );
+  usePaneLoadErrorNode(loading, error);
   return useExternalLinkFooter({
     registrationId,
     focused,

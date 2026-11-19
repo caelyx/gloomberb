@@ -1,7 +1,15 @@
-import { formatCompact, formatCompactAmount } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatCompactAmount } from "../../../utils/format";
 import { formatExpDate, formatStrikeLabel } from "../../../utils/options";
 import { formatUtcTime } from "../../../utils/utc-time";
-import { formatModelSpotPrice, modelSpotLabel, modelSpotStamp, modelSpotStampVariants, observedModelSpot } from "../options/model-spot";
+import {
+  formatModelSpotPrice,
+  formatSpotTime,
+  modelSpotLabel,
+  modelSpotStamp,
+  modelSpotStampVariants,
+  observedModelSpot,
+  type OptionModelSpot,
+} from "../options/model-spot";
 
 export type PositioningTab = "strikes" | "expiries" | "gex";
 export const POSITIONING_TABS: { value: PositioningTab; label: string }[] = [
@@ -82,32 +90,56 @@ export const isCoinContract = (contract: { unit: string } | null | undefined) =>
 /** A count of contracts: whole for a US listing's, to tenths for a coin's (Deribit's 0.1 BTC step). */
 export function formatContracts(value: number | null | undefined, coin: boolean): string {
   if (!coin) return formatCount(value);
-  return value == null || !Number.isFinite(value) ? "--" : value.toLocaleString("en-US", { maximumFractionDigits: 1 });
+  return value == null || !Number.isFinite(value) ? MISSING_VALUE : value.toLocaleString("en-US", { maximumFractionDigits: 1 });
 }
 
 export function formatCount(value: number | null | undefined): string {
-  return value == null || !Number.isFinite(value) ? "--" : Math.round(value).toLocaleString("en-US");
+  return value == null || !Number.isFinite(value) ? MISSING_VALUE : Math.round(value).toLocaleString("en-US");
 }
 export function formatCountChange(value: number | null | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "--";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   const rounded = Math.round(value);
   return rounded === 0 ? "0" : `${rounded > 0 ? "+" : "-"}${Math.abs(rounded).toLocaleString("en-US")}`;
 }
 export function formatRatio(value: number | null | undefined): string {
-  return value == null || !Number.isFinite(value) ? "--" : value.toFixed(2);
+  return value == null || !Number.isFinite(value) ? MISSING_VALUE : value.toFixed(2);
 }
 /** A price level (spot, the gamma flip) written as OMON and OVDV write spot. */
 export function formatLevel(value: number | null | undefined): string {
-  return value == null || !Number.isFinite(value) ? "--" : formatModelSpotPrice(value);
+  return value == null || !Number.isFinite(value) ? MISSING_VALUE : formatModelSpotPrice(value);
 }
+
+/** The line Add Alert shows under Target Price when GEX fills it in: the level is fixed. */
+const FLIP_ALERT_NOTE = "Fixed price: it does not follow the flip.";
+
+/**
+ * Add Alert filled in for a price alert crossing the gamma flip as GEX shows it (the Flip figure's price, its
+ * grouping left out): a fixed level on the listing's quotes, which stays put when the flip moves, and says so.
+ */
+export function flipAlertValues(symbol: string, flip: number): Record<string, string> {
+  return { kind: "price", symbol, condition: "crosses", price: formatLevel(flip).replaceAll(",", ""), priceNote: FLIP_ALERT_NOTE };
+}
+/**
+ * The spot of a positioning answer as the options panes stamp theirs: the
+ * regular session's close when the server says so (a cash index outside its
+ * session, which has no extended hours), otherwise the session its time
+ * falls in.
+ */
+function positioningModelSpot(spot: number, at: number, basis?: "close"): OptionModelSpot {
+  return basis === "close"
+    ? { price: spot, observedAt: at, valuationTime: at, basis: "close", session: null }
+    : observedModelSpot(spot, at);
+}
+
 /**
  * The spot Gloom Cloud read the distances and dealer gamma at, stamped as
  * every options pane stamps its spot (`modelSpotStamp`), as a stat cell
- * carries it: `pre-market Wed 21 Oct 09:35 UTC`, its shorter forms, then
- * none, so the band keeps the columns it has in regular hours. Nothing for
- * the regular session's price.
+ * carries it: `pre-market Wed 21 Oct 09:35 UTC`, `close Tue 20 Oct` for an
+ * index outside its session, their shorter forms, then none, so the band
+ * keeps the columns it has in regular hours. Nothing for the regular
+ * session's price.
  */
-export function positioningSpotDetail(spot: number | null | undefined, spotAsOf: string | null | undefined, venue?: string):
+export function positioningSpotDetail(spot: number | null | undefined, spotAsOf: string | null | undefined, venue?: string, basis?: "close"):
   { detail?: string; detailVariants?: string[] } {
   const at = spotAsOf ? Date.parse(spotAsOf) : Number.NaN;
   if (spot == null || !Number.isFinite(at)) return {};
@@ -116,32 +148,77 @@ export function positioningSpotDetail(spot: number | null | undefined, spotAsOf:
     const time = `${new Date(at).toISOString().slice(11, 16)} UTC`;
     return { detail: `index ${time}`, detailVariants: [`index ${time}`, time, ""] };
   }
-  const observed = observedModelSpot(spot, at);
+  const observed = positioningModelSpot(spot, at, basis);
   const stamp = modelSpotStamp(observed);
   return stamp ? { detail: stamp, detailVariants: [...modelSpotStampVariants(observed), ""] } : {};
 }
 
-/** The spot as a report says it: `770.88 pre-market Wed 21 Oct 09:35 UTC`, `770.10 last Wed 21 Oct 14:05 UTC`. */
-export function formatPositioningSpot(spot: number | null | undefined, spotAsOf: string | null | undefined, venue?: string): string {
+/** The spot as a report says it: `770.88 pre-market Wed 21 Oct 09:35 UTC`, `770.10 last Wed 21 Oct 14:05 UTC`, `7,722.60 close Tue 27 Oct`. */
+export function formatPositioningSpot(spot: number | null | undefined, spotAsOf: string | null | undefined, venue?: string, basis?: "close"): string {
   const at = spotAsOf ? Date.parse(spotAsOf) : Number.NaN;
-  if (spot == null || !Number.isFinite(spot)) return "--";
+  if (spot == null || !Number.isFinite(spot)) return MISSING_VALUE;
   if (venue) return Number.isFinite(at) ? `${formatLevel(spot)} ${venue} index ${formatUtcTime(new Date(at).toISOString())}` : formatLevel(spot);
-  return Number.isFinite(at) ? `${formatLevel(spot)} ${modelSpotLabel(observedModelSpot(spot, at))}` : formatLevel(spot);
+  return Number.isFinite(at) ? `${formatLevel(spot)} ${modelSpotLabel(positioningModelSpot(spot, at, basis))}` : formatLevel(spot);
+}
+
+const instant = (value: string | null | undefined) => {
+  const at = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(at) ? at : null;
+};
+/** `Wed 08:34 UTC`. */
+const dayAndTime = (at: number) => formatSpotTime(at).replace(/^(\w{3}) \d{1,2} \w{3} /, "$1 ");
+/** `08:34 UTC`. */
+const timeOnly = (at: number) => `${new Date(at).toISOString().slice(11, 16)} UTC`;
+
+/**
+ * When dealer gamma is evaluated and when the quotes behind its volatilities
+ * were taken, as a report line: `Wed 28 Oct 08:34 UTC, vols from Tue 27 Oct
+ * 20:14 UTC`. Before the open that is the pre-market spot's time with the last
+ * session's volatilities. Null without a gamma time (an older server, which
+ * dates its quotes alone).
+ */
+export function formatGammaTimes(gammaAsOf: string | null | undefined, quotesAsOf: string | null | undefined): string | null {
+  const gamma = instant(gammaAsOf);
+  if (gamma == null) return null;
+  const quotes = instant(quotesAsOf);
+  return quotes == null ? formatSpotTime(gamma) : `${formatSpotTime(gamma)}, vols from ${formatSpotTime(quotes)}`;
+}
+
+/**
+ * The same as a GEX figure: `Gamma at Wed 08:34 UTC`, detail `vols from Tue
+ * 20:14 UTC` (the day left out when it is the gamma's), with shorter forms
+ * that keep the quote time. An older server's answer, with no gamma time,
+ * dates its quotes alone. Null with neither.
+ */
+export function gammaTimesFigure(gammaAsOf: string | null | undefined, quotesAsOf: string | null | undefined):
+  { label: string; value: string; detail?: string; detailVariants?: string[] } | null {
+  const gamma = instant(gammaAsOf);
+  const quotes = instant(quotesAsOf);
+  if (gamma == null) return quotes == null ? null : { label: "Quotes as of", value: dayAndTime(quotes) };
+  if (quotes == null) return { label: "Gamma at", value: dayAndTime(gamma) };
+  const sameDay = new Date(gamma).toISOString().slice(0, 10) === new Date(quotes).toISOString().slice(0, 10);
+  const quoted = sameDay ? timeOnly(quotes) : dayAndTime(quotes);
+  return {
+    label: "Gamma at",
+    value: dayAndTime(gamma),
+    detail: `vols from ${quoted}`,
+    detailVariants: [`vols from ${quoted}`, `vols ${quoted}`, `vols ${quoted.replace(/ UTC$/, "")}`],
+  };
 }
 
 /** Where a level sits against spot: +0.6%. */
 export function formatDistance(level: number | null | undefined, spot: number | null | undefined): string {
-  if (level == null || spot == null || !(spot > 0)) return "--";
+  if (level == null || spot == null || !(spot > 0)) return MISSING_VALUE;
   const percent = (level / spot - 1) * 100;
   const fixed = Math.abs(percent).toFixed(1);
   return `${/[1-9]/.test(fixed) ? (percent > 0 ? "+" : "-") : ""}${fixed}%`;
 }
 /** Dollars of dealer delta per 1% move, signed: +1.22B. */
 export function formatGamma(value: number | null | undefined): string {
-  return value == null ? "--" : formatCompactAmount(value, { signed: true });
+  return value == null ? MISSING_VALUE : formatCompactAmount(value, { signed: true });
 }
 export function formatPayout(value: number | null | undefined): string {
-  return value == null ? "--" : formatCompact(value);
+  return value == null ? MISSING_VALUE : formatCompact(value);
 }
 
 /** Both sides, or blank when either was not reported. A reported zero stays zero. */
@@ -207,6 +284,9 @@ export function chartWindow<T extends { strike: number }>(
 
 /** One full-width numeric domain the chart reads as time; strikes are never labelled as dates. */
 const COORDINATE_SPAN = 1_000_000_000_000;
+
+/** Where a chart date made by `toDate` sits across the plot, 0 to 1. */
+export const axisRatioOfDate = (date: Date) => date.getTime() / COORDINATE_SPAN;
 
 export interface NumericAxis {
   /** Where x sits across the plot, 0 at the left edge and 1 at the right. */

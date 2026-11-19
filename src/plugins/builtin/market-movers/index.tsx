@@ -1,17 +1,22 @@
 import { Box, useUiCapabilities } from "../../../ui";
 import { nextHeaderSort } from "../../../utils/sort-values";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { DataTableView, EmptyState, usePaneFooter, usePaneTabs, type DataTableKeyEvent } from "../../../components";
+import { DataTableView, EmptyState, QueryBar, usePaneFooter, usePaneTabs, type DataTableKeyEvent } from "../../../components";
+import { savedCopyFooterInfo } from "../../../components/layout/pane/footer";
+import { STALE_SEGMENT } from "../../../components/layout/pane/status-footer";
 import { handleRefreshKey } from "../../../components/data-table/table-pane";
 import type { PaneProps } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
 import { publicTickerKey } from "../../../utils/exchanges";
 import { usePaneSettingValue } from "../../../state/app/context";
-import { useAssetData, usePluginPaneState, usePluginTickerActions } from "../../runtime";
+import { useAssetData, usePluginPaneChoice, usePluginPaneState, usePluginTickerActions } from "../../runtime";
+import { usePlanAccess } from "../../../api-client/plan-access";
+import { shownPaneChoice } from "../../../core/state/app/pane-choices";
 import { useLiveQuoteEntries } from "../../../state/hooks/quote-streaming";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { useQuoteBoard } from "../shared/use-quote-board";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
 import {
   attachMarketMoversPersistence,
   MARKET_SUMMARY_SYMBOLS,
@@ -24,6 +29,7 @@ import {
   INDEX_SHORT,
   TABS,
   createRows,
+  isProOnlyTab,
   moverExtendedSessions,
   overlayMarketMoverQuotes,
   resolveSummarySymbols,
@@ -41,6 +47,7 @@ import { loadMarketMoverTab, marketMoverQuoteError } from "./client";
 import { summaryFooterSegments } from "./footer";
 import { isSessionTab, resolveActiveTab, usSessionAt, type UsSession } from "./session";
 import { SessionMoversBody } from "./session-body";
+import { ANY_FLOAT, minFloatEmptyTitle, minFloatFilter, minFloatShares, partialFloatFooter } from "./min-float";
 import { marketMoversHeadless } from "./headless";
 import { buildMarketMoverColumns, renderMarketMoverCell } from "./table";
 import type { ExtendedSession } from "../../../market-data/market/status";
@@ -59,6 +66,8 @@ import {
 const NO_SAVED_SELECTION: string[] = [];
 const SESSION_CHECK_MS = 30_000;
 const NO_QUOTES: MoverQuote[] = [];
+/** A list without Pro is the one built a delay before: the delayed clock reads it as one late price. */
+const DELAYED_LIST = [{ dataSource: "delayed" as const }];
 const moverKey = (row: Pick<ScreenerQuote, "symbol" | "exchange">) => publicTickerKey(row.symbol, row.exchange);
 
 /** What is trading in New York, re-read every half minute so the pane follows 04:00, 09:30 and 16:00. */
@@ -88,12 +97,19 @@ function MarketMoversPane({ focused, width, height }: PaneProps) {
   const [requestedTab, setRequestedTab] = usePluginPaneState<TabId | null>("requestedTab", null);
   const session = useUsSession();
   const tabIds = useMemo(() => tabs.map((tab) => tab.id), [tabs]);
-  const activeTab = resolveActiveTab({
-    tabs: tabIds,
-    saved: savedTab,
-    pickedIn,
-    session,
-    requested: requestedTab,
+  const freeTabIds = useMemo(() => tabIds.filter((tab) => !isProOnlyTab(tab)), [tabIds]);
+  // A list picked or asked for in this session, as opposed to restored with the workspace.
+  const [listChosen, chooseList] = usePluginPaneChoice("activeTab");
+  const [requestChosen] = usePluginPaneChoice("requestedTab");
+  const access = usePlanAccess();
+  const pick = { saved: savedTab, pickedIn, session, requested: requestedTab };
+  // Gaps restored for an account without Pro open on the list the session
+  // would show without them; the wall shows once Gaps is picked.
+  const activeTab = shownPaneChoice(resolveActiveTab({ tabs: tabIds, ...pick }), {
+    chosen: listChosen || requestChosen,
+    hasProAccess: access.hasProAccess,
+    proOnly: isProOnlyTab,
+    fallback: freeTabIds.length > 0 ? resolveActiveTab({ tabs: freeTabIds, ...pick }) : tabIds[0]!,
   });
 
   // The index summary is a quote board like any other, so it runs on the shared
@@ -108,12 +124,15 @@ function MarketMoversPane({ focused, width, height }: PaneProps) {
       .filter((quote): quote is MarketSummaryQuote => !!quote)
   ), [summaryBoard, summarySymbols]);
 
-  const tabItems = tabs.map((tab) => ({ label: tab.label, value: tab.id }));
-  const selectTab = (value: string) => {
+  // Kept between quotes, so the tab strip skips the renders a board update gives the pane.
+  const tabItems = useMemo(() => tabs.map((tab) => ({ label: tab.label, value: tab.id })), [tabs]);
+  const selectTab = useCallback((value: string) => {
+    // Picking the list already saved changes no value, so say it was picked.
+    if (!listChosen) chooseList();
     setSavedTab(value as TabId);
     setPickedIn(session.key);
     if (requestedTab) setRequestedTab(null);
-  };
+  }, [chooseList, listChosen, requestedTab, session.key, setPickedIn, setRequestedTab, setSavedTab]);
   const { strip: tabStrip } = usePaneTabs({ tabs: tabItems, activeValue: activeTab, onSelect: selectTab, focused, compact: true, variant: "bare" });
 
   return (
@@ -152,16 +171,23 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
 }) {
   const dataProvider = useAssetData();
   const { pinTicker } = usePluginTickerActions();
+  const [minFloatValue, setMinFloatValue] = usePluginPaneState<string>("minFloat", ANY_FLOAT);
+  // Trending carries no float, so the minimum is not offered there.
+  const floatFiltered = activeTab !== "trending";
+  const minFloat = floatFiltered ? minFloatShares(minFloatValue) : null;
+  const listKey = `${activeTab}:${minFloat ?? ""}`;
   const [quotes, setQuotes] = useState<MoverQuote[]>([]);
-  const [loadedTab, setLoadedTab] = useState<TabId | null>(null);
-  const visibleQuotes = loadedTab === activeTab ? quotes : NO_QUOTES;
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const visibleQuotes = loadedKey === listKey ? quotes : NO_QUOTES;
   // The first load starts before the effect runs; an empty board is not "no data".
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [sortPreference, setSortPreference] = useState<MarketMoverSortPreference>(DEFAULT_SORT_PREFERENCE);
   const [moversStale, setMoversStale] = useState(false);
-  const [lastSuccess, setLastSuccess] = useState<{ tab: ScreenerTabId; at: number } | null>(null);
+  // The list's refresh failed and a copy saved at this time (ms) answered instead.
+  const [moversSavedAt, setMoversSavedAt] = useState<number | null>(null);
+  const [lastSuccess, setLastSuccess] = useState<{ key: string; at: number } | null>(null);
 
   const fetchGenRef = useRef(0);
 
@@ -191,9 +217,10 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
   const rankedRows = useMemo(() => createRows(resolvedQuotes), [resolvedQuotes]);
   // A pre-market or after-hours column only while a row has such a print.
   const extendedSessionsKey = moverExtendedSessions(rankedRows).join(",");
+  const trending = activeTab === "trending";
   const columns = useMemo(
-    () => buildMarketMoverColumns(width, extendedSessionsKey ? extendedSessionsKey.split(",") as ExtendedSession[] : []),
-    [extendedSessionsKey, width],
+    () => buildMarketMoverColumns(width, extendedSessionsKey ? extendedSessionsKey.split(",") as ExtendedSession[] : [], { float: minFloat != null, trending }),
+    [extendedSessionsKey, minFloat, trending, width],
   );
   const rows = useMemo(() => sortRows(rankedRows, sortPreference), [rankedRows, sortPreference]);
   const selectedIdx = selectedSymbol
@@ -223,6 +250,7 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
     try {
       const result = await loadMarketMoverTab(tab, dataProvider, {
         forceRefresh: options?.forceRefresh,
+        minFloat,
       });
       if (fetchGenRef.current !== gen) return;
 
@@ -230,21 +258,23 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
       // A partial list shows only its current rows; a total failure keeps this list's prior rows.
       if (!quoteError || result.quotes.length > 0) {
         setQuotes(result.quotes);
-        setLoadedTab(tab);
+        setLoadedKey(`${tab}:${minFloat ?? ""}`);
         if (!options?.background) setSelectedSymbol(null);
       }
       setMoversStale(result.stale);
+      setMoversSavedAt(result.savedAt ?? null);
       setLoadError(quoteError);
-      if (!quoteError && !result.stale) setLastSuccess({ tab, at: Date.now() });
+      if (!quoteError && !result.stale) setLastSuccess({ key: `${tab}:${minFloat ?? ""}`, at: Date.now() });
     } catch {
       if (fetchGenRef.current !== gen) return;
       setMoversStale(true);
+      setMoversSavedAt(null);
       setLoadError("Market movers temporarily unavailable");
     }
     finally {
       if (fetchGenRef.current === gen && !options?.background) setLoading(false);
     }
-  }, [dataProvider]);
+  }, [dataProvider, minFloat]);
 
   useEffect(() => {
     setSelectedSymbol(null);
@@ -254,7 +284,7 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
   const backgroundRefresh = useCallback(() => {
     void loadTab(activeTab, { background: true });
   }, [activeTab, loadTab]);
-  useAutoRefresh(lastSuccess?.tab === activeTab ? lastSuccess.at : null, backgroundRefresh);
+  useAutoRefresh(lastSuccess?.key === listKey ? lastSuccess.at : null, backgroundRefresh);
 
   const openSymbol = useCallback((row: MarketMoverRow) => {
     pinTicker(moverKey(row), { floating: true, paneType: TICKER_RESEARCH_PANE_ID, instrument: null });
@@ -272,6 +302,8 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
     handleRefreshKey(event, () => loadTab(activeTab, { forceRefresh: true }), { stopPropagation: true })
   ), [activeTab, loadTab]);
 
+  // Without Pro the lists are the delayed ones (with Pro the real-time ones), and say so.
+  const quoteDelay = useQuoteDelayFooter(rows.length > 0 ? DELAYED_LIST : [], "movers-delay");
   usePaneFooter("market-movers", () => ({
     info: [
       ...(loadError ? [{ id: "load-error", parts: [{ text: loadError, tone: "warning" as const }] }] : []),
@@ -281,16 +313,21 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
         id: "feed",
         parts: [{ text: feedStatus, tone: feedStatus === "live" ? "value" as const : "muted" as const }],
       }] : []),
-      ...(moversStale && loadedTab === activeTab ? [{
-        id: "stale",
-        parts: [{ text: "stale", tone: "muted" as const }],
-      }] : []),
+      // A saved copy answering a failed refresh says when it was saved; other stale rows say only that.
+      ...(loadedKey === listKey ? savedCopyFooterInfo([moversSavedAt]) : []),
+      ...(moversStale && moversSavedAt == null && loadedKey === listKey ? [STALE_SEGMENT] : []),
+      // The FLOAT column shows while a minimum is set; a float the source does not date says so once.
+      ...partialFloatFooter(columns.some((column) => column.id === "floatShares"), rows),
+      ...(quoteDelay ? [quoteDelay] : []),
     ],
-  }), [activeTab, feedStatus, loadedTab, loadError, loading, moversStale, summaryQuotes]);
+  }), [columns, feedStatus, listKey, loadedKey, loadError, loading, moversStale, moversSavedAt, quoteDelay, rows, summaryQuotes]);
 
   return (
     <DataTableView<MarketMoverRow, MarketMoverColumn>
       focused={focused}
+      rootBefore={floatFiltered ? (
+        <QueryBar width={Math.max(1, width - 2)} filters={[minFloatFilter(minFloatValue, setMinFloatValue)]} />
+      ) : undefined}
       selection={{
         kind: "id",
         selectedId: selectedSymbol,
@@ -298,7 +335,7 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
         onChange: (symbol) => setSelectedSymbol(symbol),
       }}
       onRootKeyDown={handleTableKeyDown}
-      resetScrollKey={activeTab}
+      resetScrollKey={listKey}
       sortable
       columns={columns}
       items={rows}
@@ -309,7 +346,7 @@ function ScreenerMoversBody({ activeTab, focused, width, summaryQuotes, liveStre
       onActivate={openSymbol}
       renderCell={renderCell}
       selectedTextOverridesCellColor
-      emptyStateTitle={loading ? "Loading movers..." : loadError ?? "No movers returned."}
+      emptyStateTitle={loading ? "Loading movers..." : loadError ?? (minFloat != null ? minFloatEmptyTitle(minFloatValue) : "No movers returned.")}
       emptyContent={loadError ? (
         <Box paddingX={1} paddingY={1}>
           <EmptyState title={loadError} message="Try again in a moment." />

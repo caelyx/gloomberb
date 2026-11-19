@@ -3,6 +3,7 @@ import type {
   CloudEarningsTranscriptPayload,
   CloudTranscriptTurnPayload,
 } from "../../../api-client";
+import { eventLabelOf } from "./format";
 import { splitParagraphs } from "./prose";
 
 export type TranscriptSection =
@@ -14,7 +15,8 @@ export type TranscriptSection =
   | "risks"
   | "notable"
   | "analyst-focus"
-  | "participants";
+  | "participants"
+  | "original";
 
 export interface TranscriptFilter {
   section: "transcript" | "qa";
@@ -34,6 +36,11 @@ export interface TranscriptSegment {
 }
 
 const MAX_SEGMENT_CHARS = 1_600;
+/**
+ * A paragraph of a call's original text. A recording transcribed in Chinese
+ * comes as one unpunctuated block, so it is cut about this often.
+ */
+const ORIGINAL_PARAGRAPH_CHARS = 360;
 
 function roleAcronym(value: string): string {
   return value
@@ -70,22 +77,62 @@ export function filterTranscriptTurns(
   });
 }
 
-function chunks(text: string): string[] {
+/** Where a cut may fall: at a space or a line break, or after a full stop of Chinese or Japanese text. */
+function lastBreak(text: string, max: number): number {
+  const space = Math.max(text.lastIndexOf(" ", max), text.lastIndexOf("\n", max));
+  const stop = Math.max(...["。", "！", "？", "；"].map((mark) => text.lastIndexOf(mark, max - 1)));
+  return Math.max(space, stop >= 0 ? stop + 1 : -1);
+}
+
+function chunks(text: string, max = MAX_SEGMENT_CHARS): string[] {
   const normalized = text.trim();
   if (!normalized) return [];
   const result: string[] = [];
   let remaining = normalized;
-  while (remaining.length > MAX_SEGMENT_CHARS) {
-    const breakAt = Math.max(
-      remaining.lastIndexOf(" ", MAX_SEGMENT_CHARS),
-      remaining.lastIndexOf("\n", MAX_SEGMENT_CHARS),
-    );
-    const cut = breakAt > MAX_SEGMENT_CHARS / 2 ? breakAt : MAX_SEGMENT_CHARS;
+  while (remaining.length > max) {
+    const breakAt = lastBreak(remaining, max);
+    const cut = breakAt > max / 2 ? breakAt : max;
     result.push(remaining.slice(0, cut).trim());
     remaining = remaining.slice(cut).trim();
   }
   if (remaining) result.push(remaining);
   return result;
+}
+
+/** A translated call's original text as paragraphs: its own breaks, and long blocks cut at a pause. */
+export function originalParagraphs(text: string | null | undefined): string[] {
+  return (text ?? "").split(/\n\s*\n/).flatMap((block) => chunks(block, ORIGINAL_PARAGRAPH_CHARS));
+}
+
+const LANGUAGE_NAMES = new Intl.DisplayNames(["en"], { type: "language" });
+
+/**
+ * The original of a translated call is a machine transcript of its recording,
+ * names and figures misheard at times, when the transcript was made from the
+ * recording (its turns carry start times); a record the company or the
+ * exchange published as a document has none.
+ */
+export function originalIsMachineTranscript(transcript: Pick<CloudEarningsTranscriptPayload, "turns">): boolean {
+  return transcript.turns.some((turn) => turn.startSeconds != null);
+}
+
+/**
+ * The language a translated call was held in, by name ("Chinese"), from the
+ * stored code or name; null for a call that is not translated. "" when the
+ * call is translated and its language is not known.
+ */
+export function translatedFrom(transcript: Pick<CloudEarningsTranscriptPayload, "isTranslated" | "language">): string | null {
+  if (!transcript.isTranslated) return null;
+  const language = transcript.language?.trim() ?? "";
+  if (/^[a-z]{2,3}(?:[-_][a-z0-9]+)*$/i.test(language)) {
+    try {
+      const name = LANGUAGE_NAMES.of(language.replace(/_/g, "-").split("-")[0]!.toLowerCase());
+      if (name && name.toLowerCase() !== language.toLowerCase()) return name;
+    } catch {
+      // Intentional ignore: a word Intl does not take as a language code is read as a name below.
+    }
+  }
+  return language ? language[0]!.toUpperCase() + language.slice(1).toLowerCase() : "";
 }
 
 function summaryFields(
@@ -149,6 +196,20 @@ export function buildTranscriptSegments(
         }
       }
     }
+  } else if (section === "original") {
+    const search = options.search?.trim().toLowerCase() ?? "";
+    for (const text of originalParagraphs(transcript.originalText)) {
+      if (search && !text.toLowerCase().includes(search)) continue;
+      withoutIndexes.push({
+        section,
+        startSeconds: null,
+        speaker: null,
+        role: null,
+        company: null,
+        isQa: false,
+        text,
+      });
+    }
   } else if (section === "participants") {
     const speaker = options.speaker?.trim().toLowerCase() ?? "";
     for (const participant of transcript.participants) {
@@ -210,7 +271,11 @@ export function findCallForQuarter(
 ): CloudEarningsCallPayload | null {
   const sorted = sortCallsNewest(calls);
   const token = requestedQuarter.trim().toUpperCase().replace(/[\s_-]+/g, "");
-  if (!token || token === "LATEST") return sorted[0] ?? null;
+  // The latest earnings call: a deal call or an investor day held after it is
+  // not the quarter's call, unless the company has nothing else.
+  if (!token || token === "LATEST") {
+    return sorted.find((call) => !eventLabelOf(call)) ?? sorted[0] ?? null;
+  }
 
   const quarterFirst = token.match(/^(?:F?Q)?([1-4])(?:\/?(\d{2}|\d{4}))?$/);
   if (quarterFirst) {
@@ -230,10 +295,20 @@ export function findCallForQuarter(
     )) ?? null;
   }
 
+  // A half year's results: "H1 26", "1H26", "26H1".
+  const half = token.match(/^(?:H([12])(\d{2}|\d{4})?|([12])H(\d{2}|\d{4})?|(\d{2}|\d{4})H([12]))$/);
+  if (half) {
+    const which = Number(half[1] ?? half[3] ?? half[6]);
+    const year = half[2] ?? half[4] ?? half[5];
+    return sorted.find((call) => call.fiscalHalf === which && sameYear(call.fiscalYear, year ? Number(year) : null)) ?? null;
+  }
+
+  // A year's call, never its half's (SHKP's interim and annual results calls share FY2026), even when the half is all
+  // the year has so far: H1-2026 asks for that one.
   const fiscalYear = token.match(/^(?:FY)?(\d{2}|\d{4})$/);
   if (fiscalYear) {
     const year = Number(fiscalYear[1]);
-    return sorted.find((call) => sameYear(call.fiscalYear, year)) ?? null;
+    return sorted.find((call) => sameYear(call.fiscalYear, year) && !call.fiscalHalf) ?? null;
   }
 
   return null;

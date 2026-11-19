@@ -1,17 +1,22 @@
 import type { FinancialStatement, TickerFinancials } from "../../../../types/financials";
-import { fiscalPeriodLabel, ttmPeriodLabel } from "../../../../utils/fiscal-period";
+import { ebitdaLacksDepreciation } from "../../../../utils/ebitda";
+import { longerPeriodLabel, statementPeriodLabel, ttmPeriodLabel } from "../../../../utils/fiscal-period";
+import { areNearbyFinancialPeriodEnds, fillDate, fillDateText, statementPeriodMonths } from "../../../../utils/financial-statements";
 import { formatPerShareNumber } from "../../../../utils/reported-money";
 import { hasNonIncomeStatementGap } from "../../../../utils/statement-gaps";
+import { growthRate, isNotMeaningful, NOT_MEANINGFUL_TEXT, outflowGrowthRate, type Rate } from "../../../../utils/growth";
 import {
+  MISSING_VALUE,
+  displayWidth,
   formatGrowthShort,
   formatNumber,
-  formatWithDivisor,
   padTo,
   pickUnit,
 } from "../../../../utils/format";
 import {
   buildPreviousStatementMap,
   computeTTM,
+  servedTrailingStatement,
   type FinancialPeriod,
   type FinancialTableStatement,
 } from "./aggregation";
@@ -21,17 +26,25 @@ export { computeTTM } from "./aggregation";
 export { FINANCIAL_SUB_TABS } from "./schema";
 export type { FinancialPeriod } from "./aggregation";
 
+/** A ticker with statements to show: what the Financials view needs, and what Overview's way into it asks for. */
+export function hasStatementFinancials(financials: TickerFinancials | null | undefined): boolean {
+  return (financials?.annualStatements.length ?? 0) > 0 || (financials?.quarterlyStatements.length ?? 0) > 0;
+}
+
 type FinancialMetricFormat = "compact" | "eps" | "percent";
 export type FinancialGrowthDirection = "higher" | "lower" | "neutral";
 
-export type MetricDef = {
+type MetricDef = {
   label: string;
   key?: keyof FinancialStatement;
   id?: string;
-  compute?: (statement: FinancialStatement) => number | undefined;
+  /** A figure worked out of the statement: a margin, N/M over revenue that is zero or negative (revenueMargin). */
+  compute?: (statement: FinancialStatement) => Rate | undefined;
   format: FinancialMetricFormat;
   showGrowth?: boolean;
   growthDirection?: FinancialGrowthDirection;
+  /** A line kept as a negative number (capex, dividends paid): its growth is the change in what went out. */
+  outflow?: boolean;
 };
 
 export type FinancialRowDef = MetricDef | FinancialGroupDef;
@@ -58,7 +71,7 @@ export type FinancialTableRow =
     kind: "metric";
     id: string;
     key?: keyof FinancialStatement;
-    compute?: (statement: FinancialStatement) => number | undefined;
+    compute?: (statement: FinancialStatement) => Rate | undefined;
     label: string;
     unitLabel: string;
     /** Money unit word (`bn`) the values are in, "" for whole units; null for ratios, per-share values and share counts. */
@@ -67,6 +80,7 @@ export type FinancialTableRow =
     format: FinancialMetricFormat;
     showGrowth: boolean;
     growthDirection: FinancialGrowthDirection;
+    outflow?: boolean;
     depth: number;
   }
   | {
@@ -84,7 +98,7 @@ export type FinancialTableRow =
     toggleable: boolean;
   };
 
-export function statementMetricValue(
+function statementMetricValue(
   def: Pick<MetricDef, "key" | "compute">,
   statement: FinancialStatement,
 ): number | undefined {
@@ -92,16 +106,83 @@ export function statementMetricValue(
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/** The figure a row shows for a period: a group's summary line, or the row's own. */
+function financialCellValue(row: FinancialTableRow, statement: FinancialStatement): number | undefined {
+  if (row.kind === "group") return row.summaryKey ? statement[row.summaryKey] as number | undefined : undefined;
+  return statementMetricValue(row, statement);
+}
+
+/** Whether a worked-out figure (a margin) is not meaningful in a statement: over revenue that is zero or negative. */
+function statementMetricNotMeaningful(
+  def: Pick<MetricDef, "key" | "compute">,
+  statement: FinancialStatement,
+): boolean {
+  return !def.key && isNotMeaningful(def.compute?.(statement));
+}
+
 export const FINANCIAL_COL_W = 18;
 export const FINANCIAL_LABEL_W = 28;
-const FINANCIAL_GROWTH_W = 7;
-const FINANCIAL_VALUE_W = FINANCIAL_COL_W - FINANCIAL_GROWTH_W;
+const FINANCIAL_LABEL_MIN_W = 12;
 
-export function computeGrowth(current: number | undefined, previous: number | undefined): number | undefined {
-  if (current == null || previous == null || !Number.isFinite(current) || !Number.isFinite(previous) || previous === 0) return undefined;
-  const direct = (current - previous) / Math.abs(previous);
-  const growth = Number.isFinite(direct) ? direct : current / Math.abs(previous) - Math.sign(previous);
-  return Number.isFinite(growth) ? growth : undefined;
+/**
+ * The metric column's width in a table `width` cells wide: 28 where a period
+ * fits beside it, narrower (down to 12, labels cut with an ellipsis) where it
+ * would otherwise take every value off screen, as a 36-column Financials pane
+ * once showed nothing but metric names and "more →". The other 6 cells are the
+ * pane's padding, the table's, the column gap and the scrollbar.
+ */
+export function financialLabelWidth(width: number, periodWidth = FINANCIAL_COL_W): number {
+  return Math.max(FINANCIAL_LABEL_MIN_W, Math.min(FINANCIAL_LABEL_W, width - periodWidth - 6));
+}
+/** The growth after a period's value: a blank and up to six characters (`+466%`, `<-99T%`). */
+const FINANCIAL_GROWTH_W = 7;
+
+/**
+ * A terminal period column as wide as the widest value it shows and the growth
+ * after it, or its header where that is wider. A fixed 18 left a short value
+ * further from its own column's edge than from its growth, so each pair read
+ * tight and the next period far off, and fewer periods fit.
+ */
+export function financialPeriodWidth(values: Iterable<string>, headers: Iterable<string>): number {
+  let value = 0;
+  for (const text of values) value = Math.max(value, displayWidth(text));
+  let header = 0;
+  for (const text of headers) header = Math.max(header, displayWidth(text));
+  return Math.max(value + FINANCIAL_GROWTH_W, header);
+}
+
+/**
+ * A line's growth from one period to the next: N/M off a zero or negative base (a loss
+ * narrowing, or turning into a profit, is no percentage of the loss). An outflow, kept as a
+ * negative number, grows as the money that went out does.
+ */
+export function computeGrowth(current: number | undefined, previous: number | undefined, outflow = false): Rate | undefined {
+  return outflow ? outflowGrowthRate(current, previous) : growthRate(current, previous);
+}
+
+/**
+ * A row's cell in a statement column: its figure as shown (N/M for a margin over revenue
+ * that is zero or negative) and its growth on the period it is compared with.
+ */
+export function financialCellParts(
+  row: FinancialTableRow,
+  statement: FinancialTableStatement,
+  previous: FinancialStatement | undefined,
+  comparisonCurrency: string | undefined,
+): { value: number | undefined; formattedValue: string; growth: Rate | undefined } {
+  const value = financialCellValue(row, statement);
+  const previousValue = previous ? financialCellValue(row, previous) : undefined;
+  const growth = (row.kind === "metric" && !row.showGrowth)
+    || !canCompareFinancialRow(row, statement, previous, comparisonCurrency)
+    ? undefined : computeGrowth(value, previousValue, row.kind === "metric" && row.outflow === true);
+  return { value, formattedValue: formatFinancialCellValue(row, statement), growth };
+}
+
+/** A row's figure for a period as its cell shows it: N/M for a margin over revenue that is zero or negative. */
+export function formatFinancialCellValue(row: FinancialTableRow, statement: FinancialStatement): string {
+  return row.kind === "metric" && statementMetricNotMeaningful(row, statement)
+    ? NOT_MEANINGFUL_TEXT
+    : formatFinancialValue(financialCellValue(row, statement), row, statement);
 }
 
 const SHARE_COUNT_FIELDS = new Set<keyof FinancialStatement>([
@@ -115,7 +196,7 @@ const PER_SHARE_EARNINGS_FIELDS = new Set<keyof FinancialStatement>(["eps", "bas
  * shares. Counts and EPS compare only on one share basis: receipts against
  * ordinary shares would read as a split.
  */
-export function canCompareFinancialRow(
+function canCompareFinancialRow(
   row: FinancialTableRow,
   current: FinancialStatement,
   previous: FinancialStatement | undefined,
@@ -123,8 +204,9 @@ export function canCompareFinancialRow(
 ): boolean {
   if (!previous) return false;
   const key = row.kind === "group" ? row.summaryKey : row.key;
-  // A line filled from the exchange is not compared with the statements source's: the two define revenue differently.
-  if (key && filledLine(current, key) !== filledLine(previous, key)) return false;
+  // A line filled from the exchange is not compared with the statements source's: the two may define it
+  // differently. A results announcement that restates the source's figure for the year before is the same line.
+  if (key && filledLine(current, key) !== filledLine(previous, key) && !comparableLine(current, previous, key)) return false;
   const sameShareBasis = current.shareBasis === previous.shareBasis;
   if (key && SHARE_COUNT_FIELDS.has(key)) return sameShareBasis;
   if (key && PER_SHARE_EARNINGS_FIELDS.has(key) && !sameShareBasis) return false;
@@ -137,20 +219,36 @@ function filledLine(statement: FinancialStatement, key: keyof FinancialStatement
   return statement.filledFrom?.fields.some((field) => field === key) === true;
 }
 
+/**
+ * A filled year's line compared with the source's a year earlier: the lines
+ * Gloom Cloud found on the source's basis (`comparable`), or, from a server
+ * that does not say, every line of a year a year apart, so a filled year
+ * always has its year-on-year change.
+ */
+function comparableLine(current: FinancialStatement, previous: FinancialStatement, key: keyof FinancialStatement): boolean {
+  const fill = current.filledFrom;
+  if (fill?.source !== "results" || filledLine(previous, key)) return false;
+  if (fill.comparable) return fill.comparable.some((field) => field === key);
+  const days = (Date.parse(current.date) - Date.parse(previous.date)) / 86_400_000;
+  return !fill.periodMonths && days >= 300 && days <= 430;
+}
+
 export function semanticGrowthValue(
-  growth: number | undefined,
+  growth: Rate | undefined,
   direction: FinancialGrowthDirection,
 ): number | undefined {
-  if (growth == null) return undefined;
+  if (growth == null || isNotMeaningful(growth)) return undefined;
   if (direction === "lower") return -growth;
   if (direction === "neutral") return 0;
   return growth;
 }
 
-export function formatFinancialCell(value: string, growth: number | undefined) {
-  const growthText = growth != null && Number.isFinite(growth) ? formatFinancialGrowth(growth) : "";
+/** A period's value and its growth laid out in a column `width` cells wide, the growth against its right edge. */
+export function formatFinancialCell(value: string, growth: Rate | undefined, width = FINANCIAL_COL_W) {
+  const growthText = isNotMeaningful(growth) ? NOT_MEANINGFUL_TEXT
+    : growth != null && Number.isFinite(growth) ? formatFinancialGrowth(growth) : "";
   return {
-    valueText: padTo(value, FINANCIAL_VALUE_W, "right"),
+    valueText: padTo(value, Math.max(0, width - FINANCIAL_GROWTH_W), "right"),
     growthText: padTo(growthText ? ` ${growthText}` : "", FINANCIAL_GROWTH_W, "right"),
   };
 }
@@ -174,41 +272,85 @@ function formatFinancialGrowth(growth: number): string {
   return exponential.length <= budget ? exponential : percent < 0 ? "<-99T%" : ">99T%";
 }
 
-export function formatFinancialValue(
+function formatFinancialValue(
   value: number | undefined,
-  row: Pick<FinancialTableRow, "format" | "divisor">,
+  row: Pick<FinancialTableRow, "format" | "divisor"> & { key?: string },
+  statement?: FinancialStatement,
 ): string {
-  if (value == null || !Number.isFinite(value)) return "—";
+  // EBITDA is operating income plus D&A: a period that reports no D&A has none, and its cell says why.
+  if ((value == null || !Number.isFinite(value)) && row.key === "ebitda" && ebitdaLacksDepreciation(statement)) return "no D&A";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   if (row.format === "eps") return formatPerShareNumber(value);
   if (row.format === "percent") return `${formatNumber(value * 100, 1)}%`;
-  return formatWithDivisor(value, row.divisor);
+  return formatFinancialAmount(value, row.divisor);
 }
 
 /**
- * A statement column's header for reports. The compact form is the period as
- * the pane prints it without a fiscal calendar: `TTM`, or the period end date
- * the query bar shows as of. Table columns use `financialColumnLabel`.
+ * An amount in the table's one unit, to about three significant figures: `23.73` and `1,265.6`, a line a
+ * thousandth of the others as `0.001` rather than `0.00`, so no row needs a unit of its own.
  */
-export function formatFinancialHeader(date: string, currency?: string, dateSource?: FinancialStatement["dateSource"], compact = false, periodEnd?: string): string {
-  if (compact) return date === "TTM" ? "TTM" : date.slice(0, 10);
-  const period = date === "TTM" ? (periodEnd ? `TTM ${periodEnd}` : "TTM") : date.slice(0, 10);
-  const label = currency ? `${period} ${currency}` : period;
-  if (date === "TTM") return label;
-  return `${label} ${dateSource === "sec" ? "(SEC date)" : "(provider date)"}`;
+export function formatFinancialAmount(value: number, divisor: number): string {
+  const scaled = value / divisor;
+  const magnitude = Math.abs(scaled);
+  if (magnitude >= 100) return formatNumber(scaled, 1);
+  if (magnitude >= 1 || scaled === 0) return scaled.toFixed(2);
+  if (magnitude >= 0.001) return scaled.toFixed(3);
+  return Number(scaled.toPrecision(2)).toString();
 }
 
-/** A table column's label: the fiscal period, and `TTM` with the quarter it runs to. */
+/**
+ * A report column's header (`gloom fn FA`): the fiscal period as the pane's
+ * column names it and the day it ends (`FY2026 2026-09-30 USD bn (SEC
+ * date)`, `TTM Q3 FY26 2026-09-30 USD`), with a half in the quarterly list
+ * named as one (`H1 FY26 2026-06-30`, or `6M 2026-06-30` off the fiscal
+ * calendar), and a column Gloom Cloud filled
+ * from the company's results announcements dated by them alone (fillDate):
+ * `(announced 2026-08-20)` for its own results, `(comparative in the
+ * 2026-08-20 announcement)` for a later period's comparative column. `rows`
+ * are the list's other rows, where the later period's announcement is read.
+ */
+export function financialReportHeader(
+  statement: FinancialTableStatement,
+  currency: string | undefined,
+  kind: FinancialPeriod,
+  yearEndMonth: number | null,
+  rows: readonly FinancialStatement[] = [],
+): string {
+  const period = financialFiscalHeader(statement, kind, yearEndMonth);
+  const header = currency ? `${period} ${currency}` : period;
+  if (statement.date === "TTM") return header;
+  const filled = statement.filledFrom?.source === "results" ? fillDate(statement, rows) : null;
+  const source = filled ? fillDateText(filled) : statement.dateSource === "sec" ? "SEC date" : "provider date";
+  return `${header} (${source})`;
+}
+
+/**
+ * The fiscal period, with a half in the quarterly list named as a half
+ * (`H1 FY26`), and `TTM` with the quarter or half it runs to.
+ */
 export function financialColumnLabel(
   statement: FinancialTableStatement,
   kind: FinancialPeriod,
   yearEndMonth: number | null,
 ): string {
-  if (statement.date !== "TTM") return fiscalPeriodLabel(statement.date, kind, yearEndMonth);
-  const periodEnd = statement.aggregation?.periodEnd;
-  return ttmPeriodLabel(periodEnd, yearEndMonth);
+  if (statement.date !== "TTM") return statementPeriodLabel(statement, kind, yearEndMonth);
+  const { periodEnd, interimMonths } = statement.aggregation ?? {};
+  return ttmPeriodLabel(periodEnd, yearEndMonth, interimMonths);
 }
 
-/** The end of the latest period on screen, which the query bar shows as of. */
+export function financialFiscalHeader(statement: FinancialTableStatement, kind: FinancialPeriod, yearEndMonth: number | null): string {
+  const end = statement.date === "TTM" ? statement.aggregation?.periodEnd : statement.date.slice(0, 10);
+  const months = kind === "quarterly" && statement.date !== "TTM" ? statementPeriodMonths(statement) : undefined;
+  const longer = end && months && months > 3 ? longerPeriodLabel(end, months, yearEndMonth) : null;
+  const name = longer ?? financialColumnLabel(statement, kind, yearEndMonth);
+  return end && !name.endsWith(end) ? `${name} ${end}` : name;
+}
+
+/** An annual balance sheet can lead with a newer interim position. */
+export function financialColumnPeriod(statement: FinancialTableStatement, period: FinancialPeriod, annualDates: ReadonlySet<string>): FinancialPeriod {
+  return period === "annual" && (statement.date === "TTM" || annualDates.has(statement.date)) ? "annual" : "quarterly";
+}
+
 export function latestFinancialPeriodEnd(statements: readonly FinancialTableStatement[]): string | undefined {
   return statements
     .map((statement) => statement.date === "TTM" ? statement.aggregation?.periodEnd : statement.date.slice(0, 10))
@@ -300,7 +442,7 @@ function hasFinancialRowValue(
   statements: FinancialStatement[],
 ): boolean {
   if (!isFinancialGroup(row)) {
-    return statements.some((statement) => typeof statementMetricValue(row, statement) === "number");
+    return statements.some((statement) => typeof statementMetricValue(row, statement) === "number" || statementMetricNotMeaningful(row, statement));
   }
   return (
     (row.summaryKey ? hasStatementValue(statements, row.summaryKey) : false)
@@ -369,9 +511,11 @@ function resolveMetricUnit(
 }
 
 /**
- * The money unit most rows share (`bn`), said once beside the currency. Rows
- * in that unit drop their `(bn)`, and money rows too small for any unit are
- * shown in it; rows in another unit, and share counts, keep theirs.
+ * The money unit of the whole table (`bn`), said once beside the currency:
+ * the unit most rows would take on their own. Every money row is shown in it,
+ * a smaller line to more decimals (formatFinancialAmount), so a column copied
+ * out of the table is in one unit and no row carries a `(mn)` of its own.
+ * Share counts are no money and keep theirs.
  */
 export function shareFinancialUnit<T extends { unitLabel: string; label: string; moneyUnit: string | null; divisor: number }>(
   rows: readonly T[],
@@ -381,11 +525,7 @@ export function shareFinancialUnit<T extends { unitLabel: string; label: string;
   const unit = [...counts].sort((left, right) => right[1] - left[1])[0]?.[0];
   if (!unit) return { rows: [...rows], unit: undefined };
   return {
-    rows: rows.map((row) => {
-      if (row.moneyUnit === unit) return { ...row, unitLabel: row.label };
-      if (row.moneyUnit === "") return { ...row, unitLabel: row.label, moneyUnit: unit, divisor: UNIT_DIVISORS[unit]! };
-      return row;
-    }),
+    rows: rows.map((row) => row.moneyUnit == null ? row : { ...row, unitLabel: row.label, moneyUnit: unit, divisor: UNIT_DIVISORS[unit]! }),
     unit,
   };
 }
@@ -393,8 +533,10 @@ export function shareFinancialUnit<T extends { unitLabel: string; label: string;
 export function buildFinancialRows(
   defs: FinancialRowDef[],
   statements: FinancialStatement[],
-  collapsedGroups: Set<string>,
+  collapsedGroups: ReadonlySet<string>,
   depth = 0,
+  /** The lines the table already shows, above this one: a line equal to one of them is left out. */
+  shown: Array<Pick<MetricDef, "key" | "compute" | "format">> = [],
 ): FinancialTableRow[] {
   const rows: FinancialTableRow[] = [];
 
@@ -402,6 +544,11 @@ export function buildFinancialRows(
     if (!hasFinancialRowValue(def, statements)) continue;
 
     if (!isFinancialGroup(def)) {
+      // The same amount under another name further down (CapEx, then Purchase PPE) is shown once, where it is
+      // reported in every period the line above is; a line that differs in any period stays.
+      if (shown.some((line) => line.format === (def.format ?? "compact") && (line.key !== def.key || line.compute !== def.compute)
+        && repeatsLine(def, line, statements))) continue;
+      shown.push({ key: def.key, compute: def.compute, format: def.format ?? "compact" });
       const { unitLabel, moneyUnit, divisor, format } = resolveMetricUnit(statements, def, def.label);
       rows.push({
         kind: "metric",
@@ -414,7 +561,9 @@ export function buildFinancialRows(
         divisor,
         format,
         showGrowth: def.showGrowth ?? format !== "percent",
-        growthDirection: def.growthDirection ?? "higher",
+        // More spent is neither better nor worse in itself.
+        growthDirection: def.growthDirection ?? (def.outflow ? "neutral" : "higher"),
+        ...(def.outflow ? { outflow: true } : {}),
         depth,
       });
       continue;
@@ -427,6 +576,7 @@ export function buildFinancialRows(
       ? resolveMetricUnit(statements, { key: def.summaryKey, format: def.format ?? "compact" }, def.label)
       : { unitLabel: def.label, moneyUnit: null, divisor: 1, format: def.format ?? "compact" };
 
+    if (def.summaryKey) shown.push({ key: def.summaryKey, format: def.format ?? "compact" });
     rows.push({
       kind: "group",
       id: def.id,
@@ -443,7 +593,7 @@ export function buildFinancialRows(
     });
 
     if (expanded) {
-      rows.push(...buildFinancialRows(children, statements, collapsedGroups, depth + 1));
+      rows.push(...buildFinancialRows(children, statements, collapsedGroups, depth + 1, shown));
     }
   }
 
@@ -484,6 +634,12 @@ interface FinancialTableModelRow {
   summaryKey?: keyof FinancialStatement;
   label: string;
   unitLabel: string;
+  /** How the row's figures read: money or a share count (`compact`), per-share earnings, or a percent of a fraction. */
+  format: FinancialMetricFormat;
+  /** What a `compact` figure is divided by to read in the row's unit (1e9 for `bn`). */
+  divisor: number;
+  /** The money unit word the figures are in (`bn`); null for share counts, per-share figures and percents. */
+  moneyUnit: string | null;
   depth: number;
   growthDirection: FinancialGrowthDirection;
   cells: FinancialTableCellModel[];
@@ -505,13 +661,48 @@ function coversLatestYear(ttm: FinancialTableStatement, latestYear: FinancialSta
   return days <= 7;
 }
 
+/** Counts of the shares a company has issued or has outstanding, which are never zero; treasury shares can be. */
+const OUTSTANDING_COUNT_FIELDS = ["basicShares", "dilutedShares", "shareIssued", "ordinarySharesNumber"] as const;
+
+/**
+ * Share counts that cannot be the company's: zero, or under a thousandth of its
+ * typical count (IAG's 4,642 for Q3 2025, millions read as shares, which shows
+ * as 0.00 bn and a fall of 100%). They are missing, not a value to grow from.
+ */
+function withoutImpossibleShareCounts(
+  annualStatements: FinancialStatement[],
+  quarterlyStatements: FinancialStatement[],
+): { annualStatements: FinancialStatement[]; quarterlyStatements: FinancialStatement[] } {
+  const all = [...annualStatements, ...quarterlyStatements];
+  const floors = new Map<string, number>();
+  for (const field of OUTSTANDING_COUNT_FIELDS) {
+    const counts = all.map((row) => row[field]).filter((value): value is number => typeof value === "number" && value > 0).sort((a, b) => a - b);
+    floors.set(field, counts.length ? counts[Math.floor(counts.length / 2)]! / 1000 : 0);
+  }
+  const impossible = (row: FinancialStatement, field: typeof OUTSTANDING_COUNT_FIELDS[number]) => {
+    const value = row[field];
+    return typeof value === "number" && (value <= 0 || value < floors.get(field)!);
+  };
+  const clean = (rows: FinancialStatement[]) => rows.map((row) => {
+    const drop = OUTSTANDING_COUNT_FIELDS.filter((field) => impossible(row, field));
+    if (!drop.length) return row;
+    const next = { ...row };
+    for (const field of drop) delete next[field];
+    return next;
+  });
+  return { annualStatements: clean(annualStatements), quarterlyStatements: clean(quarterlyStatements) };
+}
+
 export function selectFinancialStatements(
   period: FinancialPeriod,
   statement: string,
-  annualStatements: FinancialStatement[],
-  quarterlyStatements: FinancialStatement[],
+  servedAnnual: FinancialStatement[],
+  servedQuarterly: FinancialStatement[],
   limit = period === "annual" ? 5 : 6,
+  /** Gloom Cloud's trailing twelve months where the quarters do not give them (TickerFinancials.trailingStatement). */
+  servedTrailing?: TickerFinancials["trailingStatement"],
 ) {
+  const { annualStatements, quarterlyStatements } = withoutImpossibleShareCounts(servedAnnual, servedQuarterly);
   // A period with nothing on this statement (a fiscal year-end balance point on
   // the income statement) would render as an all-dash column.
   const tabRows = FINANCIAL_SUB_TABS.find((tab) => tab.key === statement)?.rows;
@@ -519,7 +710,20 @@ export function selectFinancialStatements(
     .filter((candidate) => !tabRows || tabRows.some((row) => hasFinancialRowValue(row, [candidate])))
     .slice(-limit)
     .reverse();
-  const trailing = period === "annual" && statement !== "balance" ? computeTTM(quarterlyStatements, annualStatements) : null;
+  const fromQuarters = period === "annual" && statement !== "balance" ? computeTTM(quarterlyStatements, annualStatements) : null;
+  const served = period === "annual" && statement !== "balance" ? servedTrailingStatement(servedTrailing, annualStatements) : null;
+  // The newer of the two: four quarters, or the year plus the half since it. To the same day, the served
+  // one where a quarter lacks a headline line the four would need (Meituan's Q3 2025 revenue).
+  const quartersEnd = (fromQuarters?.aggregation?.periodEnd ?? "").slice(0, 10);
+  const servedEnd = (served?.aggregation?.periodEnd ?? "").slice(0, 10);
+  // Two ends a few days apart are one period (a quarter dated 2025-06-28 and a half to 2025-06-30).
+  const sameEnd = !!fromQuarters && !!served && areNearbyFinancialPeriodEnds(servedEnd, quartersEnd);
+  // To the same day, the served one too where the four quarters would mix two definitions of a line
+  // (a bank's revenue before credit losses in its announcements, after them at the statements source).
+  const trailing = served && (!fromQuarters || (!sameEnd && servedEnd > quartersEnd)
+    || (sameEnd && (lacksHeadline(fromQuarters, served) || !!servedTrailing?.trailing.overQuarters)))
+    ? served
+    : fromQuarters;
   // Right after a fiscal year closes, the last four quarters are that year:
   // the reported year is shown, not a second column of the same period.
   const ttm = trailing && !coversLatestYear(trailing, rawStatements[0]) ? trailing : null;
@@ -546,8 +750,14 @@ export function selectFinancialStatements(
   return { statements, previousStatementMap };
 }
 
+/** Whether four quarters summed lack a headline line the served TTM has. */
+function lacksHeadline(quarters: FinancialStatement, served: FinancialStatement): boolean {
+  return (["totalRevenue", "netIncome", "operatingCashFlow"] as const)
+    .some((key) => !Number.isFinite(quarters[key]) && Number.isFinite(served[key]));
+}
+
 export function buildFinancialTableModel(
-  financials: Pick<TickerFinancials, "annualStatements" | "quarterlyStatements" | "financialCurrency" | "fundamentals"> | null | undefined,
+  financials: Pick<TickerFinancials, "annualStatements" | "quarterlyStatements" | "financialCurrency" | "fundamentals" | "trailingStatement"> | null | undefined,
   options: {
     period?: FinancialPeriod;
     statement?: string;
@@ -570,6 +780,7 @@ export function buildFinancialTableModel(
   const { statements, previousStatementMap } = selectFinancialStatements(
     period, subTabKey, annualStatements, quarterlyStatements,
     period === "annual" ? options.annualLimit : options.quarterlyLimit,
+    financials?.trailingStatement,
   );
   const subTab = FINANCIAL_SUB_TABS.find((tab) => tab.key === subTabKey) ?? FINANCIAL_SUB_TABS[0]!;
   const collapsedGroups = options.expandAll
@@ -578,22 +789,12 @@ export function buildFinancialTableModel(
   const { rows: tableRows, unit } = shareFinancialUnit(buildFinancialRows(subTab.rows, statements, collapsedGroups));
   const rows = tableRows.map((row): FinancialTableModelRow => {
     const cells = statements.map((statement) => {
-      const previous = previousStatementMap.get(statement.date);
-      const value = row.kind === "group"
-        ? row.summaryKey ? statement[row.summaryKey] as number | undefined : undefined
-        : statementMetricValue(row, statement);
-      const previousValue = previous
-        ? row.kind === "group"
-          ? row.summaryKey ? previous[row.summaryKey] as number | undefined : undefined
-          : statementMetricValue(row, previous)
-        : undefined;
-      const growth = (row.kind === "metric" && !row.showGrowth)
-        || !canCompareFinancialRow(row, statement, previous, comparisonCurrency)
-        ? undefined : computeGrowth(value, previousValue);
+      const { value, formattedValue, growth } = financialCellParts(row, statement, previousStatementMap.get(statement.date), comparisonCurrency);
       return {
-        ...formatFinancialCell(formatFinancialValue(value, row), growth),
+        ...formatFinancialCell(formattedValue, growth),
         value,
-        growth,
+        // A number, or null with the cell's growth text reading N/M.
+        growth: typeof growth === "number" ? growth : undefined,
         semanticGrowth: semanticGrowthValue(growth, row.growthDirection),
       };
     });
@@ -604,6 +805,9 @@ export function buildFinancialTableModel(
       summaryKey: row.kind === "group" ? row.summaryKey : undefined,
       label: row.label,
       unitLabel: row.unitLabel,
+      format: row.format,
+      divisor: row.divisor,
+      moneyUnit: row.moneyUnit,
       depth: row.depth,
       growthDirection: row.growthDirection,
       cells,
@@ -624,7 +828,57 @@ export function financialStatementPeriods(
   subTab: Pick<FinancialSubTab, "rows">,
 ): Array<{ date: string; lead: boolean }> {
   const lead = subTab.rows[0];
-  return statements.map((statement) => ({ date: statement.date, lead: !!lead && hasFinancialRowValue(lead, [statement]) }));
+  return statements.map((statement) => ({ date: statement.date, lead: !!lead && hasLeadLine(lead, statement) }));
+}
+
+/**
+ * Whether a column has its lead line, or Gloom Cloud left it blank on purpose: the company's announcements
+ * count it otherwise than the statements source (HSBC's revenue, `filledFrom.omitted`), so the period is in.
+ */
+function hasLeadLine(lead: FinancialRowDef, statement: FinancialStatement): boolean {
+  if (hasFinancialRowValue(lead, [statement])) return true;
+  const key = isFinancialGroup(lead) ? lead.summaryKey : lead.key;
+  const fill = statement.filledFrom;
+  return !!key && fill?.source === "results" && (fill.omitted ?? []).some((field) => field === key);
+}
+
+/**
+ * The newest periods of a statement table that are not in yet: those before
+ * the newest with the statement's lead line (revenue, total assets, free
+ * cash flow), which hold only some figures (an EPS alone, as Pop Mart's
+ * FY2025 did before its statements were filled). The pane leaves them out of
+ * its columns and says so in `notInYetNote`, so the first column is never
+ * an all-dash one. A trailing-twelve-month column is kept: it is summed, and
+ * so is a period whose lead line was left blank on purpose (`hasLeadLine`).
+ */
+export function splitPeriodsNotInYet<T extends FinancialTableStatement>(
+  statements: readonly T[],
+  subTab: Pick<FinancialSubTab, "rows">,
+): { shown: T[]; notInYet: T[] } {
+  const lead = subTab.rows[0];
+  const notInYet: T[] = [];
+  for (const statement of statements) {
+    if (statement.date === "TTM") continue;
+    if (!lead || hasLeadLine(lead, statement)) break;
+    notInYet.push(statement);
+  }
+  // A table where no period has the lead line keeps what it has.
+  if (notInYet.length === statements.filter((statement) => statement.date !== "TTM").length) return { shown: [...statements], notInYet: [] };
+  return { shown: statements.filter((statement) => !notInYet.includes(statement)), notInYet };
+}
+
+/** "FY2025 is not in yet: only some of its figures are on file, not its revenue." Null when every period is shown. */
+export function notInYetNote(
+  notInYet: readonly FinancialTableStatement[],
+  subTab: Pick<FinancialSubTab, "rows">,
+  kind: FinancialPeriod,
+  yearEndMonth: number | null,
+): string | null {
+  if (!notInYet.length) return null;
+  const periods = notInYet.map((statement) => financialColumnLabel(statement, kind, yearEndMonth)).reverse();
+  const names = periods.length === 1 ? periods[0]! : `${periods.slice(0, -1).join(", ")} and ${periods.at(-1)}`;
+  const lead = subTab.rows[0]?.label.toLowerCase();
+  return `${names} ${periods.length === 1 ? "is" : "are"} not in yet: only some of ${periods.length === 1 ? "its" : "their"} figures are on file${lead ? `, not ${periods.length === 1 ? "its" : "their"} ${lead}` : ""}.`;
 }
 
 /** The statement lines a table has a row for (filledPeriodsNote), group totals included. */

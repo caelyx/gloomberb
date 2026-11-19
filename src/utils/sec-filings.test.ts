@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { currentReportItemsLabel, hiddenFilingsNote, isPricingSupplement, isScheduleAboutAnotherCompany, loadLatestFilings, pricingSupplementTest } from "./sec-filings";
+import { currentReportItemsLabel, form4TradeText, hiddenFilingsNote, isPricingSupplement, isScheduleAboutAnotherCompany, loadLatestFilings, pricingSupplementTest } from "./sec-filings";
 import type { SecFilingItem } from "../types/data-provider";
 
 test.each([
@@ -72,6 +72,21 @@ test("the hidden filings read as one note", () => {
   expect(hiddenFilingsNote({ pricingSupplements: 28, ownershipReportsAboutOthers: 22 }))
     .toBe("28 pricing supplements and 22 ownership reports about other companies hidden, --all to show");
   expect(hiddenFilingsNote({ pricingSupplements: 0, ownershipReportsAboutOthers: 0 })).toBeNull();
+  expect(hiddenFilingsNote({ pricingSupplements: 0, ownershipReportsAboutOthers: 0, otherFunds: 14 })).toBe("14 filings for the trust's other funds hidden, --all to show");
+});
+
+test("a fund's list keeps its own series' filings, not the NPORT-P its trust filed for each other fund the same day", async () => {
+  const filing = (form: string, index: number, fundSeries?: boolean): SecFilingItem =>
+    ({ form, accessionNumber: String(index), filingDate: new Date(0), cik: "1021882", filingUrl: "", ...fundSeries === undefined ? {} : { fundSeries } });
+  const trust = [...Array.from({ length: 14 }, (_, index) => filing("NPORT-P", index, false)), filing("NPORT-P", 20, true), filing("497K", 21, true), filing("N-CEN", 22, false)];
+  expect(await loadLatestFilings(async (count) => trust.slice(0, count), 2)).toMatchObject({
+    hidden: { otherFunds: 14 }, filings: [{ accessionNumber: "20" }, { accessionNumber: "21" }],
+  });
+  // A list the service did not mark, or marked none of as the fund's own, stays whole.
+  const unmarked = trust.map(({ fundSeries: _series, ...rest }) => rest);
+  expect((await loadLatestFilings(async (count) => unmarked.slice(0, count), 2)).filings.map((row) => row.accessionNumber)).toEqual(["0", "1"]);
+  const none = trust.map((row) => ({ ...row, fundSeries: false }));
+  expect((await loadLatestFilings(async (count) => none.slice(0, count), 2)).filings.map((row) => row.accessionNumber)).toEqual(["0", "1"]);
 });
 
 test("a read that leaves the list short is followed by a larger one, up to the issuer in full; a short list is all there is", async () => {
@@ -104,4 +119,21 @@ test("a read that leaves the list short is followed by a larger one, up to the i
   expect(await loadLatestFilings(async (count) => { reads.push(count); return few.slice(0, count); }, 5, { schedulesAboutOthers: true }))
     .toMatchObject({ hidden: { pricingSupplements: 10, ownershipReportsAboutOthers: 1 }, filings: [{ form: "8-K" }, { form: "10-Q" }] });
   expect(reads).toEqual([200]);
+});
+
+// `filings BRK.B` listed Berkshire's Form 4s of Sirius XM as "BERKSHIRE HATHAWAY INC / Insider Transaction".
+test("a Form 4 row says whose shares, which way, how many and at what price", () => {
+  const trade = { ownerName: "BERKSHIRE HATHAWAY INC", issuerName: "SIRIUS XM HOLDINGS INC.", issuerTicker: "SIRI", issuerCik: "908937",
+    code: "P", side: "buy" as const, shares: 924_281, price: 29.0975 };
+  // Filed as an owner of another company's shares: that company is named, since the list names only the filer.
+  expect(form4TradeText({ cik: "0001067983", form4: trade })).toBe("Bought 924.3k SIRI shares at $29.10 (SIRIUS XM HOLDINGS INC.)");
+  // An insider of the company itself: who traded.
+  expect(form4TradeText({ cik: "0001067983", form4: { ...trade, ownerName: "Jain Ajit", issuerName: "BERKSHIRE HATHAWAY INC",
+    issuerTicker: "BRK.A", issuerCik: "1067983", code: "G", side: "disposed", shares: 19, price: null } })).toBe("Jain Ajit: Gift of 19 shares");
+  expect(form4TradeText({ cik: "320193", form4: { ...trade, issuerCik: "320193", ownerName: "COOK TIMOTHY D", code: "S", side: "sell", shares: 120_000, price: 231.5 } }))
+    .toBe("COOK TIMOTHY D: Sold 120k shares at $231.50");
+  // A grant of options and nothing else counts options.
+  expect(form4TradeText({ cik: "320193", form4: { ...trade, issuerCik: "320193", ownerName: "COOK TIMOTHY D", code: "A", side: "acquired",
+    shares: 20_000, price: null, derivative: true } })).toBe("COOK TIMOTHY D: Awarded 20k options");
+  expect(form4TradeText({ cik: "320193" })).toBeNull();
 });

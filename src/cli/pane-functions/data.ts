@@ -7,11 +7,11 @@ import { parseChartSpec } from "../../plugins/builtin/chart-composer/chart-spec"
 import { normalizeTickerInput } from "../../tickers/search";
 import type { MarketContext } from "../types";
 import { argumentNamesTicker, cleanTickerInput } from "./options";
-import { parsePublicTickerKey, publicTickerKey } from "../../utils/exchanges";
+import { canonicalExchange, parsePublicTickerKey, publicTickerKey } from "../../utils/exchanges";
 import type { ResolvedPaneFunction } from "./resolver";
 import { toMarketDataContext } from "../../market-data/selectors";
 import { quoteMetadataFromQuote } from "../../market-data/quotes/metadata";
-import { loadSeasonalityHistory, SEASONALITY_HISTORY_RESOLUTION } from "../../plugins/builtin/seasonality/client";
+import { loadSeasonalityHistory } from "../../plugins/builtin/seasonality/client";
 import type { InstrumentRef } from "../../market-data/request-types";
 import { CORRELATION_HISTORY_RESOLUTION, loadCorrelationHistory } from "../../plugins/builtin/correlation/history";
 import type { TimeRange } from "../../time-series/range";
@@ -27,11 +27,23 @@ const SHOT_PRICE_HISTORY_RANGE = "5Y" as const;
 const FINANCIAL_ANALYSIS_PANE_ID = "financial-analysis";
 const FINANCIAL_ANALYSIS_TEMPLATE_ID = "financial-analysis-pane";
 
+/**
+ * The saved row of the listing a pane function was given. A listing named by
+ * its venue (0700:HKEX, or Z74 with --exchange SGX) that was saved under its
+ * bare symbol on that venue is that row, keyed as named: the pane looks its
+ * ticker up by the key it is bound to, and a row keyed 0700 would leave it
+ * with no ticker at all. A bare row saved on another venue is another listing.
+ */
 export async function loadStoredShotTicker(context: MarketContext, symbol: string): Promise<TickerRecord | null> {
   const normalized = cleanTickerInput(symbol);
-  const { symbol: bare } = parsePublicTickerKey(normalized);
-  return await context.store.loadTicker(normalized)
-    ?? (bare !== normalized ? await context.store.loadTicker(bare) : null);
+  const { symbol: bare, exchange } = parsePublicTickerKey(normalized);
+  const named = await context.store.loadTicker(normalized);
+  if (named || bare === normalized) return named;
+  const saved = await context.store.loadTicker(bare);
+  if (!saved) return null;
+  if (!exchange) return saved;
+  if (canonicalExchange(saved.metadata.exchange) !== canonicalExchange(exchange)) return null;
+  return { ...saved, metadata: { ...saved.metadata, ticker: normalized } };
 }
 
 /**
@@ -106,7 +118,8 @@ export async function withShotSeasonalityHistory(
   if (history.error || history.stale) {
     throw new Error(`${instrument.symbol}: ${history.error ?? `${cadence} price history is stale`}`);
   }
-  return { ...financials, priceHistory: history.history, priceHistoryResolution: SEASONALITY_HISTORY_RESOLUTION[cadence] };
+  // The bars as served: the pane closes a continuous future's rolls itself, from its daily bars.
+  return { ...financials, priceHistory: history.served.points, priceHistoryResolution: history.served.resolution };
 }
 
 /**
@@ -238,7 +251,7 @@ export function collectShotSymbols(resolved: ResolvedPaneFunction, rawArg: strin
     }
   }
   // A text argument is a phrase, not a symbol, so it must never be looked up as one.
-  const argIsTicker = argumentNamesTicker(resolved.template, resolved.headless);
+  const argIsTicker = argumentNamesTicker(resolved.template, resolved.headless, resolved.pane);
   let symbols = resolved.createOptions?.symbols?.length
     ? resolved.createOptions.symbols
     : [

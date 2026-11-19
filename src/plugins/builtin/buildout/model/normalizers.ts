@@ -1,4 +1,4 @@
-import { metricNumber, textOrNull, tickerSymbol, uniqueStrings } from "../format";
+import { metricNumber, moneyAmount, textOrNull, tickerSymbol, uniqueStrings } from "../format";
 import type {
   BuildoutCompany,
   BuildoutList,
@@ -121,10 +121,48 @@ export function normalizeList(raw: RawObject): BuildoutList {
     avgSectorGrowth: stringField(raw, "avgSectorGrowth", "avg_sector_growth"),
     avgReturn1y: stringField(raw, "avgReturn1y", "avg_return_1y"),
     avgMargin: stringField(raw, "avgMargin", "avg_margin"),
+    leaders: raw.importanceCounts && typeof raw.importanceCounts === "object"
+      ? numberField(raw.importanceCounts as RawObject, "leader")
+      : null,
   };
 }
 
+/**
+ * The statement figures a depositary receipt can carry in the issuer's
+ * reporting currency under a "$" and the receipt's USD currency: the service
+ * converts a foreign listing's figures and keeps the local ones as "...Original",
+ * but for an ADR it prints the local amounts as they are and names no currency
+ * (SK hynix's receipt shows the won revenue of its Korean listing as dollars).
+ */
+const STATEMENT_FIELDS = ["revenue", "netIncome", "freeCashFlow", "operatingCashFlow", "totalCash", "totalDebt", "dilutedEps"] as const;
+
+/** A yearly figure this many times the company's whole market value is not dollars. */
+const IMPLAUSIBLE_MULTIPLE_OF_MARKET_CAP = 10;
+
+/**
+ * A USD row with nothing converted whose revenue or net income dwarfs its own
+ * market cap has statements in another currency, and the row does not say
+ * which: the figures are left out rather than shown as wrong dollars. The
+ * ordinary range of revenue to market cap is a few times; the rows this
+ * catches sit at 15 to 4,000.
+ */
+function withoutUnconvertedStatements(company: BuildoutCompany): BuildoutCompany {
+  const converted = [company.revenueOriginal, company.netIncomeOriginal].some((value) => textOrNull(value) != null);
+  const usd = (company.currency?.trim().toUpperCase() || "USD") === "USD";
+  const cap = moneyAmount(company.marketCap);
+  if (converted || !usd || cap == null || cap <= 0) return company;
+  const revenue = moneyAmount(company.revenue);
+  const income = moneyAmount(company.netIncome);
+  const limit = cap * IMPLAUSIBLE_MULTIPLE_OF_MARKET_CAP;
+  if ((revenue == null || Math.abs(revenue) <= limit) && (income == null || Math.abs(income) <= limit)) return company;
+  return { ...company, ...Object.fromEntries(STATEMENT_FIELDS.map((field) => [field, null])) };
+}
+
 export function normalizeCompany(raw: RawObject): BuildoutCompany {
+  return withoutUnconvertedStatements(readCompany(raw));
+}
+
+function readCompany(raw: RawObject): BuildoutCompany {
   const ticker = tickerSymbol(stringField(raw, "ticker"));
   const name = stringField(raw, "name") ?? ticker ?? "Company";
   const supplyChain = objectField(raw, "supplyChain", "supply_chain");
@@ -221,6 +259,8 @@ export function normalizeCompany(raw: RawObject): BuildoutCompany {
     logoUrl: stringField(raw, "logoUrl", "logo_url"),
     researchReport: stringField(raw, "researchReport", "research_report"),
     listReason: stringField(raw, "listReason", "list_reason"),
+    listRole: stringField(raw, "listCategoryRole", "list_category_role"),
+    listTier: stringField(raw, "listCategoryImportance", "list_category_importance"),
     intelligence: arrayField(raw, "intelligence").map((item) => ({
       publishedAt: stringField(item, "publishedAt", "published_at"),
       headline: stringField(item, "headline", "title"),

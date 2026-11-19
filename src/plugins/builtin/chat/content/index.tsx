@@ -60,6 +60,9 @@ import { openChatPaneLink } from "../pane-links/open";
 import { runChatCommand, useChatFunctions } from "../pane-links/commands";
 import type { ChatMessagePaneLink } from "../pane-links/model";
 import { splitComposerDraft, type ComposerShareLink } from "../pane-links/composer";
+import { useSharePreviewStates } from "../pane-links/previews";
+import { terminalChatPaneChipRows } from "../pane-links/share-card";
+import { terminalComposerChipWidth } from "../message/pane-chip";
 import { teamStore } from "../../../../team/store";
 import { requestAccountManagementTab } from "../../account-management/navigation";
 import {
@@ -75,6 +78,7 @@ import {
 import { applyCommandSuggestion, detectChatCommandTrigger, filterCommandSuggestions } from "./command-suggestions";
 import { getComposerCursorOffset } from "./composer-cursor";
 import { ChatHandlePrompt, chatHandlePromptRows, handleSavedMessage, useChatHandlePrompt } from "./handle-prompt";
+import { SignInWall } from "../../cloud/auth-actions";
 
 interface ChatContentProps {
   width: number;
@@ -88,7 +92,36 @@ interface ChatContentProps {
   onTargetMessageHandled?: () => void;
 }
 
-export function ChatContent({
+/** No account and no saved login to finish: the chat shows nothing. */
+function isSignedOut(snapshot: { user: unknown; hasSavedSession: boolean }): boolean {
+  return !snapshot.user && !snapshot.hasSavedSession;
+}
+
+/** A check the app made this recently (the status bar's, on launch) answers for the pane. */
+const RECENT_SESSION_CHECK_MS = 30_000;
+
+/**
+ * Chat sits behind the wall every account-gated pane shows: signed out there
+ * is no transcript, no channel list and nothing to read, only the wall. A
+ * saved login, or an account still confirming its email, reads the chat and
+ * is asked at the composer to finish signing in.
+ */
+export function ChatContent(props: ChatContentProps) {
+  const controller = props.controller ?? chatController;
+  const [signedOut, setSignedOut] = useState(() => isSignedOut(controller.getSnapshot()));
+  useEffect(() => controller.subscribe((snapshot) => setSignedOut(isSignedOut(snapshot))), [controller]);
+  // Nothing behind the wall asks for the session, so a sign-in made elsewhere
+  // (the web app's cookie) is picked up here.
+  useEffect(() => {
+    if (isSignedOut(controller.getSnapshot())) void controller.refreshSession({ reuseCheckWithinMs: RECENT_SESSION_CHECK_MS }).catch(() => {});
+  }, [controller]);
+  if (signedOut) {
+    return <SignInWall placement="chat-signin" action="chat" width={props.width} height={props.height} />;
+  }
+  return <ChatConversation {...props} />;
+}
+
+function ChatConversation({
   width,
   height,
   focused,
@@ -188,7 +221,6 @@ export function ChatContent({
     conversationActivity,
     draftAttachments,
     hasOlderMessages,
-    hasSavedSession,
     loading,
     loadingOlderMessages,
     messages,
@@ -348,6 +380,13 @@ export function ChatContent({
   useEffect(() => {
     setMentionSelectedIndex(0);
   }, [suggestionTriggerKey]);
+  // The waiting links' cards are as tall as what they say, which changes as each share is read.
+  const draftLinkStates = useSharePreviewStates(nativePaneChrome ? [] : draftLinks.map((link) => link.id));
+  const draftLinkRows = useMemo(
+    () => draftLinks.reduce((rows, link) => rows + terminalChatPaneChipRows(link, terminalComposerChipWidth(contentWidth)), 0),
+    // The rows are read from the share previews' cache, which `draftLinkStates` follows.
+    [contentWidth, draftLinkStates, draftLinks],
+  );
   const {
     composerHeight,
     messageAreaHeight,
@@ -361,7 +400,7 @@ export function ChatContent({
     replyTo,
     stackHeader: stackedNav && !channelListOpen,
     draftAttachmentCount: draftAttachments.length,
-    draftLinkCount: draftLinks.length,
+    draftLinkRows,
     promptRows: canSend && !nativePaneChrome ? chatHandlePromptRows(handlePrompt, contentWidth) : 0,
   });
   const {
@@ -919,7 +958,7 @@ export function ChatContent({
     setSelectedIdx,
     stickyTranscript,
     useDefaultControllerChannel,
-    composerLayoutKey: `${editingMessage ? "" : draftAttachments.map((attachment) => attachment.status).join(",")}:${draftLinks.length}`,
+    composerLayoutKey: `${editingMessage ? "" : draftAttachments.map((attachment) => attachment.status).join(",")}:${draftLinks.length}:${draftLinkRows}`,
     highlightMessage,
     clearHover,
     clearHighlight,
@@ -1211,7 +1250,6 @@ export function ChatContent({
         contentWidth={contentWidth}
         focused={focused}
         focusComposer={focusComposer}
-        hasSavedSession={hasSavedSession}
         inputFocused={inputFocused}
         inputPlaceholder={inputPlaceholder}
         inputRef={inputRef}

@@ -2,6 +2,7 @@ import { Box, Input, Span, Text, TextAttributes, useUiCapabilities, useUiHost } 
 import { useEffect, useLayoutEffect, useRef, useState, type ComponentType, type RefObject } from "react";
 import { type InputRenderable } from "../../ui";
 import { useThemeColors } from "../../theme/theme-context";
+import { placeholderText } from "../../theme/colors";
 import { useRemoteUiNode } from "../../remote/semantic-tree";
 import { remoteStringValue } from "../../remote/semantic-helpers";
 import { truncateWithEllipsis } from "../../utils/text-wrap";
@@ -39,6 +40,11 @@ export interface TextFieldProps {
   label?: string;
   /** Accessible name when the visible label is rendered separately. */
   accessibleLabel?: string;
+  /**
+   * Leaves the field out of remote control's UI tree, for an owner that
+   * registers it itself under its own name (a form's field row).
+   */
+  remoteHidden?: boolean;
   /**
    * The form's current field, in a form that walks its fields with the
    * keyboard. The terminal marks its label with "> " and indents the other
@@ -137,6 +143,7 @@ function InlineTextField({ label = "", labelWidth = 0, active, width, hint, onMo
 function TextFieldControl({
   label,
   accessibleLabel,
+  remoteHidden = false,
   active,
   value,
   placeholder,
@@ -162,11 +169,19 @@ function TextFieldControl({
   const colors = useThemeColors();
   backgroundColor ??= variant === "well" ? colors.panel : colors.bg;
   textColor ??= colors.text;
-  placeholderColor ??= colors.textDim;
-  useRemoteUiNode({
+  // The label takes a caller's placeholder colour, dim otherwise; the placeholder is the role.
+  const labelColor = placeholderColor ?? colors.textDim;
+  const placeholderFg = placeholderColor ?? placeholderText(colors);
+  const localInputRef = useRef<InputRenderable>(null);
+  const resolvedInputRef = inputRef ?? localInputRef;
+  // The field's one node: the input under it is hidden, so a value typed
+  // here is listed once, with the field's name and type beside it.
+  useRemoteUiNode(remoteHidden ? null : {
     role: "text-field",
     label: accessibleLabel ?? label ?? placeholder,
+    disabled,
     actions: {
+      focus: () => { if (!disabled) resolvedInputRef.current?.focus?.(); },
       setValue: (input) => {
         const nextValue = remoteStringValue(input);
         if (!disabled) onChange?.(nextValue);
@@ -191,7 +206,7 @@ function TextFieldControl({
         focused={focused && !disabled}
         disabled={disabled}
         width={width}
-        inputRef={inputRef}
+        inputRef={resolvedInputRef}
         onChange={onChange}
         onSubmit={onSubmit}
         onBlur={onBlur}
@@ -209,15 +224,13 @@ function TextFieldControl({
     );
   }
 
-  const localInputRef = useRef<InputRenderable>(null);
-  const resolvedInputRef = inputRef ?? localInputRef;
   const currentValueRef = useRef(value ?? "");
   const [cursorOffset, setCursorOffset] = useState((value ?? "").length);
   const isPassword = type === "password";
   const currentValue = value ?? "";
   const maskedValue = maskPassword(currentValue);
   const maskedDisplay = maskedValue.length > 0 ? maskedValue : (placeholder ?? "");
-  const maskedTextColor = maskedValue.length > 0 ? textColor : placeholderColor;
+  const maskedTextColor = maskedValue.length > 0 ? textColor : placeholderFg;
 
   useEffect(() => {
     currentValueRef.current = currentValue;
@@ -239,7 +252,7 @@ function TextFieldControl({
     <Box flexDirection="column">
       {label && (
         <Box height={1}>
-          <Text fg={placeholderColor}>{active === undefined ? label : `${active ? "> " : "  "}${label}`}</Text>
+          <Text fg={labelColor}>{active === undefined ? label : `${active ? "> " : "  "}${label}`}</Text>
         </Box>
       )}
       <Box height={1} onMouseDown={() => {
@@ -249,6 +262,8 @@ function TextFieldControl({
       }}>
         <Input
           ref={resolvedInputRef}
+          data-gloom-remote-hidden
+          type={type}
           width={width}
           value={value}
           selectable={!isPassword}
@@ -256,7 +271,7 @@ function TextFieldControl({
           {...(maxLength === undefined ? {} : { maxLength })}
           focused={focused && !disabled}
           textColor={isPassword ? backgroundColor : textColor}
-          placeholderColor={placeholderColor}
+          placeholderColor={placeholderFg}
           backgroundColor={backgroundColor}
           selectionBg={isPassword ? backgroundColor : undefined}
           selectionFg={isPassword ? backgroundColor : undefined}

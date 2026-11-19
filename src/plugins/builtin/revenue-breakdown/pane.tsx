@@ -99,7 +99,7 @@ function RevenueBreakdownView({ width, height, focused }: { width: number; heigh
     clearOnError: (error) => error instanceof Error && error.message === NO_BREAKDOWN,
   });
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => void resource.reload(), { focused });
+  usePaneRefreshKey(() => resource.reload(), { focused });
 
   const payload = useMemo(
     () => (resource.data ? reportedSpan(resource.data.payload) : null),
@@ -214,6 +214,8 @@ function RevenueBreakdownView({ width, height, focused }: { width: number; heigh
       {payload ? (
         <DataTableView<Item>
           columns={columns}
+          // Reporting quarters in time order, then the latest and TTM.
+          columnReorder={false}
           items={items}
           focused={focused}
           rootWidth={width}

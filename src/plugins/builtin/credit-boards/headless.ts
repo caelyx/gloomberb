@@ -1,6 +1,8 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { HeadlessPaneColumn, HeadlessPaneDefinition, HeadlessPaneRow } from "../../../types/plugin";
 import type { CdxBoardIndex, CreditIndexQuote } from "../../../api-client/credit-boards";
-import { CDX_MAX_DAYS, fetchCdxBoard, fetchSovrBoard, loadCurrencyMoves } from "./client";
+import { boardPublisher, CDX_MAX_DAYS, fetchCdxBoard, fetchSovrBoard, loadCurrencyMoves } from "./client";
+import { readsInBatches } from "../../../market-data/batched-reads";
 import {
   cdxDay,
   cdxRows,
@@ -10,12 +12,13 @@ import {
   formatCurrencyMove,
   formatLevel,
   formatMove,
+  levelKinds,
   partialDayText,
   quoteUnits,
   sovrRows,
 } from "./model";
 
-const percentile = (value: unknown) => value == null ? "--" : Number(value).toFixed(0);
+const percentile = (value: unknown) => value == null ? MISSING_VALUE : Number(value).toFixed(0);
 /** A 1Y rank as the board draws it, a whole number, so exports do not carry 8.23293172691. */
 const rank = (value: number | null) => value == null ? null : Math.round(value);
 /** The series a row is of, as `history` and the data catalog name it: `cdx:hy`, `sovereign-cds:br`. */
@@ -53,11 +56,6 @@ const dayColumn: HeadlessPaneColumn = {
   format: (value) => typeof value === "string" ? value : "",
 };
 
-/** The publisher a board's payload names, spelled out: `DTCC PPD` is DTCC's public price dissemination. */
-function boardPublisher(source: string | null | undefined): string | undefined {
-  return source?.trim().replace(/\bPPD\b/, "Public Price Dissemination") || undefined;
-}
-
 /**
  * Each day's level on the contract on the run that day, newest first, over
  * the last `days`: the chart as a table. Its key is `day`, not `date`, so the
@@ -74,6 +72,8 @@ function historySection(index: CdxBoardIndex, days: number, now: number) {
   const priced = index.quote === "price" && index.points.some((point) => point.spreadBp !== undefined);
   const partial = today.partial && latest === index.date;
   const symbol = cdxSeries(index.id);
+  const shown = index.points.filter((point) => point.date > from).reverse();
+  const kinds = levelKinds(shown, (point) => point.kind);
   return {
     title: `${index.name} 5Y daily ${index.quote === "spread" ? "spread" : "price"}`,
     columns: [
@@ -83,11 +83,12 @@ function historySection(index: CdxBoardIndex, days: number, now: number) {
       { key: "prints", header: "Prints", align: "right" as const },
       { key: "maturity", header: "Contract", textFormat: (value: unknown) => formatContract(typeof value === "string" ? value : null) },
       ...(partial ? [dayColumn] : []),
+      ...kinds.columns,
     ],
-    rows: index.points.filter((point) => point.date > from).reverse().map((point) => ({
+    rows: shown.map((point) => ({
       day: point.date, level: point.level, unit,
       ...(priced ? { spreadBp: point.spreadBp ?? null, spreadUnit: "bp" } : {}),
-      prints: point.prints, maturity: point.maturity, series: symbol,
+      prints: point.prints, maturity: point.maturity, series: symbol, ...kinds.row(point),
       ...(partial && point.date === latest ? { session: partialDayText(point.prints, today.lastPrintAt), partial: true, lastPrintAt: today.lastPrintAt } : {}),
     })),
     rowUnitKey: "unit",
@@ -104,7 +105,10 @@ const CDX_COLUMNS: HeadlessPaneColumn[] = [
   moveColumn("change1W", "1W", "changeUnit"),
   moveColumn("change1M", "1M", "changeUnit"),
   spreadColumn,
-  { key: "percentile", header: "Pctl 1Y", align: "right", format: percentile },
+  { key: "percentile", header: "Pctl 1Y", align: "right", format: percentile,
+    description: "Where the spread sits in its last year, 100 the widest. IG and iTraxx rank their spread; HY and EM rank the spread "
+      + "equivalent of each day's on-the-run contract, not their price; CMBX, quoted in price alone, ranks its price upside down, "
+      + "so its lowest price is 100. Blank with fewer than 20 days of spreads in the year." },
   { key: "prints", header: "Prints", align: "right" },
   { key: "contract", header: "Contract" },
   { key: "date", header: "As of" },
@@ -133,6 +137,7 @@ export const cdxHeadless: HeadlessPaneDefinition<"bundle"> = {
     const shown = index ? [index] : payload.indexes;
     // A server that predates the spread equivalent sends none: no column of blanks.
     const spreads = shown.some((entry) => entry.spreadBp !== undefined);
+    const kinds = levelKinds(shown, (entry) => entry.kind);
     const rows = cdxRows(shown, payload.asOf, now).map((row) => {
       const units = quoteUnits(row.index.quote);
       const priced = spreads && row.index.quote === "price";
@@ -151,6 +156,7 @@ export const cdxHeadless: HeadlessPaneDefinition<"bundle"> = {
         contract: formatContract(row.index.maturity),
         date: row.index.date,
         changeDate: row.day.changeDate,
+        ...kinds.row(row.index),
         ...(row.day.partial ? { session: partialDayText(row.index.prints, row.day.lastPrintAt), partial: true, lastPrintAt: row.day.lastPrintAt } : {}),
       };
     });
@@ -158,7 +164,7 @@ export const cdxHeadless: HeadlessPaneDefinition<"bundle"> = {
     return {
       sections: [
         {
-          title: "On the run, 5Y", columns: [...CDX_COLUMNS.filter((column) => spreads || column !== spreadColumn), ...(anyPartial ? [dayColumn] : [])], rows,
+          title: "On the run, 5Y", columns: [...CDX_COLUMNS.filter((column) => spreads || column !== spreadColumn), ...(anyPartial ? [dayColumn] : []), ...kinds.columns], rows,
           rowUnitKey: "unit", rowSymbolKey: "series", rowAsOfKey: "date", interval: "daily",
         },
         ...(index ? [historySection(index, days, now)] : []),
@@ -170,6 +176,15 @@ export const cdxHeadless: HeadlessPaneDefinition<"bundle"> = {
   },
 };
 
+const SOVR_COLUMNS: HeadlessPaneColumn[] = [
+  { key: "name", header: "Sovereign" },
+  levelColumn,
+  moveColumn("change1M", "1M", "unit"),
+  { key: "currency", header: "Ccy 1M", align: "right" },
+  { key: "percentile", header: "Pctl 1Y", align: "right", format: percentile },
+  { key: "date", header: "As of" },
+];
+
 export const sovrHeadless: HeadlessPaneDefinition<"rows"> = {
   discovery: { aliases: ["SOVR", "WCDS"], dataRequirements: ["Gloom Cloud sovereign CDS endpoint"],
     limitations: ["Daily 5Y levels from public DTCC prints; thinly traded names can miss days."] },
@@ -178,14 +193,7 @@ export const sovrHeadless: HeadlessPaneDefinition<"rows"> = {
   argument: { kind: "free-text", optional: true, placeholder: "country",
     description: "A country (Brazil, BR) to list its row alone; omit for every sovereign." },
   options: [],
-  columns: [
-    { key: "name", header: "Sovereign" },
-    levelColumn,
-    moveColumn("change1M", "1M", "unit"),
-    { key: "currency", header: "Ccy 1M", align: "right" },
-    { key: "percentile", header: "Pctl 1Y", align: "right", format: percentile },
-    { key: "date", header: "As of" },
-  ],
+  columns: SOVR_COLUMNS,
   describe: "Sovereign CDS",
   async load(args, ctx) {
     const payload = await fetchSovrBoard(ctx.apiClient);
@@ -193,10 +201,13 @@ export const sovrHeadless: HeadlessPaneDefinition<"rows"> = {
     const country = query ? findSovereign(payload.sovereigns, query) : null;
     if (query && !country) throw new Error(`No sovereign ${query}. Use one of: ${payload.sovereigns.map((entry) => entry.name).join(", ")}.`);
     const sovereigns = country ? [country] : payload.sovereigns;
+    const batch = await readsInBatches(ctx.marketData, "getPriceHistory");
     const moves = await loadCurrencyMoves(sovereigns.map((row) => row.currency),
-      (symbol) => ctx.marketData.getPriceHistory(symbol, "", "3M"));
+      (symbol) => ctx.marketData.getPriceHistory(symbol, "", "3M", batch ? { batch } : undefined), batch);
     const publisher = boardPublisher(payload.source);
+    const kinds = levelKinds(sovereigns, (row) => row.kind);
     return {
+      ...(kinds.columns.length ? { columns: [...SOVR_COLUMNS, ...kinds.columns] } : {}),
       rows: sovrRows(sovereigns, payload.asOf, moves).map((row) => ({
         name: row.label,
         series: sovereignSeries(row.sovereign.id),
@@ -206,6 +217,7 @@ export const sovrHeadless: HeadlessPaneDefinition<"rows"> = {
         currency: formatCurrencyMove(row.sovereign.currency, row.currencyMove),
         percentile: rank(row.percentile),
         date: row.sovereign.date,
+        ...kinds.row(row.sovereign),
       })),
       rowUnitKey: "unit",
       rowSymbolKey: "series",

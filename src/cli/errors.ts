@@ -1,25 +1,33 @@
 import type { AppPersistence } from "../data/app-persistence";
-import { ApiRequestError } from "../api-client/errors";
+import { ApiRequestError, wasAskedTwice } from "../api-client/errors";
 import { DEFAULT_CLI_OPTIONS, type CliGlobalOptions } from "./options";
 import { serializeCliError, type CliErrorObject } from "./result";
+import { unreachableHint } from "./unreachable";
 import { cliStyles, cliTerminalWidth, wrapText } from "../utils/cli-output";
 import { withSearchHints, type FredSeriesCheck } from "./not-a-ticker";
-import { isProviderBusy, SEARCH_BUSY_CODE, SEARCH_BUSY_MESSAGE } from "../sources/provider-errors";
+import { isProviderBusy, isSourceFailure, SEARCH_BUSY_CODE, SEARCH_BUSY_MESSAGE, serviceDidNotAnswerMessage } from "../sources/provider-errors";
 import { DATA_SERVICE_UNREACHABLE_MESSAGE, isNetworkFailure } from "../utils/network-failure";
+import { isReasonCode, readableError } from "../utils/reason-codes";
 
 const USAGE_PREFIX = "Usage: ";
 /** The code of every error a command fails with: bad input, nothing found, an option it does not take. */
 export const CLI_ERROR_CODE = "cli_error";
+/** The code of a command that ran, and the data service has nothing for what it asked. */
+export const NO_DATA_CODE = "no_data";
 /** The code of a command whose requests never reached the data service. */
-export const SERVICE_UNREACHABLE_CODE = "service_unreachable";
+const SERVICE_UNREACHABLE_CODE = "service_unreachable";
+/** The code of a command whose data no source could serve just now, one having failed rather than had none. */
+const SOURCE_UNAVAILABLE_CODE = "source_unavailable";
 
-/** What to check when nothing answered: the connection, and the proxy when one is set. */
-function unreachableHint(): string {
-  const env = typeof process === "undefined" ? {} : process.env;
-  const proxy = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"].find((name) => env[name]?.trim());
-  return proxy
-    ? `Check the internet connection and the proxy in ${proxy}, then try again.`
-    : "Check the internet connection, then try again.";
+
+
+/**
+ * An answer of the data service that a source it reads failed and nothing it
+ * kept could stand in (the 13F source down): the service was reached, and
+ * asked again later it may answer.
+ */
+export function isSourceUnavailableAnswer(error: unknown): error is ApiRequestError {
+  return error instanceof ApiRequestError && error.code === SOURCE_UNAVAILABLE_CODE;
 }
 
 export interface CliErrorContext {
@@ -61,9 +69,30 @@ export function failWithFields(message: string, code: string, fields: Record<str
   throw new CliFailure(message, undefined, code, undefined, fields);
 }
 
+/** Fails as `error` says: its code, message, details and whether to retry, and any field it carries beside them. */
+export function failWithError(error: CliErrorObject): never {
+  const { code, message, details, retryable, ...fields } = error;
+  throw new CliFailure(message, details, code, retryable, Object.keys(fields).length > 0 ? fields : undefined);
+}
+
 /** Fails with what asking again shortly may get past (a busy service): `--json` marks it `retryable`. */
 export function failRetryable(message: string, code: string): never {
   throw new CliFailure(message, undefined, code, true);
+}
+
+/**
+ * What a command says when its requests never reached the data service:
+ * `message` names what it could not get (by default only that), and the
+ * details what to check. `--json` marks it retryable.
+ */
+export function unreachableError(message = DATA_SERVICE_UNREACHABLE_MESSAGE): CliErrorObject {
+  return { code: SERVICE_UNREACHABLE_CODE, message, details: unreachableHint(), retryable: true };
+}
+
+/** Fails as a command whose requests never reached the data service (`unreachableError`). */
+export function failUnreachable(message?: string): never {
+  const error = unreachableError(message);
+  throw new CliFailure(error.message, error.details, error.code, error.retryable);
 }
 
 export function closeAndFail(persistence: AppPersistence, message: string, details?: string): never {
@@ -96,15 +125,41 @@ function cliErrorObject(error: unknown): CliErrorObject {
   }
   // No answer came back at all: in Gloom's words, whichever fetch failed (Bun's "Unable to connect", a refused proxy).
   if (isNetworkFailure(error)) {
-    return { code: SERVICE_UNREACHABLE_CODE, message: DATA_SERVICE_UNREACHABLE_MESSAGE, details: unreachableHint(), retryable: true };
+    return unreachableError();
+  }
+  // A source failed (a timeout, a rate limit) where none had the data to answer: asked again it may.
+  if (isSourceFailure(error) || isSourceUnavailableAnswer(error)) {
+    const message = error instanceof Error ? error.message : String(error);
+    // It failed, it is not missing: says to ask again unless the message already says when.
+    return { code: SOURCE_UNAVAILABLE_CODE, message, ...(/\btry again\b/i.test(message) ? {} : { details: "Try again in a moment." }), retryable: true };
+  }
+  // A listing read the data service failed to answer twice: said in Gloom's words. Any other 5xx keeps the server's.
+  if (wasAskedTwice(error)) {
+    return { code: SOURCE_UNAVAILABLE_CODE, message: serviceDidNotAnswerMessage(undefined, error), retryable: true };
   }
   // Gloom Cloud refused what was asked (an unknown series, a bad date): the input was wrong, not the program.
   if (error instanceof ApiRequestError && error.status === 400) {
     return { code: CLI_ERROR_CODE, message: error.message };
   }
+  const message = error instanceof Error ? error.message : String(error);
+  // A read that ended in the data service's bare reason code: it had nothing, or its source failed and may answer later.
+  if (isReasonCode(message)) {
+    return NOTHING_CODES.has(message.trim())
+      ? { code: NO_DATA_CODE, message }
+      : { code: SOURCE_UNAVAILABLE_CODE, message, retryable: true };
+  }
+  return { code: "unexpected_error", message };
+}
+
+/** The reason codes that say the data service has nothing, as opposed to a source that failed. */
+const NOTHING_CODES = new Set(["NO_DATA", "NOT_FOUND", "BAD_MAPPING"]);
+
+/** What a failure says in words: a reason code (UPSTREAM_ERROR) in its message or details reads as what happened. */
+function readableCliError(error: CliErrorObject): CliErrorObject {
   return {
-    code: "unexpected_error",
-    message: error instanceof Error ? error.message : String(error),
+    ...error,
+    message: readableError(error.message),
+    ...(typeof error.details === "string" ? { details: readableError(error.details) } : {}),
   };
 }
 
@@ -155,7 +210,7 @@ function hintedError(error: CliErrorObject, args: readonly string[], isFredSerie
 
 export function printCliError(error: unknown, options: CliGlobalOptions, context: CliErrorContext = {}): void {
   if (options.quiet && options.format === "text") return;
-  const errorObject = cliErrorObject(error);
+  const errorObject = readableCliError(cliErrorObject(error));
   console.error(options.format === "text"
     ? formatCliErrorText(hintedError(errorObject, context.args ?? [], context.isFredSeries), context)
     : serializeCliError(errorObject, options));

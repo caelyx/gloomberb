@@ -29,9 +29,12 @@ function setup() {
   const backend = {
     requireWorkspace: () => workspace,
     setConfig: () => {},
-    detachedWindows: { reconcile: () => {} },
     reconcileWindows: () => {},
-    flushPendingWindowFocus: () => {},
+    fullWindowKey: (rpc: DesktopRpc) => {
+      const key = rpcs.getRpcWindowKey(rpc);
+      return key && !key.startsWith("detached:") ? key : null;
+    },
+    detachedWindows: { reconcile: () => {} },
     stateBroadcaster,
   } as unknown as DesktopBackend;
   const open = (key: string, onState?: (snapshot: DesktopSharedStateSnapshot) => void): TestWindow => {
@@ -112,7 +115,11 @@ describe("desktop state fan-out", () => {
       [2, { collectionId: "main", cursorSymbol: "MSFT" }],
       [2, { collectionId: "main", cursorSymbol: "MSFT" }],
     ]);
-    expect(late.received).toEqual([workspace.getSnapshot(), workspace.getSnapshot()]);
+    // Each state is numbered, so a window's next sync can name the one it built on.
+    expect(late.received.map(({ stateSeq, ...snapshot }) => [typeof stateSeq, snapshot])).toEqual([
+      ["number", workspace.getSnapshot()],
+      ["number", workspace.getSnapshot()],
+    ]);
   });
 
   test("a popped-out window gets the state its own change made, so its next save keeps the main window's tabs and font size", async () => {
@@ -148,7 +155,9 @@ describe("desktop state fan-out", () => {
     const saved = workspace.getSnapshot().config;
     expect(saved.fontSize).toBe(15);
     expect(saved.layouts.map((entry) => entry.name)).toEqual(["Home", "Monitor", "Macro", "Added"]);
-    expect(main.received.map((snapshot) => snapshot.paneState["portfolio-list:main"])).toEqual([
+    // The copied tab came with the original's id and got one of its own, which goes back to the main window.
+    expect(new Set(main.received[0]!.config.layouts.map((entry) => entry.id)).size).toBe(4);
+    expect(main.received.slice(1).map((snapshot) => snapshot.paneState["portfolio-list:main"])).toEqual([
       { collectionId: "main", cursorSymbol: "MSFT" },
       { collectionId: "main", cursorSymbol: "MSFT" },
     ]);

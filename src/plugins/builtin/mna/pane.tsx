@@ -12,7 +12,7 @@ import {
   type PaneHint,
   type SelectControl,
 } from "../../../components";
-import { usePaneStatusFooter } from "../../../components/layout/pane/status-footer";
+import { useCompanyDataFooter, usePaneStatusFooter } from "../../../components/layout/pane/status-footer";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { isAccessDenied } from "../../../api-client/errors";
 import type {
@@ -48,11 +48,16 @@ import {
   formatListDate,
   formatPercentShort,
   formatPrice,
+  legsApart,
   MISSING,
   partyCell,
+  spreadBasisLabel,
   stageLabel,
   termsLabel,
 } from "./model";
+import { formatFeedTime } from "../../../utils/datetime-format";
+import { createDataTableCsv } from "../../../components/data-table/export";
+import { logFailure } from "../../../utils/log-failure";
 
 const STATUS_OPTIONS: { value: MnaStatusFilter; label: string }[] = [
   { value: "pending", label: "Pending" },
@@ -72,7 +77,7 @@ const REGION_OPTIONS: { value: MnaRegionFilter; label: string }[] = [
   { value: "intl", label: "International" },
 ];
 
-type ColumnId = "date" | "target" | "acquirer" | "terms" | "value" | "price" | "spread" | "annualized" | "close" | "stage";
+type ColumnId = "date" | "target" | "acquirer" | "terms" | "value" | "price" | "spread" | "annualized" | "basis" | "close" | "stage";
 
 const COLUMNS: Record<ColumnId, DataTableColumn> = {
   date: { id: "date", label: "DATE", width: 8, align: "left" },
@@ -83,20 +88,26 @@ const COLUMNS: Record<ColumnId, DataTableColumn> = {
   price: { id: "price", label: "PRICE", width: 9, align: "right" },
   spread: { id: "spread", label: "SPREAD", width: 7, align: "right" },
   annualized: { id: "annualized", label: "ANN.", width: 7, align: "right" },
+  // What the spread's prices are: a session's closes (`Mon close`), or trades and when (`15:42`, `8h apart`).
+  basis: { id: "basis", label: "AS OF", width: 12, align: "left" },
   close: { id: "close", label: "CLOSE", width: 7, align: "left" },
   stage: { id: "stage", label: "STAGE", width: 16, align: "left" },
 };
 
 const COLUMNS_BY_STATUS: Record<MnaStatusFilter, ColumnId[]> = {
-  pending: ["date", "target", "acquirer", "terms", "value", "price", "spread", "annualized", "close", "stage"],
+  pending: ["date", "target", "acquirer", "terms", "value", "price", "spread", "annualized", "basis", "close", "stage"],
   talks: ["date", "target", "acquirer", "value", "stage"],
   completed: ["date", "target", "acquirer", "terms", "value", "close"],
   terminated: ["date", "target", "acquirer", "terms", "value", "close"],
-  all: ["date", "target", "acquirer", "terms", "value", "spread", "stage"],
+  all: ["date", "target", "acquirer", "terms", "value", "spread", "basis", "stage"],
 };
 
-/** What goes first when the pane is too narrow for every column. */
-const DROP_ORDER: ColumnId[] = ["price", "close", "date", "value", "annualized", "terms", "stage", "acquirer", "spread"];
+/**
+ * What goes first when the pane is too narrow for every column. The spread
+ * never shows without what it is as of: AS OF goes only with it. The
+ * announcement date goes before the expected close, which an arb reads.
+ */
+const DROP_ORDER: ColumnId[] = ["price", "date", "close", "value", "annualized", "terms", "stage", "acquirer", "spread"];
 
 /** Columns that fit `width`; `targetWidth` widens the target column, e.g. for the unlock prompt. */
 function mnaColumns(status: MnaStatusFilter, width: number, targetWidth = COLUMNS.target.width): DataTableColumn[] {
@@ -105,7 +116,7 @@ function mnaColumns(status: MnaStatusFilter, width: number, targetWidth = COLUMN
   const need = (list: ColumnId[]) => list.reduce((sum, id) => sum + widthOf(id) + 1, 0);
   for (const drop of DROP_ORDER) {
     if (need(ids) <= width) break;
-    ids = ids.filter((id) => id !== drop);
+    ids = ids.filter((id) => id !== drop && !(drop === "spread" && id === "basis"));
   }
   const ended = status === "completed" || status === "terminated";
   return ids.map((id) => ({
@@ -238,7 +249,9 @@ function MnaDealsView({ focused, width, height, symbol }: {
       .then((page) => {
         if (pageRequest.current === request) setPaged({ owner: first, payload: appendMnaDeals(data, page) });
       })
-      .catch(() => {})
+      .catch((error) => {
+        if (!request.signal.aborted) logFailure("mna.pane", "Load more M&A deals failed")(error);
+      })
       .finally(() => {
         if (pageRequest.current === request) setLoadingMore(false);
       });
@@ -246,7 +259,7 @@ function MnaDealsView({ focused, width, height, symbol }: {
   const onScroll = useTableLoadMore(scrollRef, !!data?.hasMore && !loadingMore && !openId, loadMore);
 
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => void resource.reload(), { focused, enabled: !openId });
+  usePaneRefreshKey(() => resource.reload(), { focused, enabled: !openId });
 
   const deals = data?.deals ?? NO_DEALS;
   const quoteSymbols = useMemo(() => {
@@ -279,6 +292,11 @@ function MnaDealsView({ focused, width, height, symbol }: {
         case "price": return spreadOf(deal)?.price ?? null;
         case "spread": return spreadOf(deal)?.spread ?? null;
         case "annualized": return spreadOf(deal)?.annualized ?? null;
+        case "basis": {
+          const basis = spreadOf(deal)?.basis;
+          // As of when: a close at its New York evening, a trade at its time.
+          return !basis ? null : basis.kind === "close" ? Date.parse(`${basis.session}T21:00:00Z`) : basis.at;
+        }
         case "close": return deal.closed ?? expectedCloseDate(deal.expectedClose)?.toISOString().slice(0, 10) ?? null;
         case "stage": return stageLabel(deal);
         default: return null;
@@ -293,6 +311,11 @@ function MnaDealsView({ focused, width, height, symbol }: {
   const columns = useMemo(
     () => mnaColumns(status, width, locked > 0 ? Math.min(lockedText.length + 3, Math.floor(width / 3)) : undefined),
     [locked, lockedText, status, width],
+  );
+  // Export CSV keeps the columns an earlier export had where they were: AS OF, drawn beside the spread, comes last.
+  const exportColumns = useMemo(
+    () => [...columns.filter((column) => column.id !== "basis"), ...columns.filter((column) => column.id === "basis")],
+    [columns],
   );
   const items = useMemo<Item[]>(() => [
     ...Array.from({ length: Math.min(MAX_LOCKED_ROWS, locked) }, (_, index) => ({ kind: "locked" as const, index })),
@@ -337,6 +360,8 @@ function MnaDealsView({ focused, width, height, symbol }: {
     hints,
   });
   usePaneFooter("mna:access", () => (access.segment && !openId ? { order: 5, info: [access.segment] } : null), [access.segment, openId]);
+  // A receipt's or foreign line's deals include its company's, read from the home line.
+  useCompanyDataFooter(data?.companyFrom, !openId);
 
   const placeholder = blendHex(colors.bg, colors.textMuted, 0.35);
   const renderCell = useCallback((item: Item, column: DataTableColumn, _index: number, state: { selected: boolean }): DataTableCell => {
@@ -376,6 +401,13 @@ function MnaDealsView({ focused, width, height, symbol }: {
       case "annualized": {
         const annualized = spreadOf(deal)?.annualized ?? null;
         return { text: annualized == null ? MISSING : formatPercentShort(annualized), color: annualized == null ? muted : base };
+      }
+      case "basis": {
+        const spread = spreadOf(deal);
+        if (!spread) return { text: MISSING, color: muted };
+        // Trades too far apart to be one moment's take the warning tone every stale mark has.
+        const apart = legsApart(spread.basis);
+        return { text: spreadBasisLabel(spread.basis, (at) => formatFeedTime(at), Date.now(), { timed: false }), color: apart && !state.selected ? colors.warning : muted };
       }
       case "close": {
         const ended = deal.status === "completed" || deal.status === "terminated";
@@ -455,6 +487,7 @@ function MnaDealsView({ focused, width, height, symbol }: {
         resetTo: { columnId: null, direction: "desc" },
       }))}
       renderCell={renderCell}
+      exportCsv={() => createDataTableCsv({ columns: exportColumns, items, renderCell })}
       scrollRef={scrollRef}
       onBodyScrollActivity={onScroll}
       resetScrollKey={paramsKey}

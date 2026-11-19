@@ -33,7 +33,7 @@ import { useShortcut } from "../../../react/input";
 import { colors } from "../../../theme/colors";
 import { Box, Text, TextAttributes, useRendererHost, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { withCountryFlag } from "../../../components/ui/country-flag";
-import { formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatNumber } from "../../../utils/format";
 import { isPlainKey } from "../../../utils/keyboard";
 import { nextHeaderSort } from "../../../utils/sort-values";
 import { ProWall, SignInWall } from "../cloud/auth-actions";
@@ -47,6 +47,8 @@ import {
   buildMoverColumns,
   buildMoverRows,
   buildPostingColumns,
+  PENDING_JOBS_MESSAGE,
+  pendingJobsTitle,
   buildPostingRows,
   buildShareBars,
   changeTone,
@@ -114,19 +116,19 @@ function companyFigures(summary: CloudJobsSummaryPayload, width: number): StatIt
         ? { id: "posted", label: "Posted 30d", value: formatNumber(summary.posted30d, 0) }
         : { id: "closed", label: "Closed 30d", value: formatNumber(summary.closed30d, 0) },
     { id: "new", label: "New 7d", value: formatNumber(summary.new7d, 0), detail: roomy && summary.coverage.daysObserved <= 1 ? "first read" : undefined },
-    { id: "remote", label: "Remote", value: summary.remoteShare != null ? formatShare(summary.remoteShare) : "-" },
-    { id: "age", label: "Median age", value: summary.medianAgeDays != null ? `${summary.medianAgeDays}d` : "-" },
+    { id: "remote", label: "Remote", value: summary.remoteShare != null ? formatShare(summary.remoteShare) : MISSING_VALUE },
+    { id: "age", label: "Median age", value: summary.medianAgeDays != null ? `${summary.medianAgeDays}d` : MISSING_VALUE },
     // Standing roles the company hires for continuously; the rest are the
     // openings that say something about its plans.
     {
       id: "evergreen",
       label: "Evergreen",
-      value: summary.evergreenShare != null ? formatShare(summary.evergreenShare) : "-",
+      value: summary.evergreenShare != null ? formatShare(summary.evergreenShare) : MISSING_VALUE,
       detail: roomy && summary.evergreenCount != null && summary.evergreenShare != null
         ? `${formatNumber(Math.max(0, summary.openCount - summary.evergreenCount), 0)} specific`
         : undefined,
     },
-    { id: "contract", label: "Contract", value: summary.contractShare != null ? formatShare(summary.contractShare) : "-" },
+    { id: "contract", label: "Contract", value: summary.contractShare != null ? formatShare(summary.contractShare) : MISSING_VALUE },
   ];
 }
 
@@ -536,7 +538,7 @@ function CompanyPanel({
     [symbol, companyName],
   );
   const resource = useAsyncResource<JobsCompanyState>(request);
-  const { data, status, error, loading, reload } = resource;
+  const { data, status, error, loading, reload, reloadAndWait } = resource;
 
   // `r` asks again in every state, including a failed or uncovered company.
   usePaneRefreshKey(reload, { focused });
@@ -558,15 +560,18 @@ function CompanyPanel({
   // A failed look at an uncovered company says so: the old answer left up
   // would read as the new one.
   if (status === "error" && (!data || data.kind === "uncovered")) {
-    return <PaneStatusBody error={error ?? "Could not load hiring data."} errorTitle="Could not load hiring data." retry={{ onRetry: reload }} />;
+    return <PaneStatusBody error={error ?? "Could not load hiring data."} errorTitle="Could not load hiring data." retry={{ onRetry: reloadAndWait }} />;
   }
   if (!data) return null;
   if (data.kind === "pending") {
+    // An answer, not a load: the server is looking, which takes minutes, so the pane says so at once and fills in
+    // when the poll above brings the roles. A spinner here stood for minutes and read as a pane that never loaded.
     return (
       <PaneStatusBody
-        loading
-        align="center"
-        loadingLabel={`Looking for ${symbol}'s careers system. First read lands within a few minutes.`}
+        empty
+        emptyTitle={pendingJobsTitle(symbol)}
+        emptyMessage={PENDING_JOBS_MESSAGE}
+        retry={{ onRetry: reloadAndWait, pending: loading, label: "Check now", pendingLabel: "Checking...", unchanged: "Still looking." }}
       />
     );
   }
@@ -577,7 +582,7 @@ function CompanyPanel({
         empty
         emptyTitle={`No careers system found for ${symbol}.`}
         emptyMessage="Gloom reads companies' own careers systems. This one either has none we can read or lists roles only on third-party job boards."
-        retry={{ onRetry: reload, pending: loading, label: "Look again", pendingLabel: "Looking again...", unchanged: "Still no careers system." }}
+        retry={{ onRetry: reloadAndWait, pending: loading, label: "Look again", pendingLabel: "Looking again...", unchanged: "Still no careers system." }}
       />
     );
   }
@@ -606,7 +611,7 @@ function HomeView({ width, height, focused, registrationId }: { width: number; h
   const { navigateTicker } = usePluginTickerActions();
   const request = useCallback(() => fetchJobsMovers(undefined, MOVERS_PAGE), []);
   const resource = useAsyncResource(request);
-  const { data, status, error, reload } = resource;
+  const { data, status, error, reload, reloadAndWait } = resource;
   const [sort, setSort] = usePluginPaneState<MoverSort>("jobs:movers-sort", DEFAULT_MOVER_SORT);
   // Keyed by company, not by position, so a reload or a shared layout keeps the row.
   const [selectedKey, setSelectedKey] = usePluginPaneState<string | null>("moversSelectedKey", null);
@@ -689,7 +694,7 @@ function HomeView({ width, height, focused, registrationId }: { width: number; h
   }, [nativePaneChrome]);
 
   if (status === "loading" && !data) return <PaneStatusBody loading align="center" loadingLabel="Loading hiring data..." />;
-  if (status === "error" && !data) return <PaneStatusBody error={error ?? "Could not load hiring data."} errorTitle="Could not load hiring data." retry={{ onRetry: reload }} />;
+  if (status === "error" && !data) return <PaneStatusBody error={error ?? "Could not load hiring data."} errorTitle="Could not load hiring data." retry={{ onRetry: reloadAndWait }} />;
 
   const tableHeight = Math.max(3, height - (nativePaneChrome ? 1 : 0));
   return (

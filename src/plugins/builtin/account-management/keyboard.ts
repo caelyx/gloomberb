@@ -3,6 +3,7 @@ import { useFieldRing, type FieldRing } from "../../../components";
 import { useShortcut } from "../../../react/input";
 import type { ScrollBoxRenderable } from "../../../ui";
 import { isPlainKey } from "../../../utils/keyboard";
+import { logFailure } from "../../../utils/log-failure";
 import type { AccountDraft, AccountFieldKey } from "./model";
 
 const SCOPE = "account-management:fields";
@@ -35,7 +36,11 @@ export function useAccountManagementKeyboard({
   setDraftValue,
   deleteAccount,
   endTrial,
+  cancelPro,
+  copyInvite,
   turnOffEmailAlerts,
+  yearlyPlanAction,
+  dismissYearlyReview,
 }: {
   activeField: AccountFieldKey;
   cyclePortfolio: (delta: number) => void;
@@ -54,7 +59,13 @@ export function useAccountManagementKeyboard({
   setDraftValue: <K extends keyof AccountDraft>(key: K, value: AccountDraft[K]) => void;
   deleteAccount: () => Promise<void>;
   endTrial: () => Promise<void>;
+  cancelPro: () => Promise<void>;
+  copyInvite: () => void;
   turnOffEmailAlerts: () => Promise<void>;
+  /** The yearly row's action: review, pay or open the invoice. */
+  yearlyPlanAction: () => void;
+  /** Closes the yearly review while it is open, else null. */
+  dismissYearlyReview: (() => void) | null;
 }): FieldRing<AccountFieldKey> {
   const actions: Partial<Record<AccountFieldKey, () => void>> = {
     sharedPortfolioId: () => { void openPortfolioDialog(); },
@@ -62,9 +73,13 @@ export function useAccountManagementKeyboard({
     passwordAction: openPasswordDialog,
     upgradeAction: openUpgrade,
     cancelTrialAction: () => { void endTrial(); },
+    cancelProAction: () => { cancelPro().catch(logFailure("account-management.keyboard", "Cancel Pro failed")); },
+    inviteCopyAction: copyInvite,
     assistantsAction: openAssistants,
     deleteAccountAction: () => { void deleteAccount(); },
     emailAlertsOffAction: () => { void turnOffEmailAlerts(); },
+    yearlyPlanAction,
+    yearlyPlanDismissAction: () => dismissYearlyReview?.(),
   };
   for (const key of TOGGLE_FIELDS) actions[key] = () => setDraftValue(key, !draftRef.current[key]);
 
@@ -86,6 +101,12 @@ export function useAccountManagementKeyboard({
     if (event.ctrl && event.name === "s") {
       consume();
       void saveProfile();
+      return;
+    }
+    // Esc closes the yearly review, as Cancel does a form.
+    if (dismissYearlyReview && !event.targetEditable && isPlainKey(event, "escape")) {
+      consume();
+      dismissYearlyReview();
       return;
     }
     if (event.targetEditable || activeField !== "sharedPortfolioId") return;

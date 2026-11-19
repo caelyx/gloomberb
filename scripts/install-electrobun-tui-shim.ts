@@ -1,19 +1,10 @@
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
+import * as ResEdit from "resedit";
 import { buildShotView, packShotView, SHOT_VIEW_ARCHIVE } from "../src/cli/desktop-pane-shot-view";
+import { buildDesktopTuiBundle } from "./desktop-tui-bundle";
 
 type TargetOs = "darwin" | "linux" | "win";
-
-const OPEN_TUI_NATIVE_PACKAGES = [
-  "@opentui/core-darwin-arm64",
-  "@opentui/core-darwin-x64",
-  "@opentui/core-linux-arm64",
-  "@opentui/core-linux-arm64-musl",
-  "@opentui/core-linux-x64",
-  "@opentui/core-linux-x64-musl",
-  "@opentui/core-win32-arm64",
-  "@opentui/core-win32-x64",
-];
 
 const MACOS_SHIM = `#!/bin/sh
 set -eu
@@ -232,21 +223,91 @@ function rceditExecutablePath(): string {
   return existsSync(rceditX64Path) ? rceditX64Path : join(rceditBinDir, "rcedit.exe");
 }
 
+function packageVersion(): string {
+  return (JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as { version: string }).version;
+}
+
+/**
+ * What Windows shows for the app's processes, in Task Manager, a file's
+ * properties and its firewall and security prompts. The runtime is Bun's, and
+ * otherwise carries Bun's name and publisher.
+ */
+function windowsVersionStrings(version: string): string[] {
+  return [
+    "--set-version-string", "FileDescription", "Gloom",
+    "--set-version-string", "ProductName", "Gloom",
+    "--set-version-string", "CompanyName", "Gloom",
+    "--set-product-version", version,
+  ];
+}
+
+/** US English in Unicode: the language rcedit edits a file's version details in. */
+const VERSION_LANGUAGE = { lang: 1033, codepage: 1200 };
+
+/**
+ * Electrobun's launcher, Chromium helpers and updater tools ship with no
+ * version details at all, and rcedit only edits details a file has, so
+ * Windows showed them by file name. Each gets empty ones here, with the app's
+ * version, for rcedit to fill in.
+ */
+function addVersionDetails(exePath: string, version: string): void {
+  let exe: ResEdit.NtExecutable;
+  try {
+    exe = ResEdit.NtExecutable.from(readFileSync(exePath), { ignoreCert: true });
+  } catch (error) {
+    // Electrobun 2's bun.exe is one resedit cannot read: rcedit still edits the details it has.
+    console.log(`Left the version details of ${basename(exePath)} to rcedit: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const resources = ResEdit.NtExecutableResource.from(exe);
+  if (ResEdit.Resource.VersionInfo.fromEntries(resources.entries).length > 0) return;
+  const info = ResEdit.Resource.VersionInfo.createEmpty();
+  info.lang = VERSION_LANGUAGE.lang;
+  // The fixed version is numbers only: a canary's suffix stays in the text.
+  const [major = 0, minor = 0, patch = 0] = /^(\d+)\.(\d+)\.(\d+)/.exec(version)?.slice(1).map(Number) ?? [];
+  info.setFileVersion(major, minor, patch, 0, VERSION_LANGUAGE.lang);
+  info.setProductVersion(major, minor, patch, 0, VERSION_LANGUAGE.lang);
+  info.setStringValues(VERSION_LANGUAGE, { OriginalFilename: basename(exePath) });
+  info.outputToResourceEntries(resources.entries);
+  resources.outputResource(exe);
+  writeFileSync(exePath, Buffer.from(exe.generate()));
+}
+
+/**
+ * The app's programs: the launcher its shortcuts open, the runtime, the
+ * Chromium helpers Electrobun copies once for each kind of process, and the
+ * two tools its updater runs to apply an update.
+ */
+const WINDOWS_EXECUTABLES = [
+  "launcher.exe",
+  "bun.exe",
+  "bun Helper.exe",
+  "bun Helper (Alerts).exe",
+  "bun Helper (GPU).exe",
+  "bun Helper (Plugin).exe",
+  "bun Helper (Renderer).exe",
+  "bspatch.exe",
+  "zig-zstd.exe",
+];
+
 function embedWindowsIcons(runtimePath: string, resourcesPath: string): void {
   const iconPath = createWindowsIcon(resourcesPath);
   const rceditPath = rceditExecutablePath();
-  for (const exeName of ["launcher.exe", "bun.exe"]) {
+  const version = packageVersion();
+  const versionStrings = windowsVersionStrings(version);
+  for (const exeName of WINDOWS_EXECUTABLES) {
     const exePath = join(runtimePath, exeName);
     if (!existsSync(exePath)) continue;
+    addVersionDetails(exePath, version);
     const edited = Bun.spawnSync({
-      cmd: [rceditPath, exePath, "--set-icon", iconPath],
+      cmd: [rceditPath, exePath, "--set-icon", iconPath, ...versionStrings],
       stdout: "inherit",
       stderr: "inherit",
     });
     if (edited.exitCode !== 0) {
       process.exit(edited.exitCode ?? 1);
     }
-    console.log(`Embedded Windows icon: ${exePath}`);
+    console.log(`Embedded Windows icon and name: ${exePath}`);
   }
 }
 
@@ -269,24 +330,7 @@ for (const bundlePath of bundleCandidates(os)) {
   rmSync(tuiBundleDir, { recursive: true, force: true });
   mkdirSync(tuiBundleDir, { recursive: true });
 
-  // Production React and JSX, as the standalone binary ships (see build.ts
-  // for why it takes `--production` rather than NODE_ENV): the development
-  // build is twice the size and every launch of the desktop CLI paid to load it.
-  const build = Bun.spawnSync({
-    cmd: [
-      process.execPath,
-      "build",
-      join(process.cwd(), "src", "renderers", "electrobun", "bun", "tui-entry.ts"),
-      "--target=bun",
-      "--production",
-      `--outdir=${tuiBundleDir}`,
-      ...OPEN_TUI_NATIVE_PACKAGES.map((packageName) => `--external=${packageName}`),
-    ],
-    stdout: "inherit",
-    stderr: "inherit",
-  });
-
-  if (build.exitCode !== 0) {
+  if (buildDesktopTuiBundle(tuiBundleDir) !== 0) {
     process.exit(1);
   }
 

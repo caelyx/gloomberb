@@ -3,7 +3,7 @@ import type { AnalystResearchData, CompanyProfile, CorporateActionsData, Financi
 import { hasLikelyQuoteUnitMismatch } from "../../utils/currency-units";
 import { coalesceFinancialPeriodAliases, mergeFinancialStatementRows } from "../../utils/financial-statements";
 import { normalizePriceHistory, normalizeTickerFinancialsPriceHistory } from "../../utils/price-history";
-import { redactUnavailableFundamentals, RETRACTABLE_VALUATION_FIELDS } from "../../utils/fundamentals";
+import { redactUnavailableFundamentals, RETRACTABLE_VALUATION_FIELDS, RETRACTED_FUNDAMENTALS_FIELDS } from "../../utils/fundamentals";
 import { hasValidQuoteObservationTime, isExtendedHoursExchange, isQuoteStaleForCurrentSession } from "../../market-data/quotes/freshness";
 import { mergeQuoteMetadata, quoteMetadataFromQuote, quoteMetadataMatchesTarget } from "../../market-data/quotes/metadata";
 import { canonicalExchange, parsePublicTickerKey } from "../../utils/exchanges";
@@ -148,35 +148,42 @@ function isQuoteInActiveSession(quote: Quote, now: number): boolean {
 const OPENING_AUCTION_MS = 15 * 60_000;
 
 /**
- * Whether Gloom Cloud vouches that a delayed quote is current, however long
- * ago its last trade was. The service judges more than that trade's age: it
- * knows when it asked for the quote and how often the listing trades, so a
- * thinly traded listing's hour-old trade can be the current price while its
- * venue trades. Its verdict stands in for the age bound when:
+ * Whether Gloom Cloud vouches that a quote is current, however long ago its
+ * last trade was. The service judges more than that trade's age: it knows
+ * when it asked for the quote and how often the listing trades, so a thinly
+ * traded listing's hour-old trade can be the current price while its venue
+ * trades. Its verdict stands in for the age bound when:
  * - the service answered on this request, or a cache entry still inside its
  *   TTL holds that answer (`recentAnswer`); a copy past the TTL is not vouched for;
  * - the answer says `stale: false`. One without the flag vouches for nothing,
  *   and one flagged stale never gets this far;
- * - the quote is delayed. The service bounds a delayed quote's feed age itself
- *   but not a real-time one's, so real-time quotes keep the age bound;
- * - it reports the regular session, the venue's session is in progress as
- *   the delayed feed shows it, and the trade belongs to that session; a
- *   currency pair's session is the service's to judge; or
  * - it reports a US extended-hours session and the trade is no older than
  *   the regular session that session extends: after the close, today's
  *   regular session or its after-hours; before the open, the previous
  *   regular session or anything since. Whether the quote carries the
- *   session's price is the freshness rule's call, made before this one.
+ *   session's price is the freshness rule's call, made before this one. The
+ *   service bounds an extended-hours print's age itself, real-time or
+ *   delayed: past half an hour it asks the source again and keeps the print
+ *   only when the source shows nothing has traded since. GS after hours on
+ *   16 Nov 2026 went more than ten minutes between trades, and its real-time
+ *   quote was dropped as stuck, so the put screen had no price for it; or
+ * - the quote is delayed, it reports the regular session, the venue's
+ *   session is in progress as the delayed feed shows it, and the trade
+ *   belongs to that session; a currency pair's session is the service's to
+ *   judge. The service bounds a delayed quote's feed age in the regular
+ *   session but not a real-time one's, so there real-time quotes keep the
+ *   age bound.
  * The answer says nothing about how often a listing trades, so a liquid
  * listing the service wrongly vouches for is accepted too. The service's own
  * bound for liquid listings, about twenty minutes, is tighter than this one.
  */
 function isVouchedCurrentByService(quote: Quote, exchange: string | undefined, now: number): boolean {
-  if (quote.providerId !== "gloomberb-cloud" || quote.stale !== false || quote.dataSource !== "delayed") return false;
+  if (quote.providerId !== "gloomberb-cloud" || quote.stale !== false) return false;
+  if (quote.dataSource !== "live" && quote.dataSource !== "delayed") return false;
   if (quote.marketState === "PRE" || quote.marketState === "POST") {
     return isUsExtendedHoursSessionPrint(quote.lastUpdated, exchange, quote.marketState, now);
   }
-  if (quote.marketState !== "REGULAR") return false;
+  if (quote.dataSource !== "delayed" || quote.marketState !== "REGULAR") return false;
   // A currency pair trades around the clock through the week, and the service
   // measures its silence against how often that pair prints: a pegged or
   // exotic pair such as SAR=X goes hours without a print while its feed is fine.
@@ -443,7 +450,15 @@ function mergeDefinedObject<T extends object>(preferred: T | null | undefined, f
   return Object.fromEntries(mergedEntries) as T;
 }
 
-function setOrDelete<K extends "dividendRate" | "forwardEps">(target: Fundamentals, key: K, value: Fundamentals[K]): void {
+/** Forward P/E, its consensus EPS and the year it is for: one observation, never pieced together from two. */
+const FORWARD_FIELDS = ["forwardPE", "forwardEps", "forwardEpsCurrency", "forwardEpsPeriodEnd", "forwardEpsObservedAt"] as const;
+
+/** A block that read next year's consensus says what it found, even none: its forward fields stand whole. */
+function readsConsensus(fundamentals: Fundamentals | undefined): boolean {
+  return fundamentals?.forwardEpsPeriodEnd !== undefined;
+}
+
+function setOrDelete<K extends "dividendRate" | (typeof FORWARD_FIELDS)[number]>(target: Fundamentals, key: K, value: Fundamentals[K]): void {
   if (value === undefined) delete target[key];
   else target[key] = value;
 }
@@ -458,12 +473,21 @@ function mergeFundamentals(primary: Fundamentals | undefined, fallback: Fundamen
   const merged = mergeDefinedObject(primary, fallback);
   if (merged) {
     const unavailable = new Set(fallback?.unavailableFields ?? []);
-    for (const field of RETRACTABLE_VALUATION_FIELDS) {
+    for (const field of RETRACTED_FUNDAMENTALS_FIELDS) {
       if (primary?.unavailableFields?.includes(field)) unavailable.add(field);
       else if (typeof primary?.[field] === "number" && Number.isFinite(primary[field])) unavailable.delete(field);
     }
     if (unavailable.size) merged.unavailableFields = [...unavailable];
     else delete merged.unavailableFields;
+    // A retracted cap is none, whatever an older observation held; its reason goes with the retraction that stands.
+    if (unavailable.has("marketCap")) {
+      delete merged.marketCap;
+      merged.marketCapUnavailable = primary?.unavailableFields?.includes("marketCap")
+        ? primary.marketCapUnavailable : fallback?.marketCapUnavailable;
+      if (!merged.marketCapUnavailable) delete merged.marketCapUnavailable;
+    } else {
+      delete merged.marketCapUnavailable;
+    }
   }
   const dividend = primary?.dividendYield != null ? primary : fallback;
   if (merged && dividend) {
@@ -474,10 +498,14 @@ function mergeFundamentals(primary: Fundamentals | undefined, fallback: Fundamen
     merged.dividendYieldSource = dividend.dividendYieldSource;
     setOrDelete(merged, "dividendRate", dividend.dividendRate);
   }
-  const forward = primary?.forwardPE != null ? primary : fallback;
+  const forward = primary?.forwardPE != null || readsConsensus(primary) ? primary : fallback;
   // Forward EPS reprices the forward multiple, so it pairs with that multiple's
-  // observation; a withdrawn one never comes back from an older fallback.
-  if (merged && forward) setOrDelete(merged, "forwardEps", forward.forwardEps);
+  // observation; a withdrawn one never comes back from an older fallback, and
+  // a consensus that is a loss or none never takes an older multiple.
+  if (merged && forward) {
+    if (readsConsensus(forward)) for (const key of FORWARD_FIELDS) setOrDelete(merged, key, forward[key]);
+    else setOrDelete(merged, "forwardEps", forward.forwardEps);
+  }
   if (merged && primary && !primary.financialCurrency && [
     primary.revenue, primary.netIncome, primary.operatingCashFlow, primary.freeCashFlow, primary.eps,
   ].some((value) => value != null)) {
@@ -557,13 +585,18 @@ export function mergeRefreshedFinancials(cached: TickerFinancials, fresh: Ticker
   const merged = mergeFinancials(cached, fresh)!;
   const statistics = redactUnavailableFundamentals(fresh?.fundamentals);
   if (!statistics) return merged;
-  const update: Fundamentals = { unavailableFields: statistics.unavailableFields };
+  const update: Fundamentals = {
+    unavailableFields: statistics.unavailableFields,
+    ...statistics.marketCapUnavailable ? { marketCapUnavailable: statistics.marketCapUnavailable } : {},
+  };
   const currencyConflict = cached.fundamentals?.financialCurrency && statistics.financialCurrency
     && cached.fundamentals.financialCurrency !== statistics.financialCurrency;
   for (const field of RETRACTABLE_VALUATION_FIELDS) {
     if (!currencyConflict && typeof statistics[field] === "number" && Number.isFinite(statistics[field])) update[field] = statistics[field];
   }
   if (!currencyConflict && statistics.enterpriseValueCheck) update.enterpriseValueCheck = statistics.enterpriseValueCheck;
+  // Fresh statistics that read next year's consensus replace the forward figures whole, a loss or none included.
+  if (readsConsensus(statistics)) for (const key of FORWARD_FIELDS) if (statistics[key] !== undefined) update[key] = statistics[key] as never;
   let fundamentals = mergeFundamentals(update, merged.fundamentals);
   // The source serving a multiple or yield without its per-share base has
   // withdrawn that base, so an older one must not keep repricing the figure.

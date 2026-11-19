@@ -12,6 +12,7 @@ import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils"
 import { StaticXAxisLabels } from "./axis-overlays";
 import { buildCompositeViewportTimeAxisLayout } from "./time-axis";
 import { noopRendererHost } from "../../../test-support/renderer-host";
+import { PriceAxisLabels } from "./price-axis-labels";
 
 function hostFor(kind: "opentui" | "desktop-web"): UiHost {
   return {
@@ -97,6 +98,23 @@ type AxisProps = ComponentProps<typeof StaticXAxisLabels>;
 
 const tui = createOpenTuiTestHarness();
 
+test("terminal value axes keep colliding series observations in their own colours, ahead of the pointer's height", async () => {
+  const seriesTags = [
+    { seriesId: "value", seriesLabel: "Estimated value", side: "right" as const, value: 101.25, label: "101.25", color: "#00cc66", yRatio: 0.4, carried: false },
+    { seriesId: "other", seriesLabel: "Other", side: "right" as const, value: 101.26, label: "101.26", color: "#6699ff", yRatio: 0.401, carried: false },
+  ];
+  const props = { axisLabels: new Map<number, string>(), axisWidth: 8, axisSectionWidth: 8, side: "right" as const,
+    height: 6, cursorRow: 2, cursorLabel: "999.00", cursorColor: "#ffffff", seriesTags };
+  await tui.render(<Box width={20} height={8}><PriceAxisLabels {...props} /></Box>, { width: 20, height: 8 });
+  await act(async () => { await tui.setup().renderOnce(); });
+  expect(tui.frame()).toContain("101.25");
+  expect(tui.frame()).toContain("101.26");
+  expect(tui.frame()).not.toContain("999.00");
+  const html = renderToStaticMarkup(<UiHostProvider ui={hostFor("opentui")} renderer={noopRendererHost}><PriceAxisLabels {...props} /></UiHostProvider>);
+  expect(html).toContain("color:#00cc66");
+  expect(html).toContain("color:#6699ff");
+});
+
 /** Renders the axis in terminal cells and returns a frame reader per prop set. */
 async function renderTerminalAxis(initial: AxisProps) {
   let setProps: (props: AxisProps) => void = () => {};
@@ -128,8 +146,9 @@ function expectBadgesClear(
     expect(frame.slice(badge.start, badge.start + badge.label.length)).toBe(badge.label);
     for (let cell = badge.start; cell < badge.start + badge.label.length; cell += 1) badgeCells.add(cell);
   }
+  // Two blank cells either side, so no tick reads as part of a badge's date.
   for (const badge of badges) {
-    for (const edge of [badge.start - 1, badge.start + badge.label.length]) {
+    for (const edge of [badge.start - 2, badge.start - 1, badge.start + badge.label.length, badge.start + badge.label.length + 1]) {
       if (edge >= 0 && edge < frame.length && !badgeCells.has(edge)) expect(frame[edge]).toBe(" ");
     }
   }
@@ -137,7 +156,7 @@ function expectBadgesClear(
     const start = bare.indexOf(label);
     if (start < 0) continue;
     const end = start + label.length - 1;
-    const touched = badges.some((badge) => start <= badge.start + badge.label.length && end >= badge.start - 1);
+    const touched = badges.some((badge) => start <= badge.start + badge.label.length + 1 && end >= badge.start - 2);
     if (!touched) {
       expect(frame.slice(start, end + 1)).toBe(label);
       continue;

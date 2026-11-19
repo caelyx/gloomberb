@@ -7,6 +7,7 @@ import { ChoiceDialog } from "./choice-dialog";
 import { SelectField, openSelectField, type SelectFieldHandle } from "./select-field";
 import { Button } from "./button";
 import { WEB_CELL_WIDTH } from "../../theme/font-scale";
+import { logFailure } from "../../utils/log-failure";
 
 /** A form field's label on the desktop: bold, as TextField draws it. */
 const FORM_LABEL_STYLE = { fontWeight: "var(--gloom-weight-bold)" } as const;
@@ -18,6 +19,8 @@ export interface SelectControl {
 export interface SelectButtonOption<T extends string = string> {
   value: T;
   label: string;
+  /** Heading for a contiguous group of choices; never selectable itself. */
+  group?: string;
   /** Trigger wording when the full label is too wide for a pane header. */
   short?: string;
   description?: string;
@@ -130,13 +133,14 @@ export function SelectButton<T extends string = string>({
           choices={options.map((option) => ({
             id: option.value,
             label: option.label,
+            group: option.group,
             description: option.description,
             disabled: option.disabled,
             color: option.color,
           }))}
         />
       ),
-    }).then((next) => selectValueRef.current(next)).catch(() => {});
+    }).then((next) => selectValueRef.current(next)).catch(logFailure("ui.select-button", "Choose select option failed"));
   }, [dialog, disabled, isDesktopWeb, label, onFocus, options, title, value]);
 
   useImperativeHandle(controlRef, () => ({ open: openDialog }), [openDialog]);
@@ -158,7 +162,7 @@ export function SelectButton<T extends string = string>({
           selectRef={(element) => { selectFieldRef.current = element; }}
           onFocus={onFocus}
           value={value}
-          options={options.map((option) => ({ value: option.value, label: option.label, disabled: option.disabled }))}
+          options={options.map((option) => ({ value: option.value, label: option.label, group: option.group, disabled: option.disabled }))}
           disabled={disabled}
           onChange={selectValue}
         />
@@ -180,6 +184,7 @@ export function SelectButton<T extends string = string>({
           options={options.map((option) => ({
             value: option.value,
             label: option.label,
+            group: option.group,
             disabled: option.disabled,
           }))}
           disabled={disabled}

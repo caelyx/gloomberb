@@ -14,7 +14,7 @@ import { normalizeTickerInput } from "../../../../tickers/search";
 import { useRendererHost } from "../../../../ui";
 import type { ThemePickerHandle } from "../../theme-picker";
 import type { Command } from "../registry";
-import type { CollectionCommandId } from "../../helpers";
+import { SECURITY_DESCRIPTION_SEARCH, type CollectionCommandId } from "../../helpers";
 import {
   runDirectCommandAction,
 } from "./index";
@@ -39,6 +39,8 @@ interface UseCommandBarDirectCommandRuntimeOptions {
   focusTicker: (symbol: string, options?: PinTickerOptions) => void;
   notify: (body: string, options?: { type?: "info" | "success" | "error" }) => void;
   onCheckForUpdates?: () => void | Promise<void>;
+  /** Settings' Run Setup Again; absent where setup cannot run. */
+  onRunSetupAgain?: () => Promise<void>;
   openBuiltInWorkflow: (actionId: string) => void;
   openInlineConfirm: OpenInlineConfirm;
   openModeRoute: (
@@ -66,6 +68,7 @@ export function useCommandBarDirectCommandRuntime({
   focusTicker,
   notify,
   onCheckForUpdates,
+  onRunSetupAgain,
   openBuiltInWorkflow,
   openInlineConfirm,
   openModeRoute,
@@ -90,7 +93,7 @@ export function useCommandBarDirectCommandRuntime({
         closeAll({ revertThemePreview: false });
         return;
       }
-      openModeRoute("ticker-search", "");
+      openModeRoute("ticker-search", "", SECURITY_DESCRIPTION_SEARCH);
       return;
     }
 
@@ -110,7 +113,7 @@ export function useCommandBarDirectCommandRuntime({
       closeAll({ revertThemePreview: false });
       return;
     }
-    openModeRoute("ticker-search", trimmed);
+    openModeRoute("ticker-search", trimmed, SECURITY_DESCRIPTION_SEARCH);
   }, [
     activeCollectionId,
     activeTickerSymbol,
@@ -136,6 +139,7 @@ export function useCommandBarDirectCommandRuntime({
       getState,
       notify,
       onCheckForUpdates,
+      onRunSetupAgain,
       openBuiltInWorkflow,
       openInlineConfirm,
       openModeRoute,
@@ -159,6 +163,7 @@ export function useCommandBarDirectCommandRuntime({
     getState,
     notify,
     onCheckForUpdates,
+    onRunSetupAgain,
     openBuiltInWorkflow,
     openInlineConfirm,
     openModeRoute,

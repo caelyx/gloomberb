@@ -110,7 +110,7 @@ describe("a board with stale rows", () => {
   test("is partial everywhere: the report's line counts the stale rows and a capture's status says so", async () => {
     const loaded = await load(board());
     expect(formatFreshnessLine(deriveHeadlessFreshness(loaded.definition, loaded.result, NOW)))
-      .toBe("Source: BIS and FRED · Thu 24 Sep 2026 (oldest Thu 23 Jul 2026) · 2 of 3 stale");
+      .toBe("Source: BIS, FRED and central banks · Thu 24 Sep 2026 (oldest Thu 23 Jul 2026) · 2 of 3 stale");
     const coverage = await reportShotCoverage({ headless: centralBankRatesHeadless }, async () => loaded);
     expect(coverage).toEqual({ complete: false, unavailableSymbols: [], gaps: "2 stale" });
     // A capture that read its own view as complete takes the report's word, but stays as usable as it was.
@@ -124,10 +124,10 @@ describe("a board with stale rows", () => {
     expect(shotStatusIssues(withReportCoverage(captured, clean))).toEqual([]);
   });
 
-  test("--explain lists the terms the report shows, with the change date defined as the first observation", async () => {
+  test("--explain lists the terms the report shows, with the change date defined as the decision or the first observation", async () => {
     const { definition, args, result } = await load(board());
     const entries = reportGlossary("CBR", renderHeadlessPaneText(definition, result, args, "CBR"));
-    expect(entries.map((entry) => entry.term)).toEqual(["Last move", "Change observed", "Pctl 1Y", "Status"]);
+    expect(entries.map((entry) => entry.term)).toEqual(["Last change", "Changed", "Pctl 1Y", "Status"]);
     expect(entries[1]!.definition).toContain("first date the new rate level appears in the data");
   });
 });
@@ -141,7 +141,8 @@ const board = (): CentralBankRatesPayload => ({ generatedAt: "2026-10-12T10:00:0
   row({ asOf: "2026-10-11", value: 3.875, range: { lower: 3.75, upper: 4 }, previousValue: 3.625,
     notes: ["Midpoint of the target range, not the effective federal funds rate.", "Change date is the first observed new level, not necessarily the announcement or effective date."],
     nextMeeting: { date: "2026-10-28", sourceUrl: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm", verifiedAt: "2026-10-12", kind: "decision" }, nextMeetingStatus: "scheduled",
-    lastDecision: { date: "2026-09-16", sourceUrl: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm", verifiedAt: "2026-10-12", kind: "decision" } }),
+    lastDecision: { date: "2026-09-16", sourceUrl: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm", verifiedAt: "2026-10-12", kind: "decision" },
+    latestDecision: { date: "2026-09-16", sourceUrl: "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm", verifiedAt: "2026-10-12", kind: "decision" } }),
   bis("GB", { seriesNotes: ["From 3 Aug 2006 onwards: official bank rate."], notes: ["From 3 Aug 2006 onwards: official bank rate.", "Change date is the first observed new level, not necessarily the announcement or effective date."],
     nextMeeting: { date: "2026-11-05", sourceUrl: "https://www.bankofengland.co.uk/monetary-policy/upcoming-mpc-dates", verifiedAt: "2026-10-12", kind: "decision" }, nextMeetingStatus: "scheduled" }),
   bis("CN", { asOf: "2026-07-23", lastChangeDate: "2026-07-01", previousAsOf: "2026-06-30", nextMeeting: { date: "2026-10-20", sourceUrl: "https://www.pbc.gov.cn/en/3688253/3689009/3788480/2025092319423510791/index.html", verifiedAt: "2026-10-12", kind: "fixing" } }),
@@ -163,13 +164,29 @@ describe("citable central bank exports", () => {
       .toEqual({ source: "FRED series ECBDFR", publisher: "European Central Bank" });
   });
 
+  test("a bank BIS does not report is cited from its own published decisions, with its page, as-of and next meeting", async () => {
+    // The CBE as Gloom Cloud serves it: no BIS or FRED series, the bank's MPC page its source, read on 12 Nov.
+    const cbeUrl = "https://www.cbe.org.eg/en/monetary-policy/mpc-meetings-schedule";
+    const egypt = row({ id: "EG", label: "Egypt", countryCodes: ["EG"], centralBank: "Central Bank of Egypt", instrument: "Overnight deposit rate",
+      source: null, sourceUrl: cbeUrl, sourceSeriesIds: [], publicationFrequency: null, value: 20, range: null, asOf: "2026-11-12", lagDays: 0,
+      changeBps: 100, lastChangeDate: "2026-10-29", previousValue: 19, previousAsOf: "2026-09-24", direction: "hike",
+      confirmedAt: "2026-11-12T13:20:00.000Z", confirmationSourceUrl: cbeUrl,
+      nextMeeting: { date: "2026-12-17", sourceUrl: cbeUrl, verifiedAt: "2026-11-12" } });
+    const body = { generatedAt: "2026-11-12T13:20:00Z", status: "available" as const, gaps: [], rows: [egypt] };
+    expect(() => validateCentralBankRates(structuredClone(body))).not.toThrow();
+    expect(policyCitation(egypt)).toBe(`Overnight deposit rate 20.00%, Central Bank of Egypt's published decisions (${cbeUrl}), as of 2026-11-12`);
+    expect(policySeriesAttribution(egypt)).toEqual({ source: "Central Bank of Egypt's published decisions", publisher: "Central Bank of Egypt" });
+    const [exported] = (await load(body)).sections[0]!.rows as Array<Record<string, unknown>>;
+    expect(exported).toMatchObject({ source: "Central Bank of Egypt", series_id: null, source_url: cbeUrl, as_of: "2026-11-12", next_meeting: "2026-12-17" });
+  });
+
   test("CSV writes the rate as a number with a range's bounds beside it, then the citation block with the last decision and the row's notes", async () => {
     const result = await load(board());
     const freshness = deriveHeadlessFreshness(centralBankRatesHeadless, result, Date.parse("2026-10-12T10:00:00Z"));
     const report = headlessReportTables(centralBankRatesHeadless, result, { rawArgument: "", argument: null, symbols: [], options: {} }, "CBR", freshness,
       { complete: true, unavailableSymbols: [] });
     const [table] = report.tables;
-    expect(table!.columns).toEqual(["Jurisdiction", "Rate (%)", "Range lower (%)", "Range upper (%)", "Last move (bp)", "Change observed", "Pctl 1Y", "As of", "Status", "Instrument",
+    expect(table!.columns).toEqual(["Jurisdiction", "Rate (%)", "Range lower (%)", "Range upper (%)", "Last change (bp)", "Changed", "Pctl 1Y", "As of", "Status", "Instrument",
       "central_bank", "source", "series_id", "source_url", "as_of", "last_decision", "next_meeting", "next_meeting_kind", "next_meeting_source_url", "next_meeting_verified_at",
       "citation", "notes",
       // A reason drawn for a missing figure, beside the board's own Status.
@@ -192,8 +209,8 @@ describe("citable central bank exports", () => {
     const csv = renderReportCsv(report, freshness).split("\n");
     expect(csv[0]!.split(",").filter((column) => column === "source" || column === "as_of")).toEqual(["source", "as_of"]);
     expect(csv.filter((line) => line && !line.startsWith("#"))).toHaveLength(1 + result.sections[0]!.rows!.length);
-    expect(exportSourceLines(freshness).slice(0, 4)).toEqual([expect.stringContaining("Source: BIS and FRED"),
-      "Publisher: each row's central_bank, via BIS and FRED", "Observation date: 2026-10-11", "Oldest observation: 2026-07-23"]);
+    expect(exportSourceLines(freshness).slice(0, 4)).toEqual([expect.stringContaining("Source: BIS, FRED and central banks"),
+      "Publisher: each row's central_bank, via BIS, FRED or its own published decisions", "Observation date: 2026-10-11", "Oldest observation: 2026-07-23"]);
     const [gb] = result.sections[0]!.rows!.filter((entry) => entry.id === "GB");
     // The BIS series definition goes with the history; the caveat every row shares is said once.
     expect(gb!.notes).toEqual([]);
@@ -206,6 +223,27 @@ describe("citable central bank exports", () => {
     expect(text).toContain("Federal Reserve · last decision 2026-09-16 · next decision 2026-10-28");
     expect(text).toContain("as of 2026-10-11\n  Midpoint of the target range, not the effective federal funds rate.");
     expect(text).not.toContain("Argentina  ");
+  });
+
+  test("the last decision is the latest meeting, a hold included, and the last change has one date: the decision it came from", async () => {
+    const boj = { sourceUrl: "https://www.boj.or.jp/en/mopo/mpmsche_minu/index.htm", verifiedAt: "2026-10-12", kind: "decision" as const };
+    // 7 Nov 2026: the BoJ held on 30 Oct; its last change is the 18 Sep hike, which BIS observed 24 Sep.
+    const japan = bis("JP", { centralBank: "Bank of Japan", value: 1.25, asOf: "2026-11-03", changeBps: 25, previousValue: 1, direction: "hike",
+      lastChangeDate: "2026-09-24", previousAsOf: "2026-09-23", lastDecision: { date: "2026-09-18", ...boj }, latestDecision: { date: "2026-10-30", ...boj },
+      nextMeeting: { date: "2026-12-18", ...boj }, nextMeetingStatus: "scheduled", notes: [] });
+    // A change no decision is credited with keeps the day it was observed.
+    const uk = bis("GB", { lastChangeDate: "2025-12-18", previousAsOf: "2025-12-17", latestDecision: { date: "2026-11-05", ...boj }, asOf: "2026-11-02" });
+    const data: CentralBankRatesPayload = { generatedAt: "2026-11-07T02:05:00Z", status: "available", gaps: [], rows: [japan, uk] };
+    const result = await load(validateCentralBankRates(data));
+    expect(result.sections[0]!.rows!.map((entry) => [entry.id, entry.changeText, entry.changeDate, entry.last_decision])).toEqual([
+      ["JP", "+25bp ↑", "2026-09-18", "2026-10-30"], ["GB", "-25bp ↓", "2025-12-18", "2026-11-05"],
+    ]);
+    const text = renderHeadlessPaneText(centralBankRatesHeadless, result, { rawArgument: "", argument: null, symbols: [], options: {} }, "CBR");
+    expect(text).toContain("Bank of Japan · last decision 2026-10-30 · next decision 2026-12-18");
+    expect(text).not.toContain("2026-09-24");
+    // A latest decision that is no real day, or cites no https page, is left out.
+    const broken = { ...data, rows: [{ ...japan, latestDecision: { ...boj, date: "2026-13-01" } }] };
+    expect(validateCentralBankRates(broken).rows[0]!.latestDecision).toBeUndefined();
   });
 
   test("an older server's null meeting reads as not published, and a field it does not know is dropped, not fatal", async () => {

@@ -24,7 +24,7 @@ import {
 } from "./scheduled";
 
 test("an alert is armed until its lead day, due through the event day, and done once it has gone off", () => {
-  // Three days before Mon Nov 2 is Fri Oct 30, across the month end.
+  // Three days before Mon 2 Nov is Fri 30 Oct, across the month end.
   expect(scheduledPhase("2026-11-02", 3, undefined, "2026-10-29")).toBe("armed");
   expect(scheduledPhase("2026-11-02", 3, undefined, "2026-10-30")).toBe("due");
   expect(scheduledPhase("2026-11-02", 3, undefined, "2026-11-02")).toBe("due");
@@ -34,8 +34,8 @@ test("an alert is armed until its lead day, due through the event day, and done 
   expect(scheduledPhase("2027-02-01", 3, "2026-11-02", "2026-11-03")).toBe("armed");
   expect(scheduledPhase(undefined, 3, undefined, "2026-11-03")).toBe("unscheduled");
   expect(scheduledAlertMessage({ kind: "earnings", symbol: "CRWV", exchange: "" }, "2026-11-09", "2026-11-06"))
-    .toBe("CRWV earnings in 3 days, Mon, Nov 9");
-  expect(scheduledAlertMessage({ kind: "macro", event: "cpi" }, "2026-10-14", "2026-10-13")).toBe("CPI release tomorrow, Wed, Oct 14");
+    .toBe("CRWV earnings in 3 days, Mon 9 Nov");
+  expect(scheduledAlertMessage({ kind: "macro", event: "cpi" }, "2026-10-14", "2026-10-13")).toBe("CPI release tomorrow, Wed 14 Oct");
 });
 
 test("the next event date comes from the day the app shows it on", () => {
@@ -91,7 +91,7 @@ test("event rules keep their dates through storage and take only US listings and
 });
 
 test("alerts add reads price, earnings and calendar event forms and names what it takes", () => {
-  expect(parseAlertAddArgs(["AAPL", "above", "250"], undefined)).toEqual({ kind: "price", symbol: "AAPL", condition: "above", price: 250 });
+  expect(parseAlertAddArgs(["AAPL", "above", "250"], undefined)).toEqual({ kind: "price", symbol: "AAPL", condition: "above", price: 250, typed: "250" });
   expect(parseAlertAddArgs(["CRWV", "earnings"], "3")).toEqual({ kind: "earnings", symbol: "CRWV", leadDays: 3 });
   expect(parseAlertAddArgs(["CRWV", "earnings", "results"], undefined)).toEqual({ kind: "earnings", symbol: "CRWV", leadDays: 0, results: true });
   expect(() => parseAlertAddArgs(["CRWV", "earnings", "results"], "2")).toThrow("takes no --days");
@@ -106,8 +106,8 @@ test("alerts add reads price, earnings and calendar event forms and names what i
   expect(parseAlertAddArgs(["US", "CPI"], undefined)).toEqual({ kind: "macro", event: "cpi", leadDays: 1 });
   expect(parseAlertAddArgs(["FOMC"], undefined, undefined, "US")).toEqual({ kind: "macro", event: "fomc", leadDays: 1 });
   expect(parseAlertAddArgs(["CPI"], undefined, undefined, "CN")).toEqual({ kind: "release", query: "CPI", country: "CN", leadDays: 1 });
-  // A mistyped condition with a price is a price alert gone wrong, and the refusal names the event form too.
-  expect(() => parseAlertAddArgs(["AAPL", "abve", "250"], undefined)).toThrow('alerts add "NBS Manufacturing PMI" --country CN');
+  // A mistyped condition with a price is a price alert gone wrong, and the refusal names every kind there is.
+  expect(() => parseAlertAddArgs(["AAPL", "abve", "250"], undefined)).toThrow("economic calendar release (CPI, FOMC, NBS PMI), news keyword");
   expect(() => parseAlertAddArgs(["AAPL", "above", "250"], undefined, undefined, "CN")).toThrow("--country is for an alert on a calendar event");
   expect(() => parseAlertAddArgs(["PMI"], undefined, undefined, "XQ")).toThrow('Unknown country "XQ"');
   expect(() => parseAlertAddArgs(["CRWV", "earnings"], "0")).toThrow("1 to 14");
@@ -185,7 +185,7 @@ test("the app alerts once when the lead time is reached, logs it, and saves the 
     cpi: async () => ({ release: { nextReleaseAt: "2026-10-14T12:30:00.000Z" } }),
     fomc: async () => [],
   };
-  // Tue Oct 13, 10:00 in New York: one day before the release.
+  // Tue 13 Oct 10:00 in New York: one day before the release.
   const stop = startScheduledEventAlerts(ctx as never, sources, () => Date.parse("2026-10-13T14:00:00Z"), (entry) => logged.push(entry));
   try {
     // The save fails: no one is told and nothing is logged, so the next check alerts once.
@@ -199,12 +199,12 @@ test("the app alerts once when the lead time is reached, logs it, and saves the 
     checkScheduledEventAlertsNow();
     await saved.promise;
     await Bun.sleep(5);
-    expect(notifications).toEqual(["CPI release tomorrow, Wed, Oct 14"]);
+    expect(notifications).toEqual(["CPI release tomorrow, Wed 14 Oct"]);
     const saved1 = readEventAlerts(store.get(EVENT_ALERTS_KEY)!);
     expect(saved1.rules[0]).toMatchObject({ eventDate: "2026-10-14", firedFor: "2026-10-14" });
     expect(saved1.kept).toEqual([future]);
     expect(logged).toEqual([{ kind: "macro_event", ruleId: rule.id, rule: "CPI release · 1d before", firedAt: Date.parse("2026-10-13T14:00:00Z"),
-      value: null, detail: "CPI release tomorrow, Wed, Oct 14", quoteAt: null, source: null }]);
+      value: null, detail: "CPI release tomorrow, Wed 14 Oct", quoteAt: null, source: null }]);
 
     saved = Promise.withResolvers<void>();
     checkScheduledEventAlertsNow();
@@ -463,7 +463,7 @@ test("a calendar event alerts before its release and once with its figures; CPI 
     await check();
     now = Date.parse("2026-10-31T01:31:00Z");
     await check();
-    expect(notifications).toEqual(["NBS Manufacturing PMI (CN) in 21 hours, Sat, Oct 31, 01:30 UTC"]);
+    expect(notifications).toEqual(["NBS Manufacturing PMI (CN) in 21 hours, Sat 31 Oct, 01:30 UTC"]);
     figures.pmi = "50.3";
     now = Date.parse("2026-10-31T01:32:00Z");
     await check();
@@ -480,7 +480,7 @@ test("a calendar event alerts before its release and once with its figures; CPI 
     figures.cpi = "3.1%";
     now = Date.parse("2026-11-10T13:31:00Z");
     await check();
-    expect(notifications.slice(2)).toEqual(["CPI release tomorrow, Tue, Nov 10", "CPI release: CPI y/y 3.1% vs 3.0% expected, prior 2.9%"]);
+    expect(notifications.slice(2)).toEqual(["CPI release tomorrow, Tue 10 Nov", "CPI release: CPI y/y 3.1% vs 3.0% expected, prior 2.9%"]);
     expect(readEventAlerts(store.get(EVENT_ALERTS_KEY)!).rules[0]).toMatchObject({ kind: "macro_event", firedFor: "2026-11-10", printedFor: "2026-11-10" });
   } finally {
     stop();

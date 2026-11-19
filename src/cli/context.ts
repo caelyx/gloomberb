@@ -9,20 +9,29 @@ import { createAppServices } from "../core/app-services";
 import type { PluginCapability } from "../capabilities";
 import type { AppConfig } from "../types/config";
 import type { GloomPlugin } from "../types/plugin";
-import { getLoadablePlugins } from "../plugins/catalog";
-import { standaloneSeriesCatalog, standaloneSeriesInvoker } from "../series/standalone";
+import { standaloneSeriesCatalog, standaloneSeriesInvoker, standaloneSeriesNamed, type SeriesPlugins } from "../series/standalone";
+import { setStandaloneSeriesCatalog } from "../series/standalone-catalog";
 import type { PluginRegistry } from "../plugins/registry";
 import type { LoadedExternalPlugin } from "../plugins/loader";
 import { apiClient } from "../api-client";
 import { fail } from "./errors";
+import { isKnownUsStock } from "./known-us-stocks";
 import { resolvePersistedCloudSessionToken } from "./pane-functions/cloud-session";
 import { cloudStatementReportSources } from "./statement-filings";
 import type { ConfigContext, MarketContext } from "./types";
+import { attachFuturesTermsPersistence } from "../market-data/futures-contract";
+import { createCommandPluginPersistence } from "./saved-copy-persistence";
+
+/** Where a command keeps the futures terms it read, beside the app's other saved copies. */
+const FUTURES_TERMS_NAMESPACE = "market:futures-terms";
 
 export { withCliServices, withConfigData, withMarketData } from "./scoped-context";
 
 interface CliContextOptions {
-  plugins?: GloomPlugin[];
+  /** Every plugin that runs here. Read only once a series is looked up, so a command that never charts one loads none of them. */
+  plugins?: SeriesPlugins;
+  /** The plugins whose asset-data and news capabilities feed the data provider; every plugin when not given. */
+  dataPlugins?: GloomPlugin[];
 }
 
 interface CliServicesOptions {
@@ -41,7 +50,7 @@ export async function ensureCliServicesReady<T extends { ready: Promise<unknown>
   }
 }
 
-function resolveCliCapabilities(config: AppConfig, plugins: GloomPlugin[]): PluginCapability[] {
+function resolveCliCapabilities(config: AppConfig, plugins: readonly GloomPlugin[]): PluginCapability[] {
   const disabledPlugins = new Set(config.disabledPlugins ?? []);
   const disabledSources = new Set(config.disabledSources ?? []);
   return plugins
@@ -71,11 +80,6 @@ function isUnreadableConfig(configFile: string): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ENOENT";
   }
-}
-
-/** The data folder this profile uses, whether or not anything has created it yet. Never writes. */
-export async function resolveCliDataDir(): Promise<string> {
-  return await getDataDir() ?? getGloomberbDirs().data;
 }
 
 /**
@@ -120,8 +124,17 @@ function applyPersistedCloudSession(context: Pick<MarketContext, "persistence">)
 export async function initMarketData(options: CliContextOptions = {}): Promise<MarketContext> {
   const context = await initConfigData();
   applyPersistedCloudSession(context);
-  const plugins = options.plugins ?? getLoadablePlugins();
-  const capabilities = resolveCliCapabilities(context.config, plugins);
+  // The futures terms a command reads are kept in the profile, so a later run the service cannot answer still has them.
+  attachFuturesTermsPersistence(createCommandPluginPersistence(context.persistence.resources, FUTURES_TERMS_NAMESPACE));
+  const plugins: SeriesPlugins = options.plugins ?? (() => (require("../plugins/catalog") as typeof import("../plugins/catalog")).getLoadablePlugins());
+  const capabilities = resolveCliCapabilities(context.config, options.dataPlugins ?? (typeof plugins === "function" ? plugins() : plugins));
+  // A lookup of a symbol the shipped listings show to be a US stock asks for no perpetual contracts.
+  const { GloomberbCloudProvider } = require("../sources/gloomberb-cloud") as typeof import("../sources/gloomberb-cloud");
+  for (const capability of capabilities) {
+    if (capability.kind === "asset-data" && "provider" in capability && capability.provider instanceof GloomberbCloudProvider) {
+      capability.provider.knownUsStock = isKnownUsStock;
+    }
+  }
   const dataProvider = new AssetDataRouter(null, [], context.persistence.resources);
   const registryAdapter: Pick<PluginRegistry, "brokers" | "getEnabledCapabilities"> = {
     brokers: new Map(),
@@ -132,20 +145,28 @@ export async function initMarketData(options: CliContextOptions = {}): Promise<M
   dataProvider.setBackgroundRevalidation(false);
   const seriesCapabilities = standaloneSeriesInvoker(plugins, context.dataDir, context.config.disabledPlugins);
   const findCatalogSeries = standaloneSeriesCatalog(plugins, context.config.disabledPlugins);
-  return { ...context, dataProvider, seriesCapabilities, findCatalogSeries, statementSources: cloudStatementReportSources };
+  const findCatalogSeriesNamed = standaloneSeriesNamed(plugins, context.config.disabledPlugins);
+  // A chart typed as a catalog series' id or name (`fn G fut:crack-321`) reads it from the plugins' declared series.
+  setStandaloneSeriesCatalog(plugins, context.config.disabledPlugins);
+  return { ...context, dataProvider, seriesCapabilities, findCatalogSeries, findCatalogSeriesNamed, statementSources: cloudStatementReportSources };
 }
 
 export async function initCliServices(options: CliServicesOptions = {}) {
+  const { getLoadablePlugins } = require("../plugins/catalog") as typeof import("../plugins/catalog");
   const { dataDir, config, created } = await openCliDataDir();
   const services = createAppServices({
     config,
     plugins: getLoadablePlugins(options.externalPlugins ?? []),
     externalPlugins: options.externalPlugins ?? [],
+    interactive: false,
+    // The command exits once it has answered: no alert poller or stream starts for it.
+    runtime: "command",
   });
   services.providerRouter.setConfigAccessor(() => config);
   services.providerRouter.setBackgroundRevalidation(false);
   await ensureCliServicesReady(services);
   applyPersistedCloudSession(services);
+  attachFuturesTermsPersistence(createCommandPluginPersistence(services.persistence.resources, FUTURES_TERMS_NAMESPACE));
   return {
     config,
     dataDir,

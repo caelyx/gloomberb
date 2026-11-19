@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { PricePoint } from "../../../types/financials";
-import { equityFiveDayReturn, gpuAxisLabels, gpuBoardSections, gpuChangeWindows, gpuEquityGap, gpuEquityRows, gpuFamilies, gpuFamily, gpuHistorySeries, gpuHistoryChart, gpuHistoryViewport, gpuEventDate, gpuEventSections, gpuPricePeriods, gpuPriceLadder, gpuPreviewRows, gpuShortSource, gpuSource, gpuSparklineSeries } from "./model";
-import { gpuEvent, gpuRow } from "./test-fixture";
+import { equityFiveDayReturn, gpuAxisLabels, gpuBoardSections, gpuChangeWindows, gpuEquityGap, gpuEquityRows, gpuFamilies, gpuFamily, gpuHistorySeries, gpuHistoryChart, gpuHistoryViewport, gpuEventDate, gpuEventSections, gpuPricePeriods, gpuPriceLadder, gpuPreviewRows, gpuSettleRows, gpuShortSource, gpuSource, gpuSparklineSeries } from "./model";
+import { gpuEvent, gpuRow, gpuSettle } from "./test-fixture";
 
 describe("GPU observation charts", () => {
   test("step lines and markers use only the selected SKU's real observation dates, preserving archive provenance", () => {
@@ -195,6 +195,16 @@ describe("GPU board layout", () => {
     expect(gpuBoardSections(rows).map((section) => section.label)).toEqual(["H100 List price", "H100 Provider-declared spot", "H100 Ask", "B200 List price"]);
   });
 
+  test("the settle leads with every form factor of the picked GPU, settled or not; across all GPUs only the settled ones", () => {
+    const settles = [gpuSettle({ gpuModel: "MI300X", formFactor: "OAM", status: "no-settle", pricePerGpuHr: null }),
+      gpuSettle({ gpuModel: "A100", memoryGb: 80 }), gpuSettle({ formFactor: "PCIe" }), gpuSettle(), gpuSettle({ gpuModel: "H200", memoryGb: null })];
+    const ids = (model: string) => gpuSettleRows(settles, model).map((row) => row.id);
+    expect(ids("H100")).toEqual(["settle:H100:SXM", "settle:H100:PCIe"]);
+    expect(ids("MI300X")).toEqual(["settle:MI300X:OAM"]);
+    expect(ids("")).toEqual(["settle:H100:SXM", "settle:H100:PCIe", "settle:H200:SXM", "settle:A100:SXM"]);
+    expect(gpuSettleRows(undefined)).toEqual([]);
+  });
+
   test("change windows appear only once a figure exists, so a young history reads as new instead of columns of dashes", () => {
     expect(gpuChangeWindows([gpuRow(), gpuRow({ skuKey: "other" })])).toEqual([]);
     expect(gpuChangeWindows([gpuRow({ change1d: 0 }), gpuRow({ skuKey: "other", change30d: -2 })])).toEqual(["change1d", "change30d"]);
@@ -249,5 +259,5 @@ test("backfilled observed changes stay on their evidence date while published no
   const published = gpuEvent({ origin: "published", observedAt: "2026-10-03T00:00:00.000Z", effectiveAt: "2026-10-01T00:00:00.000Z" });
   expect(gpuEventDate(observed)).toBe(observed.observedAt);
   expect(gpuEventDate(published)).toBe(published.effectiveAt!);
-  expect(gpuEventSections([observed, published]).map(section => section.label)).toEqual(["Thu, Oct 1, 2026", "Fri, Mar 1, 2024"]);
+  expect(gpuEventSections([observed, published]).map(section => section.label)).toEqual(["Thu 1 Oct 2026", "Fri 1 Mar 2024"]);
 });

@@ -1,15 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { useShortcut } from "../../../../react/input";
 import { useKeybindings } from "../../../../app/keybindings";
 import type { WindowEditMode } from "../../../../plugins/registry";
-import {
-  armDoubleEscapeClose,
-  createDoubleEscapeCloseState,
-  offerEscapeTowardClose,
-  resetDoubleEscapeClose,
-  takeDoubleEscapeClose,
-} from "../../../../utils/double-escape-close";
 import { createOneShots } from "../../../../utils/one-shot";
+import { useDoubleEscapeClose } from "../../double-escape-close";
 import {
   inputCaptureAllowsPaneManagementShortcut,
   resolvePaneManagementShortcut,
@@ -19,7 +13,12 @@ interface ShellPaneManagementShortcutOptions {
   askAboutFocusedPane(): boolean;
   cancelActiveDrag(): void;
   closeAllFloatingPanes(): boolean;
-  closeFocusedPane(): boolean;
+  /** `focusNextFloating`: the top floating pane left takes the focus, for closing them one after another. */
+  closeFocusedPane(options?: { focusNextFloating?: boolean }): boolean;
+  /** Closes the focused pane when it is a floating window one Esc closes; false otherwise. */
+  closeFocusedFloatingPane(): boolean;
+  /** Esc Esc's close: the focused pane, then the next floating one, unless it holds unsent work. */
+  closeFocusedPaneOnEscape(): boolean;
   copyFocusedPaneScreenshot(): boolean;
   exportFocusedPaneCsv(): boolean;
   focusedPaneId: string | null;
@@ -32,6 +31,8 @@ interface ShellPaneManagementShortcutOptions {
   overlayOpen: boolean;
   popOutFocusedPane(): boolean;
   shareFocusedPane(): boolean;
+  /** Shows the tab of the focused pane's stack `direction` steps to; false when it is in no stack. */
+  showAdjacentStackTab(direction: 1 | -1): boolean;
   startWindowMode(paneId?: string, mode?: WindowEditMode): void;
   toggleFocusedPaneFullscreen(): boolean;
   toggleFocusedPaneFloating(): boolean;
@@ -42,7 +43,9 @@ export function useShellPaneManagementShortcuts({
   askAboutFocusedPane,
   cancelActiveDrag,
   closeAllFloatingPanes,
+  closeFocusedFloatingPane,
   closeFocusedPane,
+  closeFocusedPaneOnEscape,
   copyFocusedPaneScreenshot,
   exportFocusedPaneCsv,
   focusedPaneId,
@@ -55,21 +58,26 @@ export function useShellPaneManagementShortcuts({
   overlayOpen,
   popOutFocusedPane,
   shareFocusedPane,
+  showAdjacentStackTab,
   startWindowMode,
   toggleFocusedPaneFullscreen,
   toggleFocusedPaneFloating,
   toggleFocusedPaneNewLayout,
 }: ShellPaneManagementShortcutOptions): void {
-  const doubleEscapeCloseRef = useRef(createDoubleEscapeCloseState());
   // A key held down, or a trigger with no repeat flag, runs each action once.
   const [shots] = useState(createOneShots);
   const keybindings = useKeybindings();
 
-  useEffect(() => {
-    if (overlayOpen) {
-      resetDoubleEscapeClose(doubleEscapeCloseRef.current);
-    }
-  }, [overlayOpen]);
+  // Esc Esc closes the focused pane and hands the focus to the next floating
+  // one; one Esc nothing took closes a floating window.
+  useDoubleEscapeClose({
+    targetId: focusedPaneId,
+    overlayOpen,
+    editing: inputCaptured,
+    dragging: hasActiveDrag,
+    close: closeFocusedPaneOnEscape,
+    closeOnSingle: closeFocusedFloatingPane,
+  });
 
   useShortcut((event) => {
     const shortcut = resolvePaneManagementShortcut(event, keybindings);
@@ -105,7 +113,6 @@ export function useShellPaneManagementShortcuts({
         }
         if (askAboutFocusedPane()) {
           shots.get(shortcut).end();
-          resetDoubleEscapeClose(doubleEscapeCloseRef.current);
           event.preventDefault();
           event.stopPropagation();
           return;
@@ -113,46 +120,25 @@ export function useShellPaneManagementShortcuts({
       }
     }
 
-    const isEscape = event.name === "escape" || event.name === "esc";
-    if (isEscape) {
-      const doubleEscapeState = doubleEscapeCloseRef.current;
-      if (!hasActiveDrag() && !overlayOpen) {
-        if (takeDoubleEscapeClose(doubleEscapeState, focusedPaneId, Date.now()) && closeFocusedPane()) {
+    // A stack's tabs step like movement keys, a press each and no cooldown,
+    // and ahead of the panes: a list that reads PageDown without its
+    // modifiers would otherwise take Ctrl+PageDown.
+    if ((shortcut === "next-tab" || shortcut === "prev-tab") && !overlayOpen && !hasActiveDrag()) {
+      if (!inputCaptured || inputCaptureAllowsPaneManagementShortcut(shortcut, event)) {
+        if (showAdjacentStackTab(shortcut === "next-tab" ? 1 : -1)) {
           event.preventDefault();
           event.stopPropagation();
           return;
         }
-      } else {
-        resetDoubleEscapeClose(doubleEscapeState);
       }
+    }
 
-      if (!hasActiveDrag()) return;
+    if ((event.name === "escape" || event.name === "esc") && hasActiveDrag()) {
       cancelActiveDrag();
       event.preventDefault();
       event.stopPropagation();
-    } else {
-      resetDoubleEscapeClose(doubleEscapeCloseRef.current);
     }
   }, { phase: "before" });
-
-  const armDoubleEscape = () => {
-    armDoubleEscapeClose(doubleEscapeCloseRef.current, focusedPaneId, Date.now());
-  };
-
-  // A pane that uses an Esc to leave an empty field may still count it.
-  useShortcut((event) => {
-    if (event.name !== "escape" && event.name !== "esc") return;
-    if (hasActiveDrag() || overlayOpen) return;
-    offerEscapeTowardClose(event, armDoubleEscape);
-  }, { phase: "before", allowEditable: true });
-
-  // Only an Esc nothing else used arms the close, including a footer's Esc
-  // hint: the idle phase runs last and never sees a key a handler consumed.
-  useShortcut((event) => {
-    if (event.name !== "escape" && event.name !== "esc") return;
-    if (hasActiveDrag() || overlayOpen) return;
-    armDoubleEscape();
-  }, { phase: "idle" });
 
   // The pane menu key is a fallback too: a pane that binds "." keeps it,
   // however late it mounted.
@@ -174,7 +160,7 @@ export function useShellPaneManagementShortcuts({
     const shortcut = resolvePaneManagementShortcut(event, keybindings);
     if (!shortcut || hasActiveDrag() || overlayOpen) return;
     if (inputCaptured && !inputCaptureAllowsPaneManagementShortcut(shortcut, event)) return;
-    if (shortcut === "menu") return;
+    if (shortcut === "menu" || shortcut === "next-tab" || shortcut === "prev-tab") return;
     const shot = shots.get(shortcut);
     if (shot.refuses(event)) {
       event.preventDefault();

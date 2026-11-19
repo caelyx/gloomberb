@@ -1,11 +1,18 @@
 import { expect, test } from "bun:test";
 import { ApiRequestError } from "../../../api-client/errors";
 import type { CotClassSummary, CotContractPayload } from "../../../api-client/cot";
-import { fetchCotBoard, loadCotDetail, validateCotContract } from "./client";
-import { COT_MAJOR_CODES, COT_ROOT_OPTIONS, cotChartSeries, cotContractCode, cotContractCodeForTicker, cotContractUnitText, cotLegendValue, cotNetPoints, cotPriceMapping, cotScope, cotUnknownMarketMessage } from "./model";
+import { fetchCotBoard, loadCotDetail, loadCotPriceUnit, validateCotContract } from "./client";
+import { resetFuturesPriceUnits } from "../../../market-data/futures-contract";
+import {
+  COT_MAJOR_CODES, COT_ROOT_OPTIONS, cotChartSeries, cotContractCode, cotContractCodeForTicker, cotContractUnitText, cotFrontPriceUnit, cotLegendValue,
+  cotNetPoints, cotPriceMapping, cotProxyFor, cotProxyNote, cotReleaseTime, cotScope, cotUnknownMarketMessage,
+} from "./model";
 import { FUTURES_CONTRACTS } from "../../../market-data/futures-board";
 import { cotModule } from "./index";
 import { cotHeadless } from "./headless";
+import { headlessReportTables } from "../../../cli/pane-functions/headless";
+import { deriveHeadlessFreshness } from "../../../cli/pane-functions/freshness";
+import { renderReportCsv } from "../../../cli/report-tables";
 import { getPaneFunctionCapability, normalizeCapabilityOptions } from "../../../cli/pane-functions/capabilities";
 import { parsePaneFunctionArgs } from "../../../cli/pane-functions/options";
 import { parseCliGlobalArgs } from "../../../cli/options";
@@ -76,7 +83,7 @@ test("every FUT board root the CFTC reports opens by root as an argument; under 
     const code = cotContractCode(row.code);
     // Each root opens its market, whose front price is that root's own future or, without five years of it, none.
     if (code) expect([row.symbol, null]).toContain(cotPriceMapping(code)?.priceSymbol ?? null);
-    else expect(cotUnknownMarketMessage(row.code)).toBe(`${row.code} (${row.name}) is not reported in the CFTC COT.`);
+    else expect(cotUnknownMarketMessage(row.code)).toBe(`${row.code} (${row.name}) is not reported in COT.`);
   }
   expect(["NG", "ho", "RB", "BZ", "HG", "PL", "PA", "ZC", "ZM", "6E", "OJ", "NG=F"].map(cotContractCode))
     .toEqual(["023651", "022651", "111659", "06765T", "085692", "076651", "075651", "002602", "026603", "099741", "040701", "023651"]);
@@ -109,7 +116,7 @@ test("CME crypto roots name their CFTC market, and only a typed argument or cryp
   const open = (arg: string | undefined, activeTicker: string | null) => template.createInstance!({ activeTicker } as never, { arg } as never);
   expect(await open("BTC", "AAPL")).toMatchObject({ title: "COT BTC", params: { code: "133741" } });
   expect(await open("mbt", null)).toMatchObject({ title: "COT MBT", params: { code: "133742" } });
-  expect(await open(undefined, "BTC")).toMatchObject({ title: "CFTC Positioning", params: undefined });
+  expect(await open(undefined, "BTC")).toMatchObject({ title: "Trader Positioning", params: undefined });
   expect(await open(undefined, "ETH-USD")).toMatchObject({ title: "COT ETH", params: { code: "146021" } });
 
   // Bitcoin and ether chart their front price; the micros, XRP and SOL have no five-year history to chart.
@@ -143,6 +150,42 @@ test("legend values stay exact without the float32 tail of price bars", () => {
   expect(cotLegendValue(-100461, { id: "net" })).toBe("-100,461");
 });
 
+test("the front price reads in its contract's unit, as a quote of the future does: heating oil per gallon", async () => {
+  resetFuturesPriceUnits();
+  // HO's "Front price 4.8221" said nothing of dollars or gallons.
+  expect(cotFrontPriceUnit("022651", "USD / gallon")).toBe("USD/gal");
+  expect(cotLegendValue(Math.fround(4.8221), { id: "price", unit: "USD/gal" })).toBe("$4.8221/gal");
+  // Gold reads as a dollar price, as `quote GC=F` does; a unit with no currency (index points) leaves the number bare.
+  expect(cotFrontPriceUnit("088691", "USD / troy ounce")).toBe("USD");
+  expect(cotLegendValue(4346.3, { id: "price", unit: "USD" })).toBe("$4,346.3");
+  expect(cotFrontPriceUnit("13874A", "index points")).toBeNull();
+  // The unit comes from the contract's terms.
+  const ho = payload(); ho.contract = { ...ho.contract!, contractCode: "022651", marketName: "NY HARBOR ULSD - NEW YORK MERCANTILE EXCHANGE" };
+  const detail = await loadCotDetail("022651", "legacy", { getCloudCotContract: async () => ho,
+    getCloudHistory: async () => ({ status: "success", data: [{ date: "2026-09-15", close: 4.8221 }] }) as never });
+  const priceUnit = await loadCotPriceUnit("022651", { getCloudFuturesContract: async () => ({ symbol: "HO=F", root: "HO", name: "Heating Oil", contract: null, contractSymbol: null, deliveryMonth: null,
+    spec: { unit: "USD / gallon", size: "42,000 gallons", pointValue: 42_000, tick: 0.0001, tickValue: 4.2, settlement: "physical" },
+    lastTrade: null, firstNotice: null, inDelivery: false, settlement: null }) });
+  expect(priceUnit).toBe("USD/gal");
+  const series = cotChartSeries(ho, "noncommercial", detail.price, { positive: "#0f0", warning: "#fa0" }, priceUnit);
+  expect(series.find((entry) => entry.id === "price")?.unit).toBe("USD/gal");
+});
+
+test("jet fuel and kerosene open heating oil, the usual proxy, and say so", async () => {
+  for (const name of ["jet fuel", "Jet Fuel", "kerosene", "aviation fuel"]) {
+    expect(cotContractCode(name), name).toBe("022651");
+    expect(cotProxyFor(name), name).toEqual({ subject: "jet fuel", root: "HO" });
+  }
+  // A market the CFTC reports is no proxy, by name or root.
+  expect(cotProxyFor("heating oil")).toBeNull();
+  expect(cotProxyFor("HO")).toBeNull();
+  expect(cotProxyNote({ subject: "jet fuel", root: "HO" })).toBe("Jet fuel has no CFTC market: heating oil (NY Harbor ULSD, HO) is the usual proxy. "
+    + "Its price: gloom quote HO=F; US jet fuel stocks (EIA, weekly): gloom fn G CAP:doe:jet");
+  const template = cotModule.paneTemplates![0]!;
+  expect(await template.createInstance!({ activeTicker: null } as never, { arg: "jet fuel" } as never))
+    .toMatchObject({ title: "COT HO (jet fuel proxy)", params: { code: "022651" } });
+});
+
 test("the class's net leads the chart series, ahead of the front price", () => {
   const history = ["2026-09-08", "2026-09-15"].map((reportDate, index) => ({ reportDate, openInterest: 200,
     positions: [{ id: "commercial" as const, long: 10 + index, short: 30, spreading: 0, net: index - 20, netPercentOfOpenInterest: -10 }] }));
@@ -157,16 +200,19 @@ test("the class's net leads the chart series, ahead of the front price", () => {
 test("commodity names open their market as FUT finds them, before a six-letter word is read as a CFTC code", async () => {
   const names = ["cocoa", "Coffee", "SUGAR", "cotton", "OJ", "orange juice", "gold", "silver", "copper", "crude", "oil", "natural gas", "brent", "soybean", "bitcoin", "fed funds"];
   expect(names.map(cotContractCode)).toEqual([
-    "073732", "083731", "080732", "033661", "040701", "040701", "088691", "084691", "085692", "067651", "067651", "023651", "06765T", "005602", "133741", "045601",
+    "073732", "083731", "080732", "033661", "040701", "040701", "088691", "084691", "085692", "067651", "067651", "023651", "ICE00B", "005602", "133741", "045601",
   ]);
   // COFFEE and COPPER are six letters, as a CFTC code is; the name wins.
   expect(["COFFEE", "COPPER"].map(cotContractCode)).toEqual(["083731", "085692"]);
   // A named market the CFTC does not report says so; a name nothing matches gets codes and names that work.
   expect(cotContractCode("aluminum")).toBeNull();
-  expect(cotUnknownMarketMessage("aluminum")).toBe("ALI (Aluminum) is not reported in the CFTC COT.");
+  expect(cotUnknownMarketMessage("aluminum")).toBe("ALI (Aluminum) is not reported in COT.");
   expect(cotContractCode("pork bellies")).toBeNull();
   expect(cotUnknownMarketMessage("pork bellies")).toContain("CC cocoa, KC coffee, SB sugar");
   expect(cotUnknownMarketMessage("pork bellies")).toContain("HG copper");
+  // A currency's ISO code opens its CME future, as its name does (`fn COT JPY` said "Unknown market"), and the hint names one.
+  expect(["JPY", "jpy", "yen", "CHF", "EUR", "GBP", "CAD", "AUD", "MXN"].map(cotContractCode))
+    .toEqual(["097741", "097741", "097741", "092741", "099741", "096742", "090741", "232741", "095741"]);
   const template = cotModule.paneTemplates![0]!;
   expect(await template.createInstance!({ activeTicker: null } as never, { arg: "cocoa" } as never)).toMatchObject({ title: "COT CC", params: { code: "073732" } });
 });
@@ -195,6 +241,148 @@ test("a market's report lists its weeks newest first, the newest n with --limit 
     expect(weeks!.title, flags.join(" ")).toBe("Weekly positions  ·  newest 2 of 3");
     expect(weeks!.rows.map((row) => row.reportDate), flags.join(" ")).toEqual(["2026-09-15", "2026-09-08"]);
   }
+});
+
+test("fn COT gold --csv names each row's market by its root, in contracts, weekly, and each week by its own report date", async () => {
+  const gold: CotContractPayload = { ...payload(), status: "available", gaps: [], asOf: "2026-09-15",
+    contract: { contractCode: "088691", marketName: "GOLD - COMMODITY EXCHANGE INC.", exchangeCode: "CMX", commodityCode: "088", contractUnits: "CONTRACTS OF 100 TROY OUNCES" },
+    history: ["2026-09-08", "2026-09-15"].map((reportDate) => ({ reportDate, openInterest: 180,
+      positions: [{ id: "noncommercial" as const, long: 30, short: 10, spreading: 0, net: 20, netPercentOfOpenInterest: 10 }] })) };
+  const args = { argument: "gold", symbols: [], options: {} } as never;
+  const result = await cotHeadless.load(args, { apiClient: { getCloudCotContract: async () => gold } } as never);
+  const freshness = deriveHeadlessFreshness(cotHeadless, result);
+  const csv = renderReportCsv(headlessReportTables(cotHeadless, result, args, "COT", freshness, { complete: true, unavailableSymbols: [] }), freshness).split("\n");
+  // symbol_or_series, currency_or_unit, interval, source, as_of: blank before for every row.
+  const identity = (line: string) => line.split(",").slice(-6, -1);
+  expect(identity(csv.find((line) => line.startsWith("Noncommercial,"))!)).toEqual(["GC", "contracts", "weekly", "CFTC", "2026-09-15"]);
+  expect(csv.filter((line) => /^2026-09-\d\d,/.test(line)).map(identity)).toEqual([
+    ["GC", "contracts", "weekly", "CFTC", "2026-09-15"], ["GC", "contracts", "weekly", "CFTC", "2026-09-08"],
+  ]);
+});
+
+test("a report's publication time is the CFTC's release, 3:30 p.m. Eastern on its Friday or the day a holiday moved it to", async () => {
+  // Eastern daylight time, then standard time, then two releases a federal holiday put off to the Monday.
+  expect(["2026-10-27", "2026-11-03", "2026-11-10", "2025-12-30"].map(cotReleaseTime)).toEqual([
+    "2026-10-30T19:30:00.000Z", "2026-11-06T20:30:00.000Z", "2026-11-16T20:30:00.000Z", "2026-01-05T20:30:00.000Z",
+  ]);
+  // A release outside the published schedule, or a date that is no Tuesday, is not guessed.
+  expect(["2026-12-29", "2025-06-03", "2026-10-28", null].map(cotReleaseTime)).toEqual([null, null, null, null]);
+  // The export's footer gives it, where it said "Publication time: not published".
+  const load = (asOf: string) => cotHeadless.load({ argument: "CL", symbols: [], options: {} } as never,
+    { apiClient: { getCloudCotContract: async () => ({ ...payload(), asOf }) } } as never);
+  expect(await load("2026-10-27")).toMatchObject({ freshness: { publishedAt: "2026-10-30T19:30:00.000Z" } });
+  expect((await load("2026-12-29")).freshness).not.toHaveProperty("publishedAt");
+});
+
+test("--since lists the history from that day with every report's release, and Pctl All ranks every report", async () => {
+  const asked: unknown[][] = [];
+  const all = { ...position().percentile1Y, value: 12.4, sampleCount: 1_042, windowStart: "2006-06-13", historyStart: "2006-06-13", completeWindow: true };
+  const served: CotContractPayload = { ...payload(), publishedAt: "2026-09-18T19:30:00.000Z", historyStart: "2006-06-13", historyFrom: "2006-06-13",
+    positions: [{ ...position(), percentileAll: all }],
+    history: [{ ...payload().history[0]!, reportDate: "2006-06-13", publishedAt: undefined },
+      { ...payload().history[1]!, publishedAt: "2026-09-18T19:30:00.000Z" }] };
+  const result = await cotHeadless.load({ argument: "ZC", symbols: [], options: { since: "2006-06-13" } } as never,
+    { apiClient: { getCloudCotContract: async (...args: unknown[]) => { asked.push(args); return { ...served, contract: { ...served.contract!, contractCode: "002602" } }; } } } as never);
+  expect(asked).toEqual([["002602", "legacy", "futures-only", "2006-06-13"]]);
+  const [classes, weeks] = (result as { sections: Array<{ columns: Array<{ key: string }>; textColumns?: Array<{ key: string }>; rows: Array<Record<string, unknown>> }> }).sections;
+  expect(classes!.columns.map((column) => column.key)).toContain("allHistoryPercentile");
+  expect(classes!.rows[0]).toMatchObject({ oneYearPercentile: null, allHistoryPercentile: 12 });
+  // The CSV and JSON date each week by its release; one the CFTC did not publish weekly at the time has none.
+  expect(weeks!.rows.map((row) => [row.reportDate, row.released])).toEqual([["2026-09-15", "2026-09-18T19:30:00.000Z"], ["2006-06-13", null]]);
+  expect(weeks!.textColumns!.map((column) => column.key)).not.toContain("released");
+  // One publication time and one publisher: the metadata says what the export's footer says.
+  expect(result).toMatchObject({ metadata: { publishedAt: "2026-09-18T19:30:00.000Z" },
+    freshness: { publisher: "Commodity Futures Trading Commission (CFTC)", publishedAt: "2026-09-18T19:30:00.000Z" } });
+  // Corn under its 1998 code: the older reports are under the previous one, in bushels, not its first report.
+  const corn = { ...served, historyStart: "1998-01-06", history: [{ ...served.history[0]!, reportDate: "1998-01-06" }],
+    contract: { ...served.contract!, contractCode: "002602" } };
+  const early = await cotHeadless.load({ argument: "ZC", symbols: [], options: { since: "1990-01-01" } } as never,
+    { apiClient: { getCloudCotContract: async () => corn } } as never) as { notes?: string[] };
+  expect(early.notes?.join(" ")).toContain("previous code 002601, in thousands of bushels");
+  expect(early.notes?.join(" ")).not.toContain("first report");
+});
+
+test("--report tff and --positions combined read the TFF board and contracts with options, and refuse a reply for the other scope", async () => {
+  const capability = getPaneFunctionCapability({ id: "cot-pane", paneId: "cot", label: "COT", description: "COT", headless: cotHeadless },
+    { id: "cot", name: "COT", component: () => null, defaultPosition: "right" });
+  const asked: unknown[][] = [];
+  const tff = (scope: "futures-only" | "combined"): CotContractPayload => ({ ...payload(), scope, reportFamily: "tff", status: "available", gaps: [],
+    classes: [{ id: "leveraged-funds", label: "Leveraged Funds" }],
+    contract: { contractCode: "13874A", marketName: "E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE", exchangeCode: "CME", commodityCode: "138", contractUnits: "$50 X S&P 500 INDEX" },
+    positions: [{ ...position(), id: "leveraged-funds", label: "Leveraged Funds" }],
+    history: [{ reportDate: "2026-09-15", openInterest: 200, positions: [{ id: "leveraged-funds", long: 10, short: 30, spreading: 0, net: -20, netPercentOfOpenInterest: -10 }] }] });
+  const run = async (argument: string | undefined, flags: string[], reply: "futures-only" | "combined") => {
+    const global = parseCliGlobalArgs(["fn", "COT", ...(argument ? [argument] : []), ...flags]);
+    const options = normalizeCapabilityOptions(capability, parsePaneFunctionArgs(global.args.slice(1), global.options).options, { strict: true });
+    return cotHeadless.load({ argument, symbols: [], options } as never, { apiClient: {
+      getCloudCotContract: async (...args: unknown[]) => { asked.push(["contract", ...args]); return tff(reply); },
+      getCloudCotBoard: async (...args: unknown[]) => {
+        asked.push(["board", ...args]);
+        const { contract, positions, history, sourceUrl, openInterest, ...base } = tff(reply);
+        return { ...base, traderClass: "leveraged-funds", rows: [{ ...contract!, reportDate: "2026-09-15", openInterest: 200, position: positions[0]!, status: "available" }] };
+      },
+    } } as never) as Promise<{ sections: Array<{ title: string; rows: Array<Record<string, unknown>> }> }>;
+  };
+
+  const detail = await run("13874A", ["--report", "tff", "--positions", "combined"], "combined");
+  expect(detail.sections[0]!.title).toBe("E-MINI S&P 500  ·  report date 2026-09-15  ·  1 contract = $50 X S&P 500 INDEX  ·  futures + options");
+  expect(detail.sections[0]!.rows[0]!.class).toBe("Leveraged Funds");
+  const extremes = await run(undefined, ["--report", "tff", "--positions", "combined", "--scope", "all"], "combined");
+  expect(extremes.sections[0]!.title).toBe("Positioning extremes  ·  futures + options");
+  expect(extremes.sections[0]!.rows[0]!.contractCode).toBe("13874A");
+  // Without --positions the board is futures only, as it always was.
+  expect((await run(undefined, ["--report", "tff", "--scope", "all"], "futures-only")).sections[0]!.title).toBe("Positioning extremes");
+  expect(asked).toEqual([
+    ["contract", "13874A", "tff", "combined"],
+    ["board", "tff", "leveraged-funds", "combined"],
+    ["board", "tff", "leveraged-funds", "futures-only"],
+  ]);
+  await expect(run("13874A", ["--report", "tff", "--positions", "combined"], "futures-only")).rejects.toThrow();
+  await expect(run(undefined, ["--report", "tff", "--traderClass", "managed-money"], "futures-only")).rejects.toThrow("does not belong");
+});
+
+test("the text board's net column names the class it counts, and the export keeps Net", async () => {
+  // `fn COT` headed sugar's +185,473 "Net"; the disaggregated report's managed money nets +223,784 on the same market.
+  const capability = getPaneFunctionCapability({ id: "cot-pane", paneId: "cot", label: "COT", description: "COT", headless: cotHeadless },
+    { id: "cot", name: "COT", component: () => null, defaultPosition: "right" });
+  const columns = async (flags: string[]) => {
+    const global = parseCliGlobalArgs(["fn", "COT", ...flags]);
+    const options = normalizeCapabilityOptions(capability, parsePaneFunctionArgs(global.args.slice(1), global.options).options, { strict: true });
+    const board = await cotHeadless.load({ symbols: [], options } as never, { apiClient: {
+      getCloudCotBoard: async (family: string, traderClass: string) => {
+        const { contract, positions, history, sourceUrl, openInterest, ...base } = payload();
+        return { ...base, reportFamily: family, traderClass, status: "available", gaps: [], classes: [{ id: traderClass, label: traderClass }],
+          rows: [{ ...contract!, reportDate: "2026-09-15", openInterest: 200, position: { ...positions[0]!, id: traderClass }, status: "available" }] };
+      },
+    } } as never) as { sections: Array<{ columns: Array<{ key: string; header: string; textHeader?: string }> }> };
+    return board.sections[0]!.columns;
+  };
+  const text = async (flags: string[]) => (await columns(flags)).map((column) => column.textHeader ?? column.header);
+  expect(await text([])).toEqual(["Market", "Code", "Net noncommercial", "1W Δ", "Net % OI", "Pctl 1Y", "Pctl 3Y", "Pctl All", "Open interest", "As of"]);
+  expect(await text(["--report", "disaggregated"])).toContain("Net managed money");
+  expect(await text(["--report", "legacy", "--traderClass", "commercial"])).toContain("Net commercial");
+  // A CSV column is read by its name, so the export's stays Net whatever the class.
+  expect((await columns(["--report", "disaggregated"])).find((column) => column.key === "net")!.header).toBe("Net");
+});
+
+test("the API opts in to ICE only for disaggregated reports and keeps the existing scope and history parameters", async () => {
+  const { CloudDataApi } = await import("../../../api-client/data");
+  const paths: string[] = [];
+  const client = new CloudDataApi((async (path: string) => { paths.push(path); return {}; }) as never);
+  await client.getCloudCotBoard("legacy", "noncommercial");
+  await client.getCloudCotBoard("tff", "leveraged-funds", "combined");
+  await client.getCloudCotContract("13874A", "tff");
+  await client.getCloudCotContract("13874A", "tff", "combined");
+  await client.getCloudCotBoard("disaggregated", "managed-money");
+  await client.getCloudCotContract("ICE00B", "disaggregated", "combined", "2026-11-03");
+  expect(paths).toEqual([
+    "/cloud/cot/board?report=legacy&traderClass=noncommercial",
+    "/cloud/cot/board?report=tff&traderClass=leveraged-funds&scope=combined",
+    "/cloud/cot/contracts/13874A?report=tff",
+    "/cloud/cot/contracts/13874A?report=tff&scope=combined",
+    "/cloud/cot/board?report=disaggregated&traderClass=managed-money&includeIce=true",
+    "/cloud/cot/contracts/ICE00B?report=disaggregated&scope=combined&since=2026-11-03&includeIce=true",
+  ]);
 });
 
 test("a contract's size reads in plain words where the CFTC spells a unit, and keeps its own spelling otherwise", () => {

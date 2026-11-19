@@ -16,11 +16,15 @@ import {
   type CliTickerOptions,
   type CliTickerResolution,
 } from "./ticker-resolution";
-import { isUsSymbolVenue, LOOKUP_TIMEOUT_MS, tickerChangeLine, tickerChangeSymbol } from "../tickers/ticker-changes";
+import { isUsSymbolVenue, LOOKUP_TIMEOUT_MS, movedAwayChange, tickerChangeLine, tickerChangeSymbol, type MovedTickerChange } from "../tickers/ticker-changes";
 import { isVenueAbroad } from "../tickers/listing-fate";
-import { sameCompany } from "../tickers/company-name";
+import { serviceMarkedOtherListing } from "../tickers/company-name-listing";
+import { companyNameCase, sameCompany, shortCompanyName } from "../tickers/company-name";
 import { tickerHasListingSuffix } from "../sources/listing-symbols";
-import { canonicalExchange, exchangeLabel, resolveExchangeTimeZone } from "../utils/exchanges";
+import { canonicalExchange, exchangeLabel, isUsListingExchange, parsePublicTickerKey, resolveExchangeTimeZone, storedKeyListing } from "../utils/exchanges";
+import { resolveTickerInstrumentKind } from "../tickers/instrument-kind";
+import { futuresGenericListing, parseFuturesGeneric } from "../utils/futures-generic";
+import { isProviderBusy, isRateLimited, isSourceFailure, isTransientServiceFailure } from "../sources/provider-errors";
 import { isCurrencyPairListing } from "../utils/fx-market-hours";
 import { isCurrencyCode } from "../utils/currency-pair";
 import { logFailure } from "../utils/log-failure";
@@ -241,7 +245,13 @@ async function meantInstead(symbol: string, deps: SymbolDeps): Promise<string | 
 async function settleAbroad(resolution: CliTicker, deps: SymbolDeps): Promise<{ abroad: string | null; meant: string | null; onlyAbroad: boolean }> {
   if (!await listedOnlyAbroad(resolution, deps)) return { abroad: null, meant: null, onlyAbroad: false };
   const meant = await meantInstead(resolution.bareSymbol!, deps);
-  return { abroad: meant ? null : abroadOnlyNote(resolution), meant, onlyAbroad: true };
+  if (meant) return { abroad: null, meant, onlyAbroad: true };
+  // The listing the service names by the word, as `quote` says beside a minor line: "...; also 9432:JPX NTT, Inc.".
+  const marked = await serviceMarkedOtherListing(deps.dataProvider, resolution.bareSymbol!, resolution.ticker.metadata.exchange ?? "")
+    .catch(logFailure("cli.symbol-rows", "Read the listing a word names failed", null));
+  const note = abroadOnlyNote(resolution);
+  const also = marked ? `${note.replace(/\.$/, "")}; also ${marked.symbol}:${marked.exchange} ${marked.name}` : null;
+  return { abroad: also ? /\.$/.test(also) ? also : `${also}.` : note, meant: null, onlyAbroad: true };
 }
 
 /** Whether a YYYY-MM-DD day is within `ms` before `now`. */
@@ -283,7 +293,42 @@ function choiceNeeded(
       : recent ? `${symbol} matched ${label}, ${sameCompany(resolution.ticker.metadata.name, history?.company) ? "that company's old line" : "another company's listing"}`
         : null);
   if (!found) return null;
+  // The line stopped trading as its company moved on (Rite Aid to RADCQ): one line says both.
+  const moved = resolution.ended ? movedAwayChange(resolution.change) : null;
+  if (moved) return { message: stoppedTradingLine(symbol, moved, resolution.ticker.metadata.name), successor: moved.tradesAs };
   return { message: history ? `${history.note}; ${found}` : found, successor: history?.successor ?? null };
+}
+
+/**
+ * Why a listing that cannot quote (`CliTicker.noQuote`: ZION:IEX, FRC:BMV) is
+ * not stored as it matched, when the input did not name it: a bare symbol, or
+ * a company's name read as it. What its company trades as now leads, when the
+ * symbol's history says. A listing the input named is stored, its row saying
+ * it has no quote (`quotelessNote`).
+ */
+function quotelessChoice(resolution: CliTicker): { message: string; successor: string | null } | null {
+  if (!resolution.noQuote || (!resolution.bareSymbol && !resolution.readAs)) return null;
+  const history = successorOf(resolution);
+  const found = `${savedListingName(resolution.ticker).label} has no quote`;
+  return { message: history ? `${history.note}; ${found}` : found, successor: history?.successor ?? null };
+}
+
+/** "no quote": what the row of a named listing that cannot quote (ZION:IEX) says, so it is never stored silently. */
+function quotelessNote(resolution: CliTicker): string | null {
+  return resolution.noQuote ? "no quote" : null;
+}
+
+/**
+ * "Chesapeake Energy (CHK) stopped trading 2024-10-02, now EXE": a symbol
+ * whose line ended as its company moved, named first by the listing's own
+ * name as its quote gives it, else by the issuer the change names, when known.
+ */
+function stoppedTradingLine(symbol: string, moved: MovedTickerChange, name?: string | null): string {
+  // Written as a name is, never in a feed's capitals ("CHESAPEAKE ENERGY CORP" is Chesapeake Energy).
+  const own = name?.trim() && name.trim().toUpperCase() !== symbol.toUpperCase() ? shortCompanyName(companyNameCase(name.trim())) : null;
+  const issuer = own ?? (moved.issuer ? companyNameCase(moved.issuer) : null);
+  const who = issuer ? `${issuer} (${symbol})` : symbol;
+  return `${who} stopped trading ${moved.changes[0]!.date}, now ${moved.tradesAs}`;
 }
 
 /** The plain no-match answer, which a "Not found" line already says. */
@@ -317,7 +362,47 @@ export function summarizeSymbolRows(rows: readonly SymbolRow[], verb: Verb, repe
     groups.push(`${junk.length} not ${junk.length === 1 ? "a symbol" : "symbols"}: ${junk.join(junk.some((input) => input.includes(",")) ? "; " : ", ")}`);
   }
   if (repeated > 0) groups.push(`${repeated} repeat${repeated === 1 ? "" : "s"} skipped`);
+  // An add names the rows that landed off the list's main venues, to check or name with their venue (BP:LSE).
+  const off = verb === "add" ? offVenueSummary(rows) : null;
+  if (off) groups.push(off);
   return `${groups.join("; ")}.`;
+}
+
+/** Rows a list must have before the venues most of them landed on are its main ones. */
+const MAIN_VENUES_FROM = 10;
+/** The share of a list's rows a venue holds to be one of its main venues. */
+const MAIN_VENUE_SHARE = 0.1;
+
+/**
+ * The rows of an add that landed outside the venues most of the list is on: a
+ * London and Tokyo book's BP on NYSE and NTT on Warsaw, which a bare symbol
+ * or a name can land on. Null for a short list, or one with no row off them.
+ */
+function offVenueRows(rows: readonly SymbolRow[]): { main: string[]; rows: SymbolRow[] } | null {
+  // A pair or a coin has no venue to be off; the US exchanges are one market.
+  const market = (row: SymbolRow) => isUsListingExchange(row.exchange!) ? "US" : canonicalExchange(row.exchange!);
+  const landed = rows.filter((row) => (row.status === "added" || row.status === "already_listed") && row.exchange
+    && !isCurrencyPairListing(row.symbol ?? undefined, row.exchange) && !UNVENUED.has(canonicalExchange(row.exchange)));
+  if (landed.length < MAIN_VENUES_FROM) return null;
+  const counts = new Map<string, number>();
+  for (const row of landed) counts.set(market(row), (counts.get(market(row)) ?? 0) + 1);
+  const main = [...counts].filter(([, count]) => count >= landed.length * MAIN_VENUE_SHARE).sort((a, b) => b[1] - a[1]).map(([venue]) => venue);
+  const off = landed.filter((row) => !main.includes(market(row)));
+  return main.length > 0 && off.length > 0 ? { main, rows: off } : null;
+}
+
+/** Venues a row is on that are no market of listings: currencies, coins, perpetuals. */
+const UNVENUED = new Set(["CCY", "CRYPTO", "FX"]);
+
+/** "8 landed outside the list's main venues (LSE, JPX): BP:NYSE, NTT:WSE, ...", each as typed beside the listing it went to. */
+function offVenueSummary(rows: readonly SymbolRow[]): string | null {
+  const off = offVenueRows(rows);
+  if (!off) return null;
+  const named = off.rows.map((row) => {
+    const typed = symbolInputKey(row.input);
+    return row.listing && typed !== row.listing ? `${typed} as ${row.listing}` : row.listing ?? typed;
+  });
+  return `${off.rows.length} landed outside the list's main venues (${off.main.join(", ")}): ${named.join(", ")}`;
 }
 
 /** A message in a line's parentheses, without the subject the line already names or its closing stop. */
@@ -330,6 +415,109 @@ export interface BulkSymbolsOptions {
   symbols: readonly string[];
   exchange: string | undefined;
   store: TickerSource;
+  /** Whether a saved row is in the list added to: its venues are where a bare symbol that read as a future is looked for first. */
+  member?: (ticker: TickerRecord) => boolean;
+  /** How long the list's venues have to answer for such a symbol; `LOOKUP_TIMEOUT_MS` (5 s) unless set. */
+  venueWaitMs?: number;
+}
+
+/** A row that is a futures contract: a generic (ES3 on CME, the E-mini's third) or a dated or continuous one. */
+function isFutureRow(ticker: TickerRecord): boolean {
+  return resolveTickerInstrumentKind(ticker) === "future" || !!futuresGenericListing(ticker.metadata.ticker, ticker.metadata.exchange);
+}
+
+/**
+ * The venues a list's listings trade on (its `members`, and the securities
+ * `added` beside), other than the US's: SGX and HKEX for a book of DBS and
+ * Tencent. Empty when the list holds a future, which makes a bare symbol's
+ * future a fair reading.
+ */
+function listVenues(members: readonly TickerRecord[], added: readonly TickerRecord[] = []): string[] {
+  if (members.some(isFutureRow)) return [];
+  const venues = [...members, ...added.filter((ticker) => !isFutureRow(ticker))].flatMap((ticker) => {
+    const { exchange } = storedKeyListing(ticker.metadata.ticker, ticker.metadata.exchange);
+    const venue = canonicalExchange(exchange);
+    return venue && !isUsListingExchange(venue) && !UNVENUED.has(venue) && !isCurrencyPairListing(ticker.metadata.ticker, venue) ? [venue] : [];
+  });
+  return [...new Set(venues)];
+}
+
+/**
+ * A bare symbol a security could be listed as (ES3, D05), not a future's own
+ * spelling: never a continuous symbol (ES=F), a dated contract (ESZ6, CLZ26),
+ * a front generic (NQ1, ES1, how a future is typed) or a generic with a roll
+ * or an adjustment (CL2F5, ES3R).
+ */
+function securityShaped(symbol: string): boolean {
+  if (!/^[A-Z0-9]{1,6}$/.test(symbol)) return false;
+  if (/^[A-Z0-9]{1,4}[FGHJKMNQUVXZ]\d{1,2}$/.test(symbol) && !/^\d+$/.test(symbol)) return false;
+  const generic = parseFuturesGeneric(symbol);
+  return !generic || (generic.position > 1 && generic.ticker === `${generic.prefix}${generic.position}`);
+}
+
+/** A lookup that did not answer (busy, timed out, at its request limit), which says nothing of whether the venue lists it. */
+function unansweredLookup(error: unknown): boolean {
+  return isProviderBusy(error) || isTransientServiceFailure(error) || isSourceFailure(error) || isRateLimited(error);
+}
+
+/**
+ * A bare symbol that read as a future while the list's listings trade on a
+ * venue that lists the symbol as a security is that listing: ES3 in a book
+ * of DBS and OCBC on SGX is the Straits Times fund there, not the E-mini's
+ * third generic on CME. The list's venues are asked at once, under one
+ * deadline; one that is busy or does not answer in time makes the add ask
+ * which is meant (`ListingChoiceError`) rather than guess another asset class.
+ * Each venue's lookup is staged on its own and only the one kept is staged
+ * for the commit, so a lookup that finishes late saves nothing.
+ */
+async function keepListVenue(
+  lookup: CliTickerResolution,
+  venues: readonly string[],
+  { exchange, staged, dataProvider, retry, waitMs = LOOKUP_TIMEOUT_MS }: {
+    exchange: string | undefined; staged: StagedTickerRepository; dataProvider: DataProvider; retry?: CliTickerOptions["retry"]; waitMs?: number;
+  },
+): Promise<CliTickerResolution> {
+  if (lookup.error || exchange || venues.length === 0) return lookup;
+  const typed = parsePublicTickerKey(symbolInputKey(lookup.input));
+  if (typed.exchange || !securityShaped(typed.symbol.toUpperCase()) || !isFutureRow(lookup.ticker)) return lookup;
+  const future = savedListingName(lookup.ticker);
+  // Dropped first, so the venue's listing is saved under its own symbol (ES3:SGX as ES3, not ES3:XSES); an add of
+  // the future after all saves it again.
+  staged.discard(lookup.ticker.metadata.ticker);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<"late">((resolve) => { timer = setTimeout(() => resolve("late"), waitMs); });
+  type Answer = { venue: string; key: string; layer: StagedTickerRepository; found: CliTicker | null; unanswered: boolean };
+  const answers = await Promise.all(venues.map(async (venue): Promise<Answer> => {
+    const key = `${typed.symbol}:${venue}`;
+    const layer = new StagedTickerRepository(staged);
+    const asked = resolveCliTicker(key, layer, dataProvider, undefined, { retry, changes: false }).then(
+      (found) => ({ venue, key, layer, found, unanswered: false }),
+      // Not listed there: the future stands. Busy or failed: the venue did not answer.
+      (error: unknown) => ({ venue, key, layer, found: null, unanswered: unansweredLookup(error) }),
+    );
+    const answer = await Promise.race([asked, deadline]);
+    return answer === "late" ? { venue, key, layer, found: null, unanswered: true } : answer;
+  })).finally(() => clearTimeout(timer));
+  const listed = answers.find((answer) => answer.found && !isFutureRow(answer.found.ticker));
+  if (listed?.found) {
+    // Only the listing kept is staged; the other venues' lookups, late ones included, are dropped.
+    await listed.layer.commit();
+    const note = `${typed.symbol} -> ${listed.venue}, the list's venue (not the ${future.exchange || "futures"} future)`;
+    return { input: lookup.input, ...listed.found, notes: [note, ...listed.found.notes] };
+  }
+  const unanswered = answers.filter((answer) => answer.unanswered).map((answer) => answer.key);
+  if (unanswered.length === 0) return lookup;
+  const choices = [...unanswered.map((key) => ({ key, name: null })), { key: future.key, name: future.name }];
+  return {
+    input: lookup.input,
+    error: new ListingChoiceError(
+      `${typed.symbol} may be ${unanswered.join(" or ")}, on the list's venue, which did not answer, or the ${future.exchange || "futures"} future ${future.key}; name the listing`,
+      choices.map((choice) => `  ${choice.key}${choice.name ? `  ${choice.name}` : ""}`).join("\n"),
+      choices,
+      choices.length,
+      null,
+    ),
+  };
 }
 
 type AddTicker = (ticker: TickerRecord) => { changed: boolean; ticker: TickerRecord };
@@ -363,7 +551,7 @@ async function settleAdd(
       : { row: failedRow(input, error), error };
   }
   const abroad = await settleAbroad(lookup, { store: staged, dataProvider });
-  const choice = choiceNeeded(lookup, abroad);
+  const choice = choiceNeeded(lookup, abroad) ?? quotelessChoice(lookup);
   if (choice) {
     // The lookup saved the listing it matched; one that is in no list of this run is not kept.
     if (!added.has(lookup.ticker.metadata.ticker)) staged.discard(lookup.ticker.metadata.ticker);
@@ -384,8 +572,9 @@ async function settleAdd(
   added.add(result.ticker.metadata.ticker);
   // Another company had the symbol: the row says which, and what it trades as now.
   const history = successorOf(lookup);
+  const quoteless = quotelessNote(lookup);
   return { row: listingRow(input, result.changed ? "added" : "already_listed", result.ticker, {
-    notes: lookup.notes, ended: lookup.ended, hint: lookup.coinNote, readAs: lookup.readAs,
+    notes: quoteless ? [...lookup.notes, quoteless] : lookup.notes, ended: lookup.ended ?? quoteless, hint: lookup.coinNote, readAs: lookup.readAs,
     extra: { ...history ? { changeNote: history.note, tradesAs: history.successor } : {}, ...abroad.abroad ? { abroad: abroad.abroad } : {} },
   }), error: null };
 }
@@ -404,15 +593,20 @@ export async function addSymbols({
   reject,
   add,
   onRetry,
+  onProgress,
   retry,
   askWhenAmbiguous,
   failure,
   suggest,
   dryRun = false,
+  member,
+  venueWaitMs,
 }: BulkSymbolsOptions & {
   dataProvider: DataProvider;
   /** Told when requests failed and the symbols that failed are about to be looked up again. */
   onRetry?: (count: number, waitMs: number) => void;
+  /** Told as the symbols are looked up, with how many are and how many there are. */
+  onProgress?: (looked: number, total: number) => void;
   /** The command that adds one listing, for the choices a failure names. */
   retry?: (key: string) => string;
   /** Why a symbol cannot be added before it is looked up, such as the cash line; null when it can. */
@@ -430,7 +624,11 @@ export async function addSymbols({
 }): Promise<SymbolRow[]> {
   const staged = new StagedTickerRepository(store);
   const rejected = new Map(symbols.map((input) => [input, reject?.(input) ?? null] as const));
-  const resolutions = await resolveTickersForCli(symbols.filter((input) => !rejected.get(input)), staged, dataProvider, exchange, { onRetry, retry, askWhenAmbiguous });
+  const members = member ? (await store.loadAllTickers()).filter(member) : [];
+  const looked = await resolveTickersForCli(symbols.filter((input) => !rejected.get(input)), staged, dataProvider, exchange, { onRetry, onProgress, retry, askWhenAmbiguous });
+  // The list's venues, with those of the symbols added beside: a US, HKEX and SGX add keeps a bare ES3 on SGX.
+  const venues = listVenues(members, looked.flatMap((resolution) => resolution.error ? [] : [resolution.ticker]));
+  const resolutions = await Promise.all(looked.map((resolution) => keepListVenue(resolution, venues, { exchange, staged, dataProvider, retry, waitMs: venueWaitMs })));
   const resolved = new Map(resolutions.map((resolution) => [resolution.input, resolution] as const));
   const rows: SymbolRow[] = [];
   // Listings a symbol of this list was added to, which a later symbol's choice must not drop.
@@ -450,6 +648,24 @@ export async function addSymbols({
 }
 
 /**
+ * `resolveCliTicker` for a symbol a list takes outside an add (`portfolio
+ * position set`): a bare symbol that read as a future keeps the list's venue,
+ * or asks, as an add does (`keepListVenue`). Saves the listing it settles on.
+ */
+export async function resolveListTicker(
+  symbol: string,
+  { store, dataProvider, exchange, member }: { store: TickerSource; dataProvider: DataProvider; exchange: string | undefined; member: BulkSymbolsOptions["member"] },
+): Promise<CliTicker> {
+  const staged = new StagedTickerRepository(store);
+  const looked: CliTickerResolution = { input: symbol, ...await resolveCliTicker(symbol, staged, dataProvider, exchange) };
+  const members = member ? (await store.loadAllTickers()).filter(member) : [];
+  const kept = await keepListVenue(looked, listVenues(members), { exchange, staged, dataProvider });
+  if (kept.error) throw kept.error;
+  await staged.commit();
+  return kept;
+}
+
+/**
  * One symbol added as a symbol of a list is (`settleAdd`), for `watchlist add`
  * and `portfolio add` given one: a match a list would leave for a choice is
  * left for it alone too, and nothing of it saved. The single add fails fast
@@ -459,7 +675,7 @@ export async function addSymbols({
  */
 export async function addSymbol(
   input: string,
-  { exchange, store, dataProvider, reject, retry, dryRun = false, add }: {
+  { exchange, store, dataProvider, reject, retry, dryRun = false, add, member }: {
     exchange: string | undefined;
     store: TickerSource;
     dataProvider: DataProvider;
@@ -467,6 +683,7 @@ export async function addSymbol(
     retry?: CliTickerOptions["retry"];
     dryRun?: boolean;
     add: AddTicker;
+    member?: BulkSymbolsOptions["member"];
   },
 ): Promise<AddOutcome & { lookup: CliTicker | null }> {
   const refusal = reject?.(input);
@@ -479,6 +696,7 @@ export async function addSymbol(
   } catch (caught) {
     lookup = { input, error: caught instanceof Error ? caught : new Error(String(caught)) };
   }
+  if (member) lookup = await keepListVenue(lookup, listVenues((await store.loadAllTickers()).filter(member)), { exchange, staged, dataProvider, retry });
   const outcome = await settleAdd(input, lookup, staged, dataProvider, add, new Set());
   if (!dryRun) await staged.commit();
   return { ...outcome, lookup: lookup.error ? null : lookup };

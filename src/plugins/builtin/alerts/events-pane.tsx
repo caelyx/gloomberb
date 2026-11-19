@@ -17,6 +17,7 @@ import { usePluginAppActions, usePluginConfigState, usePluginState } from "../..
 import {
   CALENDAR_ALERTS_KEY,
   EVENT_ALERTS_KEY,
+  IPO_ALERTS_KEY,
   IV_LEVEL_ALERTS_KEY,
   eventAlertStoreKey,
   eventAlertTarget,
@@ -25,48 +26,59 @@ import {
   updateEventAlerts,
   type EventAlertRule,
 } from "./events";
-import { ruleState, ruleTarget } from "./event-rows";
+import { ruleState, ruleTarget, type RuleState } from "./event-rows";
+import { checksProRules, proRuleStatus } from "./pro-rules";
 import { relativeTime } from "./format";
 import { alertKindLabel, fetchAlertHistory, ruleStateText } from "./history";
 import { isResearchAlertKind } from "./research-rules";
-import { useAsyncResource } from "../../../public/react";
+import { useAppConfig, useAsyncResource } from "../../../public/react";
+import { readerTimeZone } from "../../../utils/utc-time";
 import { usePlanAccess } from "../../../api-client/plan-access";
+import { apiClient } from "../../../api-client";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
 import { rearmScheduledAlert } from "./scheduled";
 import { checkScheduledEventAlertsNow } from "./scheduled-check";
 import { checkIvLevelAlertsNow, IV_LEVEL_CHECKS_KEY, ivLevelCheckText, readIvLevelChecks, rearmIvLevelAlert } from "./iv-level";
 import { alertTarget, alertViewHints, eventRuleSubject, useOpenAlertTarget } from "./targets";
+import { FIRED_LOG_KEY } from "./fired-log";
+import { withAlertChange } from "./alert-log";
 
-const columnsFor = (width: number, lastCheck: boolean): DataTableColumn[] => [
+const columnsFor = (width: number, lastCheck: boolean, waiting: RuleState | null): DataTableColumn[] => [
   { id: "kind", label: "Event", width: 15, align: "left" },
   { id: "target", label: "Following", width: 28, flexGrow: 1, align: "left" },
   ...(lastCheck && width >= 96
     ? [{ id: "last", label: "Last check", width: 34, align: "left" as const }]
     : []),
-  { id: "status", label: "State", width: 8, align: "left" },
+  // Wide enough to say "Needs sign-in" or "Needs Pro" only when a row does.
+  { id: "status", label: "State", width: Math.max(8, waiting?.length ?? 0), align: "left" },
   { id: "created", label: "Since", width: 10, align: "left" },
 ];
 
 export function EventAlertsPane({ focused, width, height }: PaneProps) {
+  // A release's print time is on the reader's clock too, as ECO shows it.
+  const readerZone = readerTimeZone(useAppConfig().timezone);
   const [catalystStatus] = usePluginConfigState<string>(CATALYST_POLL_STATUS, "Catalyst alerts check every five minutes while the app is open");
   const [json, setJson] = usePluginConfigState<string>(EVENT_ALERTS_KEY, "[]");
-  // IV levels and calendar events are kept in their own lists, which released versions never read.
+  // IV levels, calendar events and IPOs are kept in their own lists, which released versions never read.
   const [ivJson, setIvJson] = usePluginConfigState<string>(IV_LEVEL_ALERTS_KEY, "[]");
   const [calendarJson, setCalendarJson] = usePluginConfigState<string>(CALENDAR_ALERTS_KEY, "[]");
+  const [ipoJson, setIpoJson] = usePluginConfigState<string>(IPO_ALERTS_KEY, "[]");
   const { rules, error } = useMemo(
-    () => readEventAlertStores((key) => key === IV_LEVEL_ALERTS_KEY ? ivJson : key === CALENDAR_ALERTS_KEY ? calendarJson : json),
-    [json, ivJson, calendarJson],
+    () => readEventAlertStores((key) => key === IV_LEVEL_ALERTS_KEY ? ivJson : key === CALENDAR_ALERTS_KEY ? calendarJson : key === IPO_ALERTS_KEY ? ipoJson : json),
+    [json, ivJson, calendarJson, ipoJson],
   );
   // Their readings stay on this device.
   const [savedChecks] = usePluginState<unknown>(IV_LEVEL_CHECKS_KEY, {});
+  // Deleting or re-arming a rule goes in this device's alert log, beside the alerts that fired.
+  const [, setAlertLog] = usePluginState<unknown>(FIRED_LOG_KEY, []);
   const checks = useMemo(() => readIvLevelChecks(savedChecks), [savedChecks]);
   /** Changes one rule in the list it is kept in, leaving what that list holds of kinds this version does not know. */
   const updateRules = useCallback(
     (rule: EventAlertRule, update: (rules: EventAlertRule[]) => EventAlertRule[]) => {
       const key = eventAlertStoreKey(rule);
-      (key === IV_LEVEL_ALERTS_KEY ? setIvJson : key === CALENDAR_ALERTS_KEY ? setCalendarJson : setJson)((current) => updateEventAlerts(current, update));
+      (key === IV_LEVEL_ALERTS_KEY ? setIvJson : key === CALENDAR_ALERTS_KEY ? setCalendarJson : key === IPO_ALERTS_KEY ? setIpoJson : setJson)((current) => updateEventAlerts(current, update));
     },
-    [setJson, setIvJson, setCalendarJson],
+    [setJson, setIvJson, setCalendarJson, setIpoJson],
   );
   const [selected, setSelected] = useState(0);
   const [sort, setSort] = useState<{ columnId: string; direction: SortDirection }>({ columnId: "created", direction: "desc" });
@@ -93,10 +105,16 @@ export function EventAlertsPane({ focused, width, height }: PaneProps) {
   const selectedRule = items[Math.min(selected, Math.max(0, items.length - 1))];
   const now = Date.now();
   const selectedFired = !!selectedRule && ruleState(selectedRule, now) === "Alerted";
-  const openTarget = useOpenAlertTarget();
-  const selectedTarget = useMemo(() => selectedRule ? alertTarget(eventRuleSubject(selectedRule)) : null, [selectedRule]);
   // Research rules keep a dated observation in the Cloud; show its value and percentile.
   const access = usePlanAccess();
+  // A saved session counts before its account has loaded, so a signed-in start does not flash "Needs sign-in".
+  const signedIn = access.signedIn || !!apiClient.getSessionToken();
+  // Options flow and an IV spike are checked only with Pro: a free account, signed in or not, waits on Pro.
+  const pro = checksProRules(signedIn, apiClient.getCurrentUser());
+  const shownStates = new Set(rules.map((rule) => ruleState(rule, now, signedIn, pro)));
+  const waiting: RuleState | null = shownStates.has("Needs sign-in") ? "Needs sign-in" : shownStates.has("Needs Pro") ? "Needs Pro" : null;
+  const openTarget = useOpenAlertTarget();
+  const selectedTarget = useMemo(() => selectedRule ? alertTarget(eventRuleSubject(selectedRule)) : null, [selectedRule]);
   const session = useResearchCloudSession();
   const hasResearch = rules.some((rule) => isResearchAlertKind(rule.kind) && rule.kind !== "iv_level");
   const stateLoader = useCallback(() => fetchAlertHistory(0), [session.requestKey]);
@@ -106,7 +124,7 @@ export function EventAlertsPane({ focused, width, height }: PaneProps) {
     [history.data],
   );
   // An IV level is read by this app, so its last reading needs no session.
-  const columns = columnsFor(width, (hasResearch && !!history.data) || rules.some((rule) => rule.kind === "iv_level"));
+  const columns = columnsFor(width, (hasResearch && !!history.data) || rules.some((rule) => rule.kind === "iv_level"), waiting);
   const add = useCallback(
     () => openPluginCommandWorkflow("set-event-alert"),
     [openPluginCommandWorkflow],
@@ -123,11 +141,20 @@ export function EventAlertsPane({ focused, width, height }: PaneProps) {
     (rule: EventAlertRule | undefined) => {
       if (!rule) return;
       const ivLevel = rule.kind === "iv_level";
-      updateRules(rule, (rules) => rules.map((entry) => (entry.id === rule.id ? ivLevel ? rearmIvLevelAlert(entry) : rearmScheduledAlert(entry) : entry)));
+      const now = Date.now();
+      // Only a rule that went off is re-armed, as the list reads at the write: one still waiting is left, and not logged.
+      const rearmed: EventAlertRule[] = [];
+      updateRules(rule, (rules) => rules.map((entry) => {
+        if (entry.id !== rule.id || ruleState(entry, now) !== "Alerted") return entry;
+        rearmed.push(entry);
+        return ivLevel ? rearmIvLevelAlert(entry) : rearmScheduledAlert(entry);
+      }));
+      if (!rearmed.length) return;
+      for (const entry of rearmed) setAlertLog((saved: unknown) => withAlertChange(saved, "rearmed", entry));
       // Once the write has landed, so it alerts now rather than at the next 15-minute check.
       setTimeout(ivLevel ? checkIvLevelAlertsNow : checkScheduledEventAlertsNow, 1_000);
     },
-    [updateRules],
+    [setAlertLog, updateRules],
   );
   const remove = useCallback(async () => {
     if (!selectedRule) return;
@@ -137,11 +164,15 @@ export function EventAlertsPane({ focused, width, height }: PaneProps) {
       body: [eventAlertTarget(rule)],
       confirmLabel: "Delete",
     });
-    if (confirmed) updateRules(rule, (rules) => rules.filter((entry) => entry.id !== rule.id));
-  }, [dialog, selectedRule, updateRules]);
+    if (!confirmed) return;
+    updateRules(rule, (rules) => rules.filter((entry) => entry.id !== rule.id));
+    setAlertLog((saved: unknown) => withAlertChange(saved, "deleted", rule));
+  }, [dialog, selectedRule, setAlertLog, updateRules]);
   const status =
     error ??
     (selectedRule?.kind === "catalyst" ? catalystStatus : null) ??
+    // A Pro rule nothing checks says so while it is selected, and what is free beside it.
+    (selectedRule && ruleState(selectedRule, now, signedIn, pro) === "Needs Pro" ? proRuleStatus(selectedRule) : null) ??
     sync.error ??
     (sync.phase === "disabled"
       ? "Cloud sync disabled"
@@ -163,6 +194,7 @@ export function EventAlertsPane({ focused, width, height }: PaneProps) {
           id: "toggle",
           key: "p",
           label: selectedRule?.status === "paused" ? "resume" : "ause",
+          title: selectedRule?.status === "paused" ? "Resume" : "Pause",
           onPress: () => toggle(selectedRule),
           disabled: !selectedRule,
         },
@@ -201,7 +233,9 @@ export function EventAlertsPane({ focused, width, height }: PaneProps) {
         // An IV level that could not be read says so on its own row: No data in State, the reason in Last check.
         const check = rule.kind === "iv_level" ? checks[rule.id] : undefined;
         const unread = rule.kind === "iv_level" && rule.status === "active" && !rule.triggeredAt && check?.value === null;
-        const state = ruleState(rule, now);
+        const state = ruleState(rule, now, signedIn, pro);
+        // A rule nothing checks while signed out, or without Pro, says so in its State, in the warning tone.
+        const waits = (state === "Needs sign-in" || state === "Needs Pro") && column.id === "status";
         return {
           text:
             column.id === "kind"
@@ -213,7 +247,7 @@ export function EventAlertsPane({ focused, width, height }: PaneProps) {
                     ? ruleStateText(states.get(rule.id))
                     : ""
                 : column.id === "target"
-                ? ruleTarget(rule)
+                ? ruleTarget(rule, readerZone)
                 : column.id === "status"
                   ? unread ? "No data" : state
                   : new Date(rule.createdAt).toISOString().slice(0, 10),
@@ -221,6 +255,8 @@ export function EventAlertsPane({ focused, width, height }: PaneProps) {
             ? colors.selectedText
             : unread && (column.id === "status" || column.id === "last")
               ? colors.negative
+              : waits
+                ? colors.warning
               : rule.status === "paused"
                 ? colors.textMuted
                 : colors.text,

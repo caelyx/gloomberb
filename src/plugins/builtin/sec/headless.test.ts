@@ -64,6 +64,14 @@ describe("SEC headless model", () => {
 
     const both = await headless.load(args(2), createTestHeadlessContext());
     expect(both.rows).toHaveLength(2);
+    expect(both.textColumns?.map((column) => column.key)).not.toContain("pressReleaseUrl");
+
+    // An 8-K whose index names its press release keeps the filing's link, and the release prints beside it.
+    const released = await createSecHeadless({
+      loadFilings: async () => [{ ...filings[0]!, pressReleaseUrl: "https://www.sec.gov/filing/one/ex99-1.htm" }],
+    }).load(args(1), createTestHeadlessContext());
+    expect(released.rows[0]).toMatchObject({ url: "https://www.sec.gov/filing/one", pressReleaseUrl: "https://www.sec.gov/filing/one/ex99-1.htm" });
+    expect(released.textColumns?.map((column) => column.key)).toContain("pressReleaseUrl");
     // A first read asks for a few hundred, past the pricing supplements a bank files in runs.
     expect(requestedLimits).toEqual([200, 200]);
   });
@@ -312,6 +320,33 @@ test("a grantor trust without facts says why once, and its filings line says whe
   expect(emptyOf(filed)).toBe("No SEC filings found for USO.");
 });
 
+test("fn ETF VXX: an exchange-traded note reads as its issuer's note, with the fee and index its pricing supplement states", async () => {
+  const url = "https://www.sec.gov/Archives/edgar/data/312070/000191870426004069/form424b2.htm";
+  const vxx: FundFactsPayload = {
+    ...uncovered("VXX", "VXX is an exchange-traded note: an unsecured note of Barclays Bank PLC, not a fund.", null),
+    status: "etn", name: "iPath Series B S&P 500 VIX Short-Term Futures ETN",
+    note: { issuer: "Barclays Bank PLC", name: "iPath Series B S&P 500 VIX Short-Term Futures ETN", yearlyFee: 0.89,
+      index: "S&P 500 VIX Short-Term Futures Index TR", filing: { form: "424B2", filedAt: "2026-02-13", url } },
+  };
+  // The bank's filings hold no fund forms.
+  const bank = { ...filings[1]!, form: "424B2" };
+  const result = await createFundHeadless({ loadFacts: async () => fetchFundFacts("VXX", { getFundFacts: async () => vxx } as never), loadFilings: async () => [bank] })
+    .load(fundArgs("VXX"), createTestHeadlessContext());
+  const [terms, filed] = result.sections;
+  expect(terms!.title).toBe("Note terms");
+  expect(Object.fromEntries(terms!.entries!.map((entry) => [entry.key, entry.formatted]))).toEqual({
+    name: "iPath Series B S&P 500 VIX Short-Term Futures ETN",
+    structure: "Exchange-traded note: an unsecured note of Barclays Bank PLC, not a fund",
+    issuer: "Barclays Bank PLC",
+    yearlyFeePercent: "0.89% · 2026-02-13 pricing supplement (424B2) · SEC EDGAR",
+    index: "S&P 500 VIX Short-Term Futures Index TR · 2026-02-13 pricing supplement (424B2)",
+    url,
+  });
+  expect(emptyOf(filed)).toBe("VXX is a note of Barclays Bank PLC, which files no fund forms for it. Its issuer's filings: fn SEC VXX.");
+  expect(result.freshness).toMatchObject({ source: "SEC EDGAR", basis: "filed data", asOf: "2026-02-13" });
+  expect(result.complete).toBe(true);
+});
+
 test("either half can fail without taking the other with it", async () => {
   const signedOut = createFundHeadless({ loadFacts: async () => SPY_FACTS, loadFilings: async () => { throw new Error("Sign in to Gloom Cloud to load SEC filings."); } });
   const result = await signedOut.load(fundArgs("SPY"), createTestHeadlessContext());
@@ -340,10 +375,58 @@ test("the filings-only view still says what a trust files", () => {
   expect(fundFilingsEmpty("IBIT", { count: 0, complete: true })).toBe("No SEC filings found for IBIT.");
 });
 
+const CHINAAMC_PAGE = "https://www.chinaamc.com.hk/detail?fundId=HKVAETH";
+/** 3046:HKEX as the server reads ChinaAMC's own figures for Tue 3 Nov 2026: its HKD counter, closed at 5.295. */
+const CHINAAMC_ETHER_HKD: FundFactsPayload = {
+  ticker: "3046:HKEX", covered: true, status: "covered", name: "ChinaAMC Ether ETF (HKD counter)", structure: null, currency: "HKD",
+  expenseRatio: { value: 0.99, asOf: "2026-11-04", source: "ChinaAMC (Hong Kong)", url: CHINAAMC_PAGE, kind: "management-fee" },
+  nav: { value: 5.2842, asOf: "2026-11-03", source: "ChinaAMC (Hong Kong)", url: CHINAAMC_PAGE, period: "day" },
+  closingPrice: { value: 5.295, asOf: "2026-11-03", source: "Gloom Cloud" },
+  premiumDiscount: { value: 0.2043828772567219, asOf: "2026-11-03", source: "Gloom Cloud", basis: "computed" },
+  netAssets: null, sponsor: { value: "ChinaAMC (Hong Kong)", asOf: null, source: "ChinaAMC (Hong Kong)", url: CHINAAMC_PAGE },
+  inception: null, leverage: null, index: null, bond: null,
+  sharesOutstanding: { value: 60_200_000, asOf: "2026-11-03", source: "ChinaAMC (Hong Kong)", url: CHINAAMC_PAGE },
+  coinHoldings: { asset: "ETH", coins: 18_453, unitsPerCoin: 3262.342166585379, asOf: "2026-11-03", source: "ChinaAMC (Hong Kong)", url: CHINAAMC_PAGE },
+  flows: null, stale: false, fetchedAt: "2026-11-04T03:18:26.551Z",
+};
+
+test("ETF for a Hong Kong spot coin fund gives its issuer's figures in the counter's currency, with units per coin, and asks the SEC nothing", async () => {
+  const asked: string[] = [];
+  const headless = createFundHeadless({
+    loadFacts: async (symbol) => { asked.push(symbol); return CHINAAMC_ETHER_HKD; },
+    loadFilings: async () => { throw new Error("Must not read SEC filings"); },
+    loadAbroadProfile: async () => { throw new Error("Must not read the profile"); },
+  });
+  const result = await headless.load(fundArgs("3046:HKEX"), createTestHeadlessContext());
+  expect(asked).toEqual(["3046:HKEX"]);
+  expect(result.sections).toHaveLength(1);
+  expect(result.sections[0]!.entries!.map((entry) => [entry.label, entry.formatted, entry.unit])).toEqual([
+    ["Name", "ChinaAMC Ether ETF (HKD counter)", undefined],
+    ["Management fee", "0.99% · 2026-11-04 · ChinaAMC (Hong Kong)", "%"],
+    ["NAV", "HK$5.2842 · 2026-11-03 · ChinaAMC (Hong Kong)", "HKD"],
+    ["Closing price", "HK$5.295 · 2026-11-03 · Gloom Cloud", "HKD"],
+    ["Premium/discount", "+0.20% · 2026-11-03 · closing price vs NAV · Gloom Cloud", "%"],
+    ["Shares outstanding", "60,200,000 · 2026-11-03 · ChinaAMC (Hong Kong)", "shares"],
+    ["Units per ETH", "3,262 · 2026-11-03 · ChinaAMC (Hong Kong)", "units per ETH"],
+    ["Coins held", "18,453 ETH · 2026-11-03 · ChinaAMC (Hong Kong)", "ETH"],
+    ["Sponsor", "ChinaAMC (Hong Kong)", undefined],
+    ["Issuer page", CHINAAMC_PAGE, undefined],
+  ]);
+  expect(result.freshness).toMatchObject({ source: "ChinaAMC (Hong Kong)", asOf: "2026-11-03" });
+  // A Hong Kong fund the server has no figures for keeps its issuer link.
+  const other = await createFundHeadless({
+    loadFacts: async () => ({ ...CHINAAMC_ETHER_HKD, ticker: "2800:HKEX", covered: false, status: "not-published" }),
+    loadFilings: async () => [],
+    loadAbroadProfile: async () => ({ page: "https://www.trahk.com.hk" }),
+  }).load(fundArgs("2800:HKEX"), createTestHeadlessContext());
+  expect(other.metadata).toMatchObject({ venue: "HKEX", usListedOnly: true, issuerPage: "https://www.trahk.com.hk" });
+});
+
 test("ETF for a fund listed abroad says what ticker says, with its issuer's page, and asks the SEC nothing", async () => {
   let asked = 0;
   const headless = createFundHeadless({
-    loadFacts: async () => { asked++; return SPY_FACTS; },
+    // A server before Hong Kong's figures, or a fund it has none for.
+    loadFacts: async () => { throw new Error("Unknown ticker"); },
     loadFilings: async () => { asked++; return []; },
     loadAbroadProfile: async (key) => ({
       name: `${key} fund`,
@@ -353,7 +436,7 @@ test("ETF for a fund listed abroad says what ticker says, with its issuer's page
   });
   for (const key of ["3042.HK", "3042:HKEX"]) {
     const result = await headless.load(fundArgs(key), createTestHeadlessContext());
-    expect(result.sections[0]).toMatchObject({ title: "Fund facts", rows: [], empty: "Fund facts (fee, NAV, premium) cover US-listed funds only." });
+    expect(result.sections[0]).toMatchObject({ title: "Fund facts", rows: [], empty: "Fund facts (fee, NAV, premium) cover US-listed funds and Hong Kong's spot bitcoin and ether ETFs only." });
     expect(result.sections[1]!.entries!.map((entry) => [entry.label, entry.value])).toEqual([
       ["Name", `${key} fund`],
       ["Issuer page", "https://www.chinaamc.com.hk/detail?fundId=HKVAXBT"],
@@ -375,4 +458,48 @@ test("ETF for a fund listed abroad says what ticker says, with its issuer's page
   expect(failed.sections).toEqual(bare.sections);
   expect(failed.complete).toBe(false);
   expect(failed.errors).toEqual(["Fund profile unavailable: Profile outage"]);
+});
+
+test("ETF with --tax-rate adds the tax-equivalent section DVD and fundamentals show, on the sponsor's SEC yield", async () => {
+  const ISHARES = { source: "iShares", url: "https://www.ishares.com/us/products/239766/ishares-national-muni-bond-etf" };
+  const mub: FundFactsPayload = { ...SPY_FACTS, ticker: "MUB", name: "iShares National Muni Bond ETF", bond: {
+    kind: "municipal", state: null,
+    secYield: { value: 3.7955, asOf: "2026-11-04", ...ISHARES },
+    yieldToWorst: { value: 3.89, asOf: "2026-11-04", ...ISHARES },
+    duration: { value: 7.15, asOf: "2026-11-04", measure: "effective", ...ISHARES },
+  } };
+  const headless = createFundHeadless({
+    loadFacts: async () => mub, loadFilings: async () => [],
+    loadTreasury: async () => [{ tenor: "7Y", years: 7, yield: 4.7, asOf: "2026-11-05", seriesId: "DGS7" }],
+    loadDistribution: async () => { throw new Error("Must not read a distribution yield beside a SEC yield"); },
+  });
+  const args: HeadlessPaneLoadArgs = { ...fundArgs("MUB"), options: { limit: 50, "tax-rate": "40.8" } };
+  const result = await headless.load(args, createTestHeadlessContext());
+  const section = result.sections.find((entry) => entry.title === "Tax-equivalent yield")!;
+  expect(section.textEntries!.map((entry) => entry.formatted)).toEqual([
+    "40.8% (federal; no state rate given)",
+    "6.41% (30-day SEC yield 3.7955% as of 2026-11-04 / (1 - 40.8%))",
+    "80.8% (SEC yield 3.7955% / 7Y Treasury 4.70% on 2026-11-05, the tenor nearest its 7.15-year duration)",
+  ]);
+  expect(section.entries!.find((entry) => entry.label === "Tax-equivalent yield")).toMatchObject({ formatted: "6.41%", exportUnit: "pct", asOf: "2026-11-04" });
+  expect(result.metadata).toMatchObject({ taxEquivalent: { combinedRate: 40.8, muniTreasuryRatio: { tenor: "7Y", seriesId: "DGS7" } } });
+
+  // A fund whose sponsor's figures are not loaded says so rather than that it is no bond fund; without --tax-rate there is no section.
+  const hyd = createFundHeadless({ loadFacts: async () => ({ ...SPY_FACTS, ticker: "HYD", bond: null }), loadFilings: async () => [], loadTreasury: async () => null });
+  const plain = await hyd.load({ ...fundArgs("HYD"), options: { limit: 50, "tax-rate": "40.8" } }, createTestHeadlessContext());
+  expect(plain.sections.find((entry) => entry.title === "Tax-equivalent yield")!.textEntries![1]!.formatted).toContain("no sponsor bond figures are loaded for HYD");
+  expect((await hyd.load(fundArgs("HYD"), createTestHeadlessContext())).sections.map((entry) => entry.title)).toEqual(["Fund facts", "Fund filings"]);
+  await expect(hyd.load({ ...fundArgs("HYD"), options: { limit: 50, "tax-rate": "40.8", "state-rate": "9" } }, createTestHeadlessContext()))
+    .rejects.toThrow("--state-rate and --state go together");
+
+  // A stock is not a fund, and a fund listed abroad is not a US fund: each says so, never that its figures are not loaded.
+  const taxLine = (result: Awaited<ReturnType<typeof hyd.load>>) =>
+    result.sections.find((entry) => entry.title === "Tax-equivalent yield")?.textEntries?.[1]?.formatted;
+  const ko = createFundHeadless({ loadFacts: async () => ({ ...SPY_FACTS, ticker: "KO", covered: false, status: "not-a-fund" }), loadFilings: async () => [],
+    loadTreasury: async () => null });
+  expect(taxLine(await ko.load({ ...fundArgs("KO"), options: { limit: 50, "tax-rate": "40.8" } }, createTestHeadlessContext())))
+    .toBe("no tax-equivalent yield: KO is not a fund");
+  const abroad = createFundHeadless({ loadFacts: async () => SPY_FACTS, loadFilings: async () => [], loadAbroadProfile: async () => null });
+  expect(taxLine(await abroad.load({ ...fundArgs("VUSA:LSE"), options: { limit: 50, "tax-rate": "40.8" } }, createTestHeadlessContext())))
+    .toBe("no tax-equivalent yield: --tax-rate does not apply to VUSA:LSE, a fund listed outside the US");
 });

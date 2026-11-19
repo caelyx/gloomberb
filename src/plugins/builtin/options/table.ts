@@ -3,7 +3,8 @@ import type { DataTableCell } from "../../../components";
 import type { OptionContract, OptionsChain } from "../../../types/financials";
 import { blendHex, colors } from "../../../theme/colors";
 import { blendForContrast, blendForSeparation, contrastRatio } from "../../../theme/color-utils";
-import { formatCompact } from "../../../utils/format";
+import { getTableWidth } from "../../../components/ui/table-layout";
+import { MISSING_VALUE, formatCompact } from "../../../utils/format";
 import { formatStrikeLabel } from "../../../utils/options";
 import { formatOptionPrice, optionQuoteSide, optionSpread } from "./market-reference";
 import { formatCarryPercent, formatCostOfSpot } from "./carry";
@@ -113,6 +114,44 @@ export function resolveOptionFieldIds(value: unknown): OptionFieldId[] {
   return fields.length > 0 ? fields : [...DEFAULT_OPTION_FIELD_IDS];
 }
 
+/** The strike column between the two sides. */
+const STRIKE_COLUMN_WIDTH = 9;
+
+/**
+ * The order fields give way in when calls and puts do not both fit: the
+ * Greeks past delta and the derived figures first, then the last trade and the
+ * flow, so the quotes and their volatility are what stays. The bid never goes.
+ */
+const OPTION_FIELD_DROP_ORDER: readonly OptionFieldId[] = [
+  "rho", "vega", "theta", "gamma", "extrinsicPerYear", "costOfSpot", "spread",
+  "last", "volume", "delta", "openInterest", "iv", "ask",
+];
+
+/**
+ * Cells the terminal chain draws with these fields: each column as the table
+ * draws it, widened to its header and sort mark ("C LAST" takes 8 cells, not
+ * its field's 7), with no gap or padding between them, as the pane lays it out.
+ */
+function optionChainWidth(fields: readonly OptionFieldId[]): number {
+  return getTableWidth(createOptionColumns(fields), 0, 0);
+}
+
+/**
+ * The fields a terminal chain `width` cells wide draws, so the puts are on
+ * screen beside the calls rather than past a sideways scroll (review, 12 Nov
+ * 2026: a floating OMON showed the calls and two put columns). Fields give
+ * way on both sides together, in OPTION_FIELD_DROP_ORDER, keeping the order
+ * Settings gave the rest.
+ */
+export function fitOptionFieldIds(fieldIds: readonly OptionFieldId[], width: number): OptionFieldId[] {
+  let fields = resolveOptionFieldIds(fieldIds);
+  for (const drop of OPTION_FIELD_DROP_ORDER) {
+    if (optionChainWidth(fields) <= width) break;
+    if (fields.length > 1) fields = fields.filter((field) => field !== drop);
+  }
+  return fields;
+}
+
 function sideColumn(side: OptionSide, field: OptionFieldId): Omit<OptionColumn, "headerColor"> {
   const definition = OPTION_FIELDS_BY_ID.get(field)!;
   return {
@@ -129,7 +168,7 @@ export function createOptionColumns(fieldIds: readonly OptionFieldId[]): Array<O
   const fields = resolveOptionFieldIds(fieldIds);
   return [
     ...fields.filter((field) => !OPTION_FIELDS_BY_ID.get(field)!.putOnly).map((field) => sideColumn("call", field)),
-    { id: "strike", field: "strike", side: null, label: "STRIKE", width: 9, align: "right" },
+    { id: "strike", field: "strike", side: null, label: "STRIKE", width: STRIKE_COLUMN_WIDTH, align: "right" },
     ...[...fields].reverse().map((field) => sideColumn("put", field)),
   ];
 }
@@ -163,10 +202,13 @@ export function findNearestStrikeIndex(strikes: number[], targetStrike: number):
   return bestIndex;
 }
 
-export function formatIv(value: number | undefined): string {
+export function formatIv(value: number | undefined, filled = false): string {
   // Providers send 0 for contracts with no implied volatility; "0.0%" would read
   // as a real quote of zero vol.
-  if (value == null || !Number.isFinite(value) || value <= 0) return "\u2014";
+  if (value == null || !Number.isFinite(value) || value <= 0) return MISSING_VALUE;
+  // A filled figure leads with "~": it was read off the neighbouring strikes, not solved from a quote.
+  // Without the decimal it still fits the column at 100% and over.
+  if (filled) return value >= 0.9995 ? `~${Math.round(value * 100)}%` : `~${(value * 100).toFixed(1)}%`;
   return `${(value * 100).toFixed(1)}%`;
 }
 
@@ -179,11 +221,11 @@ export function formatIv(value: number | undefined): string {
  */
 function formatSpreadPercent(contract: OptionContract): string {
   const spread = optionSpread(contract);
-  return spread.kind === "two-sided" ? `${spread.percentOfMid.toFixed(1)}%` : "—";
+  return spread.kind === "two-sided" ? `${spread.percentOfMid.toFixed(1)}%` : MISSING_VALUE;
 }
 
 function formatGreek(value: number | undefined): string {
-  if (value == null || !Number.isFinite(value)) return "\u2014";
+  if (value == null || !Number.isFinite(value)) return MISSING_VALUE;
   return value.toFixed(3).replace(/^(-?)0\./, "$1.");
 }
 
@@ -288,15 +330,15 @@ function formatOptionContractCell(
   contract: OptionContract | undefined,
   column: OptionColumn,
 ): string {
-  if (!contract) return "—";
+  if (!contract) return MISSING_VALUE;
   const greeks = optionGreeksForColumn(row, column);
   switch (column.field) {
     case "last":
-      return contract.lastPrice > 0 ? formatOptionPrice(contract.lastPrice, column.width) : "—";
+      return contract.lastPrice > 0 ? formatOptionPrice(contract.lastPrice, column.width) : MISSING_VALUE;
     case "bid":
     case "ask": {
       const quote = optionQuoteSide(contract, column.field);
-      return quote == null ? "—" : formatOptionPrice(quote, column.width);
+      return quote == null ? MISSING_VALUE : formatOptionPrice(quote, column.width);
     }
     case "spread":
       return formatSpreadPercent(contract);
@@ -305,7 +347,8 @@ function formatOptionContractCell(
     case "openInterest":
       return formatCompact(contract.openInterest, { fixedDecimals: true });
     case "iv":
-      return formatIv(row.impliedVolatility);
+      // A stale quote (from before the session, or under intrinsic) is shown, but no IV or greek is read from it.
+      return contract.quoteStale ? "stale" : formatIv(row.impliedVolatility, row.impliedVolatilityFilled);
     case "delta":
       return formatGreek(greeks?.delta);
     case "gamma":
@@ -319,7 +362,7 @@ function formatOptionContractCell(
     case "extrinsicPerYear":
       return formatCarryPercent(column.side === "call" ? row.callExtrinsicPerYear : row.putExtrinsicPerYear);
     case "costOfSpot":
-      return column.side === "put" ? formatCostOfSpot(row.putCostOfSpot) : "\u2014";
+      return column.side === "put" ? formatCostOfSpot(row.putCostOfSpot) : MISSING_VALUE;
     case "strike":
       return formatStrikeLabel(contract.strike);
   }
@@ -355,7 +398,7 @@ export function renderOptionCell(
   const surface = backgroundColor ?? rowSurface;
   return {
     text: formatOptionContractCell(row, contract, column),
-    color: contract ? optionRoleColor(optionColumnRole(column), surface) : optionMutedColor(surface),
+    color: contract && !contract.quoteStale ? optionRoleColor(optionColumnRole(column), surface) : optionMutedColor(surface),
     keepColorWhenSelected: otherHalf,
     backgroundColor,
   };

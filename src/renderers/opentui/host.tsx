@@ -11,7 +11,9 @@ import { buildTerminalMediaArgs, createTerminalMediaReaper, terminalMediaStateFi
 import { saveTextFileToDownloads } from "../../utils/save-text-file";
 import { installInteractionPerformanceRecorder } from "./interaction-performance";
 import { provideKittyServices } from "./kitty-services";
+import { setTerminalReportsControlKeys } from "../../app/keybindings/terminal-keys";
 import { captureRendererFrame } from "./frame-capture";
+import { createFrameHits } from "./frame-hits";
 import {
   createTimerFrameDriver,
   installMarketDataFrameDriver,
@@ -61,7 +63,8 @@ export function toKeyEventLike(event: {
     alt: event.alt === true || event.meta === true || event.option === true,
     meta: event.super === true,
     super: event.super === true,
-    repeat: event.repeated === true,
+    // Left unset unless the terminal says so: a press it does not flag may still be a repeat.
+    repeat: event.repeated === true ? true : undefined,
     get defaultPrevented() {
       return event.defaultPrevented ?? false;
     },
@@ -119,6 +122,11 @@ export async function createOpenTuiHost(): Promise<OpenTuiHost> {
   // at 11 is not a leak here, and it prints over the panes.
   renderer.setMaxListeners(0);
   installResolutionEventBridge(renderer);
+  // Whether Control reaches a digit, once the terminal has answered: the
+  // layout tabs name Alt+1 where it does not. Unknown until then.
+  renderer.on("capabilities", (capabilities: { kitty_keyboard?: boolean } | null) => {
+    setTerminalReportsControlKeys(capabilities?.kitty_keyboard === true);
+  });
   // Streamed quotes apply and notify on one clock of up to 10 Hz: every
   // visible row stays live while a burst of ticks costs one terminal redraw,
   // and a layout whose redraws are expensive gets fewer of them.
@@ -238,6 +246,7 @@ export async function createOpenTuiHost(): Promise<OpenTuiHost> {
     removePostProcessFn: (processFn) => renderer.removePostProcessFn(processFn as any),
     copyToClipboardOSC52: (text) => renderer.copyToClipboardOSC52(text),
     captureFrame: () => captureRendererFrame(renderer),
+    frameHits: createFrameHits(renderer),
     async capturePaneImage(rect) {
       if (renderer.isDestroyed) throw new Error("The terminal has closed.");
       // Loaded on first use: the glyph atlas is only needed for a picture.

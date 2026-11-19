@@ -1,27 +1,43 @@
-import { memo, useCallback, useMemo, useRef, type RefObject } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, type RefObject } from "react";
 import { Box, type BoxRenderable, type LiveBoxFrame } from "../../../../ui";
-import { resolveOccludedPaneIds } from "../pane-occlusion";
-import type {
-  DockDividerLayout,
-  DockLeafLayout,
-  FloatingRect,
-  LayoutBounds,
-  ResolvedPane,
+import { resolveOccludedPaneIds, visibleFocusTarget, type OcclusionPane } from "../pane-occlusion";
+import {
+  floatingStacks,
+  SHELL_DRAG_Z,
+  type DockDividerLayout,
+  type DockLeafLayout,
+  type FloatingRect,
+  type LayoutBounds,
+  type ResolvedPane,
 } from "../../../../layout/pane-manager";
-import { useDesktopWindowActive } from "../../../../state/app/context";
 import { useThemeColors } from "../../../../theme/theme-context";
 import { WEB_CELL_HEIGHT, WEB_CELL_WIDTH } from "../../../../theme/font-scale";
 import { LivePaneFrameContext, type CellSize, type LivePaneFrame } from "../../../../ui/live-stretch";
 import { constrainFloatingRectToBounds, sameRect, type ResizeEdges } from "../drag";
 import { useLiveBoxFrame, useLiveCatchUp, useLiveDrag, type LiveDragGeometry, type LiveDragStore } from "../drag/live";
+import { ARMED_DRAG_OPACITY } from "../drag/overlays";
 import { pathKey } from "../../window-edit/mode";
 import { FloatingPaneWrapper } from "../../floating-pane";
 import { PaneContent } from "../../pane/content";
 import { PaneWrapper } from "../../pane";
-import type { PaneHeaderQuickSetting } from "../../pane/header";
+import type { DockEdge } from "../../pane/frame";
+import type { PaneHeaderQuickSetting, PaneHeaderStack } from "../../pane/header";
 import { hasPaneFooterContent, PaneFooterKeys, PaneFooterProvider } from "../../pane/footer";
 import { resolvePaneBodyFrame, shouldReservePaneFooter } from "../../pane/sizing";
 import { captureStampFooter, usePaneCaptureStamp } from "../../pane/capture-stamp";
+import type { CombinedPaneFooter } from "../../pane/footer";
+import { useActionShortcut } from "../../../../ui";
+
+/**
+ * The terminal's route to ticker search for a single-ticker pane, which the desktop takes from
+ * the ticker in its title: the search's key ends the pane's footer, the first hint to go under
+ * More when the footer is narrow. The key is the app's and bound already, so the hint only says
+ * it (the pane menu has it as Change Ticker...); a click on it searches.
+ */
+function withChangeTickerHint(footer: CombinedPaneFooter, ticker: string | null, key: string, onPress: () => void): CombinedPaneFooter {
+  if (!ticker || !key) return footer;
+  return { ...footer, hints: [...footer.hints, { id: "change-ticker", key, label: " ticker", title: "Change Ticker", onPress, yieldsKey: true }] };
+}
 
 type ShellMouseHandler = (event: any) => void;
 
@@ -35,9 +51,13 @@ interface ShellPaneLayersProps {
   dockDividerLayouts: DockDividerLayout[];
   dockLeafLayouts: DockLeafLayout[];
   focusedPaneId: string | null;
+  /** Shows and focuses a pane: a click on a stack's tab. */
+  focusPane: (paneId: string) => void;
   /** Saved insertion order, independent of which floating window is in front. */
   floatingOrder: readonly { instanceId: string }[];
   getPaneTitle: (pane: ResolvedPane) => string;
+  /** The ticker a single-ticker pane shows, which ticker search changes from it; null for any other pane. */
+  getPaneTicker: (pane: ResolvedPane) => string | null;
   getPaneQuickSettings: (paneId: string) => PaneHeaderQuickSetting[];
   handleFloatingClose: (paneId: string) => void;
   handleFloatingCloseMouseDown: (paneId: string, event: any) => void;
@@ -49,6 +69,8 @@ interface ShellPaneLayersProps {
   handlePaneHelp: (paneId: string) => void;
   /** Ask Gloom about the pane; null while nothing takes the question (its plugin is off). */
   handlePaneAsk: ((paneId: string) => void) | null;
+  /** Ticker search for the pane: the ticker in its title, or its footer key in the terminal. */
+  handlePaneTicker: (paneId: string) => void;
   hoveredPaneId: string | null;
   live: LiveDragStore;
   menuPaneId: string | null;
@@ -58,9 +80,11 @@ interface ShellPaneLayersProps {
   paneMap: Map<string, ResolvedPane>;
   setHoveredPaneIfChanged: (paneId: string | null) => void;
   startNativeDividerDrag: (divider: DockDividerLayout, event: any) => void;
-  startNativeDockedDrag: (paneId: string, rect: LayoutBounds, event: any) => void;
+  startNativeDockedDrag: (paneId: string, rect: LayoutBounds, event: any, options?: { focus?: boolean }) => void;
   startNativeFloatingDrag: (paneId: string, rect: FloatingRect, event: any) => void;
   startNativeFloatResize: (paneId: string, rect: FloatingRect, event: any, edges?: ResizeEdges) => void;
+  /** A press on a tab of a floating stack. */
+  startNativeTabDrag: (paneId: string, rect: FloatingRect, event: any) => void;
   transientFocusActive: boolean;
   transientFocusPaneId: string | null;
   visibleFloatingPanes: VisibleFloatingPane[];
@@ -77,9 +101,12 @@ interface ShellPaneLayersProps {
 interface PaneLayerActions {
   paneMouseDown: (paneId: string, event: any) => void;
   hover: (paneId: string) => void;
-  dockedDragStart: (paneId: string, rect: LayoutBounds, event: any) => void;
+  /** `focus` false: a press on a stack's hidden tab, which shows it only on release. */
+  dockedDragStart: (paneId: string, rect: LayoutBounds, event: any, options?: { focus?: boolean }) => void;
   floatingDragStart: (paneId: string, rect: FloatingRect, event: any) => void;
   floatResizeStart: (paneId: string, rect: FloatingRect, event: any, edges?: ResizeEdges) => void;
+  /** A press on a tab of a floating stack: a move pulls it out. */
+  tabDragStart: (paneId: string, rect: FloatingRect, event: any) => void;
   drag: ShellMouseHandler;
   contextMenu: (paneId: string, rect: LayoutBounds, event: any) => void;
   menu: (paneId: string, rect: LayoutBounds, event: any) => void;
@@ -87,20 +114,26 @@ interface PaneLayerActions {
   help: (paneId: string) => void;
   /** The button beside the `?`: Ask Gloom about the pane. */
   ask: (paneId: string) => void;
+  /** Ticker search for the pane: the ticker in its title, or its footer key in the terminal. */
+  ticker: (paneId: string) => void;
   closeMouseDown: (paneId: string, event: any) => void;
   /** Also the failure card's Close: keep it stable, the pane body is memoized on it. */
   close: (paneId: string) => void;
   restoreFullscreen: ShellMouseHandler;
   dividerDragStart: (divider: DockDividerLayout, event: any) => void;
+  /** A click on one of a stack's tabs: show that pane. */
+  showTab: (paneId: string) => void;
 }
 
 interface PaneLayerProps {
   pane: ResolvedPane;
   rect: LayoutBounds;
   title: string;
+  /** See `getPaneTicker`. */
+  ticker: string | null;
+  /** Ticker search's key as the terminal says it; empty when it has none. */
+  tickerSearchKey: string;
   focused: boolean;
-  /** Drawn as the focused pane: focused, and in the window the user is working in. */
-  highlighted: boolean;
   windowModeSelected: boolean;
   showActions: boolean;
   /** Fully covered (terminal only): skip drawing, keep the tree mounted. */
@@ -109,6 +142,10 @@ interface PaneLayerProps {
   fullscreen: boolean;
   /** Whether the header can start a move: not in fullscreen. */
   movable: boolean;
+  /** Desktop, docked: the sides that face another pane across the gap between them. */
+  dockEdges?: readonly DockEdge[];
+  /** The panes stacked as tabs in this spot or floating window, this one shown. */
+  stackTabs?: ReadonlyArray<{ id: string; title: string }>;
   nativePaneChrome: boolean;
   nativeContextMenu: boolean;
   /** Ask Gloom takes questions about panes, so the header offers it. */
@@ -118,6 +155,28 @@ interface PaneLayerProps {
 }
 
 const EMPTY_OCCLUSION: ReadonlySet<string> = new Set();
+const ARMED_LAYER_STYLE = { opacity: ARMED_DRAG_OPACITY };
+const SIDES: readonly DockEdge[] = ["left", "right", "top", "bottom"];
+/** One array per combination of sides, so a docked layer's props stay equal between renders. */
+const DOCK_EDGE_SETS = new Map<string, readonly DockEdge[]>();
+
+/** The sides of a docked pane at `rect` that face another pane rather than the edge of the area. */
+function dockEdgesOf(rect: LayoutBounds, width: number, height: number): readonly DockEdge[] {
+  const inside = {
+    left: rect.x > 0.01,
+    right: rect.x + rect.width < width - 0.01,
+    top: rect.y > 0.01,
+    bottom: rect.y + rect.height < height - 0.01,
+  };
+  const edges = SIDES.filter((side) => inside[side]);
+  const key = edges.join(" ");
+  let set = DOCK_EDGE_SETS.get(key);
+  if (!set) {
+    set = edges;
+    DOCK_EDGE_SETS.set(key, set);
+  }
+  return set;
+}
 const selectFloatingDragActive = (geometry: LiveDragGeometry) => geometry.floating !== null;
 const selectNothing = () => null;
 const selectNoDrag = () => false;
@@ -156,14 +215,17 @@ const DockedPaneLayer = memo(function DockedPaneLayer({
   pane,
   rect: layoutRect,
   title,
+  ticker,
+  tickerSearchKey,
   focused,
-  highlighted,
   windowModeSelected,
   showActions,
   hidden,
   inView,
   fullscreen,
   movable,
+  dockEdges,
+  stackTabs,
   nativePaneChrome,
   nativeContextMenu,
   canAsk,
@@ -190,6 +252,13 @@ const DockedPaneLayer = memo(function DockedPaneLayer({
     : null), [nativePaneChrome, paneId]);
   const liveFrame = useLivePaneFrame(live, rect, sizeOf);
   const captureStamp = usePaneCaptureStamp(paneId);
+  // A stack's tabs: a click shows one, a press on one moves that pane.
+  const stack = useMemo<PaneHeaderStack | null>(() => (stackTabs ? {
+    tabs: stackTabs,
+    active: paneId,
+    onSelect: actions.showTab,
+    onTabMouseDown: nativeMove ? (tabId, event) => actions.dockedDragStart(tabId, rect, event, { focus: tabId === paneId }) : undefined,
+  } : null), [actions, nativeMove, paneId, rect, stackTabs]);
   return (
     <Box
       ref={boxRef}
@@ -202,7 +271,7 @@ const DockedPaneLayer = memo(function DockedPaneLayer({
     >
       <PaneFooterProvider>
         {(registeredFooter) => {
-          const footer = captureStampFooter(registeredFooter, captureStamp);
+          const footer = captureStampFooter(withChangeTickerHint(registeredFooter, nativePaneChrome ? null : ticker, tickerSearchKey, () => actions.ticker(paneId)), captureStamp);
           const showFooter = hasPaneFooterContent(footer);
           const reserveFooter = shouldReservePaneFooter(nativePaneChrome, showFooter);
           const bodyFrame = resolvePaneBodyFrame({
@@ -216,7 +285,9 @@ const DockedPaneLayer = memo(function DockedPaneLayer({
             <PaneWrapper
               paneId={paneId}
               title={title}
-              focused={highlighted}
+              titleTicker={nativePaneChrome ? ticker : null}
+              onTitleTickerPress={() => actions.ticker(paneId)}
+              focused={focused}
               width={rect.width}
               height={rect.height}
               stretch={nativePaneChrome}
@@ -224,6 +295,8 @@ const DockedPaneLayer = memo(function DockedPaneLayer({
               showActions={showActions}
               quickSettings={quickSettings}
               topRule={rect.y > 0.01}
+              dockEdges={dockEdges}
+              stack={stack}
               windowModeSelected={windowModeSelected}
               footer={footer}
               onMouseDownCapture={nativePaneChrome ? (event) => actions.paneMouseDown(paneId, event) : undefined}
@@ -264,8 +337,9 @@ const FloatingPaneFrame = memo(function FloatingPaneFrame({
   pane,
   rect,
   title,
+  ticker,
+  tickerSearchKey,
   focused,
-  highlighted,
   windowModeSelected,
   showActions,
   hidden,
@@ -277,6 +351,7 @@ const FloatingPaneFrame = memo(function FloatingPaneFrame({
   canAsk,
   getPaneQuickSettings,
   actions,
+  stackTabs,
   zIndex,
   frameRef,
 }: PaneLayerProps & {
@@ -289,10 +364,18 @@ const FloatingPaneFrame = memo(function FloatingPaneFrame({
   const quickSettings = usePaneQuickSettings(getPaneQuickSettings, paneId);
   const nativeMove = nativePaneChrome && movable;
   const captureStamp = usePaneCaptureStamp(paneId);
+  // A floating stack's tabs: a click shows one, a press on one pulls it out;
+  // the rest of the title bar moves the whole stack.
+  const stack = useMemo<PaneHeaderStack | null>(() => (stackTabs ? {
+    tabs: stackTabs,
+    active: paneId,
+    onSelect: actions.showTab,
+    onTabMouseDown: nativeMove ? (tabId, event) => actions.tabDragStart(tabId, rect, event) : undefined,
+  } : null), [actions, nativeMove, paneId, rect, stackTabs]);
   return (
     <PaneFooterProvider>
       {(registeredFooter) => {
-        const footer = captureStampFooter(registeredFooter, captureStamp);
+        const footer = captureStampFooter(withChangeTickerHint(registeredFooter, nativePaneChrome ? null : ticker, tickerSearchKey, () => actions.ticker(paneId)), captureStamp);
         const showFooter = hasPaneFooterContent(footer);
         const reserveFooter = shouldReservePaneFooter(nativePaneChrome, showFooter);
         const bodyFrame = resolvePaneBodyFrame({
@@ -306,13 +389,15 @@ const FloatingPaneFrame = memo(function FloatingPaneFrame({
           <FloatingPaneWrapper
             paneId={paneId}
             title={title}
+            titleTicker={nativePaneChrome ? ticker : null}
+            onTitleTickerPress={() => actions.ticker(paneId)}
             x={rect.x}
             y={rect.y}
             width={rect.width}
             height={rect.height}
             zIndex={zIndex}
             hidden={hidden}
-            focused={highlighted}
+            focused={focused}
             windowModeSelected={windowModeSelected}
             locked={pane.instance.locked === true}
             showActions={showActions}
@@ -334,6 +419,7 @@ const FloatingPaneFrame = memo(function FloatingPaneFrame({
             onResizeMouseDrag={nativeMove ? actions.drag : undefined}
             onResizeMouseDragEnd={nativeMove ? actions.drag : undefined}
             frameRef={frameRef}
+            stack={stack}
           >
             <PaneFooterKeys paneId={paneId} footer={registeredFooter} focused={focused} />
             <PaneContent
@@ -456,7 +542,12 @@ const FloatingPaneLayer = memo(function FloatingPaneLayer({
   const paneId = frame.pane.instance.instanceId;
   const slide = frame.nativePaneChrome;
   const selectRedraw = useCallback((geometry: LiveDragGeometry) => {
+    // A window a resize moves along a shared edge.
+    const partner = geometry.partners?.get(paneId);
+    if (partner) return slide ? null : partner;
     if (geometry.floating?.paneId !== paneId) return null;
+    // A tab pulled out of this stack moves as an outline; the stack stays.
+    if (geometry.paneDrag?.paneId === paneId && geometry.paneDrag.mode === "tab") return null;
     // A desktop move or resize follows by restyling the pane instead.
     if (slide && (geometry.paneDrag?.paneId === paneId || geometry.paneResize?.paneId === paneId)) return null;
     return geometry.floating.rect;
@@ -464,13 +555,18 @@ const FloatingPaneLayer = memo(function FloatingPaneLayer({
   const dragRect = useLiveDrag(live, selectRedraw);
   const layerRef = useRef<BoxRenderable | null>(null);
   const frameOf = useMemo(() => (slide ? (geometry: LiveDragGeometry): LiveBoxFrame | null => {
+    const partner = geometry.partners?.get(paneId);
+    if (partner) {
+      const resized = constrainFloatingRectToBounds(partner, width, contentHeight);
+      return { dx: resized.x - rect.x, dy: resized.y - rect.y };
+    }
     // A resize keeps the pane on its own layer too: the panes it uncovers or
     // covers never repaint, only the pane does. A left or top edge moves it.
     if (geometry.paneResize?.paneId === paneId) {
       const resized = geometry.floating?.paneId === paneId ? constrainFloatingRectToBounds(geometry.floating.rect, width, contentHeight) : null;
       return resized ? { dx: resized.x - rect.x, dy: resized.y - rect.y } : { dx: 0, dy: 0 };
     }
-    if (geometry.paneDrag?.paneId !== paneId) return null;
+    if (geometry.paneDrag?.paneId !== paneId || geometry.paneDrag.mode === "tab") return null;
     const moving = geometry.floating?.paneId === paneId ? geometry.floating.rect : null;
     // Promoted from the press, so the first move already only slides it.
     if (!moving) return { dx: 0, dy: 0 };
@@ -480,17 +576,33 @@ const FloatingPaneLayer = memo(function FloatingPaneLayer({
   useLiveBoxFrame(live, layerRef, frameOf);
   const frameRef = useRef<BoxRenderable | null>(null);
   const sizeOf = useMemo(() => (slide ? (geometry: LiveDragGeometry): CellSize | null => {
+    const partner = geometry.partners?.get(paneId);
+    if (partner) {
+      const at = constrainFloatingRectToBounds(partner, width, contentHeight);
+      return { width: at.width, height: at.height };
+    }
     if (geometry.paneResize?.paneId !== paneId || geometry.floating?.paneId !== paneId) return null;
     const at = constrainFloatingRectToBounds(geometry.floating.rect, width, contentHeight);
     return { width: at.width, height: at.height };
   } : null), [contentHeight, paneId, slide, width]);
   useLiveBoxFrame(live, frameRef, sizeOf);
   const selectCatchUp = useMemo(() => (slide ? (geometry: LiveDragGeometry) => {
+    const partner = geometry.partners?.get(paneId);
+    if (partner) {
+      const resized = constrainFloatingRectToBounds(partner, width, contentHeight);
+      return sameRect(resized, rect) ? null : resized;
+    }
     if (geometry.paneResize?.paneId !== paneId || geometry.floating?.paneId !== paneId) return null;
     const resized = constrainFloatingRectToBounds(geometry.floating.rect, width, contentHeight);
     return sameRect(resized, rect) ? null : resized;
   } : null), [contentHeight, paneId, rect, slide, width]);
   const resizeRect = useLiveCatchUp(live, selectCatchUp);
+  // Over somewhere to land, the desktop pane rises over its landing preview
+  // and turns see-through, so the preview shows under it.
+  const selectArmed = useCallback((geometry: LiveDragGeometry) => (
+    geometry.paneDrag?.paneId === paneId && geometry.paneDrag.mode !== "tab" && geometry.dockPreview !== null
+  ), [paneId]);
+  const armed = useLiveDrag(live, slide ? selectArmed : selectNoDrag);
   const preview = dragRect
     ? constrainFloatingRectToBounds(dragRect, width, contentHeight)
     // The content catches up with the size; a left or top edge's move stays
@@ -518,7 +630,8 @@ const FloatingPaneLayer = memo(function FloatingPaneLayer({
       top={0}
       width={0}
       height={0}
-      zIndex={zIndex}
+      zIndex={armed ? SHELL_DRAG_Z.over : zIndex}
+      style={armed ? ARMED_LAYER_STYLE : undefined}
     >
       {content}
       {frame.movable && !frame.hidden && (
@@ -595,8 +708,10 @@ export function ShellPaneLayers({
   dockDividerLayouts,
   dockLeafLayouts,
   focusedPaneId,
+  focusPane,
   floatingOrder,
   getPaneTitle,
+  getPaneTicker,
   getPaneQuickSettings,
   handleFloatingClose,
   handleFloatingCloseMouseDown,
@@ -607,6 +722,7 @@ export function ShellPaneLayers({
   handlePaneAction,
   handlePaneHelp,
   handlePaneAsk,
+  handlePaneTicker,
   hoveredPaneId,
   live,
   menuPaneId,
@@ -619,6 +735,7 @@ export function ShellPaneLayers({
   startNativeDockedDrag,
   startNativeFloatingDrag,
   startNativeFloatResize,
+  startNativeTabDrag,
   transientFocusActive,
   transientFocusPaneId,
   visibleFloatingPanes,
@@ -626,29 +743,73 @@ export function ShellPaneLayers({
   windowModeDockResizePathKey,
   windowModePaneId,
 }: ShellPaneLayersProps) {
-  const windowActive = useDesktopWindowActive();
   // Panes whose every cell sits under floating windows. Their streams drop to
   // the off-screen cadence on every renderer; a transient focus unmounts the
   // other panes, so there is nothing to cover. The floating rects here are the
   // committed ones, so a drag in progress does not churn subscriptions.
-  const coveredPaneIds = useMemo(() => {
-    if (transientFocusActive || visibleFloatingPanes.length === 0) return EMPTY_OCCLUSION;
-    return resolveOccludedPaneIds([
-      ...dockLeafLayouts.map((leaf, order) => ({ paneId: leaf.instanceId, rect: leaf.rect, zIndex: null, order })),
-      ...visibleFloatingPanes.map(({ pane, rect }, order) => ({
-        paneId: pane.instance.instanceId,
-        rect,
-        zIndex: pane.floating?.zIndex ?? 50,
-        order: dockLeafLayouts.length + order,
-      })),
-    ], { width, height: contentHeight });
-  }, [contentHeight, dockLeafLayouts, transientFocusActive, visibleFloatingPanes, width]);
+  const occlusionPanes = useMemo((): OcclusionPane[] => transientFocusActive || visibleFloatingPanes.length === 0 ? [] : [
+    ...dockLeafLayouts.map((leaf, order) => ({ paneId: leaf.instanceId, rect: leaf.rect, zIndex: null, order })),
+    ...visibleFloatingPanes.map(({ pane, rect }, order) => ({
+      paneId: pane.instance.instanceId,
+      rect,
+      zIndex: pane.floating?.zIndex ?? 50,
+      order: dockLeafLayouts.length + order,
+    })),
+  ], [dockLeafLayouts, transientFocusActive, visibleFloatingPanes]);
+  const coveredPaneIds = useMemo(() => occlusionPanes.length === 0 ? EMPTY_OCCLUSION
+    : resolveOccludedPaneIds(occlusionPanes, { width, height: contentHeight }), [contentHeight, occlusionPanes, width]);
+
   // Skipping the draw is a terminal concern: desktop pane chrome is DOM, where
   // the compositor already skips covered windows, and a drag keeps everything
   // drawn so the preview never reveals a blank spot.
   const floatingDragActive = useLiveDrag(live, nativePaneChrome ? selectNoDrag : selectFloatingDragActive);
   const occludedPaneIds = nativePaneChrome || floatingDragActive ? EMPTY_OCCLUSION : coveredPaneIds;
+  // Keys go to the focused pane, so it must be one the reader sees: a window filling a narrow terminal takes focus
+  // from the docked pane under it, which a restored session or Tab would otherwise leave holding the keys unseen.
+  const coveredFocusTarget = visibleFocusTarget(focusedPaneId, occlusionPanes, occludedPaneIds);
+  useEffect(() => {
+    if (coveredFocusTarget) focusPane(coveredFocusTarget);
+  }, [coveredFocusTarget, focusPane]);
   const fullscreenRect = useMemo(() => ({ x: 0, y: 0, width, height: contentHeight }), [contentHeight, width]);
+  const tickerSearchKey = useActionShortcut("ticker-search");
+  // Each stack's tabs by the pane it shows, the same array while they and their titles stay.
+  const stackTabsCache = useRef(new Map<string, ReadonlyArray<{ id: string; title: string }>>());
+  const stackTabsById = useMemo(() => {
+    const byId = new Map<string, ReadonlyArray<{ id: string; title: string }>>();
+    const cache = new Map<string, ReadonlyArray<{ id: string; title: string }>>();
+    for (const leaf of dockLeafLayouts) {
+      if (!leaf.stack) continue;
+      const tabs = leaf.stack.map((id) => {
+        const member = paneMap.get(id);
+        return { id, title: member ? getPaneTitle(member) : id };
+      });
+      const key = tabs.map((tab) => `${tab.id}\u0000${tab.title}`).join("\u0001");
+      const kept = stackTabsCache.current.get(key) ?? tabs;
+      cache.set(key, kept);
+      byId.set(leaf.instanceId, kept);
+    }
+    // A floating stack's tabs, by the pane in front.
+    for (const [shown, members] of floatingStacks(visibleFloatingPanes.map(({ pane }) => pane.floating!), floatingOrder)) {
+      const tabs = members.map((id) => {
+        const member = paneMap.get(id);
+        return { id, title: member ? getPaneTitle(member) : id };
+      });
+      const key = tabs.map((tab) => `${tab.id}\u0000${tab.title}`).join("\u0001");
+      const kept = stackTabsCache.current.get(key) ?? tabs;
+      cache.set(key, kept);
+      byId.set(shown, kept);
+    }
+    stackTabsCache.current = cache;
+    return byId;
+  }, [dockLeafLayouts, floatingOrder, getPaneTitle, paneMap, visibleFloatingPanes]);
+  // The floating panes behind the tab their stack shows: mounted, out of sight.
+  const hiddenFloatingTabs = useMemo(() => {
+    const hidden = new Set<string>();
+    for (const [shown, members] of floatingStacks(visibleFloatingPanes.map(({ pane }) => pane.floating!))) {
+      for (const id of members) if (id !== shown) hidden.add(id);
+    }
+    return hidden;
+  }, [visibleFloatingPanes]);
 
   const handlersRef = useRef({
     handleFloatingClose,
@@ -660,11 +821,14 @@ export function ShellPaneLayers({
     handlePaneAction,
     handlePaneHelp,
     handlePaneAsk,
+    handlePaneTicker,
     setHoveredPaneIfChanged,
     startNativeDividerDrag,
     startNativeDockedDrag,
     startNativeFloatingDrag,
     startNativeFloatResize,
+    startNativeTabDrag,
+    focusPane,
   });
   handlersRef.current = {
     handleFloatingClose,
@@ -676,28 +840,34 @@ export function ShellPaneLayers({
     handlePaneAction,
     handlePaneHelp,
     handlePaneAsk,
+    handlePaneTicker,
     setHoveredPaneIfChanged,
     startNativeDividerDrag,
     startNativeDockedDrag,
     startNativeFloatingDrag,
     startNativeFloatResize,
+    startNativeTabDrag,
+    focusPane,
   };
   // Only called from events, never while rendering, so reading the latest handlers is safe.
   const actions = useMemo<PaneLayerActions>(() => ({
     paneMouseDown: (paneId, event) => handlersRef.current.handleNativePaneMouseDown(paneId, event),
     hover: (paneId) => handlersRef.current.setHoveredPaneIfChanged(paneId),
-    dockedDragStart: (paneId, rect, event) => handlersRef.current.startNativeDockedDrag(paneId, rect, event),
+    dockedDragStart: (paneId, rect, event, options) => handlersRef.current.startNativeDockedDrag(paneId, rect, event, options),
     floatingDragStart: (paneId, rect, event) => handlersRef.current.startNativeFloatingDrag(paneId, rect, event),
     floatResizeStart: (paneId, rect, event, edges) => handlersRef.current.startNativeFloatResize(paneId, rect, event, edges),
+    tabDragStart: (paneId, rect, event) => handlersRef.current.startNativeTabDrag(paneId, rect, event),
     drag: (event) => handlersRef.current.handleNativeDrag(event),
     contextMenu: (paneId, rect, event) => handlersRef.current.handleNativePaneContextMenu(paneId, rect, event),
     menu: (paneId, rect, event) => handlersRef.current.handlePaneAction(paneId, rect, event),
     help: (paneId) => handlersRef.current.handlePaneHelp(paneId),
     ask: (paneId) => handlersRef.current.handlePaneAsk?.(paneId),
+    ticker: (paneId) => handlersRef.current.handlePaneTicker(paneId),
     closeMouseDown: (paneId, event) => handlersRef.current.handleFloatingCloseMouseDown(paneId, event),
     close: (paneId) => handlersRef.current.handleFloatingClose(paneId),
     restoreFullscreen: (event) => handlersRef.current.handleRestoreFullscreen(event),
     dividerDragStart: (divider, event) => handlersRef.current.startNativeDividerDrag(divider, event),
+    showTab: (paneId) => handlersRef.current.focusPane(paneId),
   }), []);
 
   // DOM z-index already stacks the windows. Reordering their React children
@@ -718,17 +888,16 @@ export function ShellPaneLayers({
   const layerProps = (pane: ResolvedPane, rect: LayoutBounds): PaneLayerProps => {
     const paneId = pane.instance.instanceId;
     const focused = focusedPaneId === paneId && (!overlayOpen || menuPaneId === paneId);
-    // Each desktop window keeps its own focused pane; only the one in use draws it.
-    const highlighted = focused && windowActive;
     const fullscreen = transientFocusActive && paneId === transientFocusPaneId;
     return {
       pane,
       rect,
       title: getPaneTitle(pane),
+      ticker: getPaneTicker(pane),
+      tickerSearchKey,
       focused,
-      highlighted,
       windowModeSelected: windowModePaneId === paneId,
-      showActions: highlighted || hoveredPaneId === paneId || menuPaneId === paneId,
+      showActions: focused || hoveredPaneId === paneId || menuPaneId === paneId,
       hidden: occludedPaneIds.has(paneId),
       inView: !coveredPaneIds.has(paneId),
       fullscreen,
@@ -743,25 +912,46 @@ export function ShellPaneLayers({
 
   return (
     <>
-      {dockLeafLayouts.map((leaf) => {
-        if (transientFocusActive && leaf.instanceId !== transientFocusPaneId) return null;
-        const pane = paneMap.get(leaf.instanceId);
-        if (!pane) return null;
-        return (
-          <DockedPaneLayer
-            key={`dock:${leaf.instanceId}`}
-            {...layerProps(pane, transientFocusActive ? fullscreenRect : leaf.rect)}
-            live={live}
-          />
-        );
+      {dockLeafLayouts.flatMap((leaf) => {
+        if (transientFocusActive && leaf.instanceId !== transientFocusPaneId) return [];
+        // Every tab of a stack has a layer of its own, keyed by its pane, so
+        // each keeps its own state (a draft, a scroll, a failure) and never
+        // another tab's. The hidden ones stay mounted out of sight, at the
+        // off-screen cadence, as a pane under a floating window does.
+        const members = transientFocusActive || !leaf.stack ? [leaf.instanceId] : leaf.stack;
+        const rect = transientFocusActive ? fullscreenRect : leaf.rect;
+        const stackTabs = transientFocusActive ? undefined : stackTabsById.get(leaf.instanceId);
+        return members.map((memberId) => {
+          const pane = paneMap.get(memberId);
+          if (!pane) return null;
+          const props = layerProps(pane, rect);
+          const shown = memberId === leaf.instanceId;
+          return (
+            <DockedPaneLayer
+              key={`dock:${memberId}`}
+              {...props}
+              hidden={props.hidden || !shown}
+              inView={props.inView && shown}
+              dockEdges={nativePaneChrome && !transientFocusActive ? dockEdgesOf(leaf.rect, width, contentHeight) : undefined}
+              stackTabs={shown ? stackTabs : undefined}
+              live={live}
+            />
+          );
+        });
       })}
 
       {floatingLayers.map(({ pane, rect }) => {
-        if (transientFocusActive && pane.instance.instanceId !== transientFocusPaneId) return null;
+        const paneId = pane.instance.instanceId;
+        if (transientFocusActive && paneId !== transientFocusPaneId) return null;
+        const props = layerProps(pane, transientFocusActive ? fullscreenRect : rect);
+        const hiddenTab = !transientFocusActive && hiddenFloatingTabs.has(paneId);
         return (
           <FloatingPaneLayer
-            key={`float:${pane.instance.instanceId}`}
-            {...layerProps(pane, transientFocusActive ? fullscreenRect : rect)}
+            key={`float:${paneId}`}
+            {...props}
+            hidden={props.hidden || hiddenTab}
+            inView={props.inView && !hiddenTab}
+            stackTabs={transientFocusActive ? undefined : stackTabsById.get(paneId)}
             rect={transientFocusActive ? fullscreenRect : rect}
             zIndex={pane.floating?.zIndex ?? 50}
             live={live}

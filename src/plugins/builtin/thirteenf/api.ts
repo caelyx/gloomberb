@@ -10,17 +10,25 @@ import type {
 } from "./types";
 import type { PluginPersistence } from "../../../types/plugin";
 import { apiClient } from "../../../api-client";
-import { ApiRequestError, isPermanentClientError } from "../../../api-client/errors";
+import { ApiRequestError, isPermanentClientError, isTransientFailure } from "../../../api-client/errors";
 import { httpFetch } from "../../../utils/http-transport";
+import { isNetworkFailure } from "../../../utils/network-failure";
 import { asRecord, finiteOrNull } from "../../../utils/guards";
 import { logFailure } from "../../../utils/log-failure";
 
 const FORMS_13F_BASE_URL = "https://forms13f.com/api/v1";
 const FORM_PAGE_LIMIT = 100;
-// Large funds file well past 2,000 positions, and a silently clipped
-// list makes every weight, total, and buy/sell action wrong. Paging further is
-// slower but truthful; page in parallel if the wait becomes the problem.
-const MAX_FORM_ROWS = 20_000;
+/** The most rows the 13F source gives in one page. */
+const FILING_PAGE_ROWS = 250;
+/** Pages of one filing read at once where the service cannot send it whole. */
+const FILING_PAGE_CONCURRENCY = 4;
+// Large funds file tens of thousands of positions (BlackRock about 50,000), and
+// a silently clipped list makes every weight, total, and buy/sell action wrong.
+const MAX_FORM_ROWS = 100_000;
+/** Rows asked first of a large filing the service is still reading. */
+const FIRST_ROWS = 2_000;
+/** How long a large filing is waited for whole before its first rows are asked. */
+const FIRST_ROWS_AFTER_MS = 300;
 const CACHE_KIND = "forms13f-api";
 const CACHE_SOURCE = "forms13f";
 const CACHE_SCHEMA_VERSION = 1;
@@ -30,7 +38,14 @@ const FORMS_13F_CACHE_POLICY = {
 } as const;
 
 export interface Forms13FReadOptions {
+  /** A part of the answer that could not be read, said beside what was. */
   onWarning?: (warning: string) => void;
+  /**
+   * A read answered from the copy saved at `savedAt` (ms) because its refresh
+   * failed. Only a caller that says when its copy was saved (the footer's
+   * "saved copy from", a command's closing line) is answered from one.
+   */
+  onSavedCopy?: (savedAt: number) => void;
   forceRefresh?: boolean;
 }
 
@@ -45,6 +60,8 @@ let forms13FPersistence: PluginPersistence | null = null;
 const failedRefreshes = new Set<string>();
 // The promise is the generation. A newer download replaces it, and the replaced one must not write.
 const activeRequests = new Map<string, Promise<unknown>>();
+/** The service answered a whole filing with 404: it is an older one, so filings are read a page at a time. */
+let wholeFilingsMissing = false;
 
 export function attachThirteenFApiPersistence(persistence: PluginPersistence) {
   if (forms13FPersistence !== persistence) resetThirteenFApiPersistence();
@@ -55,6 +72,7 @@ export function resetThirteenFApiPersistence() {
   forms13FPersistence = null;
   failedRefreshes.clear();
   activeRequests.clear();
+  wholeFilingsMissing = false;
 }
 
 function padCik(value: string): string {
@@ -96,6 +114,65 @@ function cacheKey(path: string, params: URLSearchParams): string {
   return query ? `${path}?${query}` : path;
 }
 
+const isRateLimited = (error: unknown): error is ApiRequestError => error instanceof ApiRequestError && error.status === 429;
+
+/** How long to wait before asking again, in whole seconds, from a rate limit's `Retry-After`. */
+export function retryAfterSeconds(error: unknown): number | null {
+  return isRateLimited(error) && error.retryAfterMs != null && error.retryAfterMs > 0
+    ? Math.ceil(error.retryAfterMs / 1000)
+    : null;
+}
+
+/** A refusal that carries no words of the service's own: an empty body, or the status alone. */
+const GENERIC_LIMIT_TEXT = /^\s*(?:(?:HTTP\s*)?429\b.*|too many requests\.?)?\s*$/i;
+
+/**
+ * A 13F read the service refused for its signed-out limit: the service's own
+ * message when it sent one (it says how long to wait and that signing in lifts
+ * the limit), else the same in the app's words. The limit itself is the
+ * service's.
+ */
+export function thirteenFReadError(error: unknown): unknown {
+  if (!isRateLimited(error) || !GENERIC_LIMIT_TEXT.test(error.message)) return error;
+  const seconds = retryAfterSeconds(error);
+  return new ApiRequestError(
+    `Too many 13F reads without signing in: try again in ${seconds != null ? `${seconds} s` : "a minute"}, or sign in to lift the limit.`,
+    429, error.retryAfterMs, error.code, error.details,
+  );
+}
+
+/** What a 13F read says when Gloom Cloud was reached and its 13F source failed. */
+export const THIRTEENF_SOURCE_UNAVAILABLE = "The 13F source is unavailable right now";
+
+/**
+ * A 13F read the service answered with a failure of its own (a 5xx: the 13F
+ * source down and nothing stored to answer for it, or the service busy), in
+ * the app's words. It answered, so the connection is not what to check. A
+ * failure the service named otherwise (EDGAR's) and any other answer (a rate
+ * limit, a refused parameter) are as they came.
+ */
+function thirteenFSourceError(error: unknown): unknown {
+  if (!(error instanceof ApiRequestError) || error.status === undefined || error.status < 500) return error;
+  if (error.code && error.code !== "source_unavailable") return error;
+  return new ApiRequestError(THIRTEENF_SOURCE_UNAVAILABLE, error.status, error.retryAfterMs, "source_unavailable", error.details);
+}
+
+/**
+ * When the copy Gloom Cloud answered from was read from the 13F source (ms),
+ * or null for a fresh answer. While the source is unavailable the service
+ * answers from a copy it stored, each row saying when it was read
+ * (`stored_as_of`); the oldest is the answer's.
+ */
+function storedCopyTime(value: unknown): number | null {
+  const rows = Array.isArray(value) ? value : [value];
+  let oldest = Number.POSITIVE_INFINITY;
+  for (const row of rows) {
+    const at = Date.parse(stringOrEmpty(asRecord(row).stored_as_of));
+    if (Number.isFinite(at)) oldest = Math.min(oldest, at);
+  }
+  return Number.isFinite(oldest) ? oldest : null;
+}
+
 async function fetchForms13F<T>(
   path: string,
   params: Record<string, string | number | undefined>,
@@ -115,7 +192,15 @@ async function fetchForms13F<T>(
 
   if (!options.forceRefresh) {
     const pending = activeRequests.get(key) as Promise<T> | undefined;
-    if (pending) return cached != null ? cached.value : pending;
+    if (pending) {
+      if (cached != null) return cached.value;
+      // Another reader's request, which that reader may stop (a fund read ahead
+      // while the cursor rested on it): this reader then asks again on its own.
+      return pending.catch((error: unknown) => {
+        if (options.signal?.aborted || !(error instanceof Error && error.name === "AbortError")) throw error;
+        return fetchForms13F<T>(path, params, options);
+      });
+    }
   }
 
   const slot: { promise?: Promise<T> } = {};
@@ -128,18 +213,36 @@ async function fetchForms13F<T>(
       let value: T;
       try {
         value = await apiClient.getCloudSec13F(path, params, { signal: options.signal }) as T;
-      } catch (error) {
+      } catch (cloudError) {
         options.signal?.throwIfAborted();
-        if (options.cloudOnly) throw error;
+        const error = thirteenFReadError(cloudError);
+        if (options.cloudOnly) throw thirteenFSourceError(error);
         const url = `${FORMS_13F_BASE_URL}${path}?${searchParams.toString()}`;
+        // A service that answered says what failed (its limit and when to ask again, its source being
+        // down); a direct read that cannot connect as well says less: the source is down, not this
+        // computer's connection.
+        const answered = !isNetworkFailure(error);
         const response = await httpFetch(url, {
           headers: { Accept: "application/json" },
           signal: options.signal,
+        }).catch((fallbackError: unknown) => {
+          throw answered ? thirteenFSourceError(error) : fallbackError;
         });
-        if (!response.ok) throw new ApiRequestError(`Forms13F ${response.status} for ${path}`, response.status);
+        if (!response.ok) {
+          if (isRateLimited(error)) throw error;
+          throw thirteenFSourceError(new ApiRequestError(`Forms13F ${response.status} for ${path}`, response.status));
+        }
         value = await response.json() as T;
       }
       options.signal?.throwIfAborted();
+      // The service's stored copy, while its 13F source is unavailable: said like a saved copy, and
+      // not kept as a fresh one, so the next read asks again.
+      const storedAt = storedCopyTime(value);
+      if (storedAt != null) {
+        if (current()) failedRefreshes.add(key);
+        options.onSavedCopy?.(storedAt);
+        return value;
+      }
       if (current()) {
         failedRefreshes.delete(key);
         if (value != null && options.cache !== false) {
@@ -150,18 +253,17 @@ async function fetchForms13F<T>(
     } catch (error) {
       options.signal?.throwIfAborted();
       if (current()) failedRefreshes.add(key);
-      if (isPermanentClientError(error)) {
-        if (current()) store?.deleteResource(CACHE_KIND, key, { sourceKey: CACHE_SOURCE });
+      // A saved copy answers only for a failure asking again may get past; a refusal or a reply that
+      // fails validation is the error, and a missing or denied resource also drops its copy.
+      if (!isTransientFailure(error)) {
+        if (isPermanentClientError(error) && current()) store?.deleteResource(CACHE_KIND, key, { sourceKey: CACHE_SOURCE });
         throw error;
       }
       const retained = options.cache !== false
         ? store?.getResource<T>(CACHE_KIND, key, { ...cacheOptions, allowExpired: true }) : null;
-      // A caller may retain old research only when it can surface its provenance.
-      if (!retained || !options.onWarning) throw error;
-      const retrieved = new Date(retained.fetchedAt);
-      const age = Number.isFinite(retrieved.getTime()) ? `retrieved ${retrieved.toISOString()}` : "with unavailable retrieval time";
-      const reason = (error instanceof Error ? error.message : String(error)).trim() || "Request failed";
-      options.onWarning(`${key}: refresh failed: ${reason}. Retained data ${age}.`);
+      // A caller may retain old research only when it can say when it was saved.
+      if (!retained || !options.onSavedCopy || !Number.isFinite(retained.fetchedAt)) throw error;
+      options.onSavedCopy(retained.fetchedAt);
       return retained.value;
     } finally {
       if (activeRequests.get(key) === slot.promise) activeRequests.delete(key);
@@ -227,6 +329,7 @@ function mapHolding(raw: any): ThirteenFHoldingRecord | null {
     votingAuthorityShared: finiteOrNull(raw.voting_authority_shared),
     votingAuthorityNone: finiteOrNull(raw.voting_authority_none),
     putCall: stringOrEmpty(raw.put_call).toUpperCase(),
+    ...(raw.sec_list_status === "added" || raw.sec_list_status === "deleted" ? { secListStatus: raw.sec_list_status } : {}),
   };
 }
 
@@ -337,24 +440,108 @@ export async function listThirteenFFormHoldingsPage(
   return { rows, hasMore: rows.length >= limit && offset + rows.length < MAX_FORM_ROWS };
 }
 
+function mapHoldings(raw: unknown): ThirteenFHoldingRecord[] {
+  return arrayResponse(raw).map(mapHolding).filter((holding): holding is ThirteenFHoldingRecord => !!holding);
+}
+
+/** A filing's whole information table as Gloom Cloud sends it in one answer. */
+function filingRows(raw: unknown): ThirteenFHoldingRecord[] {
+  const rows = asRecord(raw).rows;
+  if (!Array.isArray(rows)) throw new Error("13F filing answer has no rows");
+  return mapHoldings(rows);
+}
+
+export interface FilingHoldingsOptions extends Forms13FReadOptions {
+  /** The rows the filing's summary counts, when known: a large filing's first rows come first. */
+  entries?: number | null;
+  /** The filing's first rows, while a large filing the service has not read yet is still loading. */
+  onFirstRows?: (rows: ThirteenFHoldingRecord[]) => void;
+}
+
+/**
+ * A filing's whole information table: one request to Gloom Cloud, which
+ * reads the source's pages itself and keeps the filing. An older service
+ * without that answer (a 404, remembered for the session) or one that cannot
+ * be reached is read a page at a time, a few pages at once, as before; a page
+ * Gloom Cloud cannot send comes from the public source. A busy or failing
+ * service (429, 5xx) is the error: paging it would only ask it more.
+ */
 export async function listThirteenFFormHoldings(
   cik: string,
   accessionNumber: string,
   signal?: AbortSignal,
-  options: Forms13FReadOptions = {},
+  options: FilingHoldingsOptions = {},
 ): Promise<ThirteenFHoldingRecord[]> {
-  const rows: ThirteenFHoldingRecord[] = [];
-  for (let offset = 0; offset < MAX_FORM_ROWS; offset += FORM_PAGE_LIMIT) {
+  const { entries, onFirstRows, ...readOptions } = options;
+  if (wholeFilingsMissing) return listPagedHoldings(cik, accessionNumber, signal, readOptions);
+  // The count lets a filing the service has not stored yet be read in fewer requests.
+  const params = {
+    cik: normalizeCik(cik),
+    accession_number: accessionNumber,
+    ...(entries != null && entries > 0 ? { entries } : {}),
+  };
+  const whole = fetchForms13F<unknown>("/holdings", params, { ...readOptions, signal, cloudOnly: true });
+  let answered = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (onFirstRows && entries != null && entries > FIRST_ROWS) {
+    timer = setTimeout(() => {
+      if (answered) return;
+      void fetchForms13F<unknown>("/holdings", { ...params, limit: FIRST_ROWS }, { signal, cloudOnly: true, cache: false })
+        .then((raw) => { if (!answered) onFirstRows(filingRows(raw)); })
+        .catch(() => {
+          // Intentional ignore: the first rows only come ahead of the whole filing, which reports its own failure.
+        });
+    }, FIRST_ROWS_AFTER_MS);
+  }
+  try {
+    return filingRows(await whole);
+  } catch (error) {
     signal?.throwIfAborted();
+    const missing = error instanceof ApiRequestError && error.status === 404;
+    if (!missing && !isNetworkFailure(error)) throw error;
+    if (missing) wholeFilingsMissing = true;
+    return listPagedHoldings(cik, accessionNumber, signal, readOptions);
+  } finally {
+    answered = true;
+    clearTimeout(timer);
+  }
+}
+
+/** A filing read a page at a time, a few pages at once, until a page comes back short. */
+async function listPagedHoldings(
+  cik: string,
+  accessionNumber: string,
+  signal: AbortSignal | undefined,
+  options: Forms13FReadOptions,
+): Promise<ThirteenFHoldingRecord[]> {
+  const pages: ThirteenFHoldingRecord[][] = [];
+  const maxPages = Math.ceil(MAX_FORM_ROWS / FILING_PAGE_ROWS);
+  let next = 0;
+  let last: number | null = null;
+  let failed = false;
+  async function readPage() {
+    signal?.throwIfAborted();
+    const index = next++;
     const page = await listThirteenFFormHoldingsPage(cik, accessionNumber, signal, {
       ...options,
-      offset,
-      limit: FORM_PAGE_LIMIT,
+      offset: index * FILING_PAGE_ROWS,
+      limit: FILING_PAGE_ROWS,
     });
-    rows.push(...page.rows);
-    if (!page.hasMore) break;
+    pages[index] = page.rows;
+    if (page.rows.length < FILING_PAGE_ROWS && (last === null || index < last)) last = index;
   }
-  return rows;
+  async function worker() {
+    try {
+      while (!failed && next < maxPages && (last === null || next <= last)) await readPage();
+    } catch (error) {
+      failed = true;
+      throw error;
+    }
+  }
+  // The first page alone says whether there is more: most filings fit in it.
+  await readPage();
+  await Promise.all(Array.from({ length: FILING_PAGE_CONCURRENCY }, worker));
+  return pages.slice(0, (last ?? maxPages - 1) + 1).flat();
 }
 
 export async function lookupThirteenFTickers(

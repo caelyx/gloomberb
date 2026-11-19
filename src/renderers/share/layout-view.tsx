@@ -1,4 +1,5 @@
 /** @jsxImportSource react */
+import { formatShortDate } from "../../utils/datetime-format";
 import type { CSSProperties } from "react";
 import type { DockLayoutNode, PaneInstanceConfig } from "../../types/config";
 import type { LayoutMarketplaceEntry } from "../../shares/portable-layout";
@@ -79,7 +80,7 @@ function formatDate(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime())
     ? ""
-    : date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+    : formatShortDate(date);
 }
 
 export function LayoutShareView({
@@ -116,7 +117,7 @@ export function LayoutShareView({
       <section className="layout-workspace" aria-label={`${entry.name} layout preview`}>
         {entry.layout.dockRoot
           ? <DockPreview node={entry.layout.dockRoot} panes={panes} />
-          : <p>No docked panes</p>}
+          : <p>No panes in the layout</p>}
         {extra.length > 0 ? (
           <div className="layout-extra-panes">
             {extra.map((pane) => <PaneCard key={pane.instanceId} pane={pane} />)}

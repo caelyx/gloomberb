@@ -5,22 +5,19 @@ import {
   removePane,
   type ResolvedPane,
 } from "../../../layout/pane-manager";
-import { windowMoveTargets } from "../../../layout/pane-manager/secondary-windows";
-import type { DesktopWindowCommands } from "../../../state/app/context/window-commands";
 import type { PluginRegistry } from "../../../plugins/registry";
 import type { LayoutConfig } from "../../../types/config";
 import { isPaneLocked, setPaneLocked } from "../../../pane-settings";
 import { contextMenuDivider, type ContextMenuItem } from "../../../types/context-menu";
 import { pluginContextMenuSlot } from "../../../ui/context-menu";
 import { paneHintTitle, type CombinedPaneFooter } from "../pane/footer/model";
-import {
-  formatPlatformShortcutLabel,
-  type ShortcutDisplayMode,
-} from "../../../utils/shortcut-labels";
+import type { ShortcutDisplayMode } from "../../../utils/shortcut-labels";
+import { formatShortcutForHost } from "../../../app/keybindings";
 import { PANE_MANAGEMENT_ACCELERATORS, type PaneManagementAccelerators } from "./shortcuts";
 import { t, tf } from "../../../i18n";
 import { displayWidth } from "../../../utils/format";
 import { fireAndForget } from "../../../utils/fire-and-forget";
+import { getDesktopWindows, windowMoveTargets } from "../../../state/desktop-windows";
 
 const MENU_MIN_WIDTH = 18;
 const MENU_MAX_WIDTH = 44;
@@ -37,6 +34,8 @@ export interface PaneMenuEntry {
   accelerator?: string;
   checked?: boolean;
   divider?: boolean;
+  /** See ContextMenuActionItem.remoteScope. */
+  remoteScope?: string;
   action: () => void;
 }
 
@@ -68,7 +67,13 @@ export function paneFooterMenuItems(footer: CombinedPaneFooter | undefined): Con
   for (const hint of footer.hints) {
     if (hint.disabled || !hint.onPress) continue;
     const onPress = hint.onPress;
-    items.push({ id: `pane-hint:${hint.id}`, label: paneHintTitle(hint), accelerator: hint.key, onSelect: () => onPress() });
+    items.push({
+      id: `pane-hint:${hint.id}`,
+      label: paneHintTitle(hint),
+      accelerator: hint.key,
+      onSelect: () => onPress(),
+      ...(hint.remoteScope ? { remoteScope: hint.remoteScope } : {}),
+    });
   }
   for (const segment of footer.info) {
     if (segment.disabled || !segment.onPress || !segment.shortcut) continue;
@@ -114,17 +119,9 @@ export function menuForPane(
   askGloom?: () => void,
   /** Report a Bug: the pane's picture and a line to #bugs; absent where it cannot be posted or pictured. */
   reportBug?: () => void,
-  /** Move to another desktop window; absent outside the desktop app's main and secondary windows. */
-  windowCommands?: DesktopWindowCommands | null,
+  /** The pane is a tab of a stack: show the next or the previous tab. */
+  stackTabs?: { next: () => void; previous: () => void },
 ): ContextMenuItem[] {
-  // A secondary window's panes stay out of the main window's layout tabs, and
-  // it cannot open the panes Share and Ask Gloom open.
-  if (desktopWindowBridge?.kind === "window") {
-    fullscreen = undefined;
-    layoutMove = {};
-    sharePane = undefined;
-    askGloom = undefined;
-  }
   const baseActions: ContextMenuItem[] = [...paneItems];
   if (baseActions.length > 0) baseActions.push(contextMenuDivider("pane:own-actions-divider"));
   for (const setting of quickSettings) {
@@ -180,6 +177,13 @@ export function menuForPane(
   // Plugin actions sit with sharing and exporting.
   baseActions.push(pluginContextMenuSlot("pane"));
 
+  if (stackTabs) {
+    baseActions.push(
+      { id: "stack-next-tab", label: "Next Tab", accelerator: accelerators.nextTab, onSelect: stackTabs.next },
+      { id: "stack-prev-tab", label: "Previous Tab", accelerator: accelerators.prevTab, onSelect: stackTabs.previous },
+    );
+  }
+
   if (fullscreen) {
     baseActions.push({
       id: "toggle-fullscreen",
@@ -210,7 +214,7 @@ export function menuForPane(
   if (pane.floating) {
     baseActions.push({
       id: "dock",
-      label: "Dock Pane",
+      label: "Return to Layout",
       accelerator: accelerators.toggleFloating,
       onSelect: () => {
         persistLayout(applyDrop(layout, pane.instance.instanceId, { kind: "frame", edge: "right" }));
@@ -229,7 +233,9 @@ export function menuForPane(
     });
   }
 
-  if (desktopWindowBridge?.kind === "main" && desktopWindowBridge.popOutPane) {
+  // Popped-out panes belong to the main window; elsewhere a pane moves to a window instead.
+  const windows = getDesktopWindows();
+  if (desktopWindowBridge?.kind === "main" && desktopWindowBridge.popOutPane && (!windows || windows.windowId === "main")) {
     baseActions.push({
       id: "pop-out",
       label: "Pop Out",
@@ -239,16 +245,16 @@ export function menuForPane(
       },
     });
   }
-  if (windowCommands) {
-    baseActions.push({
-      id: "move-to-window",
-      label: "Move to",
-      submenu: windowMoveTargets(layout, windowCommands.windowId).map(({ target, label }) => ({
-        id: `move-to-window:${target}`,
-        label,
-        onSelect: () => windowCommands.movePaneToWindow(pane.instance.instanceId, target),
-      })),
-    });
+  if (windows) {
+    for (const move of windowMoveTargets(windows, { prefix: "pane" })) {
+      baseActions.push({
+        id: `move-to-window:${move.key}`,
+        label: move.label,
+        onSelect: () => {
+          fireAndForget(windows.movePane(pane.instance.instanceId, move.target), "desktop.movePaneToWindow");
+        },
+      });
+    }
   }
 
   const locked = isPaneLocked(pane.instance);
@@ -296,20 +302,15 @@ export function menuItemsForFallback(
   return items.flatMap((item, index): PaneMenuEntry[] => {
     if (item.type === "divider") return [{ id: item.id ?? `divider:${index}`, label: "", divider: true, action: () => {} }];
     if (item.type === "role" || item.enabled === false || item.hidden === true) return [];
-    // The kit menu has one level: a submenu's items take its label in front ("Move to Window 2").
-    if (!item.onSelect && item.submenu?.length) {
-      return menuItemsForFallback(item.submenu, shortcutDisplayMode)
-        .filter((entry) => !entry.divider)
-        .map((entry) => ({ ...entry, label: `${item.label} ${entry.label}` }));
-    }
     if (!item.onSelect) return [];
     return [{
       id: item.id,
       label: item.label,
       checked: item.checked,
       accelerator: item.accelerator
-        ? formatPlatformShortcutLabel(item.accelerator, undefined, shortcutDisplayMode)
+        ? formatShortcutForHost(item.accelerator, shortcutDisplayMode)
         : undefined,
+      ...(item.remoteScope ? { remoteScope: item.remoteScope } : {}),
       action: () => { void item.onSelect?.(); },
     }];
   });

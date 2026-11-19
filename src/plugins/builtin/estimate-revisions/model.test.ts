@@ -163,8 +163,9 @@ test("absent endpoint and denied access remain distinct", async () => {
   }
 });
 
-test("a listing suffix names the venue without looking the bare symbol up", async () => {
+test("a listing suffix names the venue without a listing lookup", async () => {
   const asked: string[] = [];
+  // No market data is passed, so a symbol the suffix did not place would ask for an exchange.
   await expect(
     fetchEstimates("BHP.AX", "", {
       getCloudEstimateRevisions: async (symbol, exchange) => {

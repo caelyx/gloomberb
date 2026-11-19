@@ -1,3 +1,5 @@
+import { MISSING_VALUE } from "../../../utils/format";
+import { formatExpDate } from "../../../utils/options";
 import type { ScannerFlowEvent, ScannerFlowHistoryQuery, ScannerStatus } from "../../../api-client";
 
 export type FlowMinPremium = "50000" | "250000" | "1000000";
@@ -82,19 +84,36 @@ function printRoot(underlying: string): string {
 }
 
 /**
+ * Whose prints the pane shows: one name (`FLOW NVDA`), which takes the place
+ * of the universe filter, or the market, narrowed to the user's own tickers
+ * when the universe filter says so.
+ */
+export interface FlowScope {
+  symbol?: string | null;
+  watchlist: ReadonlySet<string>;
+}
+
+/** The listed symbol a `FLOW <ticker>` pane is about, as the pane setting or report argument names it. */
+export function flowScopeSymbol(value: unknown): string | null {
+  const symbol = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return symbol || null;
+}
+
+/**
  * The shared feed is published once for everyone, so every user preference is a
  * local predicate over the same events. Never push these upstream.
  */
 export function filterFlowEvents(
   events: readonly ScannerFlowEvent[] | undefined,
   filters: FlowFilters,
-  watchlist: ReadonlySet<string>,
+  scope: FlowScope,
   now = Date.now(),
 ): ScannerFlowEvent[] {
   const minPremium = Number(filters.minPremium);
   const minVolOi = filters.volOi === "off" ? null : Number(filters.volOi);
   const maxExpiryDays = filters.expiry === "all" ? null : Number(filters.expiry);
-  const roots = filters.universe === "watchlist" ? new Set([...watchlist].map(flowOptionRoot)) : null;
+  const roots = scope.symbol ? new Set([flowOptionRoot(scope.symbol)])
+    : filters.universe === "watchlist" ? new Set([...scope.watchlist].map(flowOptionRoot)) : null;
 
   return (events ?? []).filter((event) => {
     if (!(event.premium >= minPremium)) return false;
@@ -121,7 +140,15 @@ export function flowEmptyState(
   received: number,
   visible: number,
   status: ScannerStatus | undefined,
+  symbol: string | null = null,
 ): { title: string; hint: string } {
+  // One name's prints are mostly recorded ones, and a quiet name has none at all.
+  if (symbol) {
+    return {
+      title: `No ${symbol} prints under these filters.`,
+      hint: "Flow is recorded for the most active names, the day's movers and names with a flow alert.",
+    };
+  }
   if (received > visible) {
     return {
       title: `${received - visible} ${received - visible === 1 ? "print" : "prints"} hidden by filters.`,
@@ -152,27 +179,33 @@ export function formatFlowType(event: ScannerFlowEvent): string {
 }
 
 export function formatFlowSide(side: ScannerFlowEvent["side"]): string {
-  return side === "unknown" ? "—" : side;
+  return side === "unknown" ? MISSING_VALUE : side;
 }
 
 export function formatFlowVolOi(volOi: number | null | undefined): string {
-  if (typeof volOi !== "number" || !Number.isFinite(volOi)) return "—";
+  if (typeof volOi !== "number" || !Number.isFinite(volOi)) return MISSING_VALUE;
   return volOi >= 10 ? `${Math.round(volOi)}x` : `${volOi.toFixed(1)}x`;
 }
 
-export function formatFlowExpiry(expiry: string): string {
-  const parts = expiry.split("-");
-  return parts.length === 3 ? `${parts[1]}/${parts[2]}` : expiry;
+/** An expiry as OMON's strip names it, `16 Jun`, with its year when it is not this one: `17 Jun '27`. */
+export function formatFlowExpiry(expiry: string, now = Date.now()): string {
+  const [year, month, day] = expiry.split("-");
+  if (!year || !month || !day) return expiry;
+  const label = formatExpDate(Date.UTC(Number(year), Number(month) - 1, Number(day)) / 1000);
+  return year === String(new Date(now).getUTCFullYear()) ? label.replace(/ '\d{2}$/, "") : label;
 }
 
-/** Today's prints to the second; earlier days carry their date. */
+/**
+ * A print's time in UTC, as the TIME UTC header says (formatFeedTime's
+ * `utc`): today's to the second, an earlier day's with its date.
+ */
 export function formatFlowTime(at: number, now = Date.now()): string {
   const date = new Date(at);
   const pad = (value: number) => String(value).padStart(2, "0");
-  if (localDay(at) !== localDay(now)) {
-    return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  if (utcDay(at) !== utcDay(now)) {
+    return `${pad(date.getUTCMonth() + 1)}/${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
   }
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
 
 /** Rows per page of recorded prints below the live tape. */
@@ -219,31 +252,51 @@ export function mergeFlowRows(
 /** The pane's filters as a query for recorded prints, so each page is rows it will show. */
 export function flowHistoryQuery(
   filters: FlowFilters,
-  watchlist: ReadonlySet<string>,
+  scope: FlowScope,
   before?: { at: number; id: string },
   limit = FLOW_HISTORY_PAGE,
 ): ScannerFlowHistoryQuery {
   return {
     ...(before ? { before } : {}),
     limit,
+    ...flowFilterQuery(filters),
+    ...(scope.symbol ? { symbols: [scope.symbol.toUpperCase()] }
+      : filters.universe === "watchlist" ? { symbols: [...scope.watchlist].map((symbol) => symbol.toUpperCase()).sort() } : {}),
+  };
+}
+
+function flowFilterQuery(filters: FlowFilters): Omit<ScannerFlowHistoryQuery, "before" | "limit" | "symbols"> {
+  return {
     minPremium: Number(filters.minPremium),
     ...(filters.side === "calls" ? { right: "C" as const } : filters.side === "puts" ? { right: "P" as const } : {}),
     ...(filters.kind === "sweeps" ? { kind: "sweep" as const } : filters.kind === "blocks" ? { kind: "block" as const } : {}),
     ...(filters.volOi === "off" ? {} : { minVolOi: Number(filters.volOi) }),
     ...(filters.expiry === "all" ? {} : { maxExpiryDays: Number(filters.expiry) }),
-    ...(filters.universe === "watchlist" ? { symbols: [...watchlist].map((symbol) => symbol.toUpperCase()).sort() } : {}),
   };
 }
 
-function localDay(at: number): string {
-  const date = new Date(at);
-  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+/**
+ * The session summary's query as the Cloud route reads it: the same filters as
+ * the recorded prints, with one name as `symbol`, which also asks for its strikes.
+ */
+export function flowSessionSearch(filters: FlowFilters, scope: FlowScope): string {
+  const params = new URLSearchParams(flowHistorySearch({
+    ...flowFilterQuery(filters),
+    ...(!scope.symbol && filters.universe === "watchlist"
+      ? { symbols: [...scope.watchlist].map((symbol) => symbol.toUpperCase()).sort() } : {}),
+  }));
+  if (scope.symbol) params.set("symbol", scope.symbol.toUpperCase());
+  return params.toString();
 }
 
-/** True when any row is from an earlier day, so the time column needs its date. */
+function utcDay(at: number): string {
+  return new Date(at).toISOString().slice(0, 10);
+}
+
+/** True when any row is from an earlier day in UTC, so the time column needs its date. */
 export function flowRowsSpanDays(events: readonly ScannerFlowEvent[], now = Date.now()): boolean {
-  const today = localDay(now);
-  return events.some((event) => localDay(event.at) !== today);
+  const today = utcDay(now);
+  return events.some((event) => utcDay(event.at) !== today);
 }
 
 /** The recorded-print query as the Cloud route reads it. */

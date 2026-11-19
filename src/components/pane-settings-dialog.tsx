@@ -19,8 +19,9 @@ import {
   TuiPaneSettingsDialogBody,
   TuiUnavailablePaneSettingsDialog,
 } from "./pane-settings-dialog/tui";
-import { isPaneSettingDisabled, isSpaceKey, stepPaneSettingSelect } from "./pane-settings-dialog/value";
+import { isPaneSettingDisabled, isSpaceKey, paneSettingValue, stepPaneSettingSelect } from "./pane-settings-dialog/value";
 import { useRowNotes } from "./ui/row-notes";
+import { logFailure } from "../utils/log-failure";
 
 const fieldKey = (field: PaneSettingField) => field.key;
 /** What an action row shows of its own state: a note on it goes once that moves on (it connected elsewhere, say). */
@@ -117,7 +118,7 @@ export function PaneSettingsDialogContent({
       if (!closed && mounted.current) setSettingsRevision((revision) => revision + 1);
       return;
     }
-    const currentValue = descriptor.context.settings[field.key];
+    const currentValue = paneSettingValue(field, descriptor.context.settings);
 
     if (field.type === "toggle") {
       await applyAndRefresh(field, currentValue !== true);
@@ -174,14 +175,14 @@ export function PaneSettingsDialogContent({
   /** Left and right change a toggle or step a select in place, the way a settings list does. */
   const stepField = (field: PaneSettingField | undefined, direction: -1 | 1) => {
     if (!field || !descriptor) return;
-    const currentValue = descriptor.context.settings[field.key];
+    const currentValue = paneSettingValue(field, descriptor.context.settings);
     if (field.type === "toggle") {
-      void applyAndRefresh(field, currentValue !== true).catch(() => {});
+      void applyAndRefresh(field, currentValue !== true).catch(logFailure("pane-settings-dialog", "Toggle pane setting failed"));
       return;
     }
     if (field.type !== "select") return;
     const value = stepPaneSettingSelect(field, currentValue, direction);
-    if (value !== null) void applyAndRefresh(field, value).catch(() => {});
+    if (value !== null) void applyAndRefresh(field, value).catch(logFailure("pane-settings-dialog", "Step pane setting failed"));
   };
 
   useDialogKeyboard((event) => {
@@ -201,14 +202,14 @@ export function PaneSettingsDialogContent({
     } else if (event.name === "escape") dismiss();
     else if (event.name === "enter" || event.name === "return" || isSpaceKey(event)) {
       event.preventDefault();
-      void openFieldEditor(fields[selectedIndex]).catch(() => {});
+      void openFieldEditor(fields[selectedIndex]).catch(logFailure("pane-settings-dialog", "Open pane setting failed"));
     }
   });
 
   if (!descriptor) {
     return isDesktop
       ? <DesktopUnavailablePaneSettingsDialog dismiss={dismiss} />
-      : <TuiUnavailablePaneSettingsDialog />;
+      : <TuiUnavailablePaneSettingsDialog dismiss={dismiss} />;
   }
 
   const title = descriptor.settingsDef.title ?? `${descriptor.paneDef.name} Settings`;
@@ -225,23 +226,24 @@ export function PaneSettingsDialogContent({
       onSelectRef={setDesktopSelectRef}
       onEdit={(field, index) => {
         setSelectedIndex(index);
-        void openFieldEditor(field).catch(() => {});
+        void openFieldEditor(field).catch(logFailure("pane-settings-dialog", "Open pane setting failed"));
       }}
       onApply={(field, value, index) => {
         setSelectedIndex(index);
-        void applyAndRefresh(field, value).catch(() => {});
+        void applyAndRefresh(field, value).catch(logFailure("pane-settings-dialog", "Apply pane setting failed"));
       }}
     />
   ) : (
     <TuiPaneSettingsDialogBody
       title={title}
+      dismiss={dismiss}
       fields={fields}
       selectedIndex={selectedIndex}
       settings={descriptor.context.settings}
       noteFor={noteFor}
       onSelect={setSelectedIndex}
       onActivate={(field) => {
-        void openFieldEditor(field).catch(() => {});
+        void openFieldEditor(field).catch(logFailure("pane-settings-dialog", "Open pane setting failed"));
       }}
     />
   );

@@ -5,6 +5,7 @@ import type {
   FinancialStatement,
   Fundamentals,
   NextEarnings,
+  OptionContract,
   OptionsChain,
   PricePoint,
   Quote,
@@ -24,11 +25,16 @@ import { isRoundTheClockCoin } from "../../utils/crypto-pair";
 import { latestSettledSessionDate } from "../../utils/price-history";
 import { zonedDateTimeParts, zonedWallClockToUtcMs } from "../../utils/zoned-date-time";
 import { createProviderMiss } from "../provider-errors";
+import { parseOptionTicker } from "../../utils/options";
 import { reconcileQuoteDayRange } from "../../market-data/quotes/day-range";
 import { redactUnavailableFundamentals } from "../../utils/fundamentals";
 import { readWithdrawnObservations } from "../../utils/statement-gaps";
+import { isBankOrInsurerIndustry, withStatementEbitda } from "../../utils/ebitda";
 import { parseListingDelisting } from "../../market-data/quotes/delisting";
 import { readIntradayBar, readStaleReason } from "../../market-data/quotes/intraday-bar";
+import { readSessionSplit } from "../../market-data/quotes/session-split";
+import { isIndexLevel } from "../../market-data/market/index-level";
+import { isYieldIndexSymbol } from "../../tickers/index-roots";
 
 export const GLOOMBERB_CLOUD_PROVIDER_ID = "gloomberb-cloud" as const;
 
@@ -65,6 +71,17 @@ function isNonFutureType(instrumentType: string | undefined): boolean {
   return !!type && type !== "FUTURE" && type !== "FUTURES" && type !== "FUT";
 }
 
+/**
+ * When Gloom Cloud fetched a quote from its source, as the service sends it
+ * (ms): a copy it kept, even one it could not refresh, says when it was
+ * fetched, never when this app read it. A time ahead of this clock reads as
+ * now. Undefined when absent or unreadable; the router then dates the quote
+ * by its own read (withRetrievedAt).
+ */
+function serviceRetrievedAt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.min(value, Date.now()) : undefined;
+}
+
 export function mapQuote(
   quote: CloudQuotePayload,
   providerMeta?: CloudProviderMeta,
@@ -86,19 +103,29 @@ export function mapQuote(
   const changePercent = !impossibleClose && typeof quote.changePercent === "number" && Number.isFinite(quote.changePercent)
     ? quote.changePercent
     : Number.NaN;
-  // A generic future (VX1, TY1) reads in points or 32nds, and an index future's
-  // continuous symbol or contract (ES=F, SXOZ26.CME) in points, not dollars.
+  // Generics, continuous symbols and listed contracts share their root's
+  // price basis: index futures in points and Treasury futures in 32nds.
   const futuresBasis = isNonFutureType(quote.instrumentType) ? null
     : futuresListingPriceBasis(quote.symbol, quote.listingExchangeName ?? quote.exchangeName);
   const priceObservation = quote.priceBasis === "nav" ? "nav" : undefined;
   const priceBasis = quote.priceBasis === "nav"
     ? "per-unit"
     : futuresBasis ?? quote.priceBasis;
+  // An index's 0 open or day range is none (^BVSP before B3 opens served Open 0.00, Day Range 0.00 - 0.00): no level
+  // is 0. A Treasury yield index's is (^IRX read 0.00 in 2020), and its levels stand.
+  const index = isIndexLevel(quote.instrumentType) && !isYieldIndexSymbol(quote.symbol ?? "");
+  const sessionPrice = (value: number | undefined) => {
+    const price = normalizePriceValueByDivisor(value, divisor);
+    return index && price != null && price <= 0 ? undefined : price;
+  };
   return withoutUndefinedFields(reconcileQuoteDayRange({
     ...quote,
+    retrievedAt: serviceRetrievedAt(quote.retrievedAt),
     delisting: parseListingDelisting(quote.delisting),
     intradayBar: readIntradayBar(quote.intradayBar),
     staleReason: readStaleReason(quote.staleReason),
+    // An exchange's name, shown as the quote's source: nothing longer or stranger is.
+    priceVenue: typeof quote.priceVenue === "string" && /^[A-Za-z][A-Za-z0-9 .-]{0,23}$/.test(quote.priceVenue) ? quote.priceVenue : undefined,
     priceBasis,
     priceObservation,
     currency: currency || quote.currency,
@@ -106,6 +133,8 @@ export function mapQuote(
     change,
     changePercent,
     previousClose: impossibleClose ? undefined : normalizePriceValueByDivisor(quote.previousClose, divisor),
+    // A split in the quote's session: its previous close is on the new basis already.
+    sessionSplit: impossibleClose ? undefined : readSessionSplit(quote.sessionSplit, divisor),
     regularClose: normalizePriceValueByDivisor(quote.regularClose, divisor),
     // JSON carries an unavailable move as null; the percent is unitless.
     regularChange: normalizePriceValueByDivisor(quote.regularChange ?? undefined, divisor),
@@ -114,11 +143,18 @@ export function mapQuote(
       : undefined,
     high52w: normalizePriceValueByDivisor(quote.high52w, divisor),
     low52w: normalizePriceValueByDivisor(quote.low52w, divisor),
+    // The service read the 52-week range from its stored daily bars, its source's being unusable.
+    yearRangeBasis: quote.yearRangeBasis === "daily-bars" ? "daily-bars" : undefined,
+    // What a coin's day range and volume measure: the composite's, or one exchange's own day.
+    statsBasis: quote.statsBasis === "composite" || quote.statsBasis === "exchange" ? quote.statsBasis : undefined,
+    rangeWidened: quote.rangeWidened === true ? true : undefined,
+    // No live quote: the close of the latest daily bar of this session.
+    dailyClose: readDailyClose(quote.dailyClose),
     bid: normalizePriceValueByDivisor(quote.bid, divisor),
     ask: normalizePriceValueByDivisor(quote.ask, divisor),
-    open: normalizePriceValueByDivisor(quote.open, divisor),
-    high: normalizePriceValueByDivisor(quote.high, divisor),
-    low: normalizePriceValueByDivisor(quote.low, divisor),
+    open: sessionPrice(quote.open),
+    high: sessionPrice(quote.high),
+    low: sessionPrice(quote.low),
     mark: normalizePriceValueByDivisor(quote.mark, divisor),
     lastTradePrice: normalizePriceValueByDivisor(quote.lastTradePrice, divisor),
     preMarketPrice: normalizePriceValueByDivisor(quote.preMarketPrice, divisor),
@@ -175,6 +211,12 @@ export function mapQuote(
         }
       : quote.provenance,
   }));
+}
+
+/** A daily close's session, an exchange-local `YYYY-MM-DD`; anything else is no daily close. */
+function readDailyClose(value: unknown): Quote["dailyClose"] {
+  const session = value && typeof value === "object" ? (value as { session?: unknown }).session : undefined;
+  return typeof session === "string" && /^\d{4}-\d{2}-\d{2}$/.test(session) ? { session } : undefined;
 }
 
 /**
@@ -234,6 +276,11 @@ function venueVolume(value: unknown): { venueVolume: { venue: string; volume: nu
     : null;
 }
 
+/** What a served bar's volume counts, when it is a short plain phrase (`aggregate`, `3 spot venues`). */
+function volumeBasis(value: unknown): { volumeBasis: string } | null {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9 ]{0,31}$/i.test(value.trim()) ? { volumeBasis: value.trim() } : null;
+}
+
 /**
  * One served bar. `coin`: the bars are a coin's, which trades every hour of every day. Its intraday volume is the
  * value traded in the bar on major spot venues, and a bar no venue reported has none rather than 0, so a 0 (from an
@@ -254,11 +301,22 @@ export function mapPricePoint(
     close: normalizePriceValueByDivisor(point.close, divisor) ?? point.close,
     volume: coin && point.volume === 0 ? undefined : point.volume,
     ...(venueVolume(point.venueVolume) ?? {}),
+    ...(volumeBasis(point.volumeBasis) ?? {}),
     ...(point.partial === true ? { partial: true } : {}),
     ...(point.filled === true ? { filled: true } : {}),
     ...(point.unsettled === true ? { unsettled: true } : {}),
+    ...(point.sessionClose === true ? { sessionClose: true } : {}),
+    ...(point.beforeClose === true ? { beforeClose: true } : {}),
+    ...(typeof point.rescaled === "number" && Number.isFinite(point.rescaled) && point.rescaled > 0 && point.rescaled !== 1
+      ? { rescaled: point.rescaled } : {}),
+    ...(typeof point.contract === "string" && FUTURES_CONTRACT_CODE.test(point.contract) ? { contract: point.contract } : {}),
+    ...(point.closeRebuilt === true ? { closeRebuilt: true } : {}),
+    ...(point.closeCopied === true ? { closeCopied: true } : {}),
   };
 }
+
+/** A listed contract as a continuous future's bar names it: root, month letter and year (NGZ26, ZQF27). */
+const FUTURES_CONTRACT_CODE = /^[A-Z0-9]{1,4}[FGHJKMNQUVXZ]\d{2}$/;
 
 /** Per-share bases the statistics block serves beside its multiples. */
 const CLOUD_PER_SHARE_BASES = ["forwardEps", "dividendRate"] as const;
@@ -283,7 +341,8 @@ function mapCloudFundamentals(fundamentals: Fundamentals | undefined): Fundament
 }
 
 const EARNINGS_TIMINGS: ReadonlySet<unknown> = new Set(["bmo", "dmh", "amc"]);
-const EARNINGS_TIMING_SOURCES: ReadonlySet<unknown> = new Set(["filing", "calendar", "history"]);
+// "company": a date (and time) the company announced itself, which the service keeps over the calendar's.
+const EARNINGS_TIMING_SOURCES: ReadonlySet<unknown> = new Set(["filing", "calendar", "history", "company"]);
 
 /** The served next report; one without a calendar date is left out. */
 function mapCloudNextEarnings(value: NextEarnings | undefined): NextEarnings | undefined {
@@ -297,11 +356,13 @@ function mapCloudNextEarnings(value: NextEarnings | undefined): NextEarnings | u
 
 /**
  * A served statement row with withdrawn values read as declared gaps, without
- * the per-issuer provenance the service can still attach.
+ * the per-issuer provenance the service can still attach, and its EBITDA
+ * operating income plus D&A whatever the service sent: derived where the row
+ * reports no operating income, except for a bank or an insurer (`derive`).
  */
-function mapCloudStatement(row: FinancialStatement): FinancialStatement {
+function mapCloudStatement(row: FinancialStatement, derive: boolean): FinancialStatement {
   const { earningsResult: _earnings, operatingResult: _operating, operatingResultAggregation: _aggregation, ...statement } = row;
-  return readWithdrawnObservations(statement);
+  return withStatementEbitda(readWithdrawnObservations(statement), derive);
 }
 
 export function mapCloudFinancials(
@@ -313,6 +374,7 @@ export function mapCloudFinancials(
   const divisor = rawQuote ? resolveCurrencyUnit(rawQuote.currency).divisor : 1;
   const exchange = rawQuote?.listingExchangeName ?? rawQuote?.exchangeName ?? "";
   const coin = isRoundTheClockCoin(rawQuote?.symbol, exchange);
+  const derive = !isBankOrInsurerIndustry(financials.profile?.industry);
   return {
     quote,
     quoteMetadata: financials.quoteMetadata,
@@ -322,8 +384,11 @@ export function mapCloudFinancials(
     fundamentals: mapCloudFundamentals(financials.fundamentals),
     financialCurrency: financials.financialCurrency,
     statementHistory: financials.statementHistory,
-    annualStatements: (financials.annualStatements ?? []).map(mapCloudStatement),
-    quarterlyStatements: (financials.quarterlyStatements ?? []).map(mapCloudStatement),
+    annualStatements: (financials.annualStatements ?? []).map((row) => mapCloudStatement(row, derive)),
+    quarterlyStatements: (financials.quarterlyStatements ?? []).map((row) => mapCloudStatement(row, derive)),
+    ...(financials.trailingStatement
+      ? { trailingStatement: { ...mapCloudStatement(financials.trailingStatement, derive), trailing: financials.trailingStatement.trailing } }
+      : {}),
     priceHistory: (financials.priceHistory ?? []).map((point) =>
       point.date instanceof Date
         ? point
@@ -333,14 +398,37 @@ export function mapCloudFinancials(
   };
 }
 
+/**
+ * Whether a contract is one a corporate action adjusted: the server tags the
+ * ones it lists on request, and a contract under a numbered root that is not
+ * the underlying's (ETHA1 beside ETHA) is one too, from a server that does not.
+ */
+function adjustedRoot(contract: OptionContract, underlying: string): string | null {
+  if (contract.adjusted) return contract.adjusted.root;
+  const root = parseOptionTicker(contract.contractSymbol)?.underlying.toUpperCase();
+  return root && /\d$/.test(root) && root !== underlying.toUpperCase() ? root : null;
+}
+
+/**
+ * A served chain: its standard contracts, or with `adjusted` the contracts a
+ * corporate action adjusted, which price another deliverable and are listed
+ * only when asked for.
+ */
 export function mapOptionsChain(
   chain: CloudOptionsChainPayload,
+  { adjusted = false }: { adjusted?: boolean } = {},
 ): OptionsChain {
+  // An adjusted contract a server did not tag is tagged here, its deliverable unstated.
+  const contracts = (side: OptionContract[] | undefined) => (side ?? []).flatMap((contract) => {
+    const root = adjustedRoot(contract, chain.underlyingSymbol);
+    if ((root != null) !== adjusted) return [];
+    return [root && !contract.adjusted ? { ...contract, adjusted: { root, deliverable: null } } : contract];
+  });
   return {
     underlyingSymbol: chain.underlyingSymbol,
     expirationDates: chain.expirationDates ?? [],
-    calls: chain.calls ?? [],
-    puts: chain.puts ?? [],
+    calls: contracts(chain.calls),
+    puts: contracts(chain.puts),
     providerId: chain.providerId,
     dataSource: chain.dataSource,
     feed: chain.feed,
@@ -361,6 +449,11 @@ export function isEmptyCloudStatus(
   status: CloudMarketResponse<unknown>["status"],
 ): boolean {
   return status === "empty" || status === "unsupported";
+}
+
+/** The service answered that its own source failed: `retryable_error`, or `fatal_error`, its catch-all for an upstream error. */
+export function isCloudSourceFailure(status: CloudMarketResponse<unknown>["status"]): boolean {
+  return status === "retryable_error" || status === "fatal_error";
 }
 
 export function mapBatchError<T>(

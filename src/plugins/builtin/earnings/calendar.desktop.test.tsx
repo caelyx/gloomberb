@@ -104,13 +104,33 @@ test("a session with more reports than fit ends on a +N more slot, which a click
 });
 
 test("a holiday says closed, unless companies report on it", async () => {
-  // Thanksgiving week: Thu Nov 26 2026 is closed.
+  // Thanksgiving week: Thu 26 Nov 2026 is closed.
   const heads = async (date: string) => {
     const container = await dom.render(
       <Calendar today="2026-11-23" onOpen={() => {}} onMore={() => {}} reports={[report("HOLI", { date })]} />,
     );
     return [...container.querySelectorAll<HTMLElement>("[data-gloom-role=earnings-calendar-days] > *")].map((day) => day.textContent);
   };
-  expect(await heads("2026-11-27")).toEqual(["Mon Nov 230", "Tue Nov 240", "Wed Nov 250", "Thu Nov 26closed", "Fri Nov 271"]);
-  expect((await heads("2026-11-26"))[3]).toBe("Thu Nov 261");
+  expect(await heads("2026-11-27")).toEqual(["Mon 23 Nov0", "Tue 24 Nov0", "Wed 25 Nov0", "Thu 26 Novclosed", "Fri 27 Nov1"]);
+  expect((await heads("2026-11-26"))[3]).toBe("Thu 26 Nov1");
+});
+
+test("a listing abroad's tile names its code under the logo, and its title the listing and the currency of its estimate", async () => {
+  const container = await dom.render(
+    <Calendar
+      onOpen={() => {}}
+      onMore={() => {}}
+      reports={[
+        report("0700:HKEX", { name: "Tencent Holdings Limited", timing: null, timingSource: null, marketCap: 459.65e9, epsEstimate: 7.21, currency: "CNY", listings: ["0700:HKEX"] }),
+        report("JPM", { timing: null, marketCap: 700e9 }),
+      ]}
+    />,
+  );
+  const tencent = tiles(container).find((tile) => tile.dataset.symbol === "0700:HKEX")!;
+  // The logo's letter, then the code: no venue to run under the next tile.
+  expect(tencent.textContent).toEndWith("0700");
+  expect(tencent.textContent).not.toContain("HKEX");
+  expect(tencent.title).toBe("0700:HKEX · Tencent Holdings Limited · time not set · EPS est 7.21 CNY");
+  // A US report's figures are dollars, as ever.
+  expect(tiles(container).find((tile) => tile.dataset.symbol === "JPM")!.title).toBe("JPM · JPM Inc. · time not set · EPS est 1.00");
 });

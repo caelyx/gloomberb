@@ -5,8 +5,11 @@ import { DEFAULT_CLI_OPTIONS } from "../options";
 import { serializeCliResult } from "../result";
 import { marketDataCliCommands } from "./market";
 import type { NewsArticle } from "../../news/types";
-import { mapCloudNewsArticle } from "../../sources/gloomberb-cloud/news";
+import { cloudNewsReadArticles, mapCloudNewsArticle, readCloudNews } from "../../sources/gloomberb-cloud/news";
+import { apiClient } from "../../api-client";
 import { commonWordCandidate, newsSearchText, wordMeansMore } from "./news-search";
+import { setCliWidthOverride } from "../../utils/cli-output";
+import { createTestArticle } from "../../test-support/news";
 
 const news = marketDataCliCommands.find((command) => command.name === "news")!;
 
@@ -22,11 +25,12 @@ function story(id: string, headline: string, publishedAt: string) {
 }
 
 /** Gloom Cloud answering /news/search with the stories, best match first; every requested URL is kept. */
-function serveSearch(items: ReturnType<typeof story>[]) {
+function serveSearch(items: ReturnType<typeof story>[], match?: "all" | "closest") {
   const requests: URL[] = [];
   setCloudApiFetchTransport(async (url) => {
     requests.push(new URL(url));
-    return new Response(JSON.stringify({ items, nextCursor: null }), { headers: { "Content-Type": "application/json" } });
+    const closest = new URL(url).searchParams.get("closest") === "1";
+    return new Response(JSON.stringify({ items, nextCursor: null, ...(closest && match ? { match } : {}) }), { headers: { "Content-Type": "application/json" } });
   });
   return requests;
 }
@@ -53,7 +57,7 @@ function unknownSymbol() {
   return { ...cli, calls };
 }
 
-test("several words, quoted or not, search story text in the service's order without looking up a listing", async () => {
+test("several words, quoted or not, search story text without looking up a listing, and print the matches newest first", async () => {
   const requests = serveSearch(STORIES);
   const cli = createTestCliContext({ dataProvider: { getNews: async () => { throw new Error("no ticker lookup"); } } });
   await news.execute(["european gas"], cli.context);
@@ -61,12 +65,77 @@ test("several words, quoted or not, search story text in the service's order wit
 
   expect(requests.map((url) => [url.pathname, url.searchParams.get("query"), url.searchParams.get("limit")]))
     .toEqual([["/news/search", "european gas", "20"], ["/news/search", "european gas", "20"]]);
-  // Headline hits lead the service's answer, so an older one stays above a newer summary hit.
-  expect((cli.printed[0]!.result.data as Array<{ id: string }>).map((article) => article.id)).toEqual(["older", "newer"]);
+  // The service answers headline hits first (an older one above a newer summary hit); the list reads newest first, as help says.
+  expect((cli.printed[0]!.result.data as Array<{ id: string }>).map((article) => article.id)).toEqual(["newer", "older"]);
   expect(cli.printed[0]!.result.metadata).toMatchObject({ ticker: null, search: "european gas" });
   const text = render(cli.printed[0]!);
   expect(text.split("\n")[0]).toBe('Stories matching "european gas"');
   expect(text).toContain("Goldman warns TTF could hit 105 euros");
+});
+
+/**
+ * `news ALL` on 30 Oct 2026 listed "September 2026 Monthly Release" with nothing under it: the $220M of
+ * catastrophe losses were only in the JSON summary, and no row carried an id the story pane would open.
+ */
+test("each story prints its short id and its summary on one indented line cut to the width; exports keep both whole", async () => {
+  const id = "7a2e8fda-0c4b-4c1e-9d55-2f4e8a6b1c3d";
+  const summary = "Allstate estimated September catastrophe losses at $220 million,\n\nbringing third-quarter losses to $1.65 billion.";
+  serveSearch([{ ...story(id, "September 2026 Monthly Release", "2026-10-15T11:52:00.000Z"), summary }]);
+  const cli = createTestCliContext({ dataProvider: { getNews: async () => { throw new Error("no ticker lookup"); } } });
+  await news.execute(["catastrophe losses"], cli.context);
+  setCliWidthOverride(72);
+  try {
+    const lines = render(cli.printed[0]!).split("\n");
+    const row = lines.findIndex((line) => line.includes("September 2026 Monthly Release"));
+    expect(lines[row]).toContain("7a2e8fda");
+    expect(lines[row]).not.toContain(id);
+    expect(lines[row + 1]).toBe("  Allstate estimated September catastrophe losses at $220 million, brin…");
+  } finally {
+    setCliWidthOverride(null);
+  }
+  const csv = serializeCliResult(cli.printed[0]!.result, { ...DEFAULT_CLI_OPTIONS, format: "csv", color: false }, cli.printed[0]!.options);
+  expect(csv).toContain(id);
+  expect((cli.printed[0]!.result.data as Array<{ summary: string }>)[0]!.summary).toBe(summary);
+});
+
+test("a search's undated stories go last, and stories of the same time keep the service's order", async () => {
+  const at = "2026-10-15T13:10:00.000Z";
+  serveSearch([
+    story("undated-a", "Hashrate climbs as miners add machines", ""),
+    story("tie-first", "Hashrate record at Foundry", at),
+    story("older", "Hashrate falls after the halving", "2026-09-23T12:30:00.000Z"),
+    story("tie-second", "Hashrate record at AntPool", at),
+    story("undated-b", "Hashrate futures listed", ""),
+    story("newest", "Hashrate index hits a high", "2026-10-15T13:11:00.000Z"),
+  ]);
+  const cli = createTestCliContext({ dataProvider: { getNews: async () => { throw new Error("no ticker lookup"); } } });
+  await news.execute(["bitcoin hashrate"], cli.context);
+  expect((cli.printed[0]!.result.data as Array<{ id: string }>).map((article) => article.id))
+    .toEqual(["newest", "tie-first", "tie-second", "older", "undated-a", "undated-b"]);
+});
+
+test("a search no story has every word of lists the closest stories, and says so under its heading", async () => {
+  const requests = serveSearch([
+    story("two", "SpaceX lockup expiration puts buyers to the test", "2026-10-09T15:45:00.000Z"),
+    story("one", "IPO calendar for the week", "2026-10-20T09:00:00.000Z"),
+  ], "closest");
+  const cli = createTestCliContext({ dataProvider: { getNews: async () => { throw new Error("no ticker lookup"); } } });
+  await news.execute(["IPO lockup expiry"], cli.context);
+  // The closest stories stay most words first, as the heading says, not by date.
+  expect((cli.printed[0]!.result.data as Array<{ id: string }>).map((article) => article.id)).toEqual(["two", "one"]);
+
+  expect(requests[0]!.searchParams.get("closest")).toBe("1");
+  expect(cli.printed[0]!.result.metadata).toMatchObject({ search: "IPO lockup expiry", match: "closest" });
+  const text = render(cli.printed[0]!);
+  expect(text.split("\n")[0]).toBe('Stories matching "IPO lockup expiry"  ·  no story has every word of "IPO lockup expiry"; the closest, most words first');
+  expect(text).toContain("SpaceX lockup expiration");
+
+  // Stories with every word read as before.
+  serveSearch(STORIES, "all");
+  const all = createTestCliContext({ dataProvider: { getNews: async () => { throw new Error("no ticker lookup"); } } });
+  await news.execute(["european gas"], all.context);
+  expect(render(all.printed[0]!).split("\n")[0]).toBe('Stories matching "european gas"');
+  expect(all.printed[0]!.result.metadata).not.toHaveProperty("match");
 });
 
 test("a word no listing answers to is searched as text, and says why under its heading", async () => {
@@ -114,6 +183,35 @@ test("a commodity's future searches the stories of its commodity, and offers no 
   await news.execute(["KC=F"], coffee.context);
   expect(none).toHaveLength(1);
   expect(render(coffee.printed[1]!)).toContain("No news for Coffee Dec 26 (NYB): news is filed under company tickers, not futures");
+});
+
+test("a future's feed read by the cloud reader, which searches its commodity itself, keeps the commodity heading, newest first", async () => {
+  // The feed reader now searches a future's commodity when no story is filed under it, for the pane; `news KC=F`
+  // read those as a coin's search ("no stories filed under KC=F", best match first).
+  const requests: URL[] = [];
+  setCloudApiFetchTransport(async (url) => {
+    const asked = new URL(url);
+    requests.push(asked);
+    const items = asked.pathname.endsWith("/news/search") ? [STORIES[0], STORIES[1]].map((item) => ({ ...item, id: `${item.id}-search` })) : [];
+    return new Response(JSON.stringify({ items, nextCursor: null }), { headers: { "Content-Type": "application/json" } });
+  });
+  const coffee = createTestCliContext({
+    dataProvider: {
+      getNews: async (query) => cloudNewsReadArticles(await readCloudNews(apiClient, query), query.ticker),
+      getQuote: async () => ({ symbol: "KC=F", name: "Coffee Dec 26", instrumentType: "FUTURE", exchangeName: "NYB" }),
+    },
+  });
+  await news.execute(["KC=F"], coffee.context);
+  expect(requests.map((url) => [url.pathname.replace(/^.*\/news/, "/news"), url.searchParams.get("query")])).toEqual([["/news", null], ["/news/search", "coffee"]]);
+  const lines = render(coffee.printed[0]!).split("\n");
+  expect(lines[0]).toBe('Stories matching "coffee"  ·  the commodity KC=F trades');
+  expect(lines.findIndex((line) => line.includes("could hit 105"))).toBeLessThan(lines.findIndex((line) => line.includes("holds TTF")));
+
+  // A metal's future reads the metals stories in the pane, as `news GC=F` does.
+  requests.length = 0;
+  await readCloudNews(apiClient, { feed: "ticker", ticker: "GC=F", limit: 20 });
+  expect(requests.at(-1)!.searchParams.get("topics")).toBe("metals");
+  expect(requests.at(-1)!.searchParams.get("query")).toBe("gold");
 });
 
 test("a search no story matches says so, never a near miss, and offers the commodity's future only when its news has stories", async () => {
@@ -228,6 +326,94 @@ test("a metal's future, name or bare board code is the metal's market news (NI M
   expect(render(cli.printed[8]!)).toContain(`No metals stories match "platinum". For every story that mentions it, try: gloom news '"platinum"'`);
 });
 
+test("oil and crude are the oil market's energy stories, and a central bank's name its decision stories under every name it goes by", async () => {
+  // OIL is the iPath ETN, whose stories were Oil India's.
+  const requests = serveSearch([
+    story("rbi", "Brazil's central bank ends run of rate cuts after Lula election win", "2026-11-04T21:39:00.000Z"),
+    story("bcb", "BCB Bancorp, Inc. Announces Results for the Third Quarter 2026", "2026-10-29T11:49:00.000Z"),
+    story("copom", "Brazil's Copom cuts the Selic rate", "2026-06-17T23:51:00.000Z"),
+  ]);
+  const cli = createTestCliContext({ dataProvider: { getNews: async () => [], getQuote: async (symbol: string) => { throw new Error(`Not a ticker: ${symbol}.`); } } });
+  await news.execute(["oil"], cli.context);
+  await news.execute(["crude"], cli.context);
+  expect(requests.map((url) => [url.searchParams.get("query"), url.searchParams.get("topics")])).toEqual([["oil", "energy"], ["crude", "energy"]]);
+  expect(render(cli.printed[0]!).split("\n")[0]).toBe('Energy news matching "oil"');
+
+  requests.length = 0;
+  await news.execute(["copom", "selic"], cli.context);
+  // The text as typed and every name, once each, the acronym BCB none: it is BCB Bancorp's too.
+  expect(requests.map((url) => url.searchParams.get("query")).sort()).toEqual(
+    ["copom selic", "Banco Central do Brasil", "Brazil central bank", "Central Bank of Brazil", "Copom", "Selic"].sort());
+  const printed = cli.printed[2]!;
+  expect(render(printed).split("\n")[0]).toBe('Stories matching "copom selic"  ·  the Central Bank of Brazil\'s stories, under each name it is reported by');
+  // Newest first, once each, and only the stories that name the bank.
+  expect((printed.result.data as NewsArticle[]).map((article) => article.id)).toEqual(["rbi", "copom"]);
+});
+
+test("a bank's short name finds its stories as a word in capitals, and what else the search asks is kept", async () => {
+  // The ECB, RBA and FOMC go by their acronyms in headlines; "fed rate cut" searched the Fed's names alone.
+  const requests = serveSearch([
+    story("ecb", "ECB holds deposit rate at 2% as inflation cools", "2026-10-29T13:15:00.000Z"),
+    story("fomc", "FOMC cuts rates by a quarter point", "2026-10-28T18:00:00.000Z"),
+    story("rba", "RBA cuts cash rate to 3.35%", "2026-11-03T03:30:00.000Z"),
+    story("feed", "Feedlot cattle prices rise", "2026-11-02T10:00:00.000Z"),
+  ]);
+  const cli = createTestCliContext({ dataProvider: { getNews: async () => [], getQuote: async (symbol: string) => { throw new Error(`Not a ticker: ${symbol}.`); } } });
+  const ids = (index: number) => (cli.printed[index]!.result.data as NewsArticle[]).map((article) => article.id);
+
+  await news.execute(["ECB"], cli.context);
+  expect(requests.map((url) => url.searchParams.get("query")).sort()).toEqual(["ECB", "Euro area central bank", "European Central Bank"]);
+  expect(ids(0)).toEqual(["ecb"]);
+
+  requests.length = 0;
+  await news.execute(["fed", "rate", "cut"], cli.context);
+  // "Fed rate cut" is the text as typed, searched once.
+  expect(requests.map((url) => url.searchParams.get("query")).sort()).toEqual([
+    "fed rate cut", "Federal Reserve Board rate cut", "Federal Reserve System rate cut", "Federal Reserve rate cut", "FOMC rate cut",
+    "United States central bank rate cut",
+  ].sort());
+  expect(ids(1)).toEqual(["fomc"]);
+
+  await news.execute(["rba"], cli.context);
+  expect(ids(2)).toEqual(["rba"]);
+});
+
+test("a bank's short name is its stories ahead of a listing abroad, which its venue still reaches; a US listing keeps it", async () => {
+  // 7 Nov 2026: `news ECB` opened ECB S.A. on the WSE with "No news", FED Fast Ejendom on CPH.
+  const requests = serveSearch([story("ecb", "ECB holds deposit rate at 2% as inflation cools", "2026-10-29T13:15:00.000Z")]);
+  const listings: Record<string, { symbol: string; name: string; exchangeName: string }> = {
+    ECB: { symbol: "ECB", name: "ECB S.A.", exchangeName: "WSE" },
+    RBA: { symbol: "RBA", name: "RB Global, Inc.", exchangeName: "NYSE" },
+  };
+  const asked: string[] = [];
+  const cli = createTestCliContext({
+    dataProvider: {
+      getNews: async (request: { ticker?: string }) => { asked.push(request.ticker ?? ""); return []; },
+      getQuote: async (symbol: string) => {
+        const quote = listings[symbol.toUpperCase()];
+        if (!quote) throw new Error(`Not a ticker: ${symbol}.`);
+        return quote;
+      },
+    },
+  });
+
+  await news.execute(["ECB"], cli.context);
+  expect(asked).toEqual([]);
+  expect(requests.map((url) => url.searchParams.get("query")).sort()).toEqual(["ECB", "Euro area central bank", "European Central Bank"]);
+  const text = render(cli.printed[0]!);
+  expect(text.split("\n")[0]).toBe('Stories matching "ECB"  ·  the European Central Bank\'s stories, under each name it is reported by');
+  expect(text).toContain("ECB is also ECB S.A. (WSE): gloom news ECB:WSE");
+  expect(cli.printed[0]!.result.metadata).toMatchObject({ listing: "ECB:WSE" });
+
+  // The listing by its venue, and a US listing by its symbol, are the listings' own news.
+  requests.length = 0;
+  await news.execute(["ECB:WSE"], cli.context);
+  await news.execute(["RBA"], cli.context);
+  expect(asked).toEqual(["ECB:WSE", "RBA"]);
+  expect(requests).toHaveLength(0);
+  expect(render(cli.printed[2]!)).toContain("No news for RB Global, Inc. (NYSE).");
+});
+
 test("a real listing, with or without stories, never falls back to a text search", async () => {
   const requests = serveSearch(STORIES);
   const quiet = createTestCliContext({
@@ -241,6 +427,20 @@ test("a real listing, with or without stories, never falls back to a text search
   await news.execute(["TTF", "--exchange", "NYSE"], unknown.context);
   await news.execute(["TTF", "--feed", "top"], unknown.context);
   expect(requests).toHaveLength(0);
+});
+
+test("a word that resolves to a ticker with no stories says so and lists the stories that mention the word", async () => {
+  // `news corn` on 5 Nov 2026 answered "No news for Teucrium Corn Fund (ARCA)." while corn's market had stories.
+  const requests = serveSearch([story("corn", "Bigger US corn stocks fuel doubts about USDA data", "2026-10-09T10:15:00.000Z")]);
+  const cli = createTestCliContext({
+    dataProvider: { getNews: async () => [], getQuote: async () => ({ symbol: "CORN", name: "Teucrium Corn Fund", exchangeName: "ARCA" }) },
+  });
+  await news.execute(["corn"], cli.context);
+
+  expect(requests.map((url) => url.searchParams.get("query"))).toEqual(["corn"]);
+  const text = render(cli.printed[0]!);
+  expect(text.split("\n")[0]).toBe('Stories matching "corn"  ·  no stories filed under CORN (Teucrium Corn Fund)');
+  expect(text).toContain("Bigger US corn stocks");
 });
 
 test("a coin pair whose stories came from searching the coin says so, with the name its quote gives to search", async () => {
@@ -284,10 +484,60 @@ test("only several words, or one that kept its quotes, are text up front; a bare
 test("a word that is also its company's name hints at the text search only when its stories are mostly elsewhere", () => {
   const filed = (tickers: string[]) => ({ tickers }) as unknown as NewsArticle;
   expect(commonWordCandidate("gold", "Gold.com Inc.")).toBe(true);
+  // A name that runs two words together, split where its case changes (PesoRama: peso, rama), as a listing abroad
+  // does with its venue in the tag.
+  expect(commonWordCandidate("peso", "PesoRama Inc.")).toBe(true);
+  expect(commonWordCandidate("rama", "PesoRama Inc.")).toBe(true);
+  // A word a name only starts with stays a plain lookup: cost in Costco, pep in PepsiCo, app in Applovin (as listed).
+  expect(commonWordCandidate("cost", "Costco Wholesale Corporation")).toBe(false);
+  expect(commonWordCandidate("pep", "PepsiCo, Inc.")).toBe(false);
+  expect(commonWordCandidate("app", "Applovin Corporation")).toBe(false);
+  expect(wordMeansMore([filed([]), filed(["PESO:TSXV", "ZE6:FWB2"]), filed([]), filed([])], "PESO", "PESO:TSXV")).toBe(true);
+  expect(wordMeansMore([filed(["PESO:TSXV"]), filed(["PESO:TSXV"]), filed([])], "PESO", "PESO:TSXV")).toBe(false);
   // Typed as a ticker, or not a word of the name: no lookup of the stories at all.
   expect(commonWordCandidate("GOLD", "Gold.com Inc.")).toBe(false);
   expect(commonWordCandidate("tsla", "Tesla, Inc.")).toBe(false);
   expect(wordMeansMore([filed([]), filed(["NEM"]), filed(["GOLD"])], "GOLD")).toBe(true);
   expect(wordMeansMore([filed(["META"]), filed(["META", "GOOGL"]), filed([])], "META")).toBe(false);
   expect(wordMeansMore([filed([]), filed([])], "GOLD")).toBe(false);
+});
+
+test("a story's tags keep the venue of a listing outside the US, so PIK on the JSE never opens Kidpik, and tag a company once", () => {
+  const link = (symbol: string, exchange: string, marketCap?: number) => ({ symbol, exchange, canonicalTicker: `${symbol}:${exchange}`,
+    relationType: "direct", displayTier: "primary" as const, confidence: 1, relevanceScore: 1, ...marketCap ? { marketCap } : {} });
+  const tags = (...tickerLinks: ReturnType<typeof link>[]) =>
+    mapCloudNewsArticle({ ...story("pnp", "Pick n Pay narrows its loss as Boxer grows", "2026-10-26T05:19:00.000Z"), tickerLinks }).tickers;
+  expect(tags(link("PIK", "XJSE"), link("BOX", "XJSE"), link("KO", "XNYS"), link("MZDAY", "OTC"), link("BTC", "CRYPTO")))
+    .toEqual(["PIK:JSE", "BOX:JSE", "KO", "MZDAY", "BTC"]);
+  // Every over-the-counter venue is a US one, bare.
+  expect(tags(link("NSRGY", "OTCM"), link("RHHBY", "OTCQX"), link("TCEHY", "PINX"), link("GMGI", "EXPM"))).toEqual(["NSRGY", "RHHBY", "TCEHY", "GMGI"]);
+  // ASML on Euronext Amsterdam and on NASDAQ is one company: its home line, the one its market cap is stated on, wherever it was tagged.
+  expect(tags(link("ASML", "XNAS"), link("SKHY", "XNAS"), link("ASML", "XAMS", 614_099_124_224))).toEqual(["ASML:AMS", "SKHY"]);
+  expect(tags(link("ASML", "XAMS", 614_099_124_224), link("ASML", "XNAS"))).toEqual(["ASML:AMS"]);
+  // With no market cap on either, the venue tagged first.
+  expect(tags(link("SHOP", "XTSE"), link("SHOP", "XNYS"))).toEqual(["SHOP:TSX"]);
+});
+
+test("a company's folded routine notices say how many in the table; exports keep the title and the count apart", async () => {
+  // `news 0005.HK` lists HSBC's daily "Transaction in own shares" as one row standing for the run.
+  const notice = createTestArticle("buyback", {
+    title: "Transaction in own shares", source: "HKEXnews", publishedAt: new Date("2026-11-10T18:19:26.000Z"), tickers: ["0005.HK"],
+    routine: { kind: "buyback", notices: 8, since: new Date("2026-10-30T18:32:16.000Z"), programme: "buy-back announced on 2026-10-28" },
+  });
+  const other = createTestArticle("results", { title: "HSBC third quarter results", source: "HKEXnews", publishedAt: new Date("2026-10-28T04:00:00.000Z"), tickers: ["0005.HK"] });
+  const cli = createTestCliContext({
+    dataProvider: { getNews: async () => [notice, other], getQuote: async () => ({ symbol: "0005.HK", name: "HSBC Holdings", exchangeName: "HKEX" }) },
+  });
+  await news.execute(["0005.HK"], cli.context);
+  const text = render(cli.printed[0]!);
+  expect(text).toContain("Transaction in own shares (8 notices since 30 Oct)");
+  expect(text.match(/notices since/g)).toHaveLength(1);
+  const csv = serializeCliResult(cli.printed[0]!.result, { ...DEFAULT_CLI_OPTIONS, format: "csv", color: false }, cli.printed[0]!.options);
+  const [header, first, second] = csv.trim().split("\n");
+  expect(header).toContain("Routine notices,Routine since");
+  expect(first).toContain("Transaction in own shares,");
+  expect(first).not.toContain("notices since");
+  expect(first).toContain(",8,2026-10-30T18:32:16.000Z");
+  expect(second).toContain("HSBC third quarter results");
+  expect(second).toContain("https://example.com/results,,,");
 });

@@ -2,13 +2,17 @@ import { afterEach, expect, test } from "bun:test";
 import { AppPersistence } from "../data/app-persistence";
 import { TickerRepository } from "../data/ticker-repository";
 import { createTestDataProvider, createTestQuote } from "../test-support/data-provider";
+import { createTestTicker } from "../test-support/ticker";
 import type { DataProvider } from "../types/data-provider";
 import type { Quote } from "../types/financials";
 import type { TickerChanges } from "../types/ticker-changes";
 import { ListingArgError, savedListingName } from "./listing-arg";
 import { connectionHealth, GLOOM_CLOUD_HTTP_CONNECTION_ID } from "../core/connection-health";
+import { ApiRequestError, markAskedTwice } from "../api-client/errors";
+import { createProviderMiss, ProviderBusyError, SEARCH_BUSY_MESSAGE } from "../sources/provider-errors";
 import { ListingChoiceError, resolveCliTicker, resolveTickerForCli, resolveTickersForCli } from "./ticker-resolution";
-import { failedReason, failedRow } from "./symbol-rows";
+import { addSymbols, failedReason, failedRow } from "./symbol-rows";
+import { resetBoardCoins } from "./board-coins";
 
 const persistences: AppPersistence[] = [];
 
@@ -141,6 +145,43 @@ test("a symbol whose search the service refused is looked up again, never report
   const refusedThroughout = await lookUp(3);
   expect(refusedThroughout.retries).toEqual([2, 2]);
   expect(refusedThroughout.outcomes.every((outcome) => outcome?.startsWith("Could not look up"))).toBe(true);
+
+  // A search no source answered in time is busy with no request failed yet: looked up again too.
+  // 2 Nov 2026: seven symbols of a 300-name add ended "Search is busy" with no new look.
+  const retries: number[] = [];
+  const [entry] = await resolveTickersForCli(["NVDA"], tickerStore(), createTestDataProvider({
+    search: async () => { if (retries.length === 0) throw new ProviderBusyError(SEARCH_BUSY_MESSAGE); return [nvda]; },
+  }), undefined, { retryWaitsMs: [0, 0], onRetry: (count) => retries.push(count) });
+  expect({ retries, ticker: entry?.ticker?.metadata.ticker }).toEqual({ retries: [1], ticker: "NVDA" });
+});
+
+test("a symbol the service answered nothing for stays not found while it refuses the others, never offered to try again", async () => {
+  // 6 Nov 2026: a book's 46 refused symbols came back with "Try again in a minute", and that command returned the same 46.
+  const looked: string[][] = [];
+  const dataProvider = createTestDataProvider({
+    search: async (query) => {
+      connectionHealth.reportRequest(GLOOM_CLOUD_HTTP_CONNECTION_ID, {
+        operation: "GET /market/search", success: false, latencyMs: looked.length, error: new Error("Anonymous market rate limit exceeded"),
+      });
+      return [];
+    },
+    getQuote: async (symbol) => { throw new Error(`Not a ticker: ${symbol}.`); },
+  });
+  // The batch answers XXXXX, found nothing; NVDA's search it leaves out, as a refused query.
+  dataProvider.searchBatch = async (queries) => {
+    looked.push([...queries]);
+    return new Map(queries.filter((query) => query.startsWith("XXXXX")).map((query) => [query, []]));
+  };
+  dataProvider.getQuotesBatch = async (targets) => targets.map((target) => ({ target, quote: null, error: `Not a ticker: ${target.symbol}.` }));
+  const retries: number[] = [];
+  const results = await resolveTickersForCli(["NVDA", "XXXXX"], tickerStore(), dataProvider, undefined, {
+    retryWaitsMs: [0, 0], onRetry: (count) => retries.push(count),
+  });
+  expect(retries).toEqual([1, 1]);
+  expect(results.map((result) => result.error?.message)).toEqual([
+    "Could not look up NVDA: Gloom Cloud did not answer. Try again in a minute.",
+    'No ticker match found for "XXXXX".',
+  ]);
 });
 
 test("what cannot be a symbol fails before any request, and never makes a list wait to look it up again", async () => {
@@ -245,7 +286,7 @@ test("a symbol whose company moved says where it trades now, as watchlist and po
   const online = provider(async (symbol) => changes[symbol] ?? null);
 
   const fb = await resolveCliTicker("FB", tickerStore(), online);
-  expect(fb.notes).toEqual(["FB now lists ProShares S&P 500 Dynamic Daily Buffer ETF; Meta Platforms trades as META (changed 2022-06-09)"]);
+  expect(fb.notes).toEqual(["FB now lists ProShares S&P 500 Dynamic Daily Buffer ETF; FB was Meta Platforms before, now META (changed 2022-06-09)"]);
   expect(fb.change).toMatchObject({ kind: "moved", tradesAs: "META", listed: "ProShares S&P 500 Dynamic Daily Buffer ETF" });
   // Nothing lists the old symbol any more: the failure says where it went.
   expect((await failed(resolveCliTicker("TRCH", tickerStore(), online)))?.message)
@@ -294,4 +335,190 @@ test("a symbol several companies list names their listings and, when its own com
     expect(failure.choices?.map((choice) => choice.key)).toEqual(["NEP:SET", "NEP:XHAM"]);
     expect(failedReason(failure, "NEP")).toBe("Choose an exchange for NEP: NEP:SET, NEP:XHAM; NEP became XIFR on 2025-02-03");
   }
+});
+
+test("a bare symbol whose line stopped trading as its company moved needs a choice, and one whose quote was refused is looked at again before it counts as trading", async () => {
+  const day = 24 * 60 * 60_000;
+  // Rite Aid's old line: search's bare US row names no venue, and neither does the quote that says it stopped.
+  const rad = { providerId: "test", symbol: "RAD", name: "RAD", exchange: "", currency: "USD", type: "Common Stock" };
+  const oldco = { ...rad, symbol: "OLDCO", name: "Oldco Inc.", exchange: "NYSE" };
+  const changes: Record<string, TickerChanges> = {
+    RAD: { symbol: "RAD", moved: { symbol: "RADCQ", name: null, hops: [{ from: "RAD", to: "RADCQ", date: "2023-10-17" }] },
+      formerly: null, listedName: null, changes: [{ from: "RAD", to: "RADCQ", date: "2023-10-17" }] },
+  };
+  const ended = (symbol: string, exchange?: string) => createTestQuote({
+    symbol, price: 0.65, lastUpdated: Date.now() - 1_000 * day, stale: true,
+    ...exchange ? { listingExchangeName: exchange, exchangeName: exchange } : {},
+    delisting: { status: "inactive", lastTradeDate: "2023-10-13", historyStart: "2019-04-22" },
+  });
+  /** A source that refuses OLDCO's quote this many times while it limits the rate, as connection health sees it. */
+  const source = (refusals: number) => {
+    let refused = 0;
+    return createTestDataProvider({
+      search: async (query) => query === "RAD" ? [rad] : query === "OLDCO" ? [oldco] : [],
+      getQuote: async (symbol, exchange) => {
+        if (symbol === "RAD") return ended("RAD");
+        if (refused < refusals) {
+          refused += 1;
+          connectionHealth.reportRequest(GLOOM_CLOUD_HTTP_CONNECTION_ID, {
+            operation: "POST /market/quotes", success: false, latencyMs: refused, error: new Error("Anonymous market rate limit exceeded"),
+          });
+          throw new Error("Anonymous market rate limit exceeded");
+        }
+        return ended("OLDCO", exchange || "NYSE");
+      },
+      getTickerChanges: async (symbol) => changes[symbol] ?? null,
+    });
+  };
+
+  // A listing named in a feed's capitals reads as a name: Chesapeake Energy, never CHESAPEAKE ENERGY CORP or its successor's.
+  const chk = { ...rad, symbol: "CHK", name: "CHESAPEAKE ENERGY CORP" };
+  const chesapeake = createTestDataProvider({
+    search: async (query) => query === "CHK" ? [chk] : [],
+    getQuote: async () => ({ ...ended("CHK"), name: "CHESAPEAKE ENERGY CORP" }),
+    getTickerChanges: async () => ({ symbol: "CHK", moved: { symbol: "EXE", name: "EXPAND ENERGY CORP", hops: [{ from: "CHK", to: "EXE", date: "2024-10-02" }] },
+      formerly: null, listedName: null, changes: [{ from: "CHK", to: "EXE", date: "2024-10-02" }] }),
+  });
+  const [renamed] = await addSymbols({ symbols: ["CHK"], store: tickerStore(), dataProvider: chesapeake, add: (ticker) => ({ ticker, changed: true }) });
+  expect(renamed?.message).toBe("Chesapeake Energy (CHK) stopped trading 2024-10-02, now EXE");
+
+  const rows = await addSymbols({ symbols: ["RAD", "OLDCO"], store: tickerStore(), dataProvider: source(0), add: (ticker) => ({ ticker, changed: true }) });
+  expect(rows.map((row) => [row.status, row.message ?? null, row.tradesAs ?? null])).toEqual([
+    ["needs_choice", "RAD stopped trading 2023-10-17, now RADCQ", "RADCQ"],
+    ["needs_choice", "OLDCO:NYSE (Oldco Inc.): Last traded 13 Oct 2023 (last price $0.65)", null],
+  ]);
+  // Saved already, as an add before this check left it, its old line is no listing under the symbol now.
+  const saved = tickerStore();
+  await saved.saveTicker(createTestTicker("RAD", "RAD", { exchange: "" }));
+  const again = await addSymbols({ symbols: ["RAD", "OLDCO"], store: saved, dataProvider: source(0), add: (ticker) => ({ ticker, changed: true }) });
+  expect(again[0]).toMatchObject({ status: "needs_choice", message: "RAD stopped trading 2023-10-17, now RADCQ" });
+
+  const lookUp = async (refusals: number) => {
+    const retries: number[] = [];
+    const [, entry] = await resolveTickersForCli(["RAD", "OLDCO"], tickerStore(), source(refusals), undefined, {
+      retryWaitsMs: [0, 0], onRetry: (count) => retries.push(count),
+    });
+    return { retries, ended: entry?.ended ?? null, error: entry?.error?.message ?? null };
+  };
+  // Refused through the first look (its own quote, then the match's): looked at again, and checked as a first look checks it.
+  expect(await lookUp(2)).toEqual({ retries: [1], ended: "OLDCO:NYSE (Oldco Inc.): Last traded 13 Oct 2023 (last price $0.65)", error: null });
+  // Refused throughout: not looked up, never taken as trading.
+  expect(await lookUp(10)).toEqual({ retries: [1, 1], ended: null, error: "Could not look up OLDCO: Gloom Cloud did not answer. Try again in a minute." });
+  // A quote the service fails for the listing itself, on every look, while other requests are refused: no wait, and the
+  // match stands (review: it cost both waits and ended as "did not answer").
+  for (const own of [createProviderMiss("Cloud quotes are unavailable for OLDCO"), markAskedTwice(new ApiRequestError("Quote source failed", 500))]) {
+    const retries: number[] = [];
+    const failing = createTestDataProvider({
+      search: async (query) => query === "OLDCO" ? [oldco] : [],
+      getQuote: async () => {
+        connectionHealth.reportRequest(GLOOM_CLOUD_HTTP_CONNECTION_ID, {
+          operation: "POST /market/quotes", success: false, latencyMs: retries.length + Math.random(), error: own,
+        });
+        throw own;
+      },
+    });
+    const [entry] = await resolveTickersForCli(["OLDCO"], tickerStore(), failing, undefined, { retryWaitsMs: [0, 0], onRetry: (count) => retries.push(count) });
+    expect({ retries, ticker: entry?.ticker?.metadata.ticker ?? null, error: entry?.error?.message ?? null }, own.message)
+      .toEqual({ retries: [], ticker: "OLDCO", error: null });
+  }
+});
+
+// A bank paste stored ZION:IEX, FRC:BMV and SBNY as if they quoted, and BRK.B beside BRK-B.
+test("a list add never stores a listing that cannot quote or stopped trading silently, and one share class is one row", async () => {
+  const day = 24 * 60 * 60_000;
+  const row = (symbol: string, exchange: string, name: string) => ({ providerId: "test", symbol, name, exchange, currency: "USD", type: "Common Stock" });
+  const rows: Record<string, ReturnType<typeof row>[]> = {
+    // Search lists a quote-less IEX line first; the symbol's own quote names its NASDAQ listing.
+    QLES: [row("QLES", "IEX", "Quoteless Bancorp")],
+    "ZION:IEX": [row("ZION", "IEX", "Zions Bancorporation N.A.")],
+    ZION: [row("ZION", "IEX", "Zions Bancorporation N.A.")],
+    // A failed bank: search still lists its old NASDAQ line, while the symbol's own quote is an OTC line that stopped.
+    DEADB: [row("DEADB", "NASDAQ", "Dead Bank-New York NY")],
+    // Merged away: search answers its old name with the company it went to.
+    COMERICA: [{ ...row("FITB", "NASDAQ", "Fifth Third Bancorp"), searchAliases: ["COMERICA INC"],
+      formerIssuer: { symbol: "CMA", name: "COMERICA INC", until: "2026-02-02", successor: { symbol: "FITB", name: "Fifth Third Bancorp" } } }],
+  };
+  const quotes: Record<string, Quote> = {
+    "DEADB|": createTestQuote({ symbol: "DEADB", price: 0.95, lastUpdated: Date.now() - 270 * day, stale: true, listingExchangeName: "OTC", exchangeName: "OTC" }),
+    "DEADB|NASDAQ": createTestQuote({ symbol: "DEADB", price: 0.18, listingExchangeName: "NASDAQ", exchangeName: "NASDAQ" }),
+    "BRK.B|": createTestQuote({ symbol: "BRK.B", name: "Berkshire Hathaway Inc.", listingExchangeName: "NYSE", exchangeName: "NYSE" }),
+    "BRK-B|": createTestQuote({ symbol: "BRK-B", name: "Berkshire Hathaway Inc.", listingExchangeName: "NYSE", exchangeName: "NYSE" }),
+  };
+  const dataProvider = createTestDataProvider({
+    search: async (query) => rows[query.toUpperCase()] ?? [],
+    getQuote: async (symbol, exchange = "") => {
+      const quote = quotes[`${symbol}|${exchange}`];
+      if (!quote) throw createProviderMiss(`No quote provider available for ${symbol}`);
+      return quote;
+    },
+  });
+  const store = tickerStore();
+  const listed = new Set<string>();
+  const added = await addSymbols({
+    symbols: ["QLES", "ZION:IEX", "DEADB", "Comerica", "BRK.B", "BRK-B"], store, dataProvider,
+    add: (ticker) => ({ ticker, changed: !listed.has(ticker.metadata.ticker) && !!listed.add(ticker.metadata.ticker) }),
+  });
+  expect(added.map((entry) => [entry.input, entry.status, entry.message ?? null, entry.tradesAs ?? null])).toEqual([
+    ["QLES", "needs_choice", "QLES:IEX (Quoteless Bancorp) has no quote", null],
+    // A listing named on purpose is kept, its row saying it has no quote.
+    ["ZION:IEX", "added", "no quote", null],
+    ["DEADB", "needs_choice", expect.stringMatching(/^DEADB: no longer trading since \d{4}-\d{2}-\d{2} \(last price \$0\.95\)$/), null],
+    ["Comerica", "needs_choice", 'No ticker match found for "COMERICA". CMA was COMERICA until 2026, now Fifth Third Bancorp: FITB.', "FITB"],
+    ["BRK.B", "added", null, null],
+    ["BRK-B", "already_listed", null, null],
+  ]);
+  // Nothing that needs a choice is stored; BRK-B is BRK.B's row.
+  expect((await store.loadAllTickers()).map(({ metadata }) => `${metadata.ticker}:${metadata.exchange}`).sort()).toEqual(["BRK.B:NYSE", "ZION:IEX"]);
+});
+
+test("a list's one-word company name no listing trades as is read as quote reads it; a word that names none stays not found", async () => {
+  const listed = (symbol: string, name: string, exchange: string) => ({ providerId: "test", symbol, name, exchange, type: "Common Stock", currency: "JPY" });
+  const dataProvider = createTestDataProvider({
+    search: async (query) => /^(canon|7751)\b/i.test(query) ? [listed("7751", "Canon Inc.", "JPX")] : [],
+    getQuote: async (symbol, exchange) => {
+      if (exchange === "JPX") return createTestQuote({ symbol, exchange: "JPX", currency: "JPY" });
+      throw new Error(`Not a ticker: ${symbol}.`);
+    },
+  });
+  // The crypto board, read before a word is taken as a company, lists no Canon (and is never fetched here).
+  resetBoardCoins([]);
+  const results = await resolveTickersForCli(["Canon", "Zorblaxx"], tickerStore(), dataProvider, undefined, { retryWaitsMs: [] }).finally(() => resetBoardCoins());
+  expect(results.map((result) => result.ticker ? `${result.ticker.metadata.ticker}:${result.ticker.metadata.exchange}` : result.error?.message))
+    .toEqual(["7751:JPX", 'No ticker match found for "ZORBLAXX".']);
+  expect(results[0]?.readAs).toBe('Read "Canon" as 7751:JPX (Canon Inc.).');
+});
+
+test("a list's word written as a name that went to another company's ticker is the company of that name, as quote reads it", async () => {
+  const listed = (symbol: string, name: string, exchange: string, homeListing = false) =>
+    ({ providerId: "test", symbol, name, exchange, type: "Common Stock", currency: "USD", ...homeListing ? { homeListing } : {} });
+  const answer = [listed("AEON", "AEON Biopharma, Inc.", "AMEX"), listed("8267", "Aeon Co., Ltd.", "JPX", true)];
+  const dataProvider = createTestDataProvider({
+    search: async (query) => /^(aeon|8267)\b/i.test(query) ? answer : [],
+    getQuote: async (symbol, exchange) => createTestQuote({
+      symbol, exchange: exchange || "AMEX", name: exchange === "JPX" || symbol.startsWith("8267") ? "Aeon Co., Ltd." : "AEON Biopharma, Inc.",
+    }),
+  });
+  resetBoardCoins([]);
+  const results = await resolveTickersForCli(["Aeon", "AEON"], tickerStore(), dataProvider, undefined, { retryWaitsMs: [] }).finally(() => resetBoardCoins());
+  expect(results.map((result) => result.ticker ? `${result.ticker.metadata.ticker}:${result.ticker.metadata.exchange}` : result.error?.message))
+    .toEqual(["8267:JPX", "AEON:AMEX"]);
+  expect(results[0]?.readAs).toBe('Read "Aeon" as 8267:JPX (Aeon Co., Ltd.); the ticker AEON is AEON Biopharma, Inc.');
+});
+
+test("a list's word the service marks as a company's name is that company, before a line abroad under the word, as quote reads it", async () => {
+  // `search VISA` against the service, 2026-11-06, trimmed: VISA is a receipt on Toronto; the service marks Visa Inc.'s V with the word.
+  const listed = (symbol: string, name: string, exchange: string, extra: Record<string, unknown> = {}) =>
+    ({ providerId: "test", symbol, name, exchange, type: "Common Stock", currency: "USD", ...extra });
+  const answer = [listed("VISA", "Visa Inc.", "TSX", { currency: "CAD" }), listed("V", "Visa Inc.", "NYSE", { homeListing: true, searchAliases: ["visa"] })];
+  const dataProvider = createTestDataProvider({
+    search: async (query) => /^(visa|v)\b/i.test(query) ? answer : [],
+    getQuote: async (symbol, exchange) => {
+      if (exchange) return createTestQuote({ symbol, exchange, name: "Visa Inc." });
+      throw new Error(`No quote provider available for ${symbol}`);
+    },
+  });
+  resetBoardCoins([]);
+  const results = await resolveTickersForCli(["VISA"], tickerStore(), dataProvider, undefined, { retryWaitsMs: [] }).finally(() => resetBoardCoins());
+  expect(results.map((result) => result.ticker ? `${result.ticker.metadata.ticker}:${result.ticker.metadata.exchange}` : result.error?.message)).toEqual(["V:NYSE"]);
+  expect(results[0]?.readAs).toBe('Read "VISA" as V:NYSE (Visa Inc.).');
 });

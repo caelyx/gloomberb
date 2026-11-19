@@ -1,14 +1,19 @@
 import { expect, test } from "bun:test";
 import { createDefaultConfig } from "../../types/config";
 import type { TickerFinancials } from "../../types/financials";
-import { atReportTtmRate, buildTickerReport, fundamentalsReportTables, loadReportBondFacts, renderFundamentalsReport } from "./ticker";
+import { atReportTtmRate, buildTickerReport, fundamentalsReportTables, loadReportFundFacts, renderFundamentalsReport, ticker } from "./ticker";
+import type { MarketContext } from "../types";
+import { createTestDataProvider } from "../../test-support/data-provider";
 import { createBaseConverter } from "../base-converter";
-import type { FundBondFacts } from "../../api-client/fund-facts";
+import type { FundBondFacts, FundFactsPayload } from "../../api-client/fund-facts";
 import { analyzeTaxEquivalent } from "../../market-data/tax-equivalent";
 import { createTestTicker } from "../../test-support/ticker";
+import { ipoDeal } from "../../plugins/builtin/ipo-calendar/test-fixture";
+import { renderReportCsv } from "../report-tables";
 
 const config = createDefaultConfig("/tmp/gloom-ticker-units-unused");
-const quote = { symbol: "UNITTEST", price: 100, currency: "USD", change: 0, changePercent: 0, lastUpdated: Date.parse("2026-09-11") };
+const quote = { symbol: "UNITTEST", price: 100, currency: "USD", change: 0, changePercent: 0, lastUpdated: Date.parse("2026-09-11"),
+  listingExchangeName: "NYSE" };
 const plainText = (text: string) => text.replace(/\u001b\[[0-9;]*m/g, "").replace(/\u00a0/g, " ").replace(/ {2,}/g, " ");
 async function report(financials: TickerFinancials): Promise<string> {
   return (await buildTickerReport({ symbol: "UNITTEST", tickerFile: null, financials, config, toBase: async value => value }))
@@ -16,17 +21,25 @@ async function report(financials: TickerFinancials): Promise<string> {
 }
 
 test("ticker monetary fundamentals keep reported units across foreign, minor and unknown currencies", async () => {
-  for (const [currency, eps] of [["CNY", "CN¥2.50"], ["GBp", "2.50 GBp"], ["GBX", "2.50 GBX"], ["ILA", "2.50 ILA"], ["ZAc", "2.50 ZAc"], [" ", "2.50 (ccy?)"]] as const) {
+  // Nothing declared and no statements, on a US listing in dollars: the listing's own USD.
+  for (const [currency, eps] of [["CNY", "CN¥2.50"], ["GBp", "2.50 GBp"], ["GBX", "2.50 GBX"], ["ILA", "2.50 ILA"], ["ZAc", "2.50 ZAc"], [" ", "$2.50"]] as const) {
     const financials: TickerFinancials = { quote, annualStatements: [], quarterlyStatements: [], priceHistory: [],
       fundamentals: { eps: 2.5, revenue: 1_000_000, netIncome: 0, freeCashFlow: -25_000, financialCurrency: currency },
     };
     const text = await report(financials);
     expect(text).toContain(`EPS (TTM) ${eps}`);
-    expect(text).toContain(`Revenue (TTM) 1M ${currency.trim() || "(ccy?)"}`);
-    expect(text).toContain(`Net Income (TTM) 0 ${currency.trim() || "(ccy?)"}`);
-    expect(text).toContain(`Free Cash Flow (TTM) -25k ${currency.trim() || "(ccy?)"}`);
+    expect(text).toContain(`Revenue (TTM) 1M ${currency.trim() || "USD"}`);
+    expect(text).toContain(`Net Income (TTM) 0 ${currency.trim() || "USD"}`);
+    expect(text).toContain(`Free Cash Flow (TTM) -25k ${currency.trim() || "USD"}`);
+    expect(text).not.toContain("(ccy?)");
     expect(financials.fundamentals?.eps).toBe(2.5);
   }
+  // A listing quoted in pence does not say whether unlabelled figures are pence or pounds.
+  const pence = await report({ quote: { ...quote, currency: "GBp" }, annualStatements: [], quarterlyStatements: [], priceHistory: [],
+    fundamentals: { eps: 2.5, revenue: 1_000_000 } });
+  expect(pence).toContain("Revenue (TTM) 1M\n");
+  expect(pence).toContain("Reporting currency not sourced for EPS (TTM) and Revenue (TTM).");
+  expect(pence).not.toContain("(ccy?)");
 });
 
 test("statement units use compatible history, keep explicit overrides and exclude share counts", async () => {
@@ -36,7 +49,7 @@ test("statement units use compatible history, keep explicit overrides and exclud
   expect(await report(financials)).toContain("Diluted EPS CN¥0.00");
   financials.quarterlyStatements.push({ date: "2026-06-30", currency: "EUR", eps: -1.25, totalRevenue: 200_000 });
   const mixed = await report(financials);
-  expect(mixed).toContain("Diluted EPS 0.00 (ccy?)");
+  expect(mixed).toContain("Diluted EPS 0.00\nDiluted Shares 400k\nReporting currency not sourced.\n\nLatest Quarter");
   expect(mixed).toContain("Diluted EPS -€1.25");
   expect(mixed).toContain("Revenue 200k EUR");
   expect(mixed).toContain("Diluted Shares 400k");
@@ -121,7 +134,7 @@ test("an insurer's EV keeps its investments and says so, and one at or below zer
   expect(capless).toContain("EV N/M: cash and investments exceed market cap + debt in the source's EV.");
 });
 
-test("an EV off market cap + debt - cash is labelled as the provider's with the reconciliation, a withdrawn one is unavailable", async () => {
+test("an EV off market cap + debt - cash is the computed one everywhere, with its inputs, and a withdrawn one is unavailable", async () => {
   // Synthetic, shaped like WPM (differs) and GFI (withdrawn).
   const check = { currency: "USD", marketCap: 62e9, totalDebt: 2e9, cash: 0.1e9, balanceSheetDate: "2026-06-30", computed: 63.9e9 };
   const withCheck = (fundamentals: TickerFinancials["fundamentals"]): TickerFinancials => ({
@@ -131,17 +144,52 @@ test("an EV off market cap + debt - cash is labelled as the provider's with the 
   const valuation = (financials: TickerFinancials) => renderFundamentalsReport({ ...financials, symbol: "UNITTEST" }, "valuation")
     .replace(/\u001b\[[0-9;]*m/g, "").replace(/ {2,}/g, " ");
   const differs = withCheck({ enterpriseValue: 61.8e9, enterpriseValueCheck: { ...check, status: "differs", source: 61.8e9 } });
-  expect(valuation(differs)).toContain("Enterprise Value 61.8B USD (provider)");
-  expect(valuation(differs)).toContain(
-    "EV 61.8B USD (provider) vs 63.9B computed from market cap + total debt - cash (balance sheet 2026-06-30).");
-  expect(await report(differs)).toContain("Enterprise Value 61.8B USD (provider)");
+  // ARWR's 7.48B in `ticker` read 7.99B in `valuation` and the overview: every view now shows the computed one.
+  // Its balance sheet is not among the statements, so the check's cash is called cash: it does not say what it holds.
+  const inputs = "EV 63.9B USD is market cap 62B + total debt 2B - cash 100M (balance sheet 2026-06-30), in place of the provider's 61.8B.";
+  expect(valuation(differs)).toMatch(/^Enterprise Value 63\.9B USD$/m);
+  expect(valuation(differs)).toContain(inputs);
+  const overview = await report(differs);
+  expect(overview).toMatch(/^Enterprise Value 63\.9B USD$/m);
+  expect(overview.replace(/ {2,}/g, " ")).toContain(inputs);
   const withdrawn = withCheck({
     unavailableFields: ["enterpriseValue", "enterpriseToRevenue"],
     enterpriseValueCheck: { ...check, status: "withdrawn", source: 128e9 },
   });
-  expect(valuation(withdrawn)).toContain("Enterprise Value unavailable");
-  expect(valuation(withdrawn)).toContain(
-    "EV unavailable: the provider's 128B USD is 2.0x the 63.9B computed from market cap + total debt - cash (balance sheet 2026-06-30).");
+  // A withdrawn one gives way to the bridge it was checked against, as RV and the reverse DCF read it. Its balance sheet
+  // is not among the statements, so its cash is called cash and its minority interest is named as not added.
+  const notOnFile = "; that balance sheet is not among the statements here, so its minority interest is not added.";
+  expect(valuation(withdrawn)).toMatch(/^Enterprise Value 63\.9B USD$/m);
+  expect(valuation(withdrawn)).toContain("EV 63.9B USD is market cap 62B + total debt 2B - cash 100M"
+    + ` (balance sheet 2026-06-30), in place of the provider's 128B, which failed validation against it${notOnFile}`);
+  // An IFRS balance sheet's leases are in the bridge, and the line says so.
+  const leased = withCheck({ enterpriseValue: 70e9, enterpriseValueCheck: { ...check, leases: 1.5e9, computed: 65.4e9, status: "differs", source: 70e9 } });
+  expect(valuation(leased)).toContain("EV 65.4B USD is market cap 62B + total debt 2B + leases 1.5B - cash 100M (balance sheet 2026-06-30), in place of the provider's 70B.");
+  // With that balance sheet on file, its lines say what the cash holds: the total with short-term investments, which
+  // Gloom Cloud takes before cash alone, or cash alone; a check that keeps investments in is cash whatever the sheet says.
+  const sheet = (row: Partial<TickerFinancials["quarterlyStatements"][number]>) => ({ ...differs,
+    quarterlyStatements: [{ date: "2026-06-30", ...row }] as TickerFinancials["quarterlyStatements"] });
+  expect(valuation(sheet({ cashCashEquivalentsAndShortTermInvestments: 0.1e9, cashAndCashEquivalents: 0.08e9 })))
+    .toContain(inputs.replace("- cash 100M", "- cash and short-term investments 100M"));
+  expect(valuation(sheet({ cashAndCashEquivalents: 0.1e9 }))).toContain(inputs);
+  expect(valuation({ ...sheet({ cashCashEquivalentsAndShortTermInvestments: 0.1e9 }), fundamentals: { ...differs.fundamentals,
+    enterpriseValueCheck: { ...differs.fundamentals!.enterpriseValueCheck!, investmentsKept: true } } })).not.toContain("short-term investments 100M");
+  // IAG on the LSE: EUR statements converted at the balance sheet's rate, the GBP figure converted twice.
+  const twice = withCheck({
+    unavailableFields: ["enterpriseValue", "enterpriseToRevenue"],
+    enterpriseValueCheck: { ...check, currency: "GBP", status: "withdrawn", source: 18.57e9, leases: 5.95e9, computed: 22.1e9,
+      fx: { from: "EUR", rate: 0.86135 }, convertedFrom: "EUR", convertedTwice: true },
+  });
+  expect(valuation(twice)).toContain("EV 22.1B GBP is market cap 62B + total debt 2B + leases 5.95B - cash 100M"
+    + ` (balance sheet 2026-06-30, EUR/GBP 0.86135 at its date's close), in place of the provider's 18.57B, which converts EUR to GBP twice${notOnFile}`);
+  // A converted EV no balance sheet checked gives Gloom Cloud's reason, not a generic one.
+  const unchecked = withCheck({
+    unavailableFields: ["enterpriseValue", "enterpriseToRevenue"],
+    enterpriseValueCheck: { status: "withdrawn", source: 306e9, currency: "USD", convertedFrom: "EUR",
+      reason: "Source EV is converted from EUR and was not checked against the balance sheet" },
+  });
+  expect(valuation(unchecked)).toContain("Enterprise Value unavailable");
+  expect(valuation(unchecked)).toContain("EV unavailable: source EV is converted from EUR and was not checked against the balance sheet.");
   // A matching EV, or a check beside another source's EV, prints as before.
   for (const fundamentals of [
     { enterpriseValue: 63e9, enterpriseValueCheck: { ...check, status: "matches" as const, source: 63e9 } },
@@ -151,6 +199,52 @@ test("an EV off market cap + debt - cash is labelled as the provider's with the 
     expect(text).toMatch(new RegExp(`^Enterprise Value ${fundamentals.enterpriseValue / 1e9}B USD$`, "m"));
     expect(text).not.toContain("computed");
   }
+});
+
+// One EV on every view: market cap + debt - cash + minority interest and preferred equity, the provider's within 5% of it.
+test("an EV whose gap is minority interest is the provider's, a bridge served in its place shows its inputs, and no check crosses currencies", async () => {
+  const pagp = { currency: "USD", marketCap: 6.2e9, totalDebt: 8.44e9, cash: 1.06e9, balanceSheetDate: "2026-06-30", computed: 13.58e9,
+    minorityAndPreferred: 13.73e9 };
+  const withCheck = (fundamentals: TickerFinancials["fundamentals"]): TickerFinancials => ({
+    quote, annualStatements: [], quarterlyStatements: [], priceHistory: [],
+    fundamentals: { marketCap: 6.2e9, marketCapCurrency: "USD", ...fundamentals },
+  });
+  const valuation = (financials: TickerFinancials) => renderFundamentalsReport({ ...financials, symbol: "UNITTEST" }, "valuation")
+    .replace(/\u001b\[[0-9;]*m/g, "").replace(/ {2,}/g, " ");
+  // PAGP as a check that did not count minority interest labels it: its 26.57B is 0.97x of 27.31B, so it stays.
+  const labelled = withCheck({ enterpriseValue: 26.57e9, enterpriseValueCheck: { ...pagp, status: "differs", source: 26.57e9 } });
+  expect(valuation(labelled)).toMatch(/^Enterprise Value 26\.57B USD$/m);
+  expect(valuation(labelled)).not.toContain("in place of");
+  expect(await report(labelled)).toMatch(/^Enterprise Value 26\.57B USD$/m);
+  // A provider's figure more than 5% off it, with the bridge Gloom Cloud serves in its place: the bridge, and its inputs.
+  const bridged = withCheck({ enterpriseValue: 27.31e9, enterpriseValueCheck: { ...pagp, status: "differs", source: 31e9 } });
+  expect(valuation(bridged)).toMatch(/^Enterprise Value 27\.31B USD$/m);
+  expect(valuation(bridged)).toContain("EV 27.31B USD is market cap 6.2B + total debt 8.44B - cash 1.06B"
+    + " + minority interest and preferred equity 13.73B (balance sheet 2026-06-30), in place of the provider's 31B.");
+  // A check in another currency than the EV is shown in describes another figure: the served one stays.
+  const crossed = withCheck({ enterpriseValue: 31e9, enterpriseValueCheck: { ...pagp, currency: "EUR", status: "differs", source: 31e9 } });
+  expect(await report(crossed)).toMatch(/^Enterprise Value 31B USD$/m);
+});
+
+// PAGP's 30 Sep 2026 balance sheet, read from its 10-Q alone: debt and cash, and no equity lines.
+test("a balance sheet with no minority interest line never puts the bridge in the provider's place, and the inputs line says why", async () => {
+  const september = { currency: "USD", marketCap: 6.04e9, totalDebt: 9.92e9, cash: 0.88e9, balanceSheetDate: "2026-09-30",
+    computed: 15.08e9, source: 26.41e9 };
+  const withCheck = (enterpriseValueCheck: NonNullable<TickerFinancials["fundamentals"]>["enterpriseValueCheck"]): TickerFinancials => ({
+    quote, annualStatements: [], quarterlyStatements: [], priceHistory: [],
+    fundamentals: { marketCap: 6.04e9, marketCapCurrency: "USD", enterpriseValue: 26.41e9, enterpriseValueCheck },
+  });
+  // The 12.21B of noncontrolling interest its 10-Q tags checks the provider's figure: 26.41B is 0.97x of 27.29B.
+  const filed = await report(withCheck({ ...september, status: "matches", minorityAndPreferred: 12.21e9, minorityFiled: true }));
+  expect(filed).toMatch(/^Enterprise Value 26\.41B USD$/m);
+  expect(filed).toContain("EV 26.41B USD is the provider's, within 5% of 27.29B: market cap 6.04B + total debt 9.92B - cash 880M"
+    + " + minority interest and preferred equity 12.21B from the company's filing (balance sheet 2026-09-30).");
+  // Where the filing tags none either, the provider's figure stands, and June's minority interest says why.
+  const unreported = await report(withCheck({ ...september, status: "unchecked",
+    minorityUnreported: { balanceSheetDate: "2026-06-30", value: 13.73e9 } }));
+  expect(unreported).toMatch(/^Enterprise Value 26\.41B USD$/m);
+  expect(unreported).toContain("EV 26.41B USD is the provider's: market cap 6.04B + total debt 9.92B - cash 880M (balance sheet 2026-09-30)"
+    + " is 15.08B with no minority interest, which that balance sheet does not report (13.73B on 2026-06-30), so the provider's figure stands.");
 });
 
 test("after the close the EV row and its note read one close, the cap rests on the shares shown, and a withdrawn EV says why", () => {
@@ -170,8 +264,8 @@ test("after the close the EV row and its note read one close, the cap rests on t
       cash: 72_314_000, balanceSheetDate: "2026-06-30", computed: 43_607_032 },
   });
   expect(chegg).toContain("Market Cap 79.11M USD\nShares Outstanding 110.91M\n");
-  expect(chegg).toContain("Enterprise Value 60.06M USD (provider)");
-  expect(chegg).toContain("EV 60.06M USD (provider) vs 40.65M computed from market cap + total debt - cash (balance sheet 2026-06-30).");
+  expect(chegg).toContain("Enterprise Value 40.65M USD");
+  expect(chegg).toContain("EV 40.65M USD is market cap 79.11M + total debt 33.84M - cash 72.31M (balance sheet 2026-06-30), in place of the provider's 60.06M.");
   expect(chegg).not.toContain("does not rest on");
   // A cap on another count than the one shown (one class's) says so; NRDY's EV, withdrawn by Gloom Cloud's
   // validation with no check, is unavailable with the reason rather than a dropped row.
@@ -184,7 +278,7 @@ test("after the close the EV row and its note read one close, the cap rests on t
   expect(nerdy).toContain("EV unavailable: the provider's figure failed validation.");
 });
 
-test("trailing figures use the fundamentals' currency, then the statements' on a listing that trades in theirs, never the quote's", async () => {
+test("trailing figures use the fundamentals' currency, then the statements' on a listing that trades in theirs, then the listing's with no statements", async () => {
   const fundamentals = { eps: 31.43, revenue: 202.08e9, netIncome: 46.98e9, operatingCashFlow: 42.43e9, freeCashFlow: 36.96e9 };
   const reportedIn = (financialCurrency: string | undefined, fundamentalsCurrency?: string, listed = "ZAR"): TickerFinancials => ({
     quote: { ...quote, currency: listed }, annualStatements: [], quarterlyStatements: [], priceHistory: [],
@@ -201,11 +295,30 @@ test("trailing figures use the fundamentals' currency, then the statements' on a
   expect(fromStatements).not.toContain("(ccy?)");
   expect(plain(renderFundamentalsReport({ ...reportedIn("ZAR"), symbol: "UNITTEST" }, "valuation"))).toContain("EPS (TTM) ZAR 31.43");
   expect(plain(await report(reportedIn("ZAR", "USD")))).toContain("Revenue (TTM) 202.08B USD");
-  // Nothing declares a currency: the GBP quote must not stand in for it, nor the ZAR statements of a GBP listing.
-  expect(plain(await report(reportedIn(undefined, undefined, "GBP")))).toContain("Revenue (TTM) 202.08B (ccy?)");
+  // Nothing declares a currency and there are no statements: a GBP listing's currency only when it listed in the last year.
+  const unsourced = "Reporting currency not sourced for EPS (TTM), Revenue (TTM), Net Income (TTM), Operating Cash Flow (TTM) and Free Cash Flow (TTM).";
+  expect(plain(await report(reportedIn(undefined, undefined, "GBP")))).toContain(`Revenue (TTM) 202.08B\n`);
+  expect(plain(await report(reportedIn(undefined, undefined, "GBP")))).toContain(unsourced);
+  const listedIn = (listingDate: string) => ({ deal: ipoDeal({ id: "ipo", symbol: "UNITTEST", status: "listed", listingDate }), news: [] });
+  const recent = plain(await buildTickerReport({ symbol: "UNITTEST", tickerFile: null, financials: reportedIn(undefined, undefined, "GBP"),
+    config, toBase: async value => value, ipo: listedIn(new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10)) }));
+  expect(recent).toContain("Revenue (TTM) 202.08B GBP");
+  const old = plain(await buildTickerReport({ symbol: "UNITTEST", tickerFile: null, financials: reportedIn(undefined, undefined, "GBP"),
+    config, toBase: async value => value, ipo: listedIn(new Date(Date.now() - 500 * 86_400_000).toISOString().slice(0, 10)) }));
+  expect(old).toContain("Revenue (TTM) 202.08B\n");
+  // A dollar receipt, or a US listing whose statements read failed, does not say its figures are dollars.
+  expect(plain(await report({ ...reportedIn(undefined, undefined, "USD"), quote: { ...quote, isDepositaryReceipt: true } })))
+    .toContain("Revenue (TTM) 202.08B\n");
+  expect(plain(await report({ ...reportedIn(undefined, undefined, "USD"),
+    statementHistory: { mode: "extended", source: "sec", status: "retryable-failure", fetchedAt: "2026-10-28T00:00:00Z" } })))
+    .toContain(unsourced);
+  expect(plain(await report(reportedIn(undefined, undefined, "USD")))).toContain("Revenue (TTM) 202.08B USD");
+  // The ZAR statements of a GBP listing do not name its figures.
   const london = plain(await report(reportedIn("ZAR", undefined, "GBP")));
-  expect(london).toContain("EPS (TTM) 31.43 (ccy?)");
-  expect(london).toContain("Revenue (TTM) 202.08B (ccy?)");
+  expect(london).toContain("EPS (TTM) 31.43\n");
+  expect(london).toContain("Revenue (TTM) 202.08B\n");
+  expect(london).toContain(unsourced);
+  expect(london).not.toContain("(ccy?)");
 });
 
 // Signed out on 2026-10-24: YPFD on BYMA printed `Revenue (TTM) 29.23T USD` and `EPS (TTM) $265.69`, ARS figures
@@ -229,8 +342,9 @@ test("a listing's TTM block and its statements each carry their own currency, an
   expect(labelled).not.toContain("converted from");
   // Served unlabelled, the block is in no known currency: never the statements' USD.
   const unlabelled = plainText(await buildTickerReport({ symbol: "YPFD:BYMA", tickerFile: null, financials: ypfd({}), config, toBase }));
-  expect(unlabelled).toContain("Revenue (TTM) 29.23T (ccy?)");
-  expect(unlabelled).toContain("EPS (TTM) 265.69 (ccy?)");
+  expect(unlabelled).toContain("Revenue (TTM) 29.23T\n");
+  expect(unlabelled).toContain("EPS (TTM) 265.69\n");
+  expect(unlabelled).toContain("Reporting currency not sourced for EPS (TTM), Revenue (TTM), Net Income (TTM) and Operating Cash Flow (TTM).");
   expect(unlabelled).not.toMatch(/\(TTM\) [^\n]*USD|\$265/);
   expect(unlabelled).not.toContain("TTM figures in");
 });
@@ -305,7 +419,7 @@ test("an EPS in another currency than the TTM amounts, and a P/E converting its 
       trailingPEConversion: { from: "USD", rate: 0.8924 } },
   };
   const xetra = await report(lin);
-  for (const line of ["P/E (TTM) 33.17", "EPS (TTM) $14.61", "Revenue (TTM) 33.99B USD", "P/E (TTM): price over EPS converted at 1 USD = 0.8924 EUR."]) {
+  for (const line of ["P/E (TTM) 33.16", "EPS (TTM) $14.61", "Revenue (TTM) 33.99B USD", "P/E (TTM): price over EPS converted at 1 USD = 0.8924 EUR."]) {
     expect(xetra).toContain(line);
   }
   expect(xetra).not.toContain("report-date");
@@ -321,7 +435,28 @@ test("a pence-quoted range shares one decimal count, other ranges are unchanged"
   const yen = await report({ quote: { ...quote, currency: "JPY", instrumentType: "EQUITY", price: 3000, low: 2950, high: 3012 }, annualStatements: [], quarterlyStatements: [], priceHistory: [] });
   expect(yen).toContain("Day Range ¥2,950 - ¥3,012");
   const dollars = await report({ quote: { ...quote, instrumentType: "EQUITY", low: 99.5, high: 101.25 }, annualStatements: [], quarterlyStatements: [], priceHistory: [] });
-  expect(dollars).toContain("Day Range $99.50 - $101.25");
+  expect(dollars).toContain("Day Range $99.50 - $101.25\n");
+  // A US line's range from Gloom Cloud says what it counts, the rule GIP and TAS read the session's by.
+  const cloud = { ...quote, instrumentType: "EQUITY", low: 10.17, high: 11.23, providerId: "gloomberb-cloud" as const, exchangeName: "NYSE" };
+  expect(await report({ quote: cloud, annualStatements: [], quarterlyStatements: [], priceHistory: [] }))
+    .toContain("Day Range $10.17 - $11.23 (regular session, every US venue, odd lots excluded)");
+  const abroad = await report({ quote: { ...cloud, currency: "AUD", exchangeName: "ASX", listingExchangeName: "ASX" }, annualStatements: [], quarterlyStatements: [], priceHistory: [] });
+  expect(abroad).not.toContain("odd lots");
+});
+
+// CL=F read "52W Range $54.97999954 - $119.48000336": the year's float32 bars, printed to every digit.
+test("a 52-week range from float32 bars prints at the instrument's decimals", async () => {
+  const f32 = Math.fround;
+  const crude = { ...quote, symbol: "CL=F", instrumentType: "FUTURE", price: 86.19, previousClose: 86.85, open: 86.43, low: 83.88, high: 86.93,
+    low52w: f32(54.98), high52w: f32(119.48), exchangeName: "NYM", listingExchangeName: "NYM" };
+  expect([crude.low52w, crude.high52w]).toEqual([54.97999954223633, 119.4800033569336]);
+  expect(await report({ quote: crude, annualStatements: [], quarterlyStatements: [], priceHistory: [] })).toContain("52W Range $54.98 - $119.48\n");
+  // A yen future keeps its sixth decimal, and a stock its cents.
+  const yen = { ...crude, symbol: "6J=F", price: 0.006545, previousClose: 0.00655, open: 0.006548, low: 0.006521, high: 0.00656,
+    low52w: f32(0.006345), high52w: f32(0.007155) };
+  expect(await report({ quote: yen, annualStatements: [], quarterlyStatements: [], priceHistory: [] })).toContain("52W Range $0.006345 - $0.007155\n");
+  const stock = { ...quote, instrumentType: "EQUITY", previousClose: 99.8, low52w: f32(71.1), high52w: f32(131.37) };
+  expect(await report({ quote: stock, annualStatements: [], quarterlyStatements: [], priceHistory: [] })).toContain("52W Range $71.10 - $131.37\n");
 });
 
 test("share counts say ADR equivalent where the service puts them on the receipts, and the profile decides only without it", async () => {
@@ -347,18 +482,35 @@ test("share counts say ADR equivalent where the service puts them on the receipt
   expect(older).toContain("Diluted Shares 2.54B\n");
 });
 
-test("a US fund's report points to its fund facts; a fund listed elsewhere says it has none; a stock's says nothing", async () => {
+test("a US fund's report points to the fund facts it has, and only when it has some; a fund listed elsewhere says it has none; a stock's says nothing", async () => {
   const plain = (text: string) => text.replace(/\u001b\[[0-9;]*m/g, "").replace(/ {2,}/g, " ");
   const note = "Fund facts (fee, NAV, premium, net assets): fn ETF IBIT.";
   const ibit: TickerFinancials = { quote: { ...quote, symbol: "IBIT", instrumentType: "ETF", exchangeName: "NASDAQ" },
     annualStatements: [], quarterlyStatements: [], priceHistory: [] };
-  expect(plain(renderFundamentalsReport({ ...ibit, symbol: "IBIT", exchange: "NASDAQ" }, "fundamentals")))
+  const fact = { value: 1, asOf: "2026-10-23", source: "iShares" };
+  const fundFacts: FundFactsPayload = {
+    ticker: "IBIT", covered: true, status: "covered", name: null, structure: "trust",
+    expenseRatio: { ...fact, kind: "sponsor-fee" }, nav: fact, closingPrice: null, premiumDiscount: { ...fact, basis: "published" },
+    netAssets: { ...fact, scope: "fund" }, sponsor: null, inception: null, index: null, stale: false, fetchedAt: null,
+  };
+  expect(plain(renderFundamentalsReport({ ...ibit, symbol: "IBIT", exchange: "NASDAQ", fundFacts }, "fundamentals")))
     .toContain(`No fundamentals reported for IBIT. ${note}`);
-  expect(plain(await buildTickerReport({ symbol: "IBIT", tickerFile: null, financials: ibit, config, toBase: async value => value })))
+  expect(plain(await buildTickerReport({ symbol: "IBIT", tickerFile: null, financials: ibit, config, toBase: async value => value, fundFacts })))
     .toContain(note);
+  // A closed-end fund with a NAV and net assets but no fee names what it has.
+  const ecc: TickerFinancials = { ...ibit, quote: { ...ibit.quote!, symbol: "ECC", instrumentType: "Closed-end Fund", exchangeName: "NYSE" } };
+  expect(plain(await buildTickerReport({ symbol: "ECC", tickerFile: null, financials: ecc, config, toBase: async value => value,
+    fundFacts: { ...fundFacts, ticker: "ECC", structure: "closed-end", expenseRatio: null } })))
+    .toContain("Fund facts (NAV, premium, net assets): fn ETF ECC.");
+  // No pointer to a pane that would only say why it has nothing: not covered, or not read.
+  for (const facts of [{ ...fundFacts, covered: false, status: "not-a-fund" as const }, null]) {
+    const text = plain(await buildTickerReport({ symbol: "ECC", tickerFile: null, financials: ecc, config, toBase: async value => value, fundFacts: facts }));
+    expect(text).not.toContain("fn ETF");
+    expect(plain(renderFundamentalsReport({ ...ecc, symbol: "ECC", exchange: "NYSE", fundFacts: facts }, "fundamentals"))).toEndWith("No fundamentals reported for ECC.");
+  }
   const london: TickerFinancials = { ...ibit, quote: { ...ibit.quote!, symbol: "VUSA", exchangeName: "LSE" } };
   expect(plain(renderFundamentalsReport({ ...london, symbol: "VUSA", exchange: "LSE" }, "fundamentals")))
-    .toContain("No fundamentals reported for VUSA. Fund facts (fee, NAV, premium) cover US-listed funds only.");
+    .toContain("No fundamentals reported for VUSA. Fund facts (fee, NAV, premium) cover US-listed funds and Hong Kong's spot bitcoin and ether ETFs only.");
   expect(await report({ quote, annualStatements: [], quarterlyStatements: [], priceHistory: [] })).not.toContain("Fund facts");
 });
 
@@ -374,10 +526,12 @@ test("a bond fund's yield is its distribution yield, not its SEC yield, which fo
   const mub: TickerFinancials = { quote: { ...quote, symbol: "MUB", instrumentType: "ETF", exchangeName: "NYSEArca" },
     annualStatements: [], quarterlyStatements: [], priceHistory: [], fundamentals: { dividendYield: 0.0327, dividendYieldBasis: "forward" } };
   const lines = [
-    "Distribution Yield (forward, not SEC yield)  3.27%",
-    "30-Day SEC Yield                             4.04% (as of 2026-10-15)",
-    "Yield to Worst                               4.16% (as of 2026-10-15)",
-    "Effective Duration                           7.13 yrs (as of 2026-10-15)",
+    "Distribution Yield (forward)  3.27% (not SEC yield; latest distribution annualized)",
+    "30-Day SEC Yield              4.04% (as of 2026-10-15)",
+    "Yield to Worst                4.16% (as of 2026-10-15)",
+    "Effective duration            7.13 yrs (as of 2026-10-15)",
+    // Sized for a curve trade: the regular session price times the duration, per basis point.
+    "DV01                          $0.0713 per share (from duration)",
   ];
   const fundamentals = plain(renderFundamentalsReport({ ...mub, symbol: "MUB", exchange: "NYSEArca", bondFund }, "fundamentals"));
   for (const line of lines) expect(fundamentals).toContain(line);
@@ -393,8 +547,8 @@ test("a bond fund's yield is its distribution yield, not its SEC yield, which fo
   expect(withTax).toContain([
     "Tax-Equivalent Yield",
     "Tax rate              40.8% (federal; no state rate given)",
-    "Tax-equivalent yield  6.83% (30-day SEC yield 4.04% as of 2026-10-15 / (1 - 40.8%))",
-    "Muni/Treasury ratio   81.2% (SEC yield 4.04% / 7Y Treasury 4.98% on 2026-10-16, the tenor nearest its 7.13-year duration)",
+    "Tax-equivalent yield  6.83% (30-day SEC yield 4.0418% as of 2026-10-15 / (1 - 40.8%))",
+    "Muni/Treasury ratio   81.2% (SEC yield 4.0418% / 7Y Treasury 4.98% on 2026-10-16, the tenor nearest its 7.13-year duration)",
   ].join("\n"));
   const tables = fundamentalsReportTables({ ...mub, symbol: "MUB", bondFund, taxEquivalent }, "fundamentals",
     { source: "Gloom Cloud", asOf: null, status: "unreported" });
@@ -408,16 +562,19 @@ test("a bond fund's yield is its distribution yield, not its SEC yield, which fo
   }
 });
 
-test("bond facts are read for a US-listed fund only, and a failed read leaves the yield as it was", async () => {
-  const facts = { bond: { kind: "taxable" as const, state: null, secYield: null, yieldToWorst: null, duration: null } };
+test("fund facts are read for a US-listed fund and a Hong Kong one only, and a failed read leaves the yield as it was", async () => {
+  const facts = { bond: { kind: "taxable" as const, state: null, secYield: null, yieldToWorst: null, duration: null } } as FundFactsPayload;
   const reads: string[] = [];
-  const load = async (symbol: string) => { reads.push(symbol); return facts.bond; };
+  const load = async (symbol: string) => { reads.push(symbol); return facts; };
   const fund = { quote: { ...quote, instrumentType: "ETF" } };
-  expect(await loadReportBondFacts("AGG", "NYSEArca", fund, null, load)).toEqual(facts.bond);
-  expect(await loadReportBondFacts("NVDA", "NASDAQ", { quote: { ...quote, instrumentType: "EQUITY" } }, null, load)).toBeNull();
-  expect(await loadReportBondFacts("VUSA", "LSE", fund, null, load)).toBeNull();
-  expect(reads).toEqual(["AGG"]);
-  expect(await loadReportBondFacts("AGG", "NYSEArca", fund, null, async () => { throw new Error("offline"); })).toBeNull();
+  expect(await loadReportFundFacts("AGG", "NYSEArca", fund, null, load)).toEqual(facts);
+  expect(await loadReportFundFacts("NVDA", "NASDAQ", { quote: { ...quote, instrumentType: "EQUITY" } }, null, load)).toBeNull();
+  expect(await loadReportFundFacts("VUSA", "LSE", fund, null, load)).toBeNull();
+  // A Hong Kong spot coin fund is asked for by its listing's key: a bare 3046 is not a US ticker.
+  expect(await loadReportFundFacts("3046", "HKEX", fund, null, load)).toEqual(facts);
+  expect(await loadReportFundFacts("3046.HK", "HKEX", fund, null, load)).toEqual(facts);
+  expect(reads).toEqual(["AGG", "3046:XHKG", "3046.HK"]);
+  expect(await loadReportFundFacts("AGG", "NYSEArca", fund, null, async () => { throw new Error("offline"); })).toBeNull();
 });
 
 // With CAD as the base, ticker JNJ printed Market Cap "877.79B CAD" beside Revenue "99.33B USD" and Last "$259.43".
@@ -517,4 +674,116 @@ test("the rate line reads as markets quote the pair, is printed once, and except
   expect(today).toContain("Cost Basis 2,800.00 CAD\n");
   expect(today.match(/figures at/g)).toHaveLength(1);
   expect(today).toContain("CAD figures at USD/CAD 1.4, as of 2026-10-20 06:00 UTC.");
+});
+
+test("a coin's volume says it is traded value in the quote currency and whose day it is; a stock's stays a share count", async () => {
+  const volumeLine = async (symbol: string, exchangeName: string | undefined, fields: Partial<typeof quote> = {}) => {
+    const text = (await buildTickerReport({ symbol, tickerFile: null, config, toBase: async value => value,
+      financials: { quote: { ...quote, symbol, exchangeName, volume: 75_244_118_016, ...fields }, annualStatements: [], quarterlyStatements: [], priceHistory: [] },
+    })).replace(/\u001b\[[0-9;]*m/g, "").replace(/ {2,}/g, " ");
+    return text.split("\n").find((line) => line.trim().startsWith("Volume"))?.trim();
+  };
+  expect(await volumeLine("BTC-USD", "CCC")).toBe("Volume 75,244,118,016 USD");
+  expect(await volumeLine("BTC-USD", "CCC", { statsBasis: "composite" })).toBe("Volume 75,244,118,016 USD (composite)");
+  expect(await volumeLine("BTC-USD", "CCC", { volume: 123_096.8, statsBasis: "exchange" })).toBe("Volume 123,097 USD (1 exchange)");
+  expect(await volumeLine("MARA", "NASDAQ")).toBe("Volume 75,244,118,016");
+});
+
+test("a fund shows no stock rows, whatever a provider sends", async () => {
+  const fund: TickerFinancials = {
+    quote: { ...quote, symbol: "SPY", instrumentType: "ETF" }, annualStatements: [], quarterlyStatements: [], priceHistory: [],
+    profile: { sector: "Basic Materials", industry: "Specialty Chemicals" },
+    fundamentals: { trailingPE: 20.74, revenue: 1_000_000, netIncome: 5, eps: 0.18, dividendYield: 0.012, dividendYieldBasis: "trailing" },
+  };
+  const text = await report(fund);
+  for (const row of ["P/E (TTM)", "Revenue (TTM)", "Net Income (TTM)", "EPS (TTM)", "Sector", "Industry"]) expect(text).not.toContain(row);
+  expect(text).toContain("Dividend Yield (trailing)");
+  // The same figures on a stock are its own.
+  expect(await report({ ...fund, quote: { ...fund.quote!, instrumentType: "EQUITY" } })).toContain("P/E (TTM) 20.74");
+});
+
+test("a stopped listing with no quote keeps its own profile, and hides one only shown to be another listing's", async () => {
+  const run = async (symbol: string, financials: TickerFinancials) => {
+    let printed: { data: any; warnings: string[] } | null = null;
+    const dataProvider = createTestDataProvider({
+      getTickerFinancials: async () => financials,
+      getQuoteMetadata: async () => null,
+      getPriceHistoryWithMetadata: async () => ({ points: [{ date: new Date("2022-10-27T00:00:00Z"), close: 53.7 }], resolution: null,
+        delisting: { status: "delisted" as const, lastTradeDate: "2022-10-27", historyStart: "2013-11-07" } }),
+      getNews: async () => [],
+    });
+    await ticker(symbol, {
+      initMarketData: async () => ({
+        config, dataDir: "/tmp/gloom-ticker-units-unused", dataProvider,
+        store: { loadTicker: async () => null, loadAllTickers: async () => [] }, persistence: { close: () => {} },
+      }) as unknown as MarketContext,
+      fail: (message) => { throw new Error(message); },
+      printResult: (result) => { printed = { data: result.data, warnings: result.warnings ?? [] }; },
+    });
+    return printed!;
+  };
+  const stopped = { quote: undefined, annualStatements: [{ date: "2021-12-31", totalRevenue: 5_077_482_000 }], quarterlyStatements: [], priceHistory: [] };
+  // TWTR: the company stopped trading and nothing says the profile under its symbol is anyone else's.
+  const twtr = await run("TWTR", { ...stopped, profile: { name: "Twitter, Inc.", country: "US", sector: "Communication Services" } });
+  expect(twtr.warnings).toContain("TWTR last traded 2022-10-27; no longer listed.");
+  expect(twtr.warnings.join("\n")).not.toContain("another listing's");
+  expect(twtr.data.profile).toMatchObject({ name: "Twitter, Inc.", sector: "Communication Services" });
+  expect(twtr.data.annualStatementCount).toBe(1);
+  // STPP: the profile under the symbol is a fund domiciled abroad, on a US line: named, and none of it shown.
+  const stpp = await run("STPP", { ...stopped, profile: { name: "State Street SPDR MSCI Europe Materials UCITS ETF", country: "NL", sector: "Basic Materials" } });
+  expect(stpp.warnings).toContain("STPP last traded 2022-10-27; no longer listed.\n"
+    + "The profile served under STPP is another listing's (State Street SPDR MSCI Europe Materials UCITS ETF), not shown.");
+  expect(stpp.data.profile ?? null).toBeNull();
+  expect(stpp.data.annualStatementCount).toBe(0);
+});
+
+// NPN:JSE read "52W Range ZAR650.5600 - ZAR1,289.5200": the four decimals a price served in cents allows, not the two it has.
+test("a range of a line served in cents prints at the decimals its prices have, as Last does", async () => {
+  const rand = { ...quote, currency: "ZAR", instrumentType: "EQUITY", providerPriceDivisor: 100, price: 760.71, previousClose: 778, open: 761.5,
+    low: 760.7, high: 782.75, low52w: 650.56, high52w: 1289.52, exchangeName: "JSE", listingExchangeName: "JSE" };
+  const text = await report({ quote: rand, annualStatements: [], quarterlyStatements: [], priceHistory: [] });
+  expect(text).toMatch(/52W Range +ZAR ?650\.56 - ZAR ?1,289\.52\n/);
+});
+
+test("an insurer's EV reads n/m for insurers in ticker and its valuation; a capital markets firm's EV is its own", async () => {
+  const valuation = (financials: TickerFinancials) => renderFundamentalsReport({ ...financials, symbol: "UNITTEST" }, "valuation")
+    .replace(/\u001b\[[0-9;]*m/g, "").replace(/ {2,}/g, " ");
+  const served = (industry: string): TickerFinancials => ({ quote, annualStatements: [], quarterlyStatements: [], priceHistory: [],
+    profile: { industry }, fundamentals: { marketCap: 100e9, marketCapCurrency: "USD", enterpriseValue: 120e9, enterpriseToRevenue: 2.4, revenue: 50e9, financialCurrency: "USD" } });
+  for (const text of [await report(served("Insurance - Life")), valuation(served("Insurance - Life"))]) {
+    expect(text).toMatch(/^Enterprise Value n\/m for insurers$/m);
+    expect(text).not.toContain("EV N/M:");
+  }
+  // Evercore, Houlihan Lokey, Tradeweb: "Capital Markets", with an EV that measures the business.
+  for (const text of [await report(served("Capital Markets")), valuation(served("Capital Markets"))]) {
+    expect(text).toMatch(/^Enterprise Value 120B USD$/m);
+  }
+});
+
+test("a margin over revenue at or below zero, and growth off it, read N/M in ticker, with no figure in the export", async () => {
+  // A biotech's trailing revenue gone negative on a reversed collaboration payment: the source's margins are numbers
+  // that say nothing (a loss over negative revenue reads as a profit margin), and growth off last year's negative
+  // quarter is no percentage of it.
+  const financials: TickerFinancials = { quote, annualStatements: [], priceHistory: [],
+    quarterlyStatements: [{ date: "2025-06-30", totalRevenue: -4e6 }, { date: "2026-06-30", totalRevenue: 12e6 }],
+    fundamentals: { marketCap: 1e9, marketCapCurrency: "USD", revenue: -2e6, financialCurrency: "USD",
+      operatingMargin: 41.5, profitMargin: 38.2, revenueGrowth: 4, lastQuarterGrowth: 4 } };
+  const text = await report(financials);
+  expect(text).toMatch(/^Operating Margin N\/M$/m);
+  expect(text).toMatch(/^Profit Margin N\/M$/m);
+  expect(text).toMatch(/^Revenue Growth N\/M$/m);
+  expect(text).toMatch(/^Last Quarter Growth N\/M$/m);
+  // CSV's value column holds only numbers: N/M is the formatted text, the value empty.
+  const csv = renderReportCsv(fundamentalsReportTables({ ...financials, symbol: "UNITTEST" }, "fundamentals",
+    { source: "Gloom Cloud", asOf: null, status: "unreported" }));
+  const line = (label: string) => csv.split("\n").find((row) => row.startsWith(`${label},`)) ?? "";
+  for (const label of ["Operating Margin", "Profit Margin", "Revenue Growth"]) {
+    expect(line(label)).toBe(`${label},N/M`);
+    expect(line(label)).not.toMatch(/4150|3820|400/);
+  }
+  // A company with revenue above zero keeps its figures.
+  const healthy = await report({ ...financials, quarterlyStatements: [{ date: "2025-06-30", totalRevenue: 8e6 }, { date: "2026-06-30", totalRevenue: 12e6 }],
+    fundamentals: { ...financials.fundamentals!, revenue: 40e6, operatingMargin: 0.12, profitMargin: 0.08, revenueGrowth: 0.5, lastQuarterGrowth: 0.5 } });
+  expect(healthy).toMatch(/^Operating Margin 12\.00%$/m);
+  expect(healthy).toMatch(/^Revenue Growth \+50\.00%$/m);
 });

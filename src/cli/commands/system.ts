@@ -1,15 +1,18 @@
 import { join } from "path";
 import { logFailure } from "../../utils/log-failure";
-import { VERSION } from "../../version";
+import { versionCommand } from "./version";
 import { saveConfig } from "../../data/config/store";
+import { layoutWindowCounts } from "../../layout/pane-manager/transient";
 import { builtinPluginGroupMembers } from "../../plugins/ownership";
 import type { AppConfig, TelemetryConfig } from "../../types/config";
 import { canonicalTimeZone } from "../../utils/utc-time";
+import type { CsvDecimal } from "../../utils/csv";
+import { parseCsvDecimal } from "../options";
 import { readBaseCurrency } from "../../utils/base-currency";
 import { NIGHTLY_CHANNEL_SUMMARY, parseUpdateChannel, withUpdateChannel } from "../../updater/channel";
 import type { CliCommandDef } from "../../types/plugin";
 import type { BuiltinCliCommandDef } from "../command-options";
-import { resolveCliDataDir, withCliServices, withConfigData } from "../context";
+import { withCliServices, withConfigData } from "../context";
 import { CLI_COMMAND_GROUPS } from "../help";
 import { dryRunNote, formatBytes, formatStatusCell } from "../helpers";
 import { cliStyles, cliTerminalWidth, renderSection, renderTable, wrapText } from "../../utils/cli-output";
@@ -39,6 +42,8 @@ const TIMEZONE_CONFIG_KEY = "timezone";
 const NO_TIMEZONE = "none";
 /** Stable releases, or nightly builds as well. */
 const UPDATE_CHANNEL_CONFIG_KEY = "updates.channel";
+/** The decimal mark CSV exports write: a dot, or a comma with `;` between cells. */
+const CSV_DECIMAL_CONFIG_KEY = "csvDecimal";
 const EDITABLE_CONFIG_KEYS = [
   "baseCurrency",
   "refreshIntervalMinutes",
@@ -48,6 +53,7 @@ const EDITABLE_CONFIG_KEYS = [
   STAR_PROMPT_CONFIG_KEY,
   TIMEZONE_CONFIG_KEY,
   UPDATE_CHANNEL_CONFIG_KEY,
+  CSV_DECIMAL_CONFIG_KEY,
 ];
 
 function isTelemetryConfigKey(key: string): key is TelemetryConfigKey {
@@ -97,11 +103,36 @@ function describeTimezone(value: unknown): string {
   return typeof value === "string" && value ? value : "not set, times print in UTC alone";
 }
 
+/** What `config get telemetry.attention` prints while the setting is untouched. */
+const ATTENTION_DEFAULT = "default";
+
+/**
+ * Attention Counts as set, not as "on": unset is the default, which counts an
+ * account only once the app has shown it its notice, so it is not `true`.
+ */
+function attentionSetting(telemetry: TelemetryConfig | undefined): boolean | typeof ATTENTION_DEFAULT {
+  return telemetry?.attention ?? ATTENTION_DEFAULT;
+}
+
+function describeAttentionSetting(value: unknown): string {
+  return value === ATTENTION_DEFAULT ? "default: on once the app has shown its notice" : describeConfigValue(value);
+}
+
 function describeConfigValue(value: unknown): string {
   if (value == null) return "nothing";
   if (Array.isArray(value)) return value.length > 0 ? value.join(", ") : "nothing";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
+}
+
+/** The config with CSV exports' decimal mark: a comma is saved, the dot is the default and leaves nothing. */
+function withCsvDecimal(config: AppConfig, decimal: CsvDecimal): AppConfig {
+  const { csvDecimal: _previous, ...rest } = config;
+  return decimal === "comma" ? { ...rest, csvDecimal: "comma" } : rest;
+}
+
+function describeCsvDecimal(value: unknown): string {
+  return value === "comma" ? "comma: CSV numbers as 17,2, cells split by ;" : "dot: CSV numbers as 17.2, cells split by ,";
 }
 
 function withTimezone(config: AppConfig, timezone: string | null): AppConfig {
@@ -174,32 +205,6 @@ function resourceCacheStats(
 }
 
 export function createSystemCliCommands(): CliCommandDef[] {
-  const versionCommand: CliCommandDef = {
-    name: "version",
-    aliases: ["--version", "-v"],
-    description: "Print the version, runtime, and data folder",
-    help: { group: CLI_COMMAND_GROUPS.app, usage: ["version"] },
-    execute: async (_args, ctx) => {
-      // Where the data lives, or will once a command or the app first runs:
-      // printing the version never creates the folder.
-      let dataDir: string | null = null;
-      try {
-        dataDir = await resolveCliDataDir();
-      } catch (error) {
-        logFailure("cli-system", "Resolve data directory failed")(error);
-        dataDir = null;
-      }
-      ctx.printResult({
-        data: [{
-          version: VERSION,
-          bun: typeof Bun === "undefined" ? null : Bun.version,
-          platform: process.platform,
-          arch: process.arch,
-          dataDir,
-        }],
-      }, { layout: "record" });
-    },
-  };
 
   const doctorCommand: CliCommandDef = {
     name: "doctor",
@@ -259,9 +264,11 @@ export function createSystemCliCommands(): CliCommandDef[] {
         "config set theme <id>",
         "config set telemetry.crashReports false",
         "config set telemetry.usage false",
+        "config set telemetry.attention false",
         "config set starPrompt.enabled false",
         "config set timezone <Region/City>|none",
         "config set updates.channel stable|nightly",
+        "config set csvDecimal comma|dot",
         "config get keybindings",
         "config set keybindings.actions.<action> <keys>|null|default",
         "config set keybindings.commands.<keys> <command>|null",
@@ -273,6 +280,11 @@ export function createSystemCliCommands(): CliCommandDef[] {
         title: "Time zone",
         lines: [
           "Times print in UTC. timezone takes an IANA zone name such as Asia/Tokyo or America/New_York, and CLI text and function reports then show your local time beside every UTC time. Trading days keep their market's date. none goes back to UTC alone. JSON and CSV keep the raw values.",
+        ],
+      }, {
+        title: "CSV numbers",
+        lines: [
+          "CSV exports write numbers with a decimal point, cells split by commas. csvDecimal comma writes 17,2 with cells split by ; for a spreadsheet in a decimal-comma locale (German, French), every CSV the CLI and the app export; --decimal comma or --decimal dot decides for one command. Text and JSON keep the dot, and dates stay ISO.",
         ],
       }, {
         title: "Themes",
@@ -293,7 +305,7 @@ export function createSystemCliCommands(): CliCommandDef[] {
         "config set timezone Asia/Tokyo",
         "config get keybindings",
         "config set keybindings.actions.ticker-search \"Ctrl+T\"",
-        "config set keybindings.commands.Alt+1 \"DES AAPL\"",
+        "config set keybindings.commands.Alt+D \"DES AAPL\"",
       ],
     },
     execute: async (args, ctx) => {
@@ -333,10 +345,11 @@ export function createSystemCliCommands(): CliCommandDef[] {
           valueFlashingEnabled: context.config.valueFlashingEnabled,
           "telemetry.crashReports": context.config.telemetry?.crashReports !== false,
           "telemetry.usage": context.config.telemetry?.usage !== false,
-          "telemetry.attention": context.config.telemetry?.attention === true,
+          "telemetry.attention": attentionSetting(context.config.telemetry),
           [STAR_PROMPT_CONFIG_KEY]: context.config.starPrompt?.enabled !== false,
           [TIMEZONE_CONFIG_KEY]: context.config.timezone ?? null,
           [UPDATE_CHANNEL_CONFIG_KEY]: context.config.updates?.channel ?? "stable",
+          [CSV_DECIMAL_CONFIG_KEY]: context.config.csvDecimal ?? "dot",
         };
 
         if (action === "list") {
@@ -347,7 +360,9 @@ export function createSystemCliCommands(): CliCommandDef[] {
               ...(key === KEYBINDINGS_CONFIG_KEY ? { format: summarizeKeybindings } : {}),
               ...(key === "theme" ? { format: (value: unknown) => describeThemeId(String(value)) } : {}),
               ...(key === TIMEZONE_CONFIG_KEY ? { format: describeTimezone } : {}),
+              ...(key === CSV_DECIMAL_CONFIG_KEY ? { format: describeCsvDecimal } : {}),
               ...(key === "baseCurrency" ? { format: describeBaseCurrency } : {}),
+              ...(key === "telemetry.attention" ? { format: describeAttentionSetting } : {}),
             })),
           });
           return;
@@ -367,7 +382,9 @@ export function createSystemCliCommands(): CliCommandDef[] {
           ctx.printResult({ data: { key, value: safeConfig[key] } }, {
             text: (data) => key === KEYBINDINGS_CONFIG_KEY ? renderKeybindings(data.value)
               : key === TIMEZONE_CONFIG_KEY ? describeTimezone(data.value)
-                : key === "baseCurrency" ? describeBaseCurrency(data.value) : describeConfigValue(data.value),
+                : key === CSV_DECIMAL_CONFIG_KEY ? describeCsvDecimal(data.value)
+                : key === "baseCurrency" ? describeBaseCurrency(data.value)
+                  : key === "telemetry.attention" ? describeAttentionSetting(data.value) : describeConfigValue(data.value),
           });
           return;
         }
@@ -411,6 +428,8 @@ export function createSystemCliCommands(): CliCommandDef[] {
               ? parseTimezoneSetting(value)
               : key === UPDATE_CHANNEL_CONFIG_KEY
               ? parseUpdateChannel(value)
+              : key === CSV_DECIMAL_CONFIG_KEY
+              ? parseCsvDecimal(value, `config set ${CSV_DECIMAL_CONFIG_KEY}`)
               : key === "refreshIntervalMinutes"
               ? Number(value)
               : isBooleanConfigKey(key)
@@ -424,7 +443,9 @@ export function createSystemCliCommands(): CliCommandDef[] {
                 ? withTimezone(context.config, parsedValue as string | null)
                 : key === UPDATE_CHANNEL_CONFIG_KEY
                   ? withUpdateChannel(context.config, parsedValue as "stable" | "nightly")
-                  : { ...context.config, [key]: parsedValue };
+                  : key === CSV_DECIMAL_CONFIG_KEY
+                    ? withCsvDecimal(context.config, parsedValue as CsvDecimal)
+                    : { ...context.config, [key]: parsedValue };
           if (!ctx.cliOptions.dryRun) await saveConfig(nextConfig);
           ctx.printResult({
             data: {
@@ -535,10 +556,15 @@ export function createSystemCliCommands(): CliCommandDef[] {
         "plugin info <id>",
         "plugin enable <id>",
         "plugin disable <id>",
-        "plugin doctor [name-or-path]",
+        "plugin doctor [id-or-path]",
         "plugin link <path>",
       ],
       sections: [{
+        title: "Naming a plugin",
+        lines: [
+          "Every plugin command takes an installed plugin's id or its folder, as gloom plugins lists them.",
+        ],
+      }, {
         title: "Developing a plugin",
         lines: [
           "link puts a symlink to a local checkout in the plugins folder, so edits are live on the next start.",
@@ -591,19 +617,30 @@ export function createSystemCliCommands(): CliCommandDef[] {
           )).length,
         }));
 
+        // An installed plugin by its folder too: `gloom install` names the
+        // folder for the repository (`gloom-hackernews`), and `gloom plugins`
+        // shows it beside the id (`hackernews`).
+        const pluginId = async (name: string): Promise<string> => {
+          if (services.services.pluginRegistry.allPlugins.has(name) || builtinPluginGroupMembers(name)) return name;
+          const { installedPluginDirectoriesById, installedPluginRegistryId } = await import("../../plugins/installer");
+          const [directory, ...others] = await installedPluginDirectoriesById(name);
+          if (!directory || others.length > 0) return name;
+          return await installedPluginRegistryId(directory) ?? name;
+        };
+
         if (action === "list") {
           ctx.printResult({ data: pluginRows() });
           return;
         }
         if (action === "info") {
-          const id = requireArg(args[1], "Usage: gloom plugin info <id>", ctx);
+          const id = await pluginId(requireArg(args[1], "Usage: gloom plugin info <id>", ctx));
           const row = pluginRows().find((plugin) => plugin.id === id);
           if (!row) ctx.fail(`Plugin "${id}" is not available.`);
           ctx.printResult({ data: row });
           return;
         }
         if (action === "enable" || action === "disable") {
-          const id = requireArg(args[1], `Usage: gloom plugin ${action} <id>`, ctx);
+          const id = await pluginId(requireArg(args[1], `Usage: gloom plugin ${action} <id>`, ctx));
           // A retired id that now names a group of built-ins switches all of them.
           const targetIds = builtinPluginGroupMembers(id) ?? [id];
           for (const targetId of targetIds) {
@@ -641,15 +678,18 @@ export function createSystemCliCommands(): CliCommandDef[] {
     help: { group: CLI_COMMAND_GROUPS.app, usage: ["layout"] },
     execute: async (_args, ctx) => {
       await withConfigData(ctx, async (config) => {
-        const rows = config.config.layouts.map((layout, index) => ({
-          index,
-          active: index === config.config.activeLayoutIndex,
-          name: layout.name,
-          panes: layout.layout.instances.length,
-          floating: layout.layout.floating.length,
-          detached: layout.layout.detached.length,
-          windows: (layout.layout.windows ?? []).length,
-        }));
+        const rows = config.config.layouts.map((layout, index) => {
+          // The windows the Layouts browser counts (layoutWindowCounts), so the two agree.
+          const { docked, floating, detached } = layoutWindowCounts(layout.layout);
+          return {
+            index,
+            active: index === config.config.activeLayoutIndex,
+            name: layout.name,
+            panes: docked + floating + detached,
+            floating,
+            detached,
+          };
+        });
         ctx.printResult({ data: rows });
       });
     },

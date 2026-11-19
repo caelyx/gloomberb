@@ -157,6 +157,35 @@ test("a listing abroad never shares calls with its US namesake, and refuses the 
   ]);
 });
 
+test("a listing keeps the calls filed under its own code whatever short name its exchange gives the company", async () => {
+  attachEarningsCallsPersistence(new MemoryPluginPersistence());
+  // HKEX files Sun Hung Kai Properties' calls as "SHK PPT"; a US namesake's call is still refused.
+  const client = clientWith(async () => ({ calls: [{ ...calls[0]!, id: "results", ticker: "0016:HKEX", companyName: "SHK PPT" }, { ...calls[0]!, id: "namesake", ticker: "16", companyName: "Other Corp" }] }));
+  const read = await loadEarningsCallsWithClient(client, "0016:HKEX", { name: "Sun Hung Kai Properties Limited" });
+  expect(read.calls.map((call) => call.id)).toEqual(["results"]);
+});
+
+test("a listing abroad with no call stored is a company whose calls are not yet available, never an unknown symbol", async () => {
+  attachEarningsCallsPersistence(new MemoryPluginPersistence());
+  // The service answers both as unknownTicker: CapitaLand's trust has no call under C38U:SGX yet, ZZZZQ is no US symbol.
+  const client = clientWith(async () => ({ calls: [], unknownTicker: true }));
+  expect((await loadEarningsCallsWithClient(client, "C38U:SGX", { force: true })).unknownTicker).toBe(false);
+  expect((await loadEarningsCallsWithClient(client, "ZZZZQ", { force: true })).unknownTicker).toBe(true);
+});
+
+test("a foreign line's calls read from its company's home line are kept whatever the line's name, and say whose", async () => {
+  attachEarningsCallsPersistence(new MemoryPluginPersistence());
+  const companyFrom = { symbol: "000660", exchange: "KRX", name: "SK hynix Inc." };
+  let home = false;
+  const client = clientWith(async () => ({ calls: [{ ...calls[0]!, id: "home", companyName: "SK hynix Inc." }], ...(home ? { companyFrom } : {}) }));
+  // A line named unlike the call's company drops the call, unless the service says it read the company's home line.
+  const listing = { exchange: "FWB2", name: "Hynix Semiconductor GDR" };
+  expect((await loadEarningsCallsWithClient(client, "HY9H", listing)).calls).toEqual([]);
+  home = true;
+  const read = await loadEarningsCallsWithClient(client, "HY9H", { ...listing, force: true });
+  expect([read.calls.map((call) => call.id), read.companyFrom]).toEqual([["home"], companyFrom]);
+});
+
 test("an older response cannot overwrite a force-refreshed list in persistence", async () => {
   attachEarningsCallsPersistence(new MemoryPluginPersistence());
   let finishOld!: (value: CloudEarningsCallListPayload) => void;
@@ -208,13 +237,30 @@ test("a transient refresh failure retains metadata, observations and their origi
   });
 });
 
-for (const status of [401, 402, 403]) {
-  test(`explicit ${status} remains an error instead of returning stale data`, async () => {
+// As every Gloom Cloud read: a client error asking again will not change (signed out, no Pro, a
+// route the server stopped serving) is said; a passing one (rate limit, timeout) answers from the copy.
+for (const status of [400, 401, 402, 403, 404, 408, 429]) {
+  const permanent = status !== 408 && status !== 429;
+  test(`a ${status} on the list, the calendar and a transcript ${permanent ? "is said over" : "answers from"} the saved copy`, async () => {
     attachEarningsCallsPersistence(new MemoryPluginPersistence());
+    const days = { from: "2026-10-21", to: "2026-10-23" };
     const client = clientWith(async () => ({ calls: [calls[0]!] }));
+    client.getCloudEarningsTranscript = async () => transcriptValue("Saved transcript");
     await loadEarningsCallsWithClient(client, "SYN");
-    client.getCloudEarningsCalls = async () => { throw new ApiRequestError("Controlled auth error", status); };
-    await expect(loadEarningsCallsWithClient(client, "SYN", { force: true })).rejects.toThrow("Controlled auth error");
+    await loadUpcomingCallsWithClient(client, days);
+    await loadTranscriptWithClient(client, "controlled-0");
+    const error = new ApiRequestError("Controlled client error", status);
+    client.getCloudEarningsCalls = async () => { throw error; };
+    client.getCloudEarningsTranscript = async () => { throw error; };
+    const reads = [
+      () => loadEarningsCallsWithClient(client, "SYN", { force: true }),
+      () => loadUpcomingCallsWithClient(client, days, { force: true }),
+      () => loadTranscriptWithClient(client, "controlled-0", { force: true }),
+    ];
+    for (const read of reads) {
+      if (permanent) await expect(read()).rejects.toBe(error);
+      else expect((await read()).savedAt).toEqual(expect.any(Number));
+    }
   });
 }
 
@@ -367,7 +413,7 @@ test("a calendar answered at the server's limit is cut, says so, and stays so fr
   const client = clientWith(async () => answer());
   const cut = await loadUpcomingCallsWithClient(client, days);
   expect(cut.truncated).toBe(true);
-  expect(upcomingCutNotice(cut.calls)).toBe("The calendar stops at 1,500 calls: later calls from Oct 23 on may be missing.");
+  expect(upcomingCutNotice(cut.calls)).toBe("The calendar stops at 1,500 calls: later calls from 23 Oct on may be missing.");
   expect((await loadUpcomingCallsWithClient(client, days)).truncated).toBe(true);
   answer = async () => { throw new ApiRequestError("Controlled outage", 503); };
   expect(await loadUpcomingCallsWithClient(client, days, { force: true })).toMatchObject({ stale: true, truncated: true });

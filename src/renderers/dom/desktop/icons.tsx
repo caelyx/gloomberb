@@ -1,5 +1,7 @@
 /** @jsxImportSource react */
 import { releasePointerFocus } from "../host/focus-scope";
+import { formatShortcutForHost } from "../../../app/keybindings/labels";
+import { ariaKeyShortcut } from "./dialog-actions";
 import type { ReactNode } from "react";
 import type { IconButtonProps, IconName, IconProps } from "../../../components/ui/icon";
 
@@ -165,6 +167,13 @@ const ICONS: Record<IconName, ReactNode> = {
       <path d="M7.3 2.9l1.8 1.8" stroke="currentColor" strokeWidth="1.1" />
     </>
   ),
+  // An envelope: a message written to you.
+  mail: (
+    <>
+      <rect x="1.5" y="2.75" width="9" height="6.5" rx="1.1" stroke="currentColor" strokeWidth="1.1" />
+      <path d="M2 3.4 6 6.5l4-3.1" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" />
+    </>
+  ),
   restore: (
     <>
       <rect x="2" y="4" width="6" height="6" rx="0.8" stroke="currentColor" strokeWidth="1.1" />
@@ -173,7 +182,7 @@ const ICONS: Record<IconName, ReactNode> = {
   ),
 };
 
-export function WebIcon({ name, size = 12, color }: IconProps) {
+export function WebIcon({ name, size = 12, color, fullHeight }: IconProps) {
   return (
     <svg
       viewBox="0 0 12 12"
@@ -182,7 +191,8 @@ export function WebIcon({ name, size = 12, color }: IconProps) {
       fill="none"
       aria-hidden="true"
       data-gloom-icon={name}
-      style={{ flex: "none", display: "block", color }}
+      // The viewBox keeps its size and sits in the middle of the taller box (preserveAspectRatio's default).
+      style={{ flex: "none", display: "block", color, ...(fullHeight ? { height: "100%" } : {}) }}
     >
       {ICONS[name]}
     </svg>
@@ -224,9 +234,9 @@ export function WebIconButton({
       className="gloom-icon-button"
       aria-label={label}
       aria-pressed={pressed}
-      aria-keyshortcuts={shortcut}
+      aria-keyshortcuts={ariaKeyShortcut(shortcut)}
       aria-haspopup={hasPopup}
-      title={title ?? (shortcut ? `${label} (${shortcut})` : label)}
+      title={title ?? (shortcut ? `${label} (${formatShortcutForHost(shortcut, "platform")})` : label)}
       disabled={disabled || !onPress}
       data-gloom-interactive={onPress && !disabled ? "true" : undefined}
       data-gloom-role="icon-button"
