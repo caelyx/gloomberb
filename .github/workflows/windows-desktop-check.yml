@@ -188,10 +188,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE: ${{ inputs.release }}
+          # Upstream's published releases: a fork has none of its own.
+          RELEASE_REPO: gloom-sh/gloomberb
         run: |
           $Tag = $env:RELEASE
-          if (-not $Tag) { $Tag = gh release view --repo $env:GITHUB_REPOSITORY --json tagName -q .tagName }
-          gh release download $Tag --repo $env:GITHUB_REPOSITORY --pattern stable-win-x64-GloomSetup.exe --dir installer
+          if (-not $Tag) { $Tag = gh release view --repo $env:RELEASE_REPO --json tagName -q .tagName }
+          gh release download $Tag --repo $env:RELEASE_REPO --pattern stable-win-x64-GloomSetup.exe --dir installer
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Host "Checking release $Tag"
 

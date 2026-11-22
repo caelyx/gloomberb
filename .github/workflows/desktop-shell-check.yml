@@ -52,10 +52,12 @@ jobs:
       - name: Install the earlier release in Applications
         env:
           GH_TOKEN: ${{ github.token }}
+          # Upstream's published releases: a fork has none of its own.
+          RELEASE_REPO: gloom-sh/gloomberb
         run: |
           set -euo pipefail
           command -v zstd || brew install zstd
-          gh release download "$EARLIER_RELEASE" --repo "$GITHUB_REPOSITORY" --pattern stable-macos-arm64-Gloom.app.tar.zst --dir earlier
+          gh release download "$EARLIER_RELEASE" --repo "$RELEASE_REPO" --pattern stable-macos-arm64-Gloom.app.tar.zst --dir earlier
           mkdir -p "$RUNNER_TEMP/earlier"
           zstd -d -o "$RUNNER_TEMP/earlier.tar" earlier/stable-macos-arm64-Gloom.app.tar.zst
           tar -xf "$RUNNER_TEMP/earlier.tar" -C "$RUNNER_TEMP/earlier"
@@ -141,8 +143,13 @@ jobs:
 
       # No release carries a Linux desktop app: the earlier one is built from its tag.
       - name: Build the earlier release
+        env:
+          RELEASE_REPO: gloom-sh/gloomberb
         run: |
           set -euo pipefail
+          # A fork carries none of upstream's tags: take the release's from upstream.
+          git rev-parse -q --verify "refs/tags/$EARLIER_RELEASE" >/dev/null \
+            || git fetch --no-tags "https://github.com/$RELEASE_REPO" "refs/tags/$EARLIER_RELEASE:refs/tags/$EARLIER_RELEASE"
           git worktree add "$RUNNER_TEMP/earlier-src" "$EARLIER_RELEASE"
           cd "$RUNNER_TEMP/earlier-src"
           bun install --frozen-lockfile
@@ -255,7 +262,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download $env:EARLIER_RELEASE --repo $env:GITHUB_REPOSITORY --pattern stable-win-x64-GloomSetup.exe --dir earlier
+          # Upstream's published releases: a fork has none of its own.
+          RELEASE_REPO: gloom-sh/gloomberb
+        run: gh release download $env:EARLIER_RELEASE --repo $env:RELEASE_REPO --pattern stable-win-x64-GloomSetup.exe --dir earlier
 
       - name: Install the earlier release
         id: earlier

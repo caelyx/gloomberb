@@ -88,7 +88,9 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download $env:EARLIER_RELEASE --repo $env:GITHUB_REPOSITORY --pattern stable-win-x64-GloomSetup.exe --dir earlier
+          # Upstream's published releases: a fork has none of its own.
+          RELEASE_REPO: gloom-sh/gloomberb
+        run: gh release download $env:EARLIER_RELEASE --repo $env:RELEASE_REPO --pattern stable-win-x64-GloomSetup.exe --dir earlier
 
       # What the Windows on Arm job installs and updates to.
       - name: Keep the release copy for Windows on Arm
