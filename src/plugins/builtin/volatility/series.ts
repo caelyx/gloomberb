@@ -16,6 +16,7 @@ const BOARD_NAMES: Readonly<Record<string, string>> = {
   gvz: "Gold volatility index",
   vxeem: "Emerging markets volatility index",
   vxewz: "Brazil volatility index",
+  vhsi: "HSI Volatility Index (VHSI)",
   vxapl: "Apple volatility index",
   vxazn: "Amazon volatility index",
   vxgog: "Alphabet volatility index",
@@ -60,12 +61,15 @@ function dvolSeries(currency: DvolCurrency): SeriesDefinition {
     frequency: "daily",
     group: "Volatility",
     tags: ["volatility", "DVOL", "Deribit", "crypto", "implied volatility", currency, `${currency}-USD`, coin.toLowerCase()],
+    // Deribit's own names: DVOL is bitcoin's, ETHDVOL ether's. DVOL is also a US fund, which a quote answers for.
+    aliases: currency === "BTC" ? ["dvol", "btcdvol"] : ["ethdvol"],
     description: `Deribit's DVOL for ${currency}: the 30-day implied volatility its ${currency} options price, in vol points, daily since March 2021.`,
     url: `https://www.deribit.com/statistics/${currency}/volatility-index`,
     refreshMs: 5 * 60_000,
     load: async ({ signal }) => {
-      const payload = await loadDvol(currency, signal ? { signal } : {});
-      return { points: payload.observations, attribution: { source: `Deribit DVOL (${currency})`, publisher: "Deribit" } };
+      const { payload, savedAt } = await loadDvol(currency, signal ? { signal } : {});
+      return { points: payload.observations, ...(savedAt != null ? { savedAt } : {}),
+        attribution: { source: `Deribit DVOL (${currency})`, publisher: "Deribit" } };
     },
   };
 }
@@ -74,7 +78,7 @@ function dvolSeries(currency: DvolCurrency): SeriesDefinition {
 export const VOLATILITY_SERIES: readonly SeriesDefinition[] = [
   ...VOLATILITY_INDICES.filter((index) => !FRED_LISTED.has(index.id)).map((index): SeriesDefinition => {
     const name = BOARD_NAMES[index.id] ?? index.label;
-    const tags = ["volatility", index.symbol.replace("^", "")];
+    const tags = ["volatility", index.symbol.replace("^", ""), ...index.id === "vhsi" ? ["VHSI", "Hong Kong"] : []];
     const code = CORRELATION[index.id];
     return code
       ? {
@@ -105,11 +109,12 @@ export const VOLATILITY_SERIES: readonly SeriesDefinition[] = [
     tags: ["term structure", "contango", "backwardation", "VIX"],
     description: "VIX 3M over VIX on each date both closed, from Cboe's daily closes and FRED's before them; above 1 is contango.",
     load: async ({ start, signal }) => {
-      const { term, warning } = await loadVolatilityTermHistory({ ...(start ? { start } : {}), ...(signal ? { signal } : {}) });
+      const { term, warning, savedAt } = await loadVolatilityTermHistory({ ...(start ? { start } : {}), ...(signal ? { signal } : {}) });
       const attribution = termAttribution(term);
       return {
         points: term.ratioHistory.map((point) => ({ date: point.date, value: point.value })),
         ...(warning ? { warning } : {}),
+        ...(savedAt != null ? { savedAt } : {}),
         ...(attribution ? { attribution } : {}),
       };
     },

@@ -1,7 +1,8 @@
-import { useMemo, type ReactNode, type RefObject } from "react";
+import { useEffect, useMemo, type ReactNode, type RefObject } from "react";
 import { Box, Input, Text, useUiCapabilities, type InputRenderable } from "../../ui";
-import { colors } from "../../theme/colors";
+import { colors, placeholderText } from "../../theme/colors";
 import { Icon } from "./icon";
+import type { PastedLines } from "../../utils/pasted-lines";
 
 export interface InlineQuickAddRowProps {
   value: string;
@@ -20,6 +21,14 @@ export interface InlineQuickAddRowProps {
   onFocus?: () => void;
   onBlur: () => void;
   onCancel?: () => void;
+  /** A paste of several lines is one line of them, each break a space, or with `"list"` each line an entry (`PastedLines`). */
+  joinPastedLines?: PastedLines;
+}
+
+/** The terminal field's scrolled window over its text; a DOM input has none. */
+interface FieldView {
+  getViewport?(): { offsetX: number; offsetY: number; width: number; height: number };
+  setViewport?(x: number, y: number, width: number, height: number): void;
 }
 
 /** Shared one-row composer used by pane-native inline add flows. */
@@ -40,6 +49,7 @@ export function InlineQuickAddRow({
   onFocus,
   onBlur,
   onCancel,
+  joinPastedLines,
 }: InlineQuickAddRowProps) {
   const inputWidth = useMemo(() => {
     const queryWidth = [...value.trim()].length;
@@ -47,11 +57,21 @@ export function InlineQuickAddRow({
       // A typed query hugs its preview unless the caller asked for a wider field.
       // The cursor and the next keystroke both need a cell: a key lands before
       // the field widens, and with one cell to spare the input scrolled its
-      // first character out of view (OMV.VI read "MV.VI").
-      return Math.max(minInputWidth ?? 4, Math.min(maxInputWidth, queryWidth + 2));
+      // first character out of view (OMV.VI read "MV.VI"). The terminal field
+      // also keeps a fifth of its width clear after the cursor, so a longer
+      // symbol needs that much more (USDTRY=X read "SDTRY=X").
+      return Math.max(minInputWidth ?? 4, Math.min(maxInputWidth, queryWidth + 2 + Math.floor(queryWidth / 4)));
     }
     return Math.max(minInputWidth ?? 6, Math.min(10, Math.floor(width * 0.18)));
   }, [maxInputWidth, minInputWidth, value, width]);
+  // A field that ran out of room scrolls its text, and keeps that scroll once the text fits again: keys typed
+  // faster than the field widens left USDTRY=X reading "SDTRY=X". Text that fits shows from its first character.
+  useEffect(() => {
+    const view = (inputRef.current as { editorView?: FieldView } | null)?.editorView;
+    const viewport = view?.getViewport?.();
+    if (!viewport || viewport.offsetX === 0 || [...value].length >= inputWidth) return;
+    view?.setViewport?.(0, viewport.offsetY, inputWidth, viewport.height);
+  }, [inputRef, inputWidth, value]);
   const hasPreview = preview !== undefined && preview !== null;
   const previewWidth = Math.max(4, width - inputWidth - 5);
   const { nativePaneChrome } = useUiCapabilities();
@@ -70,7 +90,7 @@ export function InlineQuickAddRow({
       value={value}
       focused={active && paneFocused}
       placeholder={placeholder}
-      placeholderColor={colors.textMuted}
+      placeholderColor={placeholderText()}
       textColor={colors.text}
       backgroundColor={nativePaneChrome ? "transparent" : colors.panel}
       onInput={onChange}
@@ -79,6 +99,7 @@ export function InlineQuickAddRow({
       onFocus={onFocus}
       onBlur={onBlur}
       onEscape={onCancel}
+      joinPastedLines={joinPastedLines}
     />
   );
 

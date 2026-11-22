@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { describe, expect, test } from "bun:test";
 import type { CloudCdsHistoryPointPayload, CloudCdsTradePayload } from "../../../api-client";
 import {
@@ -111,10 +112,30 @@ describe("normalizeCdsTrades", () => {
     ])).toHaveLength(0);
   });
 
+  test("reads a print without a coupon whose upfront is the quote in points as points, never a spread", () => {
+    // Whirlpool, 27 Oct 2026: 6.5 and 15.25 in the spread field beside 6.4 and 15.1 points of upfront.
+    const whirlpool = { issuerName: "Whirlpool Corp", fixedRate: null, spreadNotation: "3", notionalCapped: true };
+    const [dec28, dec29, small, coupon, bare] = normalizeCdsTrades([
+      payload({ ...whirlpool, reportedSpread: 0.00065, upfrontAmount: 319_861 }),
+      payload({ ...whirlpool, disseminationId: "2", reportedSpread: 0.001525, upfrontAmount: 757_361 }),
+      payload({ ...whirlpool, disseminationId: "3", reportedSpread: 0.00065, notionalAmount: 3_000_000, upfrontAmount: 191_917 }),
+      // With a coupon, or without an upfront that reads as the same points, the field is a spread.
+      payload({ disseminationId: "4", fixedRate: 0.01, reportedSpread: 0.0949, spreadNotation: "3", upfrontAmount: 1_232_374 }),
+      payload({ ...whirlpool, disseminationId: "5", reportedSpread: 0.0949, upfrontAmount: 1_232_374 }),
+    ]);
+    expect([dec28, dec29, small].map((trade) => [trade!.pointsUpfront, trade!.spreadBp])).toEqual([[6.5, null], [15.25, null], [6.5, null]]);
+    expect(coupon).toMatchObject({ pointsUpfront: null, couponBp: 100 });
+    expect(coupon!.spreadBp).toBeCloseTo(949, 6);
+    expect(bare!.pointsUpfront).toBeNull();
+    expect(bare!.spreadBp).toBeCloseTo(949, 6);
+    // A points print never stands in for the issuer's latest spread.
+    expect(summarizeIssuers([dec28!, dec29!])[0]!.latestSpreadBp).toBeNull();
+  });
+
   test("marks capped notionals so a floor is not read as the trade size", () => {
     expect(formatNotional({ notional: 5_000_000, notionalCapped: true })).toBe("5M+");
     expect(formatNotional({ notional: 5_000_000, notionalCapped: false })).toBe("5M");
-    expect(formatNotional({ notional: null, notionalCapped: false })).toBe("--");
+    expect(formatNotional({ notional: null, notionalCapped: false })).toBe(MISSING_VALUE);
   });
 });
 
@@ -290,9 +311,9 @@ describe("issuer aliases", () => {
     expect(normalizeCdsTrades([payload({ issuerName: "CCO Holdings;LLC" })])[0]!.issuer).toBe("CCO Holdings, LLC");
   });
 
-  test("drills down on the key so aliases open together", () => {
-    expect(tradesForIssuer(aliasTrades, "oracle").map((row) => row.issuer)).toEqual(ORACLE);
-    expect(tradesForIssuer(aliasTrades, "boeing").map((row) => row.issuer)).toEqual(BOEING);
+  test("drills down on the key so aliases open together, each print under the one spelling", () => {
+    expect(tradesForIssuer(aliasTrades, "oracle").map((row) => row.issuer)).toEqual(ORACLE.map(() => "Oracle Corporation"));
+    expect(tradesForIssuer(aliasTrades, "boeing").map((row) => row.issuer)).toEqual(BOEING.map(() => "The Boeing Company"));
   });
 });
 
@@ -343,6 +364,7 @@ describe("5Y spread chart", () => {
         level: 234.9,
         spreadBp: 234.9,
         date: "2026-09-25",
+        settlement: false,
         couponBp: null,
         change1w: 4.04,
         change1m: 12.7,
@@ -360,6 +382,9 @@ describe("5Y spread chart", () => {
       { id: "1m", label: "1M", value: "+13.0bp" },
       { id: "range", label: "Range", value: "181 to 235bp", detail: "since 2026-07-24" },
     ]);
+    // A day without enough trades stands on its settlement price, and the level says so beside its date.
+    expect(spreadFigures(line([level("2026-09-24", 233), { ...level("2026-09-25", 235), prints: 0, kind: "settlement" }]))[0]?.detail)
+      .toBe("2026-09-25 · settlement");
     // Without a comparable level the move is left out, not shown as zero.
     expect(spreadFigures(line([level("2026-06-01", 72.5), level("2026-09-25", 60)])).map((item) => item.id))
       .toEqual(["spread", "range"]);
@@ -391,6 +416,7 @@ describe("5Y spread chart", () => {
       level: 57.65,
       spreadBp: 18654.4,
       date: "2026-10-15",
+      settlement: false,
       couponBp: 500,
       change1w: 10.9,
       change1m: 36.1,
@@ -402,7 +428,7 @@ describe("5Y spread chart", () => {
       { id: "1m", label: "1M", value: "+36.1 pts" },
       { id: "range", label: "Range", value: "21.6 to 57.6 pts", detail: "since 2026-09-15" },
     ]);
-    expect([formatPoints(58.2), formatPointsMove(-0.04), formatPointsMove(null)]).toEqual(["58.2 pts", "0.0 pts", "--"]);
+    expect([formatPoints(58.2), formatPointsMove(-0.04), formatPointsMove(null)]).toEqual(["58.2 pts", "0.0 pts", MISSING_VALUE]);
   });
 
   test("says why there is no level only for the cause the server names", () => {

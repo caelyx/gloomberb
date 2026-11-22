@@ -2,6 +2,9 @@ import { expect, mock, spyOn, test } from "bun:test";
 import { apiClient } from "../../api-client";
 import { getLoadablePlugins } from "../../plugins/catalog";
 import { centralBankRatesModule } from "../../plugins/builtin/central-bank-rates";
+import { futuresCurveModule } from "../../plugins/builtin/futures-curve";
+import { cryptoBoardModule } from "../../plugins/builtin/crypto-board";
+import { volatilityModule } from "../../plugins/builtin/volatility";
 import { chartComposerModule } from "../../plugins/builtin/chart-composer";
 import { creditBoardsModule } from "../../plugins/builtin/credit-boards";
 import { ivHistoryModule } from "../../plugins/builtin/iv-history";
@@ -16,10 +19,19 @@ import type { HeadlessPaneDefinition, PaneDef, PaneTemplateDef } from "../../typ
 import type { MarketContext } from "../types";
 import { buildPaneCatalogEntries, type PaneFunctionCatalog } from "./catalog";
 import { createPaneCatalog } from "./discovery";
-import { parsePaneFunctionArgs } from "./options";
-import { applyListingArgument, parsePaneFunctionArgsFor, resolvePaneFunction, UnknownPaneFunctionError } from "./resolver";
+import { buildFunctionReport } from "./report";
+import { buildCreateOptions, parsePaneFunctionArgs } from "./options";
+import { applyListingArgument, findPaneFunction, parsePaneFunctionArgsFor, resolvePaneFunction, UnknownPaneFunctionError, withTickerList } from "./resolver";
+import { getHeadlessPaneDefinition } from "./capabilities";
+import { tickerDetailModule } from "../../plugins/builtin/ticker-detail";
+import { catalystsModule } from "../../plugins/builtin/catalysts";
+import { earningsModule } from "../../plugins/builtin/earnings";
+import { dividendYieldModule } from "../../plugins/builtin/dividend-yield";
 import { portfolioRiskHeadless } from "../../plugins/builtin/analytics/risk-headless";
 import { capabilityPluginState } from "./capabilities";
+import { newsWireModule } from "../../plugins/builtin/news/wire";
+import { shortStoryId, storyIdMatches } from "../../news/story-id";
+import type { SeriesSource } from "../series-search";
 
 const pane = (id: string): PaneDef => ({ id, name: id, component: () => null, defaultPosition: "right" });
 const template = (prefix: string, paneId: string, headless: HeadlessPaneDefinition): PaneTemplateDef => ({
@@ -57,6 +69,29 @@ test("--section picks a report table, unless the function has a section option o
   await expect(fn(["CALLS", "NVDA", "--section", "bogus"])).rejects.toThrow("Invalid --section value");
   // Screenshots have no tables to pick from.
   await expect(fn(["WEI", "--section", "Europe"], false)).rejects.toThrow("WEI does not support --section");
+});
+
+test("--limit and --tail pick the report's rows of a function with no such option, and stay refused by shot", async () => {
+  const contracts = Array.from({ length: 10 }, (_, index) => ({ contract: `CL${index}`, settle: 80 - index }));
+  const curve: HeadlessPaneDefinition<"bundle"> = {
+    shape: "bundle", argument: { kind: "none" }, options: [],
+    load: () => ({ sections: [{ title: "Contracts", rows: contracts }, { title: "Terms", entries: [{ label: "Unit", value: "USD / barrel" }] }] }),
+  };
+  const catalog: PaneFunctionCatalog = { ...registry, panes: new Map([["curve", pane("curve")]]),
+    paneTemplates: new Map([["curve-pane", template("CRV", "curve", curve)]]) };
+  const withWindow = (args: string[], globals: { limit?: number; tail?: number }) => resolvePaneFunction(
+    catalog, context, parsePaneFunctionArgs(args, globals), { strictHeadlessOptions: true, tableSection: true, rowWindow: true });
+  const limited = await withWindow(["CRV"], { limit: 3 });
+  expect(limited.rowWindow).toEqual({ limit: 3 });
+  expect(limited.options).not.toHaveProperty("limit");
+  const report = await buildFunctionReport(limited, context, "");
+  expect(report.tables.tables[0]!.rows.map((row) => row[0])).toEqual(["CL0", "CL1", "CL2"]);
+  expect(report.text).toContain("first 3 of 10 rows (--limit 3)");
+  const tail = await buildFunctionReport(await withWindow(["CRV"], { tail: 2 }), context, "");
+  expect(tail.tables.tables[0]!.rows.map((row) => row[0])).toEqual(["CL8", "CL9"]);
+  // A capture draws the pane, which lists every row: it still refuses an option the pane does not draw.
+  await expect(resolvePaneFunction(catalog, context, parsePaneFunctionArgs(["CRV"], { limit: 3 }), { strictHeadlessOptions: true, command: "shot" }))
+    .rejects.toThrow("CRV does not support --limit");
 });
 
 test("a pair option reads the words after its flag, and a refused option is named as it was typed", async () => {
@@ -140,6 +175,15 @@ test("a name that opens nothing lists the closest functions and where to search,
   expect(close?.details).toBe("Closest matches:\n  OVDV  Volatility Surface\nSearch the catalog: gloom catalog volsurf");
   // Near no code and found by no search: said plainly, with the whole catalog to look in.
   expect((await unknown("zzqxvb"))?.details).toBe("No function code is close to zzqxvb. List every function: gloom catalog");
+  // A word that names data no function is near points at the series the catalog finds for it.
+  const nikkei = { series: [
+    { id: "nkd", name: "Nikkei 225 (USD)", unit: "points", frequency: "daily", expression: "FUT:NKD", tags: ["nikkei"] },
+    { id: "niy", name: "Nikkei 225 (Yen)", unit: "points", frequency: "daily", expression: "FUT:NIY", tags: ["nikkei"] },
+  ] } as unknown as SeriesSource;
+  const named = await resolvePaneFunction(withSurface, context, parsePaneFunctionArgs(["nikkei"]), { seriesSources: [nikkei] })
+    .then(() => null, (error: unknown) => error as UnknownPaneFunctionError);
+  expect(named?.details).toBe("Series the catalog finds:\n  FUT:NKD  Nikkei 225 (USD)\n  FUT:NIY  Nikkei 225 (Yen)\n"
+    + "Chart one: gloom fn G FUT:NKD\nSearch the catalog: gloom catalog nikkei");
 });
 
 test("a code one slip from a function's (swapped, missing or extra letter) names it and the command that runs it", async () => {
@@ -198,6 +242,26 @@ test("shot hands CDX, SOVR (or its alias WCDS) and IPO their argument as the par
   expect(await shot("IPO", "pending")).toEqual({ params: expect.objectContaining({ search: "pending" }), binding: { kind: "none" } });
 });
 
+/** `fn news-story-pane 2ef88dae-…` said "Not a ticker: 2EF88DAE-…": the story pane's argument is a story id, as `news` prints it. */
+test("the story pane opens on the story id typed, whole or short, never read as a ticker", async () => {
+  const stories: PaneFunctionCatalog = {
+    panes: new Map((newsWireModule.panes ?? []).map((entry) => [entry.id, entry])),
+    paneTemplates: new Map((newsWireModule.paneTemplates ?? []).map((entry) => [entry.id, entry])),
+    destroy: () => {},
+  };
+  const open = async (id: string) => (await resolvePaneFunction(stories, context, parsePaneFunctionArgs(["news-story-pane", id]), { command: "shot" })).instance;
+  const id = "6067684e-2e13-41c5-a7cf-5052b3cefc07";
+  expect(await open(id)).toMatchObject({ params: { articleId: id }, binding: { kind: "none" } });
+  // The short id `news` prints opens the story it starts.
+  expect(shortStoryId(id)).toBe("6067684e");
+  expect(await open("6067684e")).toMatchObject({ params: { articleId: "6067684e" }, binding: { kind: "none" } });
+  expect(storyIdMatches(id, "6067684E")).toBe(true);
+  expect(storyIdMatches(id, "6067684")).toBe(false);
+  // An id from another source is printed and matched whole.
+  expect(shortStoryId("rss:abc123")).toBe("rss:abc123");
+  expect(storyIdMatches("rss:abc123", "rss:abc")).toBe(false);
+});
+
 test("an implied-vol word that is no code (IVOL, OVOL, IV) names HIVG and OVDV and runs each on the argument", async () => {
   const modules = [ivHistoryModule, volSurfaceModule];
   const vol: PaneFunctionCatalog = {
@@ -216,6 +280,54 @@ test("an implied-vol word that is no code (IVOL, OVOL, IV) names HIVG and OVDV a
   expect((await unknown(["IVOL"]))?.details).toBe("Run: gloom fn HIVG <ticker>\n     gloom fn OVDV <ticker>");
 });
 
+test("VX and vix futures open CTM VIX, and VVIX, a keyword of VIX's, says it opened VIX", async () => {
+  const modules = [futuresCurveModule, volatilityModule];
+  const vol: PaneFunctionCatalog = {
+    panes: new Map(modules.flatMap((module) => module.panes ?? []).map((entry) => [entry.id, entry])),
+    paneTemplates: new Map(modules.flatMap((module) => module.paneTemplates ?? []).map((entry) => [entry.id, entry])),
+    destroy: () => {},
+  };
+  for (const word of ["VX", "vx", "vix futures"]) {
+    const parsed = parsePaneFunctionArgsFor(vol, [word]);
+    expect(parsed).toMatchObject({ target: "CTM", arg: "VIX", listingNotes: [`${word} opened CTM VIX, Futures Curve.`] });
+    expect((await resolvePaneFunction(vol, context, parsed)).token).toBe("CTM");
+  }
+  // A root typed after it is kept.
+  expect(parsePaneFunctionArgsFor(vol, ["VX", "CL"])).toMatchObject({ target: "CTM", arg: "CL" });
+  expect(parsePaneFunctionArgsFor(vol, ["VVIX"])).toMatchObject({ target: "VVIX", listingNotes: ["VVIX opened VIX, VIX Curve."] });
+  expect((await resolvePaneFunction(vol, context, parsePaneFunctionArgsFor(vol, ["VVIX"]))).token).toBe("VIX");
+  // A function's own code or name says nothing.
+  for (const word of ["VIX", "CTM", "VOLS", "Futures Curve"]) expect(parsePaneFunctionArgsFor(vol, [word]).listingNotes).toBeUndefined();
+});
+
+test("TVL and stablecoins open CRYP on those lists though both are also its keywords", () => {
+  const crypto: PaneFunctionCatalog = {
+    panes: new Map(cryptoBoardModule.panes!.map((entry) => [entry.id, entry])),
+    paneTemplates: new Map(cryptoBoardModule.paneTemplates!.map((entry) => [entry.id, entry])),
+    destroy: () => {},
+  };
+  expect(parsePaneFunctionArgsFor(crypto, ["TVL"])).toMatchObject({ target: "CRYP", arg: "defi", listingNotes: ["TVL opened CRYP defi, Crypto."] });
+  expect(parsePaneFunctionArgsFor(crypto, ["stablecoins"])).toMatchObject({ target: "CRYP", arg: "stablecoin" });
+  // CRYP itself, and a keyword that names no list, open the board as typed.
+  expect(parsePaneFunctionArgsFor(crypto, ["CRYP", "tvl"])).toMatchObject({ target: "CRYP", arg: "tvl" });
+  expect(parsePaneFunctionArgsFor(crypto, ["bitcoin"])).toMatchObject({ target: "bitcoin", listingNotes: ["bitcoin opened CRYP, Crypto."] });
+});
+
+// `fn PDUFA` opened every catalyst and `fn runway VKTX` the T pane, though each word names one view of another function.
+test("PDUFA opens CATL on PDUFA dates and runway opens FA's liquidity, an option typed after the word keeping its own value", () => {
+  const modules = [catalystsModule, tickerDetailModule];
+  const registry: PaneFunctionCatalog = {
+    panes: new Map(modules.flatMap((module) => module.panes ?? []).map((entry) => [entry.id, entry])),
+    paneTemplates: new Map(modules.flatMap((module) => module.paneTemplates ?? []).map((entry) => [entry.id, entry])),
+    destroy: () => {},
+  };
+  expect(parsePaneFunctionArgsFor(registry, ["PDUFA"])).toMatchObject({ target: "CATL", arg: "", options: { type: "pdufa" },
+    listingNotes: ["PDUFA opened CATL --type pdufa, Catalysts."] });
+  expect(parsePaneFunctionArgsFor(registry, ["runway", "VKTX"])).toMatchObject({ target: "FA", arg: "VKTX", options: { statement: "liquidity" },
+    listingNotes: ["runway opened FA VKTX --statement liquidity, Financial Analysis."] });
+  expect(parsePaneFunctionArgsFor(registry, ["runway", "VKTX", "--statement", "cashflow"])).toMatchObject({ target: "FA", options: { statement: "cashflow" } });
+});
+
 test("a central bank's name or short form typed as a function points to CBR, and a function that owns the word keeps it", async () => {
   const modules = [centralBankRatesModule, ratePathModule];
   const banks: PaneFunctionCatalog = {
@@ -231,6 +343,15 @@ test("a central bank's name or short form typed as a function points to CBR, and
   }
   // FOMC is one of WIRP's own words, so it opens the rate path as before.
   expect((await resolve(["FOMC"])).token).toBe("WIRP");
+});
+
+test("a pane no template opens goes by its command-bar code, in the error that sends its reader to shot too", async () => {
+  const layouts: PaneFunctionCatalog = { panes: new Map([["layout-marketplace", pane("layout-marketplace")]]), paneTemplates: new Map(), destroy: () => {} };
+  for (const word of ["LAY", "layout-marketplace"]) {
+    const resolved = await resolvePaneFunction(layouts, context, parsePaneFunctionArgs([word]));
+    expect(resolved.token).toBe("LAY");
+    await expect(buildFunctionReport(resolved, context, "")).rejects.toThrow("LAY is an interactive pane with no data report; run `gloom shot LAY` to see it.");
+  }
 });
 
 test("CMP of one ticker says it needs two or more and how to ask, before any chart is built", async () => {
@@ -293,7 +414,10 @@ test("every function the catalog lists with no argument refuses one, a rendered 
     // A rendered view that reads its argument with no shortcut declares it, so the catalog lists it and fn passes it on.
     const feed = entries.find((entry) => entry.templateId === "twitter-feed-pane");
     expect(feed?.argPlaceholder).toBe("query");
-    expect((await resolvePaneFunction(catalog, context, parsePaneFunctionArgs(["twitter-feed-pane", "nvda"]))).instance.params?.query).toBe("nvda");
+    const feedQuery = await resolvePaneFunction(catalog, context, parsePaneFunctionArgs(["twitter-feed-pane", "nvda"]));
+    expect(feedQuery.instance.params?.query).toBe("nvda");
+    // An X query may be a ticker, and is read as one: only an id the pane opens (the story pane's) is not.
+    expect(feedQuery.instance.binding).toEqual({ kind: "fixed", symbol: "NVDA" });
     // A pane opened by its id stands for its templates, which take a ticker: it is not one of the catalog's functions.
     const byPaneId = await resolvePaneFunction(catalog, context, parsePaneFunctionArgs(["realized-vol", "DHI"]));
     expect(byPaneId.instance.binding).toEqual({ kind: "fixed", symbol: "DHI" });
@@ -301,4 +425,31 @@ test("every function the catalog lists with no argument refuses one, a rendered 
     catalog.destroy();
     mock.restore();
   }
+});
+
+test("only a template that opens on a list takes one as symbols: shot DVD KO JNJ ranks both, while DES, ADR and EVTS keep their symbol and arg", async () => {
+  const modules = [tickerDetailModule, earningsModule, dividendYieldModule];
+  const catalog: PaneFunctionCatalog = {
+    panes: new Map(modules.flatMap((module) => module.panes ?? []).map((entry) => [entry.id, entry])),
+    paneTemplates: new Map(modules.flatMap((module) => module.paneTemplates ?? []).map((entry) => [entry.id, entry])),
+    destroy: () => {},
+  };
+  for (const code of ["DES", "ADR", "EVTS"]) {
+    const found = findPaneFunction(catalog, code)!;
+    const before = buildCreateOptions(found.template, "KO, JNJ");
+    expect(withTickerList(found.template, before, getHeadlessPaneDefinition(found.template, found.pane!), "KO, JNJ"), code).toBe(before);
+    expect(before?.symbols, code).toBeUndefined();
+  }
+  // A report that takes a list does not make its one-ticker pane open on one.
+  const listReport: HeadlessPaneDefinition<"bundle"> = { shape: "bundle", argument: { kind: "tickers" }, options: [], load: () => ({ sections: [] }) };
+  const oneTicker = template("ONE", "one", listReport);
+  const typed = buildCreateOptions(oneTicker, "KO, JNJ");
+  expect(withTickerList(oneTicker, typed, listReport, "KO, JNJ")).toBe(typed);
+  const dvd = await resolvePaneFunction(catalog, context, parsePaneFunctionArgs(["DVD", "KO, JNJ"]), { command: "shot" });
+  expect(dvd.createOptions).toMatchObject({ symbol: "KO", arg: "KO,JNJ", symbols: ["KO", "JNJ"] });
+  expect(dvd.instance.settings).toMatchObject({ rankSymbols: ["KO", "JNJ"] });
+  // One ticker opens its own pane, and past fn's 25 the list is refused as fn refuses it.
+  expect((await resolvePaneFunction(catalog, context, parsePaneFunctionArgs(["DVD", "KO"]), { command: "shot" })).createOptions?.symbols).toBeUndefined();
+  const many = Array.from({ length: 26 }, (_, index) => `T${index}`).join(",");
+  await expect(resolvePaneFunction(catalog, context, parsePaneFunctionArgs(["DVD", many]), { command: "shot" })).rejects.toThrow("DVD accepts at most 25 symbols.");
 });

@@ -1,5 +1,6 @@
 import type { PaneReportOptionDef, PaneSettingsContext, PaneSettingsDef } from "../../../types/plugin";
 import { CURRENCY_SETS, FX_CURRENCIES, MAJOR_CURRENCIES, isFxCurrency, resolveCurrencies } from "./pairs";
+import { parseFxBoardAmountEdit, storedFxBoardAmount, withAmountCurrencies } from "./amount";
 
 const CUSTOM_SET = "custom";
 
@@ -33,7 +34,11 @@ export function fxMatrixSettings(context: PaneSettingsContext): PaneSettingsDef 
   ));
   return {
     title: "FX Cross Rates Settings",
-    values: { currencies, currencySet: matching?.id ?? CUSTOM_SET },
+    values: {
+      currencies,
+      currencySet: matching?.id ?? CUSTOM_SET,
+      ...(typeof context.settings.amount === "string" ? { amount: context.settings.amount } : {}),
+    },
     fields: [
       {
         key: "currencySet",
@@ -51,8 +56,24 @@ export function fxMatrixSettings(context: PaneSettingsContext): PaneSettingsDef 
         searchable: true,
         options: FX_CURRENCIES.map((code) => ({ value: code, label: code, description: currencyName(code) ?? undefined })),
       },
+      {
+        key: "amount",
+        label: "Amount",
+        type: "text",
+        placeholder: "2,500,000 EUR",
+        description: "Shown in every listed currency at the board's rates. Empty for none.",
+      },
     ],
     applyValue: (settings, field, value) => {
+      if (field.key === "amount") {
+        // Saved ungrouped (`storedFxBoardAmount`), so it reads back as itself; shown grouped on the board.
+        const request = parseFxBoardAmountEdit(String(value ?? ""), settings.amount);
+        if (request && "error" in request) throw new Error(request.error);
+        const { amount: _cleared, ...rest } = settings;
+        return request
+          ? { ...rest, amount: storedFxBoardAmount(request), currencies: withAmountCurrencies(resolveCurrencies(settings.currencies), request) }
+          : rest;
+      }
       if (field.key !== "currencySet") return { ...settings, [field.key]: value };
       // The set is a way to fill the list, never a setting of its own.
       const { currencySet: _unused, ...rest } = settings;
@@ -96,8 +117,13 @@ export const FX_MATRIX_REPORT_OPTIONS: readonly PaneReportOptionDef[] = [{
   normalize: parseCurrenciesOption,
 }];
 
-/** A report of the default board says it is only the majors, and how to choose others. */
-export function fxMatrixReportNotices(settings: Readonly<Record<string, unknown>>): string[] {
-  if (settings.currencies != null) return [];
-  return [`Showing the ${MAJOR_CURRENCIES.length} majors. Choose others with --currencies USD,ZAR,NGN; gloom catalog FXC lists all ${FX_CURRENCIES.length}.`];
+/**
+ * A report of the default board says it is only the majors, and how to add
+ * others: by code after FXC, as the app's command bar takes them too, or a
+ * whole list with --currencies.
+ */
+export function fxMatrixReportNotices(settings: Readonly<Record<string, unknown>>, currencies: readonly string[] = MAJOR_CURRENCIES): string[] {
+  if (settings.currencies != null || currencies.length !== MAJOR_CURRENCIES.length || currencies.some((code, index) => code !== MAJOR_CURRENCIES[index])) return [];
+  return [`Showing the ${MAJOR_CURRENCIES.length} majors. Add others with fn FXC TRY (FXC TRY in the app), or choose them with --currencies USD,ZAR,NGN; `
+    + `gloom catalog FXC lists all ${FX_CURRENCIES.length}.`];
 }

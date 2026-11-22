@@ -18,7 +18,7 @@ import { StatChartDetail } from "../../../components/market-board";
 import { useAsyncResource } from "../../../react/async-resource";
 import { colors } from "../../../theme/colors";
 import type { PaneProps } from "../../../types/plugin";
-import { formatPercentileRank } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
 import { usePaneSettingValue } from "../../../state/app/context";
 import { usePluginPaneState } from "../../runtime";
 import type { PluginModule } from "../plugin-module";
@@ -34,7 +34,7 @@ const EMPTY_ROWS: CreditConditionRow[] = [];
 const PANELS = [{ id: "main" }];
 
 function formatBp(value: number | null, signed = false): string {
-  if (value == null) return "--";
+  if (value == null) return MISSING_VALUE;
   const sign = signed && value > 0 ? "+" : "";
   return `${sign}${value.toFixed(1)}bp`;
 }
@@ -110,10 +110,14 @@ export function CreditConditionsPane({ paneId, focused, width, height }: PanePro
   const partial = rows.length > 0 && rows.length < series.length;
   // Each row carries its own date in the AS OF column; a spread between
   // indexes from different sessions is a limitation behind the warning.
+  const historyLimits = useMemo(() => [...new Set(rows.flatMap((row) => row.historyLimit ? [row.historyLimit] : []))], [rows]);
   usePaneNoticeFooter({
     registrationId: "credit-conditions:notices",
     focused,
-    notices: mixedDates ? ["The indexes carry different observation dates, so the spreads are not one session."] : [],
+    notices: [
+      ...mixedDates ? ["The indexes carry different observation dates, so the spreads are not one session."] : [],
+      ...historyLimits,
+    ],
   });
   const footerInfo = useMemo<PaneFooterSegment[]>(() => [
     ...(rows.length > 0 ? [DELAYED_SEGMENT] : []),
@@ -150,7 +154,7 @@ export const creditConditionsModule: PluginModule = {
       id: "credit-conditions-pane",
       paneId: "credit-conditions",
       label: "Credit Spreads",
-      description: "ICE BofA option-adjusted spreads from FRED: US investment grade and high yield by rating, and euro high yield.",
+      description: "ICE BofA option-adjusted spreads from FRED: US investment grade and high yield by rating, euro high yield, and emerging markets and Asia corporates.",
       keywords: ["credit", "spread", "oas", "corporate", "high yield", "investment grade", "macro", "euro", "europe", "bb", "ccc", "rating"],
       shortcut: { prefix: "CRD" },
       headless: creditConditionsHeadless,

@@ -1,5 +1,7 @@
+import { appendFileSync } from "fs";
 import { mkdir } from "fs/promises";
 import { join } from "path";
+import { testAppEnv } from "../test-app-env";
 import { evaluate, sleep, type Cdp } from "./browser";
 
 /**
@@ -23,7 +25,7 @@ const UPSTREAM = "https://api.gloom.sh";
 const READ_POSTS = /^\/api\/market\/(?:[a-z-]+\/batch|scanner\/live)$/;
 const REFUSED = /telemetry|crash|usage|analytics|research-activity|\/events|collect|beacon|track|posthog|sentry/i;
 
-export interface CatalogEntry { token: string; paneId: string; argKind?: string | null; defaultSettings?: Record<string, unknown> }
+export interface CatalogEntry { token: string; paneId: string; argKind?: string | null; argPlaceholder?: string | null; defaultSettings?: Record<string, unknown> }
 interface Answer { status: number; type: string; bytes: Uint8Array<ArrayBuffer> }
 
 function keyOf(text: string): string {
@@ -52,6 +54,26 @@ const OFFLINE_CLOCK_MS = Date.UTC(2026, 0, 6, 14, 30);
 /** Answered for a read an offline replay did not keep, as the worker answers when Gloom Cloud is down. */
 const NOT_KEPT: Answer = { status: 503, type: "text/plain", bytes: new TextEncoder().encode("Not in the replay") };
 
+/**
+ * A read as a client asked it before it asked for a payload version
+ * (`/api/cloud/debt-maturities?symbol=AAPL&version=2` was
+ * `?symbol=AAPL`), or null when it asks for none. A snapshot recorded before
+ * the client sent the parameter kept the read without it, and the server it
+ * recorded, which predates the version, answered the parameter by ignoring
+ * it: the kept answer is the one that server gives. The other parameters
+ * keep their order and encoding, so the label is the one the client wrote.
+ */
+export function unversionedRead(label: string): string | null {
+  const end = label.indexOf("\n");
+  const line = end < 0 ? label : label.slice(0, end);
+  const query = line.indexOf("?");
+  if (query < 0) return null;
+  const params = line.slice(query + 1).split("&");
+  const kept = params.filter((param) => !/^version=\d+$/.test(param));
+  if (kept.length === params.length) return null;
+  return `${line.slice(0, query)}${kept.length ? `?${kept.join("&")}` : ""}${end < 0 ? "" : label.slice(end)}`;
+}
+
 export function createReplay(dir: string, { offline = false }: { offline?: boolean } = {}): Replay {
   /** The text of every answer served this run: a cut string found here arrived cut, the page did not cut it. */
   const served = new Set<string>();
@@ -61,12 +83,19 @@ export function createReplay(dir: string, { offline = false }: { offline?: boole
   };
   return {
     async read(label, load) {
-      const file = join(dir, keyOf(label));
-      if (await Bun.file(`${file}.json`).exists()) {
+      const kept = async (key: string): Promise<Answer | null> => {
+        const file = join(dir, keyOf(key));
+        if (!await Bun.file(`${file}.json`).exists()) return null;
         const meta = await Bun.file(`${file}.json`).json();
         return remember({ status: meta.status, type: meta.type, bytes: new Uint8Array(await Bun.file(`${file}.body`).arrayBuffer()) });
+      };
+      const file = join(dir, keyOf(label));
+      const answer = await kept(label);
+      if (answer) return answer;
+      if (offline) {
+        const older = unversionedRead(label);
+        return (older && await kept(older)) || NOT_KEPT;
       }
-      if (offline) return NOT_KEPT;
       const fresh = remember(await load().catch((error) => ({ status: 502, type: "text/plain", bytes: new TextEncoder().encode(String(error)) })));
       if (fresh.status < 500 && fresh.status !== 429) {
         await mkdir(dir, { recursive: true });
@@ -97,15 +126,42 @@ export function createReplay(dir: string, { offline = false }: { offline?: boole
   };
 }
 
+/**
+ * What answers the page's live socket (`/api/cloud/ws`) when a run wants
+ * quotes streaming: Gloom Cloud's own, or frames kept from it. Without one
+ * the socket is refused.
+ */
+export interface SocketStandIn {
+  open(socket: PageSocket): void;
+  message(socket: PageSocket, text: string): void;
+  close(socket: PageSocket): void;
+}
+
+/** The page's end of the live socket, as a stand-in sees it. */
+interface PageSocket {
+  send(text: string): void;
+  close(): void;
+  data: Record<string, unknown>;
+}
+
 /** The web build in `dist`, with /api and the plugin proxy answered as the worker would for a signed-out visitor. */
-export function serveWebApp(dist: string, replay: Replay): { url: string; stop(): void } {
-  const server = Bun.serve({
+export function serveWebApp(dist: string, replay: Replay, { socket }: { socket?: SocketStandIn } = {}): { url: string; stop(): void } {
+  const server = Bun.serve<Record<string, unknown>, never>({
     hostname: "127.0.0.1",
     port: 0,
     idleTimeout: 120,
-    async fetch(request) {
+    websocket: {
+      open: (ws) => socket?.open(ws as unknown as PageSocket),
+      message: (ws, message) => socket?.message(ws as unknown as PageSocket, typeof message === "string" ? message : new TextDecoder().decode(message)),
+      close: (ws) => socket?.close(ws as unknown as PageSocket),
+    },
+    async fetch(request, bun) {
       const url = new URL(request.url);
       const target = `${url.pathname}${url.search}`;
+      if (socket && url.pathname === "/api/cloud/ws") {
+        if (bun.upgrade(request, { data: {} })) return undefined;
+        return new Response("Expected a websocket", { status: 400 });
+      }
       if (url.pathname.startsWith("/api/")) {
         const body = request.method === "POST" ? await request.text() : "";
         const isRead = request.method === "GET" || (request.method === "POST" && READ_POSTS.test(url.pathname));
@@ -139,6 +195,83 @@ export function serveWebApp(dist: string, replay: Replay): { url: string; stop()
   return { url: `http://127.0.0.1:${server.port}/`, stop: () => server.stop(true) };
 }
 
+/**
+ * The page's live socket joined to Gloom Cloud's, signed out, as the web app
+ * has it: quotes stream at the market's pace. With `record`, every frame
+ * Gloom Cloud sends is kept there, one JSON line each with when it came, for
+ * `replaySocket`.
+ */
+export function liveSocket(record?: string): SocketStandIn {
+  const upstreams = new Map<PageSocket, { socket: WebSocket; pending: string[] }>();
+  return {
+    open(page) {
+      const socket = new WebSocket(`${UPSTREAM.replace(/^http/, "ws")}/cloud/ws`, { headers: { origin: "https://term.gloom.sh" } } as unknown as string[]);
+      const link = { socket, pending: [] as string[] };
+      upstreams.set(page, link);
+      socket.onopen = () => { for (const text of link.pending.splice(0)) socket.send(text); };
+      socket.onmessage = (event) => {
+        const text = String(event.data);
+        page.send(text);
+        if (record) appendFileSync(record, `${JSON.stringify({ t: Date.now(), frame: text })}\n`);
+      };
+      socket.onclose = () => page.close();
+    },
+    message(page, text) {
+      const link = upstreams.get(page);
+      if (!link) return;
+      if (link.socket.readyState === WebSocket.OPEN) link.socket.send(text);
+      else link.pending.push(text);
+    },
+    close(page) {
+      upstreams.get(page)?.socket.close();
+      upstreams.delete(page);
+    },
+  };
+}
+
+/**
+ * Plays frames `liveSocket` kept to each page that connects, at the pace they
+ * came, from the start and again once they run out: the market's flow, the
+ * same for every checkout. A ping is answered.
+ */
+export async function replaySocket(file: string): Promise<SocketStandIn> {
+  const kept = (await Bun.file(file).text()).trim().split("\n").map((line) => JSON.parse(line) as { t: number; frame: string });
+  const ready = kept.find((entry) => entry.frame.includes('"type":"ready"'));
+  const stream = kept.filter((entry) => /"type":"market\.quotes?"/.test(entry.frame));
+  if (!ready || stream.length === 0) throw new Error(`${file} has no ready frame or no quotes`);
+  const first = stream[0]!.t;
+  const span = stream[stream.length - 1]!.t - first + 1_000;
+  const timers = new Map<PageSocket, ReturnType<typeof setTimeout>>();
+  return {
+    open(page) {
+      page.send(ready.frame);
+      const began = performance.now();
+      let index = 0;
+      let loop = 0;
+      const next = () => {
+        const entry = stream[index]!;
+        timers.set(page, setTimeout(() => {
+          page.send(entry.frame);
+          index += 1;
+          if (index === stream.length) {
+            index = 0;
+            loop += 1;
+          }
+          next();
+        }, Math.max(0, began + loop * span + entry.t - first - performance.now())));
+      };
+      next();
+    },
+    message(page, text) {
+      if (text.includes('"type":"ping"')) page.send(JSON.stringify({ type: "pong" }));
+    },
+    close(page) {
+      clearTimeout(timers.get(page));
+      timers.delete(page);
+    },
+  };
+}
+
 /** Reads the web app makes straight from another site (the release feed) go through the same replay. */
 export async function routeDirectReads(cdp: Cdp, replay: Replay): Promise<void> {
   await cdp.send("Fetch.enable", { patterns: [{ urlPattern: "https://*" }] });
@@ -163,10 +296,18 @@ export async function routeDirectReads(cdp: Cdp, replay: Replay): Promise<void> 
 }
 
 /** Saved settings a sweep can give the page beyond its layout: the theme, or onboarding left to run. */
-export interface SeedOptions { theme?: string; onboardingComplete?: boolean }
+/** A ticker a seeded workspace holds: its listing, and the watchlists it is on. */
+interface SeedTicker { ticker: string; exchange: string; currency: string; name: string; assetCategory?: string; watchlists?: string[] }
+
+export interface SeedOptions {
+  theme?: string;
+  onboardingComplete?: boolean;
+  /** The tickers the workspace holds instead of the starter watchlist; each is on the default watchlist unless it says. */
+  tickers?: SeedTicker[];
+}
 
 /** A fresh workspace each load: one layout, onboarding done, usage and crash reports off, and the sweep's clock. */
-function seedScript(layout: object, clockMs: number, focused?: string, options: SeedOptions = {}): string {
+export function seedScript(layout: object, clockMs: number, focused?: string, options: SeedOptions = {}): string {
   const config = {
     layouts: [{ name: "Sweep", layout, ...(focused ? { focusedPaneId: focused } : {}) }],
     activeLayoutIndex: 0,
@@ -179,7 +320,15 @@ function seedScript(layout: object, clockMs: number, focused?: string, options: 
   const RealDate = Date, startedAt = RealDate.now(), now = () => ${clockMs} + (RealDate.now() - startedAt);
   globalThis.Date = class extends RealDate { constructor(...args) { if (args.length === 0) super(now()); else super(...args); } static now() { return now(); } };
 })();
-localStorage.clear(); localStorage.setItem("gloomberb.web.config.v1", ${JSON.stringify(JSON.stringify(config))});`;
+localStorage.clear(); localStorage.setItem("gloomberb.web.config.v1", ${JSON.stringify(JSON.stringify(config))});${
+  options.tickers ? ` localStorage.setItem("gloomberb.web.tickers.v1", ${JSON.stringify(JSON.stringify(seededTickers(options.tickers)))});` : ""}`;
+}
+
+/** Seeded tickers as the web app keeps them (BROWSER_STORAGE_KEYS.tickers): their metadata by symbol. */
+function seededTickers(tickers: SeedTicker[]): Record<string, object> {
+  return Object.fromEntries(tickers.map(({ watchlists = ["watchlist"], ...listing }) => [listing.ticker.toUpperCase(), {
+    ...listing, portfolios: [], watchlists, positions: [], broker_contracts: [], custom: {}, tags: [],
+  }]));
 }
 
 export async function loadLayout(cdp: Cdp, url: string, replay: Replay, layout: object, focused?: string, options?: SeedOptions): Promise<void> {
@@ -215,7 +364,8 @@ export async function runCommand(cdp: Cdp, query: string, { submit = true } = {}
 }
 
 function argument(entry: CatalogEntry): string {
-  if (entry.argKind === "ticker") return "AAPL";
+  // A function on one company that also takes several (INS: its placeholder is a ticker) is pictured on one.
+  if (entry.argKind === "ticker" || entry.argPlaceholder === "ticker") return "AAPL";
   if (entry.argKind === "tickers" || entry.argKind === "symbol-list") return "AAPL,MSFT";
   return "";
 }
@@ -254,8 +404,14 @@ export async function shot(cdp: Cdp, scope: string | null, file: string, format:
   await Bun.write(file, Buffer.from(data, "base64"));
 }
 
-/** Every function in the catalog, from the CLI of the checkout at `root`. */
+/**
+ * Every function in the catalog, from the CLI of the checkout at `root`. The variable adds the panes `catalog`
+ * leaves out for a user (a team's page, the unread inbox) under their template ids, as an older checkout lists
+ * them, so the audits keep picturing them and a base and a head compare them under one name; an older checkout
+ * ignores it. A function `catalog` lists by a new name (`x-feed` for `twitter-feed-pane`) is pictured under it.
+ */
 export function readCatalog(root: string, home: string): CatalogEntry[] {
-  const listed = Bun.spawnSync(["bun", "src/cli/entry.ts", "catalog", "--all", "--json"], { cwd: root, env: { ...process.env, GLOOMBERB_HOME: home } });
+  const env = testAppEnv({ GLOOMBERB_HOME: home, GLOOMBERB_CATALOG_APP_PANES: "1" });
+  const listed = Bun.spawnSync(["bun", "src/cli/entry.ts", "catalog", "--all", "--json"], { cwd: root, env });
   return JSON.parse(listed.stdout.toString()).data as CatalogEntry[];
 }

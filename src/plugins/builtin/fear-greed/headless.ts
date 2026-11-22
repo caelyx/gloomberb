@@ -1,8 +1,11 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type {
   HeadlessBundleResult,
   HeadlessPaneDefinition,
   HeadlessPaneLoadArgs,
 } from "../../../types/plugin";
+import { isTransientFailure } from "../../../api-client/errors";
+import { servedFromSavedCopy } from "../../../data/saved-copies";
 import { httpFetch } from "../../../utils/http-transport";
 import { loadFearGreed, type FearGreedLoadResult } from "./cache";
 import { fetchFearGreedData, type FearGreedData } from "./data";
@@ -44,11 +47,26 @@ function projectFearGreedHeadless(data: FearGreedData): HeadlessBundleResult {
           secondaryValue: indicator.latestSecondaryValue,
           secondary: indicator.definition.secondaryLabel && indicator.latestSecondaryValue != null
             ? `${indicator.definition.secondaryLabel}: ${formatIndicatorValue(indicator.latestSecondaryValue, indicator.definition.valueFormat)}`
-            : "-",
+            : MISSING_VALUE,
           updatedAt: indicator.updatedAt?.toISOString() ?? null,
         })),
       },
     ],
+  };
+}
+
+/** `fn FNG` over a loaded reading, which the pane's footer also reads its source line from. */
+export function fearGreedReport(result: FearGreedLoadResult): HeadlessBundleResult {
+  // A copy kept for a refresh that could not get through (offline, a timeout) ends the report with when it was
+  // saved, as other reports do; any other failure stays an error beside the old reading.
+  const savedCopy = result.source === "stale-fallback" && isTransientFailure(result.error);
+  const metadata = { fetchedAt: result.fetchedAt, stale: result.stale };
+  return {
+    ...projectFearGreedHeadless(result.data),
+    ...(result.refreshError && !savedCopy ? { errors: [result.refreshError] } : {}),
+    // A cached index the refresh could not replace is stale; otherwise CNN's published reading.
+    freshness: { source: "CNN", status: result.stale ? "stale" : "not-a-feed", basis: "published index" },
+    metadata: savedCopy ? servedFromSavedCopy(metadata, result.fetchedAt) : metadata,
   };
 }
 
@@ -71,15 +89,7 @@ export function createFearGreedHeadless(
     options: [],
     describe: "Fear & Greed",
     async load(args, ctx) {
-      const result = await dependencies.load(args, ctx.signal);
-      const projected = projectFearGreedHeadless(result.data);
-      return {
-        ...projected,
-        ...(result.refreshError ? { errors: [result.refreshError] } : {}),
-        // A cached index the refresh could not replace is stale; otherwise CNN's published reading.
-        freshness: { source: "CNN", status: result.stale ? "stale" : "not-a-feed", basis: "published index" },
-        metadata: { fetchedAt: result.fetchedAt, stale: result.stale },
-      };
+      return fearGreedReport(await dependencies.load(args, ctx.signal));
     },
   };
 }

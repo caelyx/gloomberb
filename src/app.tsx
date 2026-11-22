@@ -1,6 +1,6 @@
 import { Box, ContextMenuProvider, useNativeRenderer, useRendererHost, useUiHost } from "./ui";
 import { ToastViewport, useToastHost } from "./ui/toast";
-import { useState, useEffect, useCallback, useRef, useMemo, type ReactNode } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo, useSyncExternalStore, type ReactNode } from "react";
 import {
   AppProvider,
   getFocusedTickerSymbol,
@@ -9,7 +9,7 @@ import {
   useAppStateRef,
   type AppState,
 } from "./state/app/context";
-import { bindAppActivity, useAppActive, useAppVisible } from "./state/app/activity";
+import { bindAppActivity, isAppVisible, setAppActive, subscribeAppVisibility, useAppActive, useAppVisible } from "./state/app/activity";
 import { Header } from "./components/layout/header";
 import { StatusBar } from "./components/layout/status-bar";
 import { useAppChromeShown } from "./components/layout/presentation";
@@ -17,10 +17,12 @@ import { useLinkedLayoutSync } from "./layout-marketplace/linked-sync";
 import { useTeamCollectionsSync } from "./team/collections-sync";
 import { Shell } from "./components/layout/shell";
 import { DetachedPaneShell } from "./components/layout/detached-pane-shell";
-import { SecondaryWindowHeader } from "./components/layout/secondary-window-header";
 import { TransientLayoutProvider } from "./components/layout/transient-layout";
 import { CommandBar } from "./components/command-bar/surface";
 import { OnboardingWizard } from "./components/onboarding/onboarding-wizard";
+import { getOnboardingProgress } from "./components/onboarding/wizard-model";
+import { HeardFromQuestionHost } from "./account/heard-from-question";
+import { useRunSetupAgain } from "./components/onboarding/run-setup-again";
 import { CompanyPickerHost } from "./plugins/builtin/cloud/company-picker";
 import { TerminalRelayHost } from "./plugins/builtin/cloud/terminal-relay/host";
 import { SignInGate } from "./components/sign-in-gate";
@@ -31,15 +33,17 @@ import type { AppServicesFactory, AppTickerRepositoryPort } from "./core/app-ser
 import { useThemeColors } from "./theme/theme-context";
 import type { AppConfig } from "./types/config";
 import type { DesktopDeepLinkBridge } from "./types/desktop-deeplink";
-import type { CliLaunchRequest, GloomPlugin } from "./types/plugin";
+import type { AppNotificationRequest, CliLaunchRequest, GloomPlugin } from "./types/plugin";
 import type { DataProvider } from "./types/data-provider";
 import type { DesktopDockPreviewState, DesktopSharedStateSnapshot, DesktopThemePreviewState, DesktopWindowBridge } from "./types/desktop-window";
 import type { DesktopApplicationMenuBridge } from "./types/desktop-menu";
-import { findPaneLocation, type LayoutBounds } from "./layout/pane-manager";
+import { isPaneInLayout, type LayoutBounds } from "./layout/pane-manager";
 import type { AppSessionSnapshot } from "./core/state/session-persistence";
 import type { MarketDataCoordinator } from "./market-data/coordinator";
 import { createAppNotifier } from "./notifications/app-notifier";
+import { attachSeenPaneNotices } from "./components/pane-notice-seen";
 import { attachNotificationLog } from "./notifications/notification-log";
+import { attachListingIndex } from "./tickers/search/listing-index";
 import { useBrokerImportRuntime } from "./app/runtime/broker-import";
 import { useDesktopDeepLinkRuntime } from "./app/runtime/desktop-deeplink";
 import { useDesktopApplicationMenuRuntime } from "./app/runtime/desktop-menu";
@@ -48,12 +52,16 @@ import { AppDialogBridge } from "./app/dialog-bridge";
 import { KeybindingsProvider, useResolvedKeybindings } from "./app/keybindings";
 import { useAppPaneRuntime } from "./app/pane-runtime";
 import { bindPluginRegistryRuntimeAccess } from "./app/runtime/plugin-bindings";
+import { useExternalProfileChanges } from "./app/runtime/external-profile-changes";
 import { useAppStartupRuntime } from "./app/runtime/startup";
 import { useTickerRefreshRuntime } from "./app/runtime/ticker-refresh";
 import { useAppUpdateRuntime } from "./app/runtime/update";
 import { resolveUpdateChannel } from "./updater/channel";
 import { createCoreSyncContributors } from "./sync/core-contributors";
 import { useCloudSyncRuntime } from "./sync/react";
+import { createSyncConfigDispatch, withOtherWindowTabs } from "./sync/other-window-tabs";
+import { getDesktopWindows } from "./state/desktop-windows";
+import type { OtherWindowTab } from "./types/desktop-window";
 import { RemoteControlHost, type RemoteControlAdapter } from "./remote/app-host";
 import { RemoteUiRegistryProvider } from "./remote/semantic-tree";
 import {
@@ -65,12 +73,19 @@ import { scheduleConfigSave } from "./state/config-save-scheduler";
 import { LOW_PRIORITY_CONFIG_SAVE_DEBOUNCE_MS } from "./state/persist-scheduler";
 import { savedLayoutsDifferOnlyInMirror } from "./core/state/app/layout";
 import { measurePerf } from "./utils/perf-marks";
+import { t } from "./i18n";
 import { useAppLanguage } from "./i18n/react";
 import { AppLanguageConfigObserver } from "./app/language-observer";
 import { isPaneShareHandoff } from "./shares/location";
 import { apiClient } from "./api-client";
 import { reportTelemetryConfig } from "./telemetry/live-config";
+import { AttentionCountsNotice } from "./app/attention-notice";
+import { useSinceLastVisit } from "./app/since-last-visit/use-since-last-visit";
+import { SinceLastVisitStrip } from "./app/since-last-visit/strip";
+import { useProWelcome } from "./app/pro-welcome/use-pro-welcome";
+import { ProWelcomeRow } from "./app/pro-welcome/row";
 import { recordFunctionOpen } from "./telemetry/usage-counts";
+import { logFailure } from "./utils/log-failure";
 
 const EMPTY_EXTERNAL_PLUGINS: LoadedExternalPlugin[] = [];
 
@@ -88,6 +103,8 @@ interface AppInnerProps {
   updatesEnabled?: boolean;
   onboardingActive?: boolean;
   onOnboardingComplete?: (config: AppConfig) => void | Promise<void>;
+  /** Shows setup again once Run Setup Again has saved its progress; absent where setup cannot run. */
+  onRunSetupAgain?: () => void;
   /** Hosted browser terminal: nothing is reachable until a session exists. */
   signInGateActive?: boolean;
   /** Fires once the startup state is in place and the first real layout can paint. */
@@ -114,6 +131,10 @@ function ThemedAppRoot({ children }: { children: ReactNode }) {
   );
 }
 
+const noOtherWindowTabs = (): readonly OtherWindowTab[] => NO_OTHER_WINDOW_TABS;
+const NO_OTHER_WINDOW_TABS: readonly OtherWindowTab[] = [];
+const noSubscription = () => () => {};
+
 function AppInner({
   externalPlugins,
   pluginRegistry,
@@ -128,6 +149,7 @@ function AppInner({
   updatesEnabled = true,
   onboardingActive = false,
   onOnboardingComplete,
+  onRunSetupAgain,
   signInGateActive = false,
   onInitialized,
   pluginsReady,
@@ -180,27 +202,46 @@ function AppInner({
     updateCheckInProgress,
     updateProgress,
   ]);
+  // Cloud sync in the desktop app's main window pushes and pulls every
+  // window's tabs, not only its own (sync/other-window-tabs.ts). The same
+  // state, getter and dispatch with one window and everywhere else.
+  const desktopWindows = getDesktopWindows();
+  const otherWindowTabs = useSyncExternalStore(
+    desktopWindows?.subscribe ?? noSubscription,
+    desktopWindows?.otherWindowTabs ?? noOtherWindowTabs,
+  );
+  const otherWindowTabsRef = useRef(otherWindowTabs);
+  otherWindowTabsRef.current = otherWindowTabs;
+  const syncState = useMemo(() => withOtherWindowTabs(state, otherWindowTabs), [state, otherWindowTabs]);
+  const getSyncState = useCallback(() => withOtherWindowTabs(stateRef.current, otherWindowTabsRef.current), [stateRef]);
+  const syncDispatch = useMemo(() => createSyncConfigDispatch({
+    dispatch,
+    otherWindowTabs: () => otherWindowTabsRef.current,
+    currentConfig: () => stateRef.current.config,
+    onSaveFailure: () => pluginRegistry.notify({ type: "error", body: t("Could not save the tabs synced to your other windows.") }),
+  }), [dispatch, pluginRegistry, stateRef]);
   const appActive = useAppActive();
   const appVisible = useAppVisible();
   const appActiveRef = useRef(appActive);
   const rendererHost = useRendererHost();
   const dialog = useDialog();
   const toast = useToastHost();
-  const isMainWindow = !desktopWindowBridge || desktopWindowBridge.kind === "main";
-  // Any window but the main one: a popped-out pane or a secondary window. Only
-  // the main window opens panes, runs the bar and syncs; the others show state.
-  const isDetachedWindow = !isMainWindow;
-  const detachedPaneId = desktopWindowBridge?.kind === "detached" ? desktopWindowBridge.paneId ?? null : null;
+  const isDetachedWindow = desktopWindowBridge?.kind === "detached";
+  // The main desktop window does the app-wide work (account sync, update
+  // checks, launch notices, background alerts); a popped-out pane's window
+  // and every other full window leave it to it.
+  const appWideWorkElsewhere = isDetachedWindow || desktopWindowBridge?.primary === false;
+  // Not while setup is already showing.
+  const runSetupAgain = useRunSetupAgain(onboardingActive ? undefined : onRunSetupAgain);
+  // A setup card holds the keyboard over the whole window; the workspace coach
+  // after the cards floats over a live workspace, whose "Ctrl+P adds more"
+  // needs the command bar's prompt (and Help) where they always are.
+  const setupCardShown = onboardingActive && getOnboardingProgress(config).stage !== "research";
+  const detachedPaneId = isDetachedWindow ? desktopWindowBridge.paneId ?? null : null;
   const focusDetachedPane = useMemo(() => {
     const focus = desktopWindowBridge?.kind === "main" ? desktopWindowBridge.focusDetachedPane : undefined;
-    return focus ? (paneId: string) => { void focus(paneId).catch(() => {}); } : undefined;
+    return focus ? (paneId: string) => { void focus(paneId).catch(logFailure("app", "Focus detached pane window failed")); } : undefined;
   }, [desktopWindowBridge]);
-  // The main window and a secondary window run the bar and open panes in their own grid.
-  const opensPanes = isMainWindow || desktopWindowBridge?.kind === "window";
-  const focusPaneInItsWindow = useMemo(() => {
-    const focus = opensPanes ? desktopWindowBridge?.focusPaneInItsWindow : undefined;
-    return focus ? (paneId: string) => { void focus(paneId).catch(() => {}); } : undefined;
-  }, [desktopWindowBridge, opensPanes]);
   const [desktopDockPreview, setDesktopDockPreview] = useState<DesktopDockPreviewState | null>(null);
   const [commandBarNativeOccluder, setCommandBarNativeOccluder] = useState<LayoutBounds | null>(null);
   appActiveRef.current = appActive;
@@ -232,32 +273,46 @@ function AppInner({
             onClick: dismissAfter(() => notification.secondaryAction?.onClick()),
           }
           : undefined,
+        onShown: notification.onShown,
       };
       if (type === "success") toastId = toast.success(notification.body, options);
       else if (type === "error") toastId = toast.error(notification.body, options);
       else toastId = toast.info(notification.body, options);
     },
     desktop: rendererHost.supportsNativeDesktopNotifications ? rendererHost : undefined,
+    notifyInBackground: rendererHost.notifyInBackground,
   }), [rendererHost, toast]);
   const notify = useCallback((body: string, options?: { type?: "info" | "success" | "error" }) => {
     pluginRegistry.notify({ body, ...options });
   }, [pluginRegistry]);
+  const notifyRequest = useCallback((request: AppNotificationRequest) => {
+    pluginRegistry.notify(request);
+  }, [pluginRegistry]);
 
   useEffect(() => {
-    if (desktopWindowBridge?.kind !== "main" || !desktopWindowBridge.subscribeDockPreview) return;
+    // Popped-out panes dock into the main window only.
+    if (desktopWindowBridge?.kind !== "main" || appWideWorkElsewhere || !desktopWindowBridge.subscribeDockPreview) return;
     return desktopWindowBridge.subscribeDockPreview((preview) => {
       setDesktopDockPreview(preview);
     });
-  }, [desktopWindowBridge]);
+  }, [appWideWorkElsewhere, desktopWindowBridge]);
 
-  // Another window reused or linked to a pane in this one, and the host brought this window forward.
+  // Another window asked this one to show one of its panes: a link followed, a pane found.
   useEffect(() => {
-    if (!opensPanes || !desktopWindowBridge?.subscribeFocusPane) return;
-    return desktopWindowBridge.subscribeFocusPane((paneId) => {
-      // Only a pane this window already shows: one it has not heard of yet would go back to the host.
-      if (findPaneLocation(stateRef.current.config.layout, paneId)?.window === "main") pluginRegistry.focusPane(paneId);
+    const windows = desktopWindowBridge?.kind === "main" ? desktopWindowBridge.windows : undefined;
+    if (!windows) return;
+    return windows.subscribeFocusRequests((paneId) => {
+      if (isPaneInLayout(stateRef.current.config.layout, paneId)) pluginRegistry.focusPane(paneId);
     });
-  }, [desktopWindowBridge, opensPanes, pluginRegistry, stateRef]);
+  }, [desktopWindowBridge, pluginRegistry, stateRef]);
+
+  // A window change the desktop app could not save: a window or popped-out pane closed, a pane docked or moved.
+  useEffect(() => {
+    if (desktopWindowBridge?.kind !== "main" || appWideWorkElsewhere || !desktopWindowBridge.subscribeSaveFailures) return;
+    return desktopWindowBridge.subscribeSaveFailures(() => {
+      pluginRegistry.notify({ type: "error", body: t("Could not save your window layout.") });
+    });
+  }, [appWideWorkElsewhere, desktopWindowBridge, pluginRegistry]);
 
   useEffect(() => {
     const disposers = createCoreSyncContributors().map((contributor) => (
@@ -294,7 +349,7 @@ function AppInner({
   const { restartToApplyUpdate, runUpdateCheck, runUpdateCommand, startUpdate } = useAppUpdateRuntime({
     enabled: updatesEnabled,
     dispatch,
-    isDetachedWindow,
+    isDetachedWindow: appWideWorkElsewhere,
     pluginRegistry,
     stateRef,
     updateAvailable: state.updateAvailable,
@@ -329,12 +384,13 @@ function AppInner({
   useAppStartupRuntime({
     appActive,
     autoImportBrokerPositions,
+    importBrokerPositions,
     dataProvider,
     dispatch,
     externalPlugins,
     focusedTickerSymbol,
     getState: getRemoteState,
-    isDetachedWindow,
+    isDetachedWindow: appWideWorkElsewhere,
     marketData,
     pluginRegistry,
     pluginsReady,
@@ -359,16 +415,16 @@ function AppInner({
   });
 
   useCloudSyncRuntime({
-    state,
-    getState: getRemoteState,
-    dispatch,
+    state: syncState,
+    getState: getSyncState,
+    dispatch: syncDispatch,
     tickerRepository,
     pluginRegistry,
     appActive,
     // Keep a first-run workspace stable while the local guide is active. Once
     // onboarding finishes, the normal pull-before-push sync starts immediately.
     initialized: state.initialized
-      && isMainWindow
+      && !appWideWorkElsewhere
       && !onboardingActive
       && !signInGateActive,
   });
@@ -377,6 +433,16 @@ function AppInner({
     scheduleConfigSave(nextConfig);
   }, []);
   useTeamCollectionsSync({ persistConfig, tickerRepository });
+  // A `gloom` command run beside the app writes the same profile: take its
+  // changes in, so none is written over. A popped-out window leaves that to the main one.
+  useExternalProfileChanges({
+    enabled: !appWideWorkElsewhere,
+    dataDir: config.dataDir,
+    dispatch,
+    stateRef,
+    pluginRegistry,
+    tickerRepository,
+  });
 
   useAppPaneRuntime({
     dataProvider,
@@ -385,7 +451,6 @@ function AppInner({
     dispatch,
     externalPlugins,
     focusDetachedPane,
-    focusPaneInItsWindow,
     isDetachedWindow,
     notify,
     persistConfig,
@@ -397,11 +462,24 @@ function AppInner({
 
   // Wire up app-level notifications.
   pluginRegistry.bindHost({ notify: appNotifier.notify });
-  // Missed alerts live in this device's state store. A detached window keeps
-  // its own in memory rather than overwrite the main window's.
+  // Missed alerts live in this device's state store. Any other desktop window
+  // keeps its own in memory rather than overwrite the main window's.
   useEffect(() => (
-    isDetachedWindow ? undefined : attachNotificationLog(pluginRegistry.persistence.pluginState)
-  ), [isDetachedWindow, pluginRegistry]);
+    appWideWorkElsewhere ? undefined : attachNotificationLog(pluginRegistry.persistence.pluginState)
+  ), [appWideWorkElsewhere, pluginRegistry]);
+  // Data warnings the user has opened stay muted across restarts, the same way.
+  useEffect(() => (
+    appWideWorkElsewhere ? undefined : attachSeenPaneNotices(pluginRegistry.persistence.pluginState)
+  ), [appWideWorkElsewhere, pluginRegistry]);
+  // The listings a typed symbol names before search answers. Every window reads
+  // them; the main window keeps what search answers and, while it can be seen,
+  // refreshes the shipped ones.
+  useEffect(() => attachListingIndex({
+    pluginState: pluginRegistry.persistence.pluginState,
+    writable: !appWideWorkElsewhere,
+    searchBatch: dataProvider.searchBatch ? (queries, options) => dataProvider.searchBatch!(queries, options) : null,
+    visibility: { isVisible: isAppVisible, subscribe: subscribeAppVisibility },
+  }), [appWideWorkElsewhere, dataProvider, pluginRegistry]);
 
   // Persist layout changes (switching, saving, deleting, renaming layouts).
   // The saved layouts also mirror live pane state and focus, so they change on
@@ -430,6 +508,26 @@ function AppInner({
     }
   }, [focusedTickerSymbol]);
 
+  // What moved in the user's tickers since their last visit: the main window
+  // only, never over setup or the sign-in gate, never in presentation mode.
+  const sinceLastVisit = useSinceLastVisit({
+    active: !appWideWorkElsewhere && !onboardingActive && !signInGateActive,
+    marketData,
+    pluginState: pluginRegistry.persistence.pluginState,
+    pluginsReady,
+    notify: notifyRequest,
+  });
+  const showSinceLastVisit = !!sinceLastVisit.recap && state.config.presentationMode !== true;
+  // A new Pro payer's first two weeks: Pro functions they have not opened, on
+  // their own tickers. Its own row under the strip, never part of it.
+  const proWelcome = useProWelcome({
+    active: !appWideWorkElsewhere && !onboardingActive && !signInGateActive,
+    pluginState: pluginRegistry.persistence.pluginState,
+    pluginRegistry,
+    pluginsReady,
+  });
+  const showProWelcome = !!proWelcome.chips && state.config.presentationMode !== true;
+
   const chrome = useAppChromeShown();
   const keybindingHost = useUiHost().kind === "opentui" ? "terminal" : "desktop";
   const keybindings = useResolvedKeybindings(state.config.keybindings, keybindingHost);
@@ -437,7 +535,6 @@ function AppInner({
     dispatch,
     focusedTickerSymbol,
     isDetachedWindow,
-    opensPanes,
     keybindings,
     pluginRegistry,
     refreshTicker,
@@ -471,47 +568,6 @@ function AppInner({
     );
   }
 
-  if (desktopWindowBridge?.kind === "window") {
-    // A secondary window: its own grid under a bare title bar, and a command
-    // bar of its own whose panes open there. The header's prompt and the
-    // status bar stay with the main window.
-    return (
-      <KeybindingsProvider value={keybindings}>
-        <AppDialogBridge />
-        <ContextMenuProvider pluginRegistry={pluginRegistry}>
-          <RemoteControlHost
-            adapter={remoteControlAdapter}
-            dispatch={dispatch}
-            getState={getRemoteState}
-            pluginRegistry={pluginRegistry}
-            desktopWindowBridge={desktopWindowBridge}
-          >
-            <ThemedAppRoot>
-              {chrome.header && <SecondaryWindowHeader />}
-              <Shell
-                pluginRegistry={pluginRegistry}
-                dataProvider={dataProvider}
-                tickerRepository={tickerRepository}
-                desktopWindowBridge={desktopWindowBridge}
-                commandBarNativeOccluder={commandBarNativeOccluder}
-              />
-              {state.commandBarOpen && (
-                <CommandBar
-                  dataProvider={dataProvider}
-                  tickerRepository={tickerRepository}
-                  pluginRegistry={pluginRegistry}
-                  quitApp={() => rendererHost.requestExit()}
-                  onNativeOccluderChange={setCommandBarNativeOccluder}
-                />
-              )}
-              <ToastViewport position="bottom-right" />
-            </ThemedAppRoot>
-          </RemoteControlHost>
-        </ContextMenuProvider>
-      </KeybindingsProvider>
-    );
-  }
-
   return (
     <KeybindingsProvider value={keybindings}>
     <AppDialogBridge />
@@ -526,13 +582,16 @@ function AppInner({
         <ThemedAppRoot>
           {chrome.header && (
             <Header
-              onOpenHelp={() => {
+              commandInputAvailable={!setupCardShown}
+              onOpenHelp={setupCardShown ? undefined : () => {
                 recordFunctionOpen({ shortcut: "HELP", externalPluginId: null });
                 pluginRegistry.showPane("help");
               }}
               onRestartForUpdate={updatesEnabled && !isDetachedWindow ? restartToApplyUpdate : undefined}
             />
           )}
+          {showSinceLastVisit ? <SinceLastVisitStrip strip={sinceLastVisit} /> : null}
+          {showProWelcome ? <ProWelcomeRow welcome={proWelcome} /> : null}
           <TransientLayoutProvider>
             <Shell
               pluginRegistry={pluginRegistry}
@@ -541,16 +600,13 @@ function AppInner({
               desktopWindowBridge={desktopWindowBridge}
               desktopDockPreview={desktopDockPreview}
               commandBarNativeOccluder={commandBarNativeOccluder}
+              topBandRows={(showSinceLastVisit ? 1 : 0) + (showProWelcome ? 1 : 0)}
             />
-            <StatusBar
-              onOpenChangelog={(version) => {
-                void pluginRegistry.createPaneFromTemplateAsync("changelog-pane", {
-                  values: { version },
-                }).catch(() => {});
-              }}
-            />
+            <StatusBar />
           </TransientLayoutProvider>
           {!onboardingActive ? <CompanyPickerHost pluginRegistry={pluginRegistry} /> : null}
+          {initialized && !onboardingActive && !signInGateActive ? <AttentionCountsNotice notify={notifyRequest} /> : null}
+          {initialized && !onboardingActive && !signInGateActive ? <HeardFromQuestionHost /> : null}
           <TerminalRelayHost device={remoteControlAdapter?.terminalDevice} />
           {onboardingActive && onOnboardingComplete ? (
             <OnboardingWizard
@@ -567,6 +623,7 @@ function AppInner({
               pluginRegistry={pluginRegistry}
               quitApp={() => rendererHost.requestExit()}
               onCheckForUpdates={updatesEnabled ? runUpdateCommand : undefined}
+              onRunSetupAgain={runSetupAgain}
               onNativeOccluderChange={setCommandBarNativeOccluder}
             />
           )}
@@ -596,6 +653,11 @@ interface AppProps {
    * terminal sets this; desktop and the TUI keep sign-in optional.
    */
   requireSignIn?: boolean;
+  /**
+   * Settings can open setup again (Run Setup Again). The browser keeps no
+   * setup progress, so it turns this off.
+   */
+  setupEnabled?: boolean;
   /** Fires once the startup state is in place and the first real layout can paint. */
   onInitialized?: () => void;
 }
@@ -614,11 +676,13 @@ export function App({
   remoteControlAdapter,
   updatesEnabled = true,
   requireSignIn = false,
+  setupEnabled = true,
   onInitialized,
 }: AppProps) {
   useAppLanguage();
   const externalPlugins = providedExternalPlugins ?? EMPTY_EXTERNAL_PLUGINS;
   const renderer = useNativeRenderer();
+  const rendererHost = useRendererHost();
   const effectiveInitialConfig = useMemo(() => {
     return resolveInitialAppConfig({
       initialConfig,
@@ -650,13 +714,17 @@ export function App({
   }, [requireSignIn]);
   const signInGateActive = requireSignIn && !signedIn;
   const shareHandoff = isPaneShareHandoff();
+  // Setup runs in the main window only.
   const [showOnboarding, setShowOnboarding] = useState(() => (
-    (!desktopWindowBridge || desktopWindowBridge.kind === "main")
+    desktopWindowBridge?.kind !== "detached"
+    && desktopWindowBridge?.primary !== false
     && !shareHandoff
     && (!effectiveInitialConfig.onboardingComplete || !!effectiveInitialConfig.onboardingProgress)
   ));
 
-  useEffect(() => bindAppActivity(renderer), [renderer]);
+  const showSetup = useCallback(() => setShowOnboarding(true), []);
+
+  useEffect(() => rendererHost.subscribeAppActivity?.(setAppActive) ?? bindAppActivity(renderer), [renderer, rendererHost]);
 
   const services = useMemo(() => {
     return measurePerf("startup.app.create-services", () => (
@@ -691,12 +759,13 @@ export function App({
     <RemoteUiRegistryProvider>
       <AppProvider
         config={config}
-        sessionStore={desktopWindowBridge && desktopWindowBridge.kind !== "main" ? undefined : services.persistence.sessions}
+        sessionStore={desktopWindowBridge?.kind === "detached" || desktopWindowBridge?.primary === false
+          ? undefined
+          : services.persistence.sessions}
         sessionSnapshot={sessionSnapshot}
         desktopBridge={desktopWindowBridge}
         desktopSnapshot={desktopSnapshot}
         initialThemePreview={desktopThemePreview}
-        onWindowConfigChange={(changed) => services.pluginRegistry.events.emit("config:changed", { config: changed })}
       >
         <AppLanguageConfigObserver />
         <AppInner
@@ -719,6 +788,7 @@ export function App({
             setConfig(updatedConfig);
             setShowOnboarding(false);
           }}
+          onRunSetupAgain={setupEnabled && !shareHandoff ? showSetup : undefined}
         />
       </AppProvider>
     </RemoteUiRegistryProvider>

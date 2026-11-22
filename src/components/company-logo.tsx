@@ -6,14 +6,30 @@ import { resolveAssetDisplayKind } from "../market-data/market/format";
 import { colors } from "../theme/colors";
 import type { DataTableCell } from "./ui/data-table";
 import { LogoMark, type LogoMarkProps } from "./ui/logo-mark";
+import { canonicalExchange, canonicalTickerKey, isUsEquityExchange } from "../utils/exchanges";
+import { tickerHasListingSuffix } from "../sources/listing-symbols";
+import { isRoundTheClockCoin } from "../utils/crypto-pair";
+
+/**
+ * A company's listing as the logo service knows it: one abroad by its venue
+ * (BA on LSE is BA:LSE, BAE Systems, never BA, Boeing), a US listing, a
+ * broker's SMART routing and a vendor's suffixed symbol (BA.L) as written.
+ */
+function logoListing(symbol: string, exchange: string | undefined): string {
+  if (!exchange || symbol.includes(":") || tickerHasListingSuffix(symbol)) return symbol;
+  const venue = canonicalExchange(exchange);
+  return !venue || venue === "SMART" || isUsEquityExchange(venue) ? symbol : canonicalTickerKey(symbol, venue);
+}
 
 export function resolveCompanyLogoSrc(input: {
   symbol: string;
   assetCategory?: string;
+  /** The listing's venue, so a symbol a US company also uses draws its own company's logo. */
+  exchange?: string;
 }): string | null {
-  const kind = logoKindForAsset(input.assetCategory);
+  const kind = logoKindForAsset(input.assetCategory, input.symbol, input.exchange);
   if (!kind) return null;
-  const path = cloudLogoPath(kind, input.symbol);
+  const path = cloudLogoPath(kind, kind === "ticker" ? logoListing(input.symbol, input.exchange) : input.symbol);
   return path ? `${getCloudApiBaseUrl()}${path}` : null;
 }
 
@@ -56,6 +72,7 @@ export function withCompanyLogo(cell: DataTableCell, subject: CompanyLogoSubject
 export function CompanyLogo({
   symbol,
   assetCategory,
+  exchange,
   name,
   width = 5,
   height = 2,
@@ -63,6 +80,8 @@ export function CompanyLogo({
 }: {
   symbol: string;
   assetCategory?: string;
+  /** The listing's venue (resolveCompanyLogoSrc). */
+  exchange?: string;
   name?: string;
   width?: number;
   height?: number;
@@ -70,7 +89,7 @@ export function CompanyLogo({
   style?: { marginTop?: number; marginRight?: number };
 }) {
   const { nativePaneChrome, cellWidthPx = 8, cellHeightPx = 18 } = useUiCapabilities();
-  const src = nativePaneChrome === true ? resolveCompanyLogoSrc({ symbol, assetCategory }) : null;
+  const src = nativePaneChrome === true ? resolveCompanyLogoSrc({ symbol, assetCategory, exchange }) : null;
   if (!src) return null;
 
   return (
@@ -84,6 +103,7 @@ export function CompanyLogo({
       alignItems="center"
       justifyContent="center"
       objectFit="contain"
+      fallbackWhileLoading
       style={{
         width: cellWidthPx * width,
         height: cellHeightPx * height,
@@ -91,22 +111,28 @@ export function CompanyLogo({
         ...style,
       }}
     >
-      {/* Without a logo the initial fills the same tile, so the header keeps its shape. */}
+      {/* Without a logo, or until it loads, the initial fills the same tile, so the header keeps its shape. It is the company's, as LogoMark's is, so a code like 0700 is not a 0. */}
       <Box width="100%" height="100%" bg={colors.border} alignItems="center" justifyContent="center">
         <Text
           fg={colors.text}
           attributes={TextAttributes.BOLD}
           style={{ fontSize: Math.round(cellHeightPx * height * 0.4) }}
         >
-          {symbol.trim().charAt(0).toUpperCase() || "?"}
+          {(name?.trim() || symbol.trim()).charAt(0).toUpperCase() || "?"}
         </Text>
       </Box>
     </ImageSurface>
   );
 }
 
-function logoKindForAsset(assetCategory?: string): CloudLogoKind | null {
+/**
+ * A coin is asked for on the crypto path, never as a ticker. A listing opened
+ * from its quote keeps no type (BTC-USD on CCC from a board row or a link), so
+ * without one its listing says whether it is a coin: a bare BTC is a US fund.
+ */
+function logoKindForAsset(assetCategory?: string, symbol?: string, exchange?: string): CloudLogoKind | null {
   const kind = resolveAssetDisplayKind({ assetCategory });
   if (kind === "cash" || kind === "contract") return null;
-  return kind === "crypto" ? "crypto" : "ticker";
+  if (kind === "crypto") return "crypto";
+  return kind === "other" && isRoundTheClockCoin(symbol, exchange) ? "crypto" : "ticker";
 }

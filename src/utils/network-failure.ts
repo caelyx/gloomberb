@@ -27,6 +27,8 @@ export class DataServiceUnreachableError extends Error {
 const NO_CONNECTION_CODES = new Set([
   "ConnectionRefused",
   "FailedToOpenSocket",
+  // Bun 1.4's refusal of a proxy to open a tunnel to the server (Bun 1.3 hands back the proxy's 502 instead).
+  "ERR_PROXY_TUNNEL",
   "ECONNREFUSED",
   "ENOTFOUND",
   "EAI_AGAIN",
@@ -73,6 +75,29 @@ export function isNetworkFailure(error: unknown): boolean {
     if (typeof code === "string" && NO_CONNECTION_CODES.has(code)) return true;
     if (typeof message === "string" && NO_CONNECTION_MESSAGES.has(message.trim())) return true;
     // Node's fetch says only "fetch failed" and puts the socket's error in `cause`.
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** Codes of a connection that closed under a request: Node's and the system's, then Bun's. */
+const DROPPED_CODES = new Set(["ECONNRESET", "ECONNABORTED", "EPIPE", "ConnectionClosed"]);
+
+/**
+ * Whether a request failed because its connection closed under it (Bun's "The
+ * socket connection was closed unexpectedly"): what a server restarting, or a
+ * proxy moving to new servers, does to the requests caught on it, and asking
+ * again moments later reaches a server that answers. A refused connection, a
+ * timeout or an abort is not one: those say the service, or the network, is
+ * not there, and asking again at once would not change that.
+ */
+export function isDroppedConnection(error: unknown): boolean {
+  if (error instanceof DataServiceUnreachableError) return false;
+  for (let current = error, depth = 0; current && typeof current === "object" && depth < 4; depth += 1) {
+    if (cameFromServer(current)) return false;
+    const { name, code } = current as { name?: unknown; code?: unknown };
+    if (name === "AbortError" || name === "TimeoutError") return false;
+    if (typeof code === "string" && DROPPED_CODES.has(code)) return true;
     current = (current as { cause?: unknown }).cause;
   }
   return false;

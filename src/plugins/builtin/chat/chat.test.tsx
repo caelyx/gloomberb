@@ -15,6 +15,8 @@ import { SLOW_SEND_THRESHOLD_MS } from "./message/pending-send";
 import { chatAnnouncementBg, chatHighlightBg } from "./message/render-state";
 import { chatBotNameColor } from "./people";
 import { ICON_GLYPHS } from "../../../components/ui/icon";
+import { formatTimeAgo } from "../../../utils/datetime-format";
+import { displayWidth } from "../../../utils/format";
 import { ChatStatusWidget } from "./status-widget";
 import { estimateMessageHeight } from "./layout";
 import {
@@ -25,6 +27,7 @@ import {
   installServerChannels,
   lineText,
   makeMessage,
+  messageDay,
 } from "./test-harness";
 import { createTestTicker } from "../../../test-support/ticker";
 import { createTestFinancials } from "../../../test-support/data-provider";
@@ -1020,7 +1023,7 @@ describe("ChatContent", () => {
 
     const frameAfterType = tui.frame();
     expect(frameAfterType).toContain("> g");
-    expect(frameAfterType).not.toContain("user1 3/30/26");
+    expect(frameAfterType).not.toContain(`user1 ${messageDay(1)}`);
     expect(frameAfterType).not.toContain("message 1 ");
   });
 
@@ -1350,7 +1353,7 @@ describe("ChatContent", () => {
       "   \u2502 a quote long enough to wrap",
       "   \u2502 onto a second row too",
     ]);
-    expect(lines[reply]).toBe("  reply ada: No price yet: it has...");
+    expect(lines[reply]).toBe("  reply ada: No price yet: it hasn'…");
     // The list is scrolled by these heights, so they must be the rows drawn.
     expect(estimateMessageHeight(message, 38)).toBe(reply - header);
   });
@@ -1565,7 +1568,7 @@ describe("ChatContent", () => {
     // The quote of a bot's message: the icon stands where the colon would, and the preview ends in an ellipsis inside the row.
     const quote = rows().find((row) => row.trimStart().startsWith("reply deskbot"))!;
     expect(quote).toContain(`reply deskbot ${botIcon} Futures`);
-    expect(quote.endsWith("...")).toBe(true);
+    expect(quote.endsWith("…")).toBe(true);
 
     // The newest message, a bot's, selected: its icon and its actions all show.
     await emitKeypress({ name: "up", sequence: "\u001b[A" });
@@ -1584,7 +1587,7 @@ describe("ChatContent", () => {
     await emitKeypress({ name: "return", sequence: "\r" });
     await flushFrame();
     const replying = rows().find((row) => row.includes("replying to @deskbot"))!;
-    expect(replying).toMatch(new RegExp(`replying to @deskbot ${botIcon} Futures.*\\.\\.\\. +Cancel$`));
+    expect(replying).toMatch(new RegExp(`replying to @deskbot ${botIcon} Futures.*\u2026 +Cancel$`));
   });
 
   test("a row too narrow for both icons drops Pro before the role and keeps the name and the actions, and a hidden clock never shows", async () => {
@@ -1594,8 +1597,8 @@ describe("ChatContent", () => {
       ],
     });
 
-    // One cell short of both icons once Reply is counted.
-    await mountChat(controller, { width: 41, height: 12 });
+    // One cell short of both icons once Reply is counted (the message's date is "28 Mar", or "28 Mar '26" in a later year).
+    await mountChat(controller, { width: 34 + displayWidth(formatTimeAgo("2026-03-28T00:00:00.000Z")), height: 12 });
     await emitKeypress({ name: "up", sequence: "\u001b[A" });
     await flushFrame();
 
@@ -1610,37 +1613,58 @@ describe("ChatContent", () => {
     expect(tui.frame()).not.toContain("Local time");
   });
 
-  test("shows a saved-login read-only footer when a session token is cached", async () => {
-    const controller = createController({
-      sessionToken: "token-123",
-      user: null,
-    });
-
+  test("signed out shows the sign-in wall and none of the chat, following the session both ways", async () => {
+    const controller = createController({ sessionToken: null, user: null, messages: [makeMessage(1)] });
     await mountChat(controller);
 
-    const frame = tui.frame();
-    expect(frame).toContain("Saved login found.");
-    expect(frame).toContain("Log in again to send.");
-    expect(frame).toContain("No messages yet.");
-    expect(frame).not.toContain("Type a message...");
+    expect(tui.frame()).toContain("Sign in to chat.");
+    expect(tui.frame()).toContain("Sign up free");
+    expect(tui.frame()).not.toContain("message 1");
+
+    await act(async () => {
+      controller.adoptSession("token-123", { id: "u0", username: "ada", emailVerified: true });
+    });
+    await flushFrame();
+    expect(tui.frame()).toContain("message 1");
+    expect(tui.frame()).toContain("Type a message...");
+    expect(tui.frame()).not.toContain("Sign in to chat.");
+
+    await act(async () => {
+      controller.clearSession();
+    });
+    await flushFrame();
+    expect(tui.frame()).toContain("Sign in to chat.");
+    expect(tui.frame()).not.toContain("message 1");
   });
 
-  test("keeps the transcript visible for logged-out users and blocks the composer, down to a narrow pane", async () => {
-    for (const width of [60, 27]) {
-      const controller = createController({
-        sessionToken: null,
-        user: null,
-        messages: [makeMessage(1)],
-      });
-
-      await mountChat(controller, { width });
+  test("a saved login or an unverified account reads the chat, with the one action it needs under it", async () => {
+    const states = [
+      { user: null, prompt: "Saved login found. Log in again to send.", action: "Log in", command: "Log In" },
+      {
+        user: { id: "u0", username: "ada", emailVerified: false },
+        prompt: "Verify your email to send messages.",
+        action: "Resend Verification Email",
+        command: "Resend Verification Email",
+      },
+    ];
+    for (const { user, prompt, action, command } of states) {
+      const opened: string[] = [];
+      const controller = createController({ sessionToken: "token-123", user, messages: [makeMessage(1)] });
+      await mountChat(controller, { width: 72, runtime: createTestPluginRuntime({ openCommandBar: (query) => opened.push(query ?? "") }) });
 
       const frame = tui.frame();
       expect(frame).toContain("message 1");
-      expect(frame).toContain("Read-only chat.");
-      expect(frame).toContain("Log in");
-      expect(frame).toContain("Sign up free");
+      expect(frame).toContain(prompt);
+      expect(frame).not.toContain("Sign up free");
       expect(frame).not.toContain("Type a message...");
+      // The button is the last row with its label: the saved-login line says "Log in" too.
+      const rows = frame.split("\n");
+      const row = rows.findLastIndex((line) => line.includes(action));
+      await act(async () => {
+        await tui.setup().mockMouse.click(rows[row]!.indexOf(action) + 1, row);
+        await tui.setup().renderOnce();
+      });
+      expect(opened).toEqual([command]);
     }
   });
 
@@ -1719,7 +1743,7 @@ describe("ChatContent", () => {
     expect(openedQueries).toEqual(["Log In"]);
   });
 
-  test("shows an unread mention badge and opens chat from the status widget", async () => {
+  test("counts unread chatter as a dim number that opens the Unread list", async () => {
     const controller = createController({
       sessionToken: "token-123",
       user: { id: "u1", username: "ada", emailVerified: true },
@@ -1738,7 +1762,7 @@ describe("ChatContent", () => {
       (controller as any).mergeMessages([{
         id: "m1",
         channelId: "everyone",
-        content: "pinging @ada before the bell",
+        content: "CPI is out",
         replyToId: null,
         createdAt: "2026-03-28T00:00:00.000Z",
         user: { id: "u2", username: "bob", displayName: "Bob" },
@@ -1758,21 +1782,13 @@ describe("ChatContent", () => {
 
     await flushFrame();
 
-    const frame = tui.frame();
-    expect(frame).toContain("ada");
-    expect(frame).toContain("[1]");
-
-    const line = frame.split("\n")[0] ?? "";
-    const nameCol = line.indexOf("ada");
-    const badgeCol = line.indexOf("[1]");
-
-    expect(nameCol).toBeGreaterThanOrEqual(0);
-    expect(badgeCol).toBeGreaterThanOrEqual(0);
+    const line = tui.frame().split("\n")[0] ?? "";
+    expect(line.trimEnd()).toBe("@ ada 1");
 
     await act(async () => {
-      await tui.setup().mockMouse.click(nameCol, 0);
+      await tui.setup().mockMouse.click(line.indexOf("ada"), 0);
       await tui.setup().renderOnce();
-      await tui.setup().mockMouse.click(badgeCol + 1, 0);
+      await tui.setup().mockMouse.click(line.indexOf("1"), 0);
       await tui.setup().renderOnce();
     });
 
@@ -1782,7 +1798,7 @@ describe("ChatContent", () => {
     ]);
   });
 
-  test("opens an unread direct-message channel from the status widget", async () => {
+  test("names who wrote to you in a chip that opens the conversation, shows their message as it arrives, and folds it until read", async () => {
     const controller = createController({
       sessionToken: "token-123",
       user: { id: "u1", username: "ada", emailVerified: true },
@@ -1798,12 +1814,18 @@ describe("ChatContent", () => {
         dmUser: { id: "u2", username: "bob", displayName: "Bob" },
       },
     ]);
-    const openedTemplates: Array<{ templateId: string; options?: { arg?: string } }> = [];
+    const toasts: string[] = [];
+    controller.setNotifier((notification) => {
+      toasts.push(notification.body);
+      return { toastVisible: true, desktopRequested: false };
+    });
+    controller.statusPreview.durationMs = 30;
+    const openedTemplates: Array<{ templateId: string; options?: { arg?: string; values?: Record<string, string> } }> = [];
     const state = createInitialState(createDefaultConfig("/tmp/gloomberb-chat"));
     state.config.disabledPlugins = [];
 
     const runtime = createTestPluginRuntime({
-      createPaneFromTemplate(templateId: string, options?: { arg?: string }) {
+      createPaneFromTemplate(templateId: string, options?: { arg?: string; values?: Record<string, string> }) {
         openedTemplates.push({ templateId, options });
       },
     });
@@ -1815,46 +1837,55 @@ describe("ChatContent", () => {
             <ChatStatusWidget controller={controller} />
           </PluginRenderProvider>
         </AppContext>,
-        { width: 40, height: 1 },
+        { width: 60, height: 1 },
       );
     });
-
     await flushFrame();
 
+    const message = {
+      id: "dm-m1",
+      channelId: dmChannelId,
+      content: "did you see the guide cut?",
+      replyToId: null,
+      createdAt: "2026-05-27T10:31:00.000Z",
+      user: { id: "u2", username: "bob", displayName: "Bob" },
+    } satisfies ChatMessage;
     await act(async () => {
-      (controller as any).mergeMessages(dmChannelId, [{
-        id: "dm-m1",
+      (controller as any).handleChatNotification({
+        id: "n1",
+        type: "channel",
         channelId: dmChannelId,
-        content: "private ping",
-        replyToId: null,
-        createdAt: "2026-05-27T10:31:00.000Z",
-        user: { id: "u2", username: "bob", displayName: "Bob" },
-      } satisfies ChatMessage]);
+        messageId: message.id,
+        createdAt: message.createdAt,
+        message,
+      });
     });
     await flushFrame();
 
-    const frame = tui.frame();
-    expect(frame).toContain("ada");
-    expect(frame).toContain("[1]");
+    // On arrival: the sender in the chip, then the message; no toast, and the DM is not counted again.
+    const arrival = tui.frame().split("\n")[0] ?? "";
+    expect(arrival.trimEnd()).toBe(` ${ICON_GLYPHS.mail} bob  did you see the guide cut?  @ ada`);
+    expect(toasts).toEqual([]);
 
-    const line = frame.split("\n")[0] ?? "";
-    const nameCol = line.indexOf("ada");
-    const badgeCol = line.indexOf("[1]");
-
-    expect(nameCol).toBeGreaterThanOrEqual(0);
-    expect(badgeCol).toBeGreaterThanOrEqual(0);
+    // Then it folds into the chip, which stays until the DM is read.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60));
+    });
+    await flushFrame();
+    const folded = tui.frame().split("\n")[0] ?? "";
+    expect(folded.trimEnd()).toBe(` ${ICON_GLYPHS.mail} bob  @ ada`);
 
     await act(async () => {
-      await tui.setup().mockMouse.click(nameCol, 0);
-      await tui.setup().renderOnce();
-      await tui.setup().mockMouse.click(badgeCol + 1, 0);
+      await tui.setup().mockMouse.click(folded.indexOf("bob"), 0);
       await tui.setup().renderOnce();
     });
+    expect(openedTemplates).toEqual([{ templateId: "new-chat-pane", options: { arg: dmChannelId, values: { messageId: message.id } } }]);
 
-    expect(openedTemplates).toEqual([
-      { templateId: "new-chat-pane", options: { arg: dmChannelId } },
-      { templateId: "unread-inbox-pane", options: undefined },
-    ]);
+    await act(async () => {
+      controller.markAllChannelsRead();
+    });
+    await flushFrame();
+    expect((tui.frame().split("\n")[0] ?? "").trimEnd()).toBe("@ ada");
   });
 
 });

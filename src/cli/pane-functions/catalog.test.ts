@@ -1,6 +1,24 @@
-import { expect, test } from "bun:test";
-import { tickerDetailModule } from "../../plugins/builtin/ticker-detail";
-import { findFunctionCode, limitationSentence } from "./catalog";
+import { expect, spyOn, test } from "bun:test";
+import { apiClient } from "../../api-client";
+import { chatController } from "../../plugins/builtin/chat/controller";
+import { subscribeASKGQuestions } from "../../plugins/builtin/cloud/askg/pending-question";
+import { subscribeRequestedThesis } from "../../plugins/builtin/cloud/thesis/pane-request";
+import { getLoadablePlugins } from "../../plugins/catalog";
+import { createDefaultConfig } from "../../types/config";
+import type { MarketContext } from "../types";
+import type { PaneTemplateDef } from "../../types/plugin";
+import {
+  buildPaneCatalogEntries, buildTemplateContext, correctCatalogQuery, filterPaneCatalogEntries, findFunctionCode, functionsForQuestion, limitationSentence,
+  paneFunctionCode, renderPaneCatalogReport, suggestedFunctionCodes, type PaneFunctionCatalog,
+} from "./catalog";
+import { GLOSSARY, lookupGlossary } from "../glossary";
+import { buildPaneShortcutItems, buildPaneTemplateItem } from "../../components/command-bar/pane-templates/items";
+import type { PluginRegistry } from "../../plugins/registry";
+import { fuzzyFilter } from "../../utils/fuzzy-search";
+import { createPaneCatalog } from "./discovery";
+import { parsePaneCatalogArgs } from "./options";
+import { parseViewSpec } from "../../plugins/builtin/custom-view/view-spec";
+import { findPaneFunction } from "./resolver";
 
 test("limitations read as sentences, so one does not run into the next", () => {
   const limitations = ["Daily medians of public DTCC prints on the on-the-run 5Y contract", "HY and EM quote in price"];
@@ -36,13 +54,332 @@ test("a function's code or alias is found in any case, with what it takes; a key
   expect(findFunctionCode(registry, "")).toBeNull();
 });
 
-test("DES, the command bar's name for the ticker research pane, is an alias of its function T", () => {
-  const template = tickerDetailModule.paneTemplates!.find((entry) => entry.shortcut?.prefix === "T")!;
-  const registry = {
-    panes: new Map([[template.paneId, { id: template.paneId, name: template.label }]]),
-    paneTemplates: new Map([[template.id, template]]),
-    destroy() {},
-  } as never;
-  expect(findFunctionCode(registry, "T")).toEqual({ argument: "<ticker>" });
-  expect(findFunctionCode(registry, "des")).toEqual({ argument: "<ticker>" });
+test("built-in catalog discovery stays offline while opening chat and chokepoint panes still resolves live arguments", async () => {
+  // Opening a chat pane fills the shared controller's channel list. Put it
+  // back, so a Chat pane in a later test file is not moved to this channel.
+  const chatChannels = (chatController as any).channelCatalog.channels;
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([
+    { id: "startup-test-channel", name: "Startup test", created_at: "2026-01-01" },
+  ]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const fetch = spyOn(globalThis, "fetch").mockRejectedValue(new Error("Discovery must stay offline"));
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context, { unlisted: true });
+    expect(channels).not.toHaveBeenCalled();
+    expect(geo).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+    expect(entries.find((entry) => entry.token === "CHAT")?.defaultSettings).toEqual({});
+    expect(entries.find((entry) => entry.token === "CHOKE")?.defaultSettings).toEqual({});
+
+    const chat = registry.paneTemplates.get("new-chat-pane")!;
+    const openedChat = await chat.createInstance!(buildTemplateContext(context, null), { arg: "startup-test-channel" });
+    expect(openedChat?.settings?.channelId).toBe("startup-test-channel");
+    expect(channels).toHaveBeenCalledTimes(1);
+
+    const choke = registry.paneTemplates.get("chokepoint-chart-pane")!;
+    const openedChart = await choke.createInstance!(buildTemplateContext(context, null), { arg: "suez" });
+    expect(openedChart?.settings).toHaveProperty("chartSpec");
+    expect(geo).toHaveBeenCalledTimes(1);
+  } finally {
+    (chatController as any).channelCatalog.channels = chatChannels;
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+    fetch.mockRestore();
+  }
+});
+
+// A name that opens no function builds the catalog in the running app too, and discovery must not run ASKG and THESIS on a sample: an open Ask Gloom pane would be asked "sample", and with none open the next one to mount would open on it.
+test("building the catalog sends no request to an open pane and leaves none for the next pane to open on", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  const received: unknown[] = [];
+  const subscribeAll = () => [
+    subscribeASKGQuestions((question) => received.push(question)),
+    subscribeRequestedThesis((request) => received.push(request)),
+  ];
+  let stops = subscribeAll();
+  try {
+    await buildPaneCatalogEntries(registry, context);
+    expect(received).toEqual([]);
+    // No pane open: a request would wait for the next one to subscribe.
+    for (const stop of stops) stop();
+    await buildPaneCatalogEntries(registry, context);
+    stops = subscribeAll();
+    expect(received).toEqual([]);
+  } finally {
+    for (const stop of stops) stop();
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+// `catalog dax` found nothing, and signed out ASKG pointed at `gloom catalog <topic>` without running it.
+test("the morning's European words lead to the index board, a question asked signed out to the functions its topic names, and VIEW to a spec that runs", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    const codes = (query: string) => filterPaneCatalogEntries(entries, query).map((entry) => entry.token);
+    for (const query of ["dax", "xetra", "stoxx", "germany", "european indices"]) expect(codes(query), query).toContain("WEI");
+    expect(codes("germany")).toContain("GC");
+    expect(codes("dax")).toContain("CMP");
+    // The question's asking words ("what", "did", "do") name nothing: "do" found DOE and DOCS.
+    const found = await functionsForQuestion(registry, "what did the DAX do yesterday?");
+    expect(found.map((entry) => entry.code).sort()).toEqual(["CMP", "WEI"]);
+    expect(found.find((entry) => entry.code === "CMP")?.command).toBe("gloom fn CMP <tickers>");
+    expect(await functionsForQuestion(registry, "what did it do?")).toEqual([]);
+    // VIEW's example is a spec that runs as typed, not only `<spec JSON or empty>`.
+    const [example] = entries.find((entry) => entry.token === "VIEW")?.argExamples ?? [];
+    expect(parseViewSpec(example!.replace(/^'|'$/g, ""))?.source).toEqual({ kind: "inline", pane: "WEI" });
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+test("a function's entry says Requires only for a sign-in or Pro, and names its other sources as Data", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    const entry = (code: string) => renderPaneCatalogReport(entries, parsePaneCatalogArgs([code])).replace(/\x1b\[[0-9;]*m/g, "");
+    // These run signed out: their Gloom Cloud data is where it comes from, not something to sign in for.
+    for (const code of ["COT", "CBR", "BTMM", "HIVG"]) {
+      expect(entry(code), code).not.toContain("Requires");
+      expect(entry(code), code).toMatch(/\nData +\S/);
+    }
+    // A sign-in stays a requirement, beside the data it opens.
+    expect(entry("BUZZ")).toContain("Requires     Free Gloom sign-in\nData         Gloom Cloud X mention history");
+    // A number option says its range before a value is refused for it (`--days must be at least 30`).
+    expect(entry("CDX")).toMatch(/--days <integer> +Days of a named index's daily levels\. From 30 to 1,100\. Default 365\./);
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+// `catalog --all` listed functions with no code by their internal ids (twitter-feed-pane, team-pane).
+test("a function with no code is listed by its name when the command line runs it, and left out when it has nothing to run", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const uncoded = (await buildPaneCatalogEntries(registry, context)).filter((entry) => entry.templateId && !entry.shortcut);
+    // Left out: New Portfolio Pane and New Watchlist Pane create what PF lists, Debug Log, Team and Unread are the app's.
+    expect(uncoded.map((entry) => [entry.token, entry.templateId])).toEqual([
+      ["gloom-trending", "attention-trending-pane"], ["story", "news-story-pane"], ["x-feed", "twitter-feed-pane"],
+    ]);
+    for (const { token, templateId } of uncoded) expect(findPaneFunction(registry, token)?.template?.id).toBe(templateId);
+    // The id a script saved still opens it.
+    expect(findPaneFunction(registry, "twitter-feed-pane")?.template?.id).toBe("twitter-feed-pane");
+    // The UI audits still picture the panes left out for a user, under the template ids an older catalog listed them by.
+    const audited = (await buildPaneCatalogEntries(registry, context, { appPanes: true })).map((entry) => entry.token);
+    expect(audited).toEqual(expect.arrayContaining(["team-pane", "unread-inbox-pane", "new-portfolio-pane", "x-feed"]));
+    // A name another function answers to first opens that one, so it is no code for this one: the id is, in errors and the catalog alike.
+    const twin = { id: "story-twin", paneId: "news-story", label: "Story", description: "Another story pane" } as PaneTemplateDef;
+    const withTwin: PaneFunctionCatalog = { ...registry, paneTemplates: new Map([...registry.paneTemplates, [twin.id, twin]]), destroy: () => {} };
+    expect(paneFunctionCode(twin, registry.panes.get("news-story")!, withTwin)).toBe("story-twin");
+    expect(paneFunctionCode(registry.paneTemplates.get("news-story-pane"), registry.panes.get("news-story")!, withTwin)).toBe("story");
+    const listed = await buildPaneCatalogEntries(withTwin, context);
+    expect(listed.filter((entry) => entry.paneId === "news-story").map((entry) => entry.token)).toEqual(["story", "story-twin"]);
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+// `catalog managers` printed the ECO card as if ECO were the function for it, found through "purchasing managers' index".
+test("a lone match found only through a word of its description is labelled the closest match; one named for the query is not", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    const searched = (query: string) => renderPaneCatalogReport(filterPaneCatalogEntries(entries, query), parsePaneCatalogArgs([query]))
+      .replace(/\x1b\[[0-9;]*m/g, "");
+    expect(searched("managers")).toStartWith('Closest match for "managers": no function is named for it.\n\nECO  Economic Calendar');
+    expect(searched("vix")).toStartWith("VIX  VIX Curve");
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+test("a perp venue's name finds PERP first, and a function only Pro opens is marked Pro where the catalog says its report is ready", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    for (const query of ["binance", "OKX", "bybit", "hyperliquid", "binance futures"]) {
+      expect(filterPaneCatalogEntries(entries, query)[0]?.token, query).toBe("PERP");
+    }
+    // A crypto carry trade starts from these words.
+    for (const query of ["crypto", "bitcoin", "btc", "carry", "basis trade"]) expect(filterPaneCatalogEntries(entries, query).map((entry) => entry.token), query).toContain("PERP");
+    // One letter off is read as the word it is near; a word no function is near, or one already found, is kept.
+    expect(correctCatalogQuery(entries, "fundng")).toBe("funding");
+    expect(correctCatalogQuery(entries, "fudning")).toBe("funding");
+    expect(correctCatalogQuery(entries, "funding")).toBeNull();
+    expect(correctCatalogQuery(entries, "xqzvw")).toBeNull();
+    // A short word, or one a first letter apart, is another word rather than a typo.
+    expect(correctCatalogQuery(entries, "moat")).toBeNull();
+    expect(correctCatalogQuery(entries, "libor")).not.toBe("hibor");
+    const plain = (args: string[]) => renderPaneCatalogReport(entries, parsePaneCatalogArgs(args)).replace(/\x1b\[[0-9;]*m/g, "");
+    expect(plain(["CALLS"])).toContain("Report       ready · Pro\n");
+    for (const code of ["EM", "GUID"]) {
+      expect(plain([code])).toContain("Report       ready · Sign-in\n");
+      expect(plain([code])).toContain("Requires     Verified Gloom sign-in");
+      expect(plain([code])).not.toContain("ready · Pro");
+    }
+    expect(plain(["earnings"])).toMatch(/\nCALLS +Earnings Calls +<ticker> +ready · Pro +Pro earnings/);
+    // A free preview is no lock: PERP reads ready.
+    expect(plain(["PERP"])).toContain("Report       ready\n");
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+test("sizing a curve trade finds the bond calculator, a bond fund's DV01 and the Treasury futures under each word a trader searches", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    const codes = (query: string) => filterPaneCatalogEntries(entries, query).map((entry) => entry.token);
+    for (const query of ["dv01", "hedge ratio", "steepener"]) expect(codes(query), query).toEqual(expect.arrayContaining(["YAS", "ETF", "CTM"]));
+    // A variance swap's strike is what VIX squares: VIX and the VIX futures curve, not CDS's or GC's swaps.
+    expect(codes("variance swap").slice(0, 2)).toEqual(["VIX", "CTM"]);
+    expect(codes("duration")).toEqual(expect.arrayContaining(["YAS", "ETF"]));
+    expect(codes("steepener")).toContain("GC");
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+// `catalog "when issued"` named PSD Crop Balances the closest match, for the "when" of "when a table is published".
+test("the when-issued yield and the tail it measures find the auctions first, and the glossary's Tail beside When-issued", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    for (const query of ["when issued", "when-issued", "WI", "tail", "auction tail"]) expect(filterPaneCatalogEntries(entries, query)[0]?.token, query).toBe("AUCT");
+    expect(lookupGlossary("when issued").exact.map((entry) => entry.term)).toEqual(["When-issued", "Tail"]);
+    expect(lookupGlossary("WI").exact.map((entry) => entry.term)).toEqual(["When-issued", "Tail"]);
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+test("reading put skew finds the surface's skew tab first, ahead of the screen that ranks it", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    for (const query of ["put skew", "25d put", "risk reversal"]) expect(filterPaneCatalogEntries(entries, query)[0]?.token, query).toBe("OVDV");
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+test("a memo's figures find FA with the tab that shows them, and an option's value finds its function with the command", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    const searched = (query: string) => renderPaneCatalogReport(filterPaneCatalogEntries(entries, query), parsePaneCatalogArgs([query]))
+      .replace(/\x1b\[[0-9;]*m/g, "");
+    for (const query of ["roic", "return on invested capital", "operating margin", "capex", "free cash flow"]) {
+      expect(filterPaneCatalogEntries(entries, query).slice(0, 3).map((entry) => entry.token), query).toContain("FA");
+    }
+    expect(searched("roic")).toStartWith('"roic": gloom fn FA <ticker> --statement profitability\n\nFA  Financial Analysis');
+    expect(searched("capex")).toStartWith('"capex": gloom fn FA <ticker> --statement cashflow');
+    // GF still answers a margin across companies, by the metric its option takes.
+    expect(searched("operating margin").replace(/\s+/g, " ")).toContain("gloom fn GF <tickers> --metric operatingMargin");
+    // An EQS preset is found by its value, which only the option's list named.
+    expect(searched("compounders")).toStartWith('"compounders": gloom fn EQS --preset compounders\n\nEQS  Equity Screener');
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
+});
+
+// `fn VAR my` offered VAL, `catalog VAR` left MARS and PORT out and the command bar found nothing for "value at risk":
+// the glossary knew VaR was PORT's, and nothing looked there.
+test("a risk term a function shows reaches it from catalog, fn's hint and the command bar, as the glossary names it", async () => {
+  const channels = spyOn(apiClient, "getChannels").mockResolvedValue([]);
+  const geo = spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
+  const context = { config: createDefaultConfig("/synthetic/catalog-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    // Every function a glossary term names is one the catalog lists, so a term never points nowhere.
+    const tokens = new Set(entries.flatMap((entry) => [entry.token, ...entry.aliases]));
+    for (const entry of GLOSSARY) for (const code of entry.functions) expect(tokens.has(code), `${entry.term}: ${code}`).toBe(true);
+    const leading = (query: string) => filterPaneCatalogEntries(entries, query).slice(0, 2).map((entry) => entry.token).sort();
+    for (const query of ["VAR", "value at risk", "expected shortfall", "cvar", "stress test"]) expect(leading(query), query).toEqual(["MARS", "PORT"]);
+    expect(filterPaneCatalogEntries(entries, "drawdown").map((entry) => entry.token)).toEqual(expect.arrayContaining(["MARS", "PORT"]));
+    expect(suggestedFunctionCodes(registry, "VAR").map((entry) => entry.code)).toEqual(["MARS", "PORT"]);
+    expect(suggestedFunctionCodes(registry, "drawdown").map((entry) => entry.code)).toEqual(["MARS", "PORT"]);
+    // The command bar finds them for the same words, as one of the rows it ranks.
+    const templates = [...registry.paneTemplates.values()].filter((template) => template.shortcut?.prefix);
+    const pluginRegistry = { getPaneTemplatePluginId: () => null, allPlugins: new Map(), panes: registry.panes } as unknown as PluginRegistry;
+    const found = (query: string) => fuzzyFilter(buildPaneShortcutItems({
+      templates, searchedQuery: query, registry: pluginRegistry,
+      createItem: (template, options) => buildPaneTemplateItem({
+        template, pluginRegistry, ...options, runPaneTemplateShortcut: () => {}, shouldOpenTemplateConfig: () => false,
+        openPaneTemplateWorkflow: () => {}, openPaneTemplateDirect: () => {},
+      }),
+    }), query, (row) => `${row.label} ${row.searchText ?? ""} ${row.detail} ${row.right ?? ""}`, (row) => row.label).map((row) => row.right);
+    for (const query of ["var", "value at risk", "expected shortfall", "stress test"]) expect(found(query).slice(0, 2).sort(), query).toEqual(["MARS", "PORT"]);
+    // HP and RETURN show a drawdown too.
+    expect(found("drawdown")).toEqual(expect.arrayContaining(["MARS", "PORT"]));
+
+    // A word of a common search, or a loose alias of a term (basis points, implied fx, close), names no function: these
+    // list what they listed before the glossary counted.
+    for (const query of ["fx", "earnings", "basis", "chart", "close", "exposure", "basis points", "implied fx", "beta", "trade"]) {
+      expect(filterPaneCatalogEntries(entries, query).map((entry) => entry.token), query)
+        .toEqual(filterPaneCatalogEntries(entries, query, { glossary: false }).map((entry) => entry.token));
+    }
+    // Nor do they send fn's hint to a function: only a term, its abbreviation or a name for its subject does.
+    for (const query of ["fx", "earnings", "basis", "chart", "close", "exposure", "basis points"]) {
+      expect(suggestedFunctionCodes(registry, query).filter((entry) => ["MARS", "PORT", "QQ", "GC"].includes(entry.code)), query).toEqual([]);
+    }
+  } finally {
+    registry.destroy();
+    channels.mockRestore();
+    geo.mockRestore();
+  }
 });

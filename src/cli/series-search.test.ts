@@ -47,6 +47,33 @@ test("a query finds series by the words that start theirs, names first, and neve
   expect(findCatalogSeries(plugins, "de")).toEqual([]);
 });
 
+test("a series named or tagged with each word whole ranks before one with a word only as the start of a longer word", () => {
+  const deficit = { id: "fred:FYFSD", name: "Federal deficit", unit: "million USD", frequency: "annual",
+    group: "Fiscal", description: "The federal surplus or deficit.", publisher: "FRED", expression: "FRED:FYFSD" };
+  const lending = { id: "crypto:lending", name: "Lending rates", unit: "%", frequency: "daily", group: "Crypto",
+    description: "Rates paid on DeFi lending protocols.", load };
+  const tvl = { id: "crypto:defi-tvl", name: "Total DeFi TVL", unit: "USD", frequency: "daily", group: "Crypto", tags: ["defi", "tvl"],
+    description: "Total value locked in DeFi protocols.", load };
+  // `catalog defi` listed the deficit first when it was registered first; a word whole in a description alone ranks nothing.
+  expect(findCatalogSeries([{ series: [deficit, lending, tvl] }], "defi").map((match) => match.id))
+    .toEqual(["crypto:defi-tvl", "fred:FYFSD", "crypto:lending"]);
+});
+
+test("the built-in catalog finds Mexico's and Brazil's government yields and iron ore by the words people use", () => {
+  const found = (query: string) => findCatalogSeries(getLoadablePlugins(), query).map((match) => [match.expression, match.name, match.unit]);
+  // `CAP:mexico-10y` named no series; `gloom catalog "10Y government bond"` is where its error points.
+  expect(found("10Y government bond")).toEqual(expect.arrayContaining([
+    ["CAP:bond-yield:mx-10y", "Mexico 10Y M bono yield", "%"],
+    ["CAP:bond-yield:br-10y", "Brazil 10Y prefixado yield", "%"],
+  ]));
+  expect(found("mexico yield")).toEqual([
+    ["CAP:bond-yield:mx-2y", "Mexico 2Y Cetes yield", "%"], ["CAP:bond-yield:mx-10y", "Mexico 10Y M bono yield", "%"],
+  ]);
+  expect(found("brazil 2y")).toEqual([["CAP:bond-yield:br-2y", "Brazil 2Y prefixado yield", "%"]]);
+  // FRED's monthly iron ore price is per dry metric ton, not a bare dollar figure.
+  expect(found("iron ore")).toEqual([["FRED:PIORECRUSDM", "Global price of iron ore (dry metric ton)", "USD/ton"]]);
+});
+
 test("catalog lists the series it finds with what fn G charts, after the functions or in their place", () => {
   const report = strip(renderPaneCatalogReport([], parsePaneCatalogArgs(["day-ahead"]), undefined, null,
     findCatalogSeries(plugins, "day-ahead")));
@@ -124,5 +151,16 @@ test("mortgage, PMMS, NAHB, homebuilder and housing lead to ECST's housing rows 
   } finally {
     registry.destroy();
     for (const spy of restore) spy.mockRestore();
+  }
+});
+
+// `catalog nigeria` printed no publisher for the sovereign CDS `fn SOVR` cites as DTCC.
+test("each built-in series a frontier country's name finds names its own publisher", () => {
+  const found = (query: string) => findCatalogSeries(getLoadablePlugins(), query).map((match) => [match.expression, match.publisher]);
+  expect(found("nigeria")).toEqual([["CAP:sovereign-cds:ng", "DTCC"]]);
+  expect(found("egypt")).toEqual([["CAP:sovereign-cds:eg", "DTCC"]]);
+  expect(found("turkey")).toEqual(expect.arrayContaining([["FRED:TURCPIYOY", "TurkStat"], ["CAP:sovereign-cds:tr", "DTCC"]]));
+  for (const query of ["nigeria", "egypt", "turkey", "argentina"]) {
+    expect(found(query).filter(([, publisher]) => !publisher), query).toEqual([]);
   }
 });

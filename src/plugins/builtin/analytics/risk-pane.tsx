@@ -1,10 +1,11 @@
+import { MISSING_VALUE, formatCurrency } from "../../../utils/format";
 import {
   staticSeries,
   scalarPoint,
 } from "../../../components/chart/static/series";
 import { loadPortfolioOptionBook } from "./risk-options";
 import { resolveChartPalette } from "../../../components/chart/core/palette";
-import { useCallback, useMemo, useRef, useState, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { Box, ScrollBox, useRendererHost, type ScrollBoxRenderable } from "../../../ui";
 import {
   chartTableChromeRows,
@@ -24,12 +25,14 @@ import {
   usePaneTabs,
   type ChartTableChart,
   type DataTableColumn,
+  type PaneFooterSegment,
   type StatItem,
 } from "../../../components";
 import {
   useAsyncResource,
   useAutoRefresh,
   usePaneSettingValue,
+  usePluginAppActions,
   usePluginPaneState,
   useShortcut,
 } from "../../../public/react";
@@ -43,7 +46,8 @@ import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
 import { isAccessDenied } from "../../../api-client/errors";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
-import { loadPortfolioRiskMarket } from "./risk-client";
+import { loadPortfolioRiskMarket, riskInstrumentOf } from "./risk-client";
+import { loadRiskEpisodeHistory, riskEpisodeTargets, type RiskEpisodeState, type RiskEpisodeTarget } from "./risk-episodes";
 import { brokerPerformanceEvidence, parsePortfolioRiskEvidence } from "./risk-evidence";
 import { useBrokerPortfolioPerformance } from "./broker-performance";
 import { parseAssetShifts, parseFxShifts, riskCashLines } from "./risk-book";
@@ -54,16 +58,20 @@ import {
   HOLDINGS_SHARE_UNIT,
   HOLDINGS_SUMMARY_ROW_IDS,
   isShockRow,
+  NO_HOLDINGS_HINT,
   portfolioRiskRequests,
   portfolioRiskTickers,
-  riskCoverageLine,
-  riskCoverageNotices,
+  riskCoverageParts,
   riskCoverageShortfall,
+  riskPaneWarnings,
   riskPercentile,
   riskEvidence,
+  riskRowWarnings,
   riskReturnsCurrency,
   riskValue,
   RISK_VIEWS,
+  isWeakFactorFit,
+  withoutFactorFit,
   type PortfolioRiskModel,
   type RiskDisplayRow,
   type RiskView,
@@ -72,6 +80,12 @@ import {
   resolvePortfolioId,
   resolveTemplatePortfolioId,
 } from "./portfolio-selection";
+import { startBrokerAdd } from "../broker-manager/add-request";
+import { CorrelationMatrixGrid, correlationMatrixFits, useCorrelationMatrixNavigation } from "../correlation/matrix/grid";
+import { usePluginTickerActions } from "../../runtime";
+import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
+import { formatTickerListInput } from "../../../tickers/list";
+import { getTableWidth } from "../../../components/ui/table-layout";
 
 const titles = {
   risk: "Risk",
@@ -88,7 +102,7 @@ const getKey = (row: RiskDisplayRow) => row.id;
 /** The two return rows chart the basket against its benchmark over the window they measure. */
 const RETURN_ROW_IDS: ReadonlySet<string> = new Set(["return", "benchmark"]);
 const formatPercentValue = (value: number) => `${value.toFixed(2)}%`;
-const formatPlainAxis = spanAxisFormatter((value, digits) => value.toFixed(digits));
+const formatPlainAxis = spanAxisFormatter((value, digits) => value.toFixed(digits), 2);
 /** What the first column lists in each view. */
 const LABEL_HEADERS: Record<RiskView, string> = {
   risk: "Metric",
@@ -101,6 +115,34 @@ const LABEL_HEADERS: Record<RiskView, string> = {
   greeks: "Metric",
 };
 const EVIDENCE_VIEWS: ReadonlySet<RiskView> = new Set(["performance", "attribution", "greeks"]);
+/**
+ * What an empty Performance, Attribution or Greeks view is missing, in plain
+ * words, and whether connecting a broker would bring it: a broker that reports
+ * account history supplies Performance, and a broker's option positions
+ * supply Greeks. No broker reports Attribution's sector book, so that view
+ * offers the import alone.
+ */
+function evidenceNeed(
+  view: RiskView,
+  { brokerLinked, unvaluedOptions }: { brokerLinked: boolean; unvaluedOptions: boolean },
+): { title: string; message?: string; broker: boolean } {
+  if (view === "performance") {
+    const title = "Performance needs this account's daily values and the money paid in and out.";
+    return brokerLinked
+      ? { title, message: "Its broker does not report them; import them as evidence JSON instead.", broker: false }
+      : { title, message: "A connected broker that reports account history provides both.", broker: true };
+  }
+  if (view === "attribution")
+    return {
+      title: "Attribution needs sector weights and returns for this account and its benchmark.",
+      message: "No broker reports them; import them as evidence JSON.",
+      broker: false,
+    };
+  if (unvaluedOptions) return { title: "No option position in this portfolio could be valued.", broker: false };
+  return brokerLinked
+    ? { title: "No option positions in this portfolio.", broker: false }
+    : { title: "No option positions in this portfolio.", message: "A connected broker syncs option positions with the rest of the account.", broker: true };
+}
 /** The risk view's tail rows, whose method the footer names. */
 const TAIL_ROW_IDS: ReadonlySet<string> = new Set(["var", "es"]);
 /** The views that read the basket's daily closes, and say to when; Holdings reads current marks. */
@@ -116,19 +158,27 @@ function sharedWordUnit(rows: RiskDisplayRow[]): string | null {
   if (!unit || unit === "%" || !rows.every((row) => row.unit === unit)) return null;
   return unit;
 }
-const bareValue = (row: RiskDisplayRow) => row.value == null ? "--" : row.value.toFixed(2);
+const bareValue = (row: RiskDisplayRow) => row.value == null ? MISSING_VALUE : row.value.toFixed(2);
 const HOLDINGS_SUMMARY_LABELS: Record<string, string> = { top: "Largest", "top-five": "Top five" };
+const CASH_ASIDE = ", cash aside";
 /** The book concentration figures that lead the holdings view, as a summary band. */
 function holdingsSummaryItems(rows: RiskDisplayRow[]): StatItem[] {
+  // Every figure leaves the cash aside; the first one that says so says it for the band.
+  let cashSaid = false;
   return rows.map((row) => {
     // A snapshot saved before the shares named their base reads "% value".
     const share = row.unit === HOLDINGS_SHARE_UNIT || row.unit === "% value";
+    // The shares name what they divide.
+    let detail = share ? (row.unit === HOLDINGS_SHARE_UNIT ? `of holdings${CASH_ASIDE}` : "of market value") : row.detail;
+    if (detail.endsWith(CASH_ASIDE)) {
+      if (cashSaid) detail = detail.slice(0, -CASH_ASIDE.length);
+      cashSaid = true;
+    }
     return {
       id: row.id,
       label: HOLDINGS_SUMMARY_LABELS[row.id] ?? row.label,
-      value: row.value == null ? "--" : share ? `${row.value.toFixed(2)}%` : row.value.toFixed(2),
-      // The same note sits on both shares: what they divide.
-      detail: share ? (row.unit === HOLDINGS_SHARE_UNIT ? "of holdings, cash aside" : "of market value") : row.detail,
+      value: row.value == null ? MISSING_VALUE : share ? `${row.value.toFixed(2)}%` : row.value.toFixed(2),
+      detail,
     };
   });
 }
@@ -168,6 +218,47 @@ function rowHistorySeries(row: RiskDisplayRow): ChartTableChart["series"] | null
     history.slice(first).map((point) => scalarPoint(new Date(point.date), point.value)),
     { id: row.id, label: row.label, color: colors.positive },
   )];
+}
+/**
+ * The basket's members, largest weight first, and each pair's correlation by
+ * symbol, for the heat matrix. Null when two members share a symbol (two
+ * listings of one name), which only the list of pairs tells apart.
+ */
+function basketCorrelationMatrix(model: PortfolioRiskModel): {
+  symbols: string[];
+  correlation: (row: string, column: string) => number | null;
+} | null {
+  const members = model.holdings.filter((row) => row.weight != null).sort((left, right) => right.weight! - left.weight!);
+  const symbols = members.map((row) => row.symbol);
+  if (new Set(symbols).size !== symbols.length) return null;
+  const ids = new Map(members.map((row) => [row.symbol, row.id]));
+  const pairs = new Map<string, number | null>();
+  for (const row of model.correlation) {
+    pairs.set(`${row.left}\u0000${row.right}`, row.value);
+    pairs.set(`${row.right}\u0000${row.left}`, row.value);
+  }
+  return {
+    symbols,
+    correlation: (row, column) => row === column ? 1 : pairs.get(`${ids.get(row)}\u0000${ids.get(column)}`) ?? null,
+  };
+}
+/**
+ * An evidence view with nothing in it: what it needs, the broker route where a
+ * broker brings it, then the import. A saved snapshot says only what it
+ * lacked: nothing can be added to it.
+ */
+function EvidenceEmptyState({ need, onImport }: { need: ReturnType<typeof evidenceNeed>; onImport: (() => void) | null }) {
+  return (
+    <PaneStatusBody
+      empty
+      emptyTitle={need.title}
+      emptyMessage={onImport ? need.message : undefined}
+      actions={onImport ? <>
+        {need.broker ? <Button label="Add Broker Account" compact onPress={startBrokerAdd} /> : null}
+        <Button label="Import evidence" variant="secondary" compact onPress={onImport} />
+      </> : undefined}
+    />
+  );
 }
 // No column: rows keep the model order (return, risk, tail), which reads better than A-Z.
 const DEFAULT_SORT = { column: "", direction: "asc" as const };
@@ -234,6 +325,7 @@ function RiskDetail({
 export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
   const instance = usePaneInstance(),
     renderer = useRendererHost();
+  const { showPane, createPaneFromTemplate } = usePluginAppActions();
   const portfolios = useAppSelector((state) => state.config.portfolios),
     tickers = useAppSelector((state) => state.tickers),
     brokerAccounts = useAppSelector((state) => state.brokerAccounts);
@@ -332,8 +424,8 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
     [portfolio?.id, tickers],
   );
   const requests = useMemo(
-    () => (portfolio ? portfolioRiskRequests(localTickers, portfolio.id) : []),
-    [localTickers, portfolio?.id],
+    () => (portfolio ? portfolioRiskRequests(localTickers, portfolio.id, !(portfolio.brokerId || portfolio.brokerInstanceId || portfolio.brokerAccountId)) : []),
+    [localTickers, portfolio],
   );
   const session = useResearchCloudSession();
   const loader = useCallback(
@@ -350,17 +442,41 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
     clearOnError: isAccessDenied,
   });
   useAutoRefresh(resource.updatedAt, resource.load);
+  // The Stress view's episodes read years-old closes of each holding, so they
+  // load only there, once the market load says which holdings the basket takes.
+  const episodeTargetsKey = useMemo(() => {
+    if (frozen || view !== "stress" || !resource.data) return null;
+    const held = localTickers.map(riskInstrumentOf);
+    const targets = riskEpisodeTargets(resource.data, held);
+    return targets.length ? JSON.stringify(targets) : null;
+  }, [frozen, localTickers, resource.data, view]);
+  const episodeLoader = useMemo(
+    () => (episodeTargetsKey && portfolio
+      ? () => loadRiskEpisodeHistory(JSON.parse(episodeTargetsKey) as RiskEpisodeTarget[], portfolio.currency)
+      : null),
+    [episodeTargetsKey, portfolio?.currency, session.requestKey],
+  );
+  const episodeResource = useAsyncResource(episodeLoader, { clearOnError: isAccessDenied, keepPreviousData: true });
+  // A reload reads the kept closes again and asks only for those that failed
+  // (a rate limit on a large book), so it follows the market data's cadence.
+  useAutoRefresh(episodeResource.updatedAt, episodeResource.load);
+  const episodeState = useMemo<RiskEpisodeState | undefined>(
+    () => (!episodeLoader ? undefined : episodeResource.data ?? { pending: true, error: episodeResource.error }),
+    [episodeLoader, episodeResource.data, episodeResource.error],
+  );
   const derived = useMemo(() => {
     if (frozen) return { model: frozen, error: null };
     if (!portfolio || (!resource.data && !evidenceText.trim() && !brokerEvidence))
       return { model: null, error: null };
-    const market = resource.data ?? {
-      histories: [],
-      yields: null,
-      volatility: null,
-      warnings: [],
-      fetchedAt: new Date().toISOString(),
-    };
+    const market = resource.data
+      ? { ...resource.data, ...(episodeState ? { episodes: episodeState } : {}) }
+      : {
+          histories: [],
+          yields: null,
+          volatility: null,
+          warnings: [],
+          fetchedAt: new Date().toISOString(),
+        };
     try {
       return {
         model: buildPortfolioRisk(
@@ -391,6 +507,7 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
     portfolio,
     localTickers,
     resource.data,
+    episodeState,
     evidenceText,
     brokerEvidence,
     equity,
@@ -403,14 +520,16 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
   const model = derived.model;
   const marketLoading = resource.loading && !resource.data;
   // A basket view with nothing to estimate says why in the body, not with a table of dashes.
-  const basketBody = useMemo<{ loading?: boolean; error?: string; title?: string; message?: string } | null>(() => {
+  const basketBody = useMemo<{ loading?: boolean; error?: string; title?: string; message?: string; noHoldings?: boolean } | null>(() => {
     if (!model || !BASKET_VIEWS.has(view)) return null;
     if (!frozen && !resource.data)
       return marketLoading ? { loading: true } : resource.error ? { error: resource.error } : null;
     if (view === "holdings") return null;
     const shortfall = riskCoverageShortfall(model.coverage);
     // The currency and price shocks reprice the book without the basket, so they stay; the footer says why the basket scenarios do not.
-    return shortfall && view === "stress" && model.rows.stress.some(isShockRow) ? null : shortfall;
+    if (shortfall && view === "stress" && model.rows.stress.some(isShockRow)) return null;
+    // A portfolio with no holdings says where they come from, as the other panes' empty states do.
+    return shortfall && !model.coverage?.holdings ? { ...shortfall, message: NO_HOLDINGS_HINT, noHoldings: true } : shortfall;
   }, [frozen, marketLoading, model, resource.data, resource.error, view]);
   // Stress with too little covered for the basket scenarios, its shocks shown alone.
   const stressShortfall = useMemo(
@@ -442,8 +561,12 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
     [basketBody, stressShortfall, model, view, sort],
   );
   const openRow = rows.find((row) => row.id === open);
+  const evidenceMissing = EVIDENCE_VIEWS.has(view) && rows.length === 0;
+  // A broker linked to the portfolio may still be sending its account history.
+  const evidenceLoading = evidenceMissing && view === "performance" && brokerPerformance.loading;
   const detailScrollRef = useRef<ScrollBoxRenderable | null>(null);
-  // Columns that say the same thing on every row belong in the footer, not repeated per row.
+  // Evidence that says the same thing on every row belongs in the footer, not repeated per row; a shared date shows
+  // where there is room, so every number keeps its date beside it.
   const showPercentile = rows.some((row) => row.percentile != null);
   const sharedDate =
     rows.length > 1 &&
@@ -509,53 +632,76 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
     [frozen, importEvidence, portfolios.length, nextPortfolio],
   );
   // Only real data limitations raise the footer warning; the empty evidence
-  // views say what they need in the body, with the import action.
-  const notices = [
-    ...riskCoverageNotices(model?.coverage),
-    ...(model?.notes ?? []),
-    ...(model?.warnings ?? []),
+  // views say what they need in the body, with the import action. What
+  // concerns one holding is its row's: a left-out holding's reason is its
+  // detail, a holding's or an option's failure its note under the table.
+  const failures = [
+    ...(model ? riskPaneWarnings(model) : []),
+    ...(view === "performance" ? model?.performanceEstimate?.warnings ?? [] : []),
     ...shocks.errors,
     ...(derived.error ? [derived.error] : []),
     ...(resource.error ? [resource.error] : []),
   ];
+  const notices = [
+    ...(model?.notes ?? []),
+    ...failures,
+  ];
   // What the basket views cover of the book and leave out, unless the body already says why they show nothing.
   // Stress showing its shocks alone says instead why the basket scenarios are not there.
+  const coverage = useMemo(
+    () => (!model || !BASKET_VIEWS.has(view) || basketBody || stressShortfall ? null : riskCoverageParts(model.coverage)),
+    [basketBody, model, stressShortfall, view],
+  );
   const coverageText = !model || !BASKET_VIEWS.has(view) || basketBody
     ? null
     : stressShortfall
-      ? `Index, 10Y and VIX scenarios: ${stressShortfall.title.replace(/\.$/, "").replace(/^[A-Z](?=[a-z])/, (letter) => letter.toLowerCase())}`
-      : riskCoverageLine(model.coverage);
+      ? `Index, 10Y, VIX and episode scenarios: ${stressShortfall.title.replace(/\.$/, "").replace(/^[A-Z](?=[a-z])/, (letter) => letter.toLowerCase())}`
+      : coverage?.text ?? null;
+  // The days the returns are on, for a basket that mixes markets: the views read from its returns say so.
+  const calendar = model && DAILY_CLOSE_VIEWS.has(view) && !basketBody && !stressShortfall ? model.calendar ?? null : null;
   const asOfDate = (stressShortfall ? rows : model?.rows[view])?.find((row) => row.asOf)?.asOf?.slice(0, 10) ?? null;
   // The views estimated from returns name the currency a non-USD account's returns were converted into.
   const returnsCurrency = BASKET_VIEWS.has(view) && view !== "holdings" && !stressShortfall ? riskReturnsCurrency(model) : null;
-  // Dated evidence only when a row has a date; a missing date is not a claim about history.
-  const asOfText = !model
-    ? null
-    : [
-        ...(basketBody ? [] : [
-          ...(coverageText ? [coverageText] : []),
-          ...(asOfDate && footerEvidence ? [footerEvidence] : []),
-          // The coverage names the currency of its basket value; a non-USD account's returns say what they converted into.
-          ...(returnsCurrency ? [returnsCurrency] : coverageText ? [] : [model.portfolio.currency]),
-          ...(EVIDENCE_VIEWS.has(view) && model.evidence ? [model.evidence.source] : []),
-        ]),
-      ].join(" · ") || null;
   // What the figures are read from and to when: the basket's daily closes, or the marks and evidence of that day.
   // The shocks alone are repriced at the current marks.
   const sourceText = basketBody || !asOfDate
     ? null
     : DAILY_CLOSE_VIEWS.has(view) && !stressShortfall ? `daily closes to ${asOfDate}` : `as of ${asOfDate}`;
+  // Each fact its own segment, in the order a narrow footer keeps them: what the numbers cover, how the tail rows are
+  // estimated and on which days; the date and the currency give way first. A capture keeps the first three, which say
+  // what its rows leave out and how they read. Dated evidence only when a row has a date; a missing date is not a
+  // claim about history.
+  const tailMethodShort = view === "risk" && footerEvidence ? footerEvidence.replace(/^historical, 1-day, \d+%, /, "historical, ") : null;
+  const infoSegments = useMemo((): PaneFooterSegment[] => {
+    if (!model || basketBody) return [];
+    const muted = (text: string) => [{ text, tone: "muted" as const }];
+    const text = (id: string, value: string | null | undefined, extra: Partial<PaneFooterSegment> = {}): PaneFooterSegment[] =>
+      value ? [{ id, parts: muted(value), ...extra }] : [];
+    return [
+      ...text("coverage", coverageText, { capture: true, ...(coverage && coverage.short !== coverage.text ? { variants: [muted(coverage.short), muted(coverage.shortest)] } : {}) }),
+      // The tail rows' labels say 1D and 95%: a narrow row keeps the rest of the method.
+      ...text("method", asOfDate ? footerEvidence : null, { capture: true, ...(tailMethodShort && tailMethodShort !== footerEvidence ? { variants: [muted(tailMethodShort)] } : {}) }),
+      ...text("calendar", calendar, { capture: true }),
+      ...text("source", sourceText, { asOf: true }),
+      // The coverage names the currency of its basket value; a non-USD account's returns say what they converted into.
+      // An evidence view with nothing in it has no amounts for a currency to describe.
+      ...text("currency", returnsCurrency ?? (coverageText || evidenceMissing ? null : model.portfolio.currency)),
+      ...text("evidence", EVIDENCE_VIEWS.has(view) && model.evidence ? model.evidence.source : null),
+    ];
+  }, [asOfDate, basketBody, calendar, coverage, coverageText, evidenceMissing, footerEvidence, model, returnsCurrency, sourceText, tailMethodShort, view]);
   usePaneNoticeFooter({
     registrationId: "portfolio-risk-notices",
     notices,
     focused,
     enabled: !openRow,
+    // A capture's footer says what the basket leaves out and how it reads; of the warnings it prints only what failed.
+    captureNotes: failures,
   });
   usePaneFooter(
     "portfolio-risk",
     () => ({
       info: [
-        ...(resource.loading
+        ...(resource.loading || (view === "stress" && episodeResource.loading)
           ? [
               {
                 id: "loading",
@@ -565,14 +711,9 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
               },
             ]
           : []),
-        // Coverage first: a narrow footer cuts the method and the date before what the numbers cover.
-        ...(asOfText
-          ? [{ id: "asof", parts: [{ text: asOfText, tone: "muted" as const }] }]
-          : []),
-        // The source and its date, which a capture's own dated status line stands in for.
-        ...(sourceText
-          ? [{ id: "source", asOf: true, parts: [{ text: sourceText, tone: "muted" as const }] }]
-          : []),
+        // Coverage first: a narrow footer cuts the method and the date before what the numbers cover. The source's
+        // date gives way to a capture's own dated status line.
+        ...infoSegments,
         ...(actionStatus
           ? [
               {
@@ -584,7 +725,7 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
       ],
       hints,
     }),
-    [resource.loading, asOfText, sourceText, actionStatus, hints],
+    [resource.loading, view, episodeResource.loading, infoSegments, actionStatus, hints],
   );
   useShortcut(
     (event) => {
@@ -602,7 +743,11 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
         event.preventDefault();
         event.stopPropagation();
         hint.onPress();
-      } else if (event.name === "r" && !frozen) void resource.reload();
+      } else if (event.name === "r" && !frozen) {
+        resource.reload();
+        // The episodes too: a read that failed is asked again.
+        if (view === "stress") episodeResource.reload();
+      }
     },
     { enabled: focused, scope: "portfolio-risk", phase: "before" },
   );
@@ -614,6 +759,15 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
   const chart = useMemo<ChartTableChart | null>(() => {
     if (!model) return null;
     if (view === "performance") {
+      if (model.performanceEstimate) return {
+        series: [staticSeries(
+          model.performanceEstimate.points.map((row) => scalarPoint(new Date(row.date), row.value)),
+          { id: "estimated-value", label: model.performanceEstimate.label, color: colors.positive, calendarSpaced: true },
+        )],
+        formatValue: (value: number) => formatCurrency(value, model.portfolio.currency),
+        formatAxisValue: formatPlainAxis,
+        remoteKind: "portfolio-risk-history",
+      };
       if (!model.performance) return null;
       return {
         series: [staticSeries(
@@ -642,11 +796,26 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
     };
   }, [chartRow, marketLoading, model, sharedUnit, view]);
   const attributionParts = view === "attribution" && rows.some((row) => row.allocation != null);
+  const factorFits = rows.some((row) => row.rSquared !== undefined);
   const valueHeader = attributionParts
     ? "Total pp"
     : sharedUnit
       ? sharedUnit.length <= 3 ? `Value ${sharedUnit}` : sharedUnit
       : "Value";
+  // Dates that differ always show; one every row shares shows where the row has room for it beside the figures.
+  const asOfColumn = useMemo<DataTableColumn | null>(() => {
+    const column: DataTableColumn = { id: "asOf", label: "As of", width: 11, align: "left" };
+    if (!sharedDate) return column;
+    const figures = [
+      { width: 19, align: "left" as const },
+      { width: sharedUnit || attributionParts ? Math.max(9, valueHeader.length) : rows.some((row) => row.amount != null) ? 18 : 16, align: "right" as const },
+      ...(attributionParts ? ATTRIBUTION_PARTS.map(() => ({ width: 11, align: "right" as const })) : []),
+      ...(factorFits ? [{ width: 9, align: "right" as const }] : []),
+      ...(showPercentile ? [{ width: 8, align: "right" as const }] : []),
+    ];
+    // A cell for the scrollbar a long table draws.
+    return getTableWidth([...figures, column]) + 1 <= width ? column : null;
+  }, [attributionParts, factorFits, rows, sharedDate, sharedUnit, showPercentile, valueHeader, width]);
   const columns = useMemo<DataTableColumn[]>(
     () => [
       {
@@ -665,12 +834,15 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
       ...(attributionParts
         ? ATTRIBUTION_PARTS.map((part) => ({ id: part.id, label: part.label, width: 11, align: "right" as const }))
         : []),
+      // A factor's beta reads with how much of the basket it explains; a weak fit says so.
+      ...(factorFits
+        ? [{ id: "rSquared", label: "R²", width: 9, align: "right" as const }]
+        : []),
       ...(showPercentile
         ? [{ id: "percentile", label: "Pctl 1Y", width: 8, align: "right" as const }]
         : []),
-      ...(sharedDate
-        ? []
-        : [{ id: "asOf", label: "As of", width: 11, align: "left" as const }]),
+      // Every row's date where there is room, the one they share too: each number says when it is from.
+      ...(asOfColumn ? [asOfColumn] : []),
       // Attribution's evidence is the three effects, now columns of their own.
       ...(width >= 95 && !footerEvidence && !attributionParts
         ? [
@@ -684,7 +856,7 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
           ]
         : []),
     ],
-    [width, view, valueHeader, sharedUnit, attributionParts, footerEvidence, showPercentile, sharedDate, rows],
+    [width, view, valueHeader, sharedUnit, attributionParts, factorFits, footerEvidence, showPercentile, asOfColumn, rows],
   );
   const selectView = (value: string) => {
     setView(value);
@@ -701,7 +873,31 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
     compact: true,
   } : null);
   const rootHeight = Math.max(3, height - tabRows);
-  const evidenceMissing = EVIDENCE_VIEWS.has(view) && rows.length === 0;
+  // Correlation shows the heat matrix CORR draws while every holding fits the
+  // pane under the portfolio bar; a larger basket lists its pairs, strongest first.
+  const basketMatrix = useMemo(
+    () => (view === "correlation" && model && !basketBody ? basketCorrelationMatrix(model) : null),
+    [basketBody, model, view],
+  );
+  const matrixShown = !!basketMatrix && correlationMatrixFits(basketMatrix.symbols, width, rootHeight - 1);
+  // The matrix has no row detail: a pair opened from the list closes once the matrix takes its place.
+  useEffect(() => {
+    if (matrixShown && open) setOpen(null);
+  }, [matrixShown, open, setOpen]);
+  const matrixSymbols = matrixShown ? basketMatrix!.symbols : [];
+  const { pinTicker, navigateTicker } = usePluginTickerActions();
+  const openMatrixSymbol = useCallback((symbol: string) => {
+    if (tickers.has(symbol)) pinTicker(symbol, { floating: true, paneType: TICKER_RESEARCH_PANE_ID });
+    else navigateTicker(symbol);
+  }, [navigateTicker, pinTicker, tickers]);
+  // CORR's cursor, hover and keys; a pair opens in GR, as it does from CORR.
+  const matrixNavigation = useCorrelationMatrixNavigation({
+    symbols: matrixSymbols,
+    focused: focused && matrixShown,
+    scope: "portfolio-risk:matrix",
+    onOpenPair: (pair) => createPaneFromTemplate("relationship-graph-pane", { symbols: pair, arg: formatTickerListInput(pair) }),
+    onOpenSymbol: openMatrixSymbol,
+  });
   if (!portfolio)
     return (
       <EmptyState
@@ -719,6 +915,37 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
           loadingLabel="Loading portfolio risk"
           emptyTitle="Risk data unavailable"
         />
+      </Box>
+    );
+  if (matrixShown)
+    return (
+      <Box width={width} height={height} flexDirection="column">
+        {tabStrip}
+        <Box width={width} height={rootHeight} flexDirection="column" overflow="hidden">
+          <QueryBar
+            width={width}
+            filters={[{
+              id: "portfolio",
+              label: "Portfolio",
+              value: portfolio.id,
+              options: portfolios.length
+                ? portfolios.map((row) => ({ value: row.id, label: row.name }))
+                : [{ value: portfolio.id, label: portfolio.name }],
+              onChange: (id: string) => {
+                setPortfolio(id);
+                setOpen(null);
+              },
+            }]}
+          />
+          <CorrelationMatrixGrid
+            symbols={matrixSymbols}
+            width={width}
+            height={rootHeight - 1}
+            correlation={basketMatrix!.correlation}
+            {...matrixNavigation.grid}
+            onOpenSymbol={openMatrixSymbol}
+          />
+        </Box>
       </Box>
     );
   return (
@@ -777,20 +1004,31 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
           })
         }
         renderCell={(row, column) => {
-          if (column.id === "label") return { text: row.label };
+          // Without the evidence column an episode says beside its label how much of it is proxied.
+          if (column.id === "label")
+            return { text: row.marker && !columns.some((entry) => entry.id === "detail") ? `${row.label} (${row.marker})` : row.label };
+          const weakFit = isWeakFactorFit(row.rSquared);
           if (column.id === "value")
             return row.leftOut
               ? { text: "left out", value: null, color: colors.textMuted }
-              : { text: sharedUnit || attributionParts ? bareValue(row) : riskValue(row) };
+              : { text: sharedUnit || attributionParts ? bareValue(row) : riskValue(row), ...(weakFit ? { color: colors.textMuted } : {}) };
+          if (column.id === "rSquared")
+            return row.rSquared == null
+              ? { text: MISSING_VALUE }
+              : { text: `${weakFit ? "weak " : ""}${row.rSquared.toFixed(2)}`, value: row.rSquared, ...(weakFit ? { color: colors.textMuted } : {}) };
           if (column.id === "percentile") return { text: riskPercentile(row) };
-          if (column.id === "asOf") return { text: row.asOf?.slice(0, 10) ?? "--" };
+          if (column.id === "asOf") return { text: row.asOf?.slice(0, 10) ?? MISSING_VALUE };
           if (column.id === "allocation" || column.id === "selection" || column.id === "interaction") {
             const part = row[column.id];
-            return { text: part == null ? "--" : part.toFixed(2) };
+            return { text: part == null ? MISSING_VALUE : part.toFixed(2) };
           }
-          return { text: row.detail };
+          return { text: factorFits ? withoutFactorFit(row.detail) : row.detail };
         }}
         selectedTextOverridesCellColor
+        rowNote={(row) => {
+          const notes = model ? riskRowWarnings(model, row.label) : [];
+          return notes.length ? `${row.label}: ${notes.join(" ")}` : null;
+        }}
         onActivate={(row) => setOpen(row.id)}
         detailOpen={!!openRow}
         detailTitle={openRow?.label}
@@ -816,13 +1054,19 @@ export function PortfolioRiskPane({ focused, width, height }: PaneProps) {
               loadingLabel="Loading portfolio risk"
               emptyTitle={basketBody.title}
               emptyMessage={basketBody.message || undefined}
+              actions={basketBody.noHoldings ? <Button label="Open Portfolio" compact onPress={() => showPane("portfolio-list")} /> : undefined}
             />
+          ) : evidenceLoading ? (
+            <PaneStatusBody loading loadingLabel="Loading account history" />
           ) : evidenceMissing ? (
-            <PaneStatusBody
-              empty
-              emptyTitle="This view needs dated local evidence."
-              emptyMessage={frozen ? undefined : "Copy version 1 evidence JSON, then import it from the clipboard."}
-              actions={frozen ? undefined : <Button label="Import evidence" compact onPress={() => void importEvidence()} />}
+            <EvidenceEmptyState
+              // Each view's own state, so Enter starts on its first action.
+              key={view}
+              need={evidenceNeed(view, {
+                brokerLinked: !!portfolio.brokerInstanceId,
+                unvaluedOptions: (model.greeks?.warnings.length ?? 0) > 0,
+              })}
+              onImport={frozen ? null : () => void importEvidence()}
             />
           ) : undefined
         }

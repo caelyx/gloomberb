@@ -1,9 +1,11 @@
+import { logFailure } from "../../../utils/log-failure";
 import { useCallback, useMemo, useRef } from "react";
 import { isAccessDenied } from "../../../api-client/errors";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import type { AppAttentionFilter, AppAttentionPayload, AppChart } from "../../../api-client/app-attention";
 import type { HiringBoard, HiringPayload } from "../../../api-client/hiring";
 import { ChartTableHeader, DataTableView, PageStackView, PaneFooterScope, PaneLinkMenu, QueryBar, useChartTableSelection, usePagedRows, useTableLoadMore, usePaneNoticeFooter, usePaneStatusFooter, usePaneTabs, type PaneHint } from "../../../components";
+import { useCompanyDataFooter } from "../../../components/layout/pane/status-footer";
 import { DetailReader, type DetailFact } from "../../../components/reader/detail-reader";
 import type { CloudJobsPostingDetail } from "../../../api-client/types";
 import { descriptionText, postingFacts, postingTitle } from "../shared/job-posting";
@@ -57,7 +59,10 @@ function Evidence({ row, width, posting, source }: Size & { row: AttentionRow; p
 }
 /** A link's site, as a reader names it: "sec.gov". */
 function linkName(url: string): string {
-  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return "Source"; }
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch {
+    // Intentional ignore: a malformed link has no site to name, so it reads as Source.
+    return "Source";
+  }
 }
 
 export function HiringPane(props: Size) {
@@ -105,7 +110,10 @@ function AttentionView({ kind, symbol, width, height, focused, initialTab }: Siz
   const [mix, setMix] = usePluginPaneState<string>(`${kind}:mix`, kind === "hiring" ? "functions" : "countries");
   const filters = useMemo<AppAttentionFilter>(() => kind === "apps" ? { ...(country ? { country } : {}), ...(chart ? { chart: chart as AppChart } : {}), days: Number(days) || 90 } : {}, [kind, country, chart, days]);
   const [snapshotSetting] = usePaneSettingValue<AttentionPayload | null>("attentionSnapshot", null);
-  const snapshot = useMemo(() => { try { return snapshotSetting ? validateAttention(kind, snapshotSetting) : null; } catch { return null; } }, [kind, snapshotSetting]);
+  const snapshot = useMemo(() => { try { return snapshotSetting ? validateAttention(kind, snapshotSetting) : null; } catch (error) {
+    logFailure("company-attention.pane", "Validate attention snapshot failed")(error);
+    return null;
+  } }, [kind, snapshotSetting]);
   const loader = useCallback((force: boolean) => snapshot ? Promise.resolve({ payload: snapshot, stale: false, refreshError: null }) : loadAttention(kind, symbol, accessKey, filters, force), [kind, symbol, accessKey, filters, snapshot]);
   const resource = useAsyncResource(loader, { initialData: () => cachedAttention(kind, symbol, accessKey, filters), clearOnError: isAccessDenied });
   const data = resource.data?.payload;
@@ -159,7 +167,7 @@ function AttentionView({ kind, symbol, width, height, focused, initialTab }: Siz
   const series = useMemo(() => model ? attentionSeries(model, colors.textBright) : [], [model, colors.textBright]);
   const chartSelection = useChartTableSelection({ rows, getId: rowId, getDate: rowDate, selectedId: selected?.id ?? null, onSelect: setSelected, focused: focused && !detailOpen, enabled: tab === "chart" });
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => { void resource.reload(); paged.reload(); }, { focused: focused && !detailOpen && !moves });
+  usePaneRefreshKey(() => { resource.reload(); paged.reload(); }, { focused: focused && !detailOpen && !moves });
   const selectedSymbol = selected?.symbol ?? symbol;
   const source = (evidence ? posting?.url ?? evidence.url : null) ?? selected?.url;
   const hints: PaneHint[] = [
@@ -177,6 +185,8 @@ function AttentionView({ kind, symbol, width, height, focused, initialTab }: Siz
   usePaneStatusFooter({ registrationId: `${kind}:status`, enabled: !openCompany && !app && !moves, loading: resource.loading || paged.loadingMore || (!!evidence && postingResource.loading), error: data ? resource.error ?? paged.moreError?.message ?? paged.error?.message : null, stale: resource.data?.stale,
     info: [...(model?.asOf ? [{ id: "observed", asOf: true, parts: [{ text: `as of ${model.asOf.slice(0, 10)}`, tone: "muted" as const }] }] : []), ...(model?.preview ? [{ id: "preview", parts: [{ text: "Pro preview", tone: "warning" as const }] }] : [])], hints });
   usePaneNoticeFooter({ registrationId: `${kind}:notices`, enabled: !openCompany && !app && !moves, focused, notices: [...(model?.notices ?? []), ...(resource.data?.refreshError ? [resource.data.refreshError] : [])] });
+  // A receipt's or foreign line's hiring or apps are its company's, read from the home line.
+  useCompanyDataFooter(data && "companyFrom" in data ? data.companyFrom : null, !openCompany && !app && !moves);
   if (signInWall) return <SignInWall placement={kind === "hiring" ? "hiring-momentum-signin" : "app-attention-signin"} action={kind === "hiring" ? "view hiring momentum" : "view app attention"} needsVerification={session.needsVerification} />;
   const countryOptions = data && kind === "apps" ? (data as AppAttentionPayload).coverage.configuredCountries : [];
   const query = kind === "hiring" && tab !== "mix" ? undefined : <QueryBar width={width} filters={kind === "apps" ? [

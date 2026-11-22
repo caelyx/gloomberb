@@ -72,10 +72,15 @@ const validPeg = (peg: CryptoMarketAsset["peg"]) =>
   && (peg.price === null || (isFiniteNumber(peg.price) && peg.price > 0))
   && nullableInstant(peg.asOf);
 
+const venueNames = (value: unknown) => value === undefined
+  || Array.isArray(value) && value.every((name) => typeof name === "string" && name.length > 0 && name.length <= 24);
+
 const validRange = (range: CryptoMarketAsset["range24h"]) =>
   !!range
   && [range.low, range.high].every((value) => isFiniteNumber(value) && value > 0)
-  && [range.lowAt, range.highAt, range.start, range.end].every(instant);
+  && [range.lowAt, range.highAt, range.start, range.end].every(instant)
+  && [range.lowVenues, range.highVenues, range.venuesChecked].every(venueNames)
+  && (range.venuesPending === undefined || typeof range.venuesPending === "boolean");
 
 /** A malformed peg or 24h range is dropped from its coin alone; the coin and the rest of the board stay. */
 function withValidStablecoinFields(asset: CryptoMarketAsset): CryptoMarketAsset {
@@ -145,10 +150,10 @@ export async function fetchCryptoMarkets(
   try {
     return validateCryptoMarkets(await client.getCloudCryptoMarkets());
   } catch (error) {
-    if (error instanceof ApiRequestError && error.status === 503) {
-      throw new Error("Crypto prices are temporarily unavailable");
-    }
-    throw unavailableOnServer(error, "Crypto markets are not available yet.");
+    // Each keeps its status: a 503 passes with time and a saved copy answers it; a 404 does not.
+    throw error instanceof ApiRequestError && error.status === 503
+      ? unavailableOnServer(error, "Crypto prices are temporarily unavailable", [503])
+      : unavailableOnServer(error, "Crypto markets are not available yet.");
   }
 }
 
@@ -248,7 +253,7 @@ function validateStablecoinSupplyHistory(data: StablecoinSupplyHistoryPayload): 
 }
 
 function supplyError(error: unknown, what: string): unknown {
-  if (error instanceof ApiRequestError && error.status === 503) return new Error(`${what} is temporarily unavailable`);
+  if (error instanceof ApiRequestError && error.status === 503) return unavailableOnServer(error, `${what} is temporarily unavailable`, [503]);
   return unavailableOnServer(error, `${what} is not available yet.`);
 }
 
@@ -300,6 +305,8 @@ const tvlValue = (value: unknown) => value === null || (isFiniteNumber(value) &&
 const changes = (entry: { change7d: unknown; change7dPercent: unknown; change30d: unknown; change30dPercent: unknown }) =>
   [entry.change7d, entry.change7dPercent, entry.change30d, entry.change30dPercent].every(nullableNumber);
 
+const INCOME_FIELDS = ["fees24h", "fees7d", "fees30d", "revenue24h", "revenue7d", "revenue30d"] as const;
+
 export function validateDefiTvl(data: DefiTvlPayload): DefiTvlPayload {
   const history = data?.history;
   if (
@@ -323,8 +330,11 @@ export function validateDefiTvl(data: DefiTvlPayload): DefiTvlPayload {
       && isFiniteNumber(protocol.tvl)
       && protocol.tvl >= 0
       && nullableNumber(protocol.change1dPercent)
-      && changes(protocol))
+      && changes(protocol)
+      // Fees and revenue: absent from servers before them, otherwise USD or null.
+      && INCOME_FIELDS.every((field) => protocol[field] === undefined || (nullableNumber(protocol[field]) && !((protocol[field] ?? 0) < 0))))
     || !nullableInstant(data.protocolsAsOf)
+    || !(data.incomeAsOf === undefined || nullableInstant(data.incomeAsOf))
     || !Array.isArray(data.chains)
     || data.chains.length > 500
     || !data.chains.every((chain) => !!chain

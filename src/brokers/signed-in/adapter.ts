@@ -20,7 +20,7 @@ import type {
   BrokerPortfolioPerformance,
   BrokerTradingCapabilities,
 } from "../../types/trading";
-import { findSignedInBroker, refreshSignedInBrokers } from "./catalog";
+import { findSignedInBroker, refreshSignedInBrokersAndWait } from "./catalog";
 import type { SignedInBroker, SignedInBrokerConnection } from "./client";
 import { SIGNED_IN_BROKER_TYPE, signedInBrokerId } from "./profile";
 
@@ -48,6 +48,23 @@ function brokerReason(lastError: string | null | undefined): string | null {
   if (!text) return null;
   const described = /^[a-z_]+:\s*(\S[\s\S]*)$/.exec(text)?.[1] ?? text;
   return described.replace(/[\s.]+$/, "").slice(0, 200) || null;
+}
+
+/**
+ * What a profile says once the broker ended its sign-in, and to connect again.
+ * A broker that keeps one AI app per account (IBKR) ends Gloom's grant when
+ * another app is connected to the account, and says only "Invalid
+ * authorization status"; that one is said in plain words. A broker the app
+ * does not know yet counts as one, since only IBKR says it.
+ */
+function signInEndedMessage(name: string, lastError: string | null | undefined, singleConnection = true): string {
+  if (singleConnection && /invalid authorization status/i.test(lastError ?? "")) {
+    return `${name} disconnected Gloom, most often because another AI app was connected to the same account, and ${name} allows one at a time. Press Connect in Brokers.`;
+  }
+  const reason = brokerReason(lastError);
+  return reason
+    ? `${name} needs you to sign in again: ${reason}. Press Connect in Brokers.`
+    : `Press Connect in Brokers to sign in to ${name}.`;
 }
 
 /** Gloom holds no live sign-in for the broker: only connecting again helps. */
@@ -179,7 +196,7 @@ export function createSignedInBrokerAdapter(overrides: Partial<SignedInBrokerAda
   const deps: SignedInBrokerAdapterDeps = {
     request: (broker, path, options) => apiClient.brokerRequest(broker, path, options),
     findBroker: findSignedInBroker,
-    refreshBrokers: () => refreshSignedInBrokers(),
+    refreshBrokers: () => refreshSignedInBrokersAndWait(),
     openUrl,
     now: () => Date.now(),
     ...overrides,
@@ -520,11 +537,8 @@ export function createSignedInBrokerAdapter(overrides: Partial<SignedInBrokerAda
         const connection = await get<SignedInBrokerConnection>(instance, "");
         canTrade.set(instance.id, connection.status === "connected" && connection.canTrade === true);
         if (connection.status !== "connected") {
-          const name = brokerName(instance);
-          const reason = brokerReason(connection.lastError);
-          throw new SignInNeededError(reason
-            ? `${name} needs you to sign in again: ${reason}. Press Connect in Brokers.`
-            : `Press Connect in Brokers to sign in to ${name}.`);
+          const singleConnection = deps.findBroker(signedInBrokerId(instance))?.capabilities.singleConnection;
+          throw new SignInNeededError(signInEndedMessage(brokerName(instance), connection.lastError, singleConnection !== false));
         }
       });
     },

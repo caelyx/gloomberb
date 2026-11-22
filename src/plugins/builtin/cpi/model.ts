@@ -1,7 +1,9 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { CpiBoardPayload, CpiReleaseStatus, CpiRow } from "../../../api-client/cpi";
 import type { ChartStripSpec } from "../../../components/chart-table/header";
 import { staticSeries } from "../../../components/chart/static/series";
 import type { ResolvedSeries } from "../../../time-series/types";
+import { cpiYearGapNote } from "../shared/cpi-year-gap";
 
 /**
  * The rows Gloom Cloud serves, by the ids its board uses, so `CPI shelter`
@@ -94,11 +96,11 @@ function signed(value: number, decimals: number): string {
 }
 
 /** Percent changes as the pane shows them: two decimals, signed, no unit (the header names it). */
-export const formatCpiChange = (value: number | null) => value == null ? "--" : signed(value, 2);
+export const formatCpiChange = (value: number | null) => value == null ? MISSING_VALUE : signed(value, 2);
 /** Contributions in percentage points, two decimals, signed. */
-export const formatCpiPoints = (value: number | null) => value == null ? "--" : signed(value, 2);
+export const formatCpiPoints = (value: number | null) => value == null ? MISSING_VALUE : signed(value, 2);
 /** Share of the basket, percent: one decimal. */
-export const formatCpiWeight = (value: number | null) => value == null ? "--" : value.toFixed(1);
+export const formatCpiWeight = (value: number | null) => value == null ? MISSING_VALUE : value.toFixed(1);
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -107,26 +109,37 @@ export function cpiMonth(period: string): string {
   return `${MONTHS[Number(period.slice(5, 7)) - 1]} ${period.slice(0, 4)}`;
 }
 
-/** A release instant on BLS's own clock: "Wed Oct 14 08:30 ET". */
+/** A release instant on BLS's own clock: "Wed 14 Oct 08:30 ET". */
 function releaseTime(iso: string): string {
   const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York", weekday: "short", month: "short", day: "numeric",
     hour: "2-digit", minute: "2-digit", hourCycle: "h23",
   }).formatToParts(new Date(iso)).map((part) => [part.type, part.value]));
-  return `${parts.weekday} ${parts.month} ${parts.day} ${parts.hour}:${parts.minute} ET`;
+  return `${parts.weekday} ${parts.day} ${parts.month} ${parts.hour}:${parts.minute} ET`;
 }
 
 /**
  * The month the data covers, when it came out and when the next release is
- * due, on one line: "Aug 2026 · released Fri Sep 11 08:30 ET · next Wed Oct
- * 14 08:30 ET". A release past its time and not in yet reads "due".
+ * due, on one line: "Aug 2026 · released Fri 11 Sep 08:30 ET · next Wed
+ * 14 Oct 08:30 ET". A release past its time and not in yet reads "due".
  */
 export function cpiHeaderLine(release: CpiReleaseStatus, now = Date.now()): string | undefined {
+  const stamp = cpiReleaseStamp(release);
+  if (!stamp) return undefined;
+  const next = cpiNextRelease(release, now);
+  return next ? `${stamp} · ${next}` : stamp;
+}
+
+/** The month the data covers and when it came out: "Aug 2026 · released Fri 11 Sep 08:30 ET". What the pane's bar keeps whole. */
+export function cpiReleaseStamp(release: CpiReleaseStatus): string | undefined {
   if (!release.period) return undefined;
-  const parts = [cpiMonth(release.period)];
-  if (release.releasedAt) parts.push(`released ${releaseTime(release.releasedAt)}`);
-  if (release.nextReleaseAt) parts.push(`${Date.parse(release.nextReleaseAt) <= now ? "due" : "next"} ${releaseTime(release.nextReleaseAt)}`);
-  return parts.join(" · ");
+  return release.releasedAt ? `${cpiMonth(release.period)} · released ${releaseTime(release.releasedAt)}` : cpiMonth(release.period);
+}
+
+/** When the next release is due, "next Wed 14 Oct 08:30 ET" ("due" once past its time): what gives way in a narrow pane. */
+export function cpiNextRelease(release: CpiReleaseStatus, now = Date.now()): string | undefined {
+  if (!release.nextReleaseAt) return undefined;
+  return `${Date.parse(release.nextReleaseAt) <= now ? "due" : "next"} ${releaseTime(release.nextReleaseAt)}`;
 }
 
 /** The first of the month a change is for, which the chart plots it on. */
@@ -189,6 +202,22 @@ export function cpiChartSeries(row: CpiRow, headline: CpiRow | null, colors: Cpi
       calendarSpaced: true }), ...YEAR_UNIT, axis: "right" });
   return series.filter((entry) => entry.points.length > 0);
 }
+
+/**
+ * Why a row's year-over-year change is empty for the release's month, with the
+ * latest month it has one for (`cpiYearGapNote`): "BLS published no October
+ * 2025 index, so no October 2026 y/y; All items 3.7% in September 2026." Null
+ * when the row has its change, or misses it for another reason.
+ */
+export function cpiYearGapLine(payload: Pick<CpiBoardPayload, "release">, row: CpiRow | null | undefined): string | null {
+  if (!payload.release.period || !row || row.yoy != null) return null;
+  const latest = row.history.findLast(([period, , yoy]) => yoy != null && period < payload.release.period!);
+  return cpiYearGapNote(payload.release.period, row.label, latest ? { period: latest[0], value: latest[2]! } : null);
+}
+
+/** The headline's gap line (`cpiYearGapLine`), which the table closes on. */
+export const cpiHeadlineYearGapLine = (payload: CpiBoardPayload) =>
+  cpiYearGapLine(payload, payload.rows.find((row) => row.code === "SA0"));
 
 /** One row for a short pane: the row's year-over-year line and its latest value. */
 export function cpiChartStrip(row: CpiRow, color: string): ChartStripSpec | null {

@@ -97,6 +97,7 @@ let officialIds: ReadonlySet<string> | null = null;
 let officialLookup: Promise<void> | null = null;
 let automationDepth = 0;
 const builtinPlugins = new WeakSet<object>();
+const openListeners = new Set<() => void>();
 
 /** Reads the config switch and the environment. Absent means on. */
 export function usageCountsEnabled(
@@ -196,10 +197,25 @@ export function automationActive(): boolean {
   return automationDepth > 0;
 }
 
+/**
+ * Calls `listener` each time the user opens a function, with nothing about
+ * which one, whether or not usage counts are on. The web terminal's One Tap
+ * prompt waits for one; automation never reaches it.
+ */
+export function subscribeFunctionOpens(listener: () => void): () => void {
+  openListeners.add(listener);
+  return () => {
+    openListeners.delete(listener);
+  };
+}
+
 /** Counts one open of a function by the user. Never throws. */
 export function recordFunctionOpen(fn: UsageFunction): void {
   try {
     if (automationDepth > 0) return;
+    for (const listener of openListeners) {
+      try { listener(); } catch { /* Intentional ignore: a listener never stops the open. */ }
+    }
     if (host && !host.isEnabled()) return;
     count(fn, "opened");
     scheduleFlush();
@@ -222,6 +238,49 @@ export function recordRestoredFunctions(fns: readonly UsageFunction[]): void {
     scheduleFlush();
   } catch (error) {
     logFailure("telemetry-usage-counts", "Could not record restored function usage")(error);
+  }
+}
+
+/**
+ * Counts a function that put itself on screen at launch, with nothing opened
+ * by the user (the since-last-visit strip): in `restored`, never `opened`, and
+ * no open listener hears of it. Unlike `recordRestoredFunctions` it can be
+ * called on its own, once the function knows it showed. Never throws.
+ */
+export function recordFunctionShown(fn: UsageFunction): void {
+  try {
+    if (automationDepth > 0) return;
+    if (host && !host.isEnabled()) return;
+    count(fn, "restored");
+    scheduleFlush();
+  } catch (error) {
+    logFailure("telemetry-usage-counts", "Could not record a function shown at launch")(error);
+  }
+}
+
+/** The install as its usage counts name it: the random install id, the surface and the OS. */
+export interface UsageInstall {
+  installId: string;
+  surface: UsageCountsSurface;
+  os?: string;
+}
+
+/**
+ * The install as usage counts report it, for what else the Usage setting
+ * covers that is filed under the install id (an install experiment, see
+ * api-client/install-experiments.ts). Null while nothing can be sent: no
+ * host yet, Usage counts off, or no install id. Never throws.
+ */
+export async function usageInstall(): Promise<UsageInstall | null> {
+  try {
+    const current = host;
+    if (!current || !current.isEnabled()) return null;
+    const installId = await current.getInstallId();
+    if (!installId) return null;
+    return { installId, surface: current.surface, ...(current.os ? { os: current.os } : {}) };
+  } catch (error) {
+    logFailure("telemetry-usage-counts", "Could not read the install id")(error);
+    return null;
   }
 }
 

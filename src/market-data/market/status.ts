@@ -1,12 +1,14 @@
 import type { MarketState, Quote } from "../../types/financials";
 import { blendHex, colors, priceColor, type ThemeColors } from "../../theme/colors";
 import { isFiniteNumber } from "../../utils/guards";
-import { canonicalExchange, isKnownExchangeCode } from "../../utils/exchanges";
+import { canonicalExchange, isKnownExchangeCode, isUsListingExchange, resolveExchangeTimeZone } from "../../utils/exchanges";
 import { quoteTradingDay } from "../quotes/day-range";
-import { isQuoteBeforeLatestSession } from "../quotes/freshness";
+import { awaitingFirstDelayedPrint, isQuoteBeforeLatestSession } from "../quotes/freshness";
 import { delistingLabel, delistingStateLabel } from "../quotes/delisting";
-import { preMarketOpenOn, regularSessionCloseOn } from "./freshness";
+import { preMarketOpenOn, regularSessionCloseOn, venueSessionOnOrBefore } from "./freshness";
 import { futuresWeekendClosure } from "./futures-week";
+import { indexLevelMarketState } from "./index-level";
+import { indexSessionVenue } from "./index-session-venues";
 
 const CLOSED_CHANGE_MUTING_RATIO = 0.55;
 const US_SESSION_TIME = new Intl.DateTimeFormat("en-US", {
@@ -66,6 +68,14 @@ export function marketStateLabel(state: MarketState): string {
 
 /** What a quote's session reads as once its last print is older than its venue's latest completed session. */
 const STALE_SESSION_LABEL = "STALE";
+/**
+ * What a quote's session reads as when nothing traded in the session its price
+ * is from, nor today while its venue trades: its price is the venue's nominal
+ * one (Quote.nominalPrice).
+ */
+const NO_TRADES_SESSION_LABEL = "NO TRADES";
+/** What a quote's session reads as when no live quote prices it: the close of its latest daily bar (Quote.dailyClose). */
+const DAILY_CLOSE_SESSION_LABEL = "DAILY CLOSE";
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] as const;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
@@ -88,9 +98,25 @@ export function quoteBookSessionLabel(quote: Quote): string | null {
   if (extended) return extended;
   const day = quoteTradingDay(quote);
   const date = day ? new Date(`${day}T00:00:00Z`) : null;
-  return date && Number.isFinite(date.getTime())
+  const label = date && Number.isFinite(date.getTime())
     ? `last quote, ${WEEKDAYS[date.getUTCDay()]} ${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`
     : "last quote";
+  return offMarketBook(quote) ? `${label}, off-market` : label;
+}
+
+/** Past this share of the last price, a closed market's bid or ask is no market for it. */
+const OFF_MARKET_SHARE = 0.05;
+
+/**
+ * Whether a closed market's last bid or ask is more than 5% off the last
+ * price: FMX's $118.00 / $135.00 around a $129.85 close on 6 Nov 2026 is a
+ * book left after the close, not where it trades.
+ */
+function offMarketBook(quote: Pick<Quote, "price" | "bid" | "ask">): boolean {
+  const last = quote.price;
+  if (typeof last !== "number" || !Number.isFinite(last) || last <= 0) return false;
+  return [quote.bid, quote.ask].some((side) =>
+    typeof side === "number" && Number.isFinite(side) && side > 0 && Math.abs(side - last) / last > OFF_MARKET_SHARE);
 }
 
 /** `Thu close`: the weekday of the session whose close a quote still stands at. */
@@ -106,7 +132,11 @@ function closeLabel(date: string): string {
  */
 function quoteMarketState(quote: Quote | null | undefined, now = Date.now()): MarketState | undefined {
   if (!quote?.marketState) return undefined;
-  return futuresWeekendClosure(quote.listingExchangeName || quote.exchangeName, now) ? "CLOSED" : quote.marketState;
+  if (futuresWeekendClosure(quote.listingExchangeName || quote.exchangeName, now)) return "CLOSED";
+  // The session follows the venue's calendar: LSE is open at 08:09, though its delayed feed has not printed in it yet.
+  if (quote.marketState !== "REGULAR" && awaitingFirstDelayedPrint(quote, now)) return "REGULAR";
+  // An index's final close is a close, not an after-hours session.
+  return indexLevelMarketState(quote);
 }
 
 /**
@@ -118,6 +148,8 @@ function quoteMarketState(quote: Quote | null | undefined, now = Date.now()): Ma
  */
 export function quoteMarketStateLabel(quote: Quote | null | undefined, now = Date.now()): string | null {
   if (quote?.delisting) return delistingLabel(quote.delisting);
+  if (quote?.nominalPrice) return NO_TRADES_SESSION_LABEL;
+  if (quote?.dailyClose) return DAILY_CLOSE_SESSION_LABEL;
   if (!quote?.marketState) return null;
   if (isQuoteBeforeLatestSession(quote, now)) return STALE_SESSION_LABEL;
   const awaiting = preMarketCloseAwaitingPrint(quote);
@@ -224,6 +256,8 @@ export function quoteSessionStateLabel(quote: Quote | null | undefined, now = Da
 
 function sessionLabel(quote: Quote | null | undefined, now: number, standingClose: boolean): string | null {
   if (quote?.delisting) return standingClose ? delistingLabel(quote.delisting) : delistingStateLabel(quote.delisting);
+  if (quote?.nominalPrice) return NO_TRADES_SESSION_LABEL;
+  if (quote?.dailyClose) return DAILY_CLOSE_SESSION_LABEL;
   if (!quote?.marketState) return null;
   if (isQuoteBeforeLatestSession(quote, now)) return STALE_SESSION_LABEL;
   if (overnightSessionDisplay(quote)) return "OVERNIGHT";
@@ -238,7 +272,7 @@ function sessionLabel(quote: Quote | null | undefined, now: number, standingClos
  * pre-market still stands at.
  */
 export function quoteSessionColor(quote: Quote | null | undefined, palette: ThemeColors = colors, now = Date.now()): string {
-  if (quote?.delisting) return palette.warning;
+  if (quote?.delisting || quote?.nominalPrice || quote?.dailyClose) return palette.warning;
   if (!quote?.marketState) return palette.textDim;
   if (isQuoteBeforeLatestSession(quote, now)) return palette.warning;
   if (overnightSessionDisplay(quote)) return marketStateColor("POST", palette);
@@ -301,6 +335,43 @@ export function getActiveQuoteDisplay(quote: Quote | null | undefined): ActiveQu
   return { price: quote.price, change: quote.change, changePercent: quote.changePercent };
 }
 
+/** A price and its move, with the extended session it is a print of when it is not the regular session's. */
+export interface SessionPriceDisplay extends ActiveQuoteDisplay {
+  /** Set when the price is a pre-market, after-hours or overnight print. */
+  session?: ExtendedSession;
+  /** That print is the midpoint of the session's bid and ask, nothing having traded in it. */
+  mark?: true;
+}
+
+/**
+ * The latest print (getActiveQuoteDisplay), naming its session when it is a
+ * pre-market, after-hours or overnight trade rather than the regular
+ * session's price or close: the extended print `quote` shows beside Last
+ * (getExtendedSessionDisplay) at the same price. A quote that says nothing
+ * has traded in the session yet (extendedSessionPrint false) carries the
+ * close, which names none. Whatever is priced at the latest print (a
+ * position's value and day, an alert's current price) says which session the
+ * price is from with this.
+ */
+export function getLatestPrintDisplay(quote: Quote | null | undefined): SessionPriceDisplay | null {
+  const latest = getActiveQuoteDisplay(quote);
+  if (!latest || quote?.extendedSessionPrint === false) return latest;
+  const extended = getExtendedSessionDisplay(quote);
+  if (!extended || extended.price !== latest.price) return latest;
+  return { ...latest, session: extended.session, ...(extended.mark ? { mark: true as const } : {}) };
+}
+
+/**
+ * The extended session `price` is a print of: the quote's latest print's
+ * (getLatestPrintDisplay) when that is the price and a pre-market,
+ * after-hours or overnight trade. Null for a regular session's price or close,
+ * and for any other price (an option's mark, a future's settlement).
+ */
+export function extendedPrintSession(quote: Quote | null | undefined, price: number | null | undefined): ExtendedSession | null {
+  const latest = getLatestPrintDisplay(quote);
+  return latest?.session && price != null && latest.price === price ? latest.session : null;
+}
+
 function isPositive(value: number | undefined): value is number {
   return isFiniteNumber(value) && value > 0;
 }
@@ -324,6 +395,18 @@ function reportedRegularMove(quote: Quote, close: number): CompletedRegularSessi
 }
 
 /**
+ * The session a quote's day belongs to: its trading day (quoteTradingDay), or
+ * for a print stamped on a day its venue does not trade (a Saturday after
+ * midnight New York, a holiday), the latest session before it. No session is
+ * read into a non-trading day.
+ */
+function quoteSessionDay(quote: Quote): string | null {
+  const day = quoteTradingDay(quote);
+  if (!day) return null;
+  return venueSessionOnOrBefore(quote.listingExchangeName || quote.exchangeName, day) ?? day;
+}
+
+/**
  * The regular session the quote's day follows, once it is over: after hours,
  * overnight, and through a weekend or holiday until the next pre-market, and
  * in the pre-market when the quote reports the last session's close and move,
@@ -344,7 +427,8 @@ function completedRegularSession(quote: Quote): CompletedRegularSession | null {
       const today = quoteTradingDay(quote);
       return reported && closeDate && today && closeDate < today ? { close, reported, date: closeDate } : null;
     }
-    if (closeDate ? closeDate === quoteTradingDay(quote) : state === "POST") {
+    // A print after the close, a weekend print included, never headlines over that close.
+    if (closeDate ? closeDate === quoteSessionDay(quote) : state === "POST") {
       return closeDate ? { close, reported, date: closeDate } : { close, reported };
     }
   }
@@ -403,12 +487,23 @@ function preMarketCloseAwaitingPrint(quote: Quote | null | undefined): { date: s
 
 /**
  * When the price a quote's headline shows was observed: the regular close a
- * pre-market with no trade yet still stands at (preMarketCloseAwaitingPrint),
- * otherwise the quote's last update. What an Updated cell and a report's
- * as-of date the quote by.
+ * pre-market with no trade yet still stands at (preMarketCloseAwaitingPrint);
+ * a completed session's close stamped after the venue closed, with no
+ * extended print beside it, at that close (regularSessionCloseOn), as `fn
+ * ADR` and `fx` date it (GGAL.BA's 4,857.50 read 20:59 UTC in `quote` and
+ * 20:10 in `fn ADR`, its close on BYMA's calendar); otherwise the quote's last
+ * update. What an Updated cell and a report's as-of date the quote by.
  */
 export function quoteHeadlineTime(quote: Quote): number {
-  return preMarketCloseAwaitingPrint(quote)?.closedAt ?? quote.lastUpdated;
+  const awaiting = preMarketCloseAwaitingPrint(quote);
+  if (awaiting) return awaiting.closedAt;
+  // A closed market's quote only: in a pre-market or after-hours session the last update can be a print.
+  const date = quote.marketState === "CLOSED" && !quote.delisting ? regularSessionDisplayDate(quote) : null;
+  if (date && Number.isFinite(quote.lastUpdated) && !getExtendedSessionDisplay(quote)) {
+    const closedAt = regularSessionCloseOn(quote.listingExchangeName || quote.exchangeName, date);
+    if (closedAt != null && quote.lastUpdated > closedAt) return closedAt;
+  }
+  return quote.lastUpdated;
 }
 
 /**
@@ -449,6 +544,31 @@ export function regularSessionDisplayDate(quote: Quote | null | undefined): stri
 }
 
 /**
+ * The exchange-local day of the close a quote's headline holds at once its
+ * regular session is over (and in the pre-market while it still shows the last
+ * close), so a report that prints an extended print beside it dates each: the
+ * close by its day, the print by its time (extendedPrintTime). Null while the
+ * session trades, for a listing that no longer trades, and when the quote does
+ * not say which day the close is.
+ */
+export function headlineCloseDate(quote: Quote | null | undefined): string | null {
+  if (!quote || quote.delisting || completedRegularClose(quote) == null) return null;
+  const date = regularSessionDisplayDate(quote);
+  return date && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : null;
+}
+
+/**
+ * When the pre-market, after-hours or overnight print getExtendedSessionDisplay
+ * shows was observed: the quote's last update, which that print is (the close
+ * beside it holds at its own day, headlineCloseDate). Null without an extended
+ * print or a time.
+ */
+export function extendedPrintTime(quote: Quote | null | undefined): number | null {
+  if (!quote || !getExtendedSessionDisplay(quote)) return null;
+  return Number.isFinite(quote.lastUpdated) && quote.lastUpdated > 0 ? quote.lastUpdated : null;
+}
+
+/**
  * getRegularSessionDisplay once the regular session is over (and in the
  * pre-market, while the quote carries the last session's close and move), null
  * while it is open. A table row headlines this when it has a column for the
@@ -480,14 +600,33 @@ export function getRegularSessionBarClose(quote: Quote | null | undefined): { pr
   return { price: quote.price, sessionDate: null };
 }
 
+/** Sessions of their own, which a stock venue's hours do not describe. */
+const OWN_SESSION_INSTRUMENT_TYPES = new Set(["FUTURE", "CRYPTOCURRENCY", "CURRENCY", "OPTION"]);
+
+/**
+ * Whether a quote's venue holds a pre-market or after-hours session. A US
+ * listing does. A stock, fund or index on a venue abroad (JPX, HKEX, LSE) has
+ * none: a price there that is not the close is no extended print, and 8058:JPX
+ * read "After-Hours +4.17%" beside its +4.28% close. Futures, coins and
+ * currency pairs, and a venue whose hours are not known, keep what the source
+ * says.
+ */
+function venueHoldsExtendedSession(quote: Quote): boolean {
+  if (OWN_SESSION_INSTRUMENT_TYPES.has(quote.instrumentType?.toUpperCase() ?? "")) return true;
+  const venue = indexSessionVenue(quote.symbol) ?? canonicalExchange(quote.listingExchangeName || quote.exchangeName);
+  if (!venue || isUsListingExchange(venue)) return true;
+  return !(isKnownExchangeCode(venue) && resolveExchangeTimeZone(venue));
+}
+
 /**
  * The pre-market or after-hours print, measured from the regular close before
  * it, while the quote has one: the pre-market until the open, the after-hours
  * session from the close, and its last print until the next pre-market. Null
- * when there is no extended print to show.
+ * when there is no extended print to show, and always for a venue without
+ * those sessions (venueHoldsExtendedSession).
  */
 export function getExtendedSessionDisplay(quote: Quote | null | undefined): ExtendedSessionDisplay | null {
-  if (!quote || quote.delisting) return null;
+  if (!quote || quote.delisting || !venueHoldsExtendedSession(quote)) return null;
   const overnight = overnightSessionDisplay(quote);
   if (overnight) return overnight;
   const state = quote.marketState;

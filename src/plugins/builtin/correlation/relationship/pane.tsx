@@ -15,11 +15,10 @@ import { scalarPoint, staticSeries } from "../../../../components/chart/static/s
 import { usePaneRefreshKey } from "../../../../components/data-table/table-pane";
 import { useShortcut, type KeyEventLike } from "../../../../react/input";
 import { usePaneInstance } from "../../../../state/app/context";
-import { colors } from "../../../../theme/colors";
 import { formatTickerListInput } from "../../../../tickers/list";
 import type { ResolvedSeries } from "../../../../time-series/types";
 import type { PaneProps, PaneTemplateDef } from "../../../../types/plugin";
-import { Box, Text, useUiCapabilities } from "../../../../ui";
+import { Box, useUiCapabilities } from "../../../../ui";
 import { formatNumber } from "../../../../utils/format";
 import { isPlainKey } from "../../../../utils/keyboard";
 import { usePluginPaneState } from "../../../runtime";
@@ -76,7 +75,7 @@ const REGRESSION_COLOR = "#ffd43b";
 const RATIO_COLOR = "#e599f7";
 /** Legend and time axis around the stacked panels. */
 const CHART_CHROME_ROWS = 2;
-/** The scatter's two label rows around a readable plot. */
+/** The scatter's y-axis title row and x-axis row around a readable plot. */
 const MIN_SCATTER_ROWS = 8;
 const MIN_PANEL_ROWS = 3;
 
@@ -145,7 +144,7 @@ export function RelationshipGraphPane({ focused, width, height }: PaneProps) {
   const left = data?.[0] ?? null;
   const right = data?.[1] ?? null;
   const analysis = useMemo(() => (
-    left && right ? buildRelationshipAnalysis(left.points, right.points, correlationWindow) : null
+    left && right ? buildRelationshipAnalysis(left.points, right.points, correlationWindow, [left.symbol, right.symbol]) : null
   ), [correlationWindow, left, right]);
   const cycleRange = useCallback(() => setRange((current) => nextRelationshipRange(current)), [setRange]);
   const cycleWindow = useCallback(() => setCorrelationWindow((current) => nextRelationshipWindow(current)), [setCorrelationWindow]);
@@ -213,7 +212,7 @@ export function RelationshipGraphPane({ focused, width, height }: PaneProps) {
     return true;
   }, [alignedDates]);
 
-  usePaneRefreshKey(() => { void reload(); }, { focused });
+  usePaneRefreshKey(() => { reload(); }, { focused });
   useShortcut((event) => {
     if (!focused) return;
     if (isPlainKey(event, "home", "end") && jumpCursor(event.name)) {
@@ -238,14 +237,15 @@ export function RelationshipGraphPane({ focused, width, height }: PaneProps) {
     registrationId: "relationship-warnings", focused,
     notices: [
       ...(error ? [`${error}${data && updatedAt ? ` Retained history retrieved ${new Date(updatedAt).toISOString()}.` : ""}`] : []),
-      ...(analysis?.unavailableReason ? [analysis.unavailableReason] : []),
       ...(analysis?.correlationUnavailableReason ? [analysis.correlationUnavailableReason] : []),
     ],
   });
 
   // The legend reads the values at the cursor and the axis carries its date,
   // so the footer only reports loading.
-  usePaneStatusFooter({ registrationId: "relationship-graph", loading });
+  const rollInfo = useMemo(() => analysis?.rollNotes.length
+    ? [{ id: "rolls", parts: [{ text: analysis.rollNotes.join(" · "), tone: "muted" as const }] }] : undefined, [analysis]);
+  usePaneStatusFooter({ registrationId: "relationship-graph", loading, ...(rollInfo ? { info: rollInfo } : {}) });
 
   if (!pair) {
     return (
@@ -275,7 +275,7 @@ export function RelationshipGraphPane({ focused, width, height }: PaneProps) {
     return (
       <Box flexDirection="column" width={width} height={height}>
         {queryBar}
-        <PaneStatusBody loading={loading} error={loading ? null : analysis?.unavailableReason ?? error} subject="relationship history" empty emptyTitle="No overlapping price history." />
+        <PaneStatusBody loading={loading} error={loading ? null : error} subject="relationship history" empty emptyTitle="No overlapping price history." />
       </Box>
     );
   }
@@ -303,15 +303,15 @@ export function RelationshipGraphPane({ focused, width, height }: PaneProps) {
         />
       </Box>
       {layout.scatterRows > 0 ? (
-        <Box flexDirection="column" height={layout.scatterRows} flexShrink={0}>
-          <Box paddingX={1} height={1}><Text fg={colors.textDim}>{`${leftSymbol} returns (%)`}</Text></Box>
+        <Box height={layout.scatterRows} flexShrink={0}>
           <StaticScatterChartSurface
             points={scatterPoints}
             width={width}
-            height={layout.scatterRows - 2}
+            height={layout.scatterRows}
             regression={stats ? { slope: stats.beta, intercept: stats.alpha, color: REGRESSION_COLOR } : null}
+            xLabel={`${rightSymbol} returns (%)`}
+            yLabel={`${leftSymbol} returns (%)`}
           />
-          <Box paddingX={1} height={1}><Text fg={colors.textDim}>{`${rightSymbol} returns (%)`}</Text></Box>
         </Box>
       ) : null}
     </Box>

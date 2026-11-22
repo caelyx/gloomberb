@@ -1,16 +1,21 @@
-import { afterAll, beforeAll, expect, setSystemTime, test } from "bun:test";
+import { afterAll, beforeAll, expect, setSystemTime, spyOn, test } from "bun:test";
+import * as screenshotRender from "./screenshot-render";
 import type { ResolvedPaneFunction } from "./resolver";
 import type { HeadlessPaneContext } from "../../types/headless";
-import { assessPaneScreenshot } from "./screenshot-assessment";
+import { assessPaneScreenshot, shotStatusIssues } from "./screenshot-assessment";
 import type { PaneScreenshotResult } from "./screenshot-types";
 import type { DesktopPaneShotPayload, DesktopPaneShotRenderResult } from "../desktop-pane-shot";
-import { appendDomReportFooter, buildDomPaneReportFromRender, domReportNote, domReportView } from "./dom";
+import { appendDomReportFooter, buildDomFunctionReport, buildDomPaneReportFromRender, domReportNote, domReportView } from "./dom";
+import { askgLockNote } from "../../plugins/builtin/cloud/askg/lock-note";
+import type { MarketContext } from "../types";
 import { getPaneFunctionCapability } from "./capabilities";
 import { researchModule } from "../../plugins/builtin/research";
 import { filingEventsModule } from "../../plugins/builtin/filing-events";
 import { renderReportCsv } from "../report-tables";
 import { formatFreshnessLine } from "./freshness";
 import { reportFailure } from ".";
+import * as paneCatalog from "./catalog";
+import { DATA_SERVICE_UNREACHABLE_MESSAGE, DataServiceUnreachableError, isNetworkFailure } from "../../utils/network-failure";
 
 // The status line names the year only when it is not the current one.
 beforeAll(() => setSystemTime(new Date("2026-10-10T12:00:00Z")));
@@ -66,10 +71,10 @@ test("keeps a cell under its own column when an earlier cell in the row is blank
       visibleText: "",
       footerText: "15m delayed",
       rows: [
-        // The pane shortens times to fit; the cell keeps the instant behind them.
-        { tableIndex: 0, rowIndex: 0, selected: false, cells: [cell("time", "TIME", "Wed 11:27", "2026-10-07T11:27:00.000Z"), cell("title", "HEADLINE", "Deal"), cell("tickers", "TICKERS", "PSKY"), cell("categories", "CATEGORY", "M&A")] },
+        // The pane shortens times to fit, on the host's clock its header names; the cell keeps the instant behind them.
+        { tableIndex: 0, rowIndex: 0, selected: false, cells: [cell("time", "TIME HKT", "Wed 19:27", "2026-10-07T11:27:00.000Z"), cell("title", "HEADLINE", "Deal"), cell("tickers", "TICKERS", "PSKY"), cell("categories", "CATEGORY", "M&A")] },
         // The DOM capture drops the blank TICKERS cell.
-        { tableIndex: 0, rowIndex: 1, selected: false, cells: [cell("time", "TIME", "Oct 2", "2026-10-02T14:00:00.000Z"), cell("title", "HEADLINE", "Sanctions"), cell("categories", "CATEGORY", "Regulatory")] },
+        { tableIndex: 0, rowIndex: 1, selected: false, cells: [cell("time", "TIME HKT", "Oct 2", "2026-10-02T14:00:00.000Z"), cell("title", "HEADLINE", "Sanctions"), cell("categories", "CATEGORY", "Regulatory")] },
       ],
       truncated: false,
       truncationReasons: [],
@@ -87,17 +92,71 @@ test("keeps a cell under its own column when an earlier cell in the row is blank
   const row = lines.find((line) => line.includes("Sanctions"))!;
   expect(row.indexOf("Regulatory")).toBe(header.indexOf("CATEGORY"));
   expect(lines.find((line) => line.includes("Deal"))).toContain("2026-10-07 11:27 UTC");
+  // `fn TOP` headed those UTC times "TIME HKT": the header names the report's zone, not the clock the pane drew.
+  expect(header).toStartWith("TIME UTC ");
   expect(row).toContain("2026-10-02 14:00 UTC");
   // The pane's declaration says what the data is; a footer phrase does not turn it into a feed.
   expect(report.data.freshness).toMatchObject({ source: "Gloom Cloud", asOf: "2026-10-07T11:27:00.000Z", status: "not-a-feed" });
   // --csv writes the same columns, the blank cell empty and each time as the instant behind it.
   expect(renderReportCsv(report.tables).split("\n").slice(0, 5)).toEqual([
-    "TIME,HEADLINE,TICKERS,CATEGORY",
+    "TIME UTC,HEADLINE,TICKERS,CATEGORY",
     "2026-10-07T11:27:00.000Z,Deal,PSKY,M&A",
     "2026-10-02T14:00:00.000Z,Sanctions,,Regulatory",
     "",
     "# Source: Gloom Cloud · Wed 7 Oct 2026 11:27 UTC · not a live feed (published stories)",
   ]);
+});
+
+test("a column only the exports carry (FUT's 3M, 6M and 1Y) is in the JSON and CSV, never in the text; a sector is each row's Group there", async () => {
+  const resolved = { token: "FUT", label: "Futures", options: {}, capability: { id: "futures-pane" }, pane: { id: "futures" } } as unknown as ResolvedPaneFunction;
+  const cells = [{ columnId: "code", columnLabel: "SYM", text: "ES" }, { columnId: "return1w", columnLabel: "1W", text: "-0.71%", value: -0.71 },
+    { columnId: "return1y", columnLabel: "1Y", text: "+14.10%", value: 14.1, reportOnly: true as const }];
+  const row = { tableIndex: 0, rowIndex: 1, key: "ES=F", selected: false, cells };
+  const sector = { tableIndex: 0, rowIndex: 0, key: "sector:equity", selected: false, section: true as const, cells: [{ columnId: "code", columnLabel: "SYM", text: "Equity Index" }] };
+  const screenshot = { symbols: [], render: { visibleText: "", rows: [{ ...row, cells: cells.slice(0, 2) }], reportRows: [sector, row],
+    truncated: false, truncationReasons: [], reportTruncationReasons: [], loadingStateDetected: false, errorStateDetected: false,
+    errorStateMarkers: [], emptyStateDetected: false, emptyStateMarkers: [] } } as unknown as PaneScreenshotResult;
+  const report = await buildDomPaneReportFromRender(resolved, screenshot);
+  expect(report.text).not.toContain("1Y");
+  expect(report.text).not.toContain("14.10");
+  // `fn FUT ZC` printed "Agriculture — — —" as a row: the text groups the rows as the CSV does.
+  expect(report.text).toMatch(/SYM +1W +GROUP\n[─ ]+\nES +-0\.71% +Equity Index$/);
+  expect((report.data.rows as typeof screenshot.render.rows).at(-1)!.cells.at(-1)).toMatchObject({ columnId: "return1y", value: 14.1 });
+  // No row of its own: the sector closes each row under it, after every column an earlier export had.
+  expect(renderReportCsv(report.tables).split("\n").slice(0, 2)).toEqual(["SYM,1W (%),1Y (%),Group", "ES,-0.71,14.1,Equity Index"]);
+});
+
+test("a time the pane draws as a date, at 00:00 UTC, prints as the date; one it draws with a time of day keeps it", async () => {
+  const resolved = {
+    token: "CLTR", label: "SEC Comment Letters", options: {}, capability: { id: "comment-letters-pane" },
+    pane: { id: "comment-letters", reportFreshness: { status: "not-a-feed", basis: "comment letters" } },
+  } as unknown as ResolvedPaneFunction;
+  const cell = (columnId: string, columnLabel: string, text: string, instant?: string) => ({ columnId, columnLabel, text, ...(instant ? { instant } : {}) });
+  const screenshot = {
+    symbols: [],
+    render: {
+      visibleText: "",
+      rows: [
+        // A filing's date, an all-day event and a shortened date carry no time of day.
+        { tableIndex: 0, rowIndex: 0, selected: false, cells: [cell("filed", "Filed", "2026-08-31", "2026-08-31T00:00:00.000Z"), cell("what", "What", "Alpha")] },
+        { tableIndex: 0, rowIndex: 1, selected: false, cells: [cell("filed", "Filed", "All day", "2026-08-28T00:00:00.000Z"), cell("what", "What", "Bravo")] },
+        { tableIndex: 0, rowIndex: 2, selected: false, cells: [cell("filed", "Filed", "Oct 2", "2026-10-02T00:00:00.000Z"), cell("what", "What", "Charlie")] },
+        // A time of day the pane draws, even a midnight, is a time.
+        { tableIndex: 0, rowIndex: 3, selected: false, cells: [cell("filed", "Filed", "Thu 00:00", "2026-10-01T00:00:00.000Z"), cell("what", "What", "Delta")] },
+        { tableIndex: 0, rowIndex: 4, selected: false, cells: [cell("filed", "Filed", "Wed 11:27", "2026-10-07T11:27:00.000Z"), cell("what", "What", "Echo")] },
+      ],
+      truncated: false, truncationReasons: [], loadingStateDetected: false, errorStateDetected: false,
+      errorStateMarkers: [], emptyStateDetected: false, emptyStateMarkers: [],
+    },
+  } as unknown as PaneScreenshotResult;
+
+  const report = await buildDomPaneReportFromRender(resolved, screenshot);
+  const lines = report.text.split("\n");
+  const filed = (what: string) => lines.find((line) => line.includes(what))!.split(/\s{2,}/)[0]!.trim();
+  expect(["Alpha", "Bravo", "Charlie", "Delta", "Echo"].map(filed))
+    .toEqual(["2026-08-31", "2026-08-28", "2026-10-02", "2026-10-01 00:00 UTC", "2026-10-07 11:27 UTC"]);
+  // The CSV keeps the instant.
+  expect(renderReportCsv(report.tables).split("\n")[1]).toStartWith("2026-08-31T00:00:00.000Z,Alpha");
 });
 
 /**
@@ -161,6 +220,24 @@ test("an OMON shot names the rows its image cuts and how many strikes the window
   expect(shot.render.truncationReasons).toEqual(["rows above and below the rendered viewport are cut"]);
 });
 
+test("a capture of the Layouts surface is not empty for having no rows, and reports no reason", () => {
+  const resolved = {
+    token: "LAY", label: "Layouts", options: {}, pane: { id: "layout-marketplace" },
+    capability: { id: "layout-marketplace", botSafe: false, outputKind: "pane", reportReadiness: "unsupported", screenshotReadiness: "live-dom" },
+  } as unknown as ResolvedPaneFunction;
+  const render = {
+    visibleText: "Layouts", rows: [], visibleKeyValues: [], semanticUi: [], emptyStateDetected: true, loadingStateDetected: false, errorStateDetected: false,
+    accessGate: null, surfaces: [], emptyStateMarkers: ["Log in to browse community layouts."],
+  };
+  const shot = assessPaneScreenshot(resolved, { financials: [] } as unknown as DesktopPaneShotPayload, render as unknown as DesktopPaneShotRenderResult, "", "/tmp/lay-shot-test.png");
+  expect(shot).toMatchObject({ rowCount: 0, empty: false, usable: true, unusableReason: null });
+  expect(shotStatusIssues(shot)).toEqual([]);
+  // The same capture of a pane that shows data is empty.
+  const data = assessPaneScreenshot({ ...resolved, pane: { id: "world-indices" } } as unknown as ResolvedPaneFunction, { financials: [] } as unknown as DesktopPaneShotPayload,
+    render as unknown as DesktopPaneShotRenderResult, "", "/tmp/lay-shot-test.png");
+  expect(data).toMatchObject({ empty: true, usable: false });
+});
+
 test("states the expiry a rendered OMON shows and dates the report by the chain behind it", async () => {
   const resolved = {
     token: "OMON", label: "Options", options: { expiration: "2028-01-21" }, capability: { id: "options-pane" }, pane: { id: "options" },
@@ -201,7 +278,7 @@ test("dates a rendered FXC by the observations behind its rates, in the report a
   const resolved = {
     token: "FXC", label: "FX Cross Rates", options: {}, capability: { id: "fx-matrix-pane" }, pane: { id: "fx-matrix" },
   } as unknown as ResolvedPaneFunction;
-  // Saturday 12:00 UTC (the clock above): Friday's close for the euro, a quiet tick on Saturday morning for the rand.
+  // Saturday 12:00 UTC (the clock above): Friday's close for the euro, the rand's last print of the day before it.
   const observation = (currency: string, quoteTime: string) => ({
     currency, quoteTime, dataSource: "delayed", stale: false, sessionExchange: "CCY", marketState: "CLOSED",
   });
@@ -210,11 +287,11 @@ test("dates a rendered FXC by the observations behind its rates, in the report a
     render: {
       visibleText: "",
       // The pane's own footer states its rates' ages, not their feed.
-      footerText: "oldest rate 2026-10-09 21:29 UTC · fetched 5m ago",
+      footerText: "oldest rate 2026-10-09 20:41 UTC · fetched 5m ago",
       rows: [{ tableIndex: 0, rowIndex: 0, selected: false, cells: [{ columnLabel: "EUR", text: "1.1206" }] }],
       semanticUi: [{
         id: "ui:1", role: "report-freshness", actions: [], metadata: {
-          observations: [observation("EUR", "2026-10-09T21:29:00.000Z"), observation("ZAR", "2026-10-10T04:21:11.000Z")],
+          observations: [observation("EUR", "2026-10-09T20:59:00.000Z"), observation("ZAR", "2026-10-09T20:41:11.000Z")],
         },
       }],
       truncated: false, truncationReasons: [], loadingStateDetected: false, errorStateDetected: false, errorStateMarkers: [],
@@ -223,9 +300,9 @@ test("dates a rendered FXC by the observations behind its rates, in the report a
   } as unknown as PaneScreenshotResult;
 
   const report = await buildDomPaneReportFromRender(resolved, screenshot);
-  expect(formatFreshnessLine(report.data.freshness!)).toBe("Source: Gloom Cloud · FX trading day Fri 9 Oct 2026 close · delayed · markets closed");
-  expect(report.data.freshness).toMatchObject({ status: "delayed", asOf: "2026-10-10T04:21:11.000Z", asOfClose: "2026-10-09", market: { state: "closed" } });
-  expect(renderReportCsv(report.tables)).toContain("# Source: Gloom Cloud · FX trading day Fri 9 Oct 2026 close · delayed · markets closed");
+  expect(formatFreshnessLine(report.data.freshness!)).toBe("Source: Gloom Cloud · FX trading day Fri 9 Oct 2026 close · delayed · markets closed · reopens Sun 21:00 UTC, 17:00 ET");
+  expect(report.data.freshness).toMatchObject({ status: "delayed", asOf: "2026-10-09T20:59:00.000Z", asOfClose: "2026-10-09", market: { state: "closed" } });
+  expect(renderReportCsv(report.tables)).toContain("# Source: Gloom Cloud · FX trading day Fri 9 Oct 2026 close · delayed · markets closed · reopens Sun 21:00 UTC, 17:00 ET");
 
   // A pane that publishes nothing keeps the unknown status in data, without filler in its line.
   const bare = { ...screenshot, render: { ...screenshot.render, semanticUi: [] } } as unknown as PaneScreenshotResult;
@@ -248,12 +325,17 @@ test("a pane behind the sign-in wall reports what it needs instead of the wall's
       errorStateDetected: true, errorStateMarkers: ["Sign in to"], emptyStateDetected: false, emptyStateMarkers: [],
     },
   } as unknown as PaneScreenshotResult)).text;
-  expect(await wall("DIAG MSTR Sign in to run the Equity Diagnostic. Log in \u21B5 Sign up free")).toBe([
-    "Equity Diagnostic", "", "DIAG MSTR Sign in to run the Equity Diagnostic. Requires a free Gloom sign-in: log in or sign up in the app.",
+  expect(await wall("DIAG MSTR Sign in to run the Equity Diagnostic. Sign up free \u21B5 Log in")).toBe([
+    "Equity Diagnostic", "", "DIAG MSTR Sign in to run the Equity Diagnostic. Requires a free Gloom sign-in: open the app (gloom) and log in or "
+      + "sign up free from the command bar (Ctrl+P, Log In or Sign Up); this command then reads with that session.",
   ].join("\n"));
+  // The key that presses the first button, as the theses wall draws it.
+  expect(await wall("THESIS Sign in to keep investment theses. Sign up free \u21A9 Log in")).toEndWith("keep investment theses. Requires a free Gloom sign-in: "
+    + "open the app (gloom) and log in or sign up free from the command bar (Ctrl+P, Log In or Sign Up); this command then reads with that session.");
   // Signed in with an unconfirmed address, the wall asks for the email instead.
   expect(await wall("DIAG MSTR Verify your email to run the Equity Diagnostic. Resend Verification Email")).toEndWith(
-    "Verify your email to run the Equity Diagnostic. Requires a verified email on your Gloom account; resend the verification email in the app.",
+    "Verify your email to run the Equity Diagnostic. Requires a verified email on your Gloom account: open the app (gloom) and resend the "
+      + "verification email from the command bar (Ctrl+P, Resend Verification Email).",
   );
 });
 
@@ -278,7 +360,7 @@ test("a pane walled whole cites no source, and one that says how to reach it say
       errorStateDetected: true, errorStateMarkers: [], emptyStateDetected: false, emptyStateMarkers: [],
     },
   } as unknown as PaneScreenshotResult, context);
-  const signedOut = await walled("sign-in", "EK NEM Sign in to read 8-K filings. Log in \u21B5 Sign up free");
+  const signedOut = await walled("sign-in", "EK NEM Sign in to read 8-K filings. Sign up free \u21B5 Log in");
   expect(signedOut.data).toMatchObject({ locked: "sign-in", complete: false });
   expect(signedOut.data.freshness).toBeUndefined();
   expect(signedOut.data.reason).toContain("Free, with no sign-in: gloom fn SEC NEM lists NEM's recent filings");
@@ -342,4 +424,146 @@ test("a rendered pane with rows beside an error marker has data for its symbol a
   const bare = await buildDomPaneReportFromRender(resolved, render([]));
   expect(bare.data.unavailableSymbols).toEqual(["AAPL"]);
   expect(reportFailure(bare.data, "fn DES AAPL", { tables: bare.tables })?.code).toBe("no_data");
+});
+
+test("a pane the sign-in wall covers whole reports the wall at once without a session, as the rendered wall reports it", async () => {
+  const { resolved, context } = askgFunction();
+  const previous = process.env.GLOOMBERB_SESSION_TOKEN;
+  delete process.env.GLOOMBERB_SESSION_TOKEN;
+  try {
+    const report = await buildDomFunctionReport(resolved, context, "which dividend stocks are cheap");
+    expect(report.data).toMatchObject({ locked: "sign-in", empty: true, complete: false });
+    expect(report.data.freshness).toBeUndefined();
+    expect(report.text).toStartWith("Ask Gloom\n\nAsk Gloom (ASKG in the app) needs only a free, verified Gloom account: log in or sign up free");
+    // The plugin that runs AI on the reader's own key, and the command that adds it.
+    expect(report.text.replace(/\s+/g, " ")).toContain("`gloom install gloom-sh/gloom-byok-ai` adds the BYOK AI plugin");
+    expect(appendDomReportFooter(report.text, domReportView(report.data), report.data.freshness))
+      .toEndWith("Rendered view: the pane is locked, so no values were read.");
+    expect(reportFailure(report.data, "fn ASKG")?.code).toBe("no_data");
+  } finally {
+    if (previous === undefined) delete process.env.GLOOMBERB_SESSION_TOKEN;
+    else process.env.GLOOMBERB_SESSION_TOKEN = previous;
+  }
+});
+
+// `fn ASKG "what did the DAX do yesterday"` signed out pointed at `gloom catalog <topic>` without running it.
+test("a question asked behind the sign-in wall lists the functions the catalog finds for it, each with its command", async () => {
+  const { resolved, context } = askgFunction();
+  const previous = process.env.GLOOMBERB_SESSION_TOKEN;
+  delete process.env.GLOOMBERB_SESSION_TOKEN;
+  const found = spyOn(paneCatalog, "functionsForQuestion").mockImplementation(async (_catalog, question, limit) => question.includes("DAX")
+    ? [{ code: "WEI", label: "World Equity Indices", command: "gloom fn WEI" }, { code: "CMP", label: "Comparison Chart", command: "gloom fn CMP <tickers>" }].slice(0, limit)
+    : []);
+  const catalog = {} as paneCatalog.PaneFunctionCatalog;
+  try {
+    const report = await buildDomFunctionReport(resolved, context, "what did the DAX do yesterday", catalog);
+    expect(report.data).toMatchObject({ locked: "sign-in" });
+    expect(report.text).toContain([
+      "Without AI, the catalog finds these functions for the question:",
+      "gloom fn WEI  World Equity Indices",
+      "gloom fn CMP <tickers>  Comparison Chart",
+    ].join("\n"));
+    expect(report.text).not.toContain("gloom catalog <topic>");
+    // A question it finds nothing for keeps the command that searches.
+    expect((await buildDomFunctionReport(resolved, context, "how are you", catalog)).text).toContain("`gloom catalog <topic>` finds the function");
+  } finally {
+    found.mockRestore();
+    if (previous === undefined) delete process.env.GLOOMBERB_SESSION_TOKEN;
+    else process.env.GLOOMBERB_SESSION_TOKEN = previous;
+  }
+});
+
+test("with a session, the same pane is rendered and answers, never the sign-in wall", async () => {
+  const { resolved, context } = askgFunction();
+  const previous = process.env.GLOOMBERB_SESSION_TOKEN;
+  process.env.GLOOMBERB_SESSION_TOKEN = "session-fixture";
+  const render = spyOn(screenshotRender, "renderDesktopShot").mockImplementation(async () => { throw new Error("Capture renderer reached"); });
+  try {
+    const report = await buildDomFunctionReport(resolved, context, "which dividend stocks are cheap");
+    expect(render).toHaveBeenCalledTimes(1);
+    // The renderer's own failure, not the lock note.
+    expect(report.data.locked).toBeUndefined();
+    expect(report.text).toContain("Capture renderer reached");
+    expect(report.text).not.toContain("needs only a free, verified Gloom account");
+  } finally {
+    render.mockRestore();
+    if (previous === undefined) delete process.env.GLOOMBERB_SESSION_TOKEN;
+    else process.env.GLOOMBERB_SESSION_TOKEN = previous;
+  }
+});
+
+/** ASKG as fn resolves it, with a market context that holds no saved session. */
+function askgFunction() {
+  const resolved = {
+    token: "ASKG", label: "Ask Gloom", options: {}, capability: { id: "askg-pane" }, instance: { settings: {} },
+    // Rendering it would need a browser; a pane that reaches the renderer here fails the test.
+    pane: { id: "askg", signInWall: true, reportLockNote: askgLockNote, component: () => { throw new Error("rendered"); } },
+  } as unknown as ResolvedPaneFunction;
+  const context = { persistence: { pluginState: { get: () => null } }, config: {}, dataProvider: {} } as unknown as MarketContext;
+  return { resolved, context };
+}
+
+// `fn ECO AR` through a proxy that refused every connection printed "No events" and "retrieved" at the time of the
+// run: the load error only reached the pane's footer. A report of a pane with nothing to show stands for its failure.
+test("a pane whose load failed with nothing to show fails as the plain commands do, never its empty body dated", async () => {
+  const resolved = { token: "ECO", label: "Economic Calendar", pane: { id: "econ-calendar", reportFreshness: { status: "not-a-feed", basis: "calendar" } },
+    capability: { id: "econ-calendar-pane" }, options: {}, instance: { settings: {} } } as unknown as ResolvedPaneFunction;
+  const context = { persistence: { pluginState: { get: () => null } }, config: {}, dataProvider: {} } as unknown as MarketContext;
+  const shown = (render: Partial<DesktopPaneShotRenderResult>) => spyOn(screenshotRender, "renderDesktopShot").mockImplementation(async () => ({
+    symbols: [],
+    render: { visibleText: "", rows: [], truncated: false, truncationReasons: [], loadingStateDetected: false, errorStateDetected: false,
+      errorStateMarkers: [], emptyStateDetected: false, emptyStateMarkers: [], semanticUi: [], ...render },
+  }) as unknown as PaneScreenshotResult);
+  const loadError = (message: string) => [{ id: "ui:1", role: "pane-load-error", label: "Load failed", metadata: { message } }];
+
+  // The footer's error, published by the status footer: no connection is said in the words `search` and `quote` use.
+  let render = shown({ visibleText: "UTC IMPACT COUNTRY EVENT No events", emptyStateDetected: true, emptyStateMarkers: ["No events"],
+    semanticUi: loadError(DATA_SERVICE_UNREACHABLE_MESSAGE) } as Partial<DesktopPaneShotRenderResult>);
+  try {
+    const failed = await buildDomFunctionReport(resolved, context, "AR").catch((error: unknown) => error);
+    expect(failed).toBeInstanceOf(DataServiceUnreachableError);
+    expect(isNetworkFailure(failed)).toBe(true);
+  } finally {
+    render.mockRestore();
+  }
+  // An error state the body draws, any other failure: its words, and no report.
+  render = shown({ visibleText: "Calendar unavailable. TIMEOUT", errorStateDetected: true, stateText: { error: ["Calendar unavailable. TIMEOUT"] } });
+  try {
+    await expect(buildDomFunctionReport(resolved, context, "")).rejects.toThrow("Calendar unavailable. TIMEOUT");
+  } finally {
+    render.mockRestore();
+  }
+  // Rows beside the failure are a report, which says it could not refresh them.
+  render = shown({ visibleText: "13:30 HIGH US Core PPI", semanticUi: loadError(DATA_SERVICE_UNREACHABLE_MESSAGE),
+    rows: [{ tableIndex: 0, rowIndex: 0, selected: false, cells: [{ columnLabel: "EVENT", text: "Core PPI m/m" }] }] } as Partial<DesktopPaneShotRenderResult>);
+  try {
+    const report = await buildDomFunctionReport(resolved, context, "");
+    expect(report.data).toMatchObject({ rowCount: 1, complete: false, reason: `The rendered pane could not refresh: ${DATA_SERVICE_UNREACHABLE_MESSAGE}` });
+    expect(report.text).toContain(`The rendered pane could not refresh: ${DATA_SERVICE_UNREACHABLE_MESSAGE}`);
+  } finally {
+    render.mockRestore();
+  }
+});
+
+test("a view the page drew from copies saved earlier is dated as saved, never as delayed at the copy's time", async () => {
+  // DES GC=F offline: the bridged quote and the proxied contract terms were saved copies, the oldest saved at 09:10.
+  const resolved = {
+    token: "FXC", label: "FX Cross Rates", options: {}, capability: { id: "fx-matrix-pane" }, pane: { id: "fx-matrix" },
+  } as unknown as ResolvedPaneFunction;
+  const screenshot = {
+    symbols: [],
+    savedCopyAt: Date.parse("2026-10-10T09:10:00Z"),
+    render: {
+      visibleText: "", footerText: "",
+      rows: [{ tableIndex: 0, rowIndex: 0, selected: false, cells: [{ columnLabel: "EUR", text: "1.1206" }] }],
+      semanticUi: [{ id: "ui:1", role: "report-freshness", actions: [], metadata: { status: "delayed", delayMinutes: 15, asOf: "2026-10-09T20:59:00.000Z" } }],
+      truncated: false, truncationReasons: [], loadingStateDetected: false, errorStateDetected: false, errorStateMarkers: [],
+      emptyStateDetected: false, emptyStateMarkers: [],
+    },
+  } as unknown as PaneScreenshotResult;
+  const report = await buildDomPaneReportFromRender(resolved, screenshot);
+  expect(report.data.freshness).toMatchObject({ savedAt: "2026-10-10T09:10:00.000Z" });
+  const line = formatFreshnessLine(report.data.freshness!);
+  expect(line).toContain("couldn't refresh; saved copy from 09:10 UTC");
+  expect(line).not.toContain("15 min delayed");
 });

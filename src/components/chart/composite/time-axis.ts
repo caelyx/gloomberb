@@ -72,10 +72,11 @@ export interface CompositeTimeAxisLayout {
 interface AxisClock {
   wall(timestamp: number): number;
   instant(wall: number): number;
-  label: string;
+  /** The zone's short name at an instant ("CET" in winter, "CEST" in summer). */
+  label(instant: number): string;
 }
 
-const UTC_CLOCK: AxisClock = { wall: (timestamp) => timestamp, instant: (wall) => wall, label: "UTC" };
+const UTC_CLOCK: AxisClock = { wall: (timestamp) => timestamp, instant: (wall) => wall, label: () => "UTC" };
 const axisClocks = new Map<string, AxisClock>();
 
 function axisClock(timeZone: string | undefined): AxisClock {
@@ -94,7 +95,7 @@ function axisClock(timeZone: string | undefined): AxisClock {
         return zonedWallClockToUtcMs(timeZone, date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate(),
           date.getUTCHours(), date.getUTCMinutes(), date.getUTCSeconds(), date.getUTCMilliseconds());
       },
-      label: timeZoneLabel(timeZone),
+      label: (instant) => timeZoneLabel(timeZone, instant),
     };
     axisClocks.set(timeZone, clock);
   }
@@ -349,13 +350,21 @@ function lowerBoundSample(samples: readonly CompositeTimeAxisSample[], timestamp
 }
 
 function normalizeMarketSamples(scene: CompositeChartScene): CompositeTimeAxisSample[] {
-  const samples = scene.dates.flatMap((date, index) => {
+  const samples: CompositeTimeAxisSample[] = [];
+  // A scene's dates come in time order, their ratios rising with them.
+  let ordered = true;
+  scene.dates.forEach((date, index) => {
     const timestamp = date.getTime();
     const ratio = scene.dateRatios[index];
-    return validTimestamp(timestamp) && typeof ratio === "number" && Number.isFinite(ratio)
-      ? [{ timestamp, ratio: clamp(ratio, 0, 1) }]
-      : [];
-  }).sort((left, right) => left.timestamp - right.timestamp || left.ratio - right.ratio);
+    if (!validTimestamp(timestamp) || typeof ratio !== "number" || !Number.isFinite(ratio)) return;
+    const sample = { timestamp, ratio: clamp(ratio, 0, 1) };
+    const previous = samples[samples.length - 1];
+    if (previous && (previous.timestamp > timestamp || (previous.timestamp === timestamp && previous.ratio > sample.ratio))) {
+      ordered = false;
+    }
+    samples.push(sample);
+  });
+  if (!ordered) samples.sort((left, right) => left.timestamp - right.timestamp || left.ratio - right.ratio);
 
   return samples.filter((sample, index) => (
     index === 0
@@ -392,7 +401,8 @@ function clockLabel(timestamp: number, unit: CompositeTimeAxisUnit): string {
 
 function calendarLabel(timestamp: number, includeYear: boolean): string {
   const date = new Date(timestamp);
-  const base = `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}`;
+  // Day-first, as every date outside the chart is written: "9 Nov 2026".
+  const base = `${date.getUTCDate()} ${MONTHS[date.getUTCMonth()]}`;
   return includeYear ? `${base} ${date.getUTCFullYear()}` : base;
 }
 
@@ -413,7 +423,7 @@ function formatBoundaryLabel(
     case "minute":
     case "hour": {
       const clock = clockLabel(timestamp, interval.unit);
-      const suffix = includeTimeZone ? ` ${axis.label}` : "";
+      const suffix = includeTimeZone ? ` ${axis.label(instant)}` : "";
       if (sameWallDay(timestamp, counterpart)) return `${clock}${suffix}`;
       const includeYear = includeBoundaryYear
         && date.getUTCFullYear() !== new Date(counterpart).getUTCFullYear();
@@ -490,6 +500,17 @@ function addCandidate(
     || existing.timestamp === candidate.timestamp
   ));
   if (!duplicate) candidates.push(candidate);
+}
+
+/**
+ * Blank cells a regular tick keeps from the start and end labels: half the
+ * room between two ticks, from 3 to 5 cells. Those two are the longest labels
+ * on the axis (a date with its year), and a tick closer than that reads as a
+ * part of one ("Oct  Oct 29 2026") instead of a mark of its own.
+ */
+function endpointLabelGap(interval: CompositeTimeAxisInterval, span: number, axisWidth: number): number {
+  const tickRoom = (axisWidth * interval.approximateMs) / span;
+  return clamp(Math.round(tickRoom / 2), 3, 5);
 }
 
 function layoutTimeAxis({
@@ -618,38 +639,61 @@ function layoutTimeAxis({
     };
   }
 
-  const placed: CompositeTimeAxisTick[] = [];
-  writeLabel(axis, 0, startLabel);
-  placed.push({
-    timestamp: firstTimestamp,
-    ratio: 0,
-    label: startLabel,
-    start: 0,
-    end: startLabel.length - 1,
-  });
-
-  const endPadding = axisWidth > startLabel.length + endLabel.length + 2 ? 1 : 0;
-  // The endpoint sits under the last observation; with no reserved offset
-  // that is the right edge.
-  const endStart = Math.max(
+  const minimumGap = interval.unit === "month" || interval.unit === "year" ? 2 : 1;
+  const endpointGap = endpointLabelGap(interval, span, axisWidth);
+  const at = (ratio: number) => ratio * Math.max(axisWidth - 1, 0);
+  const endStartFor = (label: string) => Math.max(
     startLabel.length + 1,
     Math.min(
-      axisWidth - endLabel.length - endPadding,
-      resolveLabelStart(endRatio * Math.max(axisWidth - 1, 0), endLabel, axisWidth),
+      // The endpoint sits under the last observation; with no reserved offset
+      // that is the right edge.
+      axisWidth - label.length - (axisWidth > startLabel.length + label.length + 2 ? 1 : 0),
+      resolveLabelStart(at(endRatio), label, axisWidth),
     ),
   );
-  const minimumGap = interval.unit === "month" || interval.unit === "year" ? 2 : 1;
+  const interiors = candidates.filter((entry) => !entry.boundary);
+  // A year axis's start label is a bare year too (`2021` for a chart from
+  // November 2021), so the first year tick it pushed out read as a year
+  // missing: `2021 2023 2024` (review, 12 Nov 2026). There the start label
+  // gives way to that tick instead. A month or day axis's start label is a
+  // whole date, which reads as the span's start, and keeps its place.
+  let showStart = true;
+  if (interval.unit === "year") {
+    const firstTick = interiors.find((entry) => formatInteriorLabel(entry.timestamp, firstTimestamp, interval, clock) !== endLabel);
+    if (firstTick) {
+      const label = formatInteriorLabel(firstTick.timestamp, firstTimestamp, interval, clock);
+      showStart = resolveLabelStart(at(firstTick.ratio), label, axisWidth) > startLabel.length - 1 + endpointGap;
+    }
+  }
+
+  const placed: CompositeTimeAxisTick[] = [];
+  if (showStart) {
+    writeLabel(axis, 0, startLabel);
+    placed.push({
+      timestamp: firstTimestamp,
+      ratio: 0,
+      label: startLabel,
+      start: 0,
+      end: startLabel.length - 1,
+    });
+  }
+
+  const endStart = endStartFor(endLabel);
   let previousTimestamp = firstTimestamp;
-  let previousEnd = startLabel.length - 1;
-  for (const candidate of candidates.filter((entry) => !entry.boundary)) {
-    const label = formatInteriorLabel(candidate.timestamp, previousTimestamp, interval, clock);
+  let previousEnd = showStart ? startLabel.length - 1 : -1;
+  // The first tick follows the start label, the rest follow a tick.
+  let previousGap = showStart ? endpointGap : 0;
+  for (const candidate of interiors) {
+    const label = showStart || placed.length > 0
+      ? formatInteriorLabel(candidate.timestamp, previousTimestamp, interval, clock)
+      // With no start label, the first tick says the year.
+      : formatInteriorLabel(candidate.timestamp, Date.UTC(1900, 0, 1), interval, clock);
     // A year boundary inside the final year would repeat the right endpoint's year.
     if (label === endLabel) continue;
-    const center = candidate.ratio * Math.max(axisWidth - 1, 0);
-    const start = resolveLabelStart(center, label, axisWidth);
+    const start = resolveLabelStart(at(candidate.ratio), label, axisWidth);
     const end = start + label.length - 1;
-    if (start <= previousEnd + minimumGap) continue;
-    if (end >= endStart - minimumGap) continue;
+    if (start <= previousEnd + previousGap) continue;
+    if (end >= endStart - endpointGap) continue;
     writeLabel(axis, start, label);
     placed.push({
       timestamp: candidate.timestamp,
@@ -660,6 +704,7 @@ function layoutTimeAxis({
     });
     previousTimestamp = candidate.timestamp;
     previousEnd = end;
+    previousGap = minimumGap;
   }
 
   writeLabel(axis, endStart, endLabel);

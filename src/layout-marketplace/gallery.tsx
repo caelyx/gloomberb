@@ -18,6 +18,7 @@ import { getMarketplaceHost } from "../plugins/marketplace/store";
 import { rememberLayoutRequirements } from "../components/layout/missing-pane";
 import type { PluginRegistry } from "../plugins/registry";
 import type { LayoutConfig } from "../types/config";
+import { withoutTransientPanes } from "../layout/pane-manager/transient";
 import { LayoutGalleryDesktop } from "./gallery-desktop";
 import { LayoutGalleryTerminal } from "./gallery-terminal";
 import {
@@ -37,6 +38,7 @@ import {
   publishableMarketplaceLayout,
 } from "../shares/portable-layout";
 import { useLayoutMarketplace, useTeamLayouts } from "./use-marketplace";
+import { logFailure } from "../utils/log-failure";
 
 export interface LayoutGalleryController {
   query: string;
@@ -198,7 +200,7 @@ export function LayoutMarketplaceGallery({
           width={40}
         />
       ),
-    }).catch(() => undefined);
+    }).catch(logFailure("layout-marketplace.gallery", "Open layout name prompt failed"));
     return typeof name === "string" ? name.trim() : "";
   }, [dialog]);
 
@@ -269,7 +271,7 @@ export function LayoutMarketplaceGallery({
           selectedChoiceId={defaultId ?? undefined}
         />
       ),
-    }).catch(() => undefined);
+    }).catch(logFailure("layout-marketplace.gallery", "Open team choice failed"));
     return teams.find((team) => team.id === id) ?? null;
   }, [dialog, pluginRegistry, teams]);
 
@@ -277,7 +279,7 @@ export function LayoutMarketplaceGallery({
 
   const contentFor = useCallback((entry: GalleryEntry) => {
     // The active tab's live state is the freshest copy of it.
-    if (entry.index === activeIndex) return { layout: currentLayout, paneState: currentPaneState };
+    if (entry.index === activeIndex) return { layout: withoutTransientPanes(currentLayout), paneState: currentPaneState };
     const saved = savedFor(entry);
     return saved
       ? { layout: saved.layout, paneState: (saved.paneState ?? {}) as typeof currentPaneState }
@@ -332,7 +334,7 @@ export function LayoutMarketplaceGallery({
           selectedChoiceId="copy"
         />
       ),
-    }).catch(() => undefined);
+    }).catch(logFailure("layout-marketplace.gallery", "Open layout conflict choice failed"));
     return choice === "copy" || choice === "overwrite" || choice === "discard" ? choice : null;
   }, [dialog]);
 

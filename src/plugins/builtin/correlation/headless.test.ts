@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { HeadlessPaneContext, HeadlessPaneEntry, HeadlessPaneLoadArgs, HeadlessSeriesResult } from "../../../types/headless";
 import { createTestDataProvider } from "../../../test-support/data-provider";
 import { correlationHeadless, relationshipHeadless } from "./headless";
-import { buildCorrelationMatrix, buildCorrelationSeries, buildStatusSummary, pairKey } from "./matrix/model";
+import { buildCorrelationSeries } from "./matrix/model";
 
 function args(symbols: string[]): HeadlessPaneLoadArgs {
   return { symbols, argument: symbols, rawArgument: symbols.join(","), options: { range: "ALL", rangePreset: "1Y", correlationWindow: 5 } };
@@ -67,14 +67,65 @@ test("relationship notes mixed session closes only, and keeps a small ratio's di
   const mixed = await relationshipHeadless.load(args(["IBIT", "BTC-USD"]), ctx);
   expect(mixed.metadata?.notices).toEqual(["IBIT closes 21:00 UTC; BTC-USD bar is 00:00 UTC (3 h offset). Daily pairs are matched by date."]);
   expect(statEntries(mixed).find((stat) => stat.key === "latestRatio")?.formatted).toBe("0.000006667");
+  // The ratio's latest value in the series table reads to the digits Statistics gives it, not every float digit.
+  expect(mixed.series[0]).toMatchObject({ textDecimals: 9 });
+  const ratio = await relationshipHeadless.load(args(["ABC", "XYZ"]), { ...ctx, marketData: createTestDataProvider({
+    getPriceHistory: async (symbol) => [100, 110, 105].map((close, index) => ({ date: new Date(Date.UTC(2026, 0, index + 1)), close: symbol === "ABC" ? close * 1.12313341493 : close })),
+  }) } as HeadlessPaneContext);
+  expect(statEntries(ratio).find((stat) => stat.key === "latestRatio")?.formatted).toBe("1.123");
+  expect(ratio.series[0]).toMatchObject({ textDecimals: 3 });
   expect((await relationshipHeadless.load(args(["IBIT", "MSFT"]), ctx)).metadata?.notices).toBeUndefined();
+});
+
+test("a newest day the source has not finished is no close: the line says daily bars and why, and only when that day is in the analysis", async () => {
+  const bars = (symbol: string, forming: "partial" | "unsettled" | null, days = 7) => [100, 110, 105, 115, 111, 118, 130].slice(0, days).map((close, index, all) => ({
+    date: new Date(Date.UTC(2026, 0, index + 1)), close: close * (symbol === "SPY" ? 2 : 1),
+    ...(forming && index === all.length - 1 ? { [forming]: true } : {}),
+  }));
+  const ctx = (forming: Record<string, "partial" | "unsettled" | null>, days: Record<string, number> = {}) => ({
+    ...context(),
+    marketData: createTestDataProvider({ getPriceHistory: async (symbol) => bars(symbol, forming[symbol] ?? null, days[symbol]) }),
+  }) as HeadlessPaneContext;
+  const coin = await relationshipHeadless.load(args(["BTC-USD", "SPY"]), ctx({ "BTC-USD": "partial" }));
+  expect(coin.freshness).toEqual({ basis: "daily bars", note: "the newest bar is today so far" });
+  expect((await relationshipHeadless.load(args(["GC=F", "SPY"]), ctx({ "GC=F": "unsettled" }))).freshness)
+    .toEqual({ basis: "daily bars", note: "the newest bar is not yet settled" });
+  // Finished bars leave the closes the pane declares, and so does a forming bar beyond the last day both have.
+  expect((await relationshipHeadless.load(args(["ABC", "SPY"]), ctx({}))).freshness).toEqual({});
+  expect((await relationshipHeadless.load(args(["BTC-USD", "SPY"]), ctx({ "BTC-USD": "partial" }, { SPY: 6 }))).freshness).toEqual({});
+  // A matrix dates itself by the newest day any of its symbols has.
+  expect((await correlationHeadless.load(args(["BTC-USD", "SPY"]), ctx({ "BTC-USD": "partial" }))).freshness)
+    .toMatchObject({ asOf: "2026-01-07", basis: "daily bars", note: "the newest bar is today so far" });
+  expect((await correlationHeadless.load(args(["ABC", "SPY"]), ctx({}))).freshness).toEqual({ asOf: "2026-01-07" });
+});
+
+test("fn GR names the pair, its unit and daily bars on each series, and a forming bar is as of its legs' newest quote, not its midnight", async () => {
+  // `fn GR GC=F SI=F --csv` left symbol_or_series, currency_or_unit and interval blank, and dated today's bar 00:00 UTC.
+  const quotedAt: Record<string, number> = { "GC=F": Date.parse("2026-01-07T16:06:00Z"), "SI=F": Date.parse("2026-01-07T16:05:00Z") };
+  const ctx = { ...context(), marketData: createTestDataProvider({
+    getPriceHistory: async (symbol) => [100, 110, 105, 115, 111, 118, 130].map((close, index) => ({
+      date: new Date(Date.UTC(2026, 0, index + 1)), close: close * (symbol === "SI=F" ? 0.02 : 1), ...index === 6 ? { partial: true } : {},
+    })),
+    getQuote: async (symbol) => ({ symbol, price: 1, currency: "USD", change: 0, changePercent: 0, lastUpdated: quotedAt[symbol]! }) as never,
+  }) } as HeadlessPaneContext;
+  const result = await relationshipHeadless.load(args(["GC=F", "SI=F"]), ctx);
+  expect(result.series.map(({ symbol, unit, interval }) => [symbol, unit, interval])).toEqual([["GC=F/SI=F", "ratio", "1d"], ["GC=F/SI=F", "correlation", "1d"]]);
+  expect(result.freshness).toEqual({ basis: "daily bars", note: "the newest bar is today so far", asOf: "2026-01-07T16:06:00.000Z" });
+  // A quote from before the bar's day says nothing of when it was last updated.
+  quotedAt["GC=F"] = quotedAt["SI=F"] = Date.parse("2026-01-06T21:00:00Z");
+  expect((await relationshipHeadless.load(args(["GC=F", "SI=F"]), ctx)).freshness).not.toHaveProperty("asOf");
 });
 
 test("one usable pair cannot make a matrix with disjoint histories look complete", async () => {
   const result = await correlationHeadless.load(args(["ABC", "DEF", "SPY"]), context("", true));
   expect(result.rows[0]!.correlation).toBeCloseTo(1);
   expect(result.rows.slice(1).every((row) => row.correlation == null)).toBe(true);
-  expect(result.errors).toHaveLength(2);
+  // Every pair is under 20 returns, so each says how many daily bars each side has.
+  expect(result.errors).toEqual([
+    "ABC/DEF: ABC has 7 daily bars and DEF 7 daily bars in the 1Y range; 6 daily returns fall between dates both have.",
+    "ABC/SPY: ABC has 7 daily bars and SPY 7 daily bars in the 1Y range; no daily returns fall between dates both have.",
+    "DEF/SPY: DEF has 7 daily bars and SPY 7 daily bars in the 1Y range; no daily returns fall between dates both have.",
+  ]);
   expect(result.metadata?.unavailablePairs).toEqual([
     { left: "ABC", right: "SPY", sampleSize: 0, reason: "Insufficient shared return observations" },
     { left: "DEF", right: "SPY", sampleSize: 0, reason: "Insufficient shared return observations" },
@@ -101,44 +152,31 @@ test("rolling correlation waits for the entire selected observation window", asy
 });
 
 
-test("inconsistent OHLC quarantines risk windows, retains original diagnostics and leaves independent pairs usable", async () => {
+test("a bar whose prices contradict each other is a gap, as history leaves it blank, and the export keeps what the source reported", async () => {
   const ctx = context();
   const cleanHistory = await ctx.marketData.getPriceHistory("SPY", "", "1Y");
-  // Captured SPY contradiction: reported open exceeds reported high.
-  const corrupt = { ...cleanHistory[3]!, open: 764.0800, high: 758.555, low: 757.570, close: 758.150, volume: 3461376 };
+  // A SPY bar whose open and close exceed its high: an open alone would only be withheld.
+  const corrupt = { ...cleanHistory[3]!, open: 764.0800, high: 758.555, low: 757.570, close: 759.900, volume: 3461376 };
   const history = cleanHistory.map((point, index) => index === 3 ? corrupt : point);
   ctx.marketData = createTestDataProvider({ getPriceHistory: async (symbol) => symbol === "SPY" ? history : cleanHistory });
-  const bySymbol = new Map([
-    ["ABC", buildCorrelationSeries("ABC", cleanHistory)],
-    ["SPY", buildCorrelationSeries("SPY", history)],
-    ["CONSTANT", buildCorrelationSeries("CONSTANT", cleanHistory.map(point => ({ ...point, close: 100 })))],
-  ]);
-  const matrix = buildCorrelationMatrix([...bySymbol.keys()], bySymbol);
-  expect(matrix.results.get(pairKey("ABC", "ABC"))?.correlation).toBeCloseTo(1);
-  expect(matrix.results.get(pairKey("SPY", "SPY"))?.correlation).toBeNull();
-  expect(matrix.results.get(pairKey("CONSTANT", "CONSTANT"))?.correlation).toBeNull();
-  expect(matrix.hasThinPair).toBe(false);
-  expect(buildStatusSummary([...bySymbol.keys()], bySymbol, matrix.sampleMin, matrix.sampleMax, matrix.hasThinPair)).toContain("Inconsistent OHLC: SPY");
-  const result = await correlationHeadless.load(args(["ABC", "DEF", "SPY"]), ctx);
+  const series = buildCorrelationSeries("SPY", history);
+  expect(series).toMatchObject({ status: "ready", observationCount: 5 });
+  expect(series.prices.map((point) => point.dateKey)).not.toContain("2026-01-04");
+  const result = await correlationHeadless.load(args(["ABC", "SPY"]), ctx);
+  // The gap's return runs from the close before it, as across a holiday: still the same moves, still 1.
+  expect(result.rows[0]).toMatchObject({ sampleSize: 5 });
   expect(result.rows[0]!.correlation).toBeCloseTo(1);
-  expect(result.rows.slice(1).every((row) => row.correlation === null && row.sampleSize === 0)).toBe(true);
-  expect(result.unavailableSymbols).toEqual(["SPY"]);
-  expect(result.errors?.every((error) => error.includes("Inconsistent OHLC"))).toBe(true);
+  expect(result.unavailableSymbols).toEqual([]);
   expect(result.metadata?.availability).toEqual(expect.arrayContaining([expect.objectContaining({
-    symbol: "SPY", status: "invalid", integrity: [expect.objectContaining({ sourcePoints: [expect.objectContaining({ open: 764.0800, high: 758.555, close: 758.150 })] })],
+    symbol: "SPY", status: "ready", integrity: [expect.objectContaining({ sourcePoints: [expect.objectContaining({ open: 764.0800, high: 758.555, close: 759.900 })] })],
   })]));
   const relationship = await relationshipHeadless.load(args(["ABC", "SPY"]), ctx);
-  expect(relationship.series.every((series) => series.points.length === 0)).toBe(true);
-  expect(statEntries(relationship).filter((stat) => stat.key !== "returnCount").every((stat) => stat.value === null)).toBe(true);
-  expect(relationship.unavailableSymbols).toEqual(["SPY"]);
-  expect(relationship.errors).toEqual([expect.stringContaining("Inconsistent OHLC")]);
+  expect(relationship.unavailableSymbols).toEqual([]);
+  expect(statEntries(relationship).find((stat) => stat.key === "rSquared")?.value).toBeCloseTo(1);
+  expect(relationship.metadata).toMatchObject({ alignedPriceCount: 6, returnCount: 5 });
   expect(relationship.metadata?.integrity).toMatchObject({ right: [{ sourcePoints: [expect.objectContaining({ close: corrupt.close })] }] });
   expect(history[3]).toBe(corrupt);
   expect(history[3]!.open).toBe(764.0800);
-  ctx.marketData = createTestDataProvider({ getPriceHistory: async () => cleanHistory });
-  const recovered = await relationshipHeadless.load(args(["ABC", "SPY"]), ctx);
-  expect(statEntries(recovered).find((stat) => stat.key === "rSquared")?.value).toBeCloseTo(1);
-  expect(recovered.errors).toEqual([]);
 });
 
 test("risk consumers request daily bars, clip oversized buffers, and disclose incomplete rolling windows", async () => {

@@ -1,6 +1,7 @@
 import { mkdir, rename, rm } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
+import { testAppEnv, TEST_BROWSER_PRIVACY_SCRIPT } from "../test-app-env";
 
 /**
  * Chrome for Testing's headless shell, pinned so a browser update never changes
@@ -126,22 +127,33 @@ export interface Browser {
   close(): Promise<void>;
 }
 
+/** Chrome itself, for `gpu`: the headless shell has no GPU compositing. */
+function gpuChromeExecutable(): string {
+  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
+  if (process.platform === "darwin") return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  return "google-chrome";
+}
+
 /**
  * Starts the headless shell with one page of a fixed size. No network beyond
- * this machine: every host but 127.0.0.1 fails to resolve.
+ * this machine: every host but 127.0.0.1 fails to resolve. `gpu` starts
+ * Chrome in its new headless mode with its GPU instead (CHROME_PATH, or the
+ * installed Chrome), for frame timing close to a real window's.
  */
-export async function launchBrowser(name: string, width: number, height: number): Promise<Browser> {
-  const executable = await chromeExecutable();
+export async function launchBrowser(name: string, width: number, height: number, { gpu = false }: { gpu?: boolean } = {}): Promise<Browser> {
+  const executable = gpu ? gpuChromeExecutable() : await chromeExecutable();
   const profile = cacheDir("profiles", `${name}-${process.pid}-${Date.now()}`);
   await mkdir(profile, { recursive: true });
   const proc = Bun.spawn([
     executable,
-    "--headless",
+    gpu ? "--headless=new" : "--headless",
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--disable-gpu",
+    ...(gpu ? ["--enable-gpu", "--ignore-gpu-blocklist"] : ["--disable-gpu"]),
     "--hide-scrollbars",
     "--mute-audio",
+    // The profile is throwaway: keep macOS Chrome from storing a key in the keychain and opening a dialog.
+    "--use-mock-keychain",
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-extensions",
@@ -154,7 +166,7 @@ export async function launchBrowser(name: string, width: number, height: number)
     `--user-data-dir=${profile}`,
     `--window-size=${width},${height}`,
     "about:blank",
-  ], { stdout: "ignore", stderr: "pipe" });
+  ], { env: testAppEnv(), stdout: "ignore", stderr: "pipe" });
 
   try {
     const port = await readDevToolsPort(proc.stderr);
@@ -168,6 +180,7 @@ export async function launchBrowser(name: string, width: number, height: number)
     const cdp = await Cdp.connect(pageUrl);
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: TEST_BROWSER_PRIVACY_SCRIPT });
     await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
     return {
       cdp,
@@ -298,6 +311,13 @@ export async function pressKey(cdp: Cdp, letter: string, modifiers: Array<keyof 
   await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...base });
   await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
   await frames(cdp, 2);
+}
+
+export async function copySelection(cdp: Cdp): Promise<void> {
+  const mac = process.platform === "darwin";
+  const event = { key: "c", code: "KeyC", modifiers: mac ? MODIFIERS.meta : MODIFIERS.ctrl, windowsVirtualKeyCode: 67 };
+  await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", ...event, ...(mac ? { commands: ["copy"] } : {}) });
+  await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", ...event });
 }
 
 /** A key chord as DevTools describes it: `modifiers` is Alt 1, Ctrl 2, Meta 4, Shift 8. */

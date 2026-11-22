@@ -166,11 +166,57 @@ export interface PerpRankingsPayload {
   status: string; asOf: string | null; access: "pro" | "preview"; locked: boolean;
   fundingPositive: PerpBoardRow[]; fundingNegative: PerpBoardRow[]; oiSurges: PerpBoardRow[];
   premiumDislocations: PerpBoardRow[]; closedMarketDislocations: PerpBoardRow[];
+  /** The asset class the lists rank, when one was asked for; an older server ranks every class and leaves it out. */
+  assetClass?: string;
 }
-export type PerpBoardQuery = { assetClass?: string; search?: string; sort?: string; includeDelisted?: boolean };
+/** `venue` narrows the board to one venue's markets, its own free preview included; the pane filters venues itself, to list them all. */
+export type PerpBoardQuery = { assetClass?: string; venue?: string; search?: string; sort?: string; includeDelisted?: boolean };
 export type PerpHistoryQuery = { marketId: string; from?: string; to?: string; resolution?: "auto" | "minute" | "hour" | "day"; limit?: number };
 
 export interface PerpMarketPayload extends PerpBoardPayload {
   evidence: { kind: string; period_at: string; received_at: string; superseded_at: string | null; fingerprint: string; payload: PerpMarket | PerpFunding | PerpCandle }[];
   methodologyUrl: string;
+}
+
+/** One contract's liquidations: long is longs liquidated (forced sells), short is shorts; quote notional. */
+export interface PerpLiquidationMarket {
+  marketId: string; venue: string; symbol: string; dex: string; quoteCurrency: string;
+  long24h: number; short24h: number; long7d: number; short7d: number; count24h: number; count7d: number; lastEventAt: string | null;
+}
+export interface PerpLiquidationPrint {
+  marketId: string; venue: string; symbol: string; dex: string;
+  side: "long" | "short"; priceKind: "fill" | "bankruptcy"; price: number; quantity: number; notionalUsd: number;
+  /** The venue's time for the liquidation. */
+  eventAt: string;
+  /** When Gloom Cloud received it. */
+  receivedAt: string;
+}
+/** One base asset's liquidations across the venues' public streams. */
+export interface PerpLiquidationsPayload {
+  status: string; baseAsset: string; asOf: string; from: string; collectingSince: string | null;
+  markets: PerpLiquidationMarket[];
+  totals: Pick<PerpLiquidationMarket, "long24h" | "short24h" | "long7d" | "short7d" | "count24h" | "count7d">;
+  /** Pro: UTC hours with liquidations over the last 7 days; empty for a preview. */
+  hourly: { time: string; long: number; short: number; count: number }[];
+  largest: PerpLiquidationPrint[];
+  streams: { venue: string; state: "live" | "down"; lastOkAt: string | null; error: string | null }[];
+  notes: string[];
+  locked: boolean; access: "pro" | "preview";
+}
+/** Quote notional resting within 0.5%, 1% and 2% of mid; reach is how far the returned book went, as a fraction of mid. */
+export interface PerpDepthSnapshot {
+  marketId: string; bucket: string; observedAt: string; sourceAsOf: string | null; mid: number;
+  bid05: number; ask05: number; bid1: number; ask1: number; bid2: number; ask2: number;
+  bidReach: number; askReach: number; levels: number; grouping: number | null;
+}
+export interface PerpDepthRow extends PerpDepthSnapshot { venue: string; symbol: string; dex: string; quoteCurrency: string; stale: boolean }
+/** One base asset's hourly order book depth across the venues. */
+export interface PerpDepthPayload {
+  status: string; baseAsset: string; asOf: string;
+  rows: PerpDepthRow[];
+  /** Pro: every market's hourly snapshots over the last 7 days; empty for a preview. */
+  history: PerpDepthSnapshot[];
+  sources: { venue: string; lastOkAt: string | null; error: string | null }[];
+  notes: string[];
+  locked: boolean; access: "pro" | "preview";
 }

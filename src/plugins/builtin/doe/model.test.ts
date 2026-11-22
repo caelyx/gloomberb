@@ -6,7 +6,7 @@ import type { HeadlessBundleResult, HeadlessPaneContext, HeadlessPaneLoadArgs } 
 import { DOE_NOT_AVAILABLE, fetchDoeBoard } from "./client";
 import { doeHeadless } from "./headless";
 import {
-  doeComparisonBasis, doeHeaderLine, doeSeasonalSeries, doeSeriesOption, formatDoeChange, formatDoeVsFive, formatDoeVsYear,
+  doeComparisonBasis, doeCoverageNote, doeHeaderLine, doeSeasonalSeries, doeSeriesOption, formatDoeChange, formatDoeVsFive, formatDoeVsYear,
 } from "./model";
 
 /** Commercial crude as the board served it for the week ending 2026-09-25. */
@@ -115,9 +115,11 @@ describe("DOE report dates", () => {
       reports: [petroleum, { ...gasReport, nextConsensus: 80, nextPrior: 77 }],
       series: [crude({ basis: "computed" }), mountain()],
     }));
-    const gas = await load("gas");
+    // Before the next release, which the line calls due once its time has passed.
+    setSystemTime(new Date("2026-10-23T12:00:00Z"));
+    const gas = await load("gas").finally(() => setSystemTime());
     expect(gas.freshness?.basis).toBe("weekly release; year-ago and 5-year average as EIA published");
-    expect(gas.sections[0]!.title).toBe("Gas Storage: Week ending Oct 16 · released Thu Oct 22 10:30 ET · next Thu Oct 29 10:30 ET, consensus +80 Bcf, prior +77 Bcf");
+    expect(gas.sections[0]!.title).toBe("Gas Storage: Week ending 16 Oct · released Thu 22 Oct 10:30 ET · next Thu 29 Oct 10:30 ET, consensus +80 Bcf, prior +77 Bcf");
     expect(gas.sections[0]!.rows?.[0]).toMatchObject({ vsYearAgo: "-8.9%", vsFiveYear: "+4.5%" });
     expect((await load("crude")).freshness?.basis).toBe("weekly release; year-ago and 5-year average from EIA weekly history");
     expect((await load("all")).freshness?.basis)
@@ -144,6 +146,30 @@ describe("DOE report dates", () => {
   });
 });
 
+/** `fn DOE NGS` asked for a petroleum series; the fix pointed every gas word at `fn NGS`, `fn NGS gas` included. */
+test("DOE given a gas word opens gas storage and points to NGS; NGS given one opens it without pointing to itself", async () => {
+  const spy = spyOn(apiClient, "getCloudDoeBoard").mockResolvedValue(board({ reports: [board().reports[0]!, gasReport], series: [crude(), mountain()] }));
+  try {
+    const load = async (tab: "all" | "gas", argument: string) => {
+      const args = { symbols: [], argument: [argument], rawArgument: argument, options: { tab } } as unknown as HeadlessPaneLoadArgs;
+      return await doeHeadless(tab).load(args, {} as HeadlessPaneContext) as HeadlessBundleResult;
+    };
+    const doe = await load("all", "NGS");
+    expect(doe.sections.map((section) => section.title)).toEqual([expect.stringMatching(/^Gas Storage/)]);
+    expect(doe.warnings).toEqual(["Gas storage is its own function: gloom fn NGS (one region: gloom fn NGS east)"]);
+    for (const word of ["gas", "storage", "natural gas"]) {
+      const ngs = await load("gas", word);
+      expect(ngs.sections.map((section) => section.title)).toEqual([expect.stringMatching(/^Gas Storage/)]);
+      expect(ngs.warnings ?? []).toEqual([]);
+    }
+    // A word that is no series names the series to use, and NGS only from DOE.
+    await expect(load("all", "jet fuel")).rejects.toThrow("Use a series such as cushing, gasoline, distillate or east; for gas storage, gloom fn NGS");
+    await expect(load("gas", "jet fuel")).rejects.toThrow(/^Use a series such as cushing, gasoline, distillate or east$/);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
 describe("DOE figures", () => {
   test("stocks read in millions of barrels; a rate compares in points; nothing reads -0", () => {
     expect(formatDoeChange("kb", 922)).toBe("+0.9");
@@ -160,27 +186,27 @@ describe("DOE figures", () => {
   test("the header names the week, the release and the next one on the EIA's clock, holidays included", () => {
     const report = board().reports[0]!;
     expect(doeHeaderLine(report, Date.parse("2026-10-03T08:00:00Z")))
-      .toBe("Week ending Sep 25 · released Wed Sep 30 10:30 ET · next Wed Oct 7 10:30 ET");
+      .toBe("Week ending 25 Sep · released Wed 30 Sep 10:30 ET · next Wed 7 Oct 10:30 ET");
     // Past its time and not in yet: due, not next. Standard time from November.
     expect(doeHeaderLine({ ...report, nextReleaseAt: "2026-12-29T22:00:00.000Z", nextReleaseHoliday: "Christmas" }, Date.parse("2026-12-30T00:00:00Z")))
-      .toBe("Week ending Sep 25 · released Wed Sep 30 10:30 ET · due Tue Dec 29 17:00 ET (Christmas)");
+      .toBe("Week ending 25 Sep · released Wed 30 Sep 10:30 ET · due Tue 29 Dec 17:00 ET (Christmas)");
     expect(doeHeaderLine({ ...report, weekEnding: null })).toBeUndefined();
   });
 
   test("the next storage release carries the calendar's consensus and prior as the 1W change reads them, each only when known", () => {
     const now = Date.parse("2026-10-23T08:00:00Z");
     const line = (nextConsensus: number | null, nextPrior: number | null) => doeHeaderLine({ ...gasReport, nextConsensus, nextPrior }, now);
-    expect(line(80, 77)).toBe("Week ending Oct 16 · released Thu Oct 22 10:30 ET · next Thu Oct 29 10:30 ET, consensus +80 Bcf, prior +77 Bcf");
-    expect(line(-12, null)).toBe("Week ending Oct 16 · released Thu Oct 22 10:30 ET · next Thu Oct 29 10:30 ET, consensus -12 Bcf");
-    expect(line(null, null)).toBe("Week ending Oct 16 · released Thu Oct 22 10:30 ET · next Thu Oct 29 10:30 ET");
+    expect(line(80, 77)).toBe("Week ending 16 Oct · released Thu 22 Oct 10:30 ET · next Thu 29 Oct 10:30 ET, consensus +80 Bcf, prior +77 Bcf");
+    expect(line(-12, null)).toBe("Week ending 16 Oct · released Thu 22 Oct 10:30 ET · next Thu 29 Oct 10:30 ET, consensus -12 Bcf");
+    expect(line(null, null)).toBe("Week ending 16 Oct · released Thu 22 Oct 10:30 ET · next Thu 29 Oct 10:30 ET");
     // Petroleum has no storage consensus, and an older server sends none.
     expect(doeHeaderLine({ ...board().reports[0]!, nextConsensus: 80 }, now)).not.toContain("consensus");
-    expect(doeHeaderLine(gasReport, now)).toBe("Week ending Oct 16 · released Thu Oct 22 10:30 ET · next Thu Oct 29 10:30 ET");
+    expect(doeHeaderLine(gasReport, now)).toBe("Week ending 16 Oct · released Thu 22 Oct 10:30 ET · next Thu 29 Oct 10:30 ET");
     // A narrow pane drops when the week came out before the next release or its consensus.
     const full = line(80, 77)!;
     expect(doeHeaderLine({ ...gasReport, nextConsensus: 80, nextPrior: 77 }, now, full.length)).toBe(full);
     expect(doeHeaderLine({ ...gasReport, nextConsensus: 80, nextPrior: 77 }, now, full.length - 1))
-      .toBe("Week ending Oct 16 · next Thu Oct 29 10:30 ET, consensus +80 Bcf, prior +77 Bcf");
+      .toBe("Week ending 16 Oct · next Thu 29 Oct 10:30 ET, consensus +80 Bcf, prior +77 Bcf");
   });
 
   test("the comparison basis is named only when the server says it, and per tab where the rows mix", () => {
@@ -190,6 +216,22 @@ describe("DOE figures", () => {
     // A row with nothing to compare does not count either way.
     expect(doeComparisonBasis([mountain(), crude({ basis: "computed", yearAgo: null, fiveYear: null })]))
       .toBe("year-ago and 5-year average as EIA published");
+  });
+
+  test("opened from a futures search on no energy contract, the board says what it covers and that those stocks are not on it", () => {
+    const covers = "Covers US oil and gas inventories only";
+    // FUT HG opens the board searched for HG=F; a name, a group and a rates contract read the same way.
+    expect(doeCoverageNote("HG=F")).toBe(`${covers}, not Copper (HG) stocks.`);
+    expect(doeCoverageNote("copper")).toBe(`${covers}, not Copper (HG) stocks.`);
+    // A micro metal names itself, and a name it shares with its full-size contract names that one.
+    expect(doeCoverageNote("MGC=F")).toBe(`${covers}, not Micro Gold (MGC) stocks.`);
+    expect(doeCoverageNote("SIL=F")).toBe(`${covers}, not Micro Silver (SIL) stocks.`);
+    expect(doeCoverageNote("MHG=F")).toBe(`${covers}, not Micro Copper (MHG) stocks.`);
+    expect(doeCoverageNote("silver")).toBe(`${covers}, not Silver (SI) stocks.`);
+    expect(doeCoverageNote("grains")).toBe(`${covers}, not agriculture stocks.`);
+    expect(doeCoverageNote("ZN=F")).toBe(`${covers}; 10-Year T-Note (ZN) is a financial future with none to report.`);
+    // An energy search, a search that names nothing, and no search at all are the board's own subject.
+    for (const query of ["CL=F", "NG=F", "energy", "urea", "", undefined]) expect(doeCoverageNote(query)).toBeNull();
   });
 
   test("a typed series opens by id, label or region name", () => {

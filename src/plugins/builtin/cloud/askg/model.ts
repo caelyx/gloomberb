@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../../utils/format";
 import type {
   ASKGClientErrorCode,
   ASKGConversationDetail,
@@ -40,6 +41,8 @@ export interface ASKGToolRow {
   argumentSummary: string;
   /** The arguments themselves, when known, so the row can name what it read. */
   args?: Record<string, JsonValue>;
+  /** The number the answer cites this read by, `[n]`; absent on a write and from an older server. */
+  ref?: number;
   writeTier: WriteTier;
   /** Server tools are executed by the platform and marked as run by Gloom. */
   origin: "client" | "server";
@@ -48,6 +51,11 @@ export interface ASKGToolRow {
   requiresConfirmation: boolean;
   /** Dry run description shown before a `user-data` or `broker` call runs. */
   preview?: JsonValue;
+  /**
+   * What the approval asks, when the call says more than its tool: the
+   * control a UI action presses, by label and role.
+   */
+  confirmTitle?: string;
   rowCount?: number;
   elapsedMs?: number;
   truncated?: boolean;
@@ -70,6 +78,8 @@ export interface ASKGErrorState {
   message: string;
   retryable: boolean;
   retryAfterMs?: number;
+  /** The plan tier a daily cap counted, when the server said: `standard` can upgrade. */
+  tier?: string;
 }
 
 /** The person's rating of one answer, as the control shows it. */
@@ -92,7 +102,18 @@ export interface ASKGTurn {
   startedAt: number;
   /** Absent until rated, here or on a stored conversation. */
   feedback?: ASKGTurnFeedback;
+  /**
+   * The server numbered this turn's reads for the answer to cite (its stream
+   * named a `+sources` prompt version). Absent on an older server, on a turn
+   * that fell back to no numbers, and on a stored turn, which keeps no version.
+   */
+  numbered?: true;
+  /** Questions to ask next, from the server once the answer finished. */
+  followUps?: string[];
 }
+
+/** What a server adds to the prompt version of a turn whose reads it numbered. */
+const SOURCES_PROMPT_VERSION_SUFFIX = "+sources";
 
 export interface ASKGConversationState {
   sessionId: string | null;
@@ -137,8 +158,11 @@ export type ASKGAction =
   | { type: "feedback"; turnId: string; feedback: ASKGTurnFeedback | null }
   | { type: "feedback-unavailable" }
   | { type: "event"; event: ASKGSseEvent }
-  /** `preview` is what the app resolved the call to, in place of the server's account of its arguments. */
-  | { type: "tool-awaiting-confirmation"; toolCallId: string; preview?: string }
+  /**
+   * `preview` is what the app resolved the call to, in place of the server's
+   * account of its arguments; `title` names what a UI action will press.
+   */
+  | { type: "tool-awaiting-confirmation"; toolCallId: string; preview?: string; title?: string }
   | { type: "tool-running"; toolCallId: string }
   | { type: "tool-result"; payload: ToolResultPayload }
   | { type: "tool-expanded"; toolCallId: string; expanded: boolean }
@@ -151,8 +175,9 @@ export type ASKGAction =
   | { type: "reset" };
 
 /**
- * Tiers that never run without the user saying so. `read` is silent and
- * `ui-write` is reversible, so only account and broker writes stop the turn.
+ * Tiers that never run without the user saying so. `read` is silent; a
+ * `ui-write` call that presses something on screen is asked about call by
+ * call (executor.ts gate), the rest of `ui-write` is reversible.
  */
 export function requiresLocalConfirmation(call: {
   writeTier: WriteTier;
@@ -161,6 +186,11 @@ export function requiresLocalConfirmation(call: {
   return call.requiresConfirmation
     || call.writeTier === "user-data"
     || call.writeTier === "broker";
+}
+
+/** A source number as the wire may carry it: a positive whole number, or nothing. */
+export function isSourceRef(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
 }
 
 function scalarText(value: JsonValue): string {
@@ -197,6 +227,7 @@ function rowFromToolCall(event: ASKGToolCallEvent): ASKGToolRow {
     name: event.name,
     argumentSummary: summarizeToolArguments(event.args),
     args: event.args,
+    ...(isSourceRef(event.ref) ? { ref: event.ref } : {}),
     writeTier: event.writeTier,
     origin: "client",
     // A call that needs approval waits here until the app has looked at what it would change.
@@ -293,7 +324,12 @@ function applyEvent(
           } : {}),
         },
         null,
-        (current) => (current.remoteTurnId ? current : { ...current, remoteTurnId: event.turnId }),
+        (current) => {
+          const named = current.remoteTurnId ? current : { ...current, remoteTurnId: event.turnId };
+          return event.promptVersion?.endsWith(SOURCES_PROMPT_VERSION_SUFFIX) && !named.numbered
+            ? { ...named, numbered: true }
+            : named;
+        },
       );
     }
     case "text-delta":
@@ -315,6 +351,7 @@ function applyEvent(
           name: event.name,
           argumentSummary: args ? summarizeToolArguments(args) : (event.summary.note ?? ""),
           ...(args ? { args } : {}),
+          ...(isSourceRef(event.ref) ? { ref: event.ref } : {}),
           writeTier: "read",
           origin: "server",
           source: event.source,
@@ -344,6 +381,7 @@ function applyEvent(
         }
         return {
           ...row,
+          ...(row.ref === undefined && isSourceRef(event.ref) ? { ref: event.ref } : {}),
           source: event.source,
           status: row.status === "running" || row.status === "pending" ? event.status : row.status,
           elapsedMs: row.elapsedMs ?? event.summary.elapsedMs,
@@ -365,6 +403,14 @@ function applyEvent(
       }));
     case "usage":
       return next;
+    case "follow-ups": {
+      const questions = Array.isArray(event.questions)
+        ? event.questions.filter((question): question is string => typeof question === "string" && question.trim().length > 0).slice(0, 3)
+        : [];
+      return questions.length === 0
+        ? next
+        : patchTurn(next, event.turnId, (turn) => ({ ...turn, followUps: questions.map((question) => question.trim()) }));
+    }
     case "done":
       return patchTurn(next, event.turnId, (turn) => ({
         ...turn,
@@ -391,6 +437,9 @@ function applyEvent(
             : row
         )),
       }));
+    default:
+      // A frame a newer server adds is skipped, never the end of the answer.
+      return next;
   }
 }
 
@@ -444,6 +493,7 @@ export function askgReducer(
         ...row,
         status: "awaiting-confirmation",
         ...(action.preview !== undefined ? { preview: action.preview } : {}),
+        ...(action.title !== undefined ? { confirmTitle: action.title } : {}),
       }));
     case "tool-running":
       return patchToolRow(state, action.toolCallId, (row) => ({ ...row, status: "running" }));
@@ -530,6 +580,7 @@ function rowFromStoredTool(tool: ASKGConversationTool): ASKGToolRow {
       ? summarizeToolArguments(tool.args as Record<string, JsonValue>)
       : (tool.note ?? ""),
     ...(tool.args ? { args: tool.args as Record<string, JsonValue> } : {}),
+    ...(isSourceRef(tool.ref) ? { ref: tool.ref } : {}),
     writeTier: "read",
     origin: tool.origin,
     status: (tool.status as ASKGToolRowStatus) ?? "ok",
@@ -784,7 +835,7 @@ export function rowSymbol(row: Record<string, JsonValue>): string | null {
 }
 
 export function formatCellValue(value: JsonValue | undefined): string {
-  if (value == null) return "-";
+  if (value == null) return MISSING_VALUE;
   if (typeof value === "number") {
     return Number.isInteger(value) ? String(value) : value.toFixed(2);
   }
@@ -841,13 +892,13 @@ function waitText(ms: number): string {
 export function describeASKGError(error: ASKGErrorState): string {
   const title = ERROR_TITLES[error.code] ?? "Ask Gloom failed";
   const wait = error.retryAfterMs && error.retryAfterMs > 0 ? waitText(error.retryAfterMs) : null;
-  // The cap has one thing to say: none left, and when there will be more.
-  if (error.code === "daily_turn_cap") {
-    return `No questions left today.${wait ? ` More in ${wait}.` : ""}`;
-  }
-  const retry = wait ? ` Try again in ${wait}.` : "";
   // A machine code the platform appends ("daily_turn_cap") is not for people.
   const detail = error.message.replace(/\s*\b[a-z]+(?:_[a-z]+)+\b\.?/g, "").trim();
+  // The server says how many questions were used and when the count resets.
+  if (error.code === "daily_turn_cap") {
+    return detail || `No questions left today.${wait ? ` More in ${wait}.` : ""}`;
+  }
+  const retry = wait ? ` Try again in ${wait}.` : "";
   return detail && detail.toLowerCase() !== title.toLowerCase()
     ? `${title}: ${detail}${retry}`
     : `${title}.${retry}`;

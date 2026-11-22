@@ -1,8 +1,9 @@
+import { logFailure } from "../../../utils/log-failure";
 import { Box } from "../../../ui";
 import { getCurrentPluginTarget } from "../../current-target";
 import { recordResearchActivity, recordResearchTabView } from "../../../api-client/research-activity";
 import { listExternalPlugins } from "../../external-runtime";
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { PaneProps, TickerResearchTabDef } from "../../../types/plugin";
 import { t, tf } from "../../../i18n";
 import { quoteSubscriptionTargetFromTicker } from "../../../market-data/request-types";
@@ -14,11 +15,13 @@ import {
   usePaneStateValue,
   usePaneTicker,
   usePaneAppConfig,
+  usePaneChoice,
   type AppState,
 } from "../../../state/app/context";
 import { useQuoteUpdates } from "../../../state/hooks/quote-streaming";
 import { getSharedRegistry } from "../../registry";
-import { ChoiceDialog, EmptyState, NestedPaneTabs, PaneFooterScope, usePaneFooter, usePaneMenuItems, usePaneTabs } from "../../../components";
+import { ChoiceDialog, EmptyState, NestedPaneTabs, PaneFooterScope, PaneStatusBody, usePaneFooter, usePaneMenuItems, usePaneTabs } from "../../../components";
+import { useTickerPaneOpening } from "../../../state/opening-ticker-panes";
 import { useOptionalDialog, type PromptContext } from "../../../ui/dialog";
 import { useThrottledCommitValue } from "../../../react/use-throttled-commit-value";
 import { resolveOptionsTarget } from "../../../utils/options";
@@ -28,9 +31,12 @@ import {
   resolveLockedTabId,
 } from "./settings";
 import { TICKER_RESEARCH_BUILTIN_TABS } from "./research-tabs";
+import { findTickerResearchGroup, groupTickerResearchTabs, tickerResearchGroupView } from "./research-groups";
+import { isRecord } from "../../../utils/guards";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
 import { useCloudAccessFooter } from "../shared/cloud-upgrade";
-import { CLOUD_QUOTE_DELAY_MINUTES } from "../../../api-client/plan-access";
+import { CLOUD_QUOTE_DELAY_MINUTES, usePlanAccess } from "../../../api-client/plan-access";
+import { shownPaneChoice } from "../../../core/state/app/pane-choices";
 import { parsePublicTickerKey, publicTickerKey } from "../../../utils/exchanges";
 import { captureAttentionAction } from "../../../telemetry/attention-counts";
 import { tickerHasListingSuffix } from "../../../sources/listing-symbols";
@@ -38,12 +44,16 @@ import { tickerQuoteFooterInfo } from "./quote-footer";
 import { ResearchTabKeysProvider, useResearchTabKeysHost } from "./research-tab-keys";
 import { ResearchTabNavigationProvider } from "./research-tab-navigation";
 import { usePluginAppActions } from "../../../public/react";
+import { useUtcDay } from "../../../react/auto-refresh";
 import { resolveTickerInstrumentKind } from "../../../tickers/instrument-kind";
 import { ResearchTradeWorkspace } from "../broker-trading/dock";
 
 const TICKER_RESEARCH_TAB_COMMIT_DELAY_MS = 120;
 /** A tab counts as viewed once it stays open this long, not when h/l passes over it. */
 const TICKER_RESEARCH_TAB_VIEW_DWELL_MS = 2_000;
+/** Pane state: the view last chosen in each group, by group id. */
+const GROUP_VIEWS_STATE_KEY = "groupViews";
+const NO_GROUP_VIEWS: Record<string, unknown> = {};
 
 const COMPANY_RESEARCH = [
   { id: "supply-chain-pane", label: "Supply Chain (SPLC)" },
@@ -113,12 +123,45 @@ function getCollectionName(state: AppState, collectionId: string | null): string
   return collectionId;
 }
 
+/**
+ * The shown group's views, under the groups: a compact second row in the
+ * terminal and query-bar choices on the desktop, as Fixed Income's views of a
+ * section. h/l stay with the groups. Drawn inside `NestedPaneTabs`, so the
+ * chrome keeps the groups in the title bar.
+ */
+function ResearchGroupViews({ views, activeValue, onSelect, focused, width, height, children }: {
+  /** Null for a group with one view, which opens it with no choices. */
+  views: { value: string; label: string }[] | null;
+  activeValue: string;
+  onSelect(value: string): void;
+  focused: boolean;
+  width: number;
+  height: number;
+  children(contentHeight: number): ReactNode;
+}) {
+  const { strip, rows } = usePaneTabs(views ? {
+    tabs: views,
+    activeValue,
+    onSelect,
+    focused,
+    keyboardNavigation: false,
+    dense: true,
+    queryBarWidth: width,
+  } : null);
+  return <>
+    {strip}
+    {children(Math.max(1, height - rows))}
+  </>;
+}
+
 export function TickerResearchPane({ focused, width, height }: PaneProps) {
   const dispatch = useAppDispatch();
   const { createPaneFromTemplate } = usePluginAppActions();
   const config = usePaneAppConfig();
   const paneInstance = usePaneInstance();
-  const { ticker, financials, error: instrumentError } = usePaneTicker();
+  const { symbol, ticker, financials, error: instrumentError } = usePaneTicker();
+  // Opened before its listing was found: the pane says so until the lookup settles it.
+  const opening = useTickerPaneOpening(paneInstance?.instanceId);
   const liveStreaming = useLiveStreamingSetting();
   const streamingTarget = quoteSubscriptionTargetFromTicker(ticker, ticker?.metadata.ticker, "provider");
   const streamingTargets = useMemo(() => (
@@ -152,25 +195,9 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
     TICKER_RESEARCH_TAB_COMMIT_DELAY_MS,
     { commitPendingOnUnmount: true },
   );
-  useEffect(() => {
-    if (!focused || !ticker || getCurrentPluginTarget() !== "web") return;
-    const url = new URL(window.location.href);
-    if (ticker.metadata.broker_contracts?.length) {
-      for (const key of ["ticker", "exchange", "tab"]) url.searchParams.delete(key);
-      window.history.replaceState(window.history.state, "", url.href);
-      return;
-    }
-    url.searchParams.set("ticker", ticker.metadata.ticker);
-    // A bare ticker can name different issuers on different venues. Keep the
-    // selected listing on reload, and replace any previous pane's venue.
-    if (ticker.metadata.exchange && !parsePublicTickerKey(ticker.metadata.ticker).exchange && !tickerHasListingSuffix(ticker.metadata.ticker)) {
-      url.searchParams.set("exchange", ticker.metadata.exchange);
-    } else {
-      url.searchParams.delete("exchange");
-    }
-    url.searchParams.set("tab", activeTabId);
-    window.history.replaceState(window.history.state, "", url.href);
-  }, [focused, ticker?.metadata.ticker, ticker?.metadata.exchange, activeTabId, ticker?.metadata.broker_contracts]);
+  // A tab picked in this session, by any route, as opposed to restored with the workspace.
+  const [tabChosen, chooseTab] = usePaneChoice("activeTabId");
+  const access = usePlanAccess();
   const [pluginCaptured, setPluginCaptured] = useState(false);
   useEffect(() => {
     if (focused && Number.isFinite(financials?.quote?.price) && (financials?.quote?.price ?? 0) > 0) {
@@ -200,9 +227,41 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
     config,
     hasOptionsChain,
   });
+  const savedTabId = allTabs.some((tab) => tab.id === activeTabId) ? activeTabId : (allTabs[0]?.id ?? "overview");
+  const proOnlyTabIds = useMemo(
+    () => new Set(tickerResearchTabs.filter((tab) => tab.proOnly).map((tab) => tab.id)),
+    [tickerResearchTabs],
+  );
+  // A Pro-only tab restored for an account without Pro opens on the first
+  // free tab (Overview); its wall shows once the tab is picked.
   const resolvedTabId = paneSettings.hideTabs
     ? resolveLockedTabId(paneSettings, allTabs)
-    : (allTabs.some((tab) => tab.id === activeTabId) ? activeTabId : (allTabs[0]?.id ?? "overview"));
+    : shownPaneChoice(savedTabId, {
+      chosen: tabChosen || activeTabId !== committedActiveTabId,
+      hasProAccess: access.hasProAccess,
+      proOnly: (tabId) => proOnlyTabIds.has(tabId),
+      fallback: allTabs.find((tab) => !proOnlyTabIds.has(tab.id))?.id ?? savedTabId,
+    });
+  // The address names the tab on screen, so a copied link opens what was seen.
+  useEffect(() => {
+    if (!focused || !ticker || getCurrentPluginTarget() !== "web") return;
+    const url = new URL(window.location.href);
+    if (ticker.metadata.broker_contracts?.length) {
+      for (const key of ["ticker", "exchange", "tab"]) url.searchParams.delete(key);
+      window.history.replaceState(window.history.state, "", url.href);
+      return;
+    }
+    url.searchParams.set("ticker", ticker.metadata.ticker);
+    // A bare ticker can name different issuers on different venues. Keep the
+    // selected listing on reload, and replace any previous pane's venue.
+    if (ticker.metadata.exchange && !parsePublicTickerKey(ticker.metadata.ticker).exchange && !tickerHasListingSuffix(ticker.metadata.ticker)) {
+      url.searchParams.set("exchange", ticker.metadata.exchange);
+    } else {
+      url.searchParams.delete("exchange");
+    }
+    url.searchParams.set("tab", resolvedTabId);
+    window.history.replaceState(window.history.state, "", url.href);
+  }, [focused, ticker?.metadata.ticker, ticker?.metadata.exchange, resolvedTabId, ticker?.metadata.broker_contracts]);
   // Only quote/chart views use the parent quote status. Other research tabs
   // own their data status (the options chain may have a different delay/feed).
   const quoteFooterActive = resolvedTabId === "overview" || resolvedTabId === "chart";
@@ -215,6 +274,8 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
     segmentId: "ticker-research-access",
     shortcutScope: "ticker-research:upgrade",
   });
+  // The quote's time of today drops its day; the next day the footer names it.
+  const utcDay = useUtcDay();
   usePaneFooter(
     "ticker-research-access",
     () => quoteFooterActive ? {
@@ -223,7 +284,7 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
       hints: cloudAccess.hint ? [cloudAccess.hint] : undefined,
       order: -1,
     } : null,
-    [cloudAccess.hint, cloudAccess.segment, financials?.quote, quoteFooterActive, resolvedTabId, width],
+    [cloudAccess.hint, cloudAccess.segment, financials?.quote, quoteFooterActive, resolvedTabId, utcDay, width],
   );
 
   const visibleTabIdKey = allTabs.map((tab) => tab.id).join("\0");
@@ -236,15 +297,31 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
     if (!requestedTabId || !requestedTabAt || requestedTabAt === consumedTabAt) return;
     if (!allTabs.some((tab) => tab.id === requestedTabId)) return;
     setConsumedTabAt(requestedTabAt);
+    chooseTab();
     setActiveTabId(requestedTabId);
-  }, [consumedTabAt, requestedTabAt, requestedTabId, setActiveTabId, setConsumedTabAt, visibleTabIdKey]);
-  // A quote tick re-renders this pane; the tab strip only has to re-render
+  }, [chooseTab, consumedTabAt, requestedTabAt, requestedTabId, setActiveTabId, setConsumedTabAt, visibleTabIdKey]);
+  // A quote tick re-renders this pane; the strips only have to re-render
   // when a tab appears, disappears, or is renamed.
-  const tabItemsKey = allTabs.map((tab) => `${tab.id}:${tab.name}`).join("\0");
-  const tabItems = useMemo(
-    () => allTabs.map((tab) => ({ label: t(tab.name), value: tab.id })),
-    [tabItemsKey],
+  const tabItemsKey = allTabs.map((tab) => `${tab.id}:${tab.name}:${tab.order}`).join("\0");
+  // The top strip is the groups; a view keeps its own tab id everywhere else.
+  const groups = useMemo(() => groupTickerResearchTabs(allTabs), [tabItemsKey]);
+  const groupItems = useMemo(
+    () => groups.map((group) => ({ label: t(group.name), value: group.id })),
+    [groups],
   );
+  const activeGroup = findTickerResearchGroup(groups, resolvedTabId);
+  const groupViewItems = useMemo(
+    () => activeGroup && activeGroup.views.length > 1
+      ? activeGroup.views.map((view) => ({ label: t(view.name), value: view.id }))
+      : null,
+    [activeGroup],
+  );
+  const [storedGroupViews, setGroupViews] = usePaneStateValue<Record<string, unknown>>(GROUP_VIEWS_STATE_KEY, NO_GROUP_VIEWS);
+  const groupViews = isRecord(storedGroupViews) ? storedGroupViews : NO_GROUP_VIEWS;
+  const rememberedView = useCallback((groupId: string) => {
+    const value = groupViews[groupId];
+    return typeof value === "string" ? value : undefined;
+  }, [groupViews]);
   // A tab's detail that moves with h/l itself (a 13F fund's sections) takes
   // those keys while it is open; Esc gives them back to the strip.
   const researchTabKeys = useResearchTabKeysHost();
@@ -254,17 +331,36 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
       const action = tabId === "chart" ? "chart" : tabId === "options" ? "option_chain" : null;
       if (action) captureAttentionAction()(publicTickerKey(ticker.metadata.ticker, ticker.metadata.exchange), action);
     }
+    // Picking the tab the pane has saved changes no value, so say it was picked.
+    if (!tabChosen) chooseTab();
     setActiveTabId(tabId);
-  }, [resolvedTabId, setActiveTabId, ticker]);
+  }, [chooseTab, resolvedTabId, setActiveTabId, tabChosen, ticker]);
+  // A group opens on the view last chosen in it, as Fixed Income's sections do.
+  const selectResearchGroup = useCallback((groupId: string) => {
+    const group = groups.find((entry) => entry.id === groupId);
+    if (group) selectResearchTab(tickerResearchGroupView(group, rememberedView(group.id)));
+  }, [groups, rememberedView, selectResearchTab]);
   const { strip: tabStrip, rows: tabBarHeight } = usePaneTabs(!paneSettings.hideTabs && ticker ? {
-    tabs: tabItems,
-    activeValue: resolvedTabId,
-    onSelect: selectResearchTab,
+    tabs: groupItems,
+    activeValue: activeGroup?.id ?? null,
+    onSelect: selectResearchGroup,
     focused: stripFocused,
+    // Compact, as Fixed Income's: the views' row under it starts where it does.
+    dense: true,
   } : null);
-  // h/l step one tab at a time; with twenty tabs the pane menu jumps straight to one.
+  // h/l step one group at a time; the pane menu jumps straight to any view.
   const dialog = useOptionalDialog();
   const showTabs = !paneSettings.hideTabs && !!ticker;
+  // Remember a view shown by any route (a choice, a link from Overview, the
+  // pane menu, `--tab`) when it is not the one its group would open on, so the
+  // group opens on it again. Landing on a group's own choice writes nothing.
+  useEffect(() => {
+    if (!showTabs || !activeGroup || activeGroup.views.length < 2) return;
+    if (tickerResearchGroupView(activeGroup, rememberedView(activeGroup.id)) === resolvedTabId) return;
+    // One the group never reopens on (Trade) leaves the remembered view as it was.
+    if (tickerResearchGroupView(activeGroup, resolvedTabId) !== resolvedTabId) return;
+    setGroupViews((current) => ({ ...(isRecord(current) ? current : {}), [activeGroup.id]: resolvedTabId }));
+  }, [activeGroup, rememberedView, resolvedTabId, setGroupViews, showTabs]);
   const companySymbol = ticker && resolveTickerInstrumentKind(ticker, financials) === "equity"
     ? tickerHasListingSuffix(ticker.metadata.ticker) ? ticker.metadata.ticker : publicTickerKey(ticker.metadata.ticker, ticker.metadata.exchange)
     : null;
@@ -283,11 +379,11 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
           choices={choices.map((item) => ({ ...item, label: t(item.label) }))} />,
       }).then((templateId) => {
         if (templateId && choices.some((item) => item.id === templateId)) createPaneFromTemplate(templateId, { symbol: companySymbol });
-      }).catch(() => {});
+      }).catch(logFailure("ticker-detail.pane", "Open company research choices failed"));
     } }];
   }, [companySymbol, createPaneFromTemplate, dialog, disabledPlugins, registry, tickerResearchTabsSnapshot]);
   usePaneMenuItems("ticker-research:go-to-tab", () => {
-    if (!showTabs || !dialog || tabItems.length < 2) return null;
+    if (!showTabs || !dialog || allTabs.length < 2) return null;
     return [{
       id: "go-to-tab",
       label: t("Go to Tab…"),
@@ -299,15 +395,15 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
               {...context}
               title={t("Go to Tab")}
               selectedChoiceId={resolvedTabId}
-              choices={tabItems.map((tab) => ({ id: tab.value, label: tab.label }))}
+              choices={groups.flatMap((group) => group.views.map((view) => ({ id: view.id, label: t(view.name), group: t(group.name) })))}
             />
           ),
         }).then((tabId) => {
           if (tabId) selectResearchTab(tabId);
-        }).catch(() => {});
+        }).catch(logFailure("ticker-detail.pane", "Open research tab choices failed"));
       },
     }];
-  }, [dialog, resolvedTabId, selectResearchTab, showTabs, tabItems]);
+  }, [allTabs.length, dialog, groups, resolvedTabId, selectResearchTab, showTabs]);
   // Which tabs people stay on. A pane pinned to one tab has no strip; opening
   // it is a function open, counted with those.
   useEffect(() => {
@@ -317,7 +413,7 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
     const timer = setTimeout(() => recordResearchTabView(resolvedTabId, fromExternalPlugin), TICKER_RESEARCH_TAB_VIEW_DWELL_MS);
     return () => clearTimeout(timer);
   }, [focused, registry, resolvedTabId, showTabs]);
-  const contentHeight = Math.max(1, height - tabBarHeight);
+  const bodyHeight = Math.max(1, height - tabBarHeight);
   const visibleTabIds = useMemo(() => new Set(allTabs.map((tab) => tab.id)), [visibleTabIdKey]);
   // A figure on one tab can open the tab that explains it (holders, short interest).
   const openResearchTab = useCallback((tabId: string) => {
@@ -325,16 +421,21 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
     selectResearchTab(tabId);
     return true;
   }, [selectResearchTab, visibleTabIds]);
+  // Without a ticker the pane draws only its empty state, and the tab list has
+  // no Overview, so the fallback above lands on the first tab that needs no
+  // ticker. Nobody opened it, and keeping it mounted would load its data on
+  // every ticker switch.
+  const shownTabId = ticker && visibleTabIds.has(resolvedTabId) ? resolvedTabId : null;
   const renderedTabIds = useMemo(() => {
     const next = new Set<string>();
     for (const tabId of mountedTabIds) {
       if (visibleTabIds.has(tabId)) next.add(tabId);
     }
-    if (visibleTabIds.has(resolvedTabId)) {
-      next.add(resolvedTabId);
+    if (shownTabId) {
+      next.add(shownTabId);
     }
     return next;
-  }, [mountedTabIds, resolvedTabId, visibleTabIds]);
+  }, [mountedTabIds, shownTabId, visibleTabIds]);
 
   const handlePluginCapture = useCallback((capturing: boolean) => {
     setPluginCaptured(capturing);
@@ -353,12 +454,14 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
       for (const tabId of current) {
         if (visibleTabIds.has(tabId)) next.add(tabId);
       }
-      if (visibleTabIds.has(resolvedTabId)) {
-        next.add(resolvedTabId);
+      if (shownTabId) {
+        next.add(shownTabId);
       }
       return sameStringSet(current, next) ? current : next;
     });
-  }, [resolvedTabId, visibleTabIds]);
+  }, [shownTabId, visibleTabIds]);
+
+  if (!ticker && opening && symbol) return <PaneStatusBody loading subject={symbol} />;
 
   if (!ticker) {
     const isEmptyFollowCollection = paneInstance?.binding?.kind === "follow" && !!collectionId && collectionTickerCount === 0;
@@ -375,7 +478,7 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
 
   const tradeAvailable = visibleTabIds.has("broker-trade");
   // Trade shows Chart beside its ticket: the workspace names the tab it shows.
-  const renderTabs = (contentWidth: number, contentFocused: boolean, shownTabId = resolvedTabId) => (
+  const renderTabs = (contentHeight: number) => (contentWidth: number, contentFocused: boolean, shownTabId = resolvedTabId) => (
     <ResearchTabKeysProvider value={showTabs ? researchTabKeys.value : null}>
           {tickerResearchTabs.map((tab) => {
             if (tradeAvailable && tab.id === "broker-trade" || !(renderedTabIds.has(tab.id) || tab.id === shownTabId) || !visibleTabIds.has(tab.id)) return null;
@@ -410,10 +513,17 @@ export function TickerResearchPane({ focused, width, height }: PaneProps) {
   );
   return <Box flexDirection="column" flexGrow={1} flexBasis={0} overflow="hidden">
     {tabStrip}
-    <Box height={contentHeight} flexGrow={1} flexBasis={0} overflow="hidden">
-      {tradeAvailable ? <ResearchTradeWorkspace width={width} height={contentHeight} focused={focused} symbol={ticker.metadata.ticker}
-        tabId={resolvedTabId} selectTab={selectResearchTab} onCapture={handlePluginCapture} locked={!!paneSettings.hideTabs}>{renderTabs}</ResearchTradeWorkspace>
-        : renderTabs(width, focused)}
-    </Box>
+    <NestedPaneTabs>
+      <ResearchGroupViews views={showTabs ? groupViewItems : null} activeValue={resolvedTabId} onSelect={selectResearchTab}
+        focused={focused} width={width} height={bodyHeight}>
+        {(contentHeight) => (
+          <Box height={contentHeight} flexGrow={1} flexBasis={0} overflow="hidden">
+            {tradeAvailable ? <ResearchTradeWorkspace width={width} height={contentHeight} focused={focused} symbol={ticker.metadata.ticker}
+              tabId={resolvedTabId} selectTab={selectResearchTab} onCapture={handlePluginCapture} locked={!!paneSettings.hideTabs}>{renderTabs(contentHeight)}</ResearchTradeWorkspace>
+              : renderTabs(contentHeight)(width, focused)}
+          </Box>
+        )}
+      </ResearchGroupViews>
+    </NestedPaneTabs>
   </Box>;
 }

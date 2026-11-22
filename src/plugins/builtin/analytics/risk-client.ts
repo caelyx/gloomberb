@@ -8,12 +8,15 @@ import type {
 } from "../../../api-client/types";
 import { createPluginCache } from "../../../data/plugin-cache";
 import { loadCloudResource } from "../shared/cloud-resource";
-import { canonicalExchange, normalizeSymbol } from "../../../utils/exchanges";
+import { canonicalExchange, normalizeSymbol, storedKeyListing } from "../../../utils/exchanges";
+import type { TickerRecord } from "../../../types/ticker";
 import { resolveCurrencyUnit } from "../../../utils/currency-units";
 import type { PricePoint } from "../../../types/financials";
-import { resolveDatedReturns, type DatedReturn } from "./metrics";
+import { resolveDatedReturns, type DatedReturn } from "../../../portfolio/return-metrics";
 import { qualifySharpeCadence } from "./sharpe-cadence";
+import type { RiskEpisodeState } from "./risk-episodes";
 import { evidenceDay } from "./risk-evidence";
+import { regularSessionCloseOn } from "../../../market-data/market/freshness";
 import { FX_LIVE_RATE_MAX_DEVIATION } from "../../../market-data/coordinator/fx-legs";
 import {
   accountFxPair,
@@ -35,6 +38,8 @@ export interface RiskInstrument {
 }
 /** A holding to load: what ranks it by value before any daily history is requested. */
 export interface RiskHoldingRequest extends RiskInstrument {
+  estimate?: boolean;
+  estimateStart?: string;
   /** Signed quantity; with a USD quote it ranks the holding by current value. */
   quantity?: number;
   /** The currency the position is recorded in, for the rate that values it when it is left out. */
@@ -49,6 +54,7 @@ interface RiskMarketHistory {
   currency: string | null;
   quote: CloudQuotePayload | null;
   returns: DatedReturn[];
+  closes?: Array<{ date: string; close: number }>;
   asOf: string | null;
   /** Latest completed close, used as the mark when no current quote arrived. */
   closeMark?: { price: number; date: string; currency: string } | null;
@@ -58,8 +64,15 @@ interface RiskMarketHistory {
    * Set when the listing quotes in another currency and its closes were
    * restated in USD at same-date daily FX closes; quote and closeMark are then in USD.
    */
-  converted?: { currency: string; fxAsOf: string } | null;
+  converted?: {
+    currency: string;
+    fxAsOf: string;
+    /** US sessions converted at the FX close before them, the pair having none that day (bridgedFxClose). */
+    fxBridged?: string[];
+  } | null;
   error: string | null;
+  /** Set when its daily closes did not load (the service failed or did not answer), which asked again they may. */
+  loadFailed?: true;
 }
 export interface RiskMarketSnapshot {
   histories: RiskMarketHistory[];
@@ -72,18 +85,25 @@ export interface RiskMarketSnapshot {
   fxRates?: Record<string, number>;
   /** For an account not in USD: the daily closes its returns convert at, or why they cannot. */
   accountFx?: AccountFx;
+  /** The closes the Stress view's historical episodes replay, loaded apart from the rest and only for that view. */
+  episodes?: RiskEpisodeState;
 }
 /**
  * The most holdings one load requests daily history for, largest current USD
- * value first. Each holding costs one Cloud request of up to 18 months of
- * closes, four in flight, again after every two-minute cache expiry, and the
+ * value first. Each holding costs one read of up to 18 months of closes,
+ * sixteen to a batch request, again after every two-minute cache expiry, and the
  * correlation view pairs every basket holding with every other. See
  * docs/research-data.md for the measured cost behind the number.
  */
 export const RISK_HISTORY_LIMIT = 150;
 /** Holdings quoted in one load, 50 to a batch request. */
 const RISK_QUOTE_LIMIT = 500;
-const HISTORY_CONCURRENCY = 4;
+/**
+ * Histories asked at once. They go out sixteen to a batch request, side by
+ * side (getCloudHistory's `batch`): a 60-holding book is four requests, where
+ * four single reads at a time took about 6 s.
+ */
+const HISTORY_CONCURRENCY = 64;
 const MAX_FX_CURRENCIES = 24;
 export const BEYOND_SIZE_REASON = `Beyond the supported size: only the ${RISK_HISTORY_LIMIT} largest holdings by value are modelled`;
 // Listing venues as the quotes report them; MTUM and QUAL list on Cboe BZX, not Arca.
@@ -99,6 +119,9 @@ export const RISK_FACTOR_INSTRUMENTS: RiskInstrument[] = [
 ].map(([symbol, exchange]) => ({ symbol: symbol!, exchange: exchange! }));
 /** US equity venues quote only in USD, so the listing venue alone establishes currency. */
 const US_LISTING_VENUES = new Set(["NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "CBOE"]);
+/** A held row as the listing its history is read for: `ES3:XSES` is ES3 on SGX, never a symbol the service does not know. */
+export const riskInstrumentOf = (ticker: Pick<TickerRecord, "metadata">): RiskInstrument =>
+  storedKeyListing(ticker.metadata.ticker, ticker.metadata.exchange);
 export const riskInstrumentId = (instrument: RiskInstrument) =>
   `${canonicalExchange(instrument.exchange)}:${normalizeSymbol(instrument.symbol)}`;
 const message = (error: unknown) =>
@@ -150,18 +173,30 @@ function validateRiskQuote(
  * risk math. With a conversion the listing quotes in that currency and its
  * closes are restated in USD at same-date FX closes on the basket's calendar.
  */
+/** Whether the venue's regular session on `today` (a UTC day) has closed by `now`, so its bar is final. */
+function finalCloseToday(exchange: string, today: string, now: Date): boolean {
+  if (!exchange) return false;
+  const close = regularSessionCloseOn(exchange, today);
+  return close != null && close <= now.getTime();
+}
+
 export function validateRiskHistory(
   response: CloudMarketResponse<CloudPricePointPayload[]>,
   instrument: RiskInstrument,
   quote: CloudQuotePayload | null,
   now = new Date(),
   conversion?: { listingCurrency: string; divisor: number; fx: FxCloses },
+  options: { estimate?: boolean; returnsSince?: string } = {},
 ): {
   returns: DatedReturn[];
+  closes: Array<{ date: string; close: number }>;
+  cadenceError: string | null;
   asOf: string;
   closeMark: { price: number; date: string; currency: string } | null;
   /** Latest completed close in the returns' currency, whatever marks the holding. */
   latestClose: { price: number; date: string };
+  /** With a conversion, the US sessions converted at the FX close before them (bridgedFxClose). */
+  fxBridged?: string[];
 } {
   if (
     response.status !== "success" ||
@@ -204,9 +239,12 @@ export function validateRiskHistory(
     )
   )
     throw new Error("History and quote currencies differ");
-  if (response.data.length > 1500)
+  if (response.data.length > (options.estimate ? 10_000 : 1500))
     throw new Error("Cloud daily history exceeds the supported buffer");
   const today = now.toISOString().slice(0, 10);
+  // Today's bar is still trading until the listing's session ends; after its close it is final (PORT at 23:10Z
+  // on 11 Nov runs through the 11 Nov close). A venue whose hours are unknown keeps waiting for tomorrow.
+  const todayClosed = finalCloseToday(exchange, today, now);
   const dated = new Map<string, CloudPricePointPayload>();
   for (const row of response.data) {
     if (
@@ -219,7 +257,7 @@ export function validateRiskHistory(
     )
       throw new Error("Cloud daily history contains invalid observations");
     const date = new Date(row.date).toISOString().slice(0, 10);
-    if (date >= today) continue;
+    if (date > today || (date === today && !todayClosed)) continue;
     const previous = dated.get(date);
     if (
       previous &&
@@ -242,20 +280,22 @@ export function validateRiskHistory(
   }));
   const local = resolveDatedReturns(prices);
   if (local.integrity)
-    throw new Error("Daily history has inconsistent OHLC observations");
+    throw new Error("Daily history has contradictory prices");
   // A converted series is on the NYSE calendar the basket and SPY share.
-  const series = conversion
+  const usd = conversion
     ? convertClosesToUsd(
         points.map((point) => ({ date: new Date(point.date).toISOString().slice(0, 10), close: point.close })),
         conversion.fx,
         conversion.divisor,
       )
-    : prices;
-  const returns = conversion ? resolveDatedReturns(series).returns : local.returns;
+    : null;
+  const series = usd ? usd.points : prices;
+  const returns = (conversion ? resolveDatedReturns(series).returns : local.returns)
+    .filter((point) => !options.returnsSince || point.startDateKey >= options.returnsSince);
   const cadence = qualifySharpeCadence(returns, [
     { symbol: instrument.symbol, exchange: conversion ? "NYSE" : exchange, history: series },
   ]);
-  if (!cadence.supported)
+  if (!cadence.supported && !options.estimate)
     throw new Error(cadence.reason ?? "Daily session cadence unavailable");
   const lastPoint = series.at(-1)!;
   const latestClose = {
@@ -263,7 +303,10 @@ export function validateRiskHistory(
     date: lastPoint.date.toISOString().slice(0, 10),
   };
   return {
-    returns,
+    returns: cadence.supported ? returns : [],
+    cadenceError: cadence.supported ? null : cadence.reason ?? "Daily session cadence unavailable",
+    closes: series.map((point) => ({ date: point.date.toISOString().slice(0, 10), close: point.close })),
+    ...(usd?.bridged.length ? { fxBridged: usd.bridged } : {}),
     asOf: latestClose.date,
     // A missing or stale quote is not a current mark; the latest dated close is.
     closeMark:
@@ -365,6 +408,66 @@ export async function fetchPortfolioRiskMarket(
       ...factors,
     ]).values(),
   ];
+  const start = new Date(now);
+  start.setUTCMonth(start.getUTCMonth() - 18);
+  start.setUTCDate(1);
+  const today = now.toISOString().slice(0, 10);
+  const startDate = start.toISOString().slice(0, 10),
+    endDate = new Date(Date.parse(today) - 86_400_000)
+      .toISOString()
+      .slice(0, 10);
+  const estimateStart = holdings.map((row) => row.estimateStart).filter((date): date is string => !!date && evidenceDay(date)).sort()[0];
+  const estimate = holdings.some((row) => row.estimate);
+  const historyStart = estimateStart && estimateStart < startDate ? estimateStart : startDate;
+  const historyParams = {
+    interval: "1day",
+    startDate: historyStart,
+    // validateRiskHistory keeps today's bar only once its session closed; ending on
+    // yesterday loses yesterday's close for most listings.
+    endDate: today,
+    outputsize: estimate ? 10_000 : 1000,
+    rangeKey: "2Y",
+  } as const;
+  const account = accountCurrency === "USD" ? null : accountCurrency;
+  // Every daily history is read once per listing, under one key: a factor proxy's is the holding's of the same
+  // listing however the book names its venue (SPY, ARCA:SPY), and the account currency's pair is its FX leg's.
+  const dailyHistories = new Map<string, ReturnType<RiskCloudClient["getCloudHistory"]>>();
+  const historyOf = (symbol: string, exchange: string) => {
+    const key = `${canonicalExchange(exchange)}:${normalizeSymbol(symbol)}`;
+    let loading = dailyHistories.get(key);
+    if (!loading) {
+      // Read over the window every holding shares, so they go out together; the signal stops the wait, not a batch others share.
+      dailyHistories.set(key, loading = client.getCloudHistory(symbol, exchange, historyParams, { batch: true, sharedWindow: true, ...(signal ? { signal } : {}) }));
+      loading.catch(() => {
+        // Intentional ignore: the failure is raised where the history is read.
+      });
+    }
+    return loading;
+  };
+  // What needs no quote goes out with the quotes, not after them: the factor proxies' histories, and the account
+  // currency's rate and daily closes.
+  for (const instrument of factors.values()) void historyOf(instrument.symbol, instrument.exchange || "");
+  const accountConversion = account ? riskConversion(account) : null;
+  if (accountConversion && accountConversion.divisor === 1)
+    void historyOf(accountConversion.leg.instrument.symbol, accountConversion.leg.instrument.exchange ?? "");
+  const accountRate = account ? client.getCloudExchangeRate(account) : null;
+  accountRate?.catch(() => {
+    // Intentional ignore: the failure is raised where the rate is read.
+  });
+  // The Treasury yield and the VIX, which settle rather than fail.
+  const fredWork = Promise.allSettled(
+    ["DGS10", "VIXCLS"].map(async (id) =>
+      validateFred(
+        await client.getCloudFredSeries(id, {
+          startDate,
+          endDate,
+          limit: 1000,
+          sortOrder: "asc",
+        }, signal ? { signal } : undefined),
+        id,
+      ),
+    ),
+  );
   const quotes = new Map<string, CloudQuotePayload>();
   const listings = new Map<string, { price: number; currency: string }>();
   // Listings quoted in another currency that convert to USD, and why the others do not.
@@ -400,7 +503,7 @@ export async function fetchPortfolioRiskMarket(
         if (!factors.has(id) && item.data.currency && item.data.currency !== "USD") {
           if (Number.isFinite(item.data.price) && item.data.price > 0)
             listings.set(id, { price: item.data.price, currency: item.data.currency });
-          if (entries.get(id)?.request.unsupported) continue;
+          if (entries.get(id)?.request.unsupported && !entries.get(id)?.request.estimate) continue;
           const conversion = riskConversion(item.data.currency);
           if (!conversion) {
             foreignReasons.set(id, FX_NO_PAIR);
@@ -429,7 +532,6 @@ export async function fetchPortfolioRiskMarket(
   }
   // Current rates value a foreign holding: its rank, its mark, and its size when left out.
   // The account currency's comes first: it values every holding.
-  const account = accountCurrency === "USD" ? null : accountCurrency;
   const fxCurrencies = [
     ...new Set(
       [...(account ? [account] : []), ...[...entries.values()].flatMap((row) => {
@@ -445,7 +547,7 @@ export async function fetchPortfolioRiskMarket(
   ].slice(0, MAX_FX_CURRENCIES);
   const fx = await Promise.allSettled(
     fxCurrencies.map(async (currency) => {
-      const response = await client.getCloudExchangeRate(currency);
+      const response = await (currency === account && accountRate ? accountRate : client.getCloudExchangeRate(currency));
       const rate = response.status === "success" || response.status === "partial"
         ? response.data?.rate
         : undefined;
@@ -477,35 +579,18 @@ export async function fetchPortfolioRiskMarket(
     .filter(
       (row) =>
         !factors.has(row.id) &&
-        !row.request.unsupported &&
         (!listings.has(row.id) || conversions.has(row.id)),
     )
     .map((row) => ({ ...row, rank: rankValue(row.request, usdQuote(row.id)) }))
     .sort(largestFirst);
   const requestedIds = new Set([
     ...factors.keys(),
-    ...candidates.slice(0, RISK_HISTORY_LIMIT).map((row) => row.id),
+    ...candidates.filter((row) => !row.request.unsupported).slice(0, RISK_HISTORY_LIMIT).map((row) => row.id),
+    ...candidates.filter((row) => row.request.estimate).slice(0, RISK_HISTORY_LIMIT).map((row) => row.id),
   ]);
   const instruments = [
     ...new Map([...factors, ...[...entries.values()].map((row) => [row.id, row.instrument] as const)]).entries(),
   ];
-  const start = new Date(now);
-  start.setUTCMonth(start.getUTCMonth() - 18);
-  start.setUTCDate(1);
-  const today = now.toISOString().slice(0, 10);
-  const startDate = start.toISOString().slice(0, 10),
-    endDate = new Date(Date.parse(today) - 86_400_000)
-      .toISOString()
-      .slice(0, 10);
-  const historyParams = {
-    interval: "1day",
-    startDate,
-    // validateRiskHistory drops today's bar; ending on yesterday
-    // loses yesterday's close for most listings.
-    endDate: today,
-    outputsize: 1000,
-    rangeKey: "2Y",
-  } as const;
   const histories: RiskMarketHistory[] = instruments.map(([id, instrument]) => {
     const quote = quotes.get(id) ?? null,
       listing = listings.get(id) ?? null;
@@ -536,7 +621,7 @@ export async function fetchPortfolioRiskMarket(
         let closes: FxCloses;
         try {
           closes = validateFxHistory(
-            await client.getCloudHistory(symbol, exchange ?? "", historyParams, signal ? { signal } : undefined),
+            await historyOf(symbol, exchange ?? ""),
             conversion.leg,
             now,
           );
@@ -583,15 +668,14 @@ export async function fetchPortfolioRiskMarket(
           entry = histories[index]!,
           conversion = conversions.get(instruments[index]![0]),
           { instrument, quote } = entry;
+        // Whether its closes' request failed, which asked again may answer; an answer without them, or a pair's FX, is a reason.
+        let requesting = false;
         try {
           const fxCloses = conversion ? await fxHistory(conversion) : null;
-          const response = await client.getCloudHistory(
-            instrument.symbol,
-            instrument.exchange || quote?.listingExchangeName || "",
-            historyParams,
-            signal ? { signal } : undefined,
-          );
-          const { latestClose, ...resolved } = validateRiskHistory(
+          requesting = true;
+          const response = await historyOf(instrument.symbol, instrument.exchange || quote?.listingExchangeName || "");
+          requesting = false;
+          const { latestClose, fxBridged, cadenceError, ...resolved } = validateRiskHistory(
             response,
             instrument,
             quote,
@@ -599,6 +683,7 @@ export async function fetchPortfolioRiskMarket(
             conversion && fxCloses
               ? { listingCurrency: conversion.listingCurrency, divisor: conversion.divisor, fx: fxCloses }
               : undefined,
+            { estimate, returnsSince: startDate },
           );
           if (conversion && fxCloses) {
             // A current quote marks at the current rate; without one, or without
@@ -610,8 +695,10 @@ export async function fetchPortfolioRiskMarket(
               quote: current,
               currency: "USD",
               closeMark: current ? null : { ...latestClose, currency: "USD" },
-              converted: { currency: conversion.listingCurrency, fxAsOf: fxCloses.asOf },
-              error: null,
+              converted: {
+                currency: conversion.listingCurrency, fxAsOf: fxCloses.asOf, ...(fxBridged?.length ? { fxBridged } : {}),
+              },
+              error: cadenceError,
             };
             continue;
           }
@@ -619,30 +706,18 @@ export async function fetchPortfolioRiskMarket(
             ...entry,
             currency: quote?.currency ?? resolved.closeMark?.currency ?? null,
             ...resolved,
-            error: null,
+            error: cadenceError,
           };
         } catch (error) {
           if (isAccessDenied(error) || signal?.aborted) throw error;
-          histories[index] = { ...entry, error: message(error) };
+          histories[index] = { ...entry, error: message(error), ...(requesting ? { loadFailed: true as const } : {}) };
         }
       }
     }),
   );
   const [, fred, accountFx] = await Promise.all([
     historyWork,
-    Promise.allSettled(
-      ["DGS10", "VIXCLS"].map(async (id) =>
-        validateFred(
-          await client.getCloudFredSeries(id, {
-            startDate,
-            endDate,
-            limit: 1000,
-            sortOrder: "asc",
-          }, signal ? { signal } : undefined),
-          id,
-        ),
-      ),
-    ),
+    fredWork,
     accountWork,
   ]);
   signal?.throwIfAborted();
@@ -672,7 +747,7 @@ const cacheKey = (holdings: readonly RiskHoldingRequest[], accountCurrency: stri
   [
     ...new Set(
       holdings.map(
-        (row) => `${riskInstrumentId(row)}|${row.quantity ?? ""}|${row.currency ?? ""}|${row.unsupported ? 1 : 0}`,
+        (row) => `${riskInstrumentId(row)}|${row.quantity ?? ""}|${row.currency ?? ""}|${row.unsupported ? 1 : 0}|${row.estimate ? 1 : 0}|${row.estimateStart ?? ""}`,
       ),
     ),
   ].sort().join(",") + (accountCurrency === "USD" ? "" : `@${accountCurrency}`)

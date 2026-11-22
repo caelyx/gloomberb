@@ -3,26 +3,39 @@ import type {
   HeadlessPaneDefinition,
   HeadlessPaneEntry,
 } from "../../../types/plugin";
-import { fredSourceLabel } from "../../../sources/gloomberb-cloud/fred-series";
+import { servedFromSavedCopy } from "../../../data/saved-copies";
+import { fredCitation, fredPublisher } from "../../../sources/gloomberb-cloud/fred-publisher";
+import { FRED_CATALOG_SERIES } from "../econ/fred-catalog";
+import { FRED_VINTAGE_NOTE, laggingSeriesNote } from "../../../cli/commands/fred-series";
 import { formatBasisPoints, toBasisPoints } from "../../../utils/basis-points";
-import { formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatNumber } from "../../../utils/format";
 import type { StatDef } from "./defs";
 import {
   createStatSeriesLoader,
   loadStatsBundle,
+  unansweredErrors,
   type StatsBundle,
 } from "./client";
+import { cpiNextYearGap } from "../shared/cpi-year-gap";
 import { historyStartNotice } from "../shared/history-span";
 import { formatMoveRank } from "../shared/move-rank";
 import type { StatPoint } from "../shared/stat-transform";
 import { formatSigma } from "../shared/trend";
 import { STAT_CATEGORIES } from "./defs";
-import { DEFAULT_STAT_ID, resolveStatArg, STATS } from "./stats";
+import { DEFAULT_STAT_ID, readStatArg, STATS } from "./stats";
 import { selectStatViews, type StatRangeId, type StatViewModel } from "./view";
 
 /** How a report reads a statistic: a spread in basis points, everything else as the pane does. */
 function reportFormat(stat: StatDef): (value: number) => string {
   return stat.basisPoints ? (value) => formatBasisPoints(value) : stat.formatValue;
+}
+
+function exportUnit(stat: StatDef): string {
+  if (stat.basisPoints || stat.id === "mortgage-spread") return "bp";
+  if (stat.axisUnit === "%" || ["yoy", "mom", "qoq-annualized"].includes(stat.transform)) return "pct";
+  const catalog = FRED_CATALOG_SERIES.find((series) => series.id === `fred:${stat.seriesId}`);
+  const unit = catalog?.unit.replace(/^(?:thousand|million|billion) /, "") ?? "index points";
+  return stat.category === "housing" && unit === "units" ? "units, annual rate" : unit;
 }
 
 /**
@@ -36,14 +49,14 @@ function detailEntries(view: StatViewModel, cutoffShown: boolean, text: boolean)
     {
       label: "Previous",
       value: view.previous?.value ?? null,
-      formatted: view.previous ? `${format(view.previous.value)}${text && view.previousReading ? ` (${view.previousReading})` : ""}` : "-",
+      formatted: view.previous ? `${format(view.previous.value)}${text && view.previousReading ? ` (${view.previousReading})` : ""}` : MISSING_VALUE,
       ...earlierDating(view, view.previous),
     },
     ...!text && view.previous ? [{ label: "Previous period", value: view.previous.date, formatted: view.previousReading ?? view.previous.date, ...earlierDating(view, view.previous) }] : [],
     {
       label: "1Y ago",
       value: view.yearAgo?.value ?? null,
-      formatted: view.yearAgo ? format(view.yearAgo.value) : "-",
+      formatted: view.yearAgo ? format(view.yearAgo.value) : MISSING_VALUE,
       ...earlierDating(view, view.yearAgo),
     },
     { label: "Mean", value: view.mean, formatted: format(view.mean) },
@@ -80,8 +93,13 @@ function detailEntries(view: StatViewModel, cutoffShown: boolean, text: boolean)
     // A Treasury yield adds when in the day it was taken, so it is not read against ^TNX's earlier close.
     // A figure dated by its period also says when it was released: "Sep 2026, released Tue 20 Oct".
     { label: "Period", value: view.latest.date, formatted: view.stat.cutoff && !cutoffShown ? `${view.reading} ${view.stat.cutoff}` : view.readingReleased },
-    { label: "Source", value: fredSourceLabel(view.stat.seriesId) },
+    { label: "Source", value: fredCitation(view.stat.seriesId) },
   ];
+}
+
+/** A statistic answered from the copy saved by an earlier read, its refresh having failed, says so in its row. */
+function savedCopyRow<T extends object>(view: StatViewModel, row: T): T {
+  return view.cacheSource === "stale-fallback" && view.fetchedAt != null ? servedFromSavedCopy(row, view.fetchedAt) : row;
 }
 
 /** The window the %ile column counts over, in words. */
@@ -106,12 +124,12 @@ function exportDating(view: StatViewModel): { period: string; released?: string;
 }
 
 /**
- * What an exported row is as of: the day its figure was released, else its own
+ * What an exported row is as of: the revision or first release day, else its own
  * day when it is observed daily or weekly (a Treasury yield), and nothing when
  * the date only starts the period it covers.
  */
 function exportAsOf(view: StatViewModel): string | null {
-  return view.releasedOn ?? (view.periodicity ? null : view.latest.date);
+  return view.revisedOn ?? view.releasedOn ?? (view.periodicity ? null : view.latest.date);
 }
 
 export function projectStatsHeadlessBundle(
@@ -156,20 +174,35 @@ export function projectStatsHeadlessBundle(
         textHeader: "Released",
         format: (_value: unknown, row: Record<string, unknown>) => typeof row.released === "string" ? row.released.replace(/^released /, "") : "",
       },
+      ...text ? [] : [
+        { key: "firstReleased", header: "first_released", literalHeader: true },
+        { key: "revisedOn", header: "revised_on", literalHeader: true },
+        { key: "firstReleaseValue", header: "first_release_value", literalHeader: true,
+          format: (_value: unknown, row: Record<string, unknown>) => typeof row.formattedFirstRelease === "string" ? row.formattedFirstRelease : "" },
+      ],
     ];
     return [{
       title: category.label,
       columns: columns(false),
       textColumns: columns(true),
-      // `as_of` is the release; a figure with none stated is as of its own day when it is observed daily or weekly, never its period's first day.
+      // `as_of` is the revision or release; without either, only daily or weekly figures use their observation day.
       rowAsOfKey: "exportAsOf",
-      rows: categoryViews.map((view) => ({
+      rowSymbolKey: "seriesId",
+      rowUnitKey: "unit",
+      rowIntervalKey: "interval",
+      rowSourceKey: "source",
+      appendedColumns: 3,
+      rows: categoryViews.map((view) => savedCopyRow(view, {
         id: view.stat.id,
         indicator: view.stat.shortLabel,
+        seriesId: view.stat.seriesId,
+        unit: exportUnit(view.stat),
+        interval: FRED_CATALOG_SERIES.find((series) => series.id === `fred:${view.stat.seriesId}`)?.frequency ?? (view.periodicity ?? "daily"),
+        source: fredCitation(view.stat.seriesId),
         latest: view.latest.value,
         formattedLatest: reportFormat(view.stat)(view.latest.value),
         previous: view.previous?.value ?? null,
-        formattedPrevious: view.previous ? reportFormat(view.stat)(view.previous.value) : "-",
+        formattedPrevious: view.previous ? reportFormat(view.stat)(view.previous.value) : MISSING_VALUE,
         previousPeriod: view.previous?.date ?? null,
         // A spread's values stay in percentage points; these carry the figures its text shows.
         ...(view.stat.basisPoints ? {
@@ -180,6 +213,10 @@ export function projectStatsHeadlessBundle(
         // The period the figure covers; `releasedOn` is when it was published, which the report is as of.
         asOf: view.latest.date,
         releasedOn: view.releasedOn,
+        firstReleased: view.firstReleased,
+        revisedOn: view.revisedOn,
+        firstReleaseValue: view.firstReleaseValue,
+        formattedFirstRelease: view.firstReleaseValue == null ? null : reportFormat(view.stat)(view.firstReleaseValue),
         exportAsOf: exportAsOf(view),
         ...(view.periodicity ? { periodicity: view.periodicity } : {}),
         reading: view.reading,
@@ -194,27 +231,37 @@ export function projectStatsHeadlessBundle(
   });
 
   const notice = selected ? historyStartNotice(selected.stat.label, range, selected.span) : null;
+  const cpiGap = cpiYearGapNote(views);
   // Treasury yields alone (fn ECST 10Y) name when in the day they are taken, as GC does; a mixed table cannot.
   const cutoffs = new Set(views.map((view) => view.stat.cutoff));
   const cutoff = cutoffs.size === 1 ? [...cutoffs][0] : undefined;
   return {
-    ...(cutoff ? { freshness: { ...ECST_FRESHNESS, schedule: cutoff } } : {}),
+    freshness: { ...ECST_FRESHNESS, ...(cutoff ? { schedule: cutoff } : {}),
+      ...(selected ? { source: fredCitation(selected.stat.seriesId), publisher: fredPublisher(selected.stat.seriesId) ?? undefined } : {}) },
     sections: [
       ...sections,
       ...(selected ? [{
         title: selected.stat.label,
+        symbol: selected.stat.seriesId,
+        unit: exportUnit(selected.stat),
+        interval: FRED_CATALOG_SERIES.find((series) => series.id === `fred:${selected.stat.seriesId}`)?.frequency ?? (selected.periodicity ?? "daily"),
+        source: fredCitation(selected.stat.seriesId),
         entries: detailEntries(selected, cutoff != null, false),
         textEntries: detailEntries(selected, cutoff != null, true),
         ...exportDating(selected),
       }] : []),
     ],
-    errors: bundle.errors,
+    // A statistic answered from its saved copy says so in the source line, not as an error.
+    errors: unansweredErrors(bundle),
     notes: [
       `%ile is the share of past readings at or below the latest one, over ${PERCENTILE_WINDOW[range]}.`
       + (range === "ALL" ? "" : " Full history: --range ALL."),
       ...(selected?.moves.length
         ? ["A move's pctl is the share of all 1D (or 1W) moves since that year that were smaller, ties counted half; --range does not change it."]
         : []),
+      ...(cpiGap ? [cpiGap] : []),
+      ...(views.some((view) => view.releasedOn) ? [FRED_VINTAGE_NOTE] : []),
+      ...views.flatMap((view) => laggingSeriesNote(view.stat.seriesId) ?? []),
     ],
     metadata: {
       fetchedAt: bundle.fetchedAt,
@@ -228,6 +275,24 @@ export function projectStatsHeadlessBundle(
   };
 }
 
+/** The CPI indexes the changes over twelve months are read from: all items and core, not seasonally adjusted. */
+const CPI_INDEXES: ReadonlySet<string> = new Set(["CPIAUCNS", "CPILFENS"]);
+
+/**
+ * Why the CPI changes over twelve months stop a month short of the latest
+ * release, and the latest they have, on one line: "BLS published no October
+ * 2025 index, so no October 2026 y/y; CPI y/y 3.7%, Core CPI y/y 2.6% in
+ * September 2026." Null when they are not short for that reason.
+ */
+function cpiYearGapNote(views: readonly StatViewModel[]): string | null {
+  const cpi = views.filter((view) => CPI_INDEXES.has(view.stat.seriesId) && view.stat.transform === "yoy");
+  const gap = cpi[0] ? cpiNextYearGap(cpi[0].latest.date) : null;
+  if (!gap) return null;
+  const latest = cpi.filter((view) => view.latest.date === cpi[0]!.latest.date)
+    .map((view) => `${view.stat.shortLabel} ${reportFormat(view.stat)(view.latest.value)}`);
+  return `${gap.reason}; ${latest.join(", ")} in ${gap.latestMonth}.`;
+}
+
 // Each row checks its own release schedule and says when it is stale.
 const ECST_FRESHNESS = { source: "FRED", status: "not-a-feed", basis: "published statistics" } as const;
 
@@ -238,7 +303,7 @@ export const econStatisticsHeadless: HeadlessPaneDefinition<"bundle"> = {
   argument: {
     kind: "free-text",
     placeholder: "statistic",
-    description: "Optional statistic id, FRED series id, label, or prefix.",
+    description: "Optional statistic id, name (PCE, GDP), label, FRED series id, or prefix.",
     optional: true,
   },
   options: [{
@@ -250,10 +315,13 @@ export const econStatisticsHeadless: HeadlessPaneDefinition<"bundle"> = {
   }],
   describe: (args) => `Economic Statistics | ${String(args.options.range)}`,
   async load(args, ctx) {
-    const requested = typeof args.argument === "string" ? resolveStatArg(args.argument) : null;
+    const read = typeof args.argument === "string" ? readStatArg(args.argument) : null;
+    const requested = read?.stat ?? null;
     if (args.argument && !requested) {
+      // ECST is the US's statistics; another country's policy rate is in CBR, and its published series in `fred`.
       throw new Error(
-        `Unknown economic statistic "${String(args.argument)}". Use one of: ${STATS.map(({ id }) => id).join(", ")}.`,
+        `Unknown economic statistic "${String(args.argument)}". ECST covers US statistics only: ${STATS.map(({ id }) => id).join(", ")}. `
+          + "For other countries, policy rates are in fn CBR and published series in gloom fred --list.",
       );
     }
     const range = args.options.range as StatRangeId;
@@ -261,6 +329,7 @@ export const econStatisticsHeadless: HeadlessPaneDefinition<"bundle"> = {
       loader: createStatSeriesLoader(ctx.apiClient),
       ...(requested ? { stats: [requested] } : {}),
     });
-    return projectStatsHeadlessBundle(bundle, range, requested?.id ?? DEFAULT_STAT_ID);
+    const report = projectStatsHeadlessBundle(bundle, range, requested?.id ?? DEFAULT_STAT_ID);
+    return read?.readAs ? { ...report, warnings: [read.readAs] } : report;
   },
 };

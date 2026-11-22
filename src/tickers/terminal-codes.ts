@@ -1,7 +1,7 @@
 import { futuresContractByCode } from "../market-data/futures-board";
 import { getListingSymbol, hongKongListingCode, tickerHasListingSuffix } from "../sources/listing-symbols";
 import { isCurrencyCode } from "../utils/currency-pair";
-import { isKnownExchangeCode, isUsListingExchange } from "../utils/exchanges";
+import { canonicalExchange, isKnownExchangeCode, isPredictionMarketExchange, isSharedExchangeCode, isUsListingExchange } from "../utils/exchanges";
 
 /**
  * A listing written the way a market data terminal names it, read as the
@@ -126,15 +126,25 @@ export const BLOOMBERG_MARKETS: Readonly<Record<string, BloombergMarket>> = {
   PM: { venues: [], name: "Philippine Stock Exchange" },
   AU: at("ASX"),
   NZ: at("NZX"),
-  CN: at("TSX", "TSXV"),
+  CN: at("TSX", "TSXV", "CSE"),
   CT: at("TSX"),
   CV: at("TSXV"),
+  CF: at("CSE"),
   MM: at("BMV"),
   BZ: at("B3"),
   BS: at("B3"),
   AR: at("BYMA"),
   SJ: at("JSE"),
   IT: at("TASE"),
+  IR: at("ICEX"),
+  TI: at("BIST"),
+  AB: { venues: ["TADAWUL"], hint: "Bloomberg and Tadawul codes differ there: type the Tadawul code, such as 2222 AB for Saudi Aramco." },
+  QD: at("QE"),
+  BI: at("BHB"),
+  DB: at("DFM"),
+  OM: at("MSX"),
+  KK: at("KUWAIT"),
+  EY: at("EGX"),
 };
 
 /** Bloomberg's index tickers the quote sources carry, by the symbol each is quoted as. */
@@ -142,8 +152,8 @@ const BLOOMBERG_INDICES: Readonly<Record<string, string>> = {
   SPX: "^GSPC", INDU: "^DJI", CCMP: "^IXIC", NDX: "^NDX", RTY: "^RUT", VIX: "^VIX",
   UKX: "^FTSE", DAX: "^GDAXI", CAC: "^FCHI", SX5E: "^STOXX50E", SMI: "^SSMI", AEX: "^AEX", IBEX: "^IBEX",
   NKY: "^N225", HSI: "^HSI", KOSPI: "^KS11", TWSE: "^TWII", SENSEX: "^BSESN", NIFTY: "^NSEI", FSSTI: "^STI",
-  AS51: "^AXJO", SPTSX: "^GSPTSE", MEXBOL: "^MXX", IBOV: "^BVSP", DXY: "DX-Y.NYB",
-  USGG5YR: "^FVX", USGG10YR: "^TNX", USGG30YR: "^TYX",
+  AS51: "^AXJO", SPTSX: "^GSPTSE", MEXBOL: "^MXX", IBOV: "^BVSP", XU100: "XU100.IS", DXY: "DX-Y.NYB",
+  USGG3M: "^IRX", USGG5YR: "^FVX", USGG10YR: "^TNX", USGG30YR: "^TYX", MOVE: "^MOVE",
 };
 
 /** Index and volatility futures Bloomberg writes with the Index key (ES1 Index, DM1 Index, UX1 Index), by the root quoted here. */
@@ -159,8 +169,13 @@ const BLOOMBERG_FUTURES_ALIASES: ReadonlySet<string> = new Set([
 /** "EUR Curncy" is the dollar rate in market convention: these as XXXUSD, every other currency as USDXXX. */
 const DOLLAR_BASE_CURRENCIES: ReadonlySet<string> = new Set(["EUR", "GBP", "AUD", "NZD"]);
 
-/** Bloomberg writes bitcoin as XBT. */
-const BLOOMBERG_CRYPTO: Readonly<Record<string, string>> = { XBT: "BTC-USD", XBTUSD: "BTC-USD" };
+/** Bloomberg writes bitcoin as XBT, and keys the dollar index as a currency too (DXY Curncy). */
+const BLOOMBERG_CURRENCY_CODES: Readonly<Record<string, string>> = { XBT: "BTC-USD", XBTUSD: "BTC-USD", DXY: "DX-Y.NYB" };
+
+/** Currency futures Bloomberg keys as currencies (JY1 Curncy is the yen future), by the root quoted here. */
+const BLOOMBERG_CURRENCY_FUTURE_ROOTS: Readonly<Record<string, string>> = {
+  JY: "6J", EC: "6E", BP: "6B", AD: "6A", CD: "6C", SF: "6S", NV: "6N", PE: "6M",
+};
 
 const REUTERS_VENUES: Record<string, string> = { N: "NYSE", O: "NASDAQ", OQ: "NASDAQ" };
 
@@ -252,10 +267,13 @@ function readBloombergIndex(typed: string, code: string): TerminalListingCode | 
   return root ? genericFuture(typed, root, future![2]!, "Index") : null;
 }
 
-/** `EURUSD Curncy`, `JPY Curncy` (the dollar rate in market convention: USDJPY), `XBT Curncy`. */
+/** `EURUSD Curncy`, `JPY Curncy` (the dollar rate in market convention: USDJPY), `XBT Curncy`, `DXY Curncy`, `JY1 Curncy`. */
 function readBloombergCurrency(typed: string, code: string): TerminalListingCode | null {
-  const crypto = BLOOMBERG_CRYPTO[code];
-  if (crypto) return { typed, ...keyOf(crypto, ""), terminal: "bloomberg", yellowKey: "Curncy" };
+  const named = BLOOMBERG_CURRENCY_CODES[code];
+  if (named) return { typed, ...keyOf(named, ""), terminal: "bloomberg", yellowKey: "Curncy" };
+  const future = /^([A-Z]{2})(\d{1,2})$/.exec(code);
+  const root = future ? BLOOMBERG_CURRENCY_FUTURE_ROOTS[future[1]!] : undefined;
+  if (root) return genericFuture(typed, root, future![2]!, "Curncy");
   const [base, quote] = /^[A-Z]{6}$/.test(code) ? [code.slice(0, 3), code.slice(3)]
     : /^[A-Z]{3}$/.test(code) && code !== "USD" ? DOLLAR_BASE_CURRENCIES.has(code) ? [code, "USD"] : ["USD", code]
       : [null, null];
@@ -363,6 +381,47 @@ export function unknownBloombergMarket(raw: string): UnknownBloombergMarket | nu
   };
 }
 
+/** The yellow keys that make a line one code whatever it names: an index, a currency, a commodity, a government bond. */
+const CODE_YELLOW_KEYS: Readonly<Record<string, UnreadBloombergCode["yellowKey"]>> = {
+  index: "Index", curncy: "Curncy", comdty: "Comdty", govt: "Govt",
+};
+
+/** A word of a code: capitals and digits (MOVE, GTJPY10Y, 1M, 25D), never a word of a name (Hang, Seng). */
+const CODE_WORD = /^[A-Z0-9][A-Z0-9&./-]{0,15}$/;
+
+/** A line written as a Bloomberg code that names nothing quoted here (`GTJPY10Y Govt`, `VXJ Index`, `USDJPY BGN Curncy`). */
+export interface UnreadBloombergCode {
+  typed: string;
+  /** The words before the yellow key, in capitals: `GTJPY10Y`, `USDJPY BGN`. */
+  code: string;
+  yellowKey: "Index" | "Curncy" | "Comdty" | "Govt";
+}
+
+/**
+ * A line written as a Bloomberg code with an index, currency, commodity or
+ * government bond key that no symbol here is read from: one entry, refused
+ * with a hint, never split into words or searched for as a company's name
+ * (`MOVE Index` found a Stuttgart product named after the index, and
+ * `GTJPY10Y Govt` split into GTJPY10Y and the GOVT fund). An index, a
+ * commodity or a bond is one word before its key (`FTSE 100 Index` is a
+ * name); a currency's code may carry its pricing source or tenor
+ * (`USDJPY BGN Curncy`, `USDJPY 1M 25D RR Curncy`). The first word is in
+ * capitals or has a digit, so `Gold Comdty` and `Nasdaq Index` stay names.
+ * Null for anything else, and for a code `readTerminalListingCode` reads.
+ */
+export function unreadBloombergCode(raw: string): UnreadBloombergCode | null {
+  const typed = normalizeTyped(raw);
+  const words = typed.split(" ");
+  const yellowKey = words.length >= 2 ? CODE_YELLOW_KEYS[words.at(-1)!.toLowerCase()] : undefined;
+  if (!yellowKey) return null;
+  const parts = words.slice(0, -1);
+  if (parts.length > (yellowKey === "Curncy" ? 4 : 1)) return null;
+  if (!parts.every((part) => CODE_WORD.test(part.toUpperCase()))) return null;
+  if (/\p{Ll}/u.test(parts[0]!) && !/\d/.test(parts[0]!)) return null;
+  if (readTerminalListingCode(typed)) return null;
+  return { typed, code: parts.join(" ").toUpperCase(), yellowKey };
+}
+
 /** What to type instead where Bloomberg's ticker is not the venue's own code (MK, SP); null elsewhere. */
 export function bloombergMarketHint(market: string | undefined): string | null {
   return (market && BLOOMBERG_MARKETS[market]?.hint) || null;
@@ -382,6 +441,11 @@ const LEGAL_FORMS: ReadonlySet<string> = new Set([
   "AG", "SE", "SA", "NV", "AB", "AS", "BV", "KK", "OY", "CO", "PLC", "ASA", "OYJ", "SPA", "LTD", "INC", "CORP", "LLC",
   "GMBH", "KGAA", "BHD", "TBK", "PCL",
 ]);
+
+/** Whether a word is a company's legal form (`INC`, `AG`, `PLC`), the last word of a name. */
+export function isLegalForm(word: string): boolean {
+  return LEGAL_FORMS.has(word.toUpperCase());
+}
 
 /** Two words, the second a company's legal form (`SAP SE`, `VOLVO AB`): a name to look up before reading it as a code. */
 export function endsInLegalForm(raw: string): boolean {
@@ -412,10 +476,39 @@ export interface NearMissListing {
   symbol: string;
 }
 
+/**
+ * `BP.`, `RR.`: London's code for a company with a two-letter symbol, which
+ * the exchange writes with a dot to make three. No other venue writes a
+ * trailing dot, though one can trail a US ticker by slip (`GE.`).
+ */
+const LONDON_DOTTED = /^([A-Z]{2})\.$/;
+
+/**
+ * A two-letter symbol written with London's trailing dot (`BP.`): what was
+ * typed and the symbol (BP). Whether it is London's line (BP:LSE) or a US
+ * ticker with a stray dot (`GE.`) is for where London lists it to say
+ * (`resolveCliListing`). Null for anything else.
+ */
+export function readLondonDottedSymbol(raw: string): NearMissListing | null {
+  const typed = raw.trim();
+  const london = LONDON_DOTTED.exec(typed.toUpperCase());
+  return london ? { typed, symbol: london[1]! } : null;
+}
+
 /** `BRK/B`: a US share class after a slash, as a broker writes it. One letter before the slash is a ratio or an abbreviation (P/E, N/A). */
 const SLASH_CLASS = /^([A-Z]{2,5})\/([A-Z])$/;
-/** `700.HK`: a Hong Kong code without its leading zeros. */
-const SHORT_HONG_KONG = /^(\d{1,3})\.HK$/;
+/**
+ * `700.HK`, `03042.HK`, `00700:HKEX`: a Hong Kong code without its leading
+ * zeros, or with the five digits HKEXnews and the Product Key Facts print.
+ * `3042.HKG` is the suffix some data vendors write for HKEX.
+ */
+const HONG_KONG_CODE = /^(\d{1,5})(\.HKG?|:HKEX)$/;
+
+/** A Hong Kong code as the app keys it: four digits at least (0700, 3042, 83042). */
+function hongKongWorkingCode(digits: string): string | null {
+  const code = Number(digits);
+  return code > 0 ? String(code).padStart(4, "0") : null;
+}
 /** `6758.JP`, `MC.FP`: a symbol with a Bloomberg market code where a listing suffix goes. */
 const MARKET_SUFFIX = /^([A-Z0-9]{1,10})\.([A-Z]{2})$/;
 /**
@@ -430,7 +523,9 @@ const MARKET_SUFFIX_CODES: ReadonlySet<string> = new Set([
 
 /**
  * A symbol written nearly as a listing is (`700.HK`, `6758.JP`, `BRK/B`),
- * read as the working form (`0700.HK`, `6758.T`, `BRK-B`). A Bloomberg market
+ * read as the working form (`0700.HK`, `6758.T`, `BRK-B`); a Hong Kong code
+ * with HKEX's five digits (`03042.HK`, `00700:HKEX`) drops its leading zeros
+ * (`3042.HK`, `0700:HKEX`). A Bloomberg market
  * code after the dot is that market's listing suffix (`MC.FP` is `MC.PA`),
  * `MARKET_SUFFIX_CODES` only, so `600519.SS` stays Shanghai. Null for
  * anything else.
@@ -440,13 +535,40 @@ export function readNearMissListing(raw: string): NearMissListing | null {
   const upper = typed.toUpperCase();
   const slash = SLASH_CLASS.exec(upper);
   if (slash) return { typed, symbol: `${slash[1]}-${slash[2]}` };
-  const hongKong = SHORT_HONG_KONG.exec(upper);
-  if (hongKong) return { typed, symbol: `${hongKong[1]!.padStart(4, "0")}.HK` };
+  const hongKong = HONG_KONG_CODE.exec(upper);
+  const code = hongKong ? hongKongWorkingCode(hongKong[1]!) : null;
+  const suffix = hongKong?.[2] === ".HKG" ? ".HK" : hongKong?.[2];
+  if (hongKong) return code && (code !== hongKong[1] || suffix !== hongKong[2]) ? { typed, symbol: `${code}${suffix}` } : null;
   const suffixed = MARKET_SUFFIX.exec(upper);
   if (!suffixed || !MARKET_SUFFIX_CODES.has(suffixed[2]!) || tickerHasListingSuffix(upper)) return null;
   const venue = BLOOMBERG_MARKETS[suffixed[2]!]!.venues[0]!;
   const symbol = getListingSymbol(suffixed[1]!, venue);
   return tickerHasListingSuffix(symbol) ? { typed, symbol } : null;
+}
+
+/** `TYO:7203`, `LON:LSEG`, `NASDAQ:AAPL`: an exchange's code, a colon, then the symbol, as spreadsheets and quote sites write a listing. */
+const VENUE_FIRST = /^([A-Z][A-Z0-9]{1,11}):([A-Z0-9][A-Z0-9.&-]{0,19})$/;
+
+/**
+ * A listing written venue first, as Google Sheets and quote sites write it
+ * (`TYO:7203`, `LON:LSEG`, `NASDAQ:AAPL`), read as the symbol on that venue
+ * (`7203:JPX`, `LSEG:LSE`, `AAPL:NASDAQ`): the part before the colon is an
+ * exchange code the app knows and the part after it is none, so `SAN:EPA`,
+ * written symbol first, and `BATS:LSE`, whose symbol is also a venue's code,
+ * stay as typed, as does a ticker before a two-letter market code (`ICE:US`,
+ * `ASX:AU`, `BSE:IN`, `AMS:SW`), the code it is written symbol first with.
+ * A code that names several venues (`TSE:7203`) is kept for the listing to
+ * settle. A prediction market's id (`KALSHI:...`) is not a listing. Null for
+ * anything else.
+ */
+export function readVenueFirstListing(raw: string): NearMissListing | null {
+  const typed = raw.trim();
+  const match = VENUE_FIRST.exec(typed.toUpperCase());
+  if (!match) return null;
+  const [, code, symbol] = match as unknown as [string, string, string];
+  if (!isKnownExchangeCode(code) || isKnownExchangeCode(symbol) || isPredictionMarketExchange(code)) return null;
+  if (symbol.length === 2 && BLOOMBERG_MARKETS[symbol]) return null;
+  return { typed, symbol: `${symbol}:${isSharedExchangeCode(code) ? code : canonicalExchange(code)}` };
 }
 
 /** `Read WFC.N as WFC:NYSE.`, for a command's warnings. */

@@ -11,6 +11,8 @@ import { usePaneLinkMenuEntry } from "../../ui/external-link";
 
 export interface TickerBadgeProps {
   symbol: string;
+  /** The listing the chip stands for when it is not the symbol as written (`2330` is `2330:TWSE`): what it resolves, prices and opens. */
+  listing?: string;
   status: TickerBadgeStatus;
   quote: Quote | null;
   liveQuote?: boolean;
@@ -19,6 +21,8 @@ export interface TickerBadgeProps {
   maxTextWidth?: number;
   /** Trailing gap to the next chip, which the last chip in a row does not need. */
   trailingGap?: boolean;
+  /** A move in percent the chip says and takes its tone from, instead of the day's change. */
+  move?: number;
   onHoverStart?: () => void;
   onHoverEnd?: () => void;
   onOpen: (symbol: string) => void;
@@ -37,35 +41,41 @@ const NATIVE_PRICE_OVER_RESTING_TEXT = { position: "absolute", inset: 0, overflo
 
 export function TickerBadge({
   symbol,
+  listing,
   status,
   quote,
   liveQuote = true,
   hovered = false,
   maxTextWidth,
   trailingGap = true,
+  move,
   onHoverStart,
   onHoverEnd,
   onOpen,
 }: TickerBadgeProps) {
   const registry = getSharedRegistry();
   const { nativeContextMenu, nativePaneChrome } = useUiCapabilities();
-  const ticker = typeof registry?.getTicker === "function" ? registry.getTicker(symbol) : null;
-  const financials = typeof registry?.getData === "function" ? registry.getData(symbol) : null;
+  const key = listing ?? symbol;
+  const ticker = typeof registry?.getTicker === "function" ? registry.getTicker(key) : null;
+  const financials = typeof registry?.getData === "function" ? registry.getData(key) : null;
   const openTickerContextMenu = useTickerContextMenu({
     ticker,
     financials,
     onOpen,
   });
   const quoteForDisplay = liveQuote ? quote : null;
-  const tone = status === "ready" && quoteForDisplay
+  const shownMove = liveQuote && move != null && Number.isFinite(move) ? move : null;
+  const tone = status === "ready" && shownMove != null
+    ? priceColor(shownMove)
+    : status === "ready" && quoteForDisplay
     ? priceColor(quoteForDisplay.changePercent)
     : colors.borderFocused;
-  const text = getTickerBadgeText({ symbol, status, quote, liveQuote, maxTextWidth });
-  const price = hovered ? getTickerBadgeHoverText({ symbol, status, quote, liveQuote, maxTextWidth }) : null;
+  const text = getTickerBadgeText({ symbol, status, quote, liveQuote, maxTextWidth, move });
+  const price = hovered ? getTickerBadgeHoverText({ symbol, status, quote, liveQuote, maxTextWidth, move }) : null;
   const { fg: color, bg: backgroundColor } = tickerBadgeColors(tone, hovered);
   // An ambiguous symbol is worth opening: that is how the listing gets picked.
   const interactive = status !== "loading";
-  usePaneLinkMenuEntry(interactive ? `ticker:${symbol}` : null, tf("Open {ticker}", { ticker: symbol }), () => onOpen(symbol));
+  usePaneLinkMenuEntry(interactive ? `ticker:${key}` : null, tf("Open {ticker}", { ticker: symbol }), () => onOpen(key));
 
   return (
     <Box paddingRight={trailingGap ? 1 : 0} flexShrink={0} justifyContent={nativePaneChrome ? "center" : undefined}>
@@ -95,7 +105,7 @@ export function TickerBadge({
           event.stopPropagation?.();
           event.preventDefault?.();
           if (!interactive) return;
-          onOpen(symbol);
+          onOpen(key);
         }}
         onContextMenu={(event: any) => {
           void openTickerContextMenu(event);

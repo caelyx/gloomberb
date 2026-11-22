@@ -7,7 +7,7 @@
  * exported here.
  */
 import { useEffect, useRef, useState } from "react";
-import { apiClient, type AuthUser } from "../../api-client";
+import { apiClient } from "../../api-client";
 import { SignInCodePanel } from "../../components/sign-in-code-panel";
 import { Button } from "../../components/ui/button";
 import { DialogActions } from "../../components/ui/dialog-actions";
@@ -17,12 +17,13 @@ import { useAppLanguage } from "../../i18n/react";
 import { useViewport } from "../../react/input";
 import { colors } from "../../theme/colors";
 import { useThemeColors } from "../../theme/theme-context";
-import { Box, Text, TextAttributes, useUiCapabilities } from "../../ui";
+import { Box, Text, useUiCapabilities } from "../../ui";
 import { useDialog, useDialogKeyboard, type DialogApi, type PromptContext } from "../../ui/dialog";
+import { clickOutsideWhileClean } from "../../ui/dialog-stack";
 import { isPlainKey } from "../../utils/keyboard";
 import { wrapTextLines } from "../../utils/text-wrap";
-import { DeviceSignInDialog } from "../../account/device-signin-dialog";
-import type { SignedInBroker } from "./client";
+import { promptDeviceSignIn } from "../../account/device-signin-dialog";
+import type { BrokerReplacePrompt, SignedInBroker } from "./client";
 import {
   BrokerSignInController,
   runBrokerSignIn,
@@ -53,8 +54,18 @@ export const BROKER_CONNECT_SUBTITLE = "Continue in your browser.";
 /** The key every connect surface takes for a fresh link, as the desktop shows it. */
 export const BROKER_CONNECT_NEW_LINK = { key: "r", label: "new link" };
 
-/** Under the panel: the broker's own note, or what connecting a single-connection broker does to other apps. */
-export function brokerSignInNote(broker: SignedInBroker): string | null {
+/**
+ * Under the panel: the broker's own note, or what connecting a single-connection
+ * broker does to other apps. When the broker will ask to replace the Gloom
+ * connection it already lists (`replace`, as Gloom says), the note says to
+ * choose that before the user gets there; `may` when Gloom cannot tell.
+ */
+export function brokerSignInNote(broker: SignedInBroker, replace: BrokerReplacePrompt | null = null): string | null {
+  if (replace && broker.capabilities.singleConnection) {
+    return replace === "will"
+      ? tf("{broker} will ask to replace your existing Gloom connection. Choose to replace it.", { broker: broker.name })
+      : tf("{broker} may ask to replace your existing Gloom connection. If it does, choose to replace it.", { broker: broker.name });
+  }
   return broker.capabilities.signupNote
     ?? (broker.capabilities.singleConnection
       ? tf("Other AI apps linked to {broker} get disconnected. Connect them to Gloom instead.", { broker: broker.name })
@@ -112,10 +123,7 @@ export function useBrokerSignInAttempt(
 
 /** Gloom's device sign-in, stacked over whatever asked for it. True once signed in. */
 export async function promptGloomSignIn(dialog: DialogApi): Promise<boolean> {
-  return !!await dialog.prompt<AuthUser | undefined>({
-    size: "full",
-    content: (context: unknown) => <DeviceSignInDialog {...(context as PromptContext<AuthUser | undefined>)} />,
-  });
+  return !!await promptDeviceSignIn(dialog);
 }
 
 /**
@@ -125,8 +133,8 @@ export async function promptGloomSignIn(dialog: DialogApi): Promise<boolean> {
  */
 const TERMINAL_DIALOG_ROWS = 12;
 const DESKTOP_DIALOG_ROWS = 10;
-/** Columns the terminal's full dialog takes from the window: margins, border and padding. */
-const TERMINAL_DIALOG_INSET = 8;
+/** Columns the terminal's full dialog takes from the window: margins (4), border (2) and padding (4). */
+const TERMINAL_DIALOG_INSET = 10;
 /** Cells the desktop dialog's padding takes from its width. */
 const DESKTOP_DIALOG_INSET = 4;
 
@@ -136,13 +144,24 @@ function BrokerSignInDialog({
   broker,
   write,
   renew,
-}: PromptContext<BrokerSignInOutcome> & { broker: SignedInBroker; write: boolean; renew: boolean }) {
+  replace,
+  onCleanChange,
+}: PromptContext<BrokerSignInOutcome> & {
+  broker: SignedInBroker;
+  write: boolean;
+  renew: boolean;
+  replace: BrokerReplacePrompt | null;
+  /** A click outside closes it only while no link is out: never while the broker may be connecting through one. */
+  onCleanChange?: (clean: boolean) => void;
+}) {
   useAppLanguage();
   const { nativePaneChrome } = useUiCapabilities();
   const { width: termWidth, height: termHeight } = useViewport();
   // Close after a beat so "Connected" is visible; enter skips the wait. Signed
   // out closes at once, for the host to sign in to Gloom.
   const { snapshot, restart, finish } = useBrokerSignInAttempt(broker, write, resolve, { renew });
+  const pending = snapshot.phase === "waiting" || snapshot.phase === "connected";
+  useEffect(() => onCleanChange?.(!pending), [onCleanChange, pending]);
 
   useDialogKeyboard((event) => {
     event.stopPropagation();
@@ -169,6 +188,7 @@ function BrokerSignInDialog({
             snapshot={snapshot}
             height={Math.max(4, termHeight - DESKTOP_DIALOG_ROWS)}
             width={FORM_DIALOG_WIDTH - DESKTOP_DIALOG_INSET}
+            replace={replace}
           />
           <Box style={{ marginTop: "var(--gloom-space-md)" }}>
             <DialogActions alignEnd hints={{ keys: [BROKER_CONNECT_NEW_LINK] }}>
@@ -180,26 +200,19 @@ function BrokerSignInDialog({
     );
   }
 
+  // The kit's frame, as every other dialog: its close button is a mouse's way out.
   return (
-    <Box flexDirection="column" alignItems="center">
-      <Box height={1}>
-        <Text fg={colors.textBright} attributes={TextAttributes.BOLD}>{title}</Text>
+    <DialogFrame title={title} subtitle={subtitle} footer={t("r for a new link · esc to cancel")} onClose={dismiss}>
+      <Box flexDirection="column" alignItems="center">
+        <BrokerConnectView
+          broker={broker}
+          snapshot={snapshot}
+          height={Math.max(4, termHeight - TERMINAL_DIALOG_ROWS)}
+          width={Math.max(10, termWidth - TERMINAL_DIALOG_INSET)}
+          replace={replace}
+        />
       </Box>
-      <Box height={1}>
-        <Text fg={colors.textDim}>{subtitle}</Text>
-      </Box>
-      <Box height={1} />
-      <BrokerConnectView
-        broker={broker}
-        snapshot={snapshot}
-        height={Math.max(4, termHeight - TERMINAL_DIALOG_ROWS)}
-        width={Math.max(10, termWidth - TERMINAL_DIALOG_INSET)}
-      />
-      <Box height={1} />
-      <Box height={1}>
-        <Text fg={colors.textMuted}>{t("r for a new link · esc to cancel")}</Text>
-      </Box>
-    </Box>
+    </DialogFrame>
   );
 }
 
@@ -221,6 +234,7 @@ export function BrokerConnectView({
   height,
   width,
   browserKey = true,
+  replace = null,
 }: {
   broker: SignedInBroker;
   snapshot: BrokerSignInSnapshot;
@@ -230,11 +244,13 @@ export function BrokerConnectView({
   width: number;
   /** Whether `b` opens the link now. */
   browserKey?: boolean;
+  /** Whether the broker will or may ask to replace the Gloom connection it lists: the note says to choose that. */
+  replace?: BrokerReplacePrompt | null;
 }) {
   useAppLanguage();
   const colors = useThemeColors();
   const desktop = useUiCapabilities().nativePaneChrome === true;
-  const note = brokerSignInNote(broker);
+  const note = brokerSignInNote(broker, replace);
   const noteLines = note ? wrapTextLines(note, Math.max(10, desktop ? Math.min(width, NOTE_MEASURE) : width)) : [];
   // The note goes under the panel, which gets the rows left.
   const noteRows = note ? 1 + noteLines.length : 0;
@@ -275,6 +291,8 @@ export interface BrokerSignInRequest {
   write?: boolean;
   /** Sign in again although the broker is connected. */
   renew?: boolean;
+  /** Whether the broker will or may ask to replace the Gloom connection it lists, as Gloom says. */
+  replace?: BrokerReplacePrompt | null;
   resolve: (connected: boolean) => void;
 }
 
@@ -288,12 +306,12 @@ const requestListeners = new Set<(request: BrokerSignInRequest) => void>();
  */
 export function requestBrokerSignIn(
   broker: SignedInBroker,
-  options: { write?: boolean; renew?: boolean } = {},
+  options: { write?: boolean; renew?: boolean; replace?: BrokerReplacePrompt | null } = {},
 ): Promise<boolean> {
   if (requestListeners.size === 0) return Promise.resolve(false);
   return new Promise((resolve) => {
     const write = options.write ?? Boolean(broker.capabilities.orders);
-    for (const listener of requestListeners) listener({ broker, write, renew: options.renew, resolve });
+    for (const listener of requestListeners) listener({ broker, write, renew: options.renew, replace: options.replace, resolve });
   });
 }
 
@@ -312,17 +330,23 @@ export function BrokerSignInDialogHost() {
       void runBrokerSignIn(request.broker, request.write, {
         isSignedIn: () => apiClient.isSignedIn(),
         signInToGloom: () => promptGloomSignIn(dialog),
-        connectBroker: async (broker, write, renew) => await dialog.prompt<BrokerSignInOutcome>({
-          size: "full",
-          content: (context: unknown) => (
-            <BrokerSignInDialog
-              {...(context as PromptContext<BrokerSignInOutcome>)}
-              broker={broker}
-              write={write}
-              renew={renew}
-            />
-          ),
-        }) ?? "cancelled",
+        connectBroker: async (broker, write, renew) => {
+          const { closeOnClickOutside, setClean } = clickOutsideWhileClean();
+          return await dialog.prompt<BrokerSignInOutcome>({
+            size: "full",
+            closeOnClickOutside,
+            content: (context: unknown) => (
+              <BrokerSignInDialog
+                {...(context as PromptContext<BrokerSignInOutcome>)}
+                broker={broker}
+                write={write}
+                renew={renew}
+                replace={request.replace ?? null}
+                onCleanChange={setClean}
+              />
+            ),
+          }) ?? "cancelled";
+        },
       }, { renew: request.renew })
         .then(request.resolve, () => request.resolve(false))
         .finally(() => {

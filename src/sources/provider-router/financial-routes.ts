@@ -35,6 +35,7 @@ import {
 } from "./financials";
 import type { ProviderQuoteMissNote, ProviderRouterPrimaryRoutes } from "./primary";
 import type { ProviderRouterCoreDeps, SourceResult } from "./route-types";
+import { withRetrievedAt } from "./retrieved-at";
 
 export interface ProviderRouterFinancialRouteDeps extends Pick<
   ProviderRouterCoreDeps,
@@ -110,12 +111,18 @@ export class ProviderRouterFinancialRoutes {
     exchange?: string,
     context?: MarketDataRequestContext,
   ): Promise<TickerFinancials> {
+    // An index files no statements, so its financials come back without a
+    // quote: the quote is asked beside them, not a round trip after.
+    const indexQuote = ticker.startsWith("^") ? this.getQuote(ticker, exchange, context) : null;
+    indexQuote?.catch(() => {
+      // Intentional ignore: the quote is awaited below when the financials lack one, and its failure handled there.
+    });
     const financials = await this.loadTickerFinancials(ticker, exchange, context);
     if (financials.quote) return financials;
     // Statement depth does not establish quote freshness. Use the same quote
     // fallback route as QQ, including its cache and broker/listing context.
     try {
-      const quote = await this.getQuote(ticker, exchange, context);
+      const quote = await (indexQuote ?? this.getQuote(ticker, exchange, context));
       return resolveTickerFinancialsQuoteState(financials, quote) ?? financials;
     } catch {
       // Delisted or temporarily unquoted issuers can still have valid accounts.
@@ -213,8 +220,9 @@ export class ProviderRouterFinancialRoutes {
     const cachedIsStale = rawCached && (brokerSourceKeys.includes(rawCached.sourceKey)
       ? isQuoteContributionStaleForCurrentSession(quoteWithFreshnessExchange(rawCached.value, exchange))
       : !isProviderQuoteUsableForCurrentSession(rawCached.value, exchange, ticker, { recentAnswer: !rawCached.stale }));
+    // A saved copy is dated by when it was fetched, which a copy saved before quotes said so lacks.
     const cached = rawCached && !cachedIsStale
-      ? rawCached
+      ? { ...rawCached, value: withRetrievedAt(rawCached.value, rawCached.fetchedAt) }
       : null;
     const forceRefresh = context?.cacheMode === "refresh";
     if (cached && !forceRefresh && !cached.stale) {

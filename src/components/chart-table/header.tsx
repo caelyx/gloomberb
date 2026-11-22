@@ -10,6 +10,7 @@ import { PriceSparkline } from "../price-sparkline/view";
 import { StatGrid, type StatItem } from "../ui/stat-grid";
 import type { TableWidthColumn } from "../ui/table-layout";
 import { CHART_COMPACT_ROWS, chartTableChromeRows, chartTableLayout, type ChartTableLayout } from "./layout";
+import { useRemoteUiNode } from "../../remote/semantic-tree";
 
 const DAY_MS = 86_400_000;
 /** Daily series shorter than this still span two weeks, so the axis reads days, not hours. */
@@ -36,6 +37,13 @@ export interface ChartTableChart {
   minRows?: number;
   /** Content with a natural height (a few bars): the band never takes more, the table gets the rest. */
   maxRows?: number;
+  /**
+   * The most of the height the zone may take, query bar, figures and chart
+   * together, as a share (a third), for a board whose rows are the point and
+   * whose chart is context: it goes in the table's `rootAfter`, under the
+   * rows, and the chart gives way to a strip below its readable rows.
+   */
+  maxShare?: number;
   /** The strip for a custom chart; kit series derive their own. Null keeps no strip. */
   strip?: ChartStripSpec | null;
   /** The legend value, in the table's units; the series is passed when several share the chart. */
@@ -68,7 +76,7 @@ export interface ChartTableHeaderProps {
   height: number;
   /** Body rows the table holds. */
   tableRows: number;
-  /** Table header rows, plus one when its columns overflow into a scrollbar. */
+  /** Rows occupied by the table header, disclosure and scrollbars. */
   tableChromeRows?: number;
   /** The table's columns, to count its scrollbar row when `tableChromeRows` is not given. */
   tableColumns?: readonly TableWidthColumn[];
@@ -173,13 +181,14 @@ export function useChartTableLayout(props: ChartTableHeaderProps): ChartTableLay
     figures: props.figures,
     tableRows: props.tableRows,
     tableChromeRows: props.tableChromeRows
-      ?? (props.tableColumns ? chartTableChromeRows(props.tableColumns, props.width) : undefined),
+      ?? (props.tableColumns ? chartTableChromeRows(props.tableColumns, props.width, props.tableRows) : undefined),
     chart: hasChart
       ? {
         minRows: chart.minRows,
         // Kit charts can draw in fewer rows under a short table; custom ones say their own least.
         compactRows: chart.render ? undefined : CHART_COMPACT_ROWS,
         maxRows: chart.maxRows,
+        maxShare: chart.maxShare,
         strip: chart.strip !== null,
       }
       : null,
@@ -190,12 +199,21 @@ export function useChartTableLayout(props: ChartTableHeaderProps): ChartTableLay
  * The header zone of a pane that shows figures, a chart and a table: the
  * query bar, then the figures, then the chart band, sized by
  * `chartTableLayout` for the pane's current size. It goes in the table's
- * `rootBefore`, and the table takes the rows it leaves.
+ * `rootBefore`, and the table takes the rows it leaves; a board whose rows
+ * come first puts it in `rootAfter` with the chart's `maxShare`.
  */
 export function ChartTableHeader(props: ChartTableHeaderProps) {
   const { width, query, chart } = props;
   const colors = useThemeColors();
   const layout = useChartTableLayout(props);
+  const essential = props.figures?.filter((item) => item.essential === true) ?? [];
+  useRemoteUiNode(essential.length ? {
+    role: "figure-layout", label: "Essential figures",
+    metadata: {
+      figures: essential.map(({ label, value }) => ({ label, value })),
+      omitted: essential.filter((item) => !layout.figures.includes(item)).map((item) => item.label),
+    },
+  } : null);
   const series = chart?.series;
   const viewport = useMemo(() => {
     if (chart?.viewport || !series?.length) return chart?.viewport;
@@ -257,7 +275,7 @@ export function ChartTableHeader(props: ChartTableHeaderProps) {
   return (
     <Box flexDirection="column" flexShrink={0}>
       {query}
-      {layout.figureRows ? <StatGrid items={layout.figures} width={width} /> : null}
+      {layout.figureRows ? <StatGrid items={layout.figures} width={width} maxLines={layout.figureMaxLines} /> : null}
       {band}
     </Box>
   );

@@ -1,4 +1,6 @@
 import { hasUsablePriceHistory } from "../../utils/price-history";
+import { isTransientFailure } from "../../api-client/errors";
+import { isTransientSourceFailure } from "../../sources/provider-errors";
 import type { PricePoint, Quote, TickerFinancials } from "../../types/financials";
 import { hasFreshQuoteForCurrentSession, isQuoteStaleForCurrentSession } from "../quotes/freshness";
 import type { InstrumentRef } from "../request-types";
@@ -6,7 +8,7 @@ import type { ProviderAttempt, ProviderReasonCode, QueryEntry } from "../result-
 import { resolveEntryData } from "../selectors";
 
 const EMPTY_MESSAGE = "No data available";
-export const EXPECTED_EMPTY = /no data|not found|delisted|unavailable|unsupported/i;
+const EXPECTED_EMPTY = /no data|not found|delisted|unavailable|unsupported/i;
 export const SNAPSHOT_CACHE_TTL_MS = 5 * 60_000;
 /** How long a failed or empty snapshot answer stands before an unforced load asks again. */
 export const SNAPSHOT_FAILURE_RETRY_MS = 2 * 60_000;
@@ -19,11 +21,32 @@ export const FX_CACHE_TTL_MS = 30 * 60_000;
 
 export function classifyError(error: unknown): { reasonCode: ProviderReasonCode; message: string } {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  if (/timeout/i.test(message)) return { reasonCode: "TIMEOUT", message };
+  if (/timeout|timed out/i.test(message)) return { reasonCode: "TIMEOUT", message };
   if (/unsupported/i.test(message)) return { reasonCode: "UNSUPPORTED_RANGE", message };
   if (/mapping|symbol/i.test(message)) return { reasonCode: "BAD_MAPPING", message };
   if (/not found|no data|unavailable|delisted/i.test(message)) return { reasonCode: "NOT_FOUND", message };
   return { reasonCode: "UPSTREAM_ERROR", message };
+}
+
+/**
+ * How a load that threw is recorded: `retryable_error` for a failure asking
+ * again may get past (no connection, a timeout, 429, a 5xx:
+ * `isTransientFailure`), including the router's answer that no source served
+ * it because one timed out (`isTransientSourceFailure`), whose kept data is
+ * then a saved copy (`savedCopyEntryAt`), and `fatal_error` for any other.
+ */
+export function errorStatus(error: unknown): "retryable_error" | "fatal_error" {
+  return isTransientFailure(error) || isTransientSourceFailure(error) ? "retryable_error" : "fatal_error";
+}
+
+/**
+ * As `errorStatus`, with an answer that there is nothing (no data, not found)
+ * recorded as `empty`. A transient failure stays one whatever it says: a 503
+ * "Service unavailable" is an outage, not an empty answer.
+ */
+export function failureStatus(error: unknown, classified: { message: string }): ProviderAttempt["status"] {
+  const status = errorStatus(error);
+  return status === "fatal_error" && EXPECTED_EMPTY.test(classified.message) ? "empty" : status;
 }
 
 export function hasFreshEntryData<T>(entry: QueryEntry<T>, ttlMs: number, now = Date.now()): boolean {
@@ -34,12 +57,24 @@ export function hasFreshEntryData<T>(entry: QueryEntry<T>, ttlMs: number, now = 
 /**
  * The last request for this entry failed or came back empty a moment ago.
  * A symbol with no financials (an index, a crypto pair) fails every time;
- * without this, each pane, cursor move or warm-up asks again.
+ * without this, each pane, cursor move or warm-up asks again. One that
+ * finished by `since` does not count.
  */
-export function hasRecentFailedAttempt<T>(entry: QueryEntry<T>, retryAfterMs: number, now = Date.now()): boolean {
+export function hasRecentFailedAttempt<T>(entry: QueryEntry<T>, retryAfterMs: number, now = Date.now(), since = 0): boolean {
   const attempt = entry.attempts.at(-1);
   return !!attempt && attempt.status !== "success" && attempt.status !== "partial"
-    && now - attempt.finishedAt < retryAfterMs;
+    && attempt.finishedAt > since && now - attempt.finishedAt < retryAfterMs;
+}
+
+/**
+ * A load of this entry failed (its last request errored), rather than
+ * answering, empty or not: what an outage leaves behind, and what is asked
+ * again once the service answers.
+ */
+export function hasFailedLoad<T>(entry: QueryEntry<T>): boolean {
+  const status = entry.attempts.at(-1)?.status;
+  if (status === "fatal_error" || status === "retryable_error") return true;
+  return entry.phase === "error" && status !== "empty" && status !== "unsupported";
 }
 
 export function hasFreshReadyEntry<T>(entry: QueryEntry<T>, ttlMs: number, now = Date.now()): boolean {

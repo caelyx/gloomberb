@@ -6,7 +6,8 @@ import { createTestDataProvider } from "../../../../test-support/data-provider";
 import type { PricePoint, TickerFinancials } from "../../../../types/financials";
 import { createDefaultConfig, TICKER_RESEARCH_PANE_ID } from "../../../../types/config";
 import { createInitialState } from "../../../../state/app/context";
-import { QuoteMonitorPane } from "./index";
+import { QuoteMonitorPane, quoteMonitorLabel } from "./index";
+import { createTestTicker } from "../../../../test-support/ticker";
 import type { PluginRuntimeAccess } from "../../../runtime";
 import type { PinTickerOptions } from "../../../../types/plugin";
 import { TestPaneProvider, createTestTicker as makeTicker } from "../../../../test-support/pane";
@@ -147,8 +148,8 @@ describe("QuoteMonitorPane", () => {
     await renderHarness(createQuoteMonitorHarness({ width, symbols: [symbol], financials: new Map([[symbol, financials]]) }), { width, height: 7 });
     await renderOnce();
     const frame = tui.frame();
-    expect(frame).toContain("$1.160227");
-    expect(frame).toContain("-0.001078");
+    expect(frame).toContain("$1.16023");
+    expect(frame).toContain("-0.00108");
   });
 
   test("opens a Ticker Research pane on the second card click", async () => {
@@ -227,4 +228,15 @@ describe("QuoteMonitorPane", () => {
       options: { paneType: TICKER_RESEARCH_PANE_ID, floating: true },
     }]);
   });
+});
+
+// a board of Tokyo names read "8058" on the card added from a saved row and "8031:JPX" on the rest.
+test("every card on a board is headed in one form: a listing abroad with its venue, a US listing or an index by its symbol", () => {
+  expect(quoteMonitorLabel("8058", createTestTicker("8058", "Mitsubishi Corporation", { exchange: "JPX", currency: "JPY" }))).toBe("8058:JPX");
+  expect(quoteMonitorLabel("8031:JPX", null)).toBe("8031:JPX");
+  // A key saved under the venue's MIC reads by its code, as titles name it.
+  expect(quoteMonitorLabel("9992:XHKG", null)).toBe("9992:HKEX");
+  expect(quoteMonitorLabel("9992", createTestTicker("9992", "Pop Mart", { exchange: "XHKG", currency: "HKD" }))).toBe("9992:HKEX");
+  expect(quoteMonitorLabel("AAPL", createTestTicker("AAPL"))).toBe("AAPL");
+  expect(quoteMonitorLabel("^N225", createTestTicker("^N225", "Nikkei 225", { exchange: "OSAKA", currency: "JPY" }))).toBe("^N225");
 });

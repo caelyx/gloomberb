@@ -59,6 +59,50 @@ test("--tab events lists the event alerts the Events tab shows, with their dates
   expect((await alertsHeadless.load(createTestHeadlessArgs({ options: { tab: "prices" } }), contextWith([], []))).notes).toBeUndefined();
 });
 
+test("signed out, an event alert only a signed-in account gets checked reads Needs sign-in, with one line on signing in", async () => {
+  const filing = createResearchAlert("filing_type", { "filing_type:symbol": "WHR", "filing_type:exchange": "US", "filing_type:form": "8-K" });
+  const cpi = createScheduledAlert({ kind: "macro", event: "cpi" }, 1, "2026-11-10", Date.UTC(2026, 9, 17));
+  const ctx = contextWith([], [filing, cpi]);
+  const signedOut = await alertsHeadless.load(createTestHeadlessArgs({ options: { tab: "events" } }), ctx);
+  // The app reads a CPI date itself, signed in or not.
+  expect(signedOut.rows.map((row) => [row.following, row.state])).toEqual([["WHR · 8-K", "Needs sign-in"], ["CPI release", "Active"]]);
+  expect(signedOut.notes).toEqual([expect.stringMatching(/^1 event alert needs sign-in: .*Log In or Sign Up\)\.$/)]);
+
+  const signedIn = await alertsHeadless.load(createTestHeadlessArgs({ options: { tab: "events" } }), {
+    ...ctx, apiClient: { getSessionToken: () => "session-token" } as unknown as HeadlessPaneApiClient,
+  });
+  expect(signedIn.rows.map((row) => row.state)).toEqual(["Active", "Active"]);
+  expect(signedIn.notes).toBeUndefined();
+});
+
+/** Options flow read "Needs sign-in" signed out, though a free sign-in would not arm it either. */
+test("an options flow alert reads Needs Pro without an account that has Pro, signed out or on a free plan", async () => {
+  const flow = createResearchAlert("options_flow", { "options_flow:symbol": "QQQ", "options_flow:exchange": "US", "options_flow:threshold": "1000000" });
+  const filing = createResearchAlert("filing_type", { "filing_type:symbol": "WHR", "filing_type:exchange": "US", "filing_type:form": "8-K" });
+  const ctx = contextWith([], [flow, filing]);
+  const read = async (apiClient: Partial<HeadlessPaneApiClient>) => {
+    const result = await alertsHeadless.load(createTestHeadlessArgs({ options: { tab: "events" } }), { ...ctx, apiClient: apiClient as HeadlessPaneApiClient });
+    return { states: Object.fromEntries(result.rows.map((row) => [row.kind, row.state])), notes: result.notes ?? [] };
+  };
+  const signedOut = await read({ getSessionToken: () => null });
+  expect(signedOut.states).toEqual({ options_flow: "Needs Pro", filing_type: "Needs sign-in" });
+  expect(signedOut.notes[1]).toBe("1 event alert needs Pro (options flow). Free: OMON chain, price and move alerts.");
+
+  const free = await read({ getSessionToken: () => "session-token", getCurrentUser: () => ({ emailVerified: true, plan: "free", effectivePlan: "free" }) as never });
+  expect(free.states).toEqual({ options_flow: "Needs Pro", filing_type: "Active" });
+  expect(free.notes).toEqual(["1 event alert needs Pro (options flow). Free: OMON chain, price and move alerts."]);
+
+  const pro = await read({ getSessionToken: () => "session-token", getCurrentUser: () => ({ emailVerified: true, plan: "pro", effectivePlan: "pro" }) as never });
+  expect(pro.states).toEqual({ options_flow: "Active", filing_type: "Active" });
+  expect(pro.notes).toEqual(["Options flow alerts are checked only with Pro. Free: OMON chain, price and move alerts."]);
+
+  // An IV spike's free list leads with the IV level alerts the app checks, and covers flow's.
+  const spike = createResearchAlert("iv_spike", { "iv_spike:contract": "SPY271217C00700000", "iv_spike:threshold": "5" });
+  const both = await alertsHeadless.load(createTestHeadlessArgs({ options: { tab: "events" } }),
+    { ...contextWith([], [flow, spike]), apiClient: { getSessionToken: () => null } as unknown as HeadlessPaneApiClient });
+  expect(both.notes).toEqual(["2 event alerts need Pro (options flow and IV spike). Free: IV level alerts, OMON chain, price and move alerts."]);
+});
+
 test("a saved event list that does not read is reported, not shown as no alerts", async () => {
   const ctx = contextWith([], []);
   ctx.config.pluginConfig[ALERTS_PLUGIN_ID]![EVENT_ALERTS_KEY] = "{";
@@ -71,7 +115,7 @@ test("a saved event list that does not read is reported, not shown as no alerts"
 test("Prices exports the quote's own time and feed apart from the check time, and Away in percent; the text table is the pane's", async () => {
   const quotedAt = Date.UTC(2026, 9, 22, 20, 14);
   const checkedAt = Date.UTC(2026, 9, 22, 20, 31);
-  const alert = { ...createAlert("IBIT", "above", 50), lastCheckedPrice: 46.06, lastCheckedAt: checkedAt, lastQuoteUpdatedAt: quotedAt, lastQuoteSource: "delayed" };
+  const alert = { ...createAlert("IBIT", "above", 50), createdAt: Date.UTC(2026, 9, 20, 9, 30, 5, 678), lastCheckedPrice: 46.06, lastCheckedAt: checkedAt, lastQuoteUpdatedAt: quotedAt, lastQuoteSource: "delayed" };
   const args = createTestHeadlessArgs({ options: { tab: "prices" } });
   const result = await alertsHeadless.load(args, contextWith([alert], []));
   const table = headlessReportTables(alertsHeadless, result, args, "ALRT", deriveHeadlessFreshness(alertsHeadless, result), { complete: true, unavailableSymbols: [] }).tables[0]!;
@@ -79,6 +123,8 @@ test("Prices exports the quote's own time and feed apart from the check time, an
   expect(Date.parse(String(cell("Quote")))).toBe(quotedAt);
   expect(cell("Quote source")).toBe("delayed");
   expect(Date.parse(String(cell("Checked")))).toBe(checkedAt);
+  // When it was made reads to the second, as alerts list and the pane's detail write it, not to the stored millisecond.
+  expect(cell("Created")).toBe("2026-10-20T09:30:05Z");
   expect(table.columns.find((column) => column.startsWith("Away"))).toMatch(/%/);
   expect(Number(cell(table.columns.find((column) => column.startsWith("Away"))!))).toBeCloseTo(8.55, 1);
   // The terminal keeps the pane's columns: no source or check-time column of its own.

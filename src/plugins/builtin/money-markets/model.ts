@@ -1,15 +1,21 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { MoneyMarketRow, MoneyMarketsPayload } from "../../../api-client/money-markets";
 import { formatPercentAxis, spanAxisFormatter } from "../../../components/chart-table";
 import type { CompositeAxisDomain } from "../../../components/chart/composite/types";
 import type { CurvePalette, CurveSeries } from "../../../components/chart/curve/model";
 
+/** A balance in billions to the million under $10B, to the hundred million above. */
+const billionsDigits = (value: number) => Math.abs(value) < 10 ? 3 : 1;
 export const moneyMarketValue = (value: number | null, unit: MoneyMarketRow["unit"]) => value == null
-  ? "--" : unit === "percent" ? `${value.toFixed(2)}%` : `$${value.toLocaleString("en-US", { minimumFractionDigits: Math.abs(value) < 10 ? 3 : 1, maximumFractionDigits: Math.abs(value) < 10 ? 3 : 1 })}B`;
+  ? MISSING_VALUE : unit === "percent" ? `${value.toFixed(2)}%` : `$${value.toLocaleString("en-US", { minimumFractionDigits: billionsDigits(value), maximumFractionDigits: billionsDigits(value) })}B`;
 export const moneyMarketChange = (value: number | null, unit: MoneyMarketRow["changeUnit"]) => value == null
-  ? "--" : `${value > 0 ? "+" : ""}${value.toFixed(unit === "usd-billions" && Math.abs(value) < 1 ? 3 : 1)}${unit === "basis-points" ? "bp" : "B"}`;
-const formatBillionsAxis = spanAxisFormatter((value, digits) => `$${value.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}B`);
+  ? MISSING_VALUE : `${value > 0 ? "+" : ""}${value.toFixed(unit === "usd-billions" && Math.abs(value) < 1 ? 3 : 1)}${unit === "basis-points" ? "bp" : "B"}`;
+const formatBillionsAxis = spanAxisFormatter(
+  (value, digits) => `$${value.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}B`,
+  billionsDigits,
+);
 
-/** Axis labels in the board's units, with the decimals the plotted range needs. */
+/** Axis labels in the board's units, with the decimals the plotted range needs; tags at the board's own. */
 export function moneyMarketAxis(unit: MoneyMarketRow["unit"]): (value: number, domain: CompositeAxisDomain) => string {
   return unit === "percent" ? formatPercentAxis : formatBillionsAxis;
 }
@@ -17,14 +23,33 @@ export function moneyMarketAxis(unit: MoneyMarketRow["unit"]): (value: number, d
 /** A move in a bill's discount yield, in basis points like the board's change column. */
 export const moneyMarketRateChange = (value: number) => moneyMarketChange(value * 100, "basis-points");
 
-export function moneyMarketNotices(data: MoneyMarketsPayload): string[] {
-  const notices = [...data.rows, data.netLiquidity].flatMap((row) => row.status === "unavailable"
-    ? [`${row.label}: ${(row.unavailableReason ?? "unavailable").replaceAll("-", " ")}.`]
-    : row.status === "stale" ? [`${row.label}: stale, last observation ${row.asOf ?? "unknown"}.`] : []);
+/** The board's tabs: the US funding rates, bills and Fed liquidity, and Hong Kong's Exchange Fund Bill yields. */
+export const MONEY_MARKET_TABS = [{ value: "rates", label: "Rates" }, { value: "bills", label: "Bills" }, { value: "liquidity", label: "Liquidity" },
+  { value: "hk", label: "Hong Kong" }] as const;
+export const isHongKongTab = (tab: unknown) => tab === "hk";
+
+/** Why a row has no figure, or an old one. */
+export function moneyMarketRowNote(row: MoneyMarketRow): string | null {
+  return row.status === "unavailable" ? `${row.label}: ${(row.unavailableReason ?? "unavailable").replaceAll("-", " ")}.`
+    : row.status === "stale" ? `${row.label}: stale, last observation ${row.asOf ?? "unknown"}.` : null;
+}
+
+/** Each row's note: the report's, which lists them; the pane says each on its row (`moneyMarketRowNote`). */
+export function moneyMarketRowNotices(rows: readonly MoneyMarketRow[]): string[] {
+  return rows.flatMap((row) => moneyMarketRowNote(row) ?? []);
+}
+
+/** What concerns the whole board: the bills curve and its comparisons, which are no row of it. */
+export function moneyMarketBoardNotices(data: MoneyMarketsPayload): string[] {
+  const notices: string[] = [];
   if (data.billsCurve.status === "unavailable") notices.push("Bills curve: no common observation date across all four tenors.");
   else if (data.billsCurve.status === "stale") notices.push(`Bills curve: stale, last common observation ${data.billsCurve.asOf}.`);
   for (const ghost of data.billsCurve.comparisons) if (!ghost.points.length) notices.push(`Bills ${ghost.period}: no common observation within seven days before ${ghost.targetDate ?? "the comparison date"}.`);
   return notices;
+}
+
+export function moneyMarketNotices(data: MoneyMarketsPayload): string[] {
+  return [...moneyMarketRowNotices([...data.rows, data.netLiquidity]), ...moneyMarketBoardNotices(data)];
 }
 export function moneyMarketCurves(data: MoneyMarketsPayload, palette?: CurvePalette): CurveSeries[] {
   const curve = data.billsCurve;

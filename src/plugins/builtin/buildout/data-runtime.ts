@@ -15,21 +15,28 @@ import {
   loadBuildoutData,
 } from "./model";
 import { appendUniqueById } from "./format";
+import { boardThemes, resolveBoardTheme } from "./pane/themes";
+
+/** How long the board rests on a theme before its companies load. */
+const THEME_SETTLE_MS = 180;
 
 interface UseBuildoutDataRuntimeOptions {
   activeTab: BuildoutTabId;
   onBeforeLoad: () => void;
   selectedList: BuildoutList | null;
+  /** The theme the Themes board is on, as the pane saved it. */
+  themeSlug: string | null;
 }
 
 export function useBuildoutDataRuntime({
   activeTab,
   onBeforeLoad,
-  selectedList,
+  selectedList: openedList,
+  themeSlug,
 }: UseBuildoutDataRuntimeOptions): {
-  loadCompanies: (list: BuildoutList, offset: number, append: boolean) => Promise<void>;
-  loadIntel: (offset: number, append: boolean) => Promise<void>;
-  loadSites: (offset: number, append: boolean) => Promise<void>;
+  loadCompanies: (list: BuildoutList, offset: number, append: boolean) => void;
+  loadIntel: (offset: number, append: boolean) => void;
+  loadSites: (offset: number, append: boolean) => void;
   refresh: () => void;
   resetCompanies: () => void;
   setState: Dispatch<SetStateAction<BuildoutLoadState>>;
@@ -53,7 +60,8 @@ export function useBuildoutDataRuntime({
         ? { ...current, refreshing: true, refreshError: null }
         : { status: "loading" });
 
-      const token = await getBuildoutProToken();
+      // A refresh the user pressed asks for access again: a plan bought or ended since shows at once.
+      const token = await getBuildoutProToken({ fresh: refreshVersion > 0 });
       const data = await loadBuildoutData(token);
       if (!cancelled) {
         onBeforeLoad();
@@ -78,7 +86,8 @@ export function useBuildoutDataRuntime({
     };
   }, [onBeforeLoad, refreshVersion]);
 
-  const loadCompanies = useCallback(async (list: BuildoutList, offset: number, append: boolean) => {
+  // A page load nobody waits on: its failure lands in the page's `error`.
+  const loadCompanies = useCallback((list: BuildoutList, offset: number, append: boolean) => {
     const pageKey = `companies:${list.slug}:${offset}`;
     if (loadingPageKeysRef.current.has(pageKey)) return;
     loadingPageKeysRef.current.add(pageKey);
@@ -88,17 +97,17 @@ export function useBuildoutDataRuntime({
       return {
         ...current,
         companies: {
-          ...(append ? current.companies : { ...emptyPage<BuildoutCompany>(), blurredCompanyCount: 0 }),
+          ...(append ? current.companies : { ...emptyPage<BuildoutCompany>(), blurredCompanyCount: 0, listSlug: list.slug }),
           loadingMore: true,
           error: null,
         },
       };
     });
 
-    try {
-      const page = await fetchCompaniesPage(token, list.slug, offset);
+    fetchCompaniesPage(token, list.slug, offset).then((page) => {
       setState((current) => {
-        if (current.status !== "ready") return current;
+        // A list closed or replaced since keeps the answer out.
+        if (current.status !== "ready" || current.companies.listSlug !== list.slug) return current;
         const previousItems = append ? current.companies.items : [];
         const items = appendUniqueById(previousItems, page.items);
         return {
@@ -112,12 +121,13 @@ export function useBuildoutDataRuntime({
             blurredCompanyCount: append
               ? Math.max(current.companies.blurredCompanyCount, page.blurredCompanyCount)
               : page.blurredCompanyCount,
+            listSlug: list.slug,
           },
         };
       });
-    } catch (error) {
+    }).catch((error: unknown) => {
       setState((current) => {
-        if (current.status !== "ready") return current;
+        if (current.status !== "ready" || current.companies.listSlug !== list.slug) return current;
         return {
           ...current,
           companies: {
@@ -127,12 +137,12 @@ export function useBuildoutDataRuntime({
           },
         };
       });
-    } finally {
+    }).finally(() => {
       loadingPageKeysRef.current.delete(pageKey);
-    }
+    });
   }, [state]);
 
-  const loadSites = useCallback(async (offset: number, append: boolean) => {
+  const loadSites = useCallback((offset: number, append: boolean) => {
     const pageKey = `sites:${offset}`;
     if (loadingPageKeysRef.current.has(pageKey)) return;
     loadingPageKeysRef.current.add(pageKey);
@@ -141,8 +151,7 @@ export function useBuildoutDataRuntime({
       ? { ...current, sites: { ...current.sites, loadingMore: true, error: null } }
       : current);
 
-    try {
-      const page = await fetchSitesPage(token, offset);
+    fetchSitesPage(token, offset).then((page) => {
       setState((current) => {
         if (current.status !== "ready") return current;
         const previousItems = append ? current.sites.items : [];
@@ -158,7 +167,7 @@ export function useBuildoutDataRuntime({
           },
         };
       });
-    } catch (error) {
+    }).catch((error: unknown) => {
       setState((current) => current.status === "ready"
         ? {
           ...current,
@@ -169,12 +178,12 @@ export function useBuildoutDataRuntime({
           },
         }
         : current);
-    } finally {
+    }).finally(() => {
       loadingPageKeysRef.current.delete(pageKey);
-    }
+    });
   }, [state]);
 
-  const loadIntel = useCallback(async (offset: number, append: boolean) => {
+  const loadIntel = useCallback((offset: number, append: boolean) => {
     const pageKey = `intel:${offset}`;
     if (loadingPageKeysRef.current.has(pageKey)) return;
     loadingPageKeysRef.current.add(pageKey);
@@ -183,8 +192,7 @@ export function useBuildoutDataRuntime({
       ? { ...current, intel: { ...current.intel, loadingMore: true, error: null } }
       : current);
 
-    try {
-      const page = await fetchIntelPage(token, offset);
+    fetchIntelPage(token, offset).then((page) => {
       setState((current) => {
         if (current.status !== "ready") return current;
         const previousItems = append ? current.intel.items : [];
@@ -200,7 +208,7 @@ export function useBuildoutDataRuntime({
           },
         };
       });
-    } catch (error) {
+    }).catch((error: unknown) => {
       setState((current) => current.status === "ready"
         ? {
           ...current,
@@ -211,22 +219,33 @@ export function useBuildoutDataRuntime({
           },
         }
         : current);
-    } finally {
+    }).finally(() => {
       loadingPageKeysRef.current.delete(pageKey);
-    }
+    });
   }, [state]);
 
+  // The open list's companies, once; the Themes board waits for the pointer or the keys to settle on a theme.
   useEffect(() => {
-    if (state.status !== "ready" || activeTab !== "companies" || !selectedList) return;
-    if (state.companies.items.length > 0 || state.companies.loadingMore || state.companies.error) return;
-    void loadCompanies(selectedList, 0, false);
-  }, [activeTab, loadCompanies, selectedList, state]);
+    if (state.status !== "ready") return;
+    const selectedList = activeTab === "themes" ? resolveBoardTheme(boardThemes(state.lists), themeSlug) : openedList;
+    if ((activeTab !== "companies" && activeTab !== "themes") || !selectedList) return;
+    // A list that answered with no company this account can see is loaded too (no more pages), not asked again.
+    const { companies } = state;
+    const loaded = companies.listSlug === selectedList.slug;
+    if (loaded && (companies.items.length > 0 || companies.loadingMore || companies.error || !companies.hasMore)) return;
+    if (activeTab === "companies") {
+      loadCompanies(selectedList, 0, false);
+      return;
+    }
+    const timer = setTimeout(() => loadCompanies(selectedList, 0, false), THEME_SETTLE_MS);
+    return () => clearTimeout(timer);
+  }, [activeTab, loadCompanies, openedList, state, themeSlug]);
 
   const resetCompanies = useCallback(() => {
     setState((current) => current.status === "ready"
       ? {
         ...current,
-        companies: { ...emptyPage<BuildoutCompany>(), blurredCompanyCount: 0 },
+        companies: { ...emptyPage<BuildoutCompany>(), blurredCompanyCount: 0, listSlug: null },
       }
       : current);
   }, []);

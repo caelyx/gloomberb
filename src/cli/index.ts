@@ -2,7 +2,9 @@ import { VERSION } from "../version";
 import type { CliCommandContext, CliCommandDef, CliDispatchResult, CliLaunchRequest } from "../types/plugin";
 import type { LoadedExternalPlugin } from "../plugins/loader";
 import { loadCliConfigIfAvailable } from "./context";
-import { parseCliGlobalArgs } from "./options";
+import { checkCliOutputFormat, commandOwnsOutput, parseCliGlobalArgs, type CliGlobalOptions } from "./options";
+import { checkOutputPath, resolveOutputPath, writeOutputFile } from "./output-file";
+import { printCliResult, takeCliFileExport } from "./result";
 import {
   buildCliCommandRegistry,
   createCliCommandContext,
@@ -26,6 +28,7 @@ import { CLI_EXIT_CODES } from "./exit-codes";
 import { asUsageError, fail, inferCliErrorOptions, printCliError } from "./errors";
 import { cliStyles, setCliColorEnabledOverride, setCliPlainOverride, setCliWidthOverride } from "../utils/cli-output";
 import { setDisplayTimeZone } from "../utils/utc-time";
+import { setCsvDecimal } from "../utils/csv";
 import { collectSavedCopies } from "../data/saved-copies";
 import { search, searchCandidatesForCli, buildSearchReport } from "./commands/search";
 import { ticker } from "./commands/ticker";
@@ -37,7 +40,7 @@ import { overviewCliCommands } from "./commands/overview";
 import { remoteCliCommand } from "./commands/remote";
 import { createSystemCliCommands } from "./commands/system";
 import { brokerCliCommand, ibkrCliCommand } from "./commands/broker";
-import { listPlugins, updatePlugins } from "./commands/plugins";
+import { installedPluginArg, listPlugins, updatePlugins } from "./commands/plugins";
 import { installListedPlugin, removePlugin } from "../plugins/installer";
 import {
   catalogCommandHits,
@@ -48,8 +51,7 @@ import {
   runPaneFunctionHelp,
   runPaneScreenshot,
 } from "./pane-functions";
-import { catalogPointer, tickerPointer, type CatalogCommandHit } from "./unknown-command";
-import { exportCommandPointer } from "./known-gaps";
+import { hitsBesideNearCommand, type UnknownCommandPointers, unknownCommandReply } from "./unknown-command";
 import { catalogFredSeriesIds } from "./series-search";
 import { primeBoardCoins } from "./board-coins";
 
@@ -112,6 +114,7 @@ export function createCoreCliCommands(
       execute: async (args, ctx) => {
         const query = args.join(" ");
         await search(query, {
+          limit: ctx.cliOptions.limit,
           initMarketData: ctx.initMarketData,
           fail: ctx.fail,
           plugins: ctx.plugins,
@@ -179,6 +182,7 @@ export function createCoreCliCommands(
           { flags: "--<option> <value>", description: "A function setting; gloom catalog <function> lists them" },
           { flags: "--require-bot-safe", description: "Fail unless the function has a verified, complete report" },
           { flags: "--explain", description: "Follow the report with what its terms mean (text and JSON; CSV keeps the rows)" },
+          { flags: "--output <path>, --out <path>", description: "Write the report to this file, in the format asked for, and print where it went" },
           {
             ...TABLE_SECTION_OPTION,
             description: `${TABLE_SECTION_OPTION.description} (CALLS keeps --section for the transcript part)`,
@@ -189,7 +193,8 @@ export function createCoreCliCommands(
           "fn HP AAPL",
           "fn ANR SAN:EPA",
           "fn CBR --json",
-          "fn WEI --csv --section europe > europe.csv",
+          "fn WEI --csv --section europe --output europe.csv",
+          "fn RV NEE,FSLR --csv --output rv.csv",
           "fn 13F AAPL --view=ticker-holdings",
           "fn OVME --spot 100 --strike 100 --days 30 --volatility 25",
           "fn HIVG SPY --event fomc --offset -6 --lookback ALL --csv",
@@ -223,7 +228,7 @@ export function createCoreCliCommands(
           { flags: "--scale <n>", description: "Text scale from 0.5 to 4 (default 1)" },
           { flags: "--watermark <label>", description: "Label drawn in the pane title bar" },
           { flags: "--no-status", description: "Leave out the dated status line (as-of, delay, market hours) drawn in the pane footer" },
-          { flags: "--strict", description: `Exit ${CLI_EXIT_CODES.unusableShot} when the pane is empty, shows an error, is still loading or is access-gated; the PNG and the Reason line are still written` },
+          { flags: "--strict", description: `Exit ${CLI_EXIT_CODES.unusableShot} without saving an image when the pane is empty, shows an error, is still loading, is access-gated, or draws a column blank in every row. The Reason line names what it saw. A column cut at the table's edge is a warning` },
           { flags: "--<option> <value>", description: "A function setting; gloom catalog <function> lists them" },
           EXCHANGE_OPTION,
         ],
@@ -275,17 +280,17 @@ export function createCoreCliCommands(
     },
     {
       name: "update",
-      description: "Update installed plugins, or one by name",
+      description: "Update installed plugins, or one by id or folder",
       help: {
         group: CLI_COMMAND_GROUPS.plugins,
-        usage: ["update [name]"],
+        usage: ["update [plugin]"],
         sections: [{
           title: "Updating Gloom itself",
           lines: [
             "The app updates itself from stable releases. config set updates.channel nightly adds the nightly build of main; see gloom help config.",
           ],
         }],
-        examples: ["update", "update gloom-tv"],
+        examples: ["update", "update tv"],
       },
       execute: async (args) => {
         await updatePlugins(args[0]);
@@ -297,15 +302,15 @@ export function createCoreCliCommands(
       description: "Remove an installed plugin",
       help: {
         group: CLI_COMMAND_GROUPS.plugins,
-        usage: ["remove <name>"],
-        examples: ["remove gloom-tv"],
+        usage: ["remove <plugin>"],
+        examples: ["remove tv"],
       },
       execute: async (args) => {
         const name = args[0];
         if (!name) {
-          fail("Usage: gloom remove <name>");
+          fail("Usage: gloom remove <plugin>");
         }
-        await removePlugin(name);
+        await removePlugin(await installedPluginArg(name));
       },
     },
     apiCliCommand,
@@ -351,17 +356,6 @@ function nearCommand(token: string, commands: CliCommandDef[]): string | null {
   );
 }
 
-interface UnknownCommandPointers {
-  /** The word is a function's code: the command that runs it. */
-  fn: { code: string; command: string } | null;
-  /** The word is a slip from one function's code (RCDF for RDCF), read only when it is no code, no command is close to it and the catalog finds nothing for it. */
-  nearFn: { code: string; label: string; command: string } | null;
-  /** Functions the catalog finds for the word, read only when it is no code and no command is close to it. */
-  hits: CatalogCommandHit[];
-  /** What the reader typed after the word, which a pointer runs the function with. */
-  args: readonly string[];
-}
-
 /** What an unknown command word may point at: a function's code first, then what the catalog finds for it. */
 async function unknownCommandPointers(
   ctx: CliCommandContext,
@@ -370,42 +364,29 @@ async function unknownCommandPointers(
   commands: CliCommandDef[],
 ): Promise<UnknownCommandPointers> {
   const fn = await functionCodeCommand(ctx, token, args);
-  const command = fn || nearCommand(token, commands);
-  const hits = command ? [] : await catalogCommandHits(ctx, token);
+  const near = fn ? null : nearCommand(token, commands);
+  const found = fn ? [] : await catalogCommandHits(ctx, token);
+  // A word close to a command is that command's slip, unless a function is named for it: `screen` is the
+  // screener before it is `screenshot` mistyped.
+  const hits = hitsBesideNearCommand(found, token, near);
   // What the catalog finds for a word (`comps`) outranks the code it happens to be a slip from.
-  const nearFn = command || hits.length > 0 ? null : await nearFunctionCodeCommand(ctx, token, args);
+  const nearFn = fn || near || hits.length > 0 ? null : await nearFunctionCodeCommand(ctx, token, args);
   return { fn, nearFn, hits, args };
 }
 
-/**
- * A function's code is pointed at `fn`; a typo of a command at the command;
- * a typo of a function's code (`RCDF`) at that function; a word the catalog
- * knows (`comps`, `peers`) at the functions it finds. A word written as a
- * ticker (`PLTR`) is also pointed at `quote` and `search`.
- */
+/** An unknown command word, answered as unknownCommandReply says. */
 function failUnknownCommand(token: string, commands: CliCommandDef[], pointers: UnknownCommandPointers): never {
-  if (pointers.fn) fail(`${pointers.fn.code} is a function: ${pointers.fn.command}`);
-  const ticker = tickerPointer(token);
-  const suggestion = nearCommand(token, commands);
-  if (!suggestion && pointers.nearFn) {
-    fail(
-      `Unknown command "${token}". Did you mean the function ${pointers.nearFn.code} (${pointers.nearFn.label})?`,
-      [`Run: ${pointers.nearFn.command}`, ticker].filter(Boolean).join("\n"),
-    );
-  }
-  // Exporting is a flag, not a command: `export LMT` says how, rather than listing functions that mention exports.
-  const exported = suggestion ? null : exportCommandPointer(token, pointers.args);
-  const catalog = suggestion ? null : exported ?? catalogPointer(token, pointers.hits, pointers.args);
-  const help = suggestion
-    ? `Did you mean ${suggestion}? Run gloom help to see every command.`
-    : catalog ? `${catalog}\nRun gloom help to see every command.` : "Run gloom help to see every command.";
-  fail(`Unknown command "${token}".`, ticker ? `${ticker}\n${help}` : help);
+  const reply = unknownCommandReply(token,
+    commands.map((command) => ({ name: command.name, usage: command.help?.usage ?? [] })),
+    pointers, nearCommand(token, commands));
+  fail(reply.message, reply.details);
 }
 
 const CLI_DESCRIPTION = "Market research and portfolio tracker for the terminal";
 
 export interface DispatchCliOptions {
   externalPlugins?: LoadedExternalPlugin[];
+  loadExternalPlugins?: () => Promise<LoadedExternalPlugin[]>;
 }
 
 /** Old names kept so existing scripts still run; help and suggestions leave them out. */
@@ -419,6 +400,8 @@ async function createRegistry(options: DispatchCliOptions = {}): Promise<CliComm
   const config = await loadCliConfigIfAvailable();
   // Every time a command prints follows the reader's zone from here on.
   setDisplayTimeZone(config?.timezone);
+  // Every CSV is written with the reader's decimal mark from here on; --decimal decides for one run.
+  setCsvDecimal(config?.csvDecimal);
   let registry: CliCommandRegistry | null = null;
   const coreCommands = createCoreCliCommands(
     () => listedCommands(registry!).map(({ command, source }) => ({ command, source })),
@@ -428,6 +411,7 @@ async function createRegistry(options: DispatchCliOptions = {}): Promise<CliComm
   registry = buildCliCommandRegistry({
     coreCommands,
     externalPlugins: options.externalPlugins ?? [],
+    ...(options.externalPlugins === undefined ? { loadExternalPlugins: options.loadExternalPlugins } : {}),
     config,
   });
   return registry;
@@ -438,7 +422,8 @@ export { buildSearchReport, searchCandidatesForCli };
 export async function dispatchCli(args: string[], options: DispatchCliOptions = {}): Promise<CliDispatchResult> {
   let parsed;
   try {
-    parsed = parseCliGlobalArgs(args);
+    // --output without a format is refused once the command is known: a plugin's own --output is not the export's.
+    parsed = parseCliGlobalArgs(args, { deferOutputCheck: true });
   } catch (error) {
     printCliError(asUsageError(error), inferCliErrorOptions(args));
     process.exitCode = 1;
@@ -454,9 +439,33 @@ export async function dispatchCli(args: string[], options: DispatchCliOptions = 
   }
 
   const registry = await createRegistry(options);
-  const resolved = registry.lookup.get(normalizeCliCommandToken(foldTypedText(command)));
+  if (parsed.options.decimal) setCsvDecimal(parsed.options.decimal);
+  const token = normalizeCliCommandToken(foldTypedText(command));
+  let resolved = registry.lookup.get(token);
+  if (!resolved) {
+    await registry.ensureExternalPlugins?.();
+    resolved = registry.lookup.get(token);
+  }
   if (!resolved) {
     return { kind: "unhandled" };
+  }
+  try {
+    // A plugin command with its own --output keeps it: the global flag yields, as it does to `fn` and `shot`.
+    if (parsed.options.output !== undefined && commandOwnsOutput(resolved.command)) parsed = parseCliGlobalArgs(args, { ownsOutput: true });
+    checkCliOutputFormat(parsed);
+  } catch (error) {
+    printCliError(asUsageError(error), parsed.options);
+    process.exitCode = 1;
+    return { kind: "handled" };
+  }
+
+  // The overview includes installed commands; one built-in command's help only
+  // needs that command. An unknown help topic may belong to an installed plugin.
+  if (resolved.command.name === "help") {
+    const topic = parsed.args[1];
+    if (!topic || !registry.lookup.has(normalizeCliCommandToken(foldTypedText(topic)))) {
+      await registry.ensureExternalPlugins?.();
+    }
   }
 
   // Help flags never reach the command, where they would read as a symbol, a
@@ -470,13 +479,19 @@ export async function dispatchCli(args: string[], options: DispatchCliOptions = 
     : foldCommandArgs(resolved.command, parsed.args.slice(1), parsed.literalStart - 1);
   try {
     if (!helpOnly && resolved.builtin) checkCliCommandOptions(resolved.command, commandArgs, parsed.literalStart - 1);
+    // The file --output names, checked before the command runs so a path that cannot be written fails at once.
+    const outputPath = parsed.options.output !== undefined && !helpOnly ? resolveOutputPath(parsed.options.output) : null;
+    const replacing = outputPath ? await checkOutputPath(outputPath) : false;
+    takeCliFileExport();
     // What it answers from a saved copy, its refresh having failed, its closing line says.
     const result = await collectSavedCopies(() => Promise.resolve(target.command.execute(
       commandArgs,
       createCliCommandContext(target.ownerId, registry, parsed.options, commandArgs),
     )));
+    if (outputPath) await saveFileExport(outputPath, parsed.options, resolved.command.name, replacing);
     return normalizeCliDispatchResult(result);
   } catch (error) {
+    takeCliFileExport();
     // A coin typed without its quote currency (USDT) is named by its one symbol (USDT-USD) in the hint.
     if (parsed.options.format !== "json") await primeBoardCoins([error instanceof Error ? error.message : String(error)]);
     printCliError(error, parsed.options, { command: resolved.command.name, args: commandArgs,
@@ -484,6 +499,25 @@ export async function dispatchCli(args: string[], options: DispatchCliOptions = 
     process.exitCode = 1;
     return { kind: "handled" };
   }
+}
+
+/**
+ * Writes the export a command printed to the file `--output` named, in
+ * UTF-8 without a byte order mark, and says where it went: `Saved <path>`,
+ * `Replaced <path>` over a file that was there, or in JSON its envelope. A
+ * command that printed no export (its result failed, or it has no table to
+ * export) writes no file and says so.
+ */
+async function saveFileExport(path: string, options: CliGlobalOptions, command: string, replacing: boolean): Promise<void> {
+  const written = takeCliFileExport();
+  if (written === null) {
+    if (process.exitCode) return;
+    throw new Error(`${command} printed no ${options.format.toUpperCase()} export; nothing was written to ${path}.`);
+  }
+  await writeOutputFile(path, `${written}\n`);
+  printCliResult({ data: { output: path, format: options.format, replaced: replacing } },
+    { ...options, output: undefined, format: options.format === "json" ? "json" : "text" },
+    { text: () => `${replacing ? "Replaced" : "Saved"} ${path}` });
 }
 
 /** Explains why dispatch found no command in `args`, suggesting the closest one. */
@@ -498,6 +532,7 @@ export async function failUnknownCliCommand(args: string[], options: DispatchCli
     // Intentional ignore: dispatchCli already reports invalid flags.
   }
   const registry = await createRegistry(options);
+  await registry.ensureExternalPlugins?.();
   const commands = listedCommands(registry).map((entry) => entry.command);
   // A function's code typed as a command is pointed at `fn`, and a word the catalog knows at its
   // functions, with the arguments the reader gave.

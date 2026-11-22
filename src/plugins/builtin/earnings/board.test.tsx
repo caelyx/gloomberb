@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, expect, setSystemTime, spyOn, test } from "bun:test";
-import { act } from "react";
+import { act, useReducer } from "react";
 import { apiClient } from "../../../api-client";
 import type { EarningsCalendarPayload, EarningsCalendarQuery, EarningsCalendarReport } from "../../../api-client/earnings";
 import type { CombinedPaneFooter } from "../../../components/layout/pane/footer";
 import { createOpenTuiTestHarness, settleFrame } from "../../../renderers/opentui/test-utils";
-import { createInitialState } from "../../../state/app/context";
+import { appReducer, createInitialState, type AppState } from "../../../state/app/context";
 import { TestPaneFrame, createTestPaneConfig } from "../../../test-support/pane";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import { setSharedRegistryForTests } from "../../registry/shared";
@@ -28,6 +28,7 @@ const calendarRequests = spyOn(apiClient, "getCloudEarningsCalendar").mockImplem
     asOf: "2026-10-14T15:00:00Z", from: query.from, to: query.to, reports: [entry("JPM", "2026-10-14"), entry("NFLX", "2026-10-15")],
   }),
 );
+const historyRequests = spyOn(apiClient, "getCloudEarningsHistory").mockImplementation(async (symbol) => ({ asOf: "2026-10-14T15:00:00Z", symbol, name: null, reports: [] }));
 beforeAll(() => {
   resetEarningsCloudCaches();
   setSystemTime(new Date("2026-10-14T15:00:00Z"));
@@ -38,6 +39,7 @@ afterAll(() => {
   setSystemTime();
   setSharedRegistryForTests(undefined);
   calendarRequests.mockRestore();
+  historyRequests.mockRestore();
 });
 
 test("the terminal keeps ERN's table and footer: no calendar, even from a layout that asks for it, and no results alert key", async () => {
@@ -64,4 +66,115 @@ test("the terminal keeps ERN's table and footer: no calendar, even from a layout
   expect(frame).not.toContain("Calendar");
   expect(frame).not.toContain("otify");
   expect(footer.hints.map((hint) => hint.id)).toEqual(["catalysts", "ticker", "estimates", "calls", "analysts"]);
+});
+
+/** The board with the app's reducer, so the row it selects stays selected. */
+function LiveBoard({ initial, runtime: live, highlight, onFooter }: {
+  initial: AppState;
+  runtime: ReturnType<typeof createTestPluginRuntime>;
+  highlight: string;
+  onFooter: (footer: CombinedPaneFooter) => void;
+}) {
+  const [state, dispatch] = useReducer(appReducer, initial);
+  return (
+    <TestPaneFrame state={state} dispatch={dispatch} paneId={state.focusedPaneId!} pluginId="earnings" runtime={live} width={150} height={12}>
+      {(body, value) => {
+        onFooter(value);
+        return <EarningsBoard focused scopedSymbols={MARKET} highlight={highlight} {...body} />;
+      }}
+    </TestPaneFrame>
+  );
+}
+
+test("EVTS on a small company's past report day: moves no report in view has leave, and a report out shows its move across it", async () => {
+  resetEarningsCloudCaches();
+  // Yesterday's board, largest first: twenty with options, enough reports to average and both closes in,
+  // then ten small caps with none of the three, the last of them the company asked for.
+  const priced = Array.from({ length: 20 }, (_, index) => ({
+    ...entry(`BIG${index + 10}`, "2026-10-13"), marketCap: (900 - index) * 1e9, dateStatus: "reported" as const, epsActual: 1.2,
+    implied: { move: 0.052, straddle: 5.2, spot: 100, strike: 100, expiry: "2026-10-17", session: "2026-10-12", method: "quote-mid" as const, final: true, at: "2026-10-12T20:00:00Z" },
+    realized: { move: 0.031, baseSession: "2026-10-12", baseClose: 100, afterSession: "2026-10-13", afterClose: 103.1 },
+    averageMove: 0.044, averageReports: 8,
+  }));
+  const small = Array.from({ length: 10 }, (_, index) => ({
+    ...entry(`SM${index + 10}`, "2026-10-13"), timing: null, timingSource: null, marketCap: (90 - index) * 1e6, dateStatus: "reported" as const, epsActual: -0.04,
+  }));
+  calendarRequests.mockImplementation(async (query: EarningsCalendarQuery) => ({
+    asOf: "2026-10-14T15:00:00Z", from: query.from, to: query.to, reports: [...priced, ...small],
+  }));
+  // EVTS SM19 opens on SM19's report day, yesterday's.
+  historyRequests.mockImplementation(async (symbol) => ({
+    asOf: "2026-10-14T15:00:00Z", symbol, name: null, reports: [{ ...small.at(-1)!, revenueActual: null }],
+  }));
+  try {
+    const instance = `${PANE}:moves`;
+    const state = createInitialState(createTestPaneConfig("/tmp/gloomberb-evts-moves-tui-test", { paneId: "earnings-calendar", instanceId: instance }));
+    state.focusedPaneId = instance;
+    await act(async () => {
+      await tui.render(<LiveBoard initial={state} runtime={runtime} highlight="SM19" onFooter={() => {}} />, { width: 150, height: 12 });
+    });
+    await tui.waitForFrameToContain("SM19", 40);
+    const smallCaps = await tui.waitForFrameToExclude("IMPLIED", 40);
+    expect(smallCaps).not.toContain("BIG");
+    expect(smallCaps).not.toMatch(/\bMOVE\b/);
+    await act(async () => { await tui.emitKeypress({ name: "home" }); });
+    await tui.waitForFrameToContain("BIG10", 40);
+    const priced = await tui.waitForFrameToContain("IMPLIED", 40);
+    expect(priced).toMatch(/IMPLIED\s+MOVE\s+AVG MOVE/);
+    expect(priced.split("\n").find((line) => line.includes("BIG10"))).toMatch(/±5\.2%\s+\+3\.1%\s+4\.4%/);
+  } finally {
+    calendarRequests.mockImplementation(async (query: EarningsCalendarQuery) => ({
+      asOf: "2026-10-14T15:00:00Z", from: query.from, to: query.to, reports: [entry("JPM", "2026-10-14"), entry("NFLX", "2026-10-15")],
+    }));
+    historyRequests.mockImplementation(async (symbol) => ({ asOf: "2026-10-14T15:00:00Z", symbol, name: null, reports: [] }));
+    resetEarningsCloudCaches();
+  }
+});
+
+test("EVTS 0700.HK: the market board reads the listings abroad, lands on Tencent's row below the US companies, and says its currency", async () => {
+  resetEarningsCloudCaches();
+  const asked: EarningsCalendarQuery[] = [];
+  // The footer's [t]icker opens the selected row's company.
+  const opened: string[] = [];
+  const recording = createTestPluginRuntime({ navigateTicker: (symbol: string) => { opened.push(symbol); } });
+  let boardFooter: CombinedPaneFooter | null = null;
+  // Twenty US companies larger than Tencent that day, then Tencent: off screen until the board lands on it.
+  const us = Array.from({ length: 20 }, (_, index) => ({ ...entry(`US${index + 10}`, "2026-10-15"), marketCap: (900 - index) * 1e9 }));
+  const tencent: EarningsCalendarReport = {
+    ...entry("0700:HKEX", "2026-10-15"), name: "Tencent Holdings Limited", timing: null, timingSource: null, marketCap: 459.65e9,
+    epsEstimate: 7.21, epsAnalysts: 12, revenueEstimate: 210.24e9, dateStatus: "confirmed", currency: "CNY", listings: ["0700:HKEX"],
+  };
+  calendarRequests.mockImplementation(async (query: EarningsCalendarQuery) => {
+    asked.push(query);
+    return { asOf: "2026-10-14T15:00:00Z", from: query.from, to: query.to, reports: query.markets === "all" ? [...us, tencent] : us };
+  });
+  try {
+    const instance = `${PANE}:evts`;
+    const state = createInitialState(createTestPaneConfig("/tmp/gloomberb-evts-abroad-tui-test", { paneId: "earnings-calendar", instanceId: instance }));
+    state.focusedPaneId = instance;
+    await act(async () => {
+      await tui.render(
+        <LiveBoard initial={state} runtime={recording} highlight="0700.HK" onFooter={(value) => { boardFooter = value; }} />,
+        { width: 150, height: 12 },
+      );
+    });
+    await settleFrame(tui.setup(), 8);
+    const frame = tui.frame();
+    // Read with the listings abroad, Tencent's listing named so the day's cut keeps it.
+    expect(asked.at(-1)).toMatchObject({ markets: "all", symbols: expect.arrayContaining(["0700:HKEX"]) });
+    // Its row, last by size, is the one selected: 0700.HK as typed is the board's 0700:HKEX.
+    act(() => (boardFooter as CombinedPaneFooter | null)?.hints.find((hint) => hint.id === "ticker")?.onPress?.());
+    expect(opened).toEqual(["0700:HKEX"]);
+    // Scrolled to it, below twenty larger US companies.
+    expect(frame).toContain("0700:HKEX");
+    expect(frame).not.toContain("US10 ");
+    // A board with a listing abroad's report says each report's currency, and that the cap is in dollars.
+    expect(frame).toContain("CCY");
+    expect(frame).toContain("CNY");
+  } finally {
+    calendarRequests.mockImplementation(async (query: EarningsCalendarQuery) => ({
+      asOf: "2026-10-14T15:00:00Z", from: query.from, to: query.to, reports: [entry("JPM", "2026-10-14"), entry("NFLX", "2026-10-15")],
+    }));
+    resetEarningsCloudCaches();
+  }
 });

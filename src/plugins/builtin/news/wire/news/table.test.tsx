@@ -103,6 +103,12 @@ describe("NewsArticleStackView", () => {
                 categories: ["macro_politics"],
                 importance: 87,
               }),
+              makeArticle({
+                id: "approval",
+                title: "Regulator clears the first gene therapy for sale",
+                categories: ["product_approval"],
+                importance: 60,
+              }),
             ]}
             focused
             width={94}
@@ -137,12 +143,19 @@ describe("NewsArticleStackView", () => {
     // Snake_case ids and mid-word clipping never reach the user.
     expect(lines[1]).toContain("Politics");
     expect(lines[1]).not.toContain("macro_politics");
-    // The headline takes every cell the fixed columns leave, clipped behind one mark.
-    expect(lines[1]).toContain("Fed officials signal caution on further r\u2026");
+    // The headline takes every cell the fixed columns leave, clipped behind one
+    // mark. The TIME header names the host's zone, so its width is the host's.
+    const headline = buildColumns(94, ["time", "title", "tickers", "categories", "importance"]).find((column) => column.id === "title")!.width;
+    const clipped = lines[1]!.slice(lines[1]!.indexOf("Fed"), lines[1]!.indexOf("\u2026") + 1);
+    expect(clipped).toStartWith("Fed officials signal caution on further");
+    expect(clipped.length).toBeGreaterThanOrEqual(headline - 2);
+    // A label too long for the ten-cell column is shortened, not cut mid-word.
+    expect(lines[2]).toContain("Approval");
+    expect(lines[2]).not.toContain("Product ap");
   });
 
   test("narrowing gives up category, then ticker room, before the headline", () => {
-    const ids = (width: number) => buildColumns(width, ["time", "source", "title", "tickers", "categories", "importance"])
+    const ids = (width: number) => buildColumns(width, ["time", "source", "title", "tickers", "categories", "importance"], "UTC")
       .map((column) => column.id === "tickers" ? `tickers:${column.width}` : column.id);
     expect(ids(127)).toEqual(["time", "source", "title", "tickers:18", "categories", "importance"]);
     expect(ids(102)).toEqual(["time", "source", "title", "tickers:18", "importance"]);
@@ -169,7 +182,7 @@ describe("NewsArticleStackView", () => {
               }),
             ]}
             focused
-            width={90}
+            width={100}
             rootHeight={10}
             selectedArticleId="media"
             setSelectedArticleId={() => {}}
@@ -184,7 +197,7 @@ describe("NewsArticleStackView", () => {
           />
         </PaneInstanceProvider>
       </AppContext>,
-      { width: 90, height: 10 },
+      { width: 100, height: 10 },
     );
 
     await act(async () => {
@@ -249,4 +262,14 @@ describe("NewsArticleStackView under a pinned crosshair", () => {
       await act(async () => pin?.(null));
     }
   });
+});
+
+// a Hong Kong reader's "Wed 11:26" said nothing of which 11:26; the header names the zone, as TIME UTC does elsewhere.
+test("the time column names the zone its times are in", () => {
+  const time = (zone: string) => buildColumns(120, ["time", "title"], zone).find((column) => column.id === "time")!.label;
+  // Named as the charts and session lines name it; a zone without a short name reads its city, as on a chart.
+  expect(time("Asia/Hong_Kong")).toBe("TIME HKT");
+  expect(time("UTC")).toBe("TIME UTC");
+  expect(time("America/New_York")).toBe("TIME ET");
+  expect(time("Asia/Dubai")).toBe("TIME Dubai");
 });

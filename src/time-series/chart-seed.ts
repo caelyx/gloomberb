@@ -10,7 +10,7 @@ import { aggregatePriceBars, futuresOpenMinuteOf, withBuiltBarSize } from "./bar
 import type { TickerFinancials } from "../types/financials";
 import { isMarketFieldId } from "./field-catalog";
 import { chartPriceHistoryIntegrityNotices } from "./market";
-import { resolveStudies } from "./studies";
+import { activeStudyInputSeriesIds, resolveStudies } from "./studies/resolve";
 import { clipSeriesToWindow } from "./alignment";
 import { bufferPriceComparison, clipPriceComparison, priceComparisonBoundsForSeries, resolvePriceComparison } from "./price-comparison";
 import { readSeedListingFacts } from "./parsed-history-cache";
@@ -31,7 +31,7 @@ import {
   followLatestMarketObservation,
   latestSessionView,
 } from "./chart-bounds";
-import { emptyFinancials, chartCalculationSeriesIds, baseSecuritySeries } from "./base-series";
+import { emptyFinancials, chartCalculationSeriesIds, baseSecuritySeries, withPriorClose } from "./base-series";
 import {
   resolvePriceHistoryIntegrity,
   assignAxes,
@@ -73,17 +73,25 @@ export function seedChartResolutionResult(
   // the swap changes no label and moves no plot.
   const support: ChartResolutionSupport[][] = [];
   const series: ResolvedSeries[] = [];
+  // A hidden series a study reads (a formula's next month) is the study's input alone, never drawn.
+  const studyInputs = activeStudyInputSeriesIds(spec.studies);
+  const hiddenInputs: ResolvedSeries[] = [];
   spec.series.forEach((seriesSpec, index) => {
-    if (seriesSpec.visible === false || seriesSpec.source.kind !== "security") return;
+    const hidden = seriesSpec.visible === false;
+    if ((hidden && !studyInputs.has(seriesSpec.id)) || seriesSpec.source.kind !== "security") return;
     if (!isMarketFieldId(seriesSpec.source.fieldId)) return;
     const history = historyByInstrument.get(instrumentKey(seriesSpec.source));
     if (!history?.length) return;
     const facts = readSeedListingFacts(seriesSpec.source.instrument);
     const { symbol, exchange } = seriesSpec.source.instrument;
     const bars = builtBarSize ? aggregatePriceBars(history, builtBarSize, { symbol, exchange }) : history;
-    const base = baseSecuritySeries(seriesSpec, emptyFinancials(bars), index, resolution, facts?.quoteMetadata, facts?.contractUnit);
+    const base = baseSecuritySeries(seriesSpec, emptyFinancials(bars), index, resolution, facts?.quoteMetadata ?? undefined, facts?.contractUnit);
     const resolved = base && builtBarSize ? withBuiltBarSize(base, builtBarSize) : base;
     if (!resolved?.points.length) return;
+    if (hidden) {
+      hiddenInputs.push(resolved);
+      return;
+    }
     series.push(resolved);
     if (facts?.resolutionSupport?.length) support.push(facts.resolutionSupport);
   });
@@ -98,7 +106,7 @@ export function seedChartResolutionResult(
   const primary = series[0]!;
   if (sessionView?.priorClose != null && primary.transform === "raw"
     && primary.unitGroup.startsWith("price") && primary.unitGroup !== "price:unknown") {
-    series[0] = { ...primary, priorClose: sessionView.priorClose };
+    series[0] = withPriorClose(primary, sessionView.priorClose);
   }
   const resolutionSupport = support.length === series.length ? intersectChartResolutionSupport(support) : [];
   const priceComparison = resolvePriceComparison(spec, series, bounds, resolution, spec.viewport.dateWindow,
@@ -109,7 +117,7 @@ export function seedChartResolutionResult(
   const baseSeries = series.map((entry) => prepareBaseSeriesForStudies(entry, priceComparisonBoundsForSeries(entry, priceComparison) ?? comparisonBounds));
   // Calculate studies from raw buffered inputs, then use the same presentation
   // and visible-window rules as the network result.
-  const studies = resolveStudies(series, spec.studies, resolution, undefined, studyAnchors(series, priceComparison, comparisonBounds));
+  const studies = resolveStudies([...series, ...hiddenInputs], spec.studies, resolution, undefined, studyAnchors(series, priceComparison, comparisonBounds));
   const axisWarnings: string[] = [];
   const bufferedSeries = assignAxes([
     ...baseSeries,

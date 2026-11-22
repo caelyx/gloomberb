@@ -13,36 +13,100 @@
  * on the public internet, so an unrestricted copy would be an open proxy
  * running on our bandwidth and our IP reputation. Everything below exists to
  * keep that from happening.
- *
- * Downstream (private deployment): who may call this route is a deployment
- * policy, see `proxyPolicyFor`. The public service requires a Gloom session;
- * a private copy behind Cloudflare Access may drop only that requirement.
- * Every other check here applies in both modes.
  */
 import {
   encodeResponseBody,
   readRequestInit,
   toResponseHead,
   type HttpProxyResponseEnvelope,
-  type ProxiedRequestInit,
 } from "../../utils/http-proxy-response";
 import { isProxiedHost, PROXY_ALLOWED_HOSTS } from "../../utils/plugin-proxy-hosts";
+import { fetchCheckingRedirects, readBytesWithin, type ProxyUpstreamResult } from "../../utils/http-proxy-upstream";
 import { SESSION_COOKIE_NAMES } from "../../api-client/session-cookie";
 import type { ProxySessionGate } from "./proxy-session";
 
 const PROXY_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"]);
-/** Set by the caller's browser or meaningful only to the hop it came from. */
-const STRIPPED_REQUEST_HEADERS = new Set([
-  "connection",
-  "content-length",
-  "host",
-  "keep-alive",
-  "proxy-authorization",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-]);
+
+/** Requests a caller without a confirmed session may send to one host. */
+export interface SignedOutRoute {
+  methods: readonly ("GET" | "HEAD" | "POST")[];
+  /** A path and anything under it; one ending in a slash covers only what is under it. */
+  path: string;
+}
+
+const READ = ["GET", "HEAD"] as const;
+
+/**
+ * What a caller without a confirmed session may send, host by host: the
+ * reads the plugins that work signed out make, and nothing else. The Origin
+ * check is no barrier to a script, so anonymous use stays a read-only proxy
+ * to those endpoints (a POST carries a search, as FINRA's tape and Pascal's
+ * market search do), never to the rest of an exchange's API. Every proxied
+ * host is listed, with no routes when it needs a sign-in; a test holds the
+ * two lists together.
+ */
+export const SIGNED_OUT_ROUTES: Readonly<Record<string, readonly SignedOutRoute[]>> = {
+  "api.crypto.com": [{ methods: READ, path: "/dcm/v1/public/" }],
+  "api.elections.kalshi.com": [{ methods: READ, path: "/trade-api/v2/" }],
+  "api.fda.gov": [{ methods: READ, path: "/" }],
+  "api.gemini.com": [{ methods: READ, path: "/v1/prediction-markets/" }],
+  "api.limitless.exchange": [{ methods: READ, path: "/markets/" }],
+  "api.votehub.com": [{ methods: READ, path: "/polls" }],
+  "clinicaltrials.gov": [{ methods: READ, path: "/api/v2/" }],
+  "data.pascal.trade": [
+    { methods: READ, path: "/api/v1/markets" },
+    { methods: ["POST"], path: "/api/v1/markets/text-search" },
+  ],
+  "efts.sec.gov": [{ methods: READ, path: "/LATEST/search-index" }],
+  "forms13f.com": [{ methods: READ, path: "/api/v1/" }],
+  "gateway.polymarket.us": [{ methods: READ, path: "/v1/markets" }],
+  "markets.newyorkfed.org": [{ methods: READ, path: "/api/" }],
+  "nasdaqtrader.com": [{ methods: READ, path: "/rss.aspx" }],
+  "production.dataviz.cnn.io": [{ methods: READ, path: "/index/fearandgreed/" }],
+  "services-dynarep.ddwa.finra.org": [{ methods: ["POST"], path: "/public/reporting/v2/data/group/" }],
+  "www.treasurydirect.gov": [{ methods: READ, path: "/TA_WS/securities/search" }],
+  // Downstream: hosts of the plugins only the private deployment bundles. None is
+  // open signed out; that deployment needs no session (`proxyPolicyFor`).
+  "api.openelectricity.org.au": [],
+  "api.tenders.gov.au": [],
+  "asx.api.markitdigital.com": [],
+  "cdn-api.markitdigital.com": [],
+  "cdn.cboe.com": [],
+  "data.api.abs.gov.au": [],
+  "download.asic.gov.au": [],
+  "generativelanguage.googleapis.com": [],
+  "googlevideo.com": [],
+  "hacker-news.firebaseio.com": [],
+  "home.treasury.gov": [],
+  "news.google.com": [],
+  "scanner.tradingview.com": [],
+  "takeovers.gov.au": [],
+  "visualisations.aemo.com.au": [],
+  "www.abc.net.au": [],
+  "www.abs.gov.au": [],
+  "www.asic.gov.au": [],
+  "www.asx.com.au": [],
+  "www.rba.gov.au": [],
+  "www.tga.gov.au": [],
+  "www.youtube.com": [],
+  "youtube.com": [],
+  "ytimg.com": [],
+};
+
+/** Whether a caller without a confirmed session may send `method` to `url`. */
+export function signedOutRouteAllows(
+  url: URL,
+  method: string,
+  routes: Readonly<Record<string, readonly SignedOutRoute[]>> = SIGNED_OUT_ROUTES,
+): boolean {
+  const host = url.hostname.toLowerCase();
+  const entry = Object.entries(routes).find(([allowed]) => host === allowed || host.endsWith(`.${allowed}`));
+  return !!entry?.[1].some((route) => (route.methods as readonly string[]).includes(method) && (
+    route.path.endsWith("/")
+      ? url.pathname.startsWith(route.path)
+      : url.pathname === route.path || url.pathname.startsWith(`${route.path}/`)
+  ));
+}
 /**
  * Credentials that belong to this origin, never to a plugin's host: the Gloom
  * session (which the browser transport can plant as a readable cookie) and the
@@ -51,17 +115,30 @@ const STRIPPED_REQUEST_HEADERS = new Set([
  */
 const ORIGIN_COOKIE_NAMES = new Set<string>([...SESSION_COOKIE_NAMES, "CF_Authorization"]);
 const ORIGIN_HEADER_PREFIX = "cf-access-";
-/** Dropped when a redirect leaves the origin the plugin set them for. */
-const CROSS_ORIGIN_STRIPPED_HEADERS = ["authorization", "cookie", "proxy-authorization"];
-/** Dropped when a redirect turns the request into a bodiless GET. */
-const REQUEST_BODY_HEADERS = ["content-encoding", "content-language", "content-location", "content-type"];
-const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-const MAX_REDIRECTS = 5;
-const MAX_BODY_BYTES = 5 * 1024 * 1024;
-/** Plugin request bodies are small JSON; anything near this is not one. */
-const MAX_REQUEST_BYTES = 1024 * 1024;
-const MAX_TIMEOUT_MS = 30_000;
-const DEFAULT_TIMEOUT_MS = 20_000;
+
+function withoutOriginCookies(cookie: string): string {
+  return cookie
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => part && !ORIGIN_COOKIE_NAMES.has((part.includes("=") ? part.slice(0, part.indexOf("=")) : part).trim()))
+    .join("; ");
+}
+
+/** A plugin's request headers less this origin's own credentials (see ORIGIN_COOKIE_NAMES). */
+export function withoutOriginCredentials(raw: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const [name, value] of Object.entries(raw)) {
+    const lower = name.toLowerCase();
+    if (lower.startsWith(ORIGIN_HEADER_PREFIX)) continue;
+    if (lower === "cookie") {
+      const kept = withoutOriginCookies(value);
+      if (kept) headers[name] = kept;
+      continue;
+    }
+    headers[name] = value;
+  }
+  return headers;
+}
 
 export interface HttpProxyPolicy {
   /** Refuse callers without a confirmed Gloom session (the public service). */
@@ -69,17 +146,25 @@ export interface HttpProxyPolicy {
 }
 
 /**
- * The public service's policy unless the deployment explicitly opts out.
+ * Downstream: the public service's policy unless the deployment explicitly opts out.
  *
  * `PRIVATE_WEB_DEPLOYMENT` must be exactly "true" to drop the session
  * requirement. Unset, "false", "1", "yes" or a typo all keep it, so an
  * ambiguous configuration fails closed. The private mode is only safe when
  * something in front of the worker (Cloudflare Access) already limits who can
- * reach it; see docs/private-web-deployment.md.
+ * reach it; see docs/private-web-deployment.md. Without a session requirement
+ * every caller counts as signed in, so the signed-out routes and limits below
+ * do not apply.
  */
 export function proxyPolicyFor(privateDeployment: unknown): HttpProxyPolicy {
   return { requireSession: privateDeployment !== "true" };
 }
+
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
+/** Plugin request bodies are small JSON; anything near this is not one. */
+const MAX_REQUEST_BYTES = 1024 * 1024;
+const MAX_TIMEOUT_MS = 30_000;
+const DEFAULT_TIMEOUT_MS = 20_000;
 
 /**
  * Rejects anything that is not a plain https host on the allowlist.
@@ -100,6 +185,7 @@ export function validateProxyTarget(
   try {
     url = new URL(rawUrl);
   } catch {
+    // Intentional ignore: an unparsable target URL is the caller's input error, answered with a 400 here.
     return { error: "The target URL is not valid.", status: 400 };
   }
   if (url.protocol !== "https:") {
@@ -120,137 +206,32 @@ export function validateProxyTarget(
   return { url };
 }
 
-function withoutOriginCookies(cookie: string): string {
-  return cookie
-    .split(";")
-    .map((part) => part.trim())
-    .filter((part) => part && !ORIGIN_COOKIE_NAMES.has((part.includes("=") ? part.slice(0, part.indexOf("=")) : part).trim()))
-    .join("; ");
-}
-
-function upstreamHeaders(raw: Record<string, string>): Headers {
-  const headers = new Headers();
-  for (const [name, rawValue] of Object.entries(raw)) {
-    const lower = name.toLowerCase();
-    if (STRIPPED_REQUEST_HEADERS.has(lower) || lower.startsWith(ORIGIN_HEADER_PREFIX)) continue;
-    const value = lower === "cookie" ? withoutOriginCookies(rawValue) : rawValue;
-    if (!value && lower === "cookie") continue;
-    try {
-      headers.set(name, value);
-    } catch {
-      // A header name the runtime refuses is dropped rather than failing the
-      // whole request, matching how a browser treats an unsettable header.
-    }
-  }
-  return headers;
-}
-
 function proxyError(message: string, status: number, headers: Record<string, string> = {}): Response {
   return Response.json({ error: message }, { status, headers: { "cache-control": "no-store", ...headers } });
 }
 
-/**
- * Reads a body, giving up once it passes `maxBytes`. Returns null when it was
- * too large, after cancelling the stream so the rest is never pulled.
- */
-async function readBytesWithin(body: ReadableStream<Uint8Array> | null, maxBytes: number): Promise<Uint8Array | null> {
-  if (!body) return new Uint8Array(0);
-  const reader = body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    size += value.byteLength;
-    if (size > maxBytes) {
-      await reader.cancel().catch(() => {});
-      return null;
-    }
-    chunks.push(value);
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
-}
-
-type UpstreamResult = { response: Response } | { error: string; status: number };
-
-/**
- * Follows redirects one hop at a time instead of letting `fetch` do it, so
- * every `Location` passes the same allowlist check as the first URL. An
- * allowlisted host that redirects elsewhere (an open redirect, a moved API)
- * would otherwise carry the request to any host on the internet.
- *
- * Method and header handling mirror the Fetch spec: 303, and 301/302 after a
- * POST, become a bodiless GET; credentials the plugin set are dropped when the
- * redirect leaves the origin they were meant for.
- */
-async function fetchWithinAllowlist(
-  first: URL,
-  init: ProxiedRequestInit,
-  fetchUpstream: typeof fetch,
-  hosts: readonly string[],
-  signal: AbortSignal,
-): Promise<UpstreamResult> {
-  const headers = upstreamHeaders(init.headers);
-  const mode = init.redirect ?? "follow";
-  let url = first;
-  let method = init.method;
-  let body = init.body;
-
-  for (let followed = 0; ; followed += 1) {
-    const response = await fetchUpstream(url, { method, headers, body, redirect: "manual", signal });
-    const location = REDIRECT_STATUSES.has(response.status) ? response.headers.get("location") : null;
-    // "manual" hands the redirect back to the plugin. If it follows it, that
-    // comes back through here as a new request and is checked like one.
-    if (location === null || mode === "manual") return { response };
-
-    await response.body?.cancel().catch(() => {});
-    if (mode === "error") return { error: "The upstream response was a redirect.", status: 502 };
-    if (followed >= MAX_REDIRECTS) return { error: "The upstream redirected too many times.", status: 502 };
-
-    let next: string;
-    try {
-      next = new URL(location, url).href;
-    } catch {
-      return { error: "The upstream sent an invalid redirect.", status: 502 };
-    }
-    const target = validateProxyTarget(next, hosts);
-    if ("error" in target) return { error: `The upstream redirect was refused. ${target.error}`, status: 502 };
-
-    if (target.url.origin !== url.origin) {
-      for (const name of CROSS_ORIGIN_STRIPPED_HEADERS) headers.delete(name);
-    }
-    if (
-      (response.status === 303 && method !== "GET" && method !== "HEAD")
-      || ((response.status === 301 || response.status === 302) && method === "POST")
-    ) {
-      method = "GET";
-      body = undefined;
-      for (const name of REQUEST_BODY_HEADERS) headers.delete(name);
-    }
-    url = target.url;
-  }
-}
-
+/** The pane shows `error` as is, so it says what happened in plain words. */
 function upstreamFailure(error: unknown): Response {
   const timedOut = error instanceof Error && error.name === "TimeoutError";
-  return proxyError(timedOut ? "The upstream request timed out." : "The upstream request failed.", 504);
+  return proxyError(timedOut ? "The data source timed out. Try again shortly." : "The data source could not be reached. Try again shortly.", 504);
 }
 
 export interface HttpProxyOptions {
-  /** Confirms the caller is signed in. One per isolate, so its cache is shared. */
+  /** Rate limits the caller, by user when signed in. One per isolate, so its cache is shared. */
   sessions: ProxySessionGate;
+  /**
+   * The limit on signed-out calls across isolates (Cloudflare's rate limiting
+   * binding): false once the caller's address, or signed-out callers as a
+   * whole, have had their share. Absent where there is none, as in tests.
+   */
+  signedOutLimit?: (request: Request) => Promise<boolean>;
+  signedOutRoutes?: Readonly<Record<string, readonly SignedOutRoute[]>>;
   /** Reaches the Gloomberb API for that check. */
   fetchApi: (request: Request) => Promise<Response>;
   /** Reaches the plugin's target. */
   fetchUpstream?: typeof fetch;
   hosts?: readonly string[];
-  /** Downstream: defaults to the public service's policy. */
+  /** Downstream: whether a Gloom session is required (`proxyPolicyFor`). Defaults to the public service's. */
   policy?: HttpProxyPolicy;
 }
 
@@ -265,6 +246,7 @@ export async function handleHttpProxy(request: Request, options: HttpProxyOption
     fetchApi,
     fetchUpstream = fetch,
     hosts = PROXY_ALLOWED_HOSTS,
+    signedOutRoutes = SIGNED_OUT_ROUTES,
     policy = proxyPolicyFor(undefined),
   } = options;
   if (request.method !== "POST") {
@@ -275,6 +257,7 @@ export async function handleHttpProxy(request: Request, options: HttpProxyOption
   if (request.headers.get("origin") !== new URL(request.url).origin) {
     return proxyError("Origin not allowed", 403);
   }
+  let signedIn = true;
   if (policy.requireSession) {
     const admission = await sessions.admit(request, fetchApi);
     if (!admission.ok) {
@@ -283,6 +266,7 @@ export async function handleHttpProxy(request: Request, options: HttpProxyOption
         : {};
       return proxyError(admission.error, admission.status, headers);
     }
+    signedIn = admission.signedIn;
   }
 
   const declaredLength = Number(request.headers.get("content-length") ?? 0);
@@ -307,11 +291,26 @@ export async function handleHttpProxy(request: Request, options: HttpProxyOption
   if (!PROXY_METHODS.has(init.method)) {
     return proxyError("Method not allowed", 405);
   }
+  if (!signedIn) {
+    if (!signedOutRouteAllows(target.url, init.method, signedOutRoutes)) {
+      return proxyError("Sign in to Gloom to send this request.", 401);
+    }
+    if (options.signedOutLimit && !(await options.signedOutLimit(request).catch(() => {
+      console.warn("[http-proxy] Could not check the signed-out rate limit; the request went ahead");
+      return true;
+    }))) {
+      return proxyError("Too many requests right now. Sign in to Gloom, or try again in a minute.", 429, { "retry-after": "60" });
+    }
+  }
 
   const signal = AbortSignal.timeout(Math.min(init.timeoutMs ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS));
-  let result: UpstreamResult;
+  let result: ProxyUpstreamResult;
   try {
-    result = await fetchWithinAllowlist(target.url, init, fetchUpstream, hosts, signal);
+    result = await fetchCheckingRedirects(target.url, { ...init, headers: withoutOriginCredentials(init.headers) }, {
+      fetch: fetchUpstream,
+      check: (url) => validateProxyTarget(url, hosts),
+      signal,
+    });
   } catch (error) {
     return upstreamFailure(error);
   }
@@ -324,7 +323,9 @@ export async function handleHttpProxy(request: Request, options: HttpProxyOption
   // memory, so the cap also keeps one response well inside an isolate's memory.
   const tooLarge = `The upstream response is larger than ${MAX_BODY_BYTES / (1024 * 1024)} MB.`;
   if (init.method !== "HEAD" && Number(response.headers.get("content-length") ?? 0) > MAX_BODY_BYTES) {
-    await response.body?.cancel().catch(() => {});
+    await response.body?.cancel().catch(() => {
+      // Intentional ignore: the refused body is dropped either way, and the 502 below answers the caller.
+    });
     return proxyError(tooLarge, 502);
   }
   let body: Uint8Array | null;

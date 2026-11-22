@@ -14,6 +14,7 @@ import {
   type CompositeColumnGroupCenter,
   type CompositeColumnLayout,
 } from "./column-layout";
+import { paintEventGuides } from "./event-guides";
 import { compositeGridRatios } from "./format";
 import { projectCompositeValue } from "./scene";
 import { paintVolumeProfile } from "./volume-profile-paint";
@@ -436,13 +437,14 @@ function drawColumns(
   domain: CompositeAxisDomain,
   color: RgbaColor,
   negativeColor: RgbaColor,
+  fallColor: RgbaColor,
   layout: CompositeColumnLayout,
   widthByFamily: ReadonlyMap<string, number>,
   opacity: number,
 ): void {
   const baseline = pixelY(0, domain, height) ?? height - 1;
   for (const projected of series.points) {
-    const fill = projected.value < 0 ? negativeColor : color;
+    const fill = projected.value < 0 ? negativeColor : projected.point.fell ? fallColor : color;
     const point = pixelPoint(projected, width, height, domain.manual);
     const geometry = columnPixelGeometry(projected, width, layout, widthByFamily);
     fillRect(
@@ -487,20 +489,27 @@ function drawOhlc(
     const closeY = pixelY(close, domain, height);
     if (highY === null || lowY === null || closeY === null) continue;
     const candleColor = close >= open ? color : negative;
-    drawLine(data, width, height, x, highY, x, lowY, candleColor, 1.1);
-    if (series.source.style === "candles" && openY !== null) {
-      fillRect(
-        data,
-        width,
-        height,
-        x - candleWidth / 2,
-        Math.min(openY, closeY),
-        x + candleWidth / 2,
-        Math.max(openY, closeY) + 1,
-        candleColor,
-      );
+    const style = series.source.style;
+    if (style !== "ohlc" && style !== "hlc" && openY !== null) {
+      const left = x - candleWidth / 2;
+      const right = x + candleWidth / 2;
+      const top = Math.min(openY, closeY);
+      const bottom = Math.max(openY, closeY) + 1;
+      // A hollow rising candle is an outline the wick stops at, as on other terminals.
+      if (style === "hollow" && close >= open) {
+        drawLine(data, width, height, x, highY, x, top, candleColor, 1.1);
+        drawLine(data, width, height, x, bottom, x, lowY, candleColor, 1.1);
+        drawLine(data, width, height, left, top, right, top, candleColor, 1.1);
+        drawLine(data, width, height, left, bottom, right, bottom, candleColor, 1.1);
+        drawLine(data, width, height, left, top, left, bottom, candleColor, 1.1);
+        drawLine(data, width, height, right, top, right, bottom, candleColor, 1.1);
+        continue;
+      }
+      drawLine(data, width, height, x, highY, x, lowY, candleColor, 1.1);
+      fillRect(data, width, height, left, top, right, bottom, candleColor);
       continue;
     }
+    drawLine(data, width, height, x, highY, x, lowY, candleColor, 1.1);
     if (series.source.style === "ohlc" && openY !== null) {
       drawLine(data, width, height, x - candleWidth / 2, openY, x, openY, candleColor, 1.2);
     }
@@ -545,6 +554,7 @@ export function renderCompositePanelBitmap(
     fillRect(data, width, height, 0, y, width - 1, y + 0.6, grid, 0.42);
   }
   if (panel.volumeProfile) paintVolumeProfile(data, width, height, panel.volumeProfile);
+  if (panel.eventGuides) paintEventGuides(data, width, height, panel.eventGuides, options.colors.textDim);
   // Under the bars, which read across it.
   if (panel.priorClose) {
     drawDashedLevel(data, width, height, panel.priorClose.yRatio, parseHex(options.colors.textDim),
@@ -585,6 +595,7 @@ export function renderCompositePanelBitmap(
           domain,
           color,
           negativeColor,
+          negative,
           columnLayout,
           columnWidthByFamily,
           mixesColumnsWithOtherMarks ? 0.48 : 0.72,
@@ -615,6 +626,8 @@ export function renderCompositePanelBitmap(
         break;
       }
       case "candles":
+      case "hollow":
+      case "heikin-ashi":
       case "ohlc":
       case "hlc":
         drawOhlc(data, width, height, series, domain, color, negative);

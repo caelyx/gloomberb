@@ -22,6 +22,32 @@ function context(): GloomPluginContext {
 }
 
 describe("composeBuiltinPlugin", () => {
+  test("a moved pane loads its component only when rendered and keeps the wrapped identity", () => {
+    let loads = 0;
+    const component = () => null;
+    const plugin = composeBuiltinPlugin({
+      id: "successor",
+      name: "Successor",
+      version: "1.0.0",
+      modules: [{
+        stateId: "legacy",
+        module: {
+          panes: [{
+            id: "moved", name: "Moved", defaultPosition: "right",
+            get component() { loads++; return component; },
+          }],
+        },
+      }],
+    });
+    const pane = plugin.panes![0]!;
+    expect(pane.id).toBe("moved");
+    expect(loads).toBe(0);
+    const wrapped = pane.component;
+    expect(loads).toBe(1);
+    expect(pane.component).toBe(wrapped);
+    expect(loads).toBe(1);
+  });
+
   test("combines every declarative contribution under the parent plugin", () => {
     const first: PluginModule = {
       cliCommands: [{ name: "example", description: "Example", execute: () => {} }],
@@ -95,6 +121,28 @@ describe("composeBuiltinPlugin", () => {
       "dispose:second",
       "dispose:first",
     ]);
+  });
+
+  test("synchronous module setups finish before setup hands back the tick", async () => {
+    // Gloom Cloud restores the saved session in its second module, and the
+    // panes restored at launch send their first requests once the tick is free.
+    const lifecycle: string[] = [];
+    const plugin = composeBuiltinPlugin({
+      id: "parent",
+      name: "Parent",
+      version: "1.0.0",
+      modules: [
+        { setup: () => { lifecycle.push("first"); } },
+        { setup: () => { lifecycle.push("second"); } },
+        { setup: async () => { lifecycle.push("async"); await Bun.sleep(0); lifecycle.push("async:done"); } },
+        { setup: () => { lifecycle.push("after-async"); } },
+      ],
+    });
+
+    const pending = plugin.setup?.(context());
+    expect(lifecycle).toEqual(["first", "second", "async"]);
+    await pending;
+    expect(lifecycle).toEqual(["first", "second", "async", "async:done", "after-async"]);
   });
 
   test("a module that moved plugins keeps reading the state saved under its old namespace", async () => {

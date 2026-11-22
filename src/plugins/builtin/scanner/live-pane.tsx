@@ -28,7 +28,7 @@ import type { PaneProps } from "../../../types/plugin";
 import { Box, TextAttributes, useUiCapabilities } from "../../../ui";
 import { useDialog, useDialogState } from "../../../ui/dialog";
 import { publicTickerKey } from "../../../utils/exchanges";
-import { formatCompact, formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatPercentRaw } from "../../../utils/format";
 import { logFailure } from "../../../utils/log-failure";
 import { usePluginAppActions, usePluginPaneState, usePluginTickerActions } from "../../runtime";
 import { usePluginRenderContext } from "../../runtime/context";
@@ -60,6 +60,7 @@ import {
   universeLabel,
   universeOptions,
   universeValue,
+  warmingWindowsText,
   type LiveScan,
   type SavedLiveScan,
 } from "./live-model";
@@ -99,9 +100,11 @@ const DISPLAY_ORDER = ["symbol", "name", "price", "change", "conditions", "rvol"
 /**
  * Symbol, name, price and change, then one column per condition with the
  * figure it matched on, then context as the width allows: a column is added
- * only when it fits whole, the row's status first.
+ * only when it fits whole, the row's status first, and only when a row has
+ * one (after the close none does, and an empty column would take the room of
+ * the figures).
  */
-function liveScanColumns(width: number, conditions: readonly LiveScanCondition[]): DataTableColumn[] {
+export function liveScanColumns(width: number, conditions: readonly LiveScanCondition[], withStatus: boolean): DataTableColumn[] {
   const own = conditions.map((condition, index): DataTableColumn => {
     const label = conditionColumnLabel(condition);
     return { id: `c:${index}`, label, width: Math.max(8, label.length), align: "right" };
@@ -120,7 +123,7 @@ function liveScanColumns(width: number, conditions: readonly LiveScanCondition[]
   ));
   let columns = order([...base, ...own]);
   for (const column of OPTIONAL_COLUMNS) {
-    if (repeats.has(column.id)) continue;
+    if (repeats.has(column.id) || (column.id === "status" && !withStatus)) continue;
     const next = order([...columns, column]);
     if (getTableWidth(next) > width) break;
     columns = next;
@@ -135,7 +138,7 @@ function noteText(note: LiveScanRowNote | null): string {
 }
 
 function numberCell(value: number | null, format: (value: number) => string, color?: string): DataTableCell {
-  return value == null ? { text: "--", color: colors.textDim } : { text: format(value), value, ...(color ? { color } : {}) };
+  return value == null ? { text: MISSING_VALUE, color: colors.textDim } : { text: format(value), value, ...(color ? { color } : {}) };
 }
 
 const signColor = (value: number | null) => (value == null ? undefined : priceColor(Math.abs(value) < 0.005 ? 0 : value, colors));
@@ -194,9 +197,8 @@ function emptyState(payload: LiveScanPayload | null): { title: string; hint?: st
 }
 
 function warmingNotice(payload: LiveScanPayload | null): string | null {
-  const windows = payload?.status === "live" || payload?.status === "degraded" ? payload.warmingWindows : [];
-  if (!windows?.length) return null;
-  const list = windows.map((window) => `${window} min`).join(", ");
+  const list = warmingWindowsText(payload);
+  if (!list) return null;
   return `The scanner started recently: conditions over ${list} match nothing until that much of the session has been watched.`;
 }
 
@@ -349,7 +351,8 @@ export default function LiveScanPane({ focused, width, height }: PaneProps) {
     [payload, track],
   );
   const matches = useMemo(() => sortMatches(payload?.matches ?? [], sort, noteOf), [noteOf, payload?.matches, sort]);
-  const columns = useMemo(() => liveScanColumns(width, scan.conditions), [scan.conditions, width]);
+  const withStatus = useMemo(() => matches.some((match) => noteOf(match) != null), [matches, noteOf]);
+  const columns = useMemo(() => liveScanColumns(width, scan.conditions, withStatus), [scan.conditions, width, withStatus]);
 
   const apply = (next: LiveScan) => {
     setStoredScan(next);
@@ -433,7 +436,7 @@ export default function LiveScanPane({ focused, width, height }: PaneProps) {
         ? `${payload.matched.toLocaleString("en-US")} symbols match; the ${payload.matches.length} strongest are listed. Add a condition or raise a floor to narrow the scan.`
         : null,
       wire.skipped.length
-        ? `${wire.skipped.length} watchlist ${wire.skipped.length === 1 ? "row is" : "rows are"} not a US stock and ${wire.skipped.length === 1 ? "is" : "are"} left out: ${wire.skipped.slice(0, 8).join(", ")}${wire.skipped.length > 8 ? ", ..." : ""}`
+        ? `${wire.skipped.length} watchlist ${wire.skipped.length === 1 ? "row is" : "rows are"} not a US stock and ${wire.skipped.length === 1 ? "is" : "are"} left out: ${wire.skipped.slice(0, 8).join(", ")}${wire.skipped.length > 8 ? ", \u2026" : ""}`
         : null,
       runnable ? wire.problem : null,
       feed.error && payload ? feed.error : null,
@@ -462,13 +465,13 @@ export default function LiveScanPane({ focused, width, height }: PaneProps) {
       const tone = condition.kind === "new_high" ? colors.positive
         : condition.kind === "new_low" ? colors.negative
           : signColor(match.vwapPercent);
-      return value == null ? { text: "--", color: colors.textDim } : { text: formatScanTime(value), value: new Date(value).toISOString(), ...(tone ? { color: tone } : {}) };
+      return value == null ? { text: MISSING_VALUE, color: colors.textDim } : { text: formatScanTime(value), value: new Date(value).toISOString(), ...(tone ? { color: tone } : {}) };
     }
     switch (column.id) {
       case "symbol":
         return { text: match.symbol, attributes: TextAttributes.BOLD };
       case "name":
-        return withCompanyLogo({ text: match.name ?? "--" }, { symbol: match.symbol, name: match.name ?? undefined }, logos);
+        return withCompanyLogo({ text: match.name ?? MISSING_VALUE }, { symbol: match.symbol, name: match.name ?? undefined }, logos);
       case "price":
         return { text: formatHiloPrice(match.price), value: match.price };
       case "change":

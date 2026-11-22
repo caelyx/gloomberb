@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { PricePoint } from "../../../types/financials";
-import { macroDayStats, matchesSurprise, projectMacroDays } from "./model";
+import { formatMacroDayMove, macroDayStats, macroFigureGapNotices, macroSurpriseExclusionNote, matchesSurprise, projectMacroDays } from "./model";
+import { mergeMacroReleases, type MacroReleaseFigures } from "./releases";
 
 /** Weekday closes from `from` to `to`, skipping `closed`; each close is 1% above the one before unless `closes` says otherwise. */
 function weekdays(from: string, to: string, closed: string[], closes: Record<string, number> = {}): PricePoint[] {
@@ -124,3 +125,103 @@ describe("macro-day surprises", () => {
     expect([model.normal, model.allEvents, model.byKind.cpi]).toEqual([usOnly.normal, usOnly.allEvents, usOnly.byKind.cpi]);
   });
 });
+
+describe("macro-day surprise without a headline actual", () => {
+  test("gap notices use a fallback only when it supplies the effective surprise", () => {
+    const figures: MacroReleaseFigures = { event: "Inflation Rate YoY", actual: "3.7%", forecast: "3.6%", prior: "3.4%", surprise: "hot",
+      surpriseBasis: { basis: "core m/m", actual: "0.2%", forecast: "0.3%", surprise: "cool" } };
+    const event = { kind: "cpi", date: "2026-11-10", figures } as const;
+    expect(macroFigureGapNotices([event])).toEqual([]);
+    expect(macroFigureGapNotices([{ ...event, figures: { ...figures, actual: null, surprise: null } }]))
+      .toEqual(["2026-11-10 CPI has no actual. Surprise read from core m/m: 0.2% vs 0.3% forecast."]);
+    expect(macroFigureGapNotices([{ ...event, figures: { ...figures, computed: "the index change" } }]))
+      .toEqual(["2026-11-10 CPI actual is the index change."]);
+  });
+
+  test("unread surprises have disjoint reasons, while classified fallbacks stay readable", () => {
+    const figures: MacroReleaseFigures = { event: "Inflation Rate YoY", actual: "3.7%", forecast: "3.6%", prior: "3.4%", surprise: null };
+    const complete = { figures };
+    const missingBoth = { figures: { ...figures, actual: null, forecast: null } };
+    const fallback = { figures: { ...figures, actual: null,
+      surpriseBasis: { basis: "core m/m", actual: "0.3%", forecast: "0.2%", surprise: "hot" as const } } };
+    const events = [complete, missingBoth, { figures: null }, { figures: { ...figures, forecast: null } }, fallback];
+    expect(macroSurpriseExclusionNote(events, "hot"))
+      .toBe("4 prints excluded: 2 no actual, 1 no forecast, 1 surprise unavailable.");
+    expect(macroSurpriseExclusionNote([complete], "cool")).toBe("1 print excluded: surprise unavailable.");
+    expect(macroSurpriseExclusionNote([missingBoth], "hot")).toBe("1 print excluded: no actual.");
+    expect(macroSurpriseExclusionNote([fallback], "hot")).toBeNull();
+    expect(macroSurpriseExclusionNote(events, "all")).toBeNull();
+  });
+
+  test("a CPI day with no y/y is read by the m/m print Gloom Cloud names, and a filter counts the days it cannot read", () => {
+    // `fn MDAY TLT --release cpi --surprise hot` listed 2 hot CPI days and left out 10 Nov 2026 without a word: BLS
+    // published no October y/y, while its core m/m (0.3% against 0.2%) and m/m (0.4% against 0.3%) came in hot.
+    const served = mergeMacroReleases({ releases: [], coveredThrough: "2026-10-01" }, {
+      coveredThrough: "2026-11-12", releases: { cpi: ["2026-10-14", "2026-11-10"], jobs: [], fomc: ["2026-10-28"] },
+      figures: { cpi: {
+        "2026-10-14": { event: "Inflation Rate YoY", actual: "3.7%", forecast: "3.6%", prior: "3.4%", surprise: "hot" },
+        "2026-11-10": { event: "Inflation Rate YoY", actual: null, forecast: "3.9%", prior: "3.7%", surprise: null,
+          actualMissing: "the CPI index (CPIAUCNS) has no October 2025 level to compute it from",
+          surpriseBasis: { basis: "core m/m", actual: "0.3%", forecast: "0.2%", surprise: "hot" } },
+      } },
+    });
+    const history = weekdays("2026-09-01", "2026-11-12", []);
+    const model = projectMacroDays(history, { symbol: "TLT", lookbackYears: 1, ...served });
+    const cpi = model.events.filter((event) => event.kind === "cpi");
+    expect(cpi.filter((event) => matchesSurprise(event, "hot")).map((event) => event.date)).toEqual(["2026-11-10", "2026-10-14"]);
+    expect(macroFigureGapNotices(cpi)).toEqual(["2026-11-10 CPI has no actual: the CPI index (CPIAUCNS) has no October 2025 level to compute it "
+      + "from. Surprise read from core m/m: 0.3% vs 0.2% forecast."]);
+    // Every CPI day read: nothing left out. The FOMC day before the calendar has no actual, and the filter says so.
+    expect(macroSurpriseExclusionNote(cpi, "hot")).toBeNull();
+    expect(macroSurpriseExclusionNote(model.events, "cool")).toBe("1 print excluded: no actual.");
+    expect(macroSurpriseExclusionNote(model.events, "all")).toBeNull();
+    // A basis that breaks the contract is none: the day is left out, and counted.
+    const broken = mergeMacroReleases({ releases: [], coveredThrough: "2026-10-01" }, { coveredThrough: "2026-11-12",
+      releases: { cpi: ["2026-11-10"], jobs: [], fomc: [] }, figures: { cpi: { "2026-11-10": { event: "Inflation Rate YoY", actual: null,
+        forecast: "3.9%", prior: "3.7%", surprise: null, surpriseBasis: { basis: "core m/m", surprise: "hot" } } } } });
+    const days = projectMacroDays(history, { symbol: "TLT", lookbackYears: 1, ...broken }).events;
+    expect(days.filter((event) => matchesSurprise(event, "hot"))).toEqual([]);
+    expect(macroSurpriseExclusionNote(days, "hot")).toBe("1 print excluded: no actual.");
+  });
+});
+
+describe("macro-day moves on a yield", () => {
+  test("reads a Treasury yield index's move as the change in the yield, in basis points, and a price's as a return", () => {
+    // ^TNX's level is the 10-year yield in percent: 5.24 to 5.28 is +4bp, not +0.76%.
+    const closes = { "2026-10-01": 5.24, "2026-10-02": 5.28, "2026-10-05": 5.10 };
+    const history = weekdays("2026-09-28", "2026-10-09", [], closes);
+    const options = { lookbackYears: 1, coveredThrough: "2026-12-31", releases: [{ kind: "jobs", date: "2026-10-02" }] } as const;
+    const yieldDays = projectMacroDays(history, { ...options, symbol: "^TNX" });
+    expect(yieldDays.basis).toBe("yield");
+    expect(yieldDays.events[0]!.move).toBeCloseTo(0.04, 12);
+    expect(formatMacroDayMove(yieldDays.events[0]!.move, yieldDays.basis)).toBe("+4.0bp");
+    // An average size has no sign; a move that rounds to nothing has none either.
+    expect(formatMacroDayMove(0.065, "yield", { signed: false })).toBe("6.5bp");
+    // Under a column headed bp, the number alone.
+    expect(formatMacroDayMove(0.04, "yield", { unit: false })).toBe("+4.0");
+    expect(formatMacroDayMove(-0.0004, "yield")).toBe("0.0bp");
+
+    const priceDays = projectMacroDays(history, { ...options, symbol: "SPY" });
+    expect(priceDays.basis).toBe("return");
+    expect(formatMacroDayMove(priceDays.events[0]!.move, priceDays.basis)).toBe("+0.76%");
+  });
+});
+
+describe("macro-day ECB decisions on a pair's closes", () => {
+  test("reads each ECB day on its close, and no move into or out of a close the source copied from the open", () => {
+    // EUR/USD: Thu 21 Jul 2022's decision on its own close; Fri 8 Jul's close is the source's copy of its open, which
+    // nothing rebuilt, so neither its move nor Mon 11 Jul's is a day's.
+    const history = weekdays("2022-07-04", "2022-07-29", [], { "2022-07-07": 1.0186, "2022-07-08": 1.0162, "2022-07-11": 1.0035 })
+      .map((point) => point.date.toISOString().startsWith("2022-07-08") ? { ...point, closeCopied: true } : point);
+    const model = projectMacroDays(history, { symbol: "EURUSD=X", lookbackYears: 1, coveredThrough: "2022-12-31", releases: [
+      { kind: "ecb", date: "2022-07-21" },
+      { kind: "cpi", date: "2022-07-11" },
+    ] });
+    expect(model.kinds).toContain("ecb");
+    expect(model.events.map((event) => [event.kind, event.date])).toEqual([["ecb", "2022-07-21"]]);
+    expect(model.byKind.ecb.count).toBe(1);
+    // The normal days leave out the two moves the copied close is an end of; an ECB day is a normal US day, as IPCA's is.
+    expect(model.normal.count).toBe(history.length - 1 - 2);
+  });
+});
+

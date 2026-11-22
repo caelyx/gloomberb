@@ -140,6 +140,10 @@ export interface GeoEntitiesPayload {
   columns: GeoColumn[];
   rows: GeoEntityRow[];
   total: number;
+  /** Each column's total over every row a filtered query finds (one country's ports), where the layer's figures add up. */
+  totals?: Record<string, GeoPropValue>;
+  /** The query was read as a country's name: the rows are that country's alone. */
+  matched?: "country";
   status?: GeoLayerStatus;
   statusNote?: string;
 }
@@ -172,6 +176,12 @@ export interface GeoSeriesPayload {
   asOf: string | null;
   /** Its layer's `publisher`, when the server names one. */
   publisher?: string;
+  /**
+   * When the publisher published the newest point (ISO), for a series dated
+   * by the day it counts and the day it came out (TSA's travelers, EIA-930
+   * demand). Absent when the server does not know it.
+   */
+  publishedAt?: string;
 }
 
 /** West, south, east, north in degrees. */

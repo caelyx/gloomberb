@@ -3,6 +3,10 @@ import { listingIdentity } from "../shared/ticker-request";
 import { Box, ScrollBox, Text, useUiCapabilities } from "../../../ui";
 import { useAsyncResource, useAutoRefresh, usePaneSettingValue, usePluginPaneState, useShortcut, useUpdatedAgo } from "../../../public/react";
 import { CompositeChart, DataTableStackView, EmptyState, PaneStatusBody, usePaneNoticeFooter, usePaneStatusLinkFooter, type DataTableCell, StatGrid } from "../../../components";
+import { ageFooterSegment } from "../../../components/layout/pane/footer";
+import { useUtcDay } from "../../../react/auto-refresh";
+import { reportFooterSegment } from "../shared/source-footer";
+import { socialMentionsHeadless } from "./headless";
 import { colors } from "../../../theme/colors";
 import type { SocialMentionPost, SocialMentionsRange } from "../../../api-client/social-mentions";
 import { staticSeries } from "../../../components/chart/static/series";
@@ -11,6 +15,8 @@ import { isPlainKey } from "../../../utils/keyboard";
 import { SignInWall } from "../cloud/auth-actions";
 import { isCloudSessionRequired, useResearchCloudSession } from "../shared/research-cloud-session";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
+import { usePaneInstance } from "../../../state/app/context";
+import { SocialOutliersView, type SocialOpenedTicker } from "./outliers";
 import { asSessionRequired, cachedSocialMentions, loadSocialMentionPosts, loadSocialMentions } from "./client";
 import { SOCIAL_COLUMNS, socialChartPoints, socialCount, socialDayRows, socialRatio, socialStance, socialSummary, sortedSocialRows, stanceWord, topPostCell, type SocialColumn, type SocialDayRow, type SocialSort } from "./model";
 
@@ -69,11 +75,18 @@ function DayDetail({ symbol, row, recent, width, height }: {
   </Box>;
 }
 
-export function SocialMentionsPane({ width, height, focused }: Pick<PaneProps, "width" | "height" | "focused">) {
-  const { ticker } = usePaneTickerIdentity();
+/**
+ * BUZZ on a listing: its daily posts on X against their median, the chart and
+ * the days. `listingKey` is the pane's ticker, or one opened from the ranking.
+ */
+function SocialMentionsTickerView({ width, height, focused, listingKey, onDetailChange }: Pick<PaneProps, "width" | "height" | "focused"> & {
+  listingKey: string | undefined;
+  /** Opened from the ranking: whether a day is open, so Esc closes it first. */
+  onDetailChange?: (open: boolean) => void;
+}) {
   const [rangeValue] = usePaneSettingValue("socialRange", "1y");
   const range: SocialMentionsRange = RANGES.includes(rangeValue as SocialMentionsRange) ? rangeValue as SocialMentionsRange : "1y";
-  const listing = listingIdentity(ticker?.metadata.ticker);
+  const listing = listingIdentity(listingKey);
   const symbol = listing?.symbol && /^[A-Z][A-Z0-9]{0,5}$/.test(listing.symbol) ? listing.symbol : null;
   const session = useResearchCloudSession();
   const loader = useCallback((force: boolean) => loadSocialMentions(symbol!, range, force).catch((error: unknown) => { throw asSessionRequired(error); }),
@@ -105,19 +118,26 @@ export function SocialMentionsPane({ width, height, focused }: Pick<PaneProps, "
   const pending = !!data?.pending.length;
   useEffect(() => {
     if (!pending) return;
-    const timer = setTimeout(() => void resource.reload(), PENDING_RETRY_MS);
+    const timer = setTimeout(() => resource.reload(), PENDING_RETRY_MS);
     return () => clearTimeout(timer);
   }, [pending, resource.updatedAt, resource.reload]);
   useAutoRefresh(resource.updatedAt, resource.load);
-  useShortcut((event) => { if (focused && isPlainKey(event, "r")) { event.preventDefault(); void resource.reload(); } });
+  // The footer leaves the day off a time of today; the next day it names it.
+  useUtcDay();
+  const dayOpen = !!openRow;
+  useEffect(() => onDetailChange?.(dayOpen), [dayOpen, onDetailChange]);
+  useEffect(() => () => onDetailChange?.(false), [onDetailChange]);
+  useShortcut((event) => { if (focused && isPlainKey(event, "r")) { event.preventDefault(); resource.reload(); } });
   usePaneNoticeFooter({ registrationId: "social-mentions:notices", focused,
     notices: [...(data?.warnings ?? []), ...(resource.data?.refreshError ? [resource.data.refreshError] : [])] });
   // The wall says it; a missing sign-in is not a failure for the footer to repeat.
   const signInWall = !data && isCloudSessionRequired(resource.error);
   usePaneStatusLinkFooter({ registrationId: "social-mentions", focused, loading: resource.loading || pending, error: signInWall ? null : resource.error,
     url: selected?.topPost?.url ?? (symbol ? `https://x.com/search?q=%24${symbol}` : null), showOpenHint: true,
+    // Its source and when the posts were counted, as `fn BUZZ` ends; how long ago it loaded goes first on a narrow row.
     info: data ? [
-      ...(updatedAgo ? [{ id: "updated", parts: [{ text: updatedAgo, tone: "muted" as const }] }] : []),
+      reportFooterSegment(socialMentionsHeadless, { sections: [], metadata: { asOf: data.asOf } }),
+      ...(updatedAgo ? [ageFooterSegment(updatedAgo)] : []),
       ...(resource.data?.stale ? [{ id: "stale", parts: [{ text: "stale", tone: "warning" as const }] }] : []),
     ] : [],
   });
@@ -155,4 +175,21 @@ export function SocialMentionsPane({ width, height, focused }: Pick<PaneProps, "
       /> : null}
     </PaneStatusBody>
   </Box>;
+}
+
+const renderOpenedTicker = ({ symbol, ...props }: SocialOpenedTicker) => <SocialMentionsTickerView {...props} listingKey={symbol} />;
+
+/**
+ * BUZZ on a ticker is that ticker's posts on X; without one it is the ranking
+ * of the market's social outliers. A ranked ticker opens here as BUZZ on its
+ * cashtag, and Back returns to the ranking.
+ */
+export function SocialMentionsPane({ width, height, focused }: Pick<PaneProps, "width" | "height" | "focused">) {
+  const { symbol, ticker } = usePaneTickerIdentity();
+  const instance = usePaneInstance();
+  // No ticker at all is the ranking; a pane linked to a list keeps its own empty state while the list has nothing selected.
+  if (!symbol && instance?.binding?.kind !== "follow") {
+    return <SocialOutliersView width={width} height={height} focused={focused} renderTicker={renderOpenedTicker} />;
+  }
+  return <SocialMentionsTickerView width={width} height={height} focused={focused} listingKey={ticker?.metadata.ticker} />;
 }

@@ -6,6 +6,7 @@ import type { QueryEntry } from "../../../market-data/result-types";
 import { buildQuoteKey, resolveEntryData } from "../../../market-data/selectors";
 import type { Quote } from "../../../types/financials";
 import { isFiniteNumber } from "../../../utils/guards";
+import { isValuationMultiple, screenRowId } from "./model";
 
 /**
  * A screen row with its quote laid over it: price, change, volume and market
@@ -30,6 +31,19 @@ function liveMetric(metric: ScreenMetric, value: number, asOf: string, observedA
 }
 
 /**
+ * Multiples of the price, which move with it as `valuation` reprices them:
+ * the snapshot serves each over its row's price (its cap, for P/B), so over
+ * the quote's price it is the snapshot's times the price's move.
+ */
+const PRICE_MULTIPLE_FIELDS = ["trailingPE", "forwardPE", "priceToBook"] as const;
+
+/** The company's name as its quote gives it, so a row reads as `quote` does; the snapshot's without one. */
+function quoteNamed(row: ScreenRow, quote: Quote): ScreenRow {
+  const name = quote.name?.trim();
+  return name && name !== row.name ? { ...row, name } : row;
+}
+
+/**
  * Price, day change, volume and market cap from a quote, over a snapshot row,
  * as `quote` headlines them: the live quote while the regular session trades,
  * then the completed session's close and its move (getRegularSessionQuoteDisplay,
@@ -42,8 +56,10 @@ function liveMetric(metric: ScreenMetric, value: number, asOf: string, observedA
  * live quote observed before it, a quote of an earlier day than the
  * snapshot's price) leaves the row alone.
  */
-function overlayLiveScreenRow(row: ScreenRow, quote: Quote | null | undefined): LiveScreenRow {
-  if (!quote || quote.stale === true || !isFiniteNumber(quote.price) || quote.price <= 0 || !isFiniteNumber(quote.lastUpdated)) return row;
+function overlayLiveScreenRow(snapshotRow: ScreenRow, quote: Quote | null | undefined): LiveScreenRow {
+  if (!quote) return snapshotRow;
+  const row = quoteNamed(snapshotRow, quote);
+  if (quote.stale === true || !isFiniteNumber(quote.price) || quote.price <= 0 || !isFiniteNumber(quote.lastUpdated)) return row;
   const quoteCurrency = quote.currency?.trim();
   if (quoteCurrency && row.currency && quoteCurrency !== row.currency) return row;
   const snapshotPrice = row.metrics.price;
@@ -74,9 +90,16 @@ function overlayLiveScreenRow(row: ScreenRow, quote: Quote | null | undefined): 
   if (!headline.completed && isFiniteNumber(quote.volume) && quote.volume >= 0) {
     metrics.volume = liveMetric(metrics.volume, quote.volume, asOf, observedAt);
   }
-  const cap = metrics.marketCap;
-  if (isFiniteNumber(cap.value) && isFiniteNumber(snapshotPrice.value) && snapshotPrice.value > 0) {
-    metrics.marketCap = liveMetric(cap, cap.value * (headline.price / snapshotPrice.value), asOf, observedAt);
+  if (isFiniteNumber(snapshotPrice.value) && snapshotPrice.value > 0) {
+    const move = headline.price / snapshotPrice.value;
+    const cap = metrics.marketCap;
+    if (isFiniteNumber(cap.value)) metrics.marketCap = liveMetric(cap, cap.value * move, asOf, observedAt);
+    // Over the price the row shows, as `valuation` reprices them: one ticker, one P/E at one time. The
+    // earnings or book under it keep the snapshot's date and state.
+    for (const field of PRICE_MULTIPLE_FIELDS) {
+      const metric = metrics[field];
+      if (metric && isFiniteNumber(metric.value) && metric.value > 0 && move !== 1) metrics[field] = { ...metric, value: metric.value * move };
+    }
   }
   return { ...row, metrics, ...(extended ? { extended } : {}) };
 }
@@ -84,58 +107,118 @@ function overlayLiveScreenRow(row: ScreenRow, quote: Quote | null | undefined): 
 /** The last overlay per snapshot row, so a row whose quote did not move keeps its object. */
 const liveRows = new WeakMap<ScreenRow, { quote: Quote | null; row: LiveScreenRow }>();
 
-function overlayRows(rows: readonly ScreenRow[], quoteOf: (key: string) => Quote | null | undefined): LiveScreenRow[] {
-  return rows.map((row) => {
-    const quote = quoteOf(screenRowQuoteKey(row));
-    if (quote === undefined) return row;
-    const cached = liveRows.get(row);
-    if (cached && cached.quote === quote) return cached.row;
-    const next = overlayLiveScreenRow(row, quote);
-    liveRows.set(row, { quote, row: next });
-    return next;
-  });
+/** Where each quote key sits in a rows array: a screen's rows are replaced as a whole, so this is read once per array. */
+const rowPositions = new WeakMap<readonly ScreenRow[], Map<string, number[]>>();
+
+function positionsByQuoteKey(rows: readonly ScreenRow[]): Map<string, number[]> {
+  let positions = rowPositions.get(rows);
+  if (!positions) {
+    positions = new Map();
+    rows.forEach((row, index) => {
+      const key = screenRowQuoteKey(row);
+      const at = positions!.get(key);
+      if (at) at.push(index);
+      else positions!.set(key, [index]);
+    });
+    rowPositions.set(rows, positions);
+  }
+  return positions;
+}
+
+/**
+ * The rows with their quotes laid over them. Only the rows a quote names are
+ * touched, so a long list costs what its quotes do, and the same array comes
+ * back while none of them moved a row (a tick for a row off the loaded pages,
+ * or one that changes none of what the row shows).
+ */
+function overlayRows(
+  rows: readonly ScreenRow[],
+  quotes: Iterable<readonly [string, Quote | null | undefined]>,
+): readonly LiveScreenRow[] {
+  const positions = positionsByQuoteKey(rows);
+  let next: LiveScreenRow[] | null = null;
+  for (const [key, quote] of quotes) {
+    if (quote === undefined) continue;
+    for (const index of positions.get(key) ?? []) {
+      const row = rows[index]!;
+      let live: LiveScreenRow;
+      const cached = liveRows.get(row);
+      if (cached && cached.quote === quote) live = cached.row;
+      else {
+        live = overlayLiveScreenRow(row, quote);
+        liveRows.set(row, { quote, row: live });
+      }
+      if (live !== (next ?? rows)[index]) (next ??= [...rows])[index] = live;
+    }
+  }
+  return next ?? rows;
 }
 
 /** The pane's rows with the streamed quotes on screen laid over them. */
 export function overlayLiveScreenRows(
   rows: readonly ScreenRow[],
   entries: ReadonlyMap<string, QueryEntry<Quote>>,
-): LiveScreenRow[] {
-  return overlayRows(rows, (key) => {
-    const entry = entries.get(key);
-    return entry ? resolveEntryData(entry) : undefined;
-  });
+): readonly LiveScreenRow[] {
+  return overlayRows(rows, Array.from(entries, ([key, entry]) => [key, resolveEntryData(entry)] as const));
 }
 
 /** Rows with quotes keyed by screenRowQuoteKey laid over them, for a report. */
-export function overlayScreenQuotes(rows: readonly ScreenRow[], quotes: ReadonlyMap<string, Quote>): LiveScreenRow[] {
-  return overlayRows(rows, (key) => quotes.get(key));
+export function overlayScreenQuotes(rows: readonly ScreenRow[], quotes: ReadonlyMap<string, Quote>): readonly LiveScreenRow[] {
+  return overlayRows(rows, quotes);
 }
 
 /** The fields a quote moves on a row (overlayLiveScreenRow). */
-const LIVE_SORT_FIELDS: ReadonlySet<string> = new Set(["price", "changePercent", "volume", "marketCap"]);
+const LIVE_SORT_FIELDS: ReadonlySet<string> = new Set(["price", "changePercent", "volume", "marketCap", ...PRICE_MULTIPLE_FIELDS]);
 
 /**
  * Rows in the screen's order by the figures they show. A sort on a field the
- * quotes move (price, change, volume, market cap) is redone on the overlaid
+ * quotes move (price, change, volume, market cap, the P/Es and P/B) is redone on the overlaid
  * values, so the column reads monotone: GRAB's snapshot cap, two closes old,
  * kept it above MANH after its quote moved it below. Rows without a
- * value stay last, and ties keep the snapshot's order. Any other sort is the
+ * value stay last, a multiple at zero or below just before them, and ties
+ * keep the snapshot's order. Any other sort is the
  * snapshot's, which the overlay does not touch.
  */
 export function sortLiveScreenRows<T extends ScreenRow>(rows: readonly T[], sort: ScreenDefinition["sort"]): T[] {
   if (!LIVE_SORT_FIELDS.has(sort.field)) return [...rows];
-  const field = sort.field as "price" | "changePercent" | "volume" | "marketCap";
+  const field = sort.field as "price" | "changePercent" | "volume" | "marketCap" | (typeof PRICE_MULTIPLE_FIELDS)[number];
   const sign = sort.direction === "desc" ? -1 : 1;
+  // A multiple at zero or below follows the positive ones, either way, as the server ranks it; unknowns last.
+  const lossesLast = isValuationMultiple(field);
+  const band = (value: number | null | undefined) => !isFiniteNumber(value) ? 2 : lossesLast && value <= 0 ? 1 : 0;
   return rows
     .map((row, index) => ({ row, index, value: row.metrics[field]?.value }))
     .sort((a, b) => {
-      const aKnown = isFiniteNumber(a.value), bKnown = isFiniteNumber(b.value);
-      if (aKnown !== bKnown) return aKnown ? -1 : 1;
-      if (aKnown && bKnown && a.value !== b.value) return sign * (a.value! - b.value!);
+      const aBand = band(a.value), bBand = band(b.value);
+      if (aBand !== bBand) return aBand - bBand;
+      if (aBand < 2 && a.value !== b.value) return sign * (a.value! - b.value!);
       return a.index - b.index;
     })
     .map(({ row }) => row);
+}
+
+/**
+ * Where each row sits in the screen's order by the figures it shows
+ * (sortLiveScreenRows), by row id in that order. The pane takes it from
+ * figures sampled every few seconds, so a tick reorders nothing: the rows it
+ * moves are placed by it (placeLiveScreenRows), and the sort is not redone.
+ */
+export function liveScreenPlaces(rows: readonly ScreenRow[], sort: ScreenDefinition["sort"]): ReadonlyMap<string, number> {
+  return new Map(sortLiveScreenRows(rows, sort).map((row, index) => [screenRowId(row), index]));
+}
+
+/** `rows` in the order of `places`; a row it does not know follows those it does, in the order it has. */
+export function placeLiveScreenRows<T extends ScreenRow>(rows: readonly T[], places: ReadonlyMap<string, number>): T[] {
+  const placed: Array<T | undefined> = [];
+  const rest: T[] = [];
+  for (const row of rows) {
+    const place = places.get(screenRowId(row));
+    if (place === undefined || placed[place] !== undefined) rest.push(row);
+    else placed[place] = row;
+  }
+  const ordered: T[] = [];
+  for (const row of placed) if (row !== undefined) ordered.push(row);
+  return ordered.concat(rest);
 }
 
 /** The extended sessions some row has a print for, in the order their columns go. */

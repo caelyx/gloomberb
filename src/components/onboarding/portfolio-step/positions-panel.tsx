@@ -5,8 +5,16 @@ import { shownPriceColor } from "../../../theme/colors";
 import { t, tf } from "../../../i18n";
 import { formatMarketPrice } from "../../../market-data/market/format";
 import { getRegularSessionDisplay } from "../../../market-data/market/status";
+import { regularSessionValuationTime } from "../../../market-data/quotes/regular-session-valuation";
+import { formatUtcTime } from "../../../utils/utc-time";
 import { formatPercentRaw } from "../../../utils/format";
-import { Button, NumberField, TextField } from "../../ui";
+import { Button, NumberField, Prose, TextField } from "../../ui";
+import { DelayedMark } from "../../ui/delayed-mark";
+import { useFreeQuoteDelay } from "../../../api-client/plan-access";
+import { useRemoteUiNode } from "../../../remote/semantic-tree";
+import { remoteStringValue } from "../../../remote/semantic-helpers";
+import { logFailure } from "../../../utils/log-failure";
+import { wrapTextLines } from "../../../utils/text-wrap";
 import { ONBOARDING_DESKTOP } from "../onboarding-frame";
 import {
   POSITION_FIELDS,
@@ -31,7 +39,7 @@ const FIELD_LABELS: Record<PositionFieldId, string> = {
 const FIELD_PLACEHOLDERS: Record<Exclude<PositionFieldId, "currency">, string> = {
   ticker: "e.g. AAPL",
   shares: "optional",
-  avgCost: "current price",
+  avgCost: "last price",
 };
 
 /** A field's label; the size counts contracts once the symbol is a future. */
@@ -47,6 +55,8 @@ function fieldPlaceholder(field: PositionFieldId, state: OnboardingPositionsStat
 /** Company name and last price for the symbol being typed, or why it will not resolve. */
 function PreviewLine({ preview, error }: Pick<OnboardingPositionsState, "preview" | "error">) {
   const colors = useThemeColors();
+  // Signed out or free, the price is the delayed one, and says so: setup covers the status bar's note.
+  const delay = useFreeQuoteDelay(preview.status === "ready" ? preview.quote : null);
   if (error) return <Text fg={colors.negative} wrapText>{error}</Text>;
   if (preview.status === "idle") return null;
   if (preview.status === "checking") {
@@ -57,15 +67,28 @@ function PreviewLine({ preview, error }: Pick<OnboardingPositionsState, "preview
   const headline = getRegularSessionDisplay(preview.quote);
   const price = headline?.price;
   const change = headline?.changePercent;
+  // Only the name gives way to a narrow row, clipped on its right: the symbol, price and move keep every cell.
   return (
-    <Box flexDirection="row" minWidth={0} overflow="hidden">
-      <Text fg={colors.text} attributes={TextAttributes.BOLD}>{preview.symbol}</Text>
-      {preview.name ? <Text fg={colors.textDim}>{`  ${preview.name}`}</Text> : null}
-      {price != null ? <Text fg={colors.text}>{`  ${formatMarketPrice(price, { maxWidth: 12 })}`}</Text> : null}
-      {change != null ? <Text fg={shownPriceColor(change, 2, colors)}>{` ${formatPercentRaw(change)}`}</Text> : null}
-      {preview.duplicate ? <Text fg={colors.textMuted}>{t("  already added")}</Text> : null}
+    <Box flexDirection="column" minWidth={0} flexShrink={0}>
+      <Box flexDirection="row" alignItems="center" minWidth={0} overflow="hidden">
+        <Box flexShrink={0}><Text fg={colors.text} attributes={TextAttributes.BOLD}>{preview.symbol}</Text></Box>
+        {preview.name ? (
+          <Box flexShrink={1} minWidth={0} overflow="hidden" paddingLeft={2}><Text fg={colors.textDim}>{preview.name}</Text></Box>
+        ) : null}
+        {price != null ? <Box flexShrink={0} paddingLeft={2}><Text fg={colors.text}>{formatMarketPrice(price, { maxWidth: 12 })}</Text></Box> : null}
+        {change != null ? <Box flexShrink={0} paddingLeft={1}><Text fg={shownPriceColor(change, 2, colors)}>{formatPercentRaw(change)}</Text></Box> : null}
+        {price != null && delay != null ? <Box flexShrink={0} paddingLeft={1}><DelayedMark minutes={delay} /></Box> : null}
+        {preview.duplicate ? <Box flexShrink={0}><Text fg={colors.textMuted}>{t("  already added")}</Text></Box> : null}
+      </Box>
+      {price != null ? <Text fg={colors.textDim} wrapText>{previewTime(preview)}</Text> : null}
     </Box>
   );
+}
+
+function previewTime(preview: OnboardingPositionsState["preview"]): string {
+  if (preview.status !== "ready") return "";
+  const time = regularSessionValuationTime(preview.quote);
+  return time ? `As of ${formatUtcTime(time)}` : "Price time unavailable";
 }
 
 const wholeCurrencyFormatters = new Map<string, Intl.NumberFormat>();
@@ -182,7 +205,6 @@ function DesktopPositionsPanel({
     size: "comfortable" as const,
     backgroundColor: colors.panel,
     textColor: colors.text,
-    placeholderColor: colors.textDim,
     onMouseDown: () => state.focusField(index),
   });
 
@@ -263,20 +285,37 @@ function TuiFieldRow({
             focused={!state.submitting}
             backgroundColor={colors.panel}
             textColor={colors.text}
-            placeholderColor={colors.textDim}
             onChange={(next) => state.setField(field, next)}
           />
         ) : (
           <Text fg={value ? colors.text : colors.textMuted}>{value || fieldPlaceholder(field, state)}</Text>
         )}
       </Box>
-      {field === "ticker" ? (
-        <Box flexGrow={1} minWidth={0} overflow="hidden" paddingLeft={1}>
-          <PreviewLine preview={state.preview} error={null} />
+      {/* The form's last field ends in Add, as the desktop's row does, so a mouse adds the row without Enter. */}
+      {index === POSITION_FIELDS.length - 1 ? (
+        <Box flexShrink={0} paddingLeft={1}>
+          <Button
+            label={state.submitting ? "Adding..." : "Add"}
+            variant="secondary"
+            compact
+            disabled={state.submitting}
+            onPress={() => { void state.addPosition().catch(logFailure("onboarding.positions", "Add position failed")); }}
+          />
         </Box>
       ) : null}
     </Box>
   );
+}
+
+/**
+ * The line under the form: what Enter does, and how the step goes on. It
+ * needs one ticker; once one is listed, Enter on the empty Ticker field
+ * continues, as Continue does.
+ */
+function positionsHint(editing: boolean, count: number): string {
+  if (!editing && count > 0) return tf("Enter continues · a adds another{broker}", { broker: "" });
+  const enter = editing ? t("Enter: next field, then add") : t("Enter to add a ticker");
+  return `${enter} · ${count > 0 ? t("Enter on an empty ticker: continue") : t("Add one ticker to continue")}`;
 }
 
 /** The size held: negative for a short. */
@@ -284,7 +323,27 @@ function SignedNumberField(props: ComponentProps<typeof NumberField>) {
   return <NumberField {...props} allowNegative />;
 }
 
-function TuiPositionsPanel({ state, inputRef, editing, selectedSymbol, shortcut }: PositionsPanelProps) {
+/** Cells the note under the terminal's form wraps across in a card `columns` wide: its two cells of indent on each side. */
+const tuiNoteWidth = (columns: number) => Math.max(8, columns - 4);
+
+/** The line under the terminal's form, as TuiPositionsPanel draws it. */
+function tuiPositionsNote(state: OnboardingPositionsState, editing: boolean): string {
+  return state.error ?? (state.submitting ? t("adding...") : positionsHint(editing, state.positions.length));
+}
+
+/**
+ * The rows the terminal's panel takes at `width` columns: the fields, the
+ * note under them as it wraps, the heading and the rows it lists, and the
+ * line on adding more later. The card is as tall as what it holds.
+ */
+export function tuiPositionsPanelRows(state: OnboardingPositionsState, editing: boolean, width: number): number {
+  const noteRows = wrapTextLines(tuiPositionsNote(state, editing), tuiNoteWidth(width)).length;
+  const previewRows = state.preview.status === "idle" ? 0
+    : state.preview.status === "ready" ? 1 + wrapTextLines(previewTime(state.preview), tuiNoteWidth(width)).length : 1;
+  return POSITION_FIELDS.length + previewRows + noteRows + 4 + Math.min(state.positions.length, TUI_VISIBLE_ROWS);
+}
+
+function TuiPositionsPanel({ state, inputRef, editing, selectedSymbol, shortcut, columns }: PositionsPanelProps) {
   const colors = useThemeColors();
   // The newest rows, until the cursor climbs above them.
   const selectedIndex = state.positions.findIndex((row) => row.symbol === selectedSymbol);
@@ -296,18 +355,20 @@ function TuiPositionsPanel({ state, inputRef, editing, selectedSymbol, shortcut 
       {POSITION_FIELDS.map((field, index) => (
         <TuiFieldRow key={field} field={field} index={index} state={state} inputRef={inputRef} editing={editing} />
       ))}
-      <Box height={1} overflow="hidden">
-        {state.error ? (
-          <Text fg={colors.negative}>{state.error}</Text>
-        ) : state.submitting ? (
-          <Text fg={colors.textDim}>{t("adding...")}</Text>
+      <PreviewLine preview={state.preview} error={null} />
+      {/* Wraps in a narrow window (64 columns) rather than cutting how the step goes on, at the words the
+          card's height counted (tuiPositionsPanelRows), so the card holds every line it draws. */}
+      <Box flexShrink={0} flexDirection="column">
+        {columns ? (
+          <Prose
+            text={tuiPositionsNote(state, editing)}
+            width={tuiNoteWidth(columns)}
+            figures={false}
+            color={state.error ? colors.negative : state.submitting ? colors.textDim : colors.textMuted}
+          />
         ) : (
-          <Text fg={colors.textMuted}>
-            {editing
-              ? t("Enter: next field, then add.")
-              : state.positions.length > 0
-                ? tf("Enter continues · a adds another{broker}", { broker: "" })
-                : t("Enter to add a ticker.")}
+          <Text fg={state.error ? colors.negative : state.submitting ? colors.textDim : colors.textMuted} wrapText>
+            {tuiPositionsNote(state, editing)}
           </Text>
         )}
       </Box>
@@ -366,9 +427,70 @@ export interface PositionsPanelProps {
   selectedSymbol: string | null;
   /** Command bar shortcut in the host's notation, e.g. "Ctrl+K". */
   shortcut: string;
+  /** The terminal card's content columns, the width its height counts the note's lines at. */
+  columns?: number;
+}
+
+/**
+ * One field of the position form as remote control fills it, the same on both
+ * hosts: the terminal draws only the field being typed in as an input, and
+ * Enter there is the card's key, not the input's. `submit` adds the position,
+ * as the desktop's Add button does.
+ */
+function RemotePositionField({ field, index, state, editing }: { field: PositionFieldId; index: number; state: OnboardingPositionsState; editing: boolean }) {
+  useRemoteUiNode({
+    role: "form-field",
+    label: fieldLabel(field, state),
+    disabled: state.submitting,
+    actions: {
+      focus: () => state.focusField(index),
+      setValue: (input) => state.setField(field, remoteStringValue(input)),
+      submit: () => state.addPosition(),
+    },
+    metadata: {
+      fieldId: field,
+      fieldType: field === "shares" || field === "avgCost" ? "number" : "text",
+      active: editing && index === state.fieldIdx,
+      value: state.draft[field],
+      placeholder: fieldPlaceholder(field, state),
+      ...(field === "ticker" && state.error ? { error: state.error } : {}),
+    },
+  });
+  return null;
+}
+
+/** The positions added so far, as remote control reads them; `remove` takes one off by its symbol or index. */
+function RemotePositionList({ state }: { state: OnboardingPositionsState }) {
+  useRemoteUiNode({
+    role: "list",
+    label: t("Positions"),
+    actions: {
+      remove: (input) => {
+        const record = input && typeof input === "object" ? input as { id?: unknown; index?: unknown } : {};
+        const symbol = typeof record.index === "number"
+          ? state.positions[record.index]?.symbol
+          : typeof record.id === "string" ? record.id : remoteStringValue(input, "");
+        const row = state.positions.find((entry) => entry.symbol === symbol?.toUpperCase());
+        if (!row) throw new Error(`No position ${symbol ? `"${symbol}"` : "at that index"} is listed.`);
+        return state.removePosition(row.symbol);
+      },
+    },
+    metadata: {
+      items: state.positions.map((row, index) => ({ index, id: row.symbol, label: row.symbol, detail: positionSummary(row) })),
+    },
+  });
+  return null;
 }
 
 export function PositionsPanel(props: PositionsPanelProps) {
   const desktop = useUiCapabilities().nativePaneChrome === true;
-  return desktop ? <DesktopPositionsPanel {...props} /> : <TuiPositionsPanel {...props} />;
+  return (
+    <>
+      {POSITION_FIELDS.map((field, index) => (
+        <RemotePositionField key={field} field={field} index={index} state={props.state} editing={props.editing} />
+      ))}
+      <RemotePositionList state={props.state} />
+      {desktop ? <DesktopPositionsPanel {...props} /> : <TuiPositionsPanel {...props} />}
+    </>
+  );
 }

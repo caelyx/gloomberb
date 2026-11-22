@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useMemo, useRef, useState } from "react";
 import { Box, ScrollBox } from "../../../ui";
 import { DataTableView, FieldGrid, KeyValueRow, Notice, QueryBar, Section, usePaneNoticeFooter, usePaneTabs, type GridField, type SelectControl } from "../../../components";
@@ -29,7 +30,7 @@ const SHOCK_COLUMNS = [
   { id: "returnPercent", label: "Return %", width: 12, align: "right" as const },
 ];
 const loadBenchmark = () => loadBondBenchmark();
-const fixed = (value: number | null | undefined, digits = 4) => value == null ? "-" : value.toFixed(digits);
+const fixed = (value: number | null | undefined, digits = 4) => value == null ? MISSING_VALUE : value.toFixed(digits);
 
 export function BondCalculatorPane({ focused, width, height }: PaneProps) {
   const [settlement] = usePaneSettingValue<string | undefined>("settlement", undefined);
@@ -71,7 +72,7 @@ export function BondCalculatorPane({ focused, width, height }: PaneProps) {
   }, [result, draft.quote, update]);
   const selectTab = useCallback((value: string) => { setActiveField(null); setTab(value); }, [setTab]);
   const { strip: tabStrip, rows: tabRows } = usePaneTabs({ tabs: TABS, activeValue: tab, onSelect: selectTab, focused: focused && !activeField, dense: true });
-  usePaneRefreshKey(() => { void load(); }, { focused });
+  usePaneRefreshKey(() => { load(); }, { focused });
   useShortcut((event) => {
     if (event.defaultPrevented || event.propagationStopped || event.ctrl || event.alt || event.meta || event.super) return;
     const consume = () => { event.preventDefault(); event.stopPropagation(); };
@@ -122,7 +123,7 @@ export function BondCalculatorPane({ focused, width, height }: PaneProps) {
     [{ label: "Clean price", value: fixed(result.analytics.cleanPrice) }, { label: "Yield", value: `${fixed(result.analytics.yieldPercent)}%` }],
     [{ label: "Dirty price", value: fixed(result.analytics.dirtyPrice) }, { label: "Accrued", value: fixed(result.analytics.accruedInterest) }],
     [{ label: "Macaulay", value: `${fixed(result.analytics.macaulayDuration)} yr` }, { label: "Modified", value: `${fixed(result.analytics.modifiedDuration)} yr` }],
-    [{ label: "Convexity", value: `${fixed(result.analytics.convexity)} yr²` }, { label: "DV01 / 100", value: fixed(result.analytics.dv01, 6) }],
+    [{ label: "Convexity", value: `${fixed(result.analytics.convexity)} yr²` }, { label: "DV01", value: `${fixed(result.analytics.dv01, 6)} per 100 face` }],
   ] : [];
   return <Box flexDirection="column" width={width} height={height}>
     {tabStrip}

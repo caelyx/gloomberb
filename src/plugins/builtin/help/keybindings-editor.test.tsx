@@ -4,12 +4,14 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { act, useReducer } from "react";
 import { apiClient } from "../../../api-client";
+import * as configStore from "../../../data/config/store";
 import { requestKeybindingCapture } from "../../../app/keybindings";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
 import { flushPendingPersistence } from "../../../state/persist-scheduler";
 import { appReducer, createInitialState, type AppState } from "../../../state/app/context";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import type { KeybindingsConfig } from "../../../types/config";
+import type { AppNotificationRequest } from "../../../types/plugin-notifications";
 import { TestPaneFrame, createTestPaneConfig } from "../../../test-support/pane";
 import { helpModule } from "./index";
 
@@ -21,7 +23,11 @@ const WAIT_ATTEMPTS = 60;
 let latestState: AppState | null = null;
 let dataDir = "";
 
-function Harness({ keybindings }: { keybindings?: KeybindingsConfig }) {
+function Harness({ keybindings, width = 90, runtime = createTestPluginRuntime() }: {
+  keybindings?: KeybindingsConfig;
+  width?: number;
+  runtime?: ReturnType<typeof createTestPluginRuntime>;
+}) {
   const config = createTestPaneConfig(dataDir, { instanceId: id, paneId: "help", binding: { kind: "none" } });
   config.keybindings = keybindings;
   const initial = createInitialState(config);
@@ -29,7 +35,7 @@ function Harness({ keybindings }: { keybindings?: KeybindingsConfig }) {
   const [state, dispatch] = useReducer(appReducer, initial);
   latestState = state;
   return (
-    <TestPaneFrame state={state} dispatch={dispatch} paneId={id} pluginId="help" runtime={createTestPluginRuntime()} width={90} height={30}>
+    <TestPaneFrame state={state} dispatch={dispatch} paneId={id} pluginId="help" runtime={runtime} width={width} height={30}>
       {(body) => <HelpPane paneId={id} paneType="help" focused {...body} />}
     </TestPaneFrame>
   );
@@ -42,8 +48,8 @@ async function frame() {
   });
 }
 
-async function openShortcutsTab() {
-  await act(async () => { await tui.render(<Harness />, { width: 90, height: 30 }); });
+async function openShortcutsTab(width = 90, runtime?: ReturnType<typeof createTestPluginRuntime>) {
+  await act(async () => { await tui.render(<Harness width={width} runtime={runtime} />, { width, height: 30 }); });
   await frame();
   await act(async () => { await tui.clickFrameText("Shortcuts"); });
   // The table measures its viewport before it can lay columns and rows out.
@@ -70,7 +76,7 @@ test("rebinding from the help pane captures the next chord, shows the way back, 
   // Sections carry their count, and the actions live in the pane footer.
   expect(text).toContain("Global Keys (13)");
   expect(text).toContain("KEY");
-  expect(text).toContain("Open ticker search directly.");
+  expect(text).toContain("Change the focused pane's ticker.");
   expect(text).toContain("[Enter]rebind");
   expect(text).toContain("[x]unbind");
 
@@ -101,6 +107,56 @@ test("rebinding from the help pane captures the next chord, shows the way back, 
   await frame();
   expect(latestState?.config.keybindings).toEqual({ actions: { "ticker-search": null } });
   expect(tui.frame()).toContain("unbound");
+});
+
+test("a rebind the config file cannot take says so and keeps the new key for now", async () => {
+  spyOn(configStore, "saveConfig").mockRejectedValue(new Error("disk full"));
+  const notices: AppNotificationRequest[] = [];
+  const failed = Promise.withResolvers<void>();
+  await openShortcutsTab(90, createTestPluginRuntime({
+    notify: (notice) => {
+      notices.push(notice);
+      failed.resolve();
+    },
+  }));
+  await tui.emitKeypress({ name: "j" });
+  await tui.emitKeypress({ name: "return" });
+  await frame();
+  await tui.emitKeypress({ name: "y", ctrl: true, shift: true });
+  await frame();
+  await failed.promise;
+  expect(notices).toEqual([{ type: "error", body: "Could not save your keybindings." }]);
+  expect(latestState?.config.keybindings).toEqual({ actions: { "ticker-search": "CmdOrCtrl+Shift+Y" } });
+});
+
+test("NOTE shows only while a row has a note and ACTION keeps 30 cells beside it, wherever the table is scrolled", async () => {
+  const rebindTickerSearch = async () => {
+    await tui.emitKeypress({ name: "j" });
+    await tui.emitKeypress({ name: "return" });
+    await frame();
+    await tui.emitKeypress({ name: "y", ctrl: true, shift: true });
+    await frame();
+  };
+  // 90 columns: no note on screen, no NOTE; the rebound row's note brings it.
+  await openShortcutsTab(90);
+  expect(tui.frame()).not.toContain("NOTE");
+  await rebindTickerSearch();
+  expect(tui.frame()).toContain("NOTE");
+  // Scrolled past the rebound row, the columns hold: NOTE is decided from every row, not the rows on screen.
+  for (let step = 0; step < 40; step += 1) await tui.emitKeypress({ name: "j" });
+  await frame();
+  expect(tui.frame()).not.toContain("Change the focused pane's ticker.");
+  expect(tui.frame()).toContain("NOTE");
+  await act(async () => { await tui.destroy(); });
+
+  // 80 columns cut "Change the focused pa…" beside an empty 26-cell NOTE. With a note, NOTE would leave ACTION
+  // 25 cells, so the footer carries it.
+  await openShortcutsTab(80);
+  expect(tui.frame()).toContain("Change the focused pane's ticker.");
+  expect(tui.frame()).not.toContain("NOTE");
+  await rebindTickerSearch();
+  expect(tui.frame()).not.toContain("NOTE");
+  expect(tui.frame()).toContain("Bound to Ctrl+Shift+Y.");
 });
 
 test("a capture landing on a built-in action's chord is refused, names that action and saves nothing", async () => {

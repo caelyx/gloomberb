@@ -1,5 +1,3 @@
-import { commandBarResultsFromNodes } from "../../../../remote/command-bar";
-import { findCommandBarResult, findMatchingUiNode } from "../../../../remote/matching";
 import type {
   RemoteCallContext,
   RemoteControlRequest,
@@ -16,14 +14,15 @@ import {
   type TerminalRelayToolKind,
 } from "./manifest";
 import {
-  LOCAL_UI_ACTIONS,
-  NAVIGATION_RESULT_KINDS,
+  describeConfirmedOperation,
   operationPolicy,
   patchPolicy,
+  planUiCall,
+  UiCallRefusal,
+  type UiCallPlan,
 } from "./policy";
 import { REDACTED, redactConfig, redactRelayResult, redactResource } from "./redact";
 import { keyArgumentLines, shortValue, type CallSummary } from "./summary";
-import { logFailure } from "../../../../utils/log-failure";
 
 /**
  * Runs the tool calls Gloom Cloud relays from a remote assistant, in this
@@ -41,7 +40,6 @@ import { logFailure } from "../../../../utils/log-failure";
  * 60 s for an answer, then up to 15 s for the operation.
  */
 
-export const RELAY_PROMPT_SCOPE = "terminal-relay-prompt";
 export const CONFIRM_WINDOW_MS = 60_000;
 const EXECUTION_BUDGET_MS = 15_000;
 /** Answers the server cannot take (a call frame tens of megabytes long) are cut to fit. */
@@ -112,10 +110,8 @@ interface PlannedCall {
    * run. Passed back once the person allows it, so the app does not ask twice.
    */
   confirmKey?: string;
-  /** Re-reads the target right before running; false when it changed while the person decided. */
-  stillSame?: () => Promise<boolean>;
-  /** Refuses a semantic action aimed at the relay's own prompt. */
-  targetsPrompt?: () => Promise<boolean>;
+  /** A call that acts on what is on screen, checked again right before it runs (policy.ts). */
+  recheck?: UiCallPlan["recheck"];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -312,6 +308,11 @@ export class TerminalRelayEngine {
       controller: new AbortController(),
     };
     this.live.set(call.id, call);
+    // Ends when this call has run or failed: the next prompt opens only then (prompt()).
+    let finish!: () => void;
+    const finished = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
     try {
       if (!caller || !caller.id) throw new RelayRefusal("not_allowed", "The call does not say which assistant sent it.");
       if (typeof data.tool !== "string") throw new RelayRefusal("not_allowed", "The call names no tool.");
@@ -321,19 +322,15 @@ export class TerminalRelayEngine {
 
       await this.ensureApproved(call);
       const plan = await this.plan(binding, input);
-      if (plan.confirm) await this.confirm(call, plan.confirm);
+      if (plan.confirm) await this.confirm(call, plan.confirm, finished);
 
       // Last check before anything runs.
       if (!this.isLive(call)) return;
       if (this.options.grants.decision(caller.id) === "deny" || this.options.grants.decision(caller.id) === null) {
         throw new RelayRefusal("revoked", "This assistant's access to the terminal was revoked.");
       }
-      if (plan.targetsPrompt && (this.promptOpen || await plan.targetsPrompt())) {
-        throw new RelayRefusal("not_allowed", "A Gloom confirmation is open; the assistant cannot act on it.");
-      }
-      if (plan.stillSame && !(await plan.stillSame())) {
-        throw new RelayRefusal("not_allowed", "What the call pointed at changed while the person decided, so it did not run. Read the state again and retry.");
-      }
+      const stale = await plan.recheck?.(this.promptOpen);
+      if (stale) throw new RelayRefusal("not_allowed", stale);
       if (!this.isLive(call)) return;
 
       const result = await this.execute(binding, plan, input, call);
@@ -348,6 +345,7 @@ export class TerminalRelayEngine {
         : new RelayRefusal("app_error", error instanceof Error ? error.message : String(error));
       this.reply(call, { ok: false, error: { code: refusal.code, message: refusal.message } });
     } finally {
+      finish();
       if (this.live.get(call.id) === call) this.live.delete(call.id);
     }
   }
@@ -361,8 +359,16 @@ export class TerminalRelayEngine {
   /**
    * One prompt at a time; each keeps its own 60 s window from when it opens.
    * Aborting the call (a cancel, a revoke, a lost connection) closes it at once.
+   * A confirmed call keeps the next prompt closed until `heldUntil` (it has
+   * run), so it runs with no other prompt open and the person never answers
+   * one while a call they allowed still acts.
    */
-  private prompt<T>(call: LiveCall, kind: "approval" | "confirmation", ask: (signal: AbortSignal) => Promise<T>): Promise<T | "timeout"> {
+  private prompt<T>(
+    call: LiveCall,
+    kind: "approval" | "confirmation",
+    ask: (signal: AbortSignal) => Promise<T>,
+    heldUntil?: Promise<void>,
+  ): Promise<T | "timeout"> {
     this.announceWaiting(call, kind, this.now() + this.confirmWindowMs);
     const run = async (): Promise<T | "timeout"> => {
       if (!this.isLive(call)) throw new RelayRefusal("app_error", "cancelled");
@@ -388,9 +394,10 @@ export class TerminalRelayEngine {
       }
     };
     const result = this.promptChain.then(run, run);
-    this.promptChain = result.catch(() => {
+    const answered = result.catch(() => {
       // Intentional ignore: the returned result reports this failure; the chain only stays usable.
     });
+    this.promptChain = heldUntil ? Promise.all([answered, heldUntil]).then(() => {}) : answered;
     return result;
   }
 
@@ -412,8 +419,8 @@ export class TerminalRelayEngine {
     }
   }
 
-  private async confirm(call: LiveCall, summary: CallSummary): Promise<void> {
-    const answer = await this.prompt(call, "confirmation", (signal) => this.options.prompts.askConfirmation(call.caller, summary, signal));
+  private async confirm(call: LiveCall, summary: CallSummary, ran: Promise<void>): Promise<void> {
+    const answer = await this.prompt(call, "confirmation", (signal) => this.options.prompts.askConfirmation(call.caller, summary, signal), ran);
     if (!this.isLive(call)) throw new RelayRefusal("app_error", "cancelled");
     if (answer === "timeout") {
       throw new RelayRefusal("confirmation_timeout", `The person did not confirm "${summary.title}" within ${Math.round(this.confirmWindowMs / 1_000)} s, so it did not run.`);
@@ -425,11 +432,6 @@ export class TerminalRelayEngine {
     const response = await this.withBudget(this.options.handle({ type: "get", resource }));
     if (!response.ok) throw new Error(response.error.message);
     return response.data;
-  }
-
-  private async uiNodes(): Promise<RemoteUiNodeSnapshot[]> {
-    const nodes = await this.read("ui://tree");
-    return Array.isArray(nodes) ? nodes as RemoteUiNodeSnapshot[] : [];
   }
 
   /** The request to run and, for the `confirm` cases, what the person is asked. */
@@ -485,67 +487,30 @@ export class TerminalRelayEngine {
     const { policy } = operationPolicy(operation);
     if (policy === "allow") return { request, binding, confirm: null };
 
-    if (policy === "local-ui") {
-      const action = typeof input.action === "string" && input.action ? input.action : "press";
-      const find = async () => {
-        const nodes = await this.uiNodes();
-        return operation === "ui.invoke"
-          ? nodes.find((node) => node.id === input.nodeId)
-          : findMatchingUiNode(nodes, input);
-      };
-      const target = await find();
-      const targetsPrompt = async () => (await find())?.metadata?.scope === RELAY_PROMPT_SCOPE;
-      if (target?.metadata?.scope === RELAY_PROMPT_SCOPE || this.promptOpen) {
-        throw new RelayRefusal("not_allowed", "A Gloom confirmation is open; the assistant cannot act on it.");
-      }
-      if (LOCAL_UI_ACTIONS.has(action)) return { request, binding, confirm: null, targetsPrompt };
-      const fingerprint = target ? `${target.id}|${target.role}|${target.label ?? ""}` : "";
-      return {
-        request,
-        binding,
-        targetsPrompt,
-        stillSame: async () => {
-          const now = await find();
-          return (now ? `${now.id}|${now.role}|${now.label ?? ""}` : "") === fingerprint;
-        },
-        confirm: {
-          title: `${action === "press" ? "Press" : `Run "${action}" on`} ${target?.label ? `"${shortValue(target.label)}"` : "a control"}`,
-          lines: [
-            { label: "Control", value: target ? `${target.label ? shortValue(target.label) : "unlabelled"} (${target.role})` : "none visible yet" },
-            { label: "Action", value: action },
-            ...(input.input !== undefined ? [{ label: "Input", value: shortValue(input.input) }] : []),
-          ],
-        },
-      };
+    let ui: UiCallPlan | null;
+    try {
+      ui = await planUiCall(operation, input, { read: (resource) => this.read(resource), promptOpen: this.promptOpen });
+    } catch (error) {
+      if (error instanceof UiCallRefusal) throw new RelayRefusal(error.code, error.message);
+      throw error;
     }
-
-    if (policy === "navigation") {
-      const find = async () => findCommandBarResult(commandBarResultsFromNodes(await this.uiNodes()), input);
-      const result = await find();
-      if (!result) throw new RelayRefusal("invalid_input", "No matching command-bar result is visible.");
-      const kind = typeof result.kind === "string" ? result.kind : "";
-      if (NAVIGATION_RESULT_KINDS.has(kind)) return { request, binding, confirm: null };
-      const fingerprint = `${shortValue(result.label)}|${kind}|${shortValue(result.itemId)}`;
-      return {
-        request,
-        binding,
-        stillSame: async () => {
-          const now = await find();
-          return !!now && `${shortValue(now.label)}|${typeof now.kind === "string" ? now.kind : ""}|${shortValue(now.itemId)}` === fingerprint;
-        },
-        confirm: {
-          title: `Run "${shortValue(result.label)}" from the command bar`,
-          lines: [
-            { label: "Command", value: shortValue(result.label) },
-            ...(result.detail ? [{ label: "Detail", value: shortValue(result.detail) }] : []),
-          ],
-        },
-      };
-    }
+    if (ui) return { request, binding, confirm: ui.confirm, recheck: ui.recheck };
 
     const planned = await this.plannedChange(operation, input);
     if (planned) return { request, binding, ...planned };
-    return { request, binding, confirm: await this.operationSummary(operation, input) };
+    const described = await describeConfirmedOperation(operation, input, (resource) => this.read(resource));
+    if (described) {
+      const recheck = described.recheck;
+      return { request, binding, confirm: described.confirm, ...(recheck ? { recheck: () => recheck() } : {}) };
+    }
+    return {
+      request,
+      binding,
+      confirm: {
+        title: terminalRelayToolTitle(operation),
+        lines: [{ label: "Operation", value: operation }, ...keyArgumentLines(input)],
+      },
+    };
   }
 
   /**
@@ -572,52 +537,6 @@ export class TerminalRelayEngine {
         lines: lines.map((line) => ({ label: shortValue(line.label), value: shortValue(line.value) })),
       },
       confirmKey: plan.confirmKey,
-    };
-  }
-
-  private async operationSummary(operation: string, input: Record<string, unknown>): Promise<CallSummary> {
-    if (operation === "capability.invoke") {
-      const capabilityId = typeof input.capabilityId === "string" ? input.capabilityId : "";
-      const operationId = typeof input.operationId === "string" ? input.operationId : "";
-      let plugin = capabilityId;
-      let operationTitle = operationId;
-      try {
-        const manifests = await this.read("app://capabilities");
-        const manifest = Array.isArray(manifests)
-          ? manifests.find((entry) => isRecord(entry) && entry.id === capabilityId) as Record<string, unknown> | undefined
-          : undefined;
-        if (manifest && typeof manifest.name === "string") plugin = manifest.name;
-        const operations = manifest && Array.isArray(manifest.operations) ? manifest.operations : [];
-        const described = operations.find((entry) => isRecord(entry) && entry.id === operationId) as Record<string, unknown> | undefined;
-        if (described && typeof described.title === "string") operationTitle = described.title;
-      } catch (error) {
-        // The ids alone still say what runs.
-        logFailure("cloud.terminal-relay", "Read plugin names for a confirmation failed")(error);
-      }
-      return {
-        title: `${shortValue(operationTitle)} with ${shortValue(plugin)}`,
-        lines: [
-          { label: "Plugin", value: `${shortValue(plugin)}${plugin !== capabilityId ? ` (${shortValue(capabilityId)})` : ""}` },
-          { label: "Operation", value: shortValue(operationId) },
-          ...keyArgumentLines(input.payload),
-        ],
-      };
-    }
-    if (operation === "layout.delete") {
-      let name = `#${String(input.index)}`;
-      try {
-        const layouts = await this.read("app://layouts");
-        const layout = Array.isArray(layouts) && typeof input.index === "number" ? layouts[input.index] : undefined;
-        if (isRecord(layout) && typeof layout.name === "string") name = `"${shortValue(layout.name)}"`;
-      } catch (error) {
-        // The index still identifies it.
-        logFailure("cloud.terminal-relay", "Read layout names for a confirmation failed")(error);
-      }
-      return { title: `Delete the layout ${name}`, lines: [{ label: "Undo", value: "Not available for a deleted layout" }] };
-    }
-    return {
-      title: terminalRelayToolTitle(operation),
-      lines: [{ label: "Operation", value: operation }, ...keyArgumentLines(input)],
     };
   }
 
@@ -725,7 +644,8 @@ export class TerminalRelayEngine {
     } catch {
       // Intentional ignore: a pane without settings rejects this read, and its content has none.
     }
-    const nodes = (await this.uiNodes()).filter((node) => (
+    const tree = await this.read("ui://tree");
+    const nodes = (Array.isArray(tree) ? tree as RemoteUiNodeSnapshot[] : []).filter((node) => (
       (node.paneId === instanceId || node.metadata?.paneInstanceId === instanceId)
       // A bare clickable box says nothing about what the pane shows.
       && !(node.role === "box" && !node.label)

@@ -18,7 +18,8 @@ import { useChartViewReset } from "../chart/core/view-reset";
 export interface QueryBarSearch {
   value: string;
   onChange: (query: string) => void;
-  placeholder: string;
+  /** Longest first: a narrow field shows the first that fits (`["filter loaded stories", "filter stories"]`). */
+  placeholder: string | readonly string[];
   /** The pane is focused. */
   focused: boolean;
   /** The field owns the keyboard. */
@@ -61,6 +62,12 @@ export interface QueryBarSelectFilter<T extends string = string> extends QueryBa
   /** Draw the options inline (one click) instead of a menu. For four or fewer short values. */
   inline?: boolean;
   /**
+   * Inline filters: a long list that runs past the bar's edge (expiries). On
+   * the desktop it is a strip that scrolls by itself, where other inline
+   * choices fold into their menu when the bar runs short of room.
+   */
+  scrolls?: boolean;
+  /**
    * The options are the range a chart in this pane shows (1D, 1Y, MAX). Choosing
    * the one already selected sends the pane's charts back to it, as `0` does
    * after a pan or zoom, and does nothing to a chart that was not moved. Inline
@@ -83,7 +90,7 @@ export interface QueryBarMultiFilter extends QueryBarFilterBase {
 export interface QueryBarToggleFilter extends QueryBarFilterBase {
   kind: "toggle";
   value: boolean;
-  /** A shorter label for the terminal's single row. */
+  /** A shorter label for the terminal's single row, and for a desktop bar short of room. */
   short?: string;
   onChange: (value: boolean) => void;
   /**
@@ -122,20 +129,31 @@ export interface QueryBarView<T extends string = string> {
   value: T;
   options: readonly { value: T; label: string; hint?: string; disabled?: boolean }[];
   onChange: (value: T) => void;
+  /**
+   * What the choice is ("Interval", "Sort"): its name for a screen reader, and
+   * its menu's on the desktop when a bar short of room folds it. A chart's range
+   * is "Range" and any other unnamed view "View".
+   */
+  label?: string;
   /** Terminal: left/right cycle the view while this is true. */
   focused?: boolean;
   shortcutScope?: string;
   /** The options are a chart's range; see `QueryBarSelectFilter.chartRange`. */
   chartRange?: boolean;
+  /**
+   * The choice is which view the body shows, a nested tab strip
+   * (`usePaneTabs`): drawn first, where a tab row starts, not at the right.
+   */
+  start?: boolean;
 }
 
 export interface QueryBarProps {
   width: number;
   search?: QueryBarSearch;
   filters?: QueryBarFilter[];
-  /** Presentation that does not narrow the list: sort, range, interval. Right aligned. */
+  /** Presentation that does not narrow the list: sort, range, interval. Right aligned unless `start`. */
   view?: QueryBarView<any>;
-  /** Muted context at the right edge (the selected row's date). Not for status. */
+  /** Muted context at the right edge (the selected row's date, a growth basis). Not for status. Gives way first when the row runs short. */
   meta?: string;
   /**
    * What the whole list is about, drawn before the search and filters: a
@@ -143,11 +161,51 @@ export interface QueryBarProps {
    */
   leading?: ReactNode;
   /**
-   * The date the data is as of (`as of 2026-10-09`), shown where `meta` is
-   * when there is none. A `gloom shot` whose status line dates the data
-   * leaves it out, so the date is said once.
+   * The date the data is as of (`as of 2026-10-09`): its own segment before
+   * `meta`, which never gives way. When the row runs short, inline filters
+   * collapse to their menus first. A `gloom shot` whose status line dates
+   * the data leaves it out, so the date is said once.
    */
   asOf?: string;
+}
+
+/** An inline filter of a few short options, drawn as segments: what collapses to its menu when the row runs short. */
+function collapsibleInline(filter: QueryBarFilter): filter is QueryBarSelectFilter {
+  return (filter.kind === undefined || filter.kind === "select") && filter.inline === true && filter.options.length <= TERMINAL_SEGMENT_LIMIT;
+}
+
+/**
+ * The cells a terminal query bar takes with every control drawn in full: what decides whether its inline filters
+ * collapse to menus so the as-of keeps its place. `meta` gives way by itself and a long strip scrolls, so neither counts.
+ */
+function terminalRowCells(width: number, { search, filters = [], view, asOf }: Pick<QueryBarProps, "search" | "filters" | "view" | "asOf">): number {
+  const segments = (options: readonly { label: string; short?: string; hint?: string }[]) => options.length > TERMINAL_SEGMENT_LIMIT ? 0
+    : options.reduce((sum, option) => sum + (keyedStrip(options) && option.hint ? option.hint.length + 1 : 0) + (option.short ?? option.label).length + 2, 0);
+  const parts = [
+    ...search ? [Math.max(16, Math.min(36, Math.floor(width * 0.3)))] : [],
+    ...filters.map((filter) => {
+      if (filter.kind === "text") return (filter.width ?? 20) + filter.label.length + 1;
+      if (filter.kind === "toggle") return (filter.short ?? filter.label).length + 4;
+      if (filter.kind === "multi") return filter.label.length + 8;
+      if (filter.inline) return filter.label.length + 1 + segments(filter.options);
+      const current = filter.options.find((option) => option.value === filter.value);
+      return filter.label.length + (current?.short ?? current?.label ?? "").length + 6;
+    }),
+    ...view ? [segments(view.options)] : [],
+    ...asOf ? [asOf.length] : [],
+  ];
+  return 2 + parts.reduce((sum, part) => sum + part, 0) + 2 * Math.max(0, parts.length - 1);
+}
+
+/**
+ * Whether a terminal strip draws its keys: a strip with one for every option
+ * (chart ranges' 1 to 8). Keys on a few options step from the active one (OMON's
+ * `[` and `]` either side of its expiry); they move with it, and as `]:Nov 16`
+ * read as part of the date (review, 12 Nov 2026), so they stay in the pane menu
+ * and the desktop's tooltip.
+ */
+function keyedStrip(options: readonly { hint?: string }[]): boolean {
+  return options.length > 0 && options.every((option) => option.hint);
 }
 
 /** Beyond this many options a terminal strip scrolls instead of segmenting. */
@@ -155,8 +213,8 @@ const TERMINAL_SEGMENT_LIMIT = 6;
 
 /**
  * Terminal rendering of an inline filter or view: segments for a few short
- * options, a scrolling tab strip for many (expiries, chart ranges). Hints
- * prefix the label ("1:1D") because the terminal has no tooltip.
+ * options, a scrolling tab strip for many (expiries, chart ranges). Keys
+ * prefix the label ("1:1D") where every option has one (keyedStrip).
  */
 function TerminalChoiceStrip({
   options,
@@ -171,9 +229,10 @@ function TerminalChoiceStrip({
   focused?: boolean;
   shortcutScope?: string;
 }) {
+  const keyed = keyedStrip(options);
   const labelled = options.map((option) => ({
     value: option.value,
-    label: option.hint ? `${option.hint}:${option.label}` : option.label,
+    label: keyed ? `${option.hint}:${option.label}` : option.label,
     disabled: option.disabled,
   }));
   if (options.length > TERMINAL_SEGMENT_LIMIT) {
@@ -244,10 +303,10 @@ export function useQueryBarSearch(): QueryBarSearchFocus {
  * same everywhere. The desktop draws soft chips with menus; the terminal keeps
  * text controls and the choice dialogs.
  */
-export function QueryBar({ width, search, filters = [], view, meta: given, asOf, leading }: QueryBarProps) {
+export function QueryBar({ width, search, filters = [], view, meta, asOf: given, leading }: QueryBarProps) {
   const ui = useUiHost();
   const captureDatesData = useCaptureDatesData();
-  const meta = given ?? (captureDatesData ? undefined : asOf);
+  const asOf = captureDatesData ? undefined : given;
   const colors = useThemeColors();
   const HostQueryBar = ui.QueryBar as ComponentType<HostQueryBarProps> | undefined;
   const localInputRef = useRef<InputRenderable | null>(null);
@@ -378,6 +437,7 @@ export function QueryBar({ width, search, filters = [], view, meta: given, asOf,
         id: filter.id,
         kind: "toggle",
         label: filter.label,
+        short: filter.short,
         valueLabel: filter.label,
         narrowing: isNarrowing(filter),
         checked: filter.value,
@@ -414,9 +474,11 @@ export function QueryBar({ width, search, filters = [], view, meta: given, asOf,
       valueLabel: current?.short ?? current?.label ?? String(filter.value),
       narrowing: isNarrowing(filter),
       inline: filter.inline === true,
+      scrolls: filter.scrolls,
       options: filter.options.map((option) => ({
         value: option.value,
         label: option.label,
+        group: option.group,
         description: option.description,
         disabled: option.disabled,
         selected: option.value === filter.value,
@@ -463,17 +525,36 @@ export function QueryBar({ width, search, filters = [], view, meta: given, asOf,
             if (value !== view.value) view.onChange(value);
             else if (view.chartRange) resetChartView();
           },
+          start: view.start,
+          label: view.label ?? (view.chartRange ? "Range" : undefined),
         } : undefined}
         onClearAll={narrowingCount >= 2 ? resetAll : undefined}
         meta={meta}
+        asOf={asOf}
         leading={leading}
         openRequest={openRequest}
       />
     );
   }
 
+  const viewStrip = view ? (
+    <Box flexShrink={view.options.length > TERMINAL_SEGMENT_LIMIT ? 1 : 0} minWidth={0}>
+      <TerminalChoiceStrip
+        options={view.options.map((option) => ({ value: option.value, label: option.label, hint: option.hint, disabled: option.disabled }))}
+        value={view.value}
+        onChange={(value) => choose(view, value)}
+        focused={view.focused}
+        shortcutScope={view.shortcutScope}
+      />
+    </Box>
+  ) : null;
+  const viewAtEnd = !!view && !view.start;
+  // Short of room, inline filters give up their segments for a menu, so the as-of and the controls after them stay.
+  // Only a bar with an as-of: elsewhere the row keeps its segments, as it always has.
+  const collapseInline = !!asOf && filters.some(collapsibleInline) && terminalRowCells(width, { search, filters, view, asOf }) > width;
   return (
     <Box height={1} width={width} flexDirection="row" gap={2} paddingX={1} overflow="hidden" flexShrink={0}>
+      {view?.start ? viewStrip : null}
       {leading ? <Box flexShrink={0} height={1}>{leading}</Box> : null}
       {searchNode}
       {filters.map((filter) => {
@@ -502,7 +583,7 @@ export function QueryBar({ width, search, filters = [], view, meta: given, asOf,
             />
           );
         }
-        if (filter.inline) {
+        if (filter.inline && !(collapseInline && collapsibleInline(filter))) {
           return (
             <Box key={filter.id} flexDirection="row" gap={1} flexShrink={filter.options.length > TERMINAL_SEGMENT_LIMIT ? 1 : 0} minWidth={0}>
               <Box flexShrink={0}><Text fg={colors.textMuted}>{filter.label}</Text></Box>
@@ -530,24 +611,15 @@ export function QueryBar({ width, search, filters = [], view, meta: given, asOf,
       {narrowingCount >= 2 && (
         <Box onMouseDown={resetAll} cursor="pointer"><Text fg={colors.textDim}>clear</Text></Box>
       )}
-      {(view || meta) && <Box flexGrow={1} />}
-      {/* Context gives way before the controls when the row runs short. */}
+      {(viewAtEnd || meta || asOf) && <Box flexGrow={1} />}
+      {/* The as-of keeps its width; the context after it gives way before the controls when the row runs short. */}
+      {asOf ? <Box flexShrink={0}><Text fg={colors.textMuted} wrapMode="none">{asOf}</Text></Box> : null}
       {meta && (
         <Box flexShrink={1} minWidth={0} height={1} overflow="hidden">
           <Text fg={colors.textMuted} wrapMode="none" truncate flexShrink={1} minWidth={0}>{meta}</Text>
         </Box>
       )}
-      {view && (
-        <Box flexShrink={view.options.length > TERMINAL_SEGMENT_LIMIT ? 1 : 0} minWidth={0}>
-          <TerminalChoiceStrip
-            options={view.options.map((option) => ({ value: option.value, label: option.label, hint: option.hint, disabled: option.disabled }))}
-            value={view.value}
-            onChange={(value) => choose(view, value)}
-            focused={view.focused}
-            shortcutScope={view.shortcutScope}
-          />
-        </Box>
-      )}
+      {viewAtEnd ? viewStrip : null}
     </Box>
   );
 }

@@ -231,7 +231,7 @@ export function GridFieldView({
       input?.focus?.();
       if (!text) input?.setCursorOffset?.(0);
     } catch {
-      // Renderer teardown can race queued focus attempts.
+      // Intentional ignore: a focus queued before renderer teardown has no input left to focus.
     }
   }, [text]);
   const toneColor = field.tone === "positive"
@@ -401,7 +401,6 @@ export function GridFieldView({
       variant="plain"
       backgroundColor={nativePaneChrome ? "transparent" : colors.selected}
       textColor={fg}
-      placeholderColor={colors.textMuted}
       onMouseDown={onFocus}
       onChange={(next) => {
         setDraft(next);
@@ -421,7 +420,6 @@ export function GridFieldView({
       variant="plain"
       backgroundColor={nativePaneChrome ? "transparent" : colors.selected}
       textColor={fg}
-      placeholderColor={colors.textMuted}
       onMouseDown={onFocus}
       onChange={(nextText) => {
         dirtyRef.current = true;

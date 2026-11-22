@@ -10,7 +10,7 @@ import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import { Box } from "../../../ui";
 import { companyKpisCache } from "./client";
 import { CompanyGuidancePane, CompanyKpisPane } from "./pane";
-import { guidancePayload, kpisPayload } from "./test-fixture";
+import { guide, guidancePayload, kpisPayload } from "./test-fixture";
 
 const tui = createOpenTuiTestHarness();
 afterEach(() => { setCloudApiFetchTransport(null); companyKpisCache.reset(); });
@@ -49,6 +49,26 @@ test("preview keeps real values and evidence navigable at narrow size while lock
   expect(await tui.waitForFrameToContain("METRIC")).toContain("125.00M");
 });
 
+test.each([46, 52, 60])("a %s-column guide keeps its value and wraps its access and older-issue notices", async (width) => {
+  setCloudApiFetchTransport(async () => Response.json(guidancePayload({ access: "preview", lockedRows: 8, truncated: true,
+    guidance: [guide({ issuedDate: "2026-05-20" }), guide({ id: "newer", issuedDate: "2026-08-19", seriesKey: "other" })] })));
+  await mount({ guidance: true, width, height: 30 });
+  const frame = await tui.waitForFrameToContain("110.00M");
+  expect(frame).toContain("120.00M");
+  expect(frame).toContain("2026-05-20");
+  expect(frame.replace(/\s+/g, " ")).toContain("Gloom Pro");
+});
+
+test.each([46, 52, 60])("a %s-column EPS range keeps its accounting basis beside the number", async (width) => {
+  const base = guide();
+  const eps = guide({ metricId: "eps", metric: { ...base.metric, id: "eps", name: "Earnings per share" },
+    low: 7.5, high: 8.5, unit: "currency_per_share", currency: "USD", basis: "adjusted", seriesKey: "eps:adjusted:USD" });
+  setCloudApiFetchTransport(async () => Response.json(guidancePayload({ guidance: [eps] })));
+  await mount({ guidance: true, width });
+  const frame = await tui.waitForFrameToContain("EPS · Adjusted");
+  expect(frame).toContain("7.50 – 8.50 USD/sh");
+});
+
 test("guidance history exposes matched actuals and evidence without substituting a range midpoint", async () => {
   setCloudApiFetchTransport(async () => Response.json(guidancePayload()));
   await mount({ guidance: true, tab: "history", width: 150 });
@@ -65,4 +85,20 @@ test("chart with too little comparable history reports collection state and keep
   setCloudApiFetchTransport(async () => Response.json(kpisPayload()));
   await mount({ tab: "chart" });
   expect(await tui.waitForFrameToContain("Two comparable disclosures")).toContain("125.00M");
+});
+
+test("a company with no guidance says so plainly and names one that has some, in the shared empty state", async () => {
+  setCloudApiFetchTransport(async () => Response.json(guidancePayload({ guidance: [], history: [], totalRows: 0 })));
+  await mount({ guidance: true });
+  const frame = await tui.waitForFrameToContain("Guidance for EXAMPLE:LSE is not yet available.");
+  expect(frame).toContain("Try GUIDE WMT.");
+  expect(frame).not.toContain("No disclosed observations");
+});
+
+test("the tracker keeps Issued in view at 90 cells and says what the guide did in plain words", async () => {
+  setCloudApiFetchTransport(async () => Response.json(guidancePayload()));
+  await mount({ guidance: true, width: 90 });
+  const frame = await tui.waitForFrameToContain("Raised");
+  expect(frame).toContain("ISSUED");
+  expect(frame).toContain("2026-02-01");
 });

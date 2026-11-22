@@ -1,8 +1,8 @@
 import { describe, expect, setSystemTime, test } from "bun:test";
 import { createTestDataProvider } from "../test-support/data-provider";
-import type { PricePoint, Quote } from "../types/financials";
+import type { CorporateActionsData, PricePoint, Quote } from "../types/financials";
 import { chartQuoteOverrideKeyForSource } from "./live-quotes";
-import { resolvePriceComparison } from "./price-comparison";
+import { comparisonLegCurrencies, resolvePriceComparison } from "./price-comparison";
 import { resolveChartSpecData } from "./resolve";
 import { ChartResolveCache } from "./resolve-context";
 import { seedChartResolutionResult } from "./chart-seed";
@@ -58,6 +58,108 @@ describe("normalized market price comparison", () => {
       expect(seeded?.priceComparison?.start).toBe(result.priceComparison?.start);
     });
   }
+
+  test("a split inside a leg's window is named, with the returns said to be split-adjusted; one on its base day, after its end or a spinoff's adjustment is not", async () => {
+    const splits: Record<string, CorporateActionsData["splits"]> = {
+      OLDER: [
+        { date: "2022-05-02", fromFactor: 1, toFactor: 2 },
+        { date: "2023-06-01", ratio: 0.05, fromFactor: 20, toFactor: 1, description: "1:20" },
+        { date: "2024-01-02", ratio: 1.0526, fromFactor: 1, toFactor: 1.0526 },
+        { date: "2026-09-08", fromFactor: 1, toFactor: 3 },
+      ],
+      NEWER: [{ date: "2024-03-01", ratio: 4, fromFactor: 1, toFactor: 4, description: "4:1" }],
+    };
+    const base = sources();
+    const getCorporateActions = async (symbol: string): Promise<CorporateActionsData> => ({ symbol, dividends: [], splits: splits[symbol] ?? [], earnings: [] });
+    const withSplits = { ...base, dataProvider: new Proxy(base.dataProvider, { get: (target, property, receiver) => (
+      property === "getCorporateActions" ? getCorporateActions : Reflect.get(target, property, receiver)
+    ) }) };
+    const result = await resolveChartSpecData(spec("1d"), withSplits);
+    const notice = "Splits in range: OLDER 1-for-20 reverse on Thu 1 Jun 2023; NEWER 4-for-1 on Fri 1 Mar 2024; returns are split-adjusted.";
+    expect(result.splitNotice).toBe(notice);
+    expect(result.warnings).toContain(notice);
+    // A window that ends before the splits names none.
+    const before = { ...spec("1d"), viewport: { ...spec("1d").viewport, dateWindow: { start: "2021-01-01", end: "2022-05-09" } } };
+    expect((await resolveChartSpecData(before, withSplits)).splitNotice).toBeUndefined();
+  });
+
+  /** SOXS's closes fell 18.4x on Tue 26 May 2026, a day with no split, under a note that called them split-adjusted. */
+  test("a close over 5x the one before or under its fifth is named, a split's day or not, and the returns are not called split-adjusted", async () => {
+    const jumped = {
+      OLDER: rows([["2021-01-04", 100], ["2022-05-02", 1500], ["2022-05-09", 81], ["2026-09-07", 90]]),
+      NEWER: rows([["2022-05-02", 50], ["2023-06-01", 50], ["2023-06-02", 1000], ["2026-09-07", 1200]]),
+    };
+    const splits: Record<string, CorporateActionsData["splits"]> = {
+      NEWER: [{ date: "2023-06-02", ratio: 0.05, fromFactor: 20, toFactor: 1, description: "1:20" }],
+    };
+    const resolve = async (history: Record<string, PricePoint[]>) => {
+      const base = sources(history);
+      const getCorporateActions = async (symbol: string): Promise<CorporateActionsData> => ({ symbol, dividends: [], splits: splits[symbol] ?? [], earnings: [] });
+      return (await resolveChartSpecData(spec("1d"), { ...base, dataProvider: new Proxy(base.dataProvider, { get: (target, property, receiver) => (
+        property === "getCorporateActions" ? getCorporateActions : Reflect.get(target, property, receiver)
+      ) }) })).splitNotice;
+    };
+    expect(await resolve(jumped)).toBe("Splits in range: NEWER 1-for-20 reverse on Fri 2 Jun 2023. OLDER falls 18.5× on Mon 9 May 2022 with no split "
+      + "recorded that day; NEWER rises 20× on Fri 2 Jun 2023, the day of its 1-for-20 reverse split, unadjusted, so the returns across them are unreliable.");
+    // NEWER's closes adjusted for its split: OLDER's jump alone is named, though OLDER has no split at all.
+    expect(await resolve({ ...jumped, NEWER: histories.NEWER })).toBe("Splits in range: NEWER 1-for-20 reverse on Fri 2 Jun 2023. "
+      + "OLDER falls 18.5× on Mon 9 May 2022 with no split recorded that day, so the returns across it are unreliable.");
+  });
+
+  test("total return reinvests each leg's cash at its ex-date close, names its basis, and leaves a leg without a history on price", async () => {
+    const chart = { ...spec(), viewport: { ...spec().viewport, totalReturn: true } };
+    const data = {
+      OLDER: rows([["2022-05-02", 100], ["2022-05-09", 100], ["2022-05-16", 95], ["2022-05-23", 95]]),
+      NEWER: rows([["2022-05-02", 50], ["2022-05-09", 50], ["2022-05-16", 50], ["2022-05-23", 55]]),
+    };
+    const actions = (symbol: string): CorporateActionsData => ({
+      symbol, currency: "USD", coverage: { dividends: "available" }, splits: [], earnings: [],
+      dividends: symbol === "OLDER" ? [{ exDate: "2022-05-16", amount: 5 }] : [],
+    });
+    const withActions = (getCorporateActions: (symbol: string) => Promise<CorporateActionsData>) => {
+      const base = sources(data);
+      // The price currency is the listing's, from its quote metadata.
+      const getQuoteMetadata = async (symbol: string) => ({ symbol, currency: "USD", instrumentType: "EQUITY", listingExchangeName: "NASDAQ", source: {} });
+      return { ...base, dataProvider: new Proxy(base.dataProvider, { get: (target, property, receiver) => (
+        property === "getCorporateActions" ? getCorporateActions
+          : property === "getQuoteMetadata" ? getQuoteMetadata : Reflect.get(target, property, receiver)
+      ) }) };
+    };
+
+    const result = await resolveChartSpecData(chart, withActions(async (symbol) => actions(symbol)));
+    // OLDER paid 5 on a 95 close: 95 + 5 over 100 is flat, so it holds at 0%; NEWER paid nothing and is its price.
+    expect(result.series.map((entry) => entry.points.at(-1)?.value)).toEqual([0, 10]);
+    expect(result.series.map((entry) => [entry.returnBasis, entry.label])).toEqual([
+      ["total", "OLDER:NASDAQ Total return"], ["total", "NEWER:NASDAQ Total return"]]);
+    expect(result.priceComparison?.notice).toStartWith("Total returns in each listing's currency; cash distributions reinvested at the ex-date close");
+    expect(result.warnings.join(" ")).not.toContain("distribution history unavailable");
+
+    // One listing whose history cannot be read stays a price return, says so, and the other still reinvests.
+    const partial = await resolveChartSpecData(chart, withActions(async (symbol) => {
+      if (symbol === "NEWER") throw new Error("no history");
+      return actions(symbol);
+    }));
+    expect(partial.series.map((entry) => entry.returnBasis)).toEqual(["total", "price"]);
+    expect(partial.series.map((entry) => entry.points.at(-1)?.value)).toEqual([0, 10]);
+    expect(partial.priceComparison?.notice).toContain("Price return for NEWER: distribution history unavailable.");
+    expect(partial.warnings).toContain("NEWER:NASDAQ: distribution history unavailable; showing the price return.");
+
+    // On the raw price axis it is no comparison, and the levels still say they include reinvested cash.
+    const rawAxis = { ...chart, series: chart.series.map((entry) => ({ ...entry, transform: "raw" as const })) };
+    const levels = await resolveChartSpecData(rawAxis, withActions(async (symbol) => actions(symbol)));
+    expect(levels.priceComparison).toBeUndefined();
+    expect(levels.returnBasisNotice).toStartWith("Total return levels in each listing's currency: prices include cash distributions reinvested at the ex-date close");
+    expect(levels.warnings).toContain(levels.returnBasisNotice!);
+    expect(levels.series[0]!.points.at(-1)!.value).toBeCloseTo(100, 6);
+
+    // The default comparison stays a price return: each listing's actions are read once, for its splits, and no cash is reinvested.
+    let asked = 0;
+    const price = await resolveChartSpecData(spec(), withActions(async (symbol) => { asked += 1; return actions(symbol); }));
+    expect(asked).toBe(2);
+    expect(price.series.every((entry) => entry.returnBasis === undefined)).toBe(true);
+    expect(price.priceComparison?.notice).toStartWith("Price returns in each listing's currency");
+    expect(price.returnBasisNotice).toBeUndefined();
+  });
 
   test("a panned comparison keeps loaded bars past both edges of the view to pan into, and only shared dates inside it", async () => {
     const days = (from: string, count: number, skip: string[] = []) => Array.from({ length: count }, (_, index) => (
@@ -169,10 +271,11 @@ describe("normalized market price comparison", () => {
     const network = await resolveChartSpecData(chart, sources(data));
     const seeded = seedChartResolutionResult(chart, new Map(chart.series.map((entry) => [chartQuoteOverrideKeyForSource(entry.source), data[entry.id as keyof typeof data]])));
     for (const result of [network, seeded!]) {
-      expect(result.series.slice(0, 2).map((entry) => entry.points.map((point) => point.value))).toEqual([[0, 10], [0, 20]]);
-      expect(result.viewport?.start.toISOString()).toBe("2026-01-07T23:00:00.000Z");
+      // Measured from the close before the window, 7 Jan's on both venues (Sydney's opens on 6 Jan UTC).
+      expect(result.series.slice(0, 2).map((entry) => entry.points.map((point) => point.value))).toEqual([[0, 11.11111111111111, 22.22222222222222], [0, 66.66666666666666, 100]]);
+      expect(result.viewport?.start.toISOString()).toBe("2026-01-06T23:00:00.000Z");
       expect(result.viewport?.end.toISOString()).toBe("2026-01-09T23:59:59.999Z");
-      expect(result.series.find((entry) => entry.id === "sma")?.points.map((point) => [point.rawValue, point.value])).toEqual([[95, -5], [105, 5]]);
+      expect(result.series.find((entry) => entry.id === "sma")?.points.map((point) => [point.rawValue, point.value])).toEqual([[95, 5.555555555555555], [105, 16.666666666666664]]);
     }
     expect(chart.viewport.dateWindow).toEqual({ start: "2026-01-08", end: "2026-01-09" });
     const requestViewport = { start: date("2026-01-08"), end: date("2026-01-09T23:59:59.999Z") };
@@ -209,7 +312,7 @@ describe("normalized market price comparison", () => {
     expect(result.series.map((s) => s.points.at(-1)?.rawValue)).toEqual([180, 60]);
   });
 
-  test("a preset range measures each leg from its close on or before the same date a range before, and to its own newest close", async () => {
+  test("a daily preset ends every line and return on the latest shared date, including a forming bar only when all have it", async () => {
     const weekdays = (to: string) => {
       const out: [string, number][] = [];
       for (let time = Date.parse("2026-07-01"); time <= Date.parse(to); time += 86_400_000) {
@@ -217,19 +320,30 @@ describe("normalized market price comparison", () => {
       }
       return out;
     };
-    // NEWER's saved copy stops on Fri 16 Oct; OLDER trades on Tue 20 Oct, whose session is open.
-    const data = { OLDER: weekdays("2026-10-20"), NEWER: weekdays("2026-10-16") };
+    const data = { OLDER: weekdays("2026-10-20"), NEWER: weekdays("2026-10-19") };
     const chart: ChartSpec = { ...spec(), viewport: { range: "1M", resolution: "1d" } };
-    const result = await resolveChartSpecData(chart, { ...sources({ OLDER: rows(data.OLDER), NEWER: rows(data.NEWER) }), now: date("2026-10-20T18:00:00Z") });
-    // A month before Tue 20 Oct is Sun 20 Sep: both legs run from Fri 18 Sep's close, and NEWER does not cut OLDER short.
-    expect(result.priceComparison?.legs).toEqual({
-      OLDER: { baseDay: "2026-09-18", endDay: "2026-10-20", intraday: true },
-      NEWER: { baseDay: "2026-09-18", endDay: "2026-10-16", intraday: false },
-    });
-    expect(result.priceComparison?.notice).toContain("From Fri 18 Sep close to Tue 20 Oct, latest, intraday (NEWER Fri 16 Oct close);");
-    const close = (leg: [string, number][], day: string) => leg.find(([key]) => key === day)![1];
-    expect(result.series[0]!.points.at(-1)!.value!).toBeCloseTo((close(data.OLDER, "2026-10-20") / close(data.OLDER, "2026-09-18") - 1) * 100, 10);
-    expect(result.series[1]!.points.at(-1)!.value!).toBeCloseTo((close(data.NEWER, "2026-10-16") / close(data.NEWER, "2026-09-18") - 1) * 100, 10);
+    for (const state of ["missing", "forming", "mixed"] as const) {
+      const intraday = state === "forming";
+      const endDay = intraday ? "2026-10-20" : "2026-10-19";
+      const older = rows(data.OLDER);
+      if (state === "mixed") older.at(-1)!.partial = true;
+      const result = await resolveChartSpecData(chart, {
+        ...sources({ OLDER: older, NEWER: rows(state === "missing" ? data.NEWER : data.OLDER) }),
+        now: date(state === "mixed" ? "2026-10-20T21:00:00Z" : "2026-10-20T18:00:00Z"),
+      });
+      const expected = { baseDay: "2026-09-18", endDay, intraday };
+      expect(result.priceComparison?.legs).toEqual({ OLDER: expected, NEWER: expected });
+      expect(result.priceComparison?.notice).toContain(intraday
+        ? "From Fri 18 Sep close to Tue 20 Oct, latest, intraday;"
+        : "From Fri 18 Sep close to Mon 19 Oct close;");
+      const close = (day: string) => data.OLDER.find(([key]) => key === day)![1];
+      for (const collection of [result.series, result.legendSeries!]) {
+        for (const line of collection) {
+          expect(line.points.at(-1)?.date.toISOString()).toBe(`${endDay}T00:00:00.000Z`);
+          expect(line.points.at(-1)!.value!).toBeCloseTo((close(endDay) / close("2026-09-18") - 1) * 100, 10);
+        }
+      }
+    }
   });
 
   test("a leg that is not a ticker is left out, named as asked and pointed at its index, not by its id", async () => {
@@ -293,7 +407,9 @@ describe("normalized market price comparison", () => {
     selected.viewport.dateWindow!.start = "2022-05-09";
     const cache = new ChartResolveCache();
     const result = await resolveChartSpecData(selected, sources(), cache);
-    expect(result.series.map((s) => s.points.at(-1)?.value)).toEqual([100, 100 / 11]);
+    // Authored dates measure from the close the legs share before the first date, as RETURN does: 2 May's.
+    expect(result.series.map((s) => s.points.at(-1)?.value)).toEqual([125, 20]);
+    expect(result.priceComparison?.notice).toContain("From Mon 2 May 2022 close");
     const panned = await resolveChartSpecData(selected, sources(), cache, { requestViewport: { start: date("2026-09-07"), end: date("2026-09-10") } });
     expect(panned.priceComparison?.start).toBeNull();
     const raw = spec();
@@ -308,4 +424,135 @@ describe("normalized market price comparison", () => {
     const limited = spec(); limited.viewport.maxPoints = 2;
     expect(resolvePriceComparison(limited, rawResult.series, { start: null, end: null })).toBeNull();
   });
+
+  test("a window in monthly bars is measured from the close of the month it starts in, as --from 2019-12-31 asks", async () => {
+    // `fn CMP IAG:LSE LHA:XETRA --from 2019-12-31` comes back in monthly bars, dated by each month's 1st: the
+    // December bar's close is 31 Dec 2019's, and the comparison is measured from it, not from January's.
+    const monthly = (closes: number[]) => rows(closes.map((close, index) => [`20${19 + Math.floor((index + 11) / 12)}-${String((index + 11) % 12 + 1).padStart(2, "0")}-01`, close]));
+    const window = spec("1d");
+    window.viewport = { range: "ALL", resolution: "1mo", dateWindow: { start: "2019-12-31", end: "2020-03-31" } };
+    const result = await resolveChartSpecData(window, sources({ OLDER: monthly([100, 80, 50, 40]), NEWER: monthly([10, 9, 6, 5]) }));
+    expect(result.priceComparison?.notice).toContain("From Tue 31 Dec 2019 close");
+    expect(result.series.map((s) => s.points.at(-1)?.value)).toEqual([-60, -50]);
+  });
+});
+
+describe("a fund compared with a coin", () => {
+  const HOUR = 60 * 60_000;
+  // Every calendar day from Wed 30 Sep to Fri 23 Oct 2026; IBIT closes on weekdays at 20:00 UTC, BTC-USD every UTC day.
+  const days = Array.from({ length: 24 }, (_, index) => new Date(Date.UTC(2026, 8, 30 + index)).toISOString().slice(0, 10));
+  const weekdays = days.filter((day) => ![0, 6].includes(new Date(`${day}T00:00:00Z`).getUTCDay()));
+  const fund = rows(weekdays.map((day, index) => [day, 50 + index]));
+  // A coin's UTC-day close, and its price at 20:00 UTC (the US close, and its clock on a weekend): far apart, to tell.
+  const utcClose = (day: string) => 100_000 + days.indexOf(day) * 1_000;
+  const atUsClose = (day: string) => 90_000 + days.indexOf(day) * 100;
+  const coinDaily = rows(days.map((day) => [day, utcClose(day)]));
+  // Hourly coin bars by open time: the one opening 19:00 UTC closes at the US close; `forming` bars are still open.
+  const coinHourly = (forming: readonly string[] = []) => (from: string, to: string): PricePoint[] => {
+    const points: PricePoint[] = [];
+    for (let time = Date.parse(from); time < Date.parse(to); time += HOUR) {
+      const day = new Date(time).toISOString().slice(0, 10);
+      const close = new Date(time).getUTCHours() === 19 && days.includes(day) ? atUsClose(day) : 95_000;
+      points.push({ date: new Date(time), close, ...(forming.includes(new Date(time).toISOString()) ? { partial: true } : {}) });
+    }
+    return points;
+  };
+  function chart(window: { start: string; end: string }, resolution: "1d" | "1h" = "1d"): ChartSpec {
+    return {
+      version: CHART_SPEC_VERSION,
+      viewport: { range: "1M", resolution, dateWindow: window },
+      panels: [{ id: "main" }], studies: [],
+      series: [["IBIT", "NASDAQ"], ["BTC-USD", "CCC"]].map(([symbol, exchange]) => ({
+        id: symbol!, source: { kind: "security", instrument: { symbol: symbol!, exchange: exchange! }, fieldId: "market.close" },
+        style: "line", transform: "percent", axis: "left", panelId: "main", interpolation: "none",
+      })),
+    };
+  }
+  function coinSources(hourly: (from: string, to: string) => PricePoint[] = coinHourly(), intraday?: Record<string, PricePoint[]>) {
+    const daily: Record<string, PricePoint[]> = { IBIT: fund, "BTC-USD": coinDaily };
+    const history = async (symbol: string) => (intraday ?? daily)[symbol] ?? [];
+    return {
+      now: date("2026-10-30T22:00:00Z"),
+      dataProvider: createTestDataProvider({
+        getQuote: async (symbol) => ({ symbol, currency: "USD", price: 1, change: 0, changePercent: 0, lastUpdated: Date.parse("2026-10-30T22:00:00Z") }),
+        getTickerFinancials: async (symbol) => ({ annualStatements: [], quarterlyStatements: [], priceHistory: daily[symbol] ?? [] }),
+        getPriceHistory: history,
+        getPriceHistoryForResolution: history,
+        getDetailedPriceHistoryWithMetadata: async (symbol, _exchange, start, end) => ({
+          points: intraday?.[symbol] ?? (symbol === "BTC-USD" ? hourly(start.toISOString(), end.toISOString()) : []), resolution: "1h" as const,
+        }),
+      }),
+      loadFredSeries: async () => ({ data: { observations: [], info: null }, fetchedAt: 0, stale: false, source: "network" as const }),
+    };
+  }
+  const coinCloses = (result: Awaited<ReturnType<typeof resolveChartSpecData>>) => result.series[1]!.points.map((point) => point.rawValue);
+  const span = (from: string, to: string) => days.filter((day) => day >= from && day <= to);
+
+  test("the coin is measured at the fund's close on every day of the line, a weekend at that clock, and the notice says so", async () => {
+    const result = await resolveChartSpecData(chart({ start: "2026-10-19", end: "2026-10-23" }), coinSources());
+    expect(result.priceComparison?.notice).toContain("BTC-USD at the US close");
+    // From Fri 16 Oct to Fri 23 Oct at 20:00 UTC, the weekend between included: none of them a UTC-day close.
+    expect(coinCloses(result)).toEqual(span("2026-10-16", "2026-10-23").map(atUsClose));
+    expect(result.series[1]!.points.at(-1)?.value).toBeCloseTo((atUsClose("2026-10-23") / atUsClose("2026-10-16") - 1) * 100, 9);
+  });
+
+  test("a window past 16 days is re-timed on every day when the hourly bars cover them, and on none when one hour is missing", async () => {
+    const window = { start: "2026-10-01", end: "2026-10-23" };
+    const covered = await resolveChartSpecData(chart(window), coinSources());
+    expect(covered.priceComparison?.notice).toContain("From Wed 30 Sep close to Fri 23 Oct close; BTC-USD at the US close.");
+    expect(coinCloses(covered)).toEqual(span("2026-09-30", "2026-10-23").map(atUsClose));
+    // A bar still forming has no close yet: one day short, the line keeps its UTC closes throughout, and says so.
+    const short = await resolveChartSpecData(chart(window), coinSources(coinHourly(["2026-10-10T19:00:00.000Z"])));
+    expect(short.priceComparison?.notice).toContain("BTC-USD to 00:00 UTC, 4 h after the US close");
+    expect(coinCloses(short)).toEqual(span("2026-09-30", "2026-10-23").map(utcClose));
+  });
+
+  test("without hourly bars the coin keeps its UTC close, and the notice names both close times", async () => {
+    const result = await resolveChartSpecData(chart({ start: "2026-10-19", end: "2026-10-23" }), coinSources(() => []));
+    expect(result.priceComparison?.notice).toContain("BTC-USD to 00:00 UTC, 4 h after the US close");
+    expect(coinCloses(result)).toEqual(span("2026-10-16", "2026-10-23").map(utcClose));
+  });
+
+  test("an explicit --from is measured from the close before that date, as RETURN is", async () => {
+    const result = await resolveChartSpecData(chart({ start: "2026-10-19", end: "2026-10-23" }), coinSources(() => []));
+    expect(result.priceComparison?.notice).toContain("From Fri 16 Oct close");
+    expect(result.series[0]!.points[0]).toMatchObject({ value: 0, rawValue: 50 + weekdays.indexOf("2026-10-16") });
+  });
+
+  test("hourly legs stamped at different minutes are matched by the hour; legs that never share one name the bar that compares them", async () => {
+    // IBIT's hourly bars open on the half hour, BTC-USD's on the hour.
+    const fundHours = rows([["2026-10-29T13:30:00Z", 50], ["2026-10-29T14:30:00Z", 51], ["2026-10-29T15:30:00Z", 55]]);
+    const coinHours = rows([["2026-10-29T13:00:00Z", 100], ["2026-10-29T14:00:00Z", 104], ["2026-10-29T15:00:00Z", 110]]);
+    const window = { start: "2026-10-29", end: "2026-10-29" };
+    const matched = await resolveChartSpecData(chart(window, "1h"), coinSources(coinHourly(), { IBIT: fundHours, "BTC-USD": coinHours }));
+    expect(matched.series.map((entry) => entry.points.at(-1)?.value)).toEqual([10, 10]);
+    const apart = await resolveChartSpecData(chart(window, "1h"), coinSources(coinHourly(), {
+      IBIT: fundHours, "BTC-USD": rows([["2026-10-29T03:00:00Z", 100], ["2026-10-29T04:00:00Z", 104]]),
+    }));
+    expect(apart.priceComparison?.notice).toContain("IBIT and BTC-USD share no 1H bar times in this range; daily bars (1D) compare them.");
+  });
+});
+
+// `shot CMP "GUBRF.IS,BAGFS.IS,NTR,CF"` drew TRY and USD returns on one chart with nothing saying so.
+test("legs in more than one currency each name theirs, and a chart in one currency names it on the legs it converts", async () => {
+  const currencies: Record<string, string> = { OLDER: "TRY", NEWER: "USD" };
+  const withCurrencies = () => {
+    const base = sources();
+    const getQuoteMetadata = async (symbol: string) => ({ symbol, currency: currencies[symbol], instrumentType: "EQUITY", listingExchangeName: "NASDAQ", source: {} });
+    const getQuote = async (symbol: string) => ({ symbol, currency: currencies[symbol], instrumentType: "EQUITY", price: 999, change: 0, changePercent: 0,
+      lastUpdated: Date.parse("2026-09-10T18:00:00Z") });
+    return { ...base, dataProvider: new Proxy(base.dataProvider, { get: (target, property, receiver) => (
+      property === "getQuoteMetadata" ? getQuoteMetadata : property === "getQuote" ? getQuote : Reflect.get(target, property, receiver)
+    ) }) };
+  };
+  const mixed = await resolveChartSpecData(spec(), withCurrencies());
+  expect(comparisonLegCurrencies(mixed.legendSeries!, mixed.priceComparison?.seriesIds)).toEqual(new Map([["OLDER", "TRY"], ["NEWER", "USD"]]));
+  // One currency says nothing.
+  currencies.OLDER = "USD";
+  const same = await resolveChartSpecData(spec(), withCurrencies());
+  expect(comparisonLegCurrencies(same.legendSeries!, same.priceComparison?.seriesIds).size).toBe(0);
+  // Converted into USD, each leg reads in USD once one of them was converted.
+  const converted = [{ id: "OLDER", unit: "%", rawUnit: "USD", convertedFrom: "TRY" }, { id: "NEWER", unit: "%", rawUnit: "USD" }];
+  expect(comparisonLegCurrencies(converted, ["OLDER", "NEWER"], "USD")).toEqual(new Map([["OLDER", "USD"], ["NEWER", "USD"]]));
+  expect(comparisonLegCurrencies(converted.map(({ convertedFrom: _, ...leg }) => leg), ["OLDER", "NEWER"], "USD").size).toBe(0);
 });

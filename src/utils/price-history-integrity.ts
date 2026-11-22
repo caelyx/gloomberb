@@ -28,12 +28,8 @@ function above(left: number, right: number): boolean {
   return left - right > 8 * Number.EPSILON * Math.max(Math.abs(left), Math.abs(right));
 }
 
-/**
- * Each way a bar's prices contradict each other, as short codes such as
- * `high<open` or `low>close`; empty when they agree. Missing OHLC fields are
- * not contradictory: close-only histories remain usable.
- */
-export function pricePointIntegrityFlags(point: PricePoint): string[] {
+/** Each way a bar's prices contradict each other, its open's included (pricePointIntegrityFlags). */
+function contradictionFlags(point: PricePoint): string[] {
   const { open, high, low, close } = point;
   const flags: string[] = [];
   for (const [name, value] of [["open", open], ["close", close]] as const) {
@@ -44,6 +40,116 @@ export function pricePointIntegrityFlags(point: PricePoint): string[] {
   }
   if (isFiniteNumber(high) && isFiniteNumber(low) && above(low, high)) flags.push("low>high");
   return flags;
+}
+
+/** Whether a contradiction is the open's alone: above the high or under the low. */
+const isOpenContradiction = (code: string) => code === "high<open" || code === "low>open";
+
+/**
+ * Each way a bar's prices contradict each other, as short codes such as
+ * `high<open` or `low>close`, which blank the bar whole; empty when they
+ * agree. An open alone outside a range its high, low and close agree on
+ * does not blank the bar: only the open is withheld (pricePointOpenWithheld).
+ * Missing OHLC fields are not contradictory: close-only histories remain
+ * usable.
+ */
+export function pricePointIntegrityFlags(point: PricePoint): string[] {
+  const flags = contradictionFlags(point);
+  return flags.every(isOpenContradiction) ? [] : flags;
+}
+
+/** What a bar whose open alone contradicts its range is flagged with, in `history` and HP. */
+export const OPEN_WITHHELD_FLAG = "open withheld";
+
+/** A currency pair's bar whose close the server rebuilt from the next session's open: the source repeated its open as its close. */
+export const CLOSE_REBUILT_FLAG = "close rebuilt";
+/** A currency pair's bar whose source repeated its open as its close, which no next open in its week rebuilds. */
+export const CLOSE_COPIED_FLAG = "close copied";
+
+/**
+ * Whether a bar's close is its source's copy of its open, which no next open
+ * in its week rebuilds (a Friday's, or one the next open is outside the range
+ * of): no day's close. A return into or out of it is no day's move, so
+ * return-based functions leave the bar out.
+ */
+export function pricePointCloseCopied(point: Pick<PricePoint, "closeCopied">): boolean {
+  return point.closeCopied === true;
+}
+
+/**
+ * Whether a bar's open alone contradicts its range: above its high or under
+ * its low, while the high, low and close agree. MTN on the JSE, 30 Oct 2026:
+ * open 193.05 under a low of 194.86, high 204.65, close 198.41, the open of
+ * a session the source copied. Only the open is withheld; the high, low,
+ * close and volume stand, so closes, returns and ranges read the bar.
+ */
+export function pricePointOpenWithheld(point: PricePoint): boolean {
+  const flags = contradictionFlags(point);
+  return flags.length > 0 && flags.every(isOpenContradiction);
+}
+
+/**
+ * A wick too far from its bar's body to have traded: a low under half the lower
+ * of open and close, or a high over twice the higher, as `low<close/2` or
+ * `high>2*open` (IAG on LSE, 2021-11-29: a low of 0.0155 under a close of
+ * 1.316). Only that wick is withheld: the open and close stand, so closes,
+ * returns and drawdowns read the bar while lows, highs and ranges do not.
+ * Empty when the wicks are plausible, or when the bar's prices contradict
+ * each other, which blanks it whole (pricePointIntegrityFlags).
+ */
+export function pricePointWickFlags(point: PricePoint): string[] {
+  const { high, low, close } = point;
+  if (pricePointIntegrityFlags(point).length > 0) return [];
+  // A withheld open is no part of the body the wicks are held to.
+  const open = pricePointOpenWithheld(point) ? undefined : point.open;
+  const body = [["open", open], ["close", close]].filter((entry): entry is [string, number] => isFiniteNumber(entry[1]));
+  if (body.length === 0) return [];
+  // On a tie the close names the side, as the price the bar is read by.
+  const [bottomName, bottom] = body.reduce((least, entry) => entry[1] <= least[1] ? entry : least);
+  const [topName, top] = body.reduce((most, entry) => entry[1] >= most[1] ? entry : most);
+  const flags: string[] = [];
+  if (isFiniteNumber(low) && bottom > 0 && low < bottom / 2) flags.push(`low<${bottomName}/2`);
+  if (isFiniteNumber(high) && top > 0 && high > top * 2) flags.push(`high>2*${topName}`);
+  return flags;
+}
+
+/** Whether a flag code is a withheld wick (pricePointWickFlags), whose bar keeps its open and close. */
+export function isWickFlag(code: string): boolean {
+  return /^(low<(open|close)\/2|high>2\*(open|close))$/.test(code);
+}
+
+/** A bar's high and low with a wick too far from its body to have traded (pricePointWickFlags) left out. */
+export function pricePointWicks(point: PricePoint): { high: number | undefined; low: number | undefined } {
+  const flags = pricePointWickFlags(point);
+  return {
+    high: flags.some((flag) => flag.startsWith("high")) ? undefined : point.high,
+    low: flags.some((flag) => flag.startsWith("low")) ? undefined : point.low,
+  };
+}
+
+/**
+ * "2 bars came from the source at a tenth or a hundredth of their price; shown scaled back to the bars around them.",
+ * or undefined for none: the bars served in the wrong unit (`PricePoint.rescaled`), as `history` flags them rescaled.
+ */
+export function priceHistoryRescaleNotice(points: readonly Pick<PricePoint, "rescaled">[]): string | undefined {
+  const count = points.filter(({ rescaled }) => rescaled != null && Number.isFinite(rescaled) && rescaled > 0 && rescaled !== 1).length;
+  return count > 0
+    ? `${count === 1 ? "1 bar" : `${count} bars`} came from the source in the wrong unit; shown scaled back to the bars around ${count === 1 ? "it" : "them"}.`
+    : undefined;
+}
+
+/** "1 bar has an open outside its high and low; the open is withheld, the rest of the bar kept.", or undefined for none. */
+export function priceHistoryOpenNotice(count: number): string | undefined {
+  return count > 0
+    ? `${count === 1 ? "1 bar has an open" : `${count} bars have opens`} outside ${count === 1 ? "its" : "their"} high and low; ${count === 1 ? "the open is" : "those opens are"} withheld, the rest of ${count === 1 ? "the bar" : "each bar"} kept.`
+    : undefined;
+}
+
+/** "1 bar has a low or high too far from its open and close to have traded; left out of ranges.", or undefined for none. */
+export function priceHistoryWickNotice(count: number): string | undefined {
+  return count > 0
+    ? `${count === 1 ? "1 bar has a low or high" : `${count} bars have lows or highs`} too far from ${count === 1 ? "its" : "their"} open and close to have traded; left out of ranges.`
+    : undefined;
 }
 
 export function pricePointIntegrity(point: PricePoint): PriceHistoryIntegrity | undefined {
@@ -58,16 +164,27 @@ export function pricePointIntegrity(point: PricePoint): PriceHistoryIntegrity | 
 /** Calculation/display fields deliberately exclude the contradictory source row. */
 export function pricePointValues(point: PricePoint, integrity = pricePointIntegrity(point)) {
   const value = (number: number | undefined) => !integrity && isFiniteNumber(number) ? number : null;
+  // A wick too far from the body to have traded is left out; the rest of the bar stands.
+  const wicks = pricePointWicks(point);
   return {
-    open: value(point.open), high: value(point.high), low: value(point.low),
+    // An open alone outside the bar's range is withheld; the rest of the bar stands (pricePointOpenWithheld).
+    open: pricePointOpenWithheld(point) ? null : value(point.open), high: value(wicks.high), low: value(wicks.low),
     close: value(point.close), volume: value(point.volume),
     ...(integrity ? { integrity } : {}),
   };
 }
 
+/** What every price view says of the bars it shows whose prices contradict each other. */
+export const CONTRADICTORY_PRICES = "contradictory prices";
+
+/**
+ * "2 bars have contradictory prices; left blank.", or undefined for none: the bars a view shows blank because their
+ * high, low, open and close contradict each other. Only views that show those bars say it; a figure read across them
+ * names itself instead (priceReturnIntegrityNotice).
+ */
 export function priceHistoryIntegrityNotice(count: number): string | undefined {
   return count > 0
-    ? `${count} inconsistent OHLC ${count === 1 ? "bar is" : "bars are"} unavailable. Affected calculations contain gaps; original values and reasons are retained in JSON exports.`
+    ? `${count === 1 ? "1 bar has" : `${count} bars have`} ${CONTRADICTORY_PRICES}; left blank.`
     : undefined;
 }
 

@@ -1,10 +1,12 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { HeadlessBundleResult, HeadlessPaneContext, HeadlessPaneDefinition, HeadlessPaneLoadArgs } from "../../../types/plugin";
 import { createVolatilityDependencies, loadVolatilityData, type VolatilityLoadResult } from "./client";
 import { termStateLabel, type VolatilityData } from "./model";
 import { newestReportTime, oldestReportTime } from "../../../utils/utc-time";
+import { servedFromSavedCopy } from "../../../data/saved-copies";
 
-function formattedValue(value: unknown): string { return typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : "--"; }
-function formattedPercentile(value: unknown): string { return typeof value === "number" && Number.isFinite(value) ? value.toFixed(0) : "--"; }
+function formattedValue(value: unknown): string { return typeof value === "number" && Number.isFinite(value) ? value.toFixed(2) : MISSING_VALUE; }
+function formattedPercentile(value: unknown): string { return typeof value === "number" && Number.isFinite(value) ? value.toFixed(0) : MISSING_VALUE; }
 /** The full ratio history stays in the JSON metadata. */
 const RECENT_RATIO_SESSIONS = 20;
 function projectVolatilityHeadless(data: VolatilityData): HeadlessBundleResult {
@@ -15,7 +17,7 @@ function projectVolatilityHeadless(data: VolatilityData): HeadlessBundleResult {
   return { sections: [
     { title: "Cash VIX tenor curve", entries: [
       { label: "As of", value: data.curve.date },
-      { label: "State", value: state, formatted: state ?? "--" }, { label: "3M / 30D", value: data.curve.ratio, formatted: formattedValue(data.curve.ratio) },
+      { label: "State", value: state, formatted: state ?? MISSING_VALUE }, { label: "3M / 30D", value: data.curve.ratio, formatted: formattedValue(data.curve.ratio) },
       { label: "3M / 30D 1Y percentile", value: data.curve.ratioPercentile1y, formatted: formattedPercentile(data.curve.ratioPercentile1y) }, { label: "3M / 30D 1Y sample", value: data.curve.ratioSampleSize },
       { label: "3M spread (points)", value: data.curve.slope, formatted: formattedValue(data.curve.slope) },
     ] },
@@ -25,7 +27,7 @@ function projectVolatilityHeadless(data: VolatilityData): HeadlessBundleResult {
       { key: "sourceId", header: "Series" },
     ], rows: data.curve.points.map((point) => ({ ...point, date: data.curve.date })) },
     { title: "3M / 30D history", entries: [
-      { label: "As of", value: data.term.termDate }, { label: "Source", value: data.term.publisher, formatted: data.term.publisher ?? "--" },
+      { label: "As of", value: data.term.termDate }, { label: "Source", value: data.term.publisher, formatted: data.term.publisher ?? MISSING_VALUE },
       { label: "3M / 30D", value: data.term.ratio, formatted: formattedValue(data.term.ratio) },
       { label: "3M spread (points)", value: data.term.slope, formatted: formattedValue(data.term.slope) },
     ] },
@@ -55,22 +57,24 @@ export function createVolatilityHeadless(dependencies: VolatilityHeadlessDepende
     discovery: { screenshotReadiness: "live-dom", limitations: [
       "Daily histories may contain isolated index observations; sparse coverage has no daily change or annual percentile.",
       "Thin histories do not support daily changes or one-year percentiles.",
-      "The existing sources do not supply a VIX futures curve.",
     ] },
     async load(args, context) {
       const result = await dependencies.load(args, context);
       context.signal.throwIfAborted();
-      // Daily index closes, dated by the newest index on the board; a sparse index shows as the oldest.
+      // A saved copy answering a failed refresh ends the report with when it was saved.
+      const savedCopy = <T>(value: T) => result.savedAt != null ? servedFromSavedCopy(value, result.savedAt) : value;
+      // Daily index closes, dated by the newest index on the board (Hong Kong's closes a session ahead of New York's);
+      // a sparse index shows as the oldest. Each row carries its own date.
       const boardDates = result.data.board.filter((row) => row.value != null).map((row) => row.date);
-      const freshness = { source: "Cboe and FRED", status: "not-a-feed" as const, basis: "daily index closes", cadence: "daily" as const,
+      const freshness = { source: "Cboe, Hang Seng Indexes and FRED", status: "not-a-feed" as const, basis: "daily index closes", cadence: "daily" as const,
         asOf: newestReportTime([...boardDates, result.data.curve.date]), oldest: oldestReportTime(boardDates) };
       return { ...projectVolatilityHeadless(result.data), freshness, errors: result.errors,
         complete: result.phase === "ready" && !result.stale && result.data.warnings.length === 0,
         unavailableSymbols: result.data.board.filter((row) => row.value == null).map((row) => row.symbol),
-        metadata: { stale: result.stale, phase: result.phase, loaded: result.loaded, total: result.total,
+        metadata: savedCopy({ stale: result.stale, phase: result.phase, loaded: result.loaded, total: result.total,
           data: result.data, unit: "index points", observations: "daily history or isolated index observation",
           percentile: "Midrank within last calendar year; at least 200 observations spanning 300 days",
-          vixFuturesAvailable: false, methodology: "docs/research-data.md#vix-curve-and-cross-asset-volatility-board" },
+          vixFuturesAvailable: false, methodology: "docs/research-data.md#vix-curve-and-cross-asset-volatility-board" }),
       };
     },
   };

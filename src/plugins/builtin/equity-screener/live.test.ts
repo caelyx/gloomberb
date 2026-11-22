@@ -12,7 +12,7 @@ import { createTestDataProvider } from "../../../test-support/data-provider";
 import { sessionQuotes } from "../../../test-support/test-fixture-session-quotes";
 import { setCliColorEnabledOverride } from "../../../utils/cli-output";
 import { equityScreenerHeadless } from "./headless";
-import { overlayLiveScreenRows, screenExtendedSessions, sortLiveScreenRows } from "./live";
+import { liveScreenPlaces, overlayLiveScreenRows, placeLiveScreenRows, screenExtendedSessions, sortLiveScreenRows } from "./live";
 import { screenFixture } from "./test-fixture";
 
 afterEach(() => setCliColorEnabledOverride(null));
@@ -102,6 +102,26 @@ test("the pane's live row keeps Last, Chg% and MCAP at the regular session and p
   expect(paneRow(snapshotRow(), { ...quotes().regular, lastUpdated: Date.parse("2026-10-09T15:00:00Z") }).metrics.price.value).toBe(198.78);
 });
 
+test("a row's P/Es and P/B move with the price it shows, as valuation reprices them, and it takes the quote's name", () => {
+  // The snapshot's P/E 41.7 and forward 24.1 are over its 190.00 row price; the live 199.10 reprices them.
+  const snapshot = snapshotRow(190, 0.2);
+  snapshot.metrics.price.observedAt = "2026-10-09T16:45:00.000Z";
+  snapshot.name = "APPLE INC";
+  snapshot.metrics.trailingPE = metric(41.7, "x", "2026-10-09");
+  snapshot.metrics.forwardPE = metric(24.1, "x", "2026-10-09");
+  snapshot.metrics.priceToBook = metric(5.2, "x", "2026-10-09");
+  const row = paneRow(snapshot, { ...quotes().regular, name: "Apple Inc." });
+  expect(row.metrics.price.value).toBe(199.1);
+  expect(row.metrics.trailingPE.value).toBeCloseTo(41.7 * 199.1 / 190, 9);
+  expect(row.metrics.forwardPE.value).toBeCloseTo(24.1 * 199.1 / 190, 9);
+  expect(row.metrics.priceToBook.value).toBeCloseTo(5.2 * 199.1 / 190, 9);
+  expect(row.name).toBe("Apple Inc.");
+  // A P/E sort is redone on the repriced figures: 43.70 now ranks after 43, which the snapshot's 41.7 did not.
+  const cheap = { ...snapshotRow(), symbol: "CHEAP" };
+  cheap.metrics.trailingPE = metric(43, "x", "2026-10-09");
+  expect(sortLiveScreenRows([row, cheap], { field: "trailingPE", direction: "asc" }).map((entry) => entry.symbol)).toEqual(["CHEAP", "AAPL"]);
+});
+
 /** EQS's report over one row, its quote read through `marketData`. */
 async function report(snapshot: ScreenRow, quote: Quote) {
   const data: ScreenPayload = screenFixture();
@@ -169,4 +189,49 @@ test("a sort on a figure the quotes move is redone on the figures shown; other s
   expect(order({ field: "marketCap", direction: "desc" })).toEqual(["MANH", "GRAB", "DUOL", "NONE"]);
   expect(order({ field: "marketCap", direction: "asc" })).toEqual(["DUOL", "GRAB", "MANH", "NONE"]);
   expect(order({ field: "trailingPE", direction: "desc" })).toEqual(["GRAB", "NONE", "MANH", "DUOL"]);
+});
+
+test("a P/E at zero or below sorts after the positive ones, cheapest or dearest first, and a missing one after it", () => {
+  const row = (symbol: string, pe: number | null) => {
+    const base = snapshotRow();
+    return { ...base, symbol, metrics: { ...base.metrics, trailingPE: { ...metric(0, "x", "2026-10-09"), value: pe } } };
+  };
+  const shown = [row("LOSS", -12), row("NONE", null), row("DEAR", 40), row("ZERO", 0), row("CHEAP", 9)];
+  const order = (direction: "asc" | "desc") => sortLiveScreenRows(shown, { field: "trailingPE", direction }).map((item) => item.symbol);
+  expect(order("asc")).toEqual(["CHEAP", "DEAR", "LOSS", "ZERO", "NONE"]);
+  expect(order("desc")).toEqual(["DEAR", "CHEAP", "ZERO", "LOSS", "NONE"]);
+  // A move below zero is a move like any other where it is no multiple.
+  const moves = shown.map((entry) => ({ ...entry, metrics: { ...entry.metrics, changePercent: { ...entry.metrics.changePercent, value: entry.metrics.trailingPE.value } } }));
+  expect(sortLiveScreenRows(moves, { field: "changePercent", direction: "asc" }).map((item) => item.symbol)).toEqual(["LOSS", "ZERO", "CHEAP", "DEAR", "NONE"]);
+});
+
+test("a tick lays over the row it names only, and moves no row (or the array) when it changes nothing shown", () => {
+  const rows = ["AAPL", "MSFT", "NVDA"].map((symbol) => {
+    const row = { ...snapshotRow(198.5, 0.36), symbol };
+    row.metrics.price.observedAt = "2026-10-09T16:45:00.000Z";
+    return row;
+  });
+  const entry = (symbol: string, quote: Quote) => [buildQuoteKey({ symbol, exchange: "NASDAQ" }), ready({ ...quote, symbol })] as const;
+  const msft = entry("MSFT", quotes().regular), unloaded = entry("ZZZZ", quotes().regular);
+  const first = overlayLiveScreenRows(rows, new Map([msft]));
+  expect(first[1]!.metrics.price.value).toBe(199.1);
+  expect(first[0]).toBe(rows[0]!);
+  expect(first[2]).toBe(rows[2]!);
+  // The same quote again keeps the row's object, and a quote for a symbol that is not loaded hands back the array it was given.
+  expect(overlayLiveScreenRows(rows, new Map([msft, unloaded]))[1]).toBe(first[1]!);
+  expect(overlayLiveScreenRows(rows, new Map([unloaded]))).toBe(rows);
+  expect(overlayLiveScreenRows(rows, new Map())).toBe(rows);
+});
+
+test("rows are placed by the order sampled earlier, so a tick moves figures without reshuffling, and an unknown row follows", () => {
+  const row = (symbol: string, cap: number) => {
+    const base = snapshotRow();
+    return { ...base, symbol, metrics: { ...base.metrics, marketCap: { ...base.metrics.marketCap, value: cap } } };
+  };
+  const sampled = [row("A", 3), row("B", 9), row("C", 5)];
+  const places = liveScreenPlaces(sampled, { field: "marketCap", direction: "desc" });
+  expect([...places.keys()].map((id) => id.split(":")[1])).toEqual(["B", "C", "A"]);
+  // A's cap overtakes B's on a tick; the places stay those sampled until the pane samples again.
+  const ticked = [row("A", 30), row("B", 9), row("C", 5), row("NEW", 1)];
+  expect(placeLiveScreenRows(ticked, places).map((item) => item.symbol)).toEqual(["B", "C", "A", "NEW"]);
 });

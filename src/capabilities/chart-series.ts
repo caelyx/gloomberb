@@ -20,6 +20,26 @@ import type {
 } from "./types";
 
 export const CHART_SERIES_CAPABILITY_KIND = "chart-series";
+
+/** Words that ask for a government bond yield. */
+const BOND_YIELD_WORDS = /\b(?:yield|yields|bond|bonds|treasury|treasuries|gilt|gilts|bund|bunds|govt|sovereign|mbono|bono|cetes|prefixado|jgb)\b/i;
+
+/**
+ * What a chart says of a `CAP:` series nothing answers to, whether no source
+ * has its first word or its source has no series by the rest: that it is not
+ * covered, and where the nearest series are, never that a plugin or provider
+ * should be enabled (none would chart it). A government yield the curves do
+ * not carry (`CAP:bond-yield:za-10y`) points at the catalog of those they do
+ * and the world grid of 2- and 10-year yields.
+ */
+export function uncoveredCapabilityMessage(capabilityId: string, seriesId?: string): string {
+  const name = seriesId ? `${capabilityId}:${seriesId}` : capabilityId;
+  const words = name.replace(/[^A-Za-z0-9]+/g, " ");
+  const nearest = BOND_YIELD_WORDS.test(words)
+    ? "The government yields a chart can name are listed by gloom catalog \"10Y government bond\" (CAP:bond-yield:de-10y, UST:10Y); the 2- and 10-year yields of every market GC covers are on gloom fn GC --tab world."
+    : "Series a chart can name: SYMBOL, SYMBOL:field, FUT:code, UST:maturity, FRED:series and GEO:series; gloom catalog lists them.";
+  return `CAP:${name} is not covered: no chart series is called "${name}". ${nearest}`;
+}
 export const MAX_CHART_SERIES_CATALOG_ITEMS = 32;
 export const MAX_CHART_SERIES_POINTS = 20_000;
 
@@ -28,7 +48,7 @@ const SERIES_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~%:/-]{0,239}$/;
 const chartSeriesLog = debugLog.createLogger("chart-series");
 const ranges = new Set<string>(TIME_RANGES);
 const periods = new Set(["auto", "daily", "weekly", "monthly", "quarterly", "annual", "ttm"]);
-const styles = new Set(["line", "area", "step", "columns", "points", "candles", "ohlc", "hlc"]);
+const styles = new Set(["line", "area", "step", "columns", "points", "candles", "hollow", "heikin-ashi", "ohlc", "hlc"]);
 const transforms = new Set(["raw", "percent", "index100", "yoy", "qoq", "log"]);
 const shapes = new Set(["scalar", "ohlcv", "event", "band"]);
 const axes = new Set(["left", "right"]);
@@ -203,7 +223,7 @@ function resolvedOutput(value: unknown): ResolvedSeries {
   const input = object(value, "resolve output");
   onlyKeys(input, "resolve output", [
     "id", "label", "color", "unit", "unitGroup", "nativeFrequency", "timestampMode", "dataShape", "style", "transform",
-    "axis", "panelId", "interpolation", "timeBasis", "latestChangePercent", "points", "warning", "hidden", "attribution",
+    "axis", "panelId", "interpolation", "timeBasis", "latestChangePercent", "points", "warning", "savedAt", "hidden", "attribution",
     "priceOf",
   ]);
   if (!Array.isArray(input.points)) fail("resolve output points", "expected an array.");
@@ -215,8 +235,10 @@ function resolvedOutput(value: unknown): ResolvedSeries {
   const kind = timeBasis?.kind === undefined ? undefined : enumValue<"market">(timeBasis.kind, "time basis kind", new Set(["market"]));
   const warning = optionalString(input.warning, "resolve output warning", 500);
   const attribution = input.attribution === undefined ? undefined : object(input.attribution, "resolve output attribution");
-  if (attribution) onlyKeys(attribution, "resolve output attribution", ["source", "publisher"]);
+  if (attribution) onlyKeys(attribution, "resolve output attribution", ["source", "publisher", "publishedAt"]);
   const publisher = attribution ? optionalString(attribution.publisher, "resolve output publisher", 160) : undefined;
+  const publishedAt = attribution ? optionalString(attribution.publishedAt, "resolve output publication time", 64) : undefined;
+  if (publishedAt !== undefined && !Number.isFinite(Date.parse(publishedAt))) fail("resolve output publication time", "expected an ISO date.");
   return {
     id: boundedString(input.id, "resolve output ID", 160),
     label: boundedString(input.label, "resolve output label", 160),
@@ -247,9 +269,11 @@ function resolvedOutput(value: unknown): ResolvedSeries {
       : {}),
     points: input.points.map(point),
     ...(warning !== undefined ? { warning } : {}),
+    ...(input.savedAt !== undefined ? { savedAt: finiteNumber(input.savedAt, "resolve output saved copy time") as number } : {}),
     ...(attribution ? { attribution: {
       source: boundedString(attribution.source, "resolve output source", 160),
       ...(publisher !== undefined ? { publisher } : {}),
+      ...(publishedAt !== undefined ? { publishedAt } : {}),
     } } : {}),
     ...(input.hidden !== undefined
       ? typeof input.hidden === "boolean" ? { hidden: input.hidden } : fail("resolve output hidden", "expected a boolean.")
@@ -350,5 +374,11 @@ export function createChartSeriesResolver(invoker: CapabilityInvoker) {
     source.capabilityId,
     "resolve",
     { seriesId: source.seriesId, viewport } satisfies ChartSeriesResolveRequest,
-  );
+  ).catch((error: unknown) => {
+    // No source registered under the id: it is not covered. A source turned off still says to turn it on.
+    if (error instanceof Error && error.message === `Capability "${source.capabilityId}" is not available.`) {
+      throw new Error(uncoveredCapabilityMessage(source.capabilityId, source.seriesId));
+    }
+    throw error;
+  });
 }

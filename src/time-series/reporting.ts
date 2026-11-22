@@ -1,5 +1,6 @@
 import type { TickerFinancials } from "../types/financials";
 import { formatCompact, formatNumber } from "../utils/format";
+import { growthRate, rateValue } from "../utils/growth";
 import { getTimeSeriesField } from "./field-catalog";
 import { extractFundamentalSeries } from "./fundamentals";
 import type { ResolvedSeries, SecuritySeriesSource } from "./types";
@@ -79,9 +80,8 @@ export function graphRowsForFinancials(
       date,
       category: point.periodLabel ?? date,
       value: current,
-      growth: consecutivePeriod && typeof previous === "number" && previous !== 0
-        ? (current - previous) / Math.abs(previous)
-        : null,
+      // None off a zero or negative base, where growth is not meaningful.
+      growth: consecutivePeriod && typeof previous === "number" ? rateValue(growthRate(current, previous)) : null,
       barWidth: Math.max(1, Math.round((Math.abs(current) / maximum) * 24)),
     };
   });
@@ -112,7 +112,7 @@ export function summarizeResolvedSeries(series: ResolvedSeries) {
       startValue: null, endValue: null, return: null,
       unit: series.rawUnit ?? series.unit,
       pointCount: series.points.length,
-      unavailableReason: inconsistentOhlc ? "Inconsistent OHLC history in the selected observations."
+      unavailableReason: inconsistentOhlc ? "Contradictory prices in the selected bars."
         : "Invalid valuation price in the selected observations.",
     };
   }

@@ -2,7 +2,10 @@ import { useMemo, useState, type ComponentType, type ReactNode } from "react";
 import { Box, Text, TextAttributes, useUiHost, type HostMenuProps, type HostMenuItem } from "../../ui";
 import { useThemeColors } from "../../theme/theme-context";
 import { useShortcut } from "../../react/input";
-import { useRemoteUiNode } from "../../remote/semantic-tree";
+import { keepEscapeFromClosing } from "../../utils/double-escape-close";
+import { useRemoteUiNode, useRemoteUiScope } from "../../remote/semantic-tree";
+import { remoteMenuItemId } from "../../remote/semantic-helpers";
+import { readsAtBodyContrast } from "../../theme/tone-contrast";
 import { Popover } from "./popover";
 
 export type MenuItem = HostMenuItem;
@@ -17,12 +20,14 @@ export type MenuProps = HostMenuProps;
  */
 export function Menu(props: MenuProps) {
   const HostMenu = useUiHost().Menu as ComponentType<MenuProps> | undefined;
+  // A menu that lists a prompt's answers (a pane's Approve) carries the prompt's scope.
+  const scope = useRemoteUiScope();
   useRemoteUiNode({
     role: "menu",
     label: props.label ?? props.title ?? "Menu",
     actions: {
       select: (input) => {
-        const id = typeof input === "string" ? input : (input as { id?: string } | null)?.id;
+        const id = remoteMenuItemId(input);
         const item = props.items.find((entry) => entry.id === id && entry.kind !== "divider" && entry.kind !== "heading" && !entry.disabled);
         if (item) props.onSelect(item.id);
       },
@@ -30,6 +35,7 @@ export function Menu(props: MenuProps) {
     metadata: {
       selection: props.selection ?? "none",
       items: props.items.filter((item) => item.kind !== "divider").map((item) => ({ id: item.id, label: item.label, selected: item.selected, checked: item.checked })),
+      ...(scope ? { scope } : {}),
     },
   });
   if (HostMenu) return <HostMenu {...props} />;
@@ -59,7 +65,11 @@ function TerminalMenu({ items, onSelect, selection = "none", title, onClose }: M
     else if (key === "home" || key === "pageup") setHighlighted(enabled[0]?.id ?? null);
     else if (key === "end" || key === "pagedown") setHighlighted(enabled[enabled.length - 1]?.id ?? null);
     else if ((key === "return" || key === "enter" || key === "space") && highlighted) choose(highlighted);
-    else if (key === "escape") onClose?.();
+    else if (key === "escape") {
+      // Closing the menu is not half of closing the pane under it.
+      keepEscapeFromClosing(event);
+      onClose?.();
+    }
     else return;
     event.preventDefault();
     event.stopPropagation();
@@ -89,7 +99,8 @@ function TerminalMenu({ items, onSelect, selection = "none", title, onClose }: M
               {`${marker}${item.label}`}
             </Text>
             {item.hint && <Box flexGrow={1} />}
-            {item.hint && <Text fg={colors.textMuted}>{` ${item.hint}`}</Text>}
+            {/* On the selection a light or colour-blind theme draws the hint as the label; dark themes keep it muted. */}
+            {item.hint && <Text fg={active && readsAtBodyContrast(colors) ? colors.selectedText : colors.textMuted}>{` ${item.hint}`}</Text>}
           </Box>
         );
       })}

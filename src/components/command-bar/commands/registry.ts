@@ -24,6 +24,8 @@ export interface Command {
   shortcut?: string;
   category: string;
   execute?: CommandExecutor;
+  /** A code the bar runs that is no function (QUIT): no help card, docs entry or place in HELP's lists. */
+  listed?: false;
 }
 
 export const commands: Command[] = [
@@ -48,6 +50,15 @@ export const commands: Command[] = [
     hasArg: true,
     argPlaceholder: "function",
     category: "Navigation",
+  },
+  {
+    id: "quit",
+    prefix: "QUIT",
+    aliases: ["EXIT"],
+    label: "Quit",
+    description: "Quit Gloom",
+    category: "Navigation",
+    listed: false,
   },
   {
     id: "send-feedback",
@@ -189,6 +200,14 @@ export const commands: Command[] = [
     argPlaceholder: "move|resize",
     category: "Config",
   },
+  // Listed only in the desktop app's full windows.
+  {
+    id: "new-window",
+    prefix: "",
+    label: "New Window",
+    description: "Open another app window with its own layout tabs, for another screen",
+    category: "Config",
+  },
   // The keyboard's way to the title bar buttons the desktop draws for itself
   // on Windows; the command bar lists these only on that host.
   {
@@ -223,10 +242,24 @@ export const commands: Command[] = [
     category: "Config",
   },
   {
+    id: "header-market",
+    prefix: "",
+    label: "Header Market",
+    description: "Choose the market the header shows, from the benchmarks or any ticker",
+    category: "Config",
+  },
+  {
     id: "toggle-value-flashing",
     prefix: "VF",
     label: "Toggle Value Flashing",
     description: "Turn quote update flashing on or off",
+    category: "Config",
+  },
+  {
+    id: "toggle-since-last-visit",
+    prefix: "",
+    label: "Since Last Visit",
+    description: "Turn on or off the strip that shows what moved in your tickers since your last visit",
     category: "Config",
   },
   {
@@ -276,7 +309,7 @@ export const commands: Command[] = [
     id: "toggle-attention-counts",
     prefix: "",
     label: "Attention Counts",
-    description: "Opt in to sharing ticker research counts for Gloom Trending",
+    description: "Turn ticker research counts on or off (on by default)",
     category: "Config",
   },
 
@@ -306,6 +339,15 @@ export const commands: Command[] = [
     hasArg: true,
     argPlaceholder: "locale",
     argOptions: () => LANGUAGE_PREFERENCES.map((value) => ({ value, label: describeLanguagePreference(value) })),
+    category: "Config",
+  },
+
+  // Setup, from its first step on what the user has (components/onboarding/run-setup-again.ts)
+  {
+    id: "run-setup-again",
+    prefix: "",
+    label: "Run Setup Again",
+    description: "Rebuild Home and setup's desk tabs; your other layouts stay",
     category: "Config",
   },
 

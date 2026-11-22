@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { validateChartSpec } from "./spec";
-import { resolveStudies } from "./studies";
+import { resolveStudies } from "./studies/resolve";
+import { formulaContractNote, formulaRollNote } from "./studies/formula";
 import { applyResolvedSeriesTransform } from "./transforms";
 import { contractPriceUnit, perBarrelUnit, perTonneUnit } from "./price-units";
 import { CHART_SPEC_VERSION, type ChartStudySpec, type ResolvedSeries, type TimeSeriesPoint } from "./types";
@@ -37,7 +38,114 @@ describe("formula studies", () => {
     expect(crack.points.map(({ value }) => value)).toEqual([42 * 2.5 - 70, 42 * 2.6 - 70, 42 * 2.4 - 72].map((value) => expect.closeTo(value, 9)));
   });
 
-  test("the 3:2:1 crack divides the weighted sum by three barrels of crude", () => {
+  test("a crack priced in crude's month takes the products' next month between the rolls, and rolls once", () => {
+    /** A continuous future whose bars name their contract: `days` maps a January day to [contract, settle]. */
+    const contracts = (symbol: string, unit: string, days: Record<number, [string, number]>): ResolvedSeries => {
+      const base = future(symbol, unit, Object.fromEntries(Object.entries(days).map(([day, [, value]]) => [day, value])));
+      return { ...base, points: base.points.map((point, index) => ({ ...point, contract: Object.values(days)[index]![0] })) };
+    };
+    // Crude rolls to its Dec contract on the 2nd; gasoline's front month is still Nov until the 3rd.
+    const cl = contracts("CL=F", "USD / barrel", { 1: ["CLX26", 70], 2: ["CLZ26", 71], 3: ["CLZ26", 72] });
+    const rb = contracts("RB=F", "USD / gallon", { 1: ["RBX26", 2], 2: ["RBX26", 2.1], 3: ["RBZ26", 2.25] });
+    const rb2 = { ...contracts("RB2", "USD / gallon", { 1: ["RBZ26", 2.05], 2: ["RBZ26", 2.15], 3: ["RBF27", 2.3] }), id: "RB2" };
+    const terms = { weight1: 42, perBarrel1: 1, weight2: -1, divisor: 1 };
+    const [crack] = resolveStudies([rb, cl, rb2], [formula(["RB=F", "CL=F", "RB2"], { ...terms, rollsWith: 2, nextMonthOf3: 1 })]).series;
+    expect(crack!.points.map(({ value, legs, roll }) => ({ value, contracts: legs?.map((leg) => leg.contract), roll: !!roll }))).toEqual([
+      { value: expect.closeTo(42 * 2 - 70, 9), contracts: ["RBX26", "CLX26"], roll: false },
+      // Dec gasoline (RB2 on the 2nd) against Dec crude, not Nov against Dec.
+      { value: expect.closeTo(42 * 2.15 - 71, 9), contracts: ["RBZ26", "CLZ26"], roll: true },
+      { value: expect.closeTo(42 * 2.25 - 72, 9), contracts: ["RBZ26", "CLZ26"], roll: false },
+    ]);
+    expect(formulaRollNote(crack!)).toBe("legs in CL=F's delivery month, rolling with it: to RBZ26, CLZ26 on 2026-01-02 (marked roll)");
+    expect(formulaContractNote(crack!)).toBeNull();
+    // The same legs as served mix Nov gasoline with Dec crude on the 2nd, and say so.
+    const [free] = resolveStudies([rb, cl], [formula(["RB=F", "CL=F"], terms)]).series;
+    expect(free!.points[1]!.legs?.map((leg) => leg.contract)).toEqual(["RBX26", "CLZ26"]);
+    expect(formulaContractNote(free!)).toBe("legs in different months on 1 day, the latest 2026-01-02.");
+  });
+
+  test("a leg takes its next month only where that is the leader's month, across Brent's roll and crude's (BZ/HO, CL/RB/HO)", () => {
+    const contracts = (symbol: string, unit: string, days: Record<number, [string | null, number]>): ResolvedSeries => {
+      const base = future(symbol, unit, Object.fromEntries(Object.entries(days).map(([day, [, value]]) => [day, value])));
+      return { ...base, points: base.points.map((point, index) => {
+        const contract = Object.values(days)[index]![0];
+        return contract ? { ...point, contract } : point;
+      }) };
+    };
+    const months = (series: ResolvedSeries | undefined) => series!.points.map((point) => point.legs?.map((leg) => leg.contract));
+    // Heating oil less Brent, in Brent's month: Brent rolls to January on the 2nd, heating oil to December on the 3rd.
+    const bz = contracts("BZ=F", "USD / barrel", { 1: ["BZZ26", 75], 2: ["BZF27", 76], 3: ["BZF27", 77] });
+    const ho = contracts("HO=F", "USD / gallon", { 1: ["HOX26", 2.4], 2: ["HOX26", 2.5], 3: ["HOZ26", 2.6] });
+    const terms = { weight1: 42, perBarrel1: 1, weight2: -1, divisor: 1, rollsWith: 2, nextMonthOf3: 1 };
+    // HO2 holds December until the 3rd, the month Brent left on the 2nd: on the 2nd no heating oil leg is in Brent's January.
+    const ho2 = { ...contracts("HO2", "USD / gallon", { 1: ["HOZ26", 2.45], 2: ["HOZ26", 2.55], 3: ["HOF27", 2.65] }), id: "HO2" };
+    const [brent] = resolveStudies([ho, bz, ho2], [formula(["HO=F", "BZ=F", "HO2"], terms)]).series;
+    expect(months(brent)).toEqual([["HOZ26", "BZZ26"], ["HOX26", "BZF27"], ["HOF27", "BZF27"]]);
+    expect(brent!.points.map(({ value }) => value)).toEqual([42 * 2.45 - 75, 42 * 2.5 - 76, 42 * 2.65 - 77].map((value) => expect.closeTo(value, 9)));
+    expect(formulaContractNote(brent!)).toBe("legs in different months on 1 day, the latest 2026-01-02.");
+    // Heating oil's alias already on December beside Brent's January, while HO2 is December too: HO2 is no January, so the leg
+    // stays in its month and the day says so, where pricing it as the month after HO=F named December's price HOF27.
+    const early = contracts("HO=F", "USD / gallon", { 1: ["HOX26", 2.4], 2: ["HOZ26", 2.55], 3: ["HOZ26", 2.6] });
+    const [ahead] = resolveStudies([early, bz, ho2], [formula(["HO=F", "BZ=F", "HO2"], terms)]).series;
+    expect(months(ahead)[1]).toEqual(["HOZ26", "BZF27"]);
+    expect(ahead!.points[1]!.value).toBeCloseTo(42 * 2.55 - 76, 9);
+
+    // The 3-2-1 crack, in crude's month: crude rolls to December on the 2nd, the products on the 3rd. HO2's bars name no
+    // contract: its month is the month after heating oil's own.
+    const cl = contracts("CL=F", "USD / barrel", { 1: ["CLX26", 70], 2: ["CLZ26", 71], 3: ["CLZ26", 72] });
+    const rb = contracts("RB=F", "USD / gallon", { 1: ["RBX26", 2], 2: ["RBX26", 2.1], 3: ["RBZ26", 2.25] });
+    const rb2 = { ...contracts("RB2", "USD / gallon", { 1: ["RBZ26", 2.05], 2: ["RBZ26", 2.15], 3: ["RBF27", 2.3] }), id: "RB2" };
+    const unnamed = { ...contracts("HO2", "USD / gallon", { 1: [null, 2.45], 2: [null, 2.55], 3: [null, 2.65] }), id: "HO2" };
+    const [crack] = resolveStudies([rb, ho, cl, rb2, unnamed], [formula(["RB=F", "HO=F", "CL=F", "RB2", "HO2"],
+      { weight1: 84, perBarrel1: 1, weight2: 42, perBarrel2: 1, weight3: -3, divisor: 3, rollsWith: 3, nextMonthOf4: 1, nextMonthOf5: 2 })]).series;
+    expect(months(crack)).toEqual([["RBX26", "HOX26", "CLX26"], ["RBZ26", "HOZ26", "CLZ26"], ["RBZ26", "HOZ26", "CLZ26"]]);
+    expect(crack!.points[1]!.value).toBeCloseTo((84 * 2.15 + 42 * 2.55 - 3 * 71) / 3, 9);
+    expect(formulaRollNote(crack!)).toBe("legs in CL=F's delivery month, rolling with it: to RBZ26, HOZ26, CLZ26 on 2026-01-02 (marked roll)");
+    expect(formulaContractNote(crack!)).toBeNull();
+  });
+
+  test("only legs that follow the front month are counted in months, a live bar is its bar before's contract, and a week is matched by week", () => {
+    const contracts = (symbol: string, unit: string, days: Record<number, [string | null, number]>): ResolvedSeries => {
+      const base = future(symbol, unit, Object.fromEntries(Object.entries(days).map(([day, [, value]]) => [day, value])));
+      return { ...base, points: base.points.map((point, index) => {
+        const contract = Object.values(days)[index]![0];
+        return contract ? { ...point, contract } : point;
+      }) };
+    };
+    const pointWith = (day: number, legs: Array<string | null>): TimeSeriesPoint => {
+      const date = new Date(Date.UTC(2026, 0, day));
+      return { date, observedAt: date, value: 1, legs: legs.map((contract) => ({ contract, price: 1 })) };
+    };
+    // A calendar spread is in two months by design; a future less a fund has one month to be in.
+    expect(formulaContractNote({ formulaLegs: ["CLZ26", "CLF27"], points: [pointWith(1, ["CLZ26", "CLF27"])] })).toBeNull();
+    expect(formulaContractNote({ formulaLegs: ["CL=F", "USO"], points: [pointWith(1, ["CLZ26", null]), pointWith(2, ["CLF27", null])] })).toBeNull();
+    // A leg whose bars name no contract leaves the others' months to compare; only no named leg at all says so.
+    expect(formulaContractNote({ formulaLegs: ["RB=F", "CL=F", "HO=F"], points: [pointWith(1, ["RBZ26", "CLF27", null])] }))
+      .toBe("legs in different months on 1 day, the latest 2026-01-01.");
+    expect(formulaContractNote({ formulaLegs: ["RB=F", "CL=F"], points: [pointWith(1, [null, null])] })).toBe("these bars do not name the legs' contracts.");
+
+    // Today's quotes (the 4th) come after the last served bars, which name no contract: crude is still Jan, gasoline Dec,
+    // so the crack takes gasoline's next month there too.
+    const cl = contracts("CL=F", "USD / barrel", { 3: ["CLF27", 72], 4: [null, 73] });
+    const rb = contracts("RB=F", "USD / gallon", { 3: ["RBZ26", 2.2], 4: [null, 2.3] });
+    const rb2 = { ...contracts("RB2", "USD / gallon", { 3: ["RBF27", 2.25], 4: [null, 2.35] }), id: "RB2" };
+    const terms = { weight1: 42, perBarrel1: 1, weight2: -1, divisor: 1 };
+    const [crack] = resolveStudies([rb, cl, rb2], [formula(["RB=F", "CL=F", "RB2"], { ...terms, rollsWith: 2, nextMonthOf3: 1 })]).series;
+    expect(crack!.points.at(-1)).toMatchObject({ value: expect.closeTo(42 * 2.35 - 73, 9), legs: [{ contract: "RBF27" }, { contract: "CLF27" }] });
+    const [free] = resolveStudies([rb, cl], [formula(["RB=F", "CL=F"], terms)]).series;
+    expect(formulaContractNote(free!)).toBe("legs in different months on 2 days, the latest 2026-01-04.");
+
+    // Weekly: the continuous bars are dated Monday the 5th, the generic's Friday the 9th; the same week's.
+    const weekly = (series: ResolvedSeries, day: number): ResolvedSeries => ({ ...series, historyResolution: "1wk", nativeFrequency: "weekly",
+      points: [{ ...series.points[0]!, date: new Date(Date.UTC(2026, 0, day)), observedAt: new Date(Date.UTC(2026, 0, day)) }] });
+    const [week] = resolveStudies([weekly(rb, 5), weekly(cl, 5), weekly(rb2, 9)],
+      [formula(["RB=F", "CL=F", "RB2"], { ...terms, rollsWith: 2, nextMonthOf3: 1 })]).series;
+    expect(week!.points.at(-1)).toMatchObject({ value: expect.closeTo(42 * 2.25 - 72, 9), legs: [{ contract: "RBF27" }, { contract: "CLF27" }] });
+    const [freeWeek] = resolveStudies([weekly(rb, 5), weekly(cl, 5)], [formula(["RB=F", "CL=F"], terms)]).series;
+    expect(formulaContractNote(freeWeek!)).toBe("legs in different months on 1 bar, the latest 2026-01-05.");
+  });
+
+  test("the 3-2-1 crack divides the weighted sum by three barrels of crude", () => {
     const result = resolveStudies([RB, HO, CL], [formula(["RB=F", "HO=F", "CL=F"], {
       weight1: 84, perBarrel1: 1, weight2: 42, perBarrel2: 1, weight3: -3, divisor: 3,
     })]);
@@ -159,6 +267,48 @@ describe("formula studies", () => {
     const spread = resolveStudies([CL, brent], [{ ...formula(["CL=F", "BZ=F"], {}), id: "spread", kind: "spread" }]);
     expect(spread.errors).toEqual([]);
     expect(spread.series[0]).toMatchObject({ unit: "USD / barrel", statedUnit: "USD / barrel" });
+  });
+
+  test("100 times a percent is basis points: a cash spread less CDX is one formula in bp, and a spread says how to write it", () => {
+    const dataset = (expression: string, unit: string, unitGroup: string, days: Record<number, number>): ResolvedSeries => ({
+      ...future(expression, unit, days), id: expression, label: `${expression} title`, unitGroup, statedUnit: undefined,
+      priceAssetCategory: undefined, listing: undefined, expression, dataShape: "scalar", observationKind: "dataset",
+    });
+    const treasury = dataset("FRED:DGS5", "%", "percent", { 1: 4.1, 2: 4.2 });
+    const cdx = dataset("CAP:cdx:ig", "bp", "series:bp", { 1: 60, 2: 61 });
+    const basis = resolveStudies([treasury, cdx], [formula(["FRED:DGS5", "CAP:cdx:ig"], { weight1: 100, percentBp1: 1, weight2: -1, divisor: 1 })]);
+    expect(basis.errors).toEqual([]);
+    expect(basis.series[0]).toMatchObject({ label: "100×FRED:DGS5 - CAP:cdx:ig", unit: "bp", unitGroup: "series:bp" });
+    expect(basis.series[0]!.points.map(({ value }) => value)).toEqual([350, 359]);
+    // 0.01 times basis points is a percent.
+    expect(resolveStudies([treasury, cdx], [formula(["FRED:DGS5", "CAP:cdx:ig"], { weight1: 1, weight2: -0.01, percentBp2: -1, divisor: 1 })])
+      .series[0]).toMatchObject({ unit: "%", unitGroup: "percent" });
+    // Unconverted, either side names the conversion, by the series as it is written.
+    expect(resolveStudies([cdx, treasury], [{ ...formula(["CAP:cdx:ig", "FRED:DGS5"], {}), id: "spread", kind: "spread" }]).errors)
+      .toEqual(["Spread: CAP:cdx:ig is in bp and FRED:DGS5 is in %: write 100*FRED:DGS5 to compare in bp."]);
+    // A spread of two published series is named as written, not by their titles, which a short legend cuts alike.
+    const oas = dataset("FRED:BAMLC0A0CM", "bp", "series:bp", { 1: 93, 2: 94 });
+    expect(resolveStudies([oas, cdx], [{ ...formula(["FRED:BAMLC0A0CM", "CAP:cdx:ig"], {}), id: "spread", kind: "spread" }]).series[0])
+      .toMatchObject({ label: "FRED:BAMLC0A0CM - CAP:cdx:ig", unit: "bp" });
+    // A 100 times the whole formula lands on both legs: the bp leg cannot convert beside the % one, so it is refused,
+    // never 100 times its basis points charted as basis points ((FRED:DGS5 - CAP:cdx:ig)*100 read -5679 bp).
+    const whole = resolveStudies([treasury, cdx], [formula(["FRED:DGS5", "CAP:cdx:ig"], { weight1: 100, percentBp1: 1, weight2: -100, percentBp2: 1, divisor: 1 })]);
+    expect(whole.series).toEqual([]);
+    expect(whole.errors).toEqual(["Formula: FRED:DGS5 is in % and CAP:cdx:ig is in bp: write 100*FRED:DGS5 to compare in bp."]);
+    // Both legs in %: both convert.
+    const tens = dataset("FRED:DGS10", "%", "percent", { 1: 4.5, 2: 4.6 });
+    expect(resolveStudies([tens, treasury], [formula(["FRED:DGS10", "FRED:DGS5"], { weight1: 100, percentBp1: 1, weight2: -100, percentBp2: 1, divisor: 1 })])
+      .series[0]).toMatchObject({ unit: "bp", points: [expect.objectContaining({ value: 40 }), expect.objectContaining({ value: 40 })] });
+    // A percent over basis points cancels to a plain number: 4.1% over 60bp is 410bp over 60bp.
+    const ratio = resolveStudies([treasury, cdx], [{ ...formula(["FRED:DGS5", "CAP:cdx:ig"], {}), id: "ratio", kind: "ratio" }]).series[0]!;
+    expect(ratio).toMatchObject({ unit: "x", unitGroup: "ratio" });
+    expect(ratio.points.map(({ value }) => value)).toEqual([6.83333333333, 6.88524590164]);
+    const over = resolveStudies([treasury, cdx], [formula(["FRED:DGS5", "CAP:cdx:ig"], { weight1: 1, power2: -1, divisor: 1 })]).series[0]!;
+    expect(over).toMatchObject({ unit: "x", unitGroup: "ratio" });
+    expect(over.points.map(({ value }) => value)).toEqual([6.83333333333, 6.88524590164]);
+    // Another multiplier keeps the percent.
+    expect(resolveStudies([treasury, cdx], [formula(["FRED:DGS5", "CAP:cdx:ig"], { weight1: 10, weight2: -1, divisor: 1 })]).errors)
+      .toEqual(["Formula: FRED:DGS5 is in % and CAP:cdx:ig is in bp: write 100*FRED:DGS5 to compare in bp."]);
   });
 
   test("a mismatch names each leg's unit: another currency, cents, or a price with no quantity", () => {

@@ -96,6 +96,15 @@ function separatorsIn(text: string): string {
 }
 
 /**
+ * A word shaped as a ticker is (BRK.B, 7203.T, 0700): no small letter, and a
+ * dot or a digit. It is never part of a company's name typed in words
+ * (`valuation BRK.B Meta` is two symbols, not a name).
+ */
+export function tickerShapedWord(word: string): boolean {
+  return !/\p{Ll}/u.test(word) && /[.\d]/.test(word);
+}
+
+/**
  * A pasted list, or one cell of a file, without the separators and quote marks
  * stuck to its ends (`UPST;`, `"GME",`). The separators it dropped are named
  * (`Ignored the stray ";" after UPST.`) rather than swallowed, and never reach
@@ -127,10 +136,12 @@ export function symbolInputKey(symbol: string): string {
 
 /**
  * How a command's symbol list spots one security typed twice: `symbolInputKey`,
- * with a share class written with a dot or a dash as one (BRK.B and BRK-B).
+ * with a share class written with a dot, a dash or, as a broker writes it, a
+ * slash as one (BRK.B, BRK-B and BRK/B). One letter before a slash is no
+ * symbol's (N/A, P/E).
  */
-function securityInputKey(symbol: string): string {
-  return symbolInputKey(symbol).replace(/-/g, ".");
+export function securityInputKey(symbol: string): string {
+  return symbolInputKey(symbol).replace(/-/g, ".").replace(/^([A-Z]{2,5})\/([A-Z])$/, "$1.$2");
 }
 
 /** The securities of a symbol list, each once, in the first spelling typed: `AAPL aapl BRK.B BRK-B` is AAPL and BRK.B. */

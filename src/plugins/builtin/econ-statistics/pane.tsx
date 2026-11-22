@@ -9,21 +9,24 @@ import { useAsyncResource } from "../../../react/async-resource";
 import { usePaneSettingValue } from "../../../state/app/context";
 import { colors } from "../../../theme/colors";
 import type { PaneProps } from "../../../types/plugin";
-import { formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatNumber } from "../../../utils/format";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { usePaneStatusFooter } from "../../../components/layout/pane/status-footer";
+import { savedCopyFooterSegment } from "../../../components/layout/pane/footer";
 import { SeriesListDetail, useSeriesList } from "../shared/series-list-detail";
-import { getCachedStatsBundle, loadStatsBundle } from "./client";
+import { getCachedStatsBundle, loadStatsBundle, unansweredErrors } from "./client";
 import { categoryLabel, changeColor, type StatCategoryId } from "./defs";
 import { StatDetail } from "./detail";
 import { DEFAULT_STAT_ID } from "./stats";
 import { selectStatViews, type StatRangeId, type StatViewModel } from "./view";
+import { laggingSeriesNote } from "../../../cli/commands/fred-series";
+import { fredCitation } from "../../../sources/gloomberb-cloud/fred-publisher";
 
 const loadBundle = (force: boolean) => loadStatsBundle({ force });
 
-const LIST_WIDTH = 53;
+const LIST_WIDTH = 60;
 const NAME_MIN_WIDTH = 13;
-const PERIOD_WIDTH = 6;
+const PERIOD_WIDTH = 10;
 
 const RANGE_OPTIONS = [
   { value: "5Y" as const, label: "5Y" },
@@ -87,6 +90,11 @@ function buildColumns(width: number, stacked: boolean): Column[] {
   ];
 }
 
+/** A link to the pane names the statistic its chart shows, with its latest print. */
+function statShareItem(view: StatViewModel) {
+  return { title: view.stat.label, excerpt: [view.stat.formatValue(view.latest.value), view.period].filter(Boolean).join(" · ") };
+}
+
 /**
  * The previous print rather than the difference. For a statistic that is already a
  * change, like payrolls, a delta would be a second derivative and mean very little.
@@ -99,7 +107,7 @@ function cellsFor(view: StatViewModel): Record<ColumnId, DataTableCell> {
       color: changeColor(view.stat.direction, view.changeOnPrevious),
     },
     previous: {
-      text: view.previous ? view.stat.formatValue(view.previous.value) : "--",
+      text: view.previous ? view.stat.formatValue(view.previous.value) : MISSING_VALUE,
       color: colors.textMuted,
     },
     period: { text: view.period, color: colors.textMuted },
@@ -141,23 +149,30 @@ export function EconStatisticsPane({ focused, width, height }: PaneProps) {
     onSelect: setStatId,
     reload,
     range: { value: range, options: RANGE_OPTIONS, onChange: setRange, chartRange: true },
+    shareItem: statShareItem,
   });
   const { selected, searchFocused } = list;
   const rows = useMemo(() => withCategoryHeaders(list.visible), [list.visible]);
 
-  const error = resource.error ?? bundle?.errors[0] ?? null;
+  const error = resource.error ?? (bundle ? unansweredErrors(bundle)[0] : null) ?? null;
   const footerInfo = useMemo<PaneFooterSegment[]>(() => {
     if (!selected) return [];
     // A Treasury yield names when in the day it was taken, as GC does, so it is not read against ^TNX's earlier close.
     const cutoff = selected.stat.cutoff ? ` ${selected.stat.cutoff}` : "";
     const info: PaneFooterSegment[] = [
+      { id: "publisher", parts: [{ text: fredCitation(selected.stat.seriesId), tone: "muted" }] },
       { id: "as-of", parts: [{ text: `reading for ${cutoff ? selected.reading : selected.readingReleased}${cutoff}`, tone: "muted" }] },
     ];
-    // The cached first paint is being replaced; its age only counts once that load fails.
+    const lag = laggingSeriesNote(selected.stat.seriesId);
+    if (lag) info.push({ id: "publication-lag", parts: [{ text: lag, tone: "warning" }] });
+    // The cached first paint is being replaced; its age only counts once that load fails, and then it is the
+    // copy an earlier read saved, which says when that was.
     const seeding = resource.loading && resource.updatedAt === null && !selected.refreshError;
-    if (selected.observationStale || (selected.cacheStale && !seeding)) {
+    const savedAt = selected.cacheSource === "stale-fallback" ? selected.fetchedAt : null;
+    if (selected.observationStale || (selected.cacheStale && !seeding && savedAt == null)) {
       info.push({ id: "stale", parts: [{ text: "STALE", tone: "warning", bold: true }] });
     }
+    if (savedAt != null) info.push(savedCopyFooterSegment("saved-copy", savedAt));
     return info;
   }, [resource.loading, resource.updatedAt, selected]);
 

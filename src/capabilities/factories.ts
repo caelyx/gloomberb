@@ -1,5 +1,6 @@
 import type { AssetDataProvider } from "../types/data-provider";
 import { quoteMetadataFromQuote } from "../market-data/quotes/metadata";
+import { assetDataOperationContract } from "./asset-data-inputs";
 import type { NewsDataProvider } from "../types/capability-route-source";
 import {
   chartSeriesCatalogOutputSchema,
@@ -24,6 +25,11 @@ function stream(subscribe: CapabilityOperation["subscribe"]): CapabilityOperatio
   return { kind: "stream", rendererSafe: true, subscribe };
 }
 
+/** Each operation with the input it checks and the summary and input shape `gloom api get` lists (asset-data-inputs.ts). */
+function withAssetDataContracts(operations: Record<string, CapabilityOperation>): Record<string, CapabilityOperation> {
+  return Object.fromEntries(Object.entries(operations).map(([id, operation]) => [id, { ...operation, ...assetDataOperationContract(id) }]));
+}
+
 export function assetDataProvider(provider: AssetDataProvider): AssetDataCapability {
   return {
     id: `asset-data.${provider.id}`,
@@ -33,9 +39,10 @@ export function assetDataProvider(provider: AssetDataProvider): AssetDataCapabil
     priority: provider.priority,
     cachePolicy: provider.cachePolicy,
     provider,
-    operations: {
+    operations: withAssetDataContracts({
       canProvide: op((input: any) => provider.canProvide?.(input.ticker, input.exchange, input.context) ?? true, "query"),
       primaryMarketSourceName: op(() => provider.primaryMarketSourceName?.() ?? provider.name, "query"),
+      batchesReads: op((input: any) => provider.batchesReads?.(input.method) ?? false, "query"),
       getCachedFinancialsForTargets: op((input: any) => provider.getCachedFinancialsForTargets?.(input.targets ?? [], input.options) ?? new Map()),
       getQuotesBatch: op((input: any) => provider.getQuotesBatch?.(input.targets ?? [], input.options) ?? Promise.resolve([])),
       getTickerFinancialsBatch: op((input: any) => provider.getTickerFinancialsBatch?.(input.targets ?? [], input.options) ?? Promise.resolve([])),
@@ -100,7 +107,7 @@ export function assetDataProvider(provider: AssetDataProvider): AssetDataCapabil
         if (!provider.subscribeQuotes) throw new Error(`${provider.name} does not provide quote streaming.`);
         return provider.subscribeQuotes(input.targets ?? [], (target, quote) => emit({ target, quote }));
       }),
-    },
+    }),
   };
 }
 

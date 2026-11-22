@@ -1,14 +1,17 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
+import type { ManualChartResolution } from "../../../time-series/resolution";
 import { deriveHeadlessFreshness } from "../../../cli/pane-functions/freshness";
 import { headlessReportTables, renderHeadlessPaneText, serializeHeadlessPaneResult } from "../../../cli/pane-functions/headless";
 import { createDefaultConfig } from "../../../types/config";
 import type { HeadlessPaneContext } from "../../../types/headless";
-import type { TickerRecord } from "../../../types/ticker";
+import type { Portfolio, TickerRecord } from "../../../types/ticker";
 import { createTestDataProvider, createTestQuote } from "../../../test-support/data-provider";
 import { createTestTicker } from "../../../test-support/ticker";
 import { setCliColorEnabledOverride } from "../../../utils/cli-output";
 import { loadFuturesContractTermsCached } from "../../../market-data/futures-contract";
 import { collectionHoldingsHeadless } from "./headless";
+
+afterEach(() => { setSystemTime(); });
 
 const BROKER = { id: "broker:ibkr-main:U1234567", name: "U1234567", currency: "USD", brokerId: "ibkr", brokerInstanceId: "ibkr-main", brokerAccountId: "U1234567" };
 const MANUAL = { id: "main", name: "Main", currency: "USD" };
@@ -33,7 +36,9 @@ const tickers = [
 function context(
   held: readonly TickerRecord[] = tickers,
   quoted: Record<string, number> = prices,
-  manual: typeof MANUAL & { targetWeights?: Record<string, number> } = MANUAL,
+  manual: typeof MANUAL & Pick<Portfolio, "targetWeights" | "cash" | "otherCash"> = MANUAL,
+  /** USD per unit of each currency; 1 for any other. */
+  usdPer: Record<string, number> = {},
 ): HeadlessPaneContext {
   const config = {
     ...createDefaultConfig("/unused/pf-headless"),
@@ -48,6 +53,7 @@ function context(
         if (!quoted[symbol]) throw new Error(`No quote for ${symbol}`);
         return createTestQuote({ symbol, price: quoted[symbol], changePercent: 1.5 });
       },
+      getExchangeRate: async (code: string) => usdPer[code] ?? 1,
     }),
     resolvePortfolio: async (id: string) => {
       const portfolio = config.portfolios.find((entry) => entry.id === id);
@@ -76,6 +82,9 @@ test("a broker portfolio's positions come largest first with weights and totals 
   expect(result.rows[0]!.weight).toBeCloseTo((12_000 / 29_000) * 100, 8);
   expect(result.rows[2]!.weight).toBeCloseTo((-5_000 / 29_000) * 100, 8);
   expect(result.columns?.find((column) => column.key === "weight")?.description).toContain("Percent of gross exposure");
+  // Market value and P&L are in the book's currency beside a quote's own, and their headers say which.
+  expect(result.columns?.filter((column) => ["marketValue", "unrealizedPnl", "price"].includes(column.key)).map((column) => column.header))
+    .toEqual(["Last", "Mkt Val (USD)", "P&L (USD)"]);
   expect(result.metadata).toMatchObject({
     collection: { kind: "portfolio", id: BROKER.id, broker: true },
     currency: "USD",
@@ -109,11 +118,16 @@ test("every column PF declares is a field of its position rows, the listing incl
 
 test("a watchlist reads by name, and an unknown id lists the ones that exist", async () => {
   const watchlist = await collectionHoldingsHeadless.load(args("tech"), context());
-  expect(watchlist.rows).toEqual([{ symbol: "SPY", name: "SPDR S&P 500", exchange: "NASDAQ", price: 500, priceCurrency: "USD", changePercent: 1.5, extendedSession: null, extendedPrice: null, extendedChange: null, extendedChangePercent: null, stale: false, updatedAt: expect.any(Number) }]);
+  expect(watchlist.rows).toEqual([{ symbol: "SPY", name: "SPDR S&P 500", exchange: "NASDAQ", price: 500, priceCurrency: "USD", changePercent: 1.5, changeBasis: "regular-session", extendedChangeBasis: null, extendedSession: null, extendedPrice: null, extendedChange: null, extendedChangePercent: null, stale: false, updatedAt: expect.any(Number) }]);
   expect(watchlist.metadata).toMatchObject({ collection: { kind: "watchlist", id: "tech" }, tickers: 1 });
 
   await expect(collectionHoldingsHeadless.load(args("default"), context()))
     .rejects.toThrow(`Unknown portfolio or watchlist "default". Portfolios and watchlists: Main (main), U1234567 (${BROKER.id}), Tech (tech).`);
+  // `fn PF` alone read an empty first portfolio as "No data."; it says which it read and how to name another.
+  const bare = await collectionHoldingsHeadless.load(args(""), context());
+  expect(bare.rows).toEqual([]);
+  expect(bare.empty).toBe(`The first portfolio, Main, holds nothing. Name one: gloom fn PF <portfolio or watchlist>, such as U1234567 (${BROKER.id}), Tech (tech).`);
+  expect((await collectionHoldingsHeadless.load(args(""), context([holding("AAPL", 10, 150, MANUAL.id)]))).empty).toBeUndefined();
 });
 
 test("a watchlist and a portfolio date a pre-market quote nothing has traded in by the close they show, as quote does", async () => {
@@ -219,7 +233,41 @@ test("a ticker held in several lots weighs each lot by its own value and gives i
   }
 });
 
+test("cash in several currencies is a CASH row each, the CASH target once on the line under them, and a currency without a rate is left out and named", async () => {
+  const manual = { ...MANUAL, cash: { amount: 40_000, currency: "HKD" }, otherCash: [{ amount: 1_000, currency: "USD" }, { amount: 250_000, currency: "TRY" }],
+    targetWeights: { CASH: 50 } };
+  // $9,000 of AAPL, HK$40,000 at 8 to the dollar and $1,000; no lira rate.
+  const result = await collectionHoldingsHeadless.load(args(MANUAL.id), context([lots("AAPL", [45, 150])], { AAPL: 200 }, manual, { HKD: 0.125, TRY: Number.NaN }));
+
+  const cash = result.rows.filter((row) => row.symbol === "CASH");
+  // JSON keeps a row per currency, the whole line's figures on the first; the rows' values add up to the cash the total counts.
+  expect(cash).toMatchObject([
+    { priceCurrency: "HKD", cashAmount: 40_000, marketValue: 5_000, weight: null, targetWeight: 50, balances: 3 },
+    { priceCurrency: "USD", cashAmount: 1_000, marketValue: 1_000, weight: null, targetWeight: null, tradeValue: null, balances: 3 },
+    { priceCurrency: "TRY", cashAmount: 250_000, marketValue: null, balanceWeight: null, balances: 3 },
+  ]);
+  expect(cash[0]!.balanceWeight).toBeCloseTo((5_000 / 15_000) * 100, 10);
+  expect(result.metadata).toMatchObject({ totals: { total: 15_000, cash: null }, unpricedCashCurrencies: ["TRY"] });
+  expect(result.metadata?.notices).toContain("Total and weights exclude the TRY cash: no TRY/USD rate.");
+
+  setCliColorEnabledOverride(false);
+  try {
+    const text = renderHeadlessPaneText(collectionHoldingsHeadless, result, args(MANUAL.id), "PF").split("\n").map((line) => line.replace(/\s+/g, " ").trim());
+    expect(text.filter((line) => line.startsWith("CASH"))).toEqual([
+      "CASH HKD Cash — — — — HKD — 5,000 — 33.3% — — — — —",
+      "CASH USD Cash — — — — USD — 1,000 — 6.7% — — — — —",
+      "CASH TRY Cash — — — — TRY — — — — — — — — —",
+      // The whole line: unknown while the lira has no rate, its 50% target still shown.
+      "CASH — — 50.0% — — —",
+    ]);
+  } finally {
+    setCliColorEnabledOverride(null);
+  }
+});
+
 test("--close values a future at its exchange settlement, dated by its session, with the day's move from the settlement before", async () => {
+  // The Monday after the settlement: a date in another year would carry its year.
+  setSystemTime(new Date("2026-10-19T14:00:00Z"));
   // Short four platinum contracts of 50 oz, beside ten shares.
   const platinum = createTestTicker("PL=F", "Platinum Jan 27", { exchange: "NYM", assetCategory: "FUTURE", portfolios: [MANUAL.id],
     positions: [{ portfolio: MANUAL.id, shares: -4, avgCost: 1_620, currency: "USD", broker: "manual", multiplier: 50 }] });
@@ -254,4 +302,71 @@ test("--close values a future at its exchange settlement, dated by its session, 
   } finally {
     setCliColorEnabledOverride(null);
   }
+});
+
+test("fn PF --from lists the period's P&L largest first within --limit, with the FX line and the total over every position", async () => {
+  setSystemTime(new Date("2026-11-05T13:00:00Z"));
+  const closes: Record<string, [number, number]> = { AAPL: [347.73, 344.63], TSLA: [400, 380], "2382": [63.15, 63.3] };
+  const hk = createTestTicker("2382", "Sunny Optical", { exchange: "HKEX", currency: "HKD", portfolios: [MANUAL.id],
+    positions: [{ portfolio: MANUAL.id, shares: 1_000, currency: "HKD", broker: "manual" }] });
+  const base = context([holding("AAPL", 50, 230, MANUAL.id), holding("TSLA", -20, 300, MANUAL.id), hk]);
+  const ctx = {
+    ...base,
+    marketData: createTestDataProvider({
+      getQuote: async (symbol) => createTestQuote({ symbol, price: closes[symbol]![1], currency: symbol === "2382" ? "HKD" : "USD" }),
+      getDetailedPriceHistoryWithMetadata: async (symbol, _exchange, start, end, interval) => ({
+        points: [["2026-10-23", closes[symbol]![0]], ["2026-10-30", closes[symbol]![1]]]
+          .map(([date, close]) => ({ date: new Date(`${date}T00:00:00Z`), close: close as number }))
+          .filter((point) => point.date >= start && point.date <= end),
+        resolution: interval as ManualChartResolution,
+      }),
+    }),
+    apiClient: { getCloudHistory: async (symbol: string, _exchange: string, params: { startDate?: string; endDate?: string }) => ({ status: "success",
+      data: symbol === "HKD=X" ? [["2026-10-23", 7.8], ["2026-10-30", 7.75]].filter(([date]) => date! >= params.startDate! && date! <= params.endDate!)
+        .map(([date, close]) => ({ date: `${date}T00:00:00.000Z`, close })) : [] }) },
+  } as unknown as HeadlessPaneContext;
+  const period = (options: Record<string, unknown>) => args(MANUAL.id, { from: "2026-10-26", to: "2026-10-30", ...options } as unknown as Record<string, number>);
+  const result = await collectionHoldingsHeadless.load(period({ limit: 2 }), ctx);
+  // The two largest at the start, in USD (AAPL's $17,387, 2382's HK$63,150 at 7.80, $8,096, over TSLA's $8,000 short),
+  // then the FX line and the total, which count TSLA too.
+  expect(result.rows.map((row) => row.symbol)).toEqual(["AAPL", "2382", "FX (HKD)", "TOTAL"]);
+  const fx = 63_150 * (1 / 7.75 - 1 / 7.8);
+  expect(result.rows.at(-1)!.pnl as number).toBeCloseTo(150 / 7.75 + 50 * (344.63 - 347.73) + -20 * (380 - 400) + fx, 6);
+  expect(result.metadata?.notices).toContain("1 more position not shown; the FX line and the total include every position.");
+  expect(result.columns?.find((column) => column.key === "pnl")?.header).toBe("P&L (USD)");
+  setCliColorEnabledOverride(false);
+  try {
+    expect(renderHeadlessPaneText(collectionHoldingsHeadless, result, period({ limit: 2 }), "PF"))
+      .toContain("P&L from the close of Fri 23 Oct to the close of Fri 30 Oct, on the holdings held now, in USD.");
+  } finally {
+    setCliColorEnabledOverride(null);
+  }
+  // --close already is what --from reads; a watchlist holds no positions.
+  await expect(collectionHoldingsHeadless.load(period({ close: true }), ctx)).rejects.toThrow("leave out --close");
+  await expect(collectionHoldingsHeadless.load({ ...period({}), rawArgument: "tech", argument: "tech" }, ctx)).rejects.toThrow("a watchlist holds no positions");
+});
+
+test("a pre-market quote without a known regular close supplies no regular-session change", async () => {
+  const ctx = { ...context(), marketData: createTestDataProvider({ getQuote: async symbol => createTestQuote({ symbol, price: 101, marketState: "PRE", changePercent: 1 }) }) } as HeadlessPaneContext;
+  const result = await collectionHoldingsHeadless.load(args("tech"), ctx);
+  expect(result.rows[0]).toMatchObject({ changePercent: null, changeBasis: null });
+});
+
+test("a multi-month window labels its 20% return as Period %, separately from the 1% regular-session move", async () => {
+  setSystemTime(new Date("2026-11-05T13:00:00Z"));
+  const base = context([holding("AAPL", 10, 80, MANUAL.id)]);
+  const ctx = { ...base, marketData: createTestDataProvider({
+    getQuote: async () => createTestQuote({ symbol: "AAPL", price: 120, changePercent: 1, marketState: "REGULAR" }),
+    getDetailedPriceHistoryWithMetadata: async (_symbol, _exchange, _start, _end, interval) => ({
+      points: [{ date: new Date("2026-07-31T00:00:00Z"), close: 100 }, { date: new Date("2026-10-30T00:00:00Z"), close: 120 }],
+      resolution: interval as ManualChartResolution,
+    }),
+  }) } as HeadlessPaneContext;
+  const period = await collectionHoldingsHeadless.load(args(MANUAL.id, { from: "2026-08-01", to: "2026-10-30" } as never), ctx);
+  const regular = await collectionHoldingsHeadless.load(args(MANUAL.id), ctx);
+  expect(period.rows.find(row => row.symbol === "AAPL")?.changePercent).toBeCloseTo(20);
+  expect(period.columns?.find(column => column.key === "changePercent")?.header).toBe("Period %");
+  expect(period.columns?.find(column => column.key === "changePercent")?.header).not.toBe("Regular %");
+  expect(regular.rows.find(row => row.symbol === "AAPL")?.changePercent).toBe(1);
+  expect(regular.columns?.find(column => column.key === "changePercent")?.header).toBe("Regular %");
 });

@@ -5,7 +5,7 @@ import type {
   HeadlessPaneLoadArgs,
 } from "../../../types/plugin";
 import { DATE_OPTION_EXAMPLES, isoDateOption } from "../../../utils/calendar-date";
-import { formatCompact, formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatNumber } from "../../../utils/format";
 import type { ShortInterestResult } from "./client";
 import {
   buildRows,
@@ -31,19 +31,19 @@ const SHORT_INTEREST_COLUMNS: HeadlessPaneColumn[] = [
     key: "daysToCover",
     header: "Days to cover",
     align: "right",
-    format: (value) => value == null ? "-" : formatNumber(Number(value), 2),
+    format: (value) => value == null ? MISSING_VALUE : formatNumber(Number(value), 2),
   },
   {
     key: "averageDailyVolume",
     header: "Avg Daily Vol",
     align: "right",
-    format: (value) => value == null ? "-" : formatCompact(Number(value)),
+    format: (value) => value == null ? MISSING_VALUE : formatCompact(Number(value)),
   },
   {
     key: "shortPercentFloat",
     header: "% Float",
     align: "right",
-    format: (value) => value == null ? "-" : `${formatNumber(Number(value), 2)}%`,
+    format: (value) => value == null ? MISSING_VALUE : `${formatNumber(Number(value), 2)}%`,
   },
   // The day of the share count the float is held within.
   { key: "floatAsOf", header: "Float As Of", align: "right" },
@@ -84,6 +84,8 @@ export function createShortInterestHeadless(
       ],
     },
     usListingsOnly: "FINRA short interest",
+    // FINRA's settlements count OTC securities' shares short too: 0700.HK is offered TCEHY.
+    usListingsOtc: true,
     options: [
       {
         key: "order",
@@ -127,17 +129,17 @@ export function createShortInterestHeadless(
       const limit = Number(args.options.limit);
       const asOf = typeof args.options.asOf === "string" && args.options.asOf ? args.options.asOf : null;
       // A settlement published after the date was not known on it.
-      const published = asOf ? buildRows(records).filter((row) => row.publishedDate !== "-" && row.publishedDate <= asOf) : buildRows(records);
+      const published = asOf ? buildRows(records).filter((row) => row.publishedDate !== MISSING_VALUE && row.publishedDate <= asOf) : buildRows(records);
       const rows = sortRows(published, preference)
         .slice(0, limit)
         .map((row) => ({
           settlementDate: row.settlementDate,
-          publishedDate: row.publishedDate === "-" ? null : row.publishedDate,
+          publishedDate: row.publishedDate === MISSING_VALUE ? null : row.publishedDate,
           sharesShort: row.record.sharesShort,
           daysToCover: row.record.shortRatio,
           averageDailyVolume: row.record.averageDailyVolume,
           shortPercentFloat: row.record.shortPercentFloat,
-          floatAsOf: row.floatAsOf === "-" ? null : row.floatAsOf,
+          floatAsOf: row.record.shortPercentFloat != null ? row.record.floatAsOf || null : null,
         }));
       const schedule = shortInterestFreshness(rows.map((row) => row.settlementDate).sort().at(-1));
       // A cut at a past date is as current as that date allowed, not stale by today's clock.

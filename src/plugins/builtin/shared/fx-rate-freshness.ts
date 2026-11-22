@@ -1,4 +1,3 @@
-import { intradayBarText } from "../../../market-data/quotes/intraday-bar";
 import type { Quote, QuoteIntradayBar } from "../../../types/financials";
 import { isFxMarketOpen } from "../../../utils/fx-market-hours";
 import { quoteFreshnessFields } from "./report-freshness";
@@ -37,23 +36,6 @@ export interface FxRateTiming {
   intradayBar?: QuoteIntradayBar;
   /** Why a stale rate stands, as the data service states it. */
   staleReason?: string;
-}
-
-/**
- * What the loaded USD rates behind a pair say of themselves, one line per
- * rate (`BRL/USD: ...`): the bar a rate is the close of, and, for a stale
- * rate, why it stands (its bars had nothing newer, or did not load). A rate
- * whose own refresh failed is stale for that reason, so it states none.
- */
-export function fxRateNotes(legs: ReadonlyMap<string, FxRateTiming>, now = Date.now()): string[] {
-  return [...legs].flatMap(([currency, timing]) => {
-    if (currency === "USD") return [];
-    const stale = timing.staleAt != null && timing.staleAt <= now;
-    return [
-      ...timing.intradayBar ? [`${currency}/USD: ${intradayBarText(timing.intradayBar)}`] : [],
-      ...stale && timing.error == null && timing.staleReason ? [`${currency}/USD: ${timing.staleReason}`] : [],
-    ];
-  });
 }
 
 function isoTime(time: number | undefined | null): string | undefined {

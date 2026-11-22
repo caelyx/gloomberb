@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "fs/promises";
+import { mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
-import { act, type ReactNode } from "react";
+import { act, useCallback, useState, type ReactNode } from "react";
 import { apiClient } from "../../api-client";
 import { useBrokerImportRuntime, type AppBrokerImportRuntime } from "../../app/runtime/broker-import";
 import { syncBrokerInstance } from "../../brokers/sync-broker-instance";
@@ -29,8 +29,16 @@ import {
   type AppConfig,
 } from "../../types/config";
 import type { DataProvider } from "../../types/data-provider";
-import { OnboardingWizard } from "./onboarding-wizard";
+import { cardKey, coachStepsAside, OnboardingWizard } from "./onboarding-wizard";
+import { useRunSetupAgain } from "./run-setup-again";
 import { loadFuturesContractTermsCached } from "../../market-data/futures-contract";
+import { formSnapshot } from "../../remote/form";
+import { createRemoteUiRegistry, RemoteUiRegistryProvider } from "../../remote/semantic-tree";
+import { allowTelemetryInTests } from "../../test-support/telemetry-guard";
+import type { InstallExperimentReport } from "../../api-client";
+import { resetInstallExperimentsForTests } from "../../api-client/install-experiments";
+import { installUsageCounter, resetUsageCountsForTests } from "../../telemetry/usage-counts";
+import { SEEDED_LIST_MIN_STARTERS, STARTER_SYMBOLS } from "../../tickers/starter-symbols";
 
 const tui = createOpenTuiTestHarness();
 let tempDataDir: string | null = null;
@@ -100,13 +108,24 @@ async function createDeskRegistry(tickerRepository: AppTickerRepositoryPort): Pr
   return { ...createPluginRegistry({ tickerRepository }), ...await builtInFunctions } as PluginRegistry;
 }
 
+let capturedDispatch: ReturnType<typeof useAppDispatch> | null = null;
+
 function StateCapture() {
   capturedConfig = useAppSelector((state) => state.config);
+  capturedDispatch = useAppDispatch();
   capturedBrokerAccounts = useAppSelector((state) => state.brokerAccounts);
   return null;
 }
 
 /** Records the keys that reach it, like a pane or the shell beside the wizard. */
+/** A pane's text field: Alt+Backspace deletes the word before the cursor, as an input does. */
+function FieldProbe({ text }: { text: { value: string } }) {
+  useShortcut((event) => {
+    if (event.targetEditable === true && event.name === "backspace" && (event.alt || event.meta)) text.value = text.value.replace(/\S+\s*$/, "");
+  }, { allowEditable: true });
+  return null;
+}
+
 function KeyProbe({ seen }: { seen: string[] }) {
   useShortcut((event) => { seen.push(event.name ?? ""); }, { phase: "before", allowEditable: true });
   return null;
@@ -136,7 +155,6 @@ function WizardHarness({
     tickerRepository: pluginRegistry.tickerRepository,
     existingTickers: tickerMap,
     resources: pluginRegistry.persistence.resources,
-    persistResolvedBrokerConfig: options?.persistResolvedBrokerConfig,
     signal: options?.signal,
   }));
   return (
@@ -202,6 +220,37 @@ function RuntimeWizardHarness({
       />
     </AppProvider>
   );
+}
+
+/** Settings' Run Setup Again over the app, the way AppInner wires it: setup shows first, then on `run`. */
+function SettingsHarness({
+  config,
+  pluginRegistry,
+  run,
+}: {
+  config: AppConfig;
+  pluginRegistry: PluginRegistry;
+  run: { current?: () => Promise<void> };
+}) {
+  return (
+    <AppProvider config={config}>
+      <StateCapture />
+      <SettingsRerun pluginRegistry={pluginRegistry} run={run} />
+    </AppProvider>
+  );
+}
+
+function SettingsRerun({ pluginRegistry, run }: { pluginRegistry: PluginRegistry; run: { current?: () => Promise<void> } }) {
+  const [open, setOpen] = useState(true);
+  const show = useCallback(() => setOpen(true), []);
+  run.current = useRunSetupAgain(open ? undefined : show);
+  return open ? (
+    <RuntimeOnboardingWizard
+      pluginRegistry={pluginRegistry}
+      tickerRepository={pluginRegistry.tickerRepository}
+      onComplete={() => setOpen(false)}
+    />
+  ) : null;
 }
 
 const emitKeypress = (event: TestKeyEvent) => tui.emitKeypress(event);
@@ -283,11 +332,52 @@ async function waitForAddedPosition(): Promise<void> {
   }
 }
 
-/** Leaves "What do you trade?" without a desk, which keeps today's first-run workspace. */
+/** Leaves "What do you trade most?" without a desk, which keeps today's first-run workspace. */
 async function skipDesks(): Promise<void> {
-  await waitForFrame("What do you trade?");
+  await waitForFrame("What do you trade most?");
   await emitKeypress({ name: "s", sequence: "s" });
 }
+
+const originalReportInstallExperiment = apiClient.reportInstallExperiment;
+const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+
+/**
+ * An install with usage counts on, which the API puts in `arm` of
+ * first_run_tickers (or whose answer fails or comes too late, as `answer`
+ * rejects); what the app reports about it lands in the list.
+ */
+function enrollInstall(arm: "control" | "tickers", answer?: Error): InstallExperimentReport[] {
+  const reports: InstallExperimentReport[] = [];
+  // The terminal's own navigator: a DOM test earlier in the run leaves one that reports automation.
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { userAgent: "Bun" } });
+  installUsageCounter({ surface: "terminal", os: "linux", isEnabled: () => true, getInstallId: () => "install-1", send: async () => {} });
+  apiClient.reportInstallExperiment = (async (report: InstallExperimentReport) => {
+    reports.push(report);
+    if (report.event !== "experiment_assign") return { accepted: true };
+    if (answer) throw answer;
+    return { accepted: true, variant: arm };
+  }) as typeof apiClient.reportInstallExperiment;
+  return reports;
+}
+
+/** "What do you hold?" left holding nothing on this build, on the Desks step. */
+function heldNothing(dataDir: string): AppConfig {
+  return {
+    ...createDefaultConfig(dataDir),
+    onboardingProgress: {
+      version: 1, stage: "desks", path: "manual", portfolioId: "main", tickerSymbol: "SPY", positionsImported: 0, asksTickers: true,
+    },
+  };
+}
+
+async function watchlist(tickerRepository: JsonTickerRepository): Promise<string[]> {
+  return (await tickerRepository.loadAllTickers())
+    .filter((ticker) => ticker.metadata.watchlists.includes("watchlist"))
+    .map((ticker) => ticker.metadata.ticker);
+}
+
+/** The first-run watchlist when nothing was picked, as the control has it. */
+const SEEDED_FIRST_RUN_WATCHLIST = ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN", "TSLA"];
 
 // Milestones and pricing go to the network; neither belongs in a render test.
 const originalRecordResearchActivity = apiClient.recordResearchActivity;
@@ -297,6 +387,8 @@ const originalGetChannels = apiClient.getChannels;
 const originalGetSession = apiClient.getSession;
 beforeEach(() => {
   expectedPositionCount = 0;
+  // first_run_tickers is asked once a session, and the session is the test process.
+  resetInstallExperimentsForTests();
   apiClient.recordResearchActivity = (async () => {}) as typeof apiClient.recordResearchActivity;
   apiClient.getCloudPricing = (async () => { throw new Error("offline"); }) as typeof apiClient.getCloudPricing;
   apiClient.getCloudAccountPlan = (async () => ({ trialAvailable: true })) as typeof apiClient.getCloudAccountPlan;
@@ -311,6 +403,10 @@ afterEach(async () => {
   // Checkout refreshes chat directly, even without a registry, and can start verification polling.
   chatController.dispose();
   apiClient.recordResearchActivity = originalRecordResearchActivity;
+  apiClient.reportInstallExperiment = originalReportInstallExperiment;
+  resetInstallExperimentsForTests();
+  resetUsageCountsForTests();
+  if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
   apiClient.getCloudPricing = originalGetCloudPricing;
   apiClient.getCloudAccountPlan = originalGetCloudAccountPlan;
   apiClient.getChannels = originalGetChannels;
@@ -327,6 +423,9 @@ afterEach(async () => {
 });
 
 describe("OnboardingWizard", () => {
+  // The first-run milestone is research activity, which the test opt-out turns off.
+  allowTelemetryInTests();
+
   test("saves manual positions and opens the largest one as the research workspace", async () => {
     tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-"));
     const tickerRepository = new JsonTickerRepository();
@@ -341,15 +440,19 @@ describe("OnboardingWizard", () => {
     expect(first).toContain("What do you hold?");
     expect(first).not.toContain("Skip setup");
     expect(first).not.toContain("Recommended");
+    // The step needs one ticker, and says so.
+    expect(first).toContain("Add one ticker to continue");
 
     await addManualPosition("MSFT", "4", "400");
     await addManualPosition("AAPL", "10", "180");
     const listed = tui.frame();
+    expect(listed).toContain("Enter on an empty ticker: continue");
     expect(listed).toContain("Positions (2)");
     expect(listed).toContain("10 @ 180");
     expect(listed).toContain("$1,000");
 
-    await pressEscape();
+    // The form is back on its empty Ticker field: Enter there goes on, as
+    // Continue does, rather than asking for a ticker.
     await pressEnter();
 
     await skipDesks();
@@ -380,6 +483,23 @@ describe("OnboardingWizard", () => {
       .filter((ticker) => ticker.metadata.watchlists.includes("watchlist"))
       .map((ticker) => ticker.metadata.ticker);
     expect(watching).toEqual(["SPY", "QQQ", "NVDA", "AMZN", "TSLA"]);
+  });
+
+  test("the setup quote preview dates its price even in a narrow terminal", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-"));
+    const tickerRepository = new JsonTickerRepository();
+    const marketData = createMarketData();
+    const readQuote = marketData.getQuote.bind(marketData);
+    marketData.getQuote = async (...args) => {
+      const quote = await readQuote(...args);
+      return quote ? { ...quote, lastUpdated: Date.parse("2026-11-13T16:30:00Z") } : quote;
+    };
+    await tui.render(
+      <WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={{ ...createPluginRegistry({ tickerRepository }), marketData }} />,
+      { width: 60, height: 32 },
+    );
+    await typeText("MSFT");
+    expect(await waitForFrame("As of")).toContain("2026-11-13 16:30 UTC");
   });
 
   test("each position takes its listing's currency unless one is typed, and blank falls back to the portfolio's", async () => {
@@ -466,7 +586,7 @@ describe("OnboardingWizard", () => {
     await waitForFrame("Built around AAPL");
   });
 
-  test("What do you trade? opens the ticked desks as tabs after Home, in the order they were ticked", async () => {
+  test("What do you trade most? opens up to three ticked desks as tabs after Home, and running it again adds no copies", async () => {
     tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-desks-"));
     const pluginRegistry = await createDeskRegistry(new JsonTickerRepository());
     const config = {
@@ -476,23 +596,29 @@ describe("OnboardingWizard", () => {
     await tui.render(<WizardHarness config={config} pluginRegistry={pluginRegistry} />, { width: 100, height: 32 });
     await tui.setup().renderOnce();
     const frame = tui.frame();
-    expect(frame).toContain("What do you trade?");
+    expect(frame).toContain("What do you trade most?");
+    expect(frame).toContain("Everything else is one search away.");
     for (const label of ["Equities", "Options", "Futures & commodities", "Rates & credit", "FX & macro", "Active trading"]) {
       expect(frame).toContain(label);
     }
 
-    // Continue waits for a desk.
+    // Continue waits for a desk: Enter with none ticked ticks the highlighted one instead, and Space unticks it.
     await pressEnter();
     await act(async () => { await Bun.sleep(20); await tui.setup().renderOnce(); });
     expect(capturedConfig?.onboardingProgress?.stage ?? "desks").toBe("desks");
+    expect(tui.frame()).toContain("[✓] Equities");
+    await pressSpace();
 
-    // Rates, then Equities, then FX & macro with the mouse; then Equities off again.
+    // Rates, then Equities, then FX & macro with the mouse; Options is a fourth
+    // and stays unticked; then Equities off again.
     for (let step = 0; step < 3; step += 1) await emitKeypress({ name: "j", sequence: "j" });
     await pressSpace();
     for (let step = 0; step < 3; step += 1) await emitKeypress({ name: "k", sequence: "k" });
     await pressSpace();
     await tui.clickFrameText("FX & macro");
-    for (let step = 0; step < 4; step += 1) await emitKeypress({ name: "up", sequence: "\u001b[A" });
+    for (let step = 0; step < 3; step += 1) await emitKeypress({ name: "up", sequence: "\u001b[A" });
+    await pressSpace();
+    await emitKeypress({ name: "up", sequence: "\u001b[A" });
     await pressSpace();
     await pressEnter();
 
@@ -503,6 +629,77 @@ describe("OnboardingWizard", () => {
     expect(capturedConfig?.layouts[1]?.layout.instances.map((instance) => instance.paneId)).toEqual([
       "rate-path", "yield-curve", "money-markets", "fixed-income", "central-bank-rates",
     ]);
+
+    // Run again over that workspace, with a layout of the user's own: the
+    // layouts onboarding made are replaced, not copied.
+    const firstRun = capturedConfig!;
+    const mine = { name: "Mine", layout: firstRun.layout };
+    await tui.render(<WizardHarness config={{
+      ...firstRun,
+      layouts: [...firstRun.layouts, mine],
+      onboardingProgress: { version: 1, stage: "desks", path: "manual", portfolioId: "main", tickerSymbol: "AAPL" },
+    }} pluginRegistry={pluginRegistry} />, { width: 100, height: 32 });
+    // The desks it made come back ticked.
+    const again = await waitForFrame("What do you trade most?");
+    expect(again).toContain("[\u2713] Rates & credit");
+    expect(again).toContain("[\u2713] FX & macro");
+    expect(again).toContain("[ ] Equities");
+    await pressEnter();
+    await waitUntil(() => capturedConfig?.onboardingProgress?.stage === "research", "the second run to build the workspace");
+    expect(capturedConfig?.layouts.map((layout) => layout.name)).toEqual(["Home", "Rates", "FX & Macro", "Monitor", "Macro", "Mine"]);
+    expect(capturedConfig?.layouts[5]).toEqual(mine);
+  });
+
+  test("Run Setup Again opens on the holdings and desks the user has, and finishing it keeps the layouts", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-again-"));
+    const pluginRegistry = await createDeskRegistry(new JsonTickerRepository());
+    const defaults = createDefaultConfig(tempDataDir);
+    const mine = { name: "Mine", layout: defaults.layout };
+    const runSetupAgain: { current?: () => Promise<void> } = {};
+    await tui.render(
+      <SettingsHarness config={{ ...defaults, layouts: [...defaults.layouts, mine] }} pluginRegistry={pluginRegistry} run={runSetupAgain} />,
+      { width: 100, height: 32 },
+    );
+    await tui.setup().renderOnce();
+
+    // The first run: AAPL, then the Rates desk.
+    await addManualPosition("AAPL", "10", "180");
+    await pressEscape();
+    await pressEnter();
+    await waitForFrame("What do you trade most?");
+    for (let step = 0; step < 3; step += 1) await emitKeypress({ name: "j", sequence: "j" });
+    await pressSpace();
+    await pressEnter();
+    await waitForFrame("Built around AAPL");
+    await emitKeypress({ name: "f10" });
+    await waitUntil(() => capturedConfig?.onboardingComplete === true, "the first run to finish");
+    const layouts = capturedConfig!.layouts;
+    expect(layouts.map((layout) => layout.name)).toEqual(["Home", "Rates", "Monitor", "Macro", "Mine"]);
+
+    // From Settings: the holding is listed, the step can be left, and the Rates desk is ticked.
+    await act(async () => { await runSetupAgain.current!(); });
+    const holdings = await waitForFrame("What do you hold?");
+    expect(holdings).toContain("Positions (1)");
+    expect(holdings).toContain("AAPL");
+    expect(holdings).toContain("Skip setup");
+    await pressEscape();
+    await pressEnter();
+    expect(await waitForFrame("What do you trade most?")).toContain("[\u2713] Rates & credit");
+    await pressEnter();
+    await waitForFrame("Built around AAPL");
+    await emitKeypress({ name: "f10" });
+    await waitUntil(() => capturedConfig?.onboardingComplete === true, "the run from Settings to finish");
+    expect(capturedConfig!.layouts).toHaveLength(layouts.length);
+    expect(capturedConfig!.layouts.map((layout) => [layout.id, layout.name])).toEqual(layouts.map((layout) => [layout.id, layout.name]));
+    expect(capturedConfig!.layouts.slice(2)).toEqual(layouts.slice(2));
+
+    // Left at its first step, it changes nothing.
+    await act(async () => { await runSetupAgain.current!(); });
+    await waitForFrame("What do you hold?");
+    const finished = capturedConfig!.layouts;
+    await emitKeypress({ name: "f10" });
+    await waitUntil(() => capturedConfig?.onboardingComplete === true, "Skip setup to close it");
+    expect(capturedConfig!.layouts).toBe(finished);
   });
 
   test("the first-run milestone that ends onboarding names the desks picked", async () => {
@@ -528,7 +725,40 @@ describe("OnboardingWizard", () => {
     expect(completedEvent()?.desks).toEqual(["options", "active"]);
   });
 
-  test("cannot be skipped or continued before the first position", async () => {
+  test("a mouse adds a typed row with Add, and Continue adds a filled row before it goes on", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-mouse-"));
+    const tickerRepository = new JsonTickerRepository();
+    const pluginRegistry = createPluginRegistry({ tickerRepository });
+    await tui.render(
+      <WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={pluginRegistry} />,
+      { width: 100, height: 32 },
+    );
+    await tui.setup().renderOnce();
+
+    // Typed, never Entered: Add saves it.
+    await typeText("MSFT");
+    await pressEnter();
+    await typeText("4");
+    await pressEnter();
+    await typeText("400");
+    await tui.clickFrameText(" Add ");
+    expect(await waitForFrame("Positions (1)")).toContain("4 @ 400");
+
+    // A second row filled in and left: Continue adds it, then goes on.
+    await typeText("AAPL");
+    await pressEnter();
+    await typeText("10");
+    await pressEnter();
+    await typeText("180");
+    await tui.clickFrameText("Continue");
+    await waitForFrame("What do you trade most?");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ stage: "desks", tickerSymbol: "AAPL", positionsImported: 2 });
+    expect((await tickerRepository.loadTicker("AAPL"))?.metadata.positions).toEqual([
+      { portfolio: "main", shares: 10, avgCost: 180, currency: "USD", broker: "manual" },
+    ]);
+  });
+
+  test("cannot be continued before the first position, and F10 skips the step and then the Desks step", async () => {
     tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-required-portfolio-"));
     const pluginRegistry = createPluginRegistry();
     let completionCount = 0;
@@ -543,14 +773,330 @@ describe("OnboardingWizard", () => {
     await tui.setup().renderOnce();
 
     expect(tui.frame()).not.toContain("Skip setup");
-    await emitKeypress({ name: "f10" });
-    expect(completionCount).toBe(0);
     await pressEscape();
     await pressEnter();
     await act(async () => { await Bun.sleep(20); await tui.setup().renderOnce(); });
     expect(completionCount).toBe(0);
     expect(capturedConfig?.onboardingProgress?.stage ?? "portfolio").toBe("portfolio");
     expect(tui.frame()).toContain("What do you hold?");
+    // Enter put the Ticker field back in focus, where s is typed: the Skip button shows F10, which presses it.
+    expect(tui.frame()).toMatch(/Skip\s+F10/);
+    await emitKeypress({ name: "f10" });
+    // Review, 12 Nov 2026: skipping setup took F10 here and s on the next step; Skip is F10 on both.
+    expect(await waitForFrame("What do you trade most?")).toMatch(/Skip\s+F10/);
+    await pressEscape();
+    await waitUntil(() => capturedConfig?.onboardingProgress?.stage === "research", "Esc skips the desks step");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ desks: [] });
+    expect(completionCount).toBe(0);
+  });
+
+  test("Esc leaves an edited holding field before skipping an empty first-run portfolio", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-escape-"));
+    let completionCount = 0;
+    await tui.render(<WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={createPluginRegistry()} onComplete={() => { completionCount += 1; }} />, { width: 52, height: 40 });
+    await tui.setup().renderOnce();
+    await typeText("AAPL");
+    await pressEscape();
+    expect(capturedConfig?.onboardingProgress?.stage ?? "portfolio").toBe("portfolio");
+    await pressEscape();
+    await waitForFrame("What do you trade most?");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ stage: "desks", positionsImported: 0 });
+    expect(completionCount).toBe(0);
+  });
+
+  // F10 is a media key on most Mac keyboards: the Ticker field needs a way out that every terminal sends.
+  test("Tab and Shift+Tab from the Ticker field reach Skip, and Enter presses it", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-tab-buttons-"));
+    await tui.render(<WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={createPluginRegistry()} />, { width: 80, height: 30 });
+    await tui.setup().renderOnce();
+    const tab = (shift = false) => emitKeypress({ name: "tab", shift, sequence: shift ? "\u001b[Z" : "\t" });
+
+    // Holding nothing: past the last field Tab reaches Skip, and Continue, which needs a ticker, is passed over.
+    for (let field = 0; field < 4; field += 1) await tab();
+    await act(async () => { await tui.setup().renderOnce(); });
+    expect(tui.frame()).toMatch(/Skip\s+F10/);
+    await tab();
+    await act(async () => { await tui.setup().renderOnce(); });
+    expect(tui.frame()).toMatch(/Skip\s+F10/);
+    // Back in the Ticker field, Shift+Tab reaches Skip at once.
+    await tab(true);
+    await pressEnter();
+    await waitForFrame("What do you trade most?");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ stage: "desks", positionsImported: 0 });
+  });
+
+  test("holding one, Shift+Tab from the Ticker field reaches Continue", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-tab-continue-"));
+    await tui.render(<WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={createPluginRegistry()} />, { width: 80, height: 30 });
+    await tui.setup().renderOnce();
+    await addManualPosition("AAPL");
+    await emitKeypress({ name: "tab", shift: true, sequence: "\u001b[Z" });
+    // Out of the field, on Continue: Enter is not the field's.
+    expect(await waitForFrame("Enter continues")).not.toMatch(/Skip/);
+    await pressEnter();
+    await waitForFrame("What do you trade most?");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ stage: "desks", tickerSymbol: "AAPL" });
+  });
+
+  test.each(["f10", "escape"])("from Settings, %s leaves setup without changing holdings", async (key) => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-rerun-f10-"));
+    let completionCount = 0;
+    const config = { ...createDefaultConfig(tempDataDir), onboardingProgress: { version: 1 as const, stage: "portfolio" as const, rerun: true } };
+    await tui.render(<WizardHarness config={config} pluginRegistry={createPluginRegistry()} onComplete={() => { completionCount += 1; }} />, { width: 80, height: 30 });
+    expect(await waitForFrame("What do you hold?")).toMatch(/Skip\s+Continue/);
+    if (key === "escape") {
+      await pressEscape();
+      expect(completionCount).toBe(0);
+    }
+    await emitKeypress({ name: key });
+    await waitUntil(() => completionCount === 1, `${key} to leave setup`);
+  });
+
+  test("remote control reads the terminal card as the setup form, adds and removes a position through it, and sends the step", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-remote-"));
+    const registry = createRemoteUiRegistry();
+    await tui.render(
+      <RemoteUiRegistryProvider registry={registry}>
+        <WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={createPluginRegistry()} />
+      </RemoteUiRegistryProvider>,
+      { width: 100, height: 32 },
+    );
+    await tui.setup().renderOnce();
+    type Form = { nodeId: string; fields: Array<{ nodeId: string; id?: string; label: string; items?: Array<{ id: string }> }> };
+    const form = () => formSnapshot(registry.snapshot(), false) as Record<string, unknown> & Form;
+    const field = (label: string) => form().fields.find((entry) => entry.label === label)!;
+
+    // The terminal draws only the field being typed in, yet every field is listed.
+    expect(form()).toMatchObject({ open: true, kind: "setup", step: "PORTFOLIO", title: "What do you hold?" });
+    expect(form().fields.map((entry) => entry.label)).toEqual(["Ticker", "Shares", "Avg cost", "Currency", "Positions"]);
+
+    await act(async () => {
+      await registry.invoke(field("Ticker").nodeId, "setValue", { value: "NVDA" });
+    });
+    await act(async () => {
+      await registry.invoke(field("Ticker").nodeId, "submit");
+    });
+    await waitForAddedPosition();
+    expect(field("Positions").items?.map((item) => item.id)).toEqual(["NVDA"]);
+
+    await act(async () => {
+      await registry.invoke(field("Positions").nodeId, "remove", { id: "NVDA" });
+    });
+    await waitUntil(() => field("Positions").items?.length === 0, "the position removed");
+
+    await act(async () => {
+      await registry.invoke(field("Ticker").nodeId, "setValue", { value: "MSFT" });
+    });
+    await act(async () => {
+      await registry.invoke(field("Ticker").nodeId, "submit");
+    });
+    await waitUntil(() => field("Positions").items?.length === 1 && !tui.frame().includes("adding..."), "the position added");
+    await act(async () => {
+      await registry.invoke(form().nodeId, "submit");
+    });
+    await waitForFrame("What do you trade most?");
+    expect(form()).toMatchObject({ open: true, kind: "setup", step: "DESKS" });
+  });
+
+  test("holding nothing, Skip (s) leaves the portfolio step at 80x24 as the Desks step's does, and the workspace is built around SPY", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-skip-portfolio-"));
+    await tui.render(<WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={createPluginRegistry()} />, { width: 80, height: 24 });
+    await tui.setup().renderOnce();
+    // Skip shows F10, in the Ticker field or out of it; out of it s presses Skip too.
+    expect(tui.frame()).toMatch(/Skip\s+F10/);
+    await pressEscape();
+    await act(async () => { await tui.setup().renderOnce(); });
+    expect(tui.frame()).toMatch(/Skip\s+F10/);
+    await emitKeypress({ name: "s", sequence: "s" });
+    await skipDesks();
+    await waitUntil(() => capturedConfig?.onboardingProgress?.stage === "research", "the research stage");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ path: "manual", tickerSymbol: "SPY", positionsImported: 0, desks: [] });
+    expect(capturedConfig?.layout.instances.find((instance) => instance.paneId === "chart-composer")?.binding).toEqual({ kind: "fixed", symbol: "SPY" });
+  });
+
+  test("first_run_tickers' tickers arm asks after the desks: the picks lead the watchlist, which reads as the user's own, and the end is counted", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-tickers-"));
+    const reports = enrollInstall("tickers");
+    const tickerRepository = new JsonTickerRepository();
+    await tui.render(
+      <WizardHarness config={createDefaultConfig(tempDataDir)} pluginRegistry={createPluginRegistry({ tickerRepository })} />,
+      { width: 100, height: 32 },
+    );
+    await tui.setup().renderOnce();
+    // Holding nothing, then Futures & commodities.
+    await pressEscape();
+    await emitKeypress({ name: "s", sequence: "s" });
+    await waitForFrame("What do you trade most?");
+    expect(reports).toEqual([]);
+    for (let step = 0; step < 2; step += 1) await emitKeypress({ name: "j", sequence: "j" });
+    await pressSpace();
+    await pressEnter();
+
+    const step = await waitForFrame("Which tickers do you follow?");
+    expect(step).toContain("E-Mini S&P 500");
+    expect(step).toMatch(/Skip\s+Esc/);
+    // Asked for the arm, then counted in the arm it showed.
+    await waitUntil(() => reports.length === 2, "the exposure");
+    expect(reports).toMatchObject([
+      { event: "experiment_assign", experiment: "first_run_tickers", installId: "install-1", surface: "terminal" },
+      { event: "experiment_exposed", experiment: "first_run_tickers", variant: "tickers", installId: "install-1" },
+    ]);
+
+    // Enter with nothing ticked ticks the highlighted suggestion, as on the Desks step; Space the next one.
+    await pressEnter();
+    await emitKeypress({ name: "down", sequence: "\u001b[B" });
+    await pressSpace();
+    // The third from the app's search: Enter picks the result and clears the search.
+    await typeText("MSFT");
+    await waitForFrame("Microsoft Corp.");
+    await pressEnter();
+    const picked = await waitForFrame("[\u2713] MSFT");
+    expect(picked).toContain("[\u2713] ES=F");
+    expect(picked).toContain("[\u2713] NQ=F");
+    // A fourth waits until one is unticked.
+    await emitKeypress({ name: "down", sequence: "\u001b[B" });
+    await emitKeypress({ name: "down", sequence: "\u001b[B" });
+    await emitKeypress({ name: "down", sequence: "\u001b[B" });
+    await pressSpace();
+    expect(tui.frame()).toContain("[ ] CL=F");
+    await pressEnter();
+
+    // Closed from its search, the step takes the field with it: the workspace card shows its keys.
+    expect(await waitForFrame("Built around ES=F")).toMatch(/Keep exploring\s+Esc/);
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ stage: "research", tickerSymbol: "ES=F", desks: ["futures"] });
+    expect(capturedConfig?.layout.instances.find((instance) => instance.paneId === "chart-composer")?.binding).toEqual({ kind: "fixed", symbol: "ES=F" });
+    const watching = await watchlist(tickerRepository);
+    expect(watching).toEqual(expect.arrayContaining(["ES=F", "NQ=F", "MSFT"]));
+    expect(watching.filter((symbol) => STARTER_SYMBOLS.has(symbol)).length).toBeLessThan(SEEDED_LIST_MIN_STARTERS);
+    expect((await tickerRepository.loadTicker("ES=F"))?.metadata).toMatchObject({ exchange: "CME", assetCategory: "FUTURE" });
+
+    await waitUntil(() => reports.length === 3, "the step's end");
+    expect(reports[2]).toMatchObject({ event: "onboarding_tickers_finished", picked: 3, skipped: false });
+    expect(JSON.stringify(reports)).not.toMatch(/ES=F|NQ=F|MSFT/);
+  });
+
+  test("a picked search result the app has never saved is saved as its listing, on the watchlist, with the workspace built around it", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-tickers-new-"));
+    const reports = enrollInstall("tickers");
+    const tickerRepository = new JsonTickerRepository();
+    await tui.render(<WizardHarness config={heldNothing(tempDataDir)} pluginRegistry={createPluginRegistry({ tickerRepository })} />, { width: 100, height: 32 });
+    await skipDesks();
+    await waitForFrame("Which tickers do you follow?");
+    expect(await tickerRepository.loadTicker("TTALO")).toBeNull();
+    // The vendor's suffixed symbol, saved as the Helsinki listing it is.
+    await typeText("TTALO.HE");
+    await waitForFrame("Terveystalo Oyj");
+    await pressEnter();
+    await waitForFrame("[\u2713] TTALO");
+    await pressEnter();
+    await waitUntil(() => capturedConfig?.onboardingProgress?.stage === "research", "the research stage");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ tickerSymbol: "TTALO" });
+    expect(capturedConfig?.layout.instances.find((instance) => instance.paneId === "chart-composer")?.binding).toEqual({ kind: "fixed", symbol: "TTALO" });
+    expect((await tickerRepository.loadTicker("TTALO"))?.metadata).toMatchObject({
+      ticker: "TTALO", name: "Terveystalo Oyj", exchange: "HEL", currency: "EUR", watchlists: ["watchlist"],
+    });
+    expect(await watchlist(tickerRepository)).toContain("TTALO");
+    await waitUntil(() => reports.length === 3, "the step's end");
+  });
+
+  test("on the tickers step, Esc clears a typed search first; Skip adds nothing: the first run is the control's, counted as skipped", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-tickers-skip-"));
+    const reports = enrollInstall("tickers");
+    const tickerRepository = new JsonTickerRepository();
+    await tui.render(<WizardHarness config={heldNothing(tempDataDir)} pluginRegistry={createPluginRegistry({ tickerRepository })} />, { width: 80, height: 24 });
+    await skipDesks();
+    await waitForFrame("Which tickers do you follow?");
+    // Ticked, then a search typed: the first Esc clears the search and stays on the step.
+    await pressSpace();
+    await typeText("MSFT");
+    await waitForFrame("Microsoft Corp.");
+    await pressEscape();
+    expect(await waitForFrame("[\u2713] NVDA")).not.toContain("Microsoft Corp.");
+    expect(tui.frame()).toContain("Which tickers do you follow?");
+    expect(capturedConfig?.onboardingProgress?.stage).toBe("tickers");
+    // The next skips, and Skip keeps none of what was ticked.
+    await pressEscape();
+    await waitUntil(() => capturedConfig?.onboardingProgress?.stage === "research", "the research stage");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ tickerSymbol: "SPY", desks: [] });
+    expect(await watchlist(tickerRepository)).toEqual(SEEDED_FIRST_RUN_WATCHLIST);
+    await waitUntil(() => reports.length === 3, "the step's end");
+    expect(reports[2]).toMatchObject({ event: "onboarding_tickers_finished", picked: 0, skipped: true });
+  });
+
+  test("the control arm is counted where the step would show and goes on as today; no answer in time is the control, never counted", async () => {
+    for (const answer of [undefined, new Error("Install experiment request timed out.")]) {
+      tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-tickers-control-"));
+      // A new session for each answer.
+      resetInstallExperimentsForTests();
+      // A late answer is the tickers arm's: the app has already gone on as the control.
+      const reports = enrollInstall(answer ? "tickers" : "control", answer);
+      const tickerRepository = new JsonTickerRepository();
+      await tui.render(<WizardHarness config={heldNothing(tempDataDir)} pluginRegistry={createPluginRegistry({ tickerRepository })} />, { width: 100, height: 32 });
+      await skipDesks();
+      await waitUntil(() => capturedConfig?.onboardingProgress?.stage === "research", "the research stage");
+      expect(tui.frame()).not.toContain("Which tickers do you follow?");
+      expect(capturedConfig?.onboardingProgress).toMatchObject({ tickerSymbol: "SPY", desks: [] });
+      expect(await watchlist(tickerRepository)).toEqual(SEEDED_FIRST_RUN_WATCHLIST);
+      await Bun.sleep(10);
+      expect(reports.map((report) => report.event)).toEqual(answer ? ["experiment_assign"] : ["experiment_assign", "experiment_exposed"]);
+      if (!answer) expect(reports[1]).toMatchObject({ variant: "control" });
+    }
+  });
+
+  test("a first run that would not show the tickers step is never put in the experiment", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-tickers-none-"));
+    const reports = enrollInstall("tickers");
+    const progress = heldNothing(tempDataDir).onboardingProgress!;
+    for (const variant of [
+      // Holding something, from a broker, from Settings, and begun on an earlier build.
+      { ...progress, tickerSymbol: "AAPL", positionsImported: 1 },
+      { ...progress, path: "broker" as const, tickerSymbol: "AAPL", positionsImported: 3 },
+      { ...progress, rerun: true },
+      { ...progress, asksTickers: undefined },
+    ]) {
+      await tui.render(
+        <WizardHarness config={{ ...createDefaultConfig(tempDataDir), onboardingProgress: variant }} pluginRegistry={createPluginRegistry()} />,
+        { width: 100, height: 32 },
+      );
+      await skipDesks();
+      await waitUntil(() => capturedConfig?.onboardingProgress?.stage === "research", "the research stage");
+      expect(tui.frame()).not.toContain("Which tickers do you follow?");
+    }
+    expect(reports).toEqual([]);
+  });
+
+  // Every step saves before it moves on. A profile that refuses the write (a
+  // Windows scanner holding the file, a read-only disk) used to keep the first
+  // run on "What do you hold?" with every way out failing on the same save.
+  test("a profile that cannot be saved never holds the first run: every step moves on with the reason shown, and setup closes", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-unsaved-"));
+    // A file where the data folder belongs: every config save fails.
+    const blocked = join(tempDataDir, "profile");
+    await writeFile(blocked, "");
+    const notices: string[] = [];
+    const pluginRegistry = {
+      ...createPluginRegistry(),
+      notify: (notification: { body: string }) => { notices.push(notification.body); },
+    } as unknown as PluginRegistry;
+    let completed: AppConfig | null = null;
+    await tui.render(
+      <WizardHarness config={createDefaultConfig(blocked)} pluginRegistry={pluginRegistry} onComplete={(next) => { completed = next; }} />,
+      { width: 80, height: 24 },
+    );
+    await tui.setup().renderOnce();
+    await pressEscape();
+    await emitKeypress({ name: "s", sequence: "s" });
+    // The card says why, and the step still moved on.
+    expect(await waitForFrame("What do you trade most?")).toMatch(/E(EXIST|NOTDIR): /);
+    await emitKeypress({ name: "s", sequence: "s" });
+    await waitForFrame("Keep exploring");
+    expect(capturedConfig?.onboardingProgress).toMatchObject({ stage: "research", tickerSymbol: "SPY" });
+
+    await pressEscape();
+    await waitUntil(() => completed !== null, "setup to close");
+    expect(completed?.onboardingComplete).toBe(true);
+    expect(capturedConfig?.onboardingComplete).toBe(true);
+    expect(notices).toEqual(["Could not save your setup."]);
   });
 
   test("imports a broker portfolio after the first manual position and opens its largest holding", async () => {
@@ -1311,5 +1857,167 @@ describe("OnboardingWizard", () => {
     await tui.emitKeypress({ name: "return", sequence: "\r", meta: true }, { trackPropagation: true });
     await waitForFrame("Connect Gloom Cloud");
     expect(capturedConfig?.onboardingProgress?.stage).toBe("account");
+  });
+
+  // The YOUR WORKSPACE card covered a floating 13F pane opened under it, and its Alt+Backspace acted on that pane.
+  test("the research coach takes its dismiss key ahead of the panes, and steps aside for a pane opened after it", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-coach-aside-"));
+    const reached: string[] = [];
+    const config = {
+      ...createDefaultConfig(tempDataDir),
+      onboardingProgress: { version: 1 as const, stage: "research" as const, path: "manual" as const, portfolioId: "main", tickerSymbol: "AAPL" },
+    };
+    await tui.render(
+      <WizardHarness config={config} pluginRegistry={createPluginRegistry()} after={<KeyProbe seen={reached} />} />,
+      { width: 100, height: 32 },
+    );
+    await tui.setup().renderOnce();
+    await waitForFrame("Built around AAPL");
+
+    // A pane opens: the card is gone, and the keys it showed are the pane's again.
+    const opened = { ...capturedConfig!, layout: { ...capturedConfig!.layout, instances: [
+      ...capturedConfig!.layout.instances, { instanceId: "13f:opened", paneId: "thirteenf" } as never,
+    ] } };
+    await act(async () => { capturedDispatch!({ type: "SET_CONFIG", config: opened }); });
+    await act(async () => { await Bun.sleep(20); await tui.setup().renderOnce(); });
+    expect(tui.frame()).not.toContain("Built around AAPL");
+    await tui.emitKeypress({ name: "backspace", meta: true }, { trackPropagation: true });
+    expect(reached).toEqual(["backspace"]);
+    expect(capturedConfig?.onboardingComplete).not.toBe(true);
+
+    // Closed again: the card is back, and its key acts on it before any pane sees it.
+    await act(async () => { capturedDispatch!({ type: "SET_CONFIG", config: { ...opened, layout: config.layout } }); });
+    await waitForFrame("Built around AAPL");
+    await tui.emitKeypress({ name: "backspace", meta: true }, { trackPropagation: true });
+    expect(reached).toEqual(["backspace"]);
+    await waitUntil(() => capturedConfig?.onboardingComplete === true, "the dismiss key finishes onboarding");
+  });
+
+  // Ctrl+P, as the card says, opened the command bar under the card: what was typed there went nowhere,
+  // Enter ran the first suggestion, and Esc closed the bar with the card still up.
+  test("the research coach steps aside while the command bar is open, and leaves it the typing and Esc", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-coach-bar-"));
+    const reached: string[] = [];
+    const config = {
+      ...createDefaultConfig(tempDataDir),
+      onboardingProgress: { version: 1 as const, stage: "research" as const, path: "manual" as const, portfolioId: "main", tickerSymbol: "AAPL" },
+    };
+    await tui.render(
+      <WizardHarness config={config} pluginRegistry={createPluginRegistry()} after={<KeyProbe seen={reached} />} />,
+      { width: 100, height: 32 },
+    );
+    await tui.setup().renderOnce();
+    await waitForFrame("Built around AAPL");
+
+    await act(async () => { capturedDispatch!({ type: "SET_COMMAND_BAR", open: true, query: "" }); });
+    await act(async () => { await Bun.sleep(20); await tui.setup().renderOnce(); });
+    expect(tui.frame()).not.toContain("Built around AAPL");
+    await tui.emitKeypress({ name: "m", sequence: "m" }, { trackPropagation: true });
+    await tui.emitKeypress({ name: "escape", sequence: "\u001b" }, { trackPropagation: true });
+    expect(reached).toEqual(["m", "escape"]);
+    expect(capturedConfig?.onboardingComplete).not.toBe(true);
+
+    // Closed without opening anything: the card is back where it was.
+    await act(async () => { capturedDispatch!({ type: "SET_COMMAND_BAR", open: false }); });
+    await waitForFrame("Built around AAPL");
+  });
+
+  // The card's Alt+Backspace ran in the field a pane had focused, finishing onboarding instead of deleting a word.
+  test("in a pane's text field Alt+Backspace deletes a word while the card shows, and the card shows no keys there", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-coach-field-"));
+    const text = { value: "berkshire hathaway" };
+    const config = {
+      ...createDefaultConfig(tempDataDir),
+      onboardingProgress: { version: 1 as const, stage: "research" as const, path: "manual" as const, portfolioId: "main", tickerSymbol: "AAPL" },
+    };
+    await tui.render(
+      <WizardHarness config={config} pluginRegistry={createPluginRegistry()} after={<FieldProbe text={text} />} />,
+      { width: 100, height: 32 },
+    );
+    await tui.setup().renderOnce();
+    await waitForFrame("Built around AAPL");
+    expect(tui.frame()).toContain("Keep exploring  Esc");
+
+    // The field has the keyboard.
+    Object.defineProperty(tui.setup().renderer, "currentFocusedEditor", { configurable: true, get: () => ({}) });
+    await tui.emitKeypress({ name: "backspace", meta: true }, { trackPropagation: true });
+    expect(text.value).toBe("berkshire ");
+    await act(async () => { await Bun.sleep(20); await tui.setup().renderOnce(); });
+    expect(tui.frame()).toContain("Built around AAPL");
+    expect(tui.frame()).not.toContain("Keep exploring  Esc");
+    expect(tui.frame()).not.toContain("Alt+Enter");
+    expect(capturedConfig?.onboardingComplete).not.toBe(true);
+
+    // Out of the field, the card's key is the card's again.
+    Object.defineProperty(tui.setup().renderer, "currentFocusedEditor", { configurable: true, get: () => null });
+    await tui.emitKeypress({ name: "backspace", meta: true }, { trackPropagation: true });
+    expect(text.value).toBe("berkshire ");
+    await waitUntil(() => capturedConfig?.onboardingComplete === true, "the dismiss key finishes onboarding");
+  });
+
+  test("a card button shows its letter only while no field is being typed in", () => {
+    expect(cardKey("s", true)).toBeUndefined();
+    expect(cardKey("s", false)).toBe("s");
+    // Keys a field does not type still work there.
+    expect(cardKey("Enter", true)).toBe("Enter");
+    const config = createDefaultConfig("/tmp/unused");
+    const shownWith = new Set([config.layout, ...config.layouts.map((saved) => saved.layout)]
+      .flatMap((layout) => layout.instances.map((instance) => instance.instanceId)));
+    expect(coachStepsAside(shownWith, config)).toBe(false);
+    // Another desk's panes were there when it came up: switching to it is not a new pane.
+    expect(coachStepsAside(shownWith, { ...config, layout: config.layouts[1]!.layout })).toBe(false);
+    expect(coachStepsAside(null, config)).toBe(false);
+  });
+
+  test("Back and Esc from Gloom Cloud return to the workspace it was opened from, never to the finished portfolio", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-cloud-back-"));
+    const config = {
+      ...createDefaultConfig(tempDataDir),
+      onboardingProgress: { version: 1 as const, stage: "research" as const, path: "manual" as const, portfolioId: "main", tickerSymbol: "AAPL", desks: [] },
+    };
+    await tui.render(<WizardHarness config={config} pluginRegistry={createPluginRegistry()} />, { width: 100, height: 32 });
+    await tui.setup().renderOnce();
+    const openCloud = async () => {
+      await tui.emitKeypress({ name: "return", sequence: "\r", meta: true });
+      await waitForFrame("Connect Gloom Cloud");
+    };
+    const backOnWorkspace = async () => {
+      await waitUntil(() => capturedConfig?.onboardingProgress?.stage === "research", "the workspace coach");
+      expect(await waitForFrame("Built around AAPL")).not.toContain("What do you hold?");
+    };
+
+    await openCloud();
+    await tui.clickFrameText("Back");
+    await backOnWorkspace();
+
+    // Esc first leaves the email field. The portfolio's digit no longer goes
+    // back to it, and the second Esc goes where the first Back did.
+    await openCloud();
+    await pressEscape();
+    await emitKeypress({ name: "1", sequence: "1" });
+    await act(async () => { await Bun.sleep(20); await tui.setup().renderOnce(); });
+    expect(capturedConfig?.onboardingProgress?.stage).toBe("account");
+    await pressEscape();
+    await backOnWorkspace();
+  });
+
+  test("the research coach shows Esc beside Keep exploring at 80x24, and Esc dismisses it", async () => {
+    tempDataDir = await mkdtemp(join(tmpdir(), "gloomberb-onboarding-coach-dismiss-"));
+    const config = {
+      ...createDefaultConfig(tempDataDir),
+      onboardingProgress: { version: 1 as const, stage: "research" as const, path: "manual" as const, portfolioId: "main", tickerSymbol: "IAG" },
+    };
+    await tui.render(<WizardHarness config={config} pluginRegistry={createPluginRegistry()} />, { width: 80, height: 24 });
+    await tui.setup().renderOnce();
+    const lines = (await waitForFrame("Keep exploring")).split("\n");
+    // Each key stays beside its button, inside the border.
+    const keep = lines.findIndex((line) => /Keep exploring\s+Esc/.test(line));
+    const connect = lines.findIndex((line) => /Connect free Cloud\s+Alt\+Enter/.test(line));
+    expect(keep).toBeGreaterThanOrEqual(0);
+    expect(connect).toBeGreaterThanOrEqual(keep);
+    for (const line of [lines[keep]!, lines[connect]!]) expect(line.trimEnd().endsWith("│")).toBe(true);
+
+    await pressEscape();
+    await waitUntil(() => capturedConfig?.onboardingComplete === true, "Esc finishes onboarding");
   });
 });

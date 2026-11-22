@@ -1,6 +1,7 @@
 import type { ChatMessage } from "../../../../api-client";
 import { t, tf } from "../../../../i18n";
 import { chatTextWithImages } from "../attachments/model";
+import { truncateWithEllipsis } from "../../../../utils/text-wrap";
 
 const USERNAME_MENTION = /(^|[^A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{2,29})(?![A-Za-z0-9_])/g;
 
@@ -20,10 +21,15 @@ export function chatMessageMentionsUsername(content: string, username: string): 
   return false;
 }
 
-/** The message as one short line, its images as `[image]` in front of the text. */
+/** The message on one line, its images as `[image]` in front of the text. */
+export function chatMessageLine(message: ChatMessage): string {
+  return chatTextWithImages(message.content, message.attachments?.length ?? 0).replace(/\s+/g, " ").trim();
+}
+
+/** The message as one short line. */
 function formatMessageSnippet(message: ChatMessage): string {
-  const normalized = chatTextWithImages(message.content, message.attachments?.length ?? 0).replace(/\s+/g, " ").trim();
-  return normalized.length > 72 ? `${normalized.slice(0, 69)}...` : normalized;
+  const normalized = chatMessageLine(message);
+  return truncateWithEllipsis(normalized, 72);
 }
 
 export function formatMentionToast(message: ChatMessage): string {

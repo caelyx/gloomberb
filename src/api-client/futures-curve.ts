@@ -11,6 +11,8 @@ export interface FuturesContractSpec {
   /** US dollars one tick makes on one contract. */
   tickValue: number
   settlement: "physical" | "cash"
+  /** What a cash-settled contract settles to where it is another contract's settlement: "the ICE Brent futures settlement". */
+  settlesTo?: string
 }
 
 /** What a futures symbol trades: the contract behind it, its terms and its latest confirmed settlement. */
@@ -41,8 +43,10 @@ export interface FuturesContractTermsPayload {
    * For a continuous symbol or a generic: how it rolls ("1 day before last
    * trade") and the first session it is on the next contract; the date is
    * null under the open interest switch. Absent from older servers.
+   * `mostTraded`: a continuous symbol that follows the most traded month
+   * (GC=F), whatever month it holds today.
    */
-  roll?: { label: string; date: string | null } | null
+  roll?: { label: string; date: string | null; mostTraded?: true } | null
   /**
    * The root's front contract (what its continuous symbol and first generic
    * price) when the symbol prices another one (NGF27, NG2); null on the front.
@@ -102,6 +106,12 @@ export interface FuturesContract {
   firstNotice?: string | null
   /** Past first notice: a long can be assigned delivery. */
   inDelivery?: boolean
+  /**
+   * A CME crypto contract's spot in the minute of its last trade: the close
+   * of the USD pair's one-minute bar that opened then. Null when no bar
+   * opened in that minute; absent on other roots and from older servers.
+   */
+  spot?: { symbol: string; price: number; minute: string } | null
 }
 
 export interface FuturesCurvePayload {
@@ -114,7 +124,11 @@ export interface FuturesCurvePayload {
   fetchedAt: string
   status: "available" | "partial" | "unavailable"
   stale: boolean
-  catalogue: { method: "provider" | "bounded-search"; complete: boolean; horizonEnd: string | null }
+  catalogue: {
+    method: "provider" | "bounded-search"; complete: boolean; horizonEnd: string | null
+    /** The contracts the provider lists that no quote resolved (NGZ31.NYM); absent from older servers. */
+    unresolved?: string[]
+  }
   contracts: FuturesContract[]
   ghosts: Array<{
     label: "1W" | "1M" | "1Y"
@@ -141,13 +155,30 @@ export interface FuturesCurvePayload {
     basis?: "last" | "settle" | null
     /** The leg that makes the spread thin (state "thin"): too few lots this session, or no trade in it. */
     thinSymbol?: string | null
+    /**
+     * The months between the front and `nextSymbol` the spread passed over:
+     * held too thinly to roll into (GCF27 beside GCG27). Absent from a server
+     * that does not say.
+     */
+    skippedSymbols?: string[] | null
     state: "contango" | "backwardation" | "flat" | "thin" | "unavailable"
   }
   gaps: string[]
+  /**
+   * A past curve's caveats about the prices it shows, never what it lacks:
+   * earlier prices of contracts that did not trade, last trades whose
+   * settlement is not archived yet. Absent from a live curve.
+   */
+  notes?: string[]
   /** The session the contracts' settlements are for; null when none is confirmed. */
   settlementDate?: string | null
   /** The root's contract terms; null where they are not listed. */
   spec?: FuturesContractSpec | null
+  /**
+   * A copy the server kept from an earlier read (`fetchedAt`), served because
+   * its source failed: every contract is marked stale for that.
+   */
+  cached?: boolean
 }
 
 
@@ -181,6 +212,9 @@ export interface FuturesCurveAsOfPayload {
     firstNotice?: string | null
     inDelivery?: boolean
   }>
+  /** What the curve lacks: no archive yet, no prices near the date, expired months missing. */
   gaps: string[]
+  /** Caveats about the prices shown, as `FuturesCurvePayload.notes`; `gaps` carries them too, for a client that reads no notes. */
+  notes?: string[]
   spec?: FuturesContractSpec | null
 }

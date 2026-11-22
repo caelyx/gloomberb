@@ -1,4 +1,6 @@
-import type { ScannerHiloExtreme, ScannerHiloPayload } from "../../../api-client";
+import { MISSING_VALUE } from "../../../utils/format";
+import type { ScannerHiloExtreme, ScannerHiloPayload, ScannerStatus } from "../../../api-client";
+import { venueMarketLine } from "../../../cli/pane-functions/freshness";
 
 type HiloWindowKey = keyof ScannerHiloPayload["windows"];
 export type HiloMinPrice = "off" | "1" | "5";
@@ -13,7 +15,7 @@ const HILO_WINDOW_ROWS: ReadonlyArray<{ key: HiloWindowKey; label: string }> = [
 
 /** Two decimals, four under a dollar, so a price column lines up. */
 export function formatHiloPrice(price: number): string {
-  if (!Number.isFinite(price)) return "--";
+  if (!Number.isFinite(price)) return MISSING_VALUE;
   return price.toLocaleString("en-US", { minimumFractionDigits: price < 1 ? 4 : 2, maximumFractionDigits: price < 1 ? 4 : 2 });
 }
 
@@ -93,4 +95,21 @@ export function filterHiloRows(
   return sort === "count"
     ? [...filtered].sort((left, right) => right.count - left.count || right.at - left.at)
     : [...filtered].sort((left, right) => right.at - left.at);
+}
+
+/**
+ * What an empty table says. The price filter when rows came in and it hid them all, or when the market is open and
+ * nothing has printed a new extreme yet. A closed market says so and when it reopens, on the status line's clocks
+ * (`Markets closed until Mon 13:30 UTC, 09:30 ET.`), as SCAN says its own close: its session has no new highs or lows
+ * to count.
+ */
+export function hiloEmptyState(
+  { filtered, status, now }: { filtered: boolean; status: ScannerStatus | undefined; now: number },
+): { title: string; hint?: string } {
+  if (filtered || status !== "closed") return { title: "Nothing above the price filter yet." };
+  const line = venueMarketLine("NYSE", now);
+  return {
+    title: line?.state !== "closed" ? "Market closed." : line.reopens ? `Markets closed until ${line.reopens}.` : "Markets closed.",
+    hint: "New highs and lows resume at the open.",
+  };
 }

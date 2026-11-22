@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { apiClient } from "../../../api-client";
 import { ConnectionHealthRegistry } from "../../../core/connection-health";
 import { createTestFinancials, createTestQuote } from "../../../test-support/data-provider";
@@ -6,7 +6,7 @@ import { MemoryPluginPersistence } from "../../../test-support/plugin-persistenc
 import { createTestTicker } from "../../../test-support/ticker";
 import { resolveTickerInstrumentKind } from "../../../tickers/instrument-kind";
 import { createDefaultConfig } from "../../../types/config";
-import type { TickerFinancials } from "../../../types/financials";
+import type { CompanyProfile, TickerFinancials } from "../../../types/financials";
 import type { TickerInstrumentKind } from "../../../types/instrument";
 import type { GloomPluginContext, TickerResearchTabDef } from "../../../types/plugin";
 import type { TickerRecord } from "../../../types/ticker";
@@ -36,6 +36,8 @@ import { shortInterestModule } from "../short-interest";
 import { thirteenFModule } from "../thirteenf";
 import { tickerDetailModule } from ".";
 import { buildVisibleTickerResearchTabs } from "./settings";
+import { groupTickerResearchTabs } from "./research-groups";
+import { PHARMA_SIGNALS_TAB_ID } from "./pharma-signals/eligibility";
 
 const modules: PluginModule[] = [
   tickerDetailModule, chartComposerModule, optionsModule, congressResearchModule,
@@ -95,12 +97,15 @@ const scenarios: Scenario[] = [
   { label: "existing statements remain visible for a fund", ticker: createTestTicker("VFIAX"), financials: { ...quoted("MUTUALFUND"), annualStatements: [{ date: "2025-12-31", totalAssets: 100 }] }, kind: "fund", visible: [...mutualFund, "financials"] },
 ];
 
-test("research visibility follows instrument and listing rules without hiding available fund or plugin research", async () => {
-  const config = createDefaultConfig(":memory:");
-  const tabs: TickerResearchTabDef[] = [];
-  // Collect shipping definitions without booting the catalog or reading data.
-  // Notes and Thesis subscribe during setup, so keep their collection signed out.
-  const signedOut = spyOn(apiClient, "isVerified").mockReturnValue(false);
+const config = createDefaultConfig(":memory:");
+const tabs: TickerResearchTabDef[] = [];
+const started: PluginModule[] = [];
+let signedOut: ReturnType<typeof spyOn> | null = null;
+
+// Collect shipping definitions without booting the catalog or reading data.
+// Notes and Thesis subscribe during setup, so keep their collection signed out.
+beforeAll(async () => {
+  signedOut = spyOn(apiClient, "isVerified").mockReturnValue(false);
   const context: Partial<GloomPluginContext> = {
     registerTickerResearchTab: (tab: TickerResearchTabDef) => { tabs.push(tab); },
     persistence: new MemoryPluginPersistence(),
@@ -115,23 +120,107 @@ test("research visibility follows instrument and listing rules without hiding av
     notify() {},
     on: () => () => {},
   };
-  const started: PluginModule[] = [];
-  try {
-    for (const module of modules) {
-      started.push(module);
-      await module.setup?.(context as GloomPluginContext);
-    }
-    tabs.push({ id: "external", name: "External", order: 100, component: () => null });
-    for (const scenario of scenarios) {
-      expect(resolveTickerInstrumentKind(scenario.ticker, scenario.financials), scenario.label).toBe(scenario.kind);
-      const visible = buildVisibleTickerResearchTabs(tabs, scenario.ticker, scenario.financials, {
-        config,
-        hasOptionsChain: scenario.hasOptionsChain ?? true,
-      });
-      expect(visible.map((tab) => tab.id).sort(), scenario.label).toEqual([...scenario.visible].sort());
-    }
-  } finally {
-    for (const module of started.reverse()) module.dispose?.();
-    signedOut.mockRestore();
+  for (const module of modules) {
+    started.push(module);
+    await module.setup?.(context as GloomPluginContext);
+  }
+  tabs.push({ id: "external", name: "External", order: 100, component: () => null });
+});
+
+afterAll(() => {
+  for (const module of started.reverse()) module.dispose?.();
+  signedOut?.mockRestore();
+});
+
+function visibleFor(scenario: Scenario) {
+  return buildVisibleTickerResearchTabs(tabs, scenario.ticker, scenario.financials, {
+    config,
+    hasOptionsChain: scenario.hasOptionsChain ?? true,
+  });
+}
+
+test("research visibility follows instrument and listing rules without hiding available fund or plugin research", () => {
+  for (const scenario of scenarios) {
+    expect(resolveTickerInstrumentKind(scenario.ticker, scenario.financials), scenario.label).toBe(scenario.kind);
+    expect(visibleFor(scenario).map((tab) => tab.id).sort(), scenario.label).toEqual([...scenario.visible].sort());
+  }
+});
+
+test("each asset type gets only the groups it has views for, and a one-view group is that view", () => {
+  const groupsOf = (label: string) => groupTickerResearchTabs(visibleFor(scenarios.find((scenario) => scenario.label === label)!))
+    .map((group) => `${group.name}: ${group.views.map((view) => view.id).join(" ")}`);
+  expect(groupsOf("AAPL equity")).toEqual([
+    "Overview: overview",
+    "Chart: chart",
+    "Financials: revenue equity-diagnostic dividend-yield",
+    "Analysts: analyst-research earnings-calls",
+    "Options: options",
+    "Events: corporate-actions catalysts mna",
+    "Filings: sec filing-events risk-factors",
+    "Ownership: holders insider thirteenf congress short-interest",
+    "People: executives jobs hiring-momentum",
+    "Buzz: news ticker-tweets app-attention",
+    "Notes: thesis notes",
+    // A plugin's own tab, after the built-in groups.
+    "External: external",
+  ]);
+  expect(groupsOf("SPY ETF")).toEqual([
+    "Overview: overview",
+    "Chart: chart",
+    "Financials: dividend-yield",
+    "Options: options",
+    "Events: corporate-actions",
+    "Ownership: thirteenf congress",
+    "Buzz: news ticker-tweets",
+    "Notes: thesis notes",
+    "External: external",
+  ]);
+  expect(groupsOf("7203.T foreign equity")).toEqual([
+    "Overview: overview",
+    "Chart: chart",
+    "Financials: equity-diagnostic dividend-yield",
+    "Analysts: analyst-research earnings-calls",
+    "Options: options",
+    "Events: corporate-actions catalysts mna",
+    "Ownership: holders",
+    "People: jobs hiring-momentum",
+    "Buzz: news app-attention",
+    "Notes: thesis notes",
+    "External: external",
+  ]);
+  expect(groupsOf("BTC-USD crypto")).toEqual([
+    "Overview: overview",
+    "Chart: chart",
+    "Buzz: news",
+    "Notes: thesis notes",
+    "External: external",
+  ]);
+});
+
+// The waitlist is for drug developers' holders: the profile decides, never the
+// sector alone, the name, a fund's theme or a profile still loading.
+test("Signals shows for biotech and drug makers only: not other healthcare, other industries, funds or an unread profile", () => {
+  const profiled = (instrumentType: string, profile: CompanyProfile) => createTestFinancials({ quote: createTestQuote({ instrumentType }), profile });
+  const cases: Array<[label: string, ticker: TickerRecord, financials: TickerFinancials | null | undefined, shown: boolean]> = [
+    ["VKTX biotech", createTestTicker("VKTX"), profiled("EQUITY", { sector: "Healthcare", industry: "Biotechnology" }), true],
+    ["PFE drug manufacturer", createTestTicker("PFE"), profiled("EQUITY", { sector: "Healthcare", industry: "Drug Manufacturers - General" }), true],
+    ["TEVA receipt, specialty and generic drugs", createTestTicker("TEVA"), profiled("ADR", { sector: "Healthcare", industry: "Drug Manufacturers - Specialty & Generic" }), true],
+    ["a US drug filer known by its SEC code", createTestTicker("CRMD"), profiled("EQUITY", { sic: "2834" }), true],
+    ["ISRG medical instruments", createTestTicker("ISRG"), profiled("EQUITY", { sector: "Healthcare", industry: "Medical Instruments & Supplies" }), false],
+    ["UNH healthcare plans", createTestTicker("UNH"), profiled("EQUITY", { sector: "Healthcare", industry: "Healthcare Plans" }), false],
+    ["TMO diagnostics and research", createTestTicker("TMO"), profiled("EQUITY", { sector: "Healthcare", industry: "Diagnostics & Research" }), false],
+    ["a diagnostics filer by SEC code", createTestTicker("DGX"), profiled("EQUITY", { sic: "2835" }), false],
+    ["a drug SEC code under another industry", createTestTicker("XYZ"), profiled("EQUITY", { industry: "Specialty Chemicals", sic: "2834" }), false],
+    ["AAPL consumer electronics", createTestTicker("AAPL"), profiled("EQUITY", { sector: "Technology", industry: "Consumer Electronics" }), false],
+    ["XBI biotech ETF", createTestTicker("XBI"), profiled("ETF", { name: "SPDR S&P Biotech ETF" }), false],
+    ["a fund whose profile names biotech", createTestTicker("BBH"), profiled("ETF", { sector: "Healthcare", industry: "Biotechnology" }), false],
+    ["a drug developer whose profile has not loaded", createTestTicker("VKTX", "Viking Therapeutics, Inc."), quoted("EQUITY"), false],
+    ["a drug developer with nothing loaded", createTestTicker("VKTX", "Viking Therapeutics, Inc."), undefined, false],
+  ];
+  for (const [label, ticker, financials, shown] of cases) {
+    const visible = buildVisibleTickerResearchTabs(tabs, ticker, financials, { config, hasOptionsChain: true });
+    expect(visible.some((tab) => tab.id === PHARMA_SIGNALS_TAB_ID), label).toBe(shown);
+    // Beside the catalysts, the last of Events.
+    if (shown) expect(groupTickerResearchTabs(visible).find((group) => group.id === "events")?.views.at(-1)?.id, label).toBe(PHARMA_SIGNALS_TAB_ID);
   }
 });

@@ -15,50 +15,73 @@ import {
   type ListingVenue,
 } from "../tickers/listing-venues";
 import { findUsListingOfCompany, type UsListing } from "../tickers/us-listing";
-import { findListingOfCompanyName, isCompanyNameInput, readTerminalCodeArg } from "../tickers/company-name-listing";
+import { listingDepositaryPair } from "../market-data/depositary-pair";
+import {
+  findListingOfCompanyName, isCompanyNameInput, marksAnotherListing, readTerminalCodeArg, serviceMarkedListing, serviceMarkedOtherListing, type CompanyNameListing,
+} from "../tickers/company-name-listing";
 import { movedAwayChange, startTickerChangeLookup, type MovedTickerChange } from "../tickers/ticker-changes";
-import { loadListingFate, MovedSymbolError, type ListingFate } from "../tickers/listing-fate";
+import { isVenueAbroad, lineMayHaveMoved, listingChangeLine, loadListingFate, MovedSymbolError, SUCCESSOR_CHANGE_WAIT_MS, type ListingFate } from "../tickers/listing-fate";
 import { quotedListingName } from "../tickers/listing-name";
+import { withdrawalLabel } from "../market-data/quotes/delisting";
 import { cliStyles } from "../utils/cli-output";
-import { groupByCompany, sameCompany, shortCompanyName } from "../tickers/company-name";
+import { companyLinesName, companyNameExtraWords, groupByCompany, namesDepositaryReceipt, sameCompany, sameCompanyName, sameListedName, shortCompanyName } from "../tickers/company-name";
 import {
   canonicalExchange,
+  displayTickerKey,
   exchangeCodeVenues,
   exchangeLabel,
+  exchangeName,
   isKnownExchangeCode,
   isSharedExchangeCode,
+  isUsEquityExchange,
   isUsListingExchange,
+  isUsOtcVenue,
+  usShareClassSpellings,
   parsePublicTickerKey,
   publicTickerKey,
   typedExchangeCode,
 } from "../utils/exchanges";
 import { withMarketData } from "./scoped-context";
 import { failWithFields } from "./errors";
-import { stripStrayEdges } from "./symbol-args";
-import { isNoProviderMessage, isProviderBusy } from "../sources/provider-errors";
-import { dashedCoinPair, MAJOR_COIN_NAMES } from "../utils/crypto-pair";
+import { stripStrayEdges, tickerShapedWord } from "./symbol-args";
+import { isNoProviderMessage, isNoSourceAnswer, isProviderBusy, isRateLimited, isTransientServiceFailure, notATickerSymbol } from "../sources/provider-errors";
+import { dashedCoinPair, exchangeLineCoinListing, isSpotCommodityOrCurrencyPair, MAJOR_COIN_NAMES, TOP_COIN_NAMES } from "../utils/crypto-pair";
 import { boardCoinFor, primeBoardCoins } from "./board-coins";
-import { knownGapMessage } from "./known-gaps";
+import { knownGapMessage, unquotedGapMessage } from "./known-gaps";
+import { renamedListingFor, renamedListingReadAs, renamedListingSymbol } from "../tickers/renamed-listings";
 import { currencyPairSpelling } from "../utils/currency-pair";
-import { bareFuturesCode, futuresContractByCode } from "../market-data/futures-board";
+import { bareFuturesCode, futuresContractByCode, futuresContractByWord, listedFuturesSymbol } from "../market-data/futures-board";
+import { commodityNameFuture } from "../market-data/commodity-names";
 import { classifyInstrumentType, kindFromListingSyntax } from "../tickers/instrument-kind";
 import type { InstrumentOfKind } from "../tickers/instrument-coverage";
-import { brokerIndexCode, brokerIndexReadAs } from "./index-roots";
+import { brokerIndexCode, brokerIndexReadAs, indexRootAlsoLine } from "./index-roots";
+import { indexRootFor } from "../tickers/index-roots";
+import { isFuturesInstrument } from "../market-data/futures-contract";
+import { continuousAliasGeneric } from "../utils/futures-generic";
 import {
   bloombergCodeOf,
   bloombergMarketHint,
   endsInLegalForm,
   isSearchOnlyVenue,
+  readLondonDottedSymbol,
   readNearMissListing,
+  readVenueFirstListing,
   readTerminalListingCode,
   terminalCodeReadAs,
   unknownBloombergMarket,
+  unreadBloombergCode,
+  type NearMissListing,
   type TerminalListingCode,
 } from "../tickers/terminal-codes";
+import { unreadBloombergCodeMessage } from "./terminal-code-hints";
+import { isKanjiOnlyName, japaneseNameChoice, japaneseNameReadAs, readExactJapaneseName, readJapaneseName, type JapaneseNameReading } from "../tickers/search/japanese-names";
 import { listingAbroadVenue } from "../utils/sec";
 import { savedAbroadForBareSymbol, savedUsListingOf } from "../tickers/search/bare-symbol";
 import { listingSuffixCandidate, listingSuffixVenue, tickerHasListingSuffix } from "../sources/listing-symbols";
-import { notTheCoinNote } from "./commands/crypto-hints";
+import { isCurrencyPairListing } from "../utils/fx-market-hours";
+import { coinElsewhereNote, notTheCoinNote } from "./commands/crypto-hints";
+import { fredSeriesArgument, fredSeriesNotListing } from "../series/fred-argument";
+import { commandWord } from "../utils/shell-word";
 
 /** The `--exchange` option of every command that takes a ticker. */
 export const EXCHANGE_OPTION = {
@@ -105,6 +128,23 @@ export interface ListingArg {
    * `readAs` asks about it, and a command the listing fails asks too.
    */
   meant?: { symbol: string; name: string };
+  /**
+   * A bare symbol a company's name was read as still says what it was read
+   * as (`listingChoiceNotes`): GETYQ for "getty images", whose NYSE line
+   * became GETYQ. Other bare symbols say where the data service chose instead.
+   */
+  readFromName?: true;
+  /**
+   * One word typed alone, read as a company's name (`Group` as UNH:NYSE):
+   * the words typed beside it are tried with it as one name first
+   * (`joinCompanyNameWords`), so "MTN Group" is MTN Group's listing.
+   */
+  wordAsName?: true;
+  /**
+   * The venue is the one search lists the company's name on (`companyListingArg`), so a quote that answers
+   * there is the listing's own, even on a US venue, whose quote answers as whichever one is asked.
+   */
+  venueFromSearch?: true;
 }
 
 /** "Did you mean JPM (JPMorgan Chase & Co.)?", for a name read as a fund or an index; empty for any other listing. */
@@ -148,10 +188,11 @@ export function parseListingArg(
   // A pasted ticker can bring the separator or quote marks that sat beside it (`UPST;`); search would ask for them.
   const stripped = stripStrayEdges(rawArg);
   const raw = stripped.text || rawArg;
-  // A terminal's code (WFC.N, "VOD LN", "JPM US Equity") is that listing (WFC:NYSE, VOD:LSE, JPM), and a symbol
-  // written nearly as one is (700.HK, 6758.JP, BRK/B) its working form (0700.HK, 6758.T, BRK-B).
+  // A terminal's code (WFC.N, "VOD LN", "JPM US Equity") is that listing (WFC:NYSE, VOD:LSE, JPM), a symbol
+  // written nearly as one is (700.HK, 6758.JP, BRK/B) its working form (0700.HK, 6758.T, BRK-B), and one written
+  // venue first, as spreadsheets write it (TYO:7203, LON:LSEG), the symbol on that venue (7203:JPX, LSEG:LSE).
   const terminal = terminalCode === undefined ? readTerminalListingCode(raw) : terminalCode;
-  const nearMiss = terminal ? null : readNearMissListing(raw);
+  const nearMiss = terminal ? null : readNearMissListing(raw) ?? (typedPerpetualListing(raw) ? null : readVenueFirstListing(raw));
   const reading = terminal ?? (nearMiss ? { typed: nearMiss.typed, key: nearMiss.symbol } : null);
   const parsed = parseCleanListingArg(reading?.key ?? raw, exchangeOption, { ownExchangeWins });
   const listing = listingSuffix ? readListingSuffix(parsed) ?? parsed : parsed;
@@ -169,13 +210,22 @@ function parseCleanListingArg(
   // VIX.X and $VIX.X, a broker's code for an index, are its own symbol ^VIX; $VIX is read in `resolveCliListing`.
   const index = option ? null : brokerIndexCode(raw);
   if (index && !index.bare) return { symbol: index.symbol, exchange: "", key: index.symbol, readAs: brokerIndexReadAs(index) };
+  // VX=F, the continuous symbol VIX futures do not have, is the front generic VX1.
+  const generic = option ? null : continuousAliasGeneric(raw);
+  // It says so, as a name read as a bare symbol does: VX1 is not what was typed.
+  if (generic) return { symbol: generic, exchange: "", key: generic, readAs: `Read ${raw.trim().toUpperCase()} as ${generic}, the front VIX future.`, readFromName: true };
   // A perpetual's market id (binance:BZUSDT, as PERP names it) is its listing on that venue (BZUSDT:BINANCE).
   let typed = (typedPerpetualListing(raw)?.key ?? raw).trim().replace(/^\$/, "").toUpperCase();
   // `SAN:` asks which listing; with --exchange it has its answer.
   if (option && typed.endsWith(":")) typed = typed.slice(0, -1);
   const venueKey = parsePublicTickerKey(typed);
-  // BTC/USD, as crypto venues write a pair, is the coin's own BTC-USD.
-  const parsed = { ...venueKey, symbol: dashedCoinPair(venueKey.symbol) ?? venueKey.symbol };
+  // A crypto exchange's line of a pair (BTC/GBP:COINBASE PRO, as search offered it) is the crypto venue's BTC-GBP:CCC.
+  const line = venueKey.exchange || optionCode ? exchangeLineCoinListing(venueKey.symbol, venueKey.exchange ?? optionCode) : null;
+  if (line) return { symbol: line.symbol, exchange: line.exchange, key: `${line.symbol}:${line.exchange}` };
+  // BTC/USD, as crypto venues write a pair, is the coin's own BTC-USD; spot crude (WTI/USD) and gold by the gram
+  // (GAU/USD:COMMODITY) are not coins, though tokens share their letters.
+  const coinPair = isSpotCommodityOrCurrencyPair(venueKey.symbol, venueKey.exchange ?? optionCode) ? null : dashedCoinPair(venueKey.symbol);
+  const parsed = { ...venueKey, symbol: coinPair ?? venueKey.symbol };
   const ownCode = parsed.exchange ? typedExchangeCode(typed) : "";
   let exchange = parsed.exchange ?? option;
   let code = ownCode || optionCode;
@@ -195,6 +245,9 @@ function parseCleanListingArg(
   if (pair && !pair.ambiguous) return { symbol: pair.symbol, exchange: "", key: pair.symbol };
   const shared = isSharedExchangeCode(code) ? { sharedCode: code } : {};
   if (exchange) return { symbol: parsed.symbol, exchange, key: `${parsed.symbol}:${exchange}`, ...shared };
+  // A contract as CTM prints it is its listing: ETHX26 is ETHX26.CME, CLZ26 is CLZ26.NYM.
+  const listed = listedFuturesSymbol(parsed.symbol);
+  if (listed) return { symbol: listed, exchange: "", key: listed };
   // A futures board code no security uses is its future: TTF is TTF=F.
   const symbol = bareFuturesCode(parsed.symbol)?.symbol ?? parsed.symbol;
   return { symbol, exchange, key: symbol };
@@ -204,6 +257,74 @@ export { listingVenues, type ListingDeps, type ListingVenue };
 
 function tradesOn(symbol: string, venues: readonly ListingVenue[]): string {
   return venues.length > 0 ? ` ${symbol} trades on: ${venues.map((venue) => venue.exchange).join(", ")}.` : "";
+}
+
+/** The companies a symbol's venues are asked about for their line on another venue: the first few, home lines first. */
+const MAX_COMPANIES_ASKED = 4;
+
+/**
+ * " Prudential plc trades on HKEX as 2378:HKEX." when a company that lists
+ * as `symbol` elsewhere has a line of its own on `exchange`: PRU on LSE is
+ * Prudential plc, whose Hong Kong line is 2378, and HSBC on NYSE is HSBC
+ * Holdings, whose is 0005. Each company is asked once, by one of its venues;
+ * empty when none has a line there or the service cannot say.
+ */
+async function companyLineOn(symbol: string, exchange: string, venues: readonly ListingVenue[], deps: ListingDeps): Promise<string> {
+  const { getIssuerListings } = deps.dataProvider;
+  if (!getIssuerListings) return "";
+  const byCompany = new Map<string, ListingVenue>();
+  for (const venue of [...venues].sort((a, b) => Number(!!b.home) - Number(!!a.home))) {
+    const company = venue.companyId ?? venue.name;
+    if (!byCompany.has(company)) byCompany.set(company, venue);
+  }
+  const asked = [...byCompany.values()].slice(0, MAX_COMPANIES_ASKED);
+  const issuers = await Promise.all(asked.map((venue) => Promise.resolve()
+    .then(() => getIssuerListings.call(deps.dataProvider, venue.symbol ?? symbol, venue.exchange))
+    .catch(logFailure("cli.listing-arg", "Read a company's listings failed", null))));
+  const lines = new Map<string, string>();
+  issuers.forEach((issuer, index) => {
+    const line = issuer?.listings.find((listing) => canonicalExchange(listing.exchange) === exchange);
+    if (!issuer || !line) return;
+    const key = parsePublicTickerKey(line.symbol).exchange ? displayTickerKey(line.symbol) : `${line.symbol}:${exchange}`;
+    // The name search writes the line asked about under, its home line first (Prudential plc), as ADR names it.
+    lines.set(key, `${companyLinesName(asked[index]!.name, issuer.name)} trades on ${exchange} as ${key}.`);
+  });
+  return [...lines.values()].map((line) => ` ${line}`).join("");
+}
+
+/** "PRU does not trade on HKEX. Prudential plc trades on HKEX as 2378:HKEX. PRU trades on: LSE, NYSE." */
+async function notTradedText(
+  listing: Pick<ListingArg, "symbol" | "exchange"> & { typed?: string },
+  venues: readonly ListingVenue[],
+  deps: ListingDeps,
+): Promise<string> {
+  const companyLine = await companyLineOn(listing.symbol, listing.exchange, venues, deps);
+  return marketCodeNotTradedText(listing, venues, companyLine)
+    ?? `${listing.symbol} does not trade on ${listing.exchange}.${companyLine}${tradesOn(listing.symbol, venues)}`;
+}
+
+/**
+ * "IS is Bloomberg's code for NSE, where AKBNK does not trade. Did you mean
+ * AKBNK TI (AKBNK:BIST)?" for a listing typed as a Bloomberg code (`AKBNK IS`,
+ * read as AKBNK on NSE) whose symbol trades elsewhere: the code says which
+ * venue it named, and each venue the symbol is on is written the way it was
+ * typed, so the next try is one step. Null for a listing not typed so.
+ */
+function marketCodeNotTradedText(
+  listing: Pick<ListingArg, "symbol" | "exchange"> & { typed?: string },
+  venues: readonly ListingVenue[],
+  companyLine: string,
+): string | null {
+  const code = listing.typed ? readTerminalListingCode(listing.typed) : null;
+  if (!code?.market || code.exchange !== listing.exchange || venues.length === 0) return null;
+  const symbol = code.symbol;
+  const choices = [...new Set(venues.map((venue) => {
+    const key = `${venue.symbol ?? symbol}:${venue.exchange}`;
+    const written = bloombergCodeOf(venue.symbol ?? symbol, venue.exchange);
+    return written ? `${written} (${key})` : key;
+  }))].slice(0, 3);
+  const meant = choices.length > 1 ? `${choices.slice(0, -1).join(", ")} or ${choices.at(-1)}` : choices[0]!;
+  return `${code.market} is Bloomberg's code for ${listing.exchange}, where ${symbol} does not trade.${companyLine} Did you mean ${meant}?`;
 }
 
 /** "Toronto Stock Exchange (TSX) or Tokyo Stock Exchange (JPX)". */
@@ -239,10 +360,11 @@ async function settleSharedCode(listing: ListingArg, deps: ListingDeps): Promise
   }
   const { exchange } = reading;
   const key = `${symbol}:${exchange}`;
-  const readAs = [
-    listing.readAs,
-    exchange === meanings[0] ? null : `Read ${symbol}:${code} as ${key}: ${code} is ${venueChoices(meanings)}, and ${symbol} trades on ${exchange}.`,
-  ].filter(Boolean).join(" ");
+  const why = exchange === meanings[0] ? "." : `: ${code} is ${venueChoices(meanings)}, and ${symbol} trades on ${exchange}.`;
+  // Written venue first (TSE:7203), one reading says where it went: "Read TSE:7203 as 7203:JPX: ...".
+  const typedAs = ` as ${symbol}:${code}.`;
+  const readAs = listing.readAs?.endsWith(typedAs) ? `${listing.readAs.slice(0, -typedAs.length)} as ${key}${why}`
+    : [listing.readAs, why === "." ? null : `Read ${symbol}:${code} as ${key}${why}`].filter(Boolean).join(" ");
   return { symbol, exchange, key, ...readAs ? { readAs } : {} };
 }
 
@@ -288,19 +410,34 @@ async function checkListingExchange(listing: ListingArg, deps: ListingDeps): Pro
  * failure stands. It searches, so ask only after a request came back empty.
  */
 export async function notTradedMessage(
-  listing: Pick<ListingArg, "symbol" | "exchange">,
+  listing: Pick<ListingArg, "symbol" | "exchange"> & { typed?: string },
   deps: ListingDeps,
 ): Promise<string | null> {
   if (!listing.exchange) return null;
   const venues = await listingVenues(listing.symbol, deps).catch(logFailure("cli.listing-arg", "Read listing venues failed", []));
+  // A line its exchange withdrew is on record, and says when it went and why.
+  const withdrawn = venues.find((venue) => venue.exchange === listing.exchange && venue.withdrawal);
+  if (withdrawn) return withdrawnListingMessage(listing, withdrawn);
   if (venues.length === 0 || venues.some((venue) => venue.exchange === listing.exchange)) return null;
   if (await quotedOnVenue(listing, deps)) return null;
-  return `${listing.symbol} does not trade on ${listing.exchange}.${tradesOn(listing.symbol, venues)}`;
+  return notTradedText(listing, venues, deps);
+}
+
+/**
+ * "0011:HKEX (Hang Seng Bank Limited): Delisted Jan 27, 2026 (Privatised by
+ * The Hongkong and Shanghai Banking Corporation Limited)." for a line its
+ * exchange withdrew: no source prices it any more.
+ */
+function withdrawnListingMessage(listing: Pick<ListingArg, "symbol" | "exchange">, venue: ListingVenue): string {
+  // The venue's name carries the day it went for a choice between listings; here the label says it.
+  const name = venue.name.split(" · ")[0]?.trim();
+  const key = `${listing.symbol}:${listing.exchange}`;
+  return `${key}${name && name.toUpperCase() !== listing.symbol.toUpperCase() ? ` (${name})` : ""}: ${withdrawalLabel(venue.withdrawal!)}.`;
 }
 
 /** Fails the command with `notTradedMessage`; returns when the symbol does trade there. */
 export async function failIfNotTraded(
-  listing: Pick<ListingArg, "symbol" | "exchange">,
+  listing: Pick<ListingArg, "symbol" | "exchange"> & { typed?: string },
   deps: ListingDeps,
   ctx: Pick<CliCommandContext, "fail">,
 ): Promise<void> {
@@ -328,6 +465,12 @@ export interface ListingDataRequest {
    * whatever came back (`failMovedSymbol`).
    */
   fate?: () => Promise<ListingFate>;
+  /**
+   * The listing's own quote, as the command reads it for itself: what says,
+   * without the fate, whether the line can have moved at all. A line whose
+   * quote trades is served as it comes back, with no lookup of its own.
+   */
+  quote?: Promise<Quote | null>;
 }
 
 /**
@@ -336,6 +479,15 @@ export interface ListingDataRequest {
  */
 export function isNoProviderError(error: unknown): boolean {
   return isNoProviderMessage(error instanceof Error ? error.message : String(error ?? ""));
+}
+
+/**
+ * The router's answer that no source served a request because one failed (a
+ * timeout, a rate limit, a refused session) rather than missed: it says
+ * nothing about whether the symbol exists, unlike "Not a ticker".
+ */
+export function isUnsettledNoProvider(error: unknown): boolean {
+  return isNoProviderError(error) && !isNoSourceAnswer(error);
 }
 
 const MAX_OTHER_LISTINGS = 5;
@@ -354,38 +506,149 @@ interface BareListingVenues {
   choose: boolean;
 }
 
-/** Whether the venues' companies differ by name. A venue with no name is no other company. */
-function listsSeveralCompanies(venues: readonly ListingVenue[]): boolean {
-  return groupByCompany(venues, (venue) => venue.name).length > 1;
+/** A venue that names its line by the code alone (BSE's "ITBEES" beside NSE's "Nippon India ETF Nifty IT"). */
+function namedByCode(symbol: string, venue: ListingVenue): boolean {
+  return venue.name.trim().toUpperCase() === (venue.symbol ?? symbol).toUpperCase();
 }
 
-/** Every other company that lists the symbol once, at its first venue in search order. */
-function otherCompanies(venues: readonly ListingVenue[], company: string): ListingVenue[] {
-  return groupByCompany(venues, (venue) => venue.name)
-    .filter((group) => !group.some((venue) => sameCompany(venue.name, company)))
+/**
+ * The companies whose lines the venues are, when the data service identifies
+ * any of them, each company's venues in search order. Venues with one id are
+ * one company, never two because each names it its own way (DHL Group AG on
+ * Xetra, Deutsche Post AG in Vienna). A venue with no id is a company's whose
+ * identified venue it is named like, or whose name that venue's company is
+ * known by besides (Deutsche Post AG, DHL Group's former name, on a line the
+ * service cannot link), else another company (BMW Industries on BSE beside
+ * Bayerische Motoren Werke on Xetra). A venue with no name, one that names its line by the code alone, and
+ * a receipt named like no company there are none. Null when no venue has an id.
+ */
+function identifiedCompanies(symbol: string, venues: readonly ListingVenue[]): ListingVenue[][] | null {
+  if (!venues.some((venue) => venue.companyId)) return null;
+  const groups: Array<{ id: string | null; venues: ListingVenue[] }> = [];
+  for (const venue of venues) {
+    if (!venue.companyId) continue;
+    const group = groups.find((entry) => entry.id === venue.companyId);
+    if (group) group.venues.push(venue);
+    else groups.push({ id: venue.companyId, venues: [venue] });
+  }
+  for (const venue of venues) {
+    if (venue.companyId || !venue.name.trim() || namedByCode(symbol, venue)) continue;
+    const named = (other: ListingVenue) => sameListedName(other.name, venue.name);
+    // Or named as the company is known besides: the former name the service sends on its rows (Deutsche Post AG).
+    const known = (other: ListingVenue) => (other.aliases ?? []).some((alias) => sameCompanyName(alias, venue.name));
+    const group = groups.find((entry) => entry.id && entry.venues.some((other) => !!other.companyId && (named(other) || known(other))))
+      ?? groups.find((entry) => !entry.id && entry.venues.some(named));
+    if (group) group.venues.push(venue);
+    else if (!namesDepositaryReceipt(venue.name)) groups.push({ id: null, venues: [venue] });
+  }
+  const order = (venue: ListingVenue) => venues.indexOf(venue);
+  return groups.map((group) => group.venues.sort((left, right) => order(left) - order(right)))
+    .sort((left, right) => order(left[0]!) - order(right[0]!));
+}
+
+/**
+ * Whether the venues are several companies' lines: by the data service's
+ * company ids where it gives any (`identifiedCompanies`). Without ids, the
+ * names decide: a venue with no name is no other company, nor is one that
+ * names its line by the code alone.
+ */
+function listsSeveralCompanies(symbol: string, venues: readonly ListingVenue[]): boolean {
+  const identified = identifiedCompanies(symbol, venues);
+  if (identified) return identified.length > 1;
+  return groupByCompany(venues, (venue) => namedByCode(symbol, venue) ? "" : venue.name).length > 1;
+}
+
+/**
+ * The venue a bare code goes to: the line the data service marks as its
+ * company's home, else the first search lists with a real name, never one
+ * that names its line by the code alone when another names it, and NSE,
+ * India's main venue, before BSE whichever search listed first.
+ */
+function homeVenue(symbol: string, venues: readonly ListingVenue[]): ListingVenue | null {
+  const home = venues.find((venue) => venue.home && !venue.withdrawal);
+  if (home) return home;
+  const named = venues.filter((venue) => !namedByCode(symbol, venue));
+  const candidates = named.length ? named : venues;
+  const first = candidates[0] ?? null;
+  return first?.exchange === "BSE" ? candidates.find((venue) => venue.exchange === "NSE") ?? first : first;
+}
+
+/**
+ * Every other company or fund that lists the symbol, once, at its first venue
+ * in search order. A venue is another's only when its name says so: one with
+ * no name, or a depositary receipt named unlike the company (a CEDEAR's short
+ * form of its fund's name), is left out rather than guessed at, and one
+ * fund's venues are one fund however each words it (`sameListedName`).
+ */
+function otherCompanies(symbol: string, venues: readonly ListingVenue[], company: string, chosen?: ListingVenue): ListingVenue[] {
+  // A line the data service identifies is told apart by its id, never by a name difference (`identifiedCompanies`).
+  const identified = chosen?.companyId ? identifiedCompanies(symbol, venues) : null;
+  if (identified) return identified.filter((group) => !group.includes(chosen!)).map((group) => group[0]!);
+  if (!company.trim()) return [];
+  const known = venues.filter((venue) => !namesDepositaryReceipt(venue.name) || sameListedName(venue.name, company));
+  return groupByCompany(known, (venue) => venue.name, sameListedName)
+    .filter((group) => !group.some((venue) => sameListedName(venue.name, company)))
     .map((group) => group[0]!);
 }
 
 /**
- * "CAR = Avis Budget Group, NASDAQ (also XETRA, ASX)": the listing a bare
- * symbol several companies list was read on, and where the others list it.
- * Null when one company lists it, so a symbol that means one thing says
- * nothing.
+ * "CAR = Avis Budget Group, NASDAQ (different companies on XETRA, ASX)": the
+ * listing a bare symbol several companies list was read on, and where the
+ * others list it. A bare symbol the data service read on the largest
+ * company's home listing abroad says so, as "SXR8 -> XETRA" does, with each
+ * other company's line: "BMW -> XETRA (Bayerische Motoren Werke); also
+ * BMW:BSE, Bmw Industries". Null when no other company is known to list it,
+ * so a symbol that means one thing (XLK, and its receipt in Buenos Aires)
+ * says nothing.
  */
 export function listingChoiceNote(
   symbol: string,
   chosen: { exchange: string; name?: string | null },
   venues: readonly ListingVenue[],
 ): string | null {
-  if (!chosen.exchange || !listsSeveralCompanies(venues)) return null;
+  if (!chosen.exchange) return null;
   const chosenVenue = venues.find((venue) => venue.exchange === chosen.exchange);
   const name = chosen.name?.trim() || chosenVenue?.name || "";
-  const others = otherCompanies(venues, chosenVenue?.name || name).map((venue) => venue.exchange)
-    .filter((exchange) => exchange !== chosen.exchange);
+  const otherVenues = otherCompanies(symbol, venues, chosenVenue?.name || name, chosenVenue)
+    .filter((venue) => venue.exchange !== chosen.exchange);
+  const others = otherVenues.map((venue) => venue.exchange);
   if (others.length === 0) return null;
   const more = others.length - MAX_OTHER_LISTINGS;
-  const also = `${others.slice(0, MAX_OTHER_LISTINGS).join(", ")}${more > 0 ? ` and ${more} more: gloom search ${symbol}` : ""}`;
-  return `${symbol} = ${name ? `${shortCompanyName(name)}, ` : ""}${chosen.exchange} (also ${also})`;
+  if (isVenueAbroad(chosen.exchange)) {
+    const also = otherVenues.slice(0, MAX_OTHER_LISTINGS)
+      .map((venue) => `${venueKey(symbol, venue)}${venue.name ? `, ${shortCompanyName(venue.name)}` : ""}`).join("; ");
+    return `${symbol} -> ${chosen.exchange}${name ? ` (${shortCompanyName(name)})` : ""}; also ${also}${more > 0 ? ` and ${more} more: gloom search ${symbol}` : ""}`;
+  }
+  const named = `${others.slice(0, MAX_OTHER_LISTINGS).map(venueInProse).join(", ")}${more > 0 ? ` and ${more} more: gloom search ${symbol}` : ""}`;
+  const which = others.length === 1 ? "a different company" : "different companies";
+  return `${symbol} = ${name ? `${shortCompanyName(name)}, ` : ""}${exchangeName(chosen.exchange)} (${which} on ${named})`;
+}
+
+/**
+ * "CON = Concentra Group (NYSE); Continental AG is CON:XETRA": a bare symbol
+ * read on a US company while another company's main listing abroad (the line
+ * the data service marks as its home) carries the symbol too. Companies are
+ * told apart by the service's ids where both lines carry one, else by name.
+ * Null when no other company's main listing carries it.
+ */
+export function otherCompanyHomeNote(
+  symbol: string,
+  chosen: { exchange: string; name?: string | null },
+  venues: readonly ListingVenue[],
+): string | null {
+  const chosenVenue = venues.find((venue) => venue.exchange === chosen.exchange);
+  const name = chosen.name?.trim() || chosenVenue?.name || "";
+  const id = chosenVenue?.companyId;
+  const home = venues.find((venue) => venue.home && !venue.withdrawal && !isUsListingExchange(venue.exchange)
+    && (id && venue.companyId ? venue.companyId !== id : !!name && !sameListedName(venue.name, name)));
+  if (!home) return null;
+  return `${symbol} = ${name ? `${shortCompanyName(name)} ` : ""}(${chosen.exchange}); ${home.name} is ${venueKey(symbol, home)}`;
+}
+
+/** A venue as a sentence names it, in full: "the Warsaw Stock Exchange", "Xetra", "NASDAQ" (a name that is its code). */
+function venueInProse(code: string): string {
+  const name = exchangeName(code);
+  return /\b(?:Exchange|Bourse|Market)$/.test(name) ? `the ${name}` : name;
 }
 
 // Quotes of these never name a company's listing, so they are never a choice between companies.
@@ -410,43 +673,94 @@ export function listingReadNotes(listing: Pick<ListingArg, "readAs">): string[] 
 }
 
 /**
+ * The coin line for a bare coin ticker (SOL, ETH) a command read as a listing that is
+ * not the coin, from the quote it was read on (`notTheCoinNote`). A list, so a command can
+ * spread it into its warnings. A named listing (`ETH:ARCA`, `--exchange`) asked for that
+ * listing on purpose and gets none.
+ */
+export function coinListingNotes(
+  listing: Pick<CliListing, "symbol" | "exchange">,
+  quote: Pick<Quote, "name" | "instrumentType" | "stale" | "delisting"> | null | undefined,
+): string[] {
+  const note = listing.exchange ? null : notTheCoinNote(listing.symbol, quote);
+  return note ? [note] : [];
+}
+
+/**
+ * `coinListingNotes` for each listing of a list (CORR RIOT,BTC), asked only
+ * of a bare top coin code, whose quote alone says whether it is the coin.
+ */
+export async function listCoinNotes(
+  listings: ReadonlyArray<Pick<CliListing, "symbol" | "exchange" | "request">>,
+  deps: Pick<ListingDeps, "dataProvider">,
+): Promise<string[]> {
+  const bare = listings.filter((listing) => !listing.exchange && TOP_COIN_NAMES.has(listing.symbol));
+  const quotes = await Promise.all(bare.map((listing) => loadListingQuote(deps.dataProvider, listing)));
+  return bare.flatMap((listing, index) => coinListingNotes(listing, quotes[index]));
+}
+
+/**
  * `listingChoiceNote` for a listing a command resolved, from the quote it was
  * read on: only a bare symbol went where the data service chose. A named
  * listing whose code names several venues says which it was read as
- * (`listingReadNotes`). A list, so a command can spread it into its warnings.
+ * (`listingReadNotes`). A bare coin ticker read as another listing ends with
+ * the coin's pair (`coinListingNotes`). A list, so a command can spread it into
+ * its warnings.
  */
 export async function listingChoiceNotes(
-  listing: Pick<CliListing, "symbol" | "exchange" | "saved" | "readAs">,
+  listing: Pick<CliListing, "symbol" | "exchange" | "saved" | "readAs" | "readFromName">,
   deps: ListingDeps,
-  quote: Pick<Quote, "name" | "listingExchangeName" | "exchangeName" | "instrumentType"> | null | undefined,
+  quote: Pick<Quote, "name" | "listingExchangeName" | "exchangeName" | "instrumentType" | "stale" | "delisting" | "isDepositaryReceipt">
+    | null | undefined,
   /** The venues `loadBareVenues` already started; looked up here when not given. */
   venues?: Promise<ListingVenue[]> | null,
 ): Promise<string[]> {
-  if (!isBareListing(listing)) return listingReadNotes(listing);
-  if (!quote || UNLISTED_TYPES.has(quote.instrumentType?.trim().toUpperCase() ?? "")) return [];
+  const coin = coinListingNotes(listing, quote);
+  if (!isBareListing(listing)) return [...listingReadNotes(listing), ...coin];
+  // A bare symbol a name was read as says so: "Read "getty images" as GETYQ (...). GETY became GETYQ on 2026-10-22."
+  if (listing.readFromName) return [...listingReadNotes(listing), ...coin];
+  if (!quote || UNLISTED_TYPES.has(quote.instrumentType?.trim().toUpperCase() ?? "")) return coin;
   const exchange = canonicalExchange(quote.listingExchangeName || quote.exchangeName);
-  if (!exchange) return [];
-  const listed = await (venues ?? loadBareVenues(listing, deps) ?? []);
+  if (!exchange) return coin;
+  // A bare symbol read on a company's own US line (JPM on NYSE) is what it means: companies abroad sharing the
+  // letters are named only when one has its main listing under them (CON, Continental AG's on Xetra), from the
+  // venues already asked for. A US receipt (SAN, Banco Santander's) may still be meant for another (Sanofi's SAN:EPA).
+  if (isUsListingExchange(exchange) && quote.isDepositaryReceipt !== true) {
+    const listed = venues ? await venues : [];
+    const other = otherCompanyHomeNote(listing.symbol, { exchange, name: quote.name }, listed);
+    return [...other ? [other] : [], ...coin];
+  }
+  const [listed, marked] = await Promise.all([
+    venues ?? loadBareVenues(listing, deps) ?? [],
+    // A primary listing the service names by the word, off the venue picked: NTT is NTT, Inc. (9432 on JPX), not Warsaw's NTT.
+    serviceMarkedOtherListing(deps.dataProvider, listing.symbol, exchange).catch(logFailure("cli.listing-arg", "Read the listing a word names failed", null)),
+  ]);
   const note = listingChoiceNote(listing.symbol, { exchange, name: quote.name }, listed);
-  return note ? [note] : [];
+  const marking = marked ? `${marked.symbol}:${marked.exchange} ${marked.name}` : null;
+  const named = quote.name?.trim() ? `${shortCompanyName(quote.name)}, ` : "";
+  // A note that already lists others ("; also BMW:BSE, Bmw Industries") takes the marked listing among them.
+  const choice = !marking ? note
+    : note?.includes("; also ") ? `${note}; ${marking}`
+    : `${note ?? `${listing.symbol} = ${named}${exchangeName(exchange)}`}; also ${marking}`;
+  return [...choice ? [choice] : [], ...coin];
 }
 
 /**
  * `listingChoiceNotes` for a command with no quote of its own to read the
  * listing from (`fn`): it loads the listing's quote, and only for a bare
  * symbol, so a named or saved listing costs nothing. A bare coin ticker read
- * as a fund (BTC, the Grayscale trust) ends with `quote`'s note naming the
- * coin's pair.
+ * as another listing (BTC, the Grayscale trust) ends with the coin's pair.
  */
 export async function quotedListingChoiceNotes(
-  listing: Pick<CliListing, "symbol" | "exchange" | "saved" | "request" | "readAs">,
+  listing: Pick<CliListing, "symbol" | "exchange" | "saved" | "request" | "readAs" | "readFromName">,
   deps: ListingDeps,
+  /** A command that draws the listing's prices (`fn HP`) names the index or future a code it reads is typed for (`ownedCodeNotes`). */
+  { pricesFor }: { pricesFor?: string } = {},
 ): Promise<string[]> {
   const venues = loadBareVenues(listing, deps);
   if (!venues) return listingReadNotes(listing);
   const quote = await loadListingQuote(deps.dataProvider, listing);
-  const coin = notTheCoinNote(listing.symbol, quote);
-  return [...await listingChoiceNotes(listing, deps, quote, venues), ...coin ? [coin] : []];
+  return [...await listingChoiceNotes(listing, deps, quote, venues), ...pricesFor ? ownedCodeNotes(listing, quote, pricesFor) : []];
 }
 
 /**
@@ -465,21 +779,51 @@ export async function usLineOfListing(
 }
 
 /**
- * The company's own listing on a US exchange: its line under the same symbol
- * (SAN:MCE's New York receipt), else the one search finds by its name
- * (Sanofi's SNY for SAN:EPA, Toyota's TM for 7203:JPX). Funds and contracts
- * that carry its name are not its listing. Null for a listing in the US or
- * with no venue, and when the company has no US line search knows.
+ * The US line a listing abroad's own quote names as its depositary receipt
+ * (0700:HKEX's TCEHY, 9988:HKEX's BABA), on the venue the receipt's quote is
+ * from: a US exchange, or over the counter (canonically OTC). Null when the
+ * quote names none, the listing is the receipt, or the receipt trades
+ * outside the US (Tencent's HTCD on SGX).
+ */
+async function depositaryReceiptLine(quote: Quote | null, deps: Pick<ListingDeps, "dataProvider">): Promise<UsListing | null> {
+  const pair = listingDepositaryPair({ quote });
+  if (!pair || quote?.isDepositaryReceipt === true) return null;
+  const receipt = await deps.dataProvider.getQuote(pair.receipt, "").catch(logFailure("cli.listing-arg", "Read a depositary receipt's quote failed", null));
+  const venue = canonicalExchange(receipt?.listingExchangeName || receipt?.exchangeName || "");
+  const exchange = isUsListingExchange(venue) ? venue : isUsOtcVenue(venue) ? "OTC" : null;
+  return receipt && exchange ? { symbol: pair.receipt, exchange, name: receipt.name ?? quote?.name ?? pair.receipt } : null;
+}
+
+/** A company's US line as a function abroad offers it: `line` when its data covers it; `otc` the line over the counter it does not. */
+interface UsLineOffer {
+  line: UsListing | null;
+  otc: UsListing | null;
+}
+
+/**
+ * The company's own listing in the US: its line under the same symbol
+ * (SAN:MCE's New York receipt), else the receipt its quote names (Tencent's
+ * TCEHY for 0700:HKEX), else the one search finds by its name (Sanofi's SNY
+ * for SAN:EPA, Toyota's TM for 7203:JPX). Funds and contracts that carry its
+ * name are not its listing. A line over the counter is offered only with
+ * `otc`, for data that covers one (FINRA's short interest); otherwise it is
+ * named apart. Nothing for a listing in the US or with no venue, and when
+ * the company has no US line search knows.
  */
 async function usListingOfCompany(
   listing: Pick<ListingArg, "symbol" | "exchange">,
   company: string | null | undefined,
   deps: ListingDeps,
-): Promise<UsListing | null> {
+  quote: Quote | null,
+  otc: boolean,
+): Promise<UsLineOffer> {
   const sameSymbol = await usLineOfListing(listing, company, deps);
-  if (sameSymbol) return { ...sameSymbol, symbol: listing.symbol };
-  if (!listing.exchange || isUsListingExchange(listing.exchange)) return null;
-  return findUsListingOfCompany(deps.dataProvider, company);
+  if (sameSymbol) return { line: { ...sameSymbol, symbol: listing.symbol }, otc: null };
+  if (!listing.exchange || isUsListingExchange(listing.exchange)) return { line: null, otc: null };
+  const receipt = await depositaryReceiptLine(quote, deps);
+  if (receipt && (otc || receipt.exchange !== "OTC")) return { line: receipt, otc: null };
+  const searched = await findUsListingOfCompany(deps.dataProvider, company, { otc });
+  return { line: searched, otc: searched ? null : receipt };
 }
 
 /**
@@ -489,25 +833,40 @@ async function usListingOfCompany(
  * symbol: "Time and sales covers US listings only, and SAN:EPA is Sanofi on
  * Euronext Paris (EPA).", then the company's US listing with the command that
  * asks for it ("Sanofi's US listing: SNY (try: gloom fn TAS SNY)"), or that
- * none was found.
+ * none was found. With `otc` (usListingsOtc) a line over the counter is
+ * offered too, said to be one ("Tencent Holdings's US listing: TCEHY, over
+ * the counter"); without it such a line is named as one the data does not
+ * cover, never offered.
  */
 export async function usListingsOnlyMessage(
   what: string,
   listing: Pick<CliListing, "symbol" | "exchange" | "key" | "request" | "saved">,
   deps: ListingDeps,
   retry: (key: string) => string | null,
+  { otc = false }: { otc?: boolean } = {},
 ): Promise<{ message: string; details: string }> {
   const quote = await loadListingQuote(deps.dataProvider, listing);
   const company = listingIdentity(listing, quote).name;
-  const named = company ? `${shortCompanyName(company)} on ${exchangeLabel(listing.exchange)}` : exchangeLabel(listing.exchange);
-  const us = await usListingOfCompany(listing, company, deps);
+  // A listing read from its vendor suffix (7203.T) or its quote has no venue typed: it is the one its quote is from.
+  const venue = canonicalExchange(listing.exchange || quote?.listingExchangeName || quote?.exchangeName || "");
+  const suffix = listing.exchange ? null : listingSuffixCandidate(listing.symbol);
+  const local = { symbol: suffix && canonicalExchange(suffix.exchange) === venue ? suffix.symbol : listing.symbol, exchange: venue };
+  // A currency pair has no listing anywhere: say what it is, never "GBP/USD on ." or the code of a venue.
+  if (isCurrencyPairListing(listing.symbol, venue)) {
+    return { message: `${what} covers US listings only, and ${listing.key} is a currency pair.`, details: "A currency pair trades over the counter, with no exchange volume to follow." };
+  }
+  const where = venue ? exchangeLabel(venue) : "";
+  const named = company ? `${shortCompanyName(company)}${where ? ` on ${where}` : ""}` : where || "not a US listing";
+  const { line: us, otc: outside } = await usListingOfCompany(local, company, deps, quote, otc);
   const owner = company ? shortCompanyName(company) : listing.key;
   const command = us ? retry(us.symbol) : null;
   return {
     message: `${what} covers US listings only, and ${listing.key} is ${named}.`,
     details: us
-      ? `${owner}'s US listing: ${us.symbol}${command ? ` (try: ${command})` : ""}`
-      : `No US listing of ${owner} was found.`,
+      ? `${owner}'s US listing: ${us.symbol}${us.exchange === "OTC" || isUsOtcVenue(us.exchange) ? ", over the counter" : ""}${command ? ` (try: ${command})` : ""}`
+      : outside
+        ? `${owner} has no US exchange listing; its US line ${outside.symbol} trades over the counter, which this data does not cover.`
+        : `No US listing of ${owner} was found.`,
   };
 }
 
@@ -517,12 +876,35 @@ export async function usListingsOnlyMessage(
  * Aramco in Riyadh): then it asks, and none of the venues is the answer. Null
  * when it named its exchange.
  */
-async function bareListingVenues(listing: BareListing, deps: ListingDeps): Promise<BareListingVenues | null> {
+/** How long a bare symbol's venue search that failed for a moment waits before it is asked once more. */
+const VENUE_RETRY_WAIT_MS = 1_000;
+
+async function bareListingVenues(
+  listing: BareListing,
+  deps: ListingDeps,
+  /**
+   * A search that failed for a reason that says nothing of the symbol is
+   * thrown: a list's 8306 read "Not a ticker" when its search was turned
+   * away, where alone it asks which exchange. A busy moment is asked once
+   * more first; the request limit never is.
+   */
+  { failTransient = false }: { failTransient?: boolean } = {},
+): Promise<BareListingVenues | null> {
   if (listing.exchange) return null;
-  const venues = await listingVenues(listing.symbol, deps).catch(logFailure("cli.listing-arg", "Read listing venues failed", []));
+  const read = () => listingVenues(listing.symbol, deps, { failTransient });
+  const venues = await (failTransient
+    ? read().catch(async (error: unknown) => {
+      if (!isTransientServiceFailure(error)) throw error;
+      await new Promise((resolve) => setTimeout(resolve, VENUE_RETRY_WAIT_MS));
+      return read();
+    })
+    : read()).catch((error: unknown) => {
+    if (failTransient && (isTransientServiceFailure(error) || isRateLimited(error))) throw error;
+    return logFailure("cli.listing-arg", "Read listing venues failed", [] as ListingVenue[])(error);
+  });
   const savedExchange = canonicalExchange(listing.saved?.metadata.exchange);
-  if (!savedExchange && listsSeveralCompanies(venues)) return { exchange: "", resolved: null, others: venues, choose: true };
-  const resolved = venues.find((venue) => venue.exchange === savedExchange) ?? (savedExchange ? null : venues[0] ?? null);
+  if (!savedExchange && listsSeveralCompanies(listing.symbol, venues)) return { exchange: "", resolved: null, others: venues, choose: true };
+  const resolved = venues.find((venue) => venue.exchange === savedExchange) ?? (savedExchange ? null : homeVenue(listing.symbol, venues));
   const exchange = resolved?.exchange ?? savedExchange;
   if (!exchange) return null;
   return { exchange, resolved, others: venues.filter((venue) => venue !== resolved && venue.exchange !== savedExchange), choose: false };
@@ -546,9 +928,9 @@ interface OtherListingsMessage {
  * --range 5Y` keeps the options. Null where the request names listings alone.
  */
 function retryCommand(request: Pick<ListingDataRequest, "command" | "retry">, key: string): string | null {
-  if (request.retry !== undefined) return request.retry?.(key) ?? null;
+  if (request.retry !== undefined) return request.retry?.(commandWord(key)) ?? null;
   const [command, ...options] = request.command.split(" ");
-  return ["gloom", command, key, ...options].join(" ");
+  return ["gloom", command, commandWord(key), ...options].join(" ");
 }
 
 /**
@@ -556,38 +938,56 @@ function retryCommand(request: Pick<ListingDataRequest, "command" | "retry">, ke
  * code a security keeps (GC, NG) when that security has no data: the future is
  * the other thing the code names. Null for any other symbol.
  */
-export function futuresTryLine(symbol: string, request: ListingDataRequest): string | null {
-  const future = futuresContractByCode(symbol);
+export function futuresTryLine(symbol: string, request: ListingDataRequest, { words = false }: { words?: boolean } = {}): string | null {
+  // With `words`, a commodity's word (BRENT, GOLD) names its future too, beside the securities that share it.
+  const future = futuresContractByCode(symbol) ?? (words ? futuresContractByWord(symbol) : null);
   if (!future) return null;
   const retry = retryCommand(request, future.symbol);
   return `${future.symbol} ${future.name} future${retry ? ` (try: ${retry})` : ""}`;
+}
+
+/** A venue's listing as its key names it: under its own symbol there (BP:LSE for `BP.`), else the one asked for. */
+function venueKey(symbol: string, venue: Pick<ListingVenue, "exchange" | "symbol">): string {
+  return `${venue.symbol ?? symbol}:${venue.exchange}`;
 }
 
 function describeOtherListings(
   listing: BareListing,
   { exchange, resolved, others, choose }: BareListingVenues,
   request: ListingDataRequest,
+  /** Listings just asked that had none: named as having none, never offered to try. */
+  without: readonly ListingVenue[] = [],
 ): OtherListingsMessage | null {
-  const future = futuresTryLine(listing.symbol, request);
-  if (others.length === 0 && !future) return null;
+  // BRENT's listings are two ETPs: Brent crude itself is the future BZ=F, offered beside them.
+  const future = futuresTryLine(listing.symbol, request, { words: true });
+  const offered = others.filter((venue) => !without.includes(venue));
+  if (offered.length === 0 && !future && without.length === 0) return null;
   const name = resolved?.name || listing.saved?.metadata.name?.trim() || "";
-  const lines = others.slice(0, MAX_OTHER_LISTINGS).map((venue) => {
-    const key = `${listing.symbol}:${venue.exchange}`;
+  const lines = offered.slice(0, MAX_OTHER_LISTINGS).map((venue) => {
+    const key = venueKey(listing.symbol, venue);
     const retry = retryCommand(request, key);
     return `${key}${venue.name ? ` ${venue.name}` : ""}${retry ? ` (try: ${retry})` : ""}`;
   });
-  if (others.length > MAX_OTHER_LISTINGS) lines.push(`and ${others.length - MAX_OTHER_LISTINGS} more: gloom search ${listing.symbol}`);
+  if (offered.length > MAX_OTHER_LISTINGS) lines.push(`and ${offered.length - MAX_OTHER_LISTINGS} more: gloom search ${listing.symbol}`);
   if (future) lines.push(future);
-  const heading = choose ? "Listings" : "Other listings";
+  // Every other listing was asked and had nothing: they are named as such, with nothing to try.
+  const heading = choose ? "Listings" : lines.length === 0 ? `No ${request.noun} on its other listings either` : "Other listings";
+  const named = lines.length === 0 ? without : offered;
+  const listed = lines.length === 0 ? `${heading}: ${without.map((venue) => venueKey(listing.symbol, venue)).join(", ")}.`
+    : lines.length === 1 ? `${heading}: ${lines[0]}` : [`${heading}:`, ...lines.map((line) => `  ${line}`)].join("\n");
+  // A top coin's code (HYPE, SOL) none of the listings is: the coin may be what was meant.
+  const coin = coinElsewhereNote(listing.symbol, [...resolved ? [resolved] : [], ...others]
+    .map((venue) => ({ key: venueKey(listing.symbol, venue), name: venue.name })));
+  const details = coin ? `${listed}\n${coin}` : listed;
   return {
     // The symbol went to no venue, so none of them is said to lack the data.
     message: choose
       ? `Choose an exchange for ${listing.symbol}.`
       : `${listing.symbol} resolved to ${name ? `${name} (${exchange})` : exchange}, which has no ${request.noun}.`,
-    details: lines.length === 1 ? `${heading}: ${lines[0]}` : [`${heading}:`, ...lines.map((line) => `  ${line}`)].join("\n"),
+    details,
     heading,
-    listings: [...others.map((venue) => `${listing.symbol}:${venue.exchange}`), ...future ? [futuresContractByCode(listing.symbol)!.symbol] : []],
-    choices: others.slice(0, MAX_OTHER_LISTINGS).map((venue) => ({ key: `${listing.symbol}:${venue.exchange}`, name: venue.name || null })),
+    listings: [...named.map((venue) => venueKey(listing.symbol, venue)), ...future ? [(futuresContractByCode(listing.symbol) ?? futuresContractByWord(listing.symbol))!.symbol] : []],
+    choices: offered.slice(0, MAX_OTHER_LISTINGS).map((venue) => ({ key: venueKey(listing.symbol, venue), name: venue.name || null })),
     choose,
   };
 }
@@ -612,30 +1012,44 @@ async function otherListingsMessage(
   return venues && describeOtherListings(listing, venues, request);
 }
 
-/** The listing on one venue, as `SYM:EXCH` names it. */
-function namedListing(listing: CliListing, exchange: string): CliListing {
-  const key = `${listing.symbol}:${exchange}`;
+/** The listing on one venue, as `SYM:EXCH` names it, under the venue's own symbol when search lists one. */
+function namedListing(listing: CliListing, venue: Pick<ListingVenue, "exchange" | "symbol">): CliListing {
+  const { exchange } = venue;
+  const symbol = venue.symbol ?? listing.symbol;
+  const key = `${symbol}:${exchange}`;
   const saved = canonicalExchange(listing.saved?.metadata.exchange) === exchange ? listing.saved : null;
-  return { symbol: listing.symbol, exchange, key, saved, request: { symbol: key, exchange } };
+  return { symbol, exchange, key, saved, request: { symbol: key, exchange } };
 }
 
+/**
+ * Each listing's quote, null where it has none; `undefined` where the request
+ * itself failed, which says nothing of whether it has one.
+ */
 async function quoteListings(
   dataProvider: DataProvider,
   listings: readonly CliListing[],
   refresh: boolean,
   datesChangeBasis = false,
-): Promise<Array<Quote | null>> {
+): Promise<Array<Quote | null | undefined>> {
   if (listings.length === 0) return [];
   const targets = listings.map((listing) => listing.request);
   if (dataProvider.getQuotesBatch) {
     const results = await dataProvider.getQuotesBatch(targets, { forceRefresh: refresh, ...(datesChangeBasis ? { datesChangeBasis } : {}) })
-      .catch(logFailure("cli.listing-arg", "Read listing quote batch failed", []));
-    return targets.map((target, index) => (results.find((result) => result.target === target) ?? results[index])?.quote ?? null);
+      .catch(logFailure("cli.listing-arg", "Read listing quote batch failed", null));
+    if (!results) return targets.map(() => undefined);
+    return targets.map((target, index) => {
+      const result = results.find((entry) => entry.target === target) ?? results[index];
+      // No source quotes it, which is an answer; any other failure is none.
+      return result?.quote ?? (result && (result.error == null || isNoProviderError(result.error)) ? null : undefined);
+    });
   }
   return Promise.all(targets.map((target) => dataProvider.getQuote(target.symbol, target.exchange, {
     cacheMode: refresh ? "refresh" : "default",
     ...(datesChangeBasis ? { datesChangeBasis } : {}),
-  }).catch(logFailure("cli.listing-arg", "Read listing quote failed", null))));
+  }).catch((error: unknown) => {
+    logFailure("cli.listing-arg", "Read listing quote failed")(error);
+    return isNoProviderError(error) ? null : undefined;
+  })));
 }
 
 export type BareListingQuote =
@@ -660,7 +1074,9 @@ export type BareListingQuote =
  * A code several companies list (2222) is never answered from one of them: it is
  * that failure, asking which. Null when the symbol named its exchange (a named
  * venue never switches) or search knows no listing of it. It searches, so ask
- * only after a request failed.
+ * only after a request failed. A search that fails twice for a reason that
+ * says nothing of the symbol (a busy moment, the request limit) is thrown,
+ * never read as a symbol no venue lists.
  */
 export async function quoteBareListing(
   listing: CliListing,
@@ -668,14 +1084,14 @@ export async function quoteBareListing(
   request: ListingDataRequest,
   { refresh = false, datesChangeBasis = false }: { refresh?: boolean; datesChangeBasis?: boolean } = {},
 ): Promise<BareListingQuote | null> {
-  const venues = await bareListingVenues(listing, deps);
+  const venues = await bareListingVenues(listing, deps, { failTransient: true });
   if (!venues) return null;
   if (venues.choose) {
     const other = describeOtherListings(listing, venues, request);
     return other && { kind: "missing", ...other };
   }
-  const first = [namedListing(listing, venues.exchange)];
-  const rest = venues.others.map((venue) => namedListing(listing, venue.exchange));
+  const first = [namedListing(listing, venues.resolved ?? { exchange: venues.exchange })];
+  const rest = venues.others.map((venue) => namedListing(listing, venue));
   let tried = first;
   let quotes = await quoteListings(deps.dataProvider, first, refresh, datesChangeBasis);
   if (!quotes[0] && rest.length > 0) {
@@ -684,7 +1100,9 @@ export async function quoteBareListing(
   }
   const found = quotes.findIndex(Boolean);
   if (found < 0) {
-    const other = describeOtherListings(listing, venues, request);
+    // A listing just asked that had no quote is no listing to try.
+    const without = venues.others.filter((_venue, index) => quotes[index + 1] === null);
+    const other = describeOtherListings(listing, venues, request, without);
     return other && { kind: "missing", ...other };
   }
   const answer = tried[found]!;
@@ -697,7 +1115,8 @@ export async function quoteBareListing(
     kind: "quoted",
     listing: answer,
     quote: quotes[found]!,
-    note: chosenListingNote(listing.symbol, answer.exchange, others, without),
+    // Under the venue's own symbol (BP:LSE for `BP.`), the note names the listing, not only its venue.
+    note: chosenListingNote(listing.symbol, answer.symbol === listing.symbol ? answer.exchange : answer.key, others, without),
   };
 }
 
@@ -708,6 +1127,51 @@ export interface ReadListing {
   exchange: string;
   /** The listing's company, from its quote. */
   name: string | null;
+  /** A bare coin ticker read as a listing that is not the coin (`coinListingNotes`); null otherwise. */
+  coinNote: string | null;
+  /**
+   * What became of the company that had the symbol, as `quote` says it ("GOGL was Golden Ocean Group until
+   * 2025, now Cmb.Tech: CMBT"), when asked for (`successor`); null otherwise.
+   */
+  successorNote?: string | null;
+  /** What `quote` says of a code a security owns that is typed for something else (`ownedCodeNotes`). */
+  ownedNotes?: string[];
+  /** What the symbol was read as, when the resolver read it as another listing (NDX as the Nasdaq-100). */
+  readAs?: string;
+}
+
+/**
+ * "GOLD is Gold.com, Inc.; for Gold, quote the future GC=F.": a commodity's
+ * word a security trades as (WTI is W&T Offshore, GOLD is Gold.com), with
+ * the future it may have meant. `quote` and `compare` say to quote it;
+ * another command names itself run on the future. Null for any other symbol.
+ */
+export function futureByWordLine(symbol: string, name: string | null | undefined, command: string): string | null {
+  const contract = futuresContractByWord(symbol);
+  if (!contract) return null;
+  const owner = `${symbol} is ${name?.trim() || "a security"}`;
+  return command === "quote" || command === "compare"
+    ? `${owner}; for ${contract.name}, quote the future ${contract.symbol}.`
+    : `${owner}; for ${contract.name}, the future is ${contract.symbol} (gloom ${command} ${commandWord(contract.symbol)}).`;
+}
+
+/**
+ * What `quote` says beside a bare code a security owns that people type for
+ * something else, worded for `command`: the index rooted at it (MOVE is
+ * Corvex: "also ^MOVE ICE BofA MOVE Index (gloom history "^MOVE")") and the
+ * future a commodity's word names (`futureByWordLine`). None for a named
+ * listing, no quote, or an index or a future quoted as itself.
+ */
+export function ownedCodeNotes(
+  listing: Pick<ListingArg, "symbol" | "exchange">,
+  quote: Pick<Quote, "name" | "instrumentType"> | null | undefined,
+  command: string,
+): string[] {
+  if (listing.exchange || !quote) return [];
+  const root = indexRootFor(listing.symbol);
+  const index = root && quote.instrumentType?.trim().toUpperCase() !== "INDEX" ? indexRootAlsoLine(root, command) : null;
+  const future = isFuturesInstrument(listing.symbol, quote.instrumentType) ? null : futureByWordLine(listing.symbol, quote.name, command);
+  return [index, future].filter((line): line is string => !!line);
 }
 
 /**
@@ -716,24 +1180,51 @@ export interface ReadListing {
  * symbol no source quotes is read on the first of its listings that has one
  * (`quoteBareListing`), and a code several companies list (BDI is Black
  * Diamond Group in Toronto and B. D. Industries in Pune) fails asking which,
- * with `quote`'s message and each listing's retry. Null when nothing better
- * than the symbol itself is known, so the command's own request speaks.
+ * with `quote`'s message and each listing's retry. A symbol whose quote says
+ * it is not a ticker and that no listing carries is `NotATicker`, with the
+ * error the quote failed with, so the command can say so without asking for
+ * its data. Null when nothing better than the symbol itself is known, so the
+ * command's own request speaks.
  */
 export async function readBareListing(
   symbol: string,
   deps: ListingDeps,
   request: ListingDataRequest,
-  { refresh = false }: { refresh?: boolean } = {},
-): Promise<ReadListing | null> {
-  const listing = await resolveCliListing(symbol, null, deps);
-  if (listing.exchange) return null;
+  /** `successor`: also say what became of the company that had the symbol, looked up beside its quote. */
+  { refresh = false, successor = false }: { refresh?: boolean; successor?: boolean } = {},
+): Promise<ReadListing | NotATicker | null> {
+  // Read on its listings below, beside its own quote, as `quote` reads it.
+  const listing = await resolveCliListing(symbol, null, deps, { listingAbroad: false });
+  // A code the resolver read as another listing (NDX as ^NDX:NIM, the Nasdaq-100) is that listing, saying so.
+  if (listing.exchange) {
+    return listing.readAs ? { symbol: listing.symbol, exchange: listing.exchange, name: null, coinNote: null, readAs: listing.readAs } : null;
+  }
+  const changes = successor ? startTickerChangeLookup(deps.dataProvider, listing.symbol, listing.exchange) : null;
   const answer = await loadListingQuoteAnswer(deps.dataProvider, listing);
-  if (answer.quote) return { symbol: listing.symbol, exchange: listing.request.exchange, name: answer.quote.name?.trim() || null };
+  if (answer.quote) {
+    const successorNote = changes
+      ? listingChangeLine(await loadListingFate(listing, deps.dataProvider, { quote: answer.quote, changes, graceMs: SUCCESSOR_CHANGE_WAIT_MS }))
+      : null;
+    const ownedNotes = ownedCodeNotes(listing, answer.quote, request.command);
+    return { symbol: listing.symbol, exchange: listing.request.exchange, name: answer.quote.name?.trim() || null, coinNote: coinListingNotes(listing, answer.quote)[0] ?? null,
+      ...successorNote ? { successorNote } : {}, ...ownedNotes.length ? { ownedNotes } : {}, ...listing.readAs ? { readAs: listing.readAs } : {} };
+  }
   if (!isNoProviderError(answer.error)) return null;
   const other = await quoteBareListing(listing, deps, request, { refresh });
-  if (other?.kind === "quoted") return { symbol: listing.symbol, exchange: other.listing.exchange, name: other.quote.name?.trim() || null };
+  if (other?.kind === "quoted") {
+    const ownedNotes = ownedCodeNotes(listing, other.quote, request.command);
+    return { symbol: listing.symbol, exchange: other.listing.exchange, name: other.quote.name?.trim() || null, coinNote: coinListingNotes(listing, other.quote)[0] ?? null,
+      ...ownedNotes.length ? { ownedNotes } : {} };
+  }
   if (other?.choose) throw new ListingArgError(other.message, other.details, other.choices);
-  return null;
+  // No venue lists it and its own quote says it is no ticker, as `quote UNISWAP` says.
+  const message = answer.error instanceof Error ? answer.error.message : "";
+  return !other && notATickerSymbol(message) ? { notATicker: answer.error as Error } : null;
+}
+
+/** A bare symbol no listing carries (`readBareListing`): the error its quote failed with, "Not a ticker: UNISWAP.". */
+export interface NotATicker {
+  notATicker: Error;
 }
 
 /**
@@ -779,10 +1270,12 @@ export function listingFateLoader(
   listing: Pick<CliListing, "symbol" | "exchange" | "request">,
   deps: Pick<ListingDeps, "dataProvider">,
   quote: Promise<Quote | null>,
+  /** `successor`: the command says what became of the company too (GOGL's merger), so the lookup is waited for. */
+  { successor = false }: { successor?: boolean } = {},
 ): () => Promise<ListingFate> {
   const changes = startTickerChangeLookup(deps.dataProvider, listing.symbol, listing.exchange);
   let fate: Promise<ListingFate> | null = null;
-  return () => fate ??= loadListingFate(listing, deps.dataProvider, { quote, changes });
+  return () => fate ??= loadListingFate(listing, deps.dataProvider, { quote, changes, ...successor ? { graceMs: SUCCESSOR_CHANGE_WAIT_MS } : {} });
 }
 
 /**
@@ -870,9 +1363,11 @@ export async function failUnchosenListing(
  * calls what it returned empty, and a listing's exchange is one its symbol does
  * not trade on, the command ends in that message instead of the request's own
  * "unavailable". With `request`, a bare symbol no source serves ends naming
- * its other listings (`otherListingsMessage`), and with `request.fate` a symbol
- * whose company moved ends naming its new symbol, served or not. A request
- * that succeeds costs no extra lookup beyond the fate the command reads anyway.
+ * its other listings (`otherListingsMessage`), and a symbol whose company
+ * moved ends naming its new symbol, served or not. A request that succeeds
+ * costs no extra lookup beyond the fate the command reads anyway, or, given
+ * the command's own quote (`request.quote`), beyond a quote that says the
+ * line stopped.
  */
 export async function loadForListing<T>(
   listings: ListingForLoad | readonly ListingForLoad[],
@@ -885,27 +1380,69 @@ export async function loadForListing<T>(
   const all = "symbol" in listings ? [listings] : listings;
   const named = all.filter((listing) => listing.exchange);
   const checkVenues = () => Promise.all(named.map((listing) => failIfNotTraded(listing, deps, ctx)));
+  // One listing a command asked for: a company that moved ends the command naming its new symbol, as `quote` names
+  // it, whether the load came back empty or failed (FI's window before the listing that reused the symbol has no bars
+  // at all) or served the old line (FI's 2024 statements). A command that reads the fate itself asks it either way.
+  // Otherwise a load that served asks only when the command's own quote says the line stopped, so a symbol that
+  // trades costs no lookup; a load that failed or came back empty asks with the quote it has, or reads one.
+  const one = request && all.length === 1 ? all[0]! : null;
+  const refuseMoved = async (served: boolean) => {
+    if (!one || !request) return;
+    const quote = request.fate || !request.quote ? undefined : await request.quote.catch(() => {
+      // Intentional ignore: the quote is the command's own read, which reports its failure; with none, the line reads as unquoted.
+      return null;
+    });
+    if (served && !request.fate && (quote === undefined || !lineMayHaveMoved(quote))) return;
+    const moved = (await (request.fate ?? commandFate(one, deps, quote))()).moved;
+    if (moved) failMovedSymbol(moved, request);
+  };
   let value: T;
   try {
     value = await load();
   } catch (error) {
     await checkVenues();
+    await refuseMoved(false);
     if (request && all.length === 1 && isNoProviderError(error)) await failUnservedListing(ctx, request, otherListingsMessage(all[0]!, deps, request));
     throw error;
   }
-  if (isMiss?.(value)) await checkVenues();
+  const missed = isMiss?.(value) === true;
+  if (missed) await checkVenues();
   // Data came back, but the symbol's company moved and nothing new lists there: the data is another security's.
-  if (request?.fate && all.length === 1) {
-    const { moved } = await request.fate();
-    if (moved) failMovedSymbol(moved, request);
-  }
+  await refuseMoved(!missed);
   return value;
 }
 
-type ListingForLoad = Pick<ListingArg, "symbol" | "exchange"> & Partial<Pick<CliListing, "saved">>;
+/**
+ * The fate of a command's one listing when the command did not look it up
+ * itself (`listingFateLoader`), read with the quote the command has (`quote`;
+ * left out, the fate reads one). A symbol the change history is not about (a
+ * listing abroad, a pair) asks nothing of it.
+ */
+function commandFate(listing: ListingForLoad, deps: Pick<ListingDeps, "dataProvider">, quote?: Quote | null): () => Promise<ListingFate> {
+  let fate: Promise<ListingFate> | null = null;
+  return () => fate ??= loadListingFate(listing, deps.dataProvider, quote === undefined ? {} : { quote });
+}
+
+/** A command that ended naming the new symbol of a company that moved (`failMovedSymbol`). */
+export function isMovedSymbolFailure(error: unknown): boolean {
+  return error instanceof Error && (error as { code?: unknown }).code === "ticker_moved";
+}
+
+type ListingForLoad = Pick<ListingArg, "symbol" | "exchange"> & Partial<Pick<CliListing, "saved" | "request">>;
 
 /** The saved ticker for a listing: under its own key, or a saved symbol whose venue it is. */
 export async function loadSavedListing(store: ListingStore, listing: ListingArg): Promise<TickerRecord | null> {
+  const saved = await loadSavedSpelling(store, listing);
+  // A US share class is one row whichever spelling saved it (BRK.B, BRK-B).
+  const spellings = saved || listing.sharedCode ? null : usShareClassSpellings(listing.symbol, listing.exchange);
+  for (const symbol of spellings?.filter((spelling) => spelling !== listing.symbol) ?? []) {
+    const other = await loadSavedSpelling(store, { ...listing, symbol, key: listing.exchange ? `${symbol}:${listing.exchange}` : symbol });
+    if (other) return other;
+  }
+  return saved;
+}
+
+async function loadSavedSpelling(store: ListingStore, listing: ListingArg): Promise<TickerRecord | null> {
   if (!listing.exchange) return store.loadTicker(listing.symbol);
   if (listing.sharedCode) {
     // 7203:TSE is the row saved on any venue TSE names.
@@ -1056,6 +1593,27 @@ async function readVenueSuffix(listing: ListingArg, deps: Pick<ListingDeps, "dat
   return { symbol: match[1]!, exchange: venue, key, readAs: `Read ${listing.symbol} as ${key}.` };
 }
 
+/** One to three digits: a Hong Kong code written without its leading zeros (700, 5, 388). */
+const SHORT_HONG_KONG_CODE = /^\d{1,3}$/;
+
+/**
+ * A Hong Kong code written without its leading zeros as its HKEX listing,
+ * "Read 700 as 0700:HKEX.", where search marks that listing with the code as
+ * typed (`searchAliases`) as it does for 700 and 5. A row saved under the
+ * code keeps it. Null for any other symbol, and when search marks no HKEX
+ * listing with it, cannot search or is too busy to say.
+ */
+async function readHongKongShortCode(listing: ListingArg, deps: ListingDeps): Promise<ListingArg | null> {
+  if (listing.exchange || !SHORT_HONG_KONG_CODE.test(listing.symbol) || !Number(listing.symbol)) return null;
+  if (await deps.store.loadTicker(listing.symbol)) return null;
+  const symbol = String(Number(listing.symbol)).padStart(4, "0");
+  const marked = await serviceMarkedListing(deps.dataProvider, listing.symbol, symbol);
+  if (marked?.exchange !== "HKEX") return null;
+  const key = `${symbol}:HKEX`;
+  const readAs = [listing.readAs, `Read ${listing.symbol} as ${key}.`].filter(Boolean).join(" ");
+  return { symbol, exchange: "HKEX", key, readAs };
+}
+
 /** 7203.T as 7203:JPX when a row of 7203 on JPX is saved: a suffix `readListingSuffix` leaves to be confirmed. Null otherwise. */
 async function savedSuffixVenue(listing: ListingArg, store: ListingStore): Promise<ListingArg | null> {
   const venue = listing.exchange ? null : listingSuffixCandidate(listing.symbol);
@@ -1085,25 +1643,94 @@ export async function resolveCliListing(
     venueSuffix?: boolean;
     /** Read a venue suffix as the venue it names, with no request (`parseListingArg`). */
     listingSuffix?: boolean;
+    /**
+     * Read a word no source quotes as the company it names (`readBareCompanyName`). On by default;
+     * `quote` reads names after its own quote request, and turns it off.
+     */
+    companyWord?: boolean;
+    /**
+     * Read a bare symbol no source quotes on the listing `quote` reads it on (`readBareListingAbroad`): O8A
+     * is O8A:FWB2. On by default; `quote` reads it after its own quote request, and turns it off, as does a
+     * lookup that searches for the listing itself (`resolveCliTicker`).
+     */
+    listingAbroad?: boolean;
   } = {},
 ): Promise<CliListing> {
   // "JPM US Equity" is Bloomberg's code for JPM; "Putnam US Equity", whose root is no US ticker, is a name.
   const typed = stripStrayEdges(raw).text || raw;
+  // FRED:T10Y2Y is the series the catalog prints, never the symbol FRED on a venue called T10Y2Y.
+  const fred = exchangeOption?.trim() ? null : fredSeriesArgument(typed);
+  if (fred) {
+    const { message, details } = fredSeriesNotListing(fred);
+    throw new ListingArgError(message, details);
+  }
+  // "iron ore" has no live price: it says so and where the monthly one is, never Kumba Iron Ore's stock.
+  const unquoted = exchangeOption?.trim() ? null : unquotedGapMessage(typed);
+  if (unquoted) throw new ListingArgError(unquoted);
+  // "GTJPY10Y Govt" and "VXJ Index" are Bloomberg codes no symbol here is read from: refused with what has them,
+  // never searched for as a name (MOVE Index found another venue's product named after the index).
+  const unreadCode = exchangeOption?.trim() ? null : unreadBloombergCode(typed);
+  if (unreadCode) throw new ListingArgError(unreadBloombergCodeMessage(unreadCode));
+  // A name typed in Japanese (ドル円, トヨタ自動車) is the listing it names, which is named in Latin letters; one several
+  // companies' names start with (トヨタ) asks which. A name in kanji alone is the service's to read first, below.
+  const japanese = exchangeOption?.trim() ? null : await readJapaneseName(typed);
+  if (japanese) return await japaneseNameListing(typed, japanese, deps, options);
+  // A listing that moved to a new symbol (ELET3, "eletrobras") is the one it trades as now, saying so.
+  const renamed = exchangeOption?.trim() ? null : renamedListingFor(typed);
+  if (renamed) {
+    const now = await resolveCliListing(renamedListingSymbol(renamed), null, deps, options);
+    return { ...now, readAs: [renamedListingReadAs(typed, renamed), now.readAs].filter(Boolean).join(" "), readFromName: true };
+  }
+  // "crude oil" is the benchmark future search ranks first (CL=F, Brent beside it), never a fund named for it.
+  const commodity = exchangeOption?.trim() ? null : commodityNameFuture(typed);
+  if (commodity) {
+    const future = await resolveCliListing(commodity.contract.symbol, null, deps, options);
+    return { ...future, readAs: [commodityFutureReadAs(typed, commodity), future.readAs].filter(Boolean).join(" "), readFromName: true };
+  }
+  // "BRK B" is Berkshire's class B with a space for its mark, never a fund whose name carries "BRK/B".
+  const shareClass = exchangeOption?.trim() ? null : await readShareClassCode(typed, deps);
+  if (shareClass) {
+    const line = await resolveCliListing(shareClass.key, null, deps, options);
+    return { ...line, readAs: shareClass.readAs, readFromName: true, typed: typed.trim() };
+  }
   const read = await readTerminalCodeArg(deps.dataProvider, typed);
   // A company's name, an entry of a comma list (`WHR, Whirlpool Corporation`), is the listing search names for it.
   // A name before a legal form ("SAP SE", "SIEMENS AG") is looked up first: SE is also SIX Swiss's market code.
-  const named = !read || endsInLegalForm(typed) ? await companyNameListingArg(raw, deps) : null;
+  const legalForm = !!read && endsInLegalForm(typed);
+  const asName = !read || legalForm ? await companyNameListingArg(raw, deps) : null;
+  // Read both ways as two companies ("ZURN SE": Zurich Insurance on SIX, Zurn Elkay by name), the code's listing wins.
+  const codeWins = legalForm && asName ? await codeOverCompanyName(read!, asName.found, deps) : null;
+  const named = codeWins ? null : asName?.listing ?? null;
   const terminal = named ? null : read;
   // "AAPL GP" is written as a code, with a market code no venue answers to and no company's name: one entry, never AAPL and GP.
   if (!terminal && !named) await refuseUnknownMarketCode(typed, deps);
-  let parsed = named ?? parseListingArg(raw, exchangeOption, { ...options, terminalCode: terminal });
+  // `BP.` is London's code for BP: its London line where London lists it, and `GE.` a US ticker with a stray dot.
+  const dotted = terminal || named || exchangeOption?.trim() ? null : readLondonDottedSymbol(typed);
+  let parsed = named ?? (dotted ? await londonDottedListing(dotted, deps) : parseListingArg(raw, exchangeOption, { ...options, terminalCode: terminal }));
+  if (codeWins) parsed = { ...parsed, readAs: codeWins };
   if (!parsed.symbol) throw new ListingArgError("Ticker symbol is required.");
+  // A bare code's own quote is asked once, however many of the readings below ask whether anything trades as it.
+  const ownQuote = bareQuoteOnce(deps);
   // $VIX is Schwab's code for ^VIX, unless a security trades as VIX: $AAPL is a cashtag.
-  const index = named || parsed.exchange ? null : await readDollarIndexCode(raw, deps);
+  const index = named || parsed.exchange ? null : await readDollarIndexCode(raw, deps, ownQuote);
   if (index) parsed = index;
+  // NDX, which no security trades as, is the Nasdaq-100 for every command, as `quote` reads it; MOVE stays Corvex.
+  const rooted = named || index || terminal || parsed.exchange ? null : await readBareIndexRoot(parsed, typed, deps, ownQuote);
+  if (rooted) parsed = rooted;
   // USD-NGN and USDNGN are the pair USDNGN=X unless a security is listed under those letters.
   const pair = parsed.exchange ? null : await readAmbiguousCurrencyPair(parsed.symbol, deps);
   if (pair) parsed = { symbol: pair, exchange: "", key: pair };
+  // 700 is how Hong Kong writes Tencent's 0700, and search reads it so.
+  const hongKong = pair || named || index ? null : await readHongKongShortCode(parsed, deps);
+  if (hongKong) parsed = hongKong;
+  // A word no source quotes that names a company (`Naspers`) is its listing, for every command, as `quote` reads it.
+  const askCompany = !(options.companyWord === false || pair || named || index || rooted || hongKong || terminal || dotted);
+  const company = askCompany ? await readBareCompanyName(parsed, typed, deps, ownQuote) : null;
+  if (company) parsed = company;
+  // A name in kanji alone the service names no company for (中電工; 中電 is CLP in Hong Kong) is a Tokyo company's
+  // whole name, when it is one.
+  const tokyo = askCompany && !company && !exchangeOption?.trim() && isKanjiOnlyName(typed) ? await readExactJapaneseName(typed) : null;
+  if (tokyo) return await japaneseNameListing(typed, tokyo, deps, options);
   // A one-letter suffix (7203.T) is read as its venue only when a row saved there says so; the listing's quote may later.
   const venueRow = options.listingSuffix && !pair && !named ? await savedSuffixVenue(parsed, deps.store) : null;
   if (venueRow) parsed = venueRow;
@@ -1130,7 +1757,7 @@ export async function resolveCliListing(
   // A code nothing could read stays the venue it is saved on.
   const savedExchange = canonicalExchange(saved?.metadata.exchange);
   if (listing.sharedCode && savedExchange) listing = { symbol: listing.symbol, exchange: savedExchange, key: `${listing.symbol}:${savedExchange}` };
-  return {
+  const resolved: CliListing = {
     ...listing,
     saved,
     typed: typed.trim(),
@@ -1138,6 +1765,148 @@ export async function resolveCliListing(
       ? { symbol: listing.key, exchange: listing.exchange }
       : { symbol: listing.symbol, exchange: saved?.metadata.exchange ?? "" },
   };
+  // A bare code no source quotes (O8A, listed in Frankfurt alone) is the listing `quote` reads it on, for every command.
+  const readElse = pair || named || index || rooted || company || hongKong || terminal || dotted || suffixed || venueRow;
+  const abroad = options.listingAbroad === false || readElse || listing.exchange || saved ? null : await readBareListingAbroad(resolved, deps, ownQuote);
+  return abroad ?? resolved;
+}
+
+/** A listing's code typed bare: letters and digits alone (O8A, 2222, SXR8), with no venue, suffix, pair or index mark. */
+const BARE_LISTING_CODE = /^[A-Z0-9]{1,10}$/;
+
+/**
+ * A bare code no source quotes, read on the listing `quote` reads it on, so
+ * every command asks that listing for its data and names it: O8A, which
+ * Pelican Aqua lists in Frankfurt alone, is O8A:FWB2, saying "O8A -> FWB2",
+ * where the data service answers "Not a ticker" for the bare code. As in
+ * `quote`, a word the service marks as a company's name is that company
+ * first (`serviceNamedCompany`). Null, so the symbol stays as typed, for a
+ * code with a quote of its own, whatever venue the service reads it on (AAPL;
+ * SXR8, which it reads on Xetra), for one the shipped listings know as a US
+ * stock, which costs no request, for a code several companies list (2222),
+ * which a command asks about once its own request fails, and when the quote
+ * or the search cannot answer.
+ */
+async function readBareListingAbroad(listing: CliListing, deps: ListingDeps, ownQuote: BareQuote): Promise<CliListing | null> {
+  if (!BARE_LISTING_CODE.test(listing.symbol) || deps.dataProvider.knownUsStock?.(listing.symbol)) return null;
+  const own = await ownQuote(listing.symbol);
+  // Only a source's answer that nothing lists the code: one that failed (a timeout, a refusal) says nothing of it.
+  if (own.quote || !isNoSourceAnswer(own.error)) return null;
+  try {
+    const named = listing.typed ? await serviceNamedCompany(listing.typed, deps) : null;
+    if (named) return { ...await resolveNamedListing(named, deps), typed: listing.typed };
+    const other = await quoteBareListing(listing, deps, { command: "quote", noun: "a quote" });
+    if (other?.kind !== "quoted") return null;
+    return { ...other.listing, typed: listing.typed, readAs: [listing.readAs, other.note].filter(Boolean).join(" ") };
+  } catch (error) {
+    return logFailure("cli.listing-arg", "Read a bare code on its listing abroad failed", null)(error);
+  }
+}
+
+/**
+ * How a symbol and a market code read when the words are also a company's name
+ * before its legal form, SE being both SIX Swiss's code and a European
+ * company's form: "ZURN SE" is Zurich Insurance on SIX as a code and Zurn
+ * Elkay Water Solutions as a name, "NOVN SE" Novartis and Novan, "SAP SE" SAP
+ * either way. Two companies: the code names one listing on one venue, as a
+ * desk typing a terminal's codes means it, so it wins, and the note names the
+ * company the words would be ("Read "ZURN SE" as ZURN:SWX (Zurich Insurance
+ * Group AG), not ZWS:NYSE (Zurn Elkay ...)"). One company, by the service's
+ * company ids or by name: null, so the name reads the company's home listing
+ * (SAP on Xetra, not its SIX line). Null too when the code's venue lists
+ * nothing under the symbol.
+ */
+async function codeOverCompanyName(code: TerminalListingCode, found: CompanyNameListing, deps: ListingDeps): Promise<string | null> {
+  if (!code.exchange) return null;
+  const venues = await listingVenues(code.symbol, deps).catch(logFailure("cli.listing-arg", "Read a market code's listing failed", [] as ListingVenue[]));
+  const line = venues.find((venue) => venue.exchange === code.exchange && venue.name.trim());
+  if (!line) return null;
+  const company = found.meant ?? found;
+  const companyLine = company.symbol.toUpperCase() === code.symbol.toUpperCase()
+    ? venues.find((venue) => venue.exchange === company.exchange) : undefined;
+  const ids = [line.companyId, companyLine?.companyId];
+  if (ids[0] && ids[1] ? ids[0] === ids[1] : sameCompany(line.name, company.name)) return null;
+  const key = company.exchange ? `${company.symbol}:${company.exchange}` : company.symbol;
+  return `${terminalCodeReadAs(code).replace(/\.$/, "")} (${line.name.trim()}), not ${key} (${company.name.trim()}).`;
+}
+
+/** A US share class typed with a space for its mark: `BRK B`, `brk b`. */
+const SPACED_SHARE_CLASS = /^([A-Za-z]{1,5})\s+([A-Za-z])$/;
+/** A US share class typed with no mark at all, in capitals: `BRKB`, `BFB`. */
+const JOINED_SHARE_CLASS = /^([A-Z]{2,5})([A-Z])$/;
+/** Lines of the joined code abroad a read names. */
+const SHARE_CLASS_OTHER_LINES = 3;
+
+/**
+ * A US share class typed without its mark, read as that class's listing:
+ * `BRK B` and `BRKB` are BRK.B, the row saved for it first, then the US line
+ * search lists for it (a listing exchange before IEX), as `search` ranks it.
+ * The answer says so and names the joined code's lines abroad ("Read "BRKB"
+ * as BRK.B (Berkshire Hathaway Inc.); also BRKB:BMV, BRKB:WSE."). The
+ * spaced form reads so wherever the class trades. The joined form is a code
+ * of its own first: one saved under it, one a US venue lists, or one abroad
+ * of another company (HEIA is Heineken, not HEI.A) stays as typed, and
+ * without `unsaved` only a saved class reads it, so a plain ticker costs no
+ * search. Null for anything else, and when no US line of the class is found.
+ */
+export async function readShareClassCode(
+  typed: string,
+  deps: ListingDeps,
+  { unsaved = false }: { unsaved?: boolean } = {},
+): Promise<ListingArg | null> {
+  const words = typed.trim();
+  const spaced = SPACED_SHARE_CLASS.exec(words);
+  const joined = spaced ? null : JOINED_SHARE_CLASS.exec(words);
+  const parts = spaced ?? joined;
+  if (!parts) return null;
+  const code = `${parts[1]}${parts[2]}`.toUpperCase();
+  const dotted = `${parts[1]}.${parts[2]}`.toUpperCase();
+  const quiet = <T,>(fallback: T) => logFailure("cli.listing-arg", "Read a share class failed", fallback);
+  const saved = await loadSavedListing(deps.store, parseListingArg(dotted)).catch(quiet(null));
+  if (joined && (!saved && !unsaved || await deps.store.loadTicker(code).catch(quiet(null)))) return null;
+  const venues = await listingVenues(code, deps).catch(quiet([] as ListingVenue[]));
+  // BRKB has no US line; a code that has one is a ticker of its own.
+  if (joined && venues.some((venue) => isUsEquityExchange(venue.exchange))) return null;
+  const savedExchange = saved ? canonicalExchange(saved.metadata.exchange) : "";
+  const savedLine = saved ? { symbol: saved.metadata.ticker, exchange: savedExchange, name: saved.metadata.name } : null;
+  // A class row saved with no exchange (an import, an older profile) is still the class: search names its US
+  // line, and with search out of reach the row itself is read. Never the name search, which finds funds on it.
+  const searched = savedLine && isUsEquityExchange(savedExchange) ? null : await usShareClassLine(dotted, deps).catch(quiet(null));
+  const line = savedLine && isUsEquityExchange(savedExchange)
+    ? savedLine
+    : searched ? { ...searched, name: searched.name || savedLine?.name || "" } : savedLine && !savedExchange ? savedLine : null;
+  if (!line || (line.exchange ? !isUsEquityExchange(line.exchange) : line !== savedLine)) return null;
+  const abroad = venues.filter((venue) => !isUsEquityExchange(venue.exchange));
+  if (joined && abroad.some((venue) => venue.name && line.name && !sameCompany(venue.name, line.name))) return null;
+  const shown = abroad.slice(0, SHARE_CLASS_OTHER_LINES).map((venue) => `${venue.symbol ?? code}:${venue.exchange}`);
+  const also = shown.length ? `; also ${shown.join(", ")}${abroad.length > shown.length ? ` and ${abroad.length - shown.length} more` : ""}` : "";
+  // A US listing is read bare, as BRK.B is; another US venue keeps its name.
+  const key = !line.exchange || isUsListingExchange(line.exchange) ? line.symbol : `${line.symbol}:${line.exchange}`;
+  return { ...parseListingArg(key), readAs: `Read "${words}" as ${line.symbol} (${line.name || "share class"})${also}.`, readFromName: true };
+}
+
+/** The US line search lists for a share class (BRK.B on NYSE before IEX), null when it lists none. */
+async function usShareClassLine(dotted: string, deps: ListingDeps): Promise<{ symbol: string; exchange: string; name: string } | null> {
+  const spellings = new Set(usShareClassSpellings(dotted) ?? [dotted]);
+  const venues = (await listingVenues(dotted, deps)).filter((venue) => isUsEquityExchange(venue.exchange)
+    && (!venue.symbol || spellings.has(venue.symbol)));
+  const venue = venues.find((entry) => isUsListingExchange(entry.exchange)) ?? venues[0];
+  return venue ? { symbol: dotted, exchange: venue.exchange, name: venue.name } : null;
+}
+
+/**
+ * A two-letter symbol written with London's trailing dot (`BP.`, `RR.`) as its
+ * London line, said as "Read BP. as BP:LSE.", where search lists it on LSE or
+ * its quote there says it trades. Elsewhere the dot was a slip after the
+ * ticker, dropped as a stray edge is (`GE.` is GE).
+ */
+async function londonDottedListing(dotted: NearMissListing, deps: ListingDeps): Promise<ListingArg> {
+  const london = { symbol: dotted.symbol, exchange: "LSE" };
+  const venues = await listingVenues(dotted.symbol, deps).catch(logFailure("cli.listing-arg", "Read listing venues failed", []));
+  const listed = venues.some((venue) => venue.exchange === london.exchange) || await quotedOnVenue(london, deps);
+  if (!listed) return parseListingArg(dotted.symbol);
+  const key = `${london.symbol}:${london.exchange}`;
+  return { ...parseListingArg(key), readAs: `Read ${dotted.typed} as ${key}.` };
 }
 
 /**
@@ -1171,9 +1940,31 @@ async function refuseUnknownMarketCode(typed: string, deps: ListingDeps): Promis
 async function checkTerminalCodeVenue(listing: ListingArg, market: string, deps: ListingDeps): Promise<void> {
   const hint = bloombergMarketHint(market);
   if (!hint && !isSearchOnlyVenue(listing.exchange)) return;
-  const venues = await listingVenues(listing.symbol, deps).catch(logFailure("cli.listing-arg", "Read listing venues failed", []));
-  if (venues.length === 0 || venues.some((venue) => venue.exchange === listing.exchange)) return;
-  throw new ListingArgError(`${listing.symbol} does not trade on ${listing.exchange}.${tradesOn(listing.symbol, venues)}`, hint ?? undefined);
+  // Only what search answers refuses the code: a busy or unreachable search leaves the listing's own request to speak.
+  const venues = await listingVenues(listing.symbol, deps, { failTransient: true })
+    .catch(logFailure("cli.listing-arg", "Read listing venues failed", null));
+  if (!venues) return;
+  const there = venues.filter((venue) => venue.exchange === listing.exchange);
+  const own = (venue: ListingVenue) => !venue.symbol || venue.symbol.toUpperCase() === listing.symbol.toUpperCase();
+  if (there.some(own) || (there.length > 0 && !hint)) return;
+  // Where the codes differ, Bloomberg's ticker can name the company search lists there under the venue's code
+  // (ARAMCO AB is Saudi Aramco, 2222 on Tadawul): say which one to type.
+  const listed = there.find((venue) => !own(venue));
+  const line = !hint ? null : listed ? { symbol: listed.symbol!, name: listed.name.trim() } : await venueLineNamed(listing, deps);
+  if (line) {
+    throw new ListingArgError(`${listing.symbol} is not a ${listing.exchange} code; did you mean ${line.symbol} ${market}${line.name ? ` (${line.name})` : ""}?`, hint!);
+  }
+  // Search lists the symbol nowhere: the request's own answer says what it finds, as it did before codes were checked.
+  if (venues.length === 0) return;
+  throw new ListingArgError(await notTradedText(listing, venues, deps), hint ?? undefined);
+}
+
+/** The one line search lists on the listing's venue for its symbol read as a name (ARAMCO: 2222 on TADAWUL); null for none or several. */
+async function venueLineNamed(listing: ListingArg, deps: ListingDeps): Promise<{ symbol: string; name: string } | null> {
+  const found = await deps.dataProvider.search(listing.symbol).catch(logFailure("cli.listing-arg", "Search a code's company failed", []));
+  const lines = found.filter((result) => canonicalExchange(result.exchange || result.primaryExchange) === listing.exchange);
+  const symbols = [...new Set(lines.map((result) => parsePublicTickerKey(result.symbol).symbol))];
+  return symbols.length === 1 && symbols[0] !== listing.symbol.toUpperCase() ? { symbol: symbols[0]!, name: lines[0]!.name.trim() } : null;
 }
 
 /**
@@ -1184,27 +1975,207 @@ async function checkTerminalCodeVenue(listing: ListingArg, market: string, deps:
  * network) says nothing about what trades, so `$MID` stays MID as typed.
  * Null for anything else.
  */
-export async function readBrokerIndexCode(raw: string, deps: Pick<ListingDeps, "dataProvider">): Promise<ListingArg | null> {
+export async function readBrokerIndexCode(
+  raw: string,
+  deps: Pick<ListingDeps, "dataProvider">,
+  ownQuote: BareQuote = bareQuoteOnce(deps),
+): Promise<ListingArg | null> {
   const code = brokerIndexCode(stripStrayEdges(raw).text || raw);
   if (!code) return null;
-  if (code.bare && !await nothingTradesAs(code.bare, deps)) return null;
+  if (code.bare && !await nothingTradesAs(code.bare, ownQuote)) return null;
   return { symbol: code.symbol, exchange: "", key: code.symbol, readAs: brokerIndexReadAs(code) };
 }
 
+/** A bare code's own quote (`getQuote(symbol, "")`), or the error it failed with. */
+type BareQuote = (symbol: string) => Promise<{ quote: Quote | null; error?: unknown }>;
+
+/** `BareQuote` asked once per code, for one resolution: every reading of the code that asks gets the same answer. */
+function bareQuoteOnce(deps: Pick<ListingDeps, "dataProvider">): BareQuote {
+  const asked = new Map<string, Promise<{ quote: Quote | null; error?: unknown }>>();
+  return (symbol) => {
+    let answer = asked.get(symbol);
+    if (!answer) {
+      answer = loadListingQuoteAnswer(deps.dataProvider, { request: { symbol, exchange: "" } });
+      asked.set(symbol, answer);
+    }
+    return answer;
+  };
+}
+
 /** Whether the sources answer that no security trades as `symbol`: no quote, or a no-provider miss. */
-async function nothingTradesAs(symbol: string, deps: Pick<ListingDeps, "dataProvider">): Promise<boolean> {
-  try {
-    return !await deps.dataProvider.getQuote(symbol, "");
-  } catch (error) {
-    if (isNoProviderError(error)) return true;
-    logFailure("cli.listing-arg", "Quote broker index root failed")(error);
-    return false;
+async function nothingTradesAs(symbol: string, ownQuote: BareQuote): Promise<boolean> {
+  const { quote, error } = await ownQuote(symbol);
+  if (error === undefined) return !quote;
+  if (isNoProviderError(error)) return true;
+  logFailure("cli.listing-arg", "Quote broker index root failed")(error);
+  return false;
+}
+
+/**
+ * A bare index root (NDX, VIX) no security trades as, read as its index: the
+ * listing the service marks for the word (^NDX:NIM), else the ^ symbol, with
+ * the line that says so ("Read "NDX" as ^NDX:NIM (NASDAQ-100)."). A source
+ * can still serve old bars for the bare code (a stopped Frankfurt line's),
+ * which no command means. A code a security trades as (MOVE, Corvex) or a
+ * row saved under it stays as typed, as does one whose quote failed another
+ * way (the network). Null for any other symbol.
+ */
+async function readBareIndexRoot(parsed: ListingArg, typed: string, deps: ListingDeps, ownQuote: BareQuote): Promise<ListingArg | null> {
+  const root = indexRootFor(parsed.symbol);
+  const word = typed.trim();
+  if (!root || word.toUpperCase() !== parsed.symbol) return null;
+  if (await deps.store.loadTicker(parsed.symbol).catch(logFailure("cli.listing-arg", "Read a saved index root failed", null))) return null;
+  if (!await nothingTradesAs(parsed.symbol, ownQuote)) return null;
+  const marked = await serviceMarkedListing(deps.dataProvider, word, root.symbol)
+    .catch(logFailure("cli.listing-arg", "Read the listing an index root names failed", null));
+  const key = marked?.exchange ? `${marked.symbol}:${marked.exchange}` : marked?.symbol ?? root.symbol;
+  return { ...parseListingArg(key), readAs: `Read "${word}" as ${key} (${marked?.name || root.name}).`, readFromName: true };
+}
+
+/**
+ * A company's name typed as one word where a symbol goes (`Naspers`,
+ * `Leumi`), written as a name is (NAME_WRITTEN_WORD), once the sources say
+ * nothing trades as it, read as `quote` reads it (`oneWordCompanyName`):
+ * "Read "Naspers" as NPN:JSE (Naspers Limited).". A real ticker always wins
+ * (MTN stays Vail Resorts), and so do a row saved under the word and a code
+ * listed abroad under it. Null for anything else, and when search names no
+ * company.
+ */
+async function readBareCompanyName(parsed: ListingArg, typed: string, deps: ListingDeps, ownQuote: BareQuote): Promise<ListingArg | null> {
+  const word = typed.trim();
+  if (parsed.exchange || !NAME_WRITTEN_WORD.test(word) || word.toUpperCase() !== parsed.symbol) return null;
+  if (await deps.store.loadTicker(parsed.symbol).catch(logFailure("cli.listing-arg", "Read a saved word failed", null))) return null;
+  if (!await nothingTradesAs(parsed.symbol, ownQuote)) return null;
+  const named = await oneWordCompanyName(word, deps).catch(logFailure("cli.listing-arg", "Read a word as a company's name failed", null));
+  // A code listed abroad under the word (FP on TSXV and BVB) is a symbol, whose listings the command names: never a name.
+  return named && named.symbol.toUpperCase() !== parsed.symbol ? named : null;
+}
+
+/**
+ * A word written as a name is, not as a ticker: letters, at least one small
+ * (`Naspers`, `leumi`), no digit, dot or capitals alone (`UNISWAP`, `RY.TO`),
+ * which a command reads as typed, at the cost of no extra quote.
+ */
+const NAME_WRITTEN_WORD = /^(?=.*\p{Ll})\p{L}[\p{L}&'’-]*$/u;
+
+/**
+ * Symbols at most whose venues a command looks up to name the company each
+ * bare one went to, and whose words it checks as companies' names
+ * (`companyWord`, a quote each): a desk's morning list of a dozen names (the
+ * DAX names it covers) still says which company each one read. A longer
+ * list is a batch of tickers.
+ */
+export const MAX_CHOICE_LOOKUPS = 12;
+
+/** At most this many words typed apart are tried as one company's name (`joinCompanyNameWords`). */
+const MAX_JOINED_NAME_WORDS = 4;
+
+/**
+ * At most this many runs of words around one word are searched as a name
+ * (`joinedRun`), all at once: its two-word runs, then three, then one of four.
+ */
+const MAX_JOINED_NAME_LOOKUPS = 6;
+
+/**
+ * Words typed apart that name one company: when a word of the arguments is
+ * read as a company's name (`wordAsName`: "Group" as UNH:NYSE), the run of
+ * words around it is tried as one name first, longest first, and a company
+ * whose name has every word of it is that run's listing ("Read "MTN Group"
+ * as MTN:JSE (MTN Group Ltd.)."), in place of the words. A word that names
+ * no company with its neighbours keeps its own reading. `entries` are the
+ * arguments in the order typed, each with the listing it was read as, null
+ * where none; the answer is in the same order, a joined run one entry.
+ */
+export async function joinCompanyNameWords<T extends { typed: string; listing: Pick<ListingArg, "wordAsName"> | null }>(
+  entries: readonly T[],
+  deps: Pick<ListingDeps, "dataProvider">,
+): Promise<Array<T | { typed: string; joined: ListingArg; words: T[] }>> {
+  // A word shaped as a ticker (BRK.B, 0700) is never part of a name.
+  const word = (entry: T | undefined) => !!entry && ONE_WORD_NAME.test(entry.typed.trim()) && !tickerShapedWord(entry.typed.trim());
+  const out: Array<T | { typed: string; joined: ListingArg; words: T[] }> = [];
+  const tried = new Set<string>();
+  let index = 0;
+  while (index < entries.length) {
+    const entry = entries[index]!;
+    if (!entry.listing?.wordAsName) {
+      out.push(entry);
+      index += 1;
+      continue;
+    }
+    let first = index;
+    let last = index;
+    // Words before it still stand as typed at the end of the answer; a run already joined is no word.
+    while (first > 0 && index - first + 1 < MAX_JOINED_NAME_WORDS && word(entries[first - 1])
+      && out[out.length - (index - first) - 1] === entries[first - 1]) first -= 1;
+    while (last < entries.length - 1 && last - index + 1 < MAX_JOINED_NAME_WORDS && word(entries[last + 1])) last += 1;
+    const joined = await joinedRun(entries.map((item) => item.typed.trim()), first, last, index, deps, tried);
+    if (!joined) {
+      out.push(entry);
+      index += 1;
+      continue;
+    }
+    // Words before the one read as a name that the run takes were pushed already: they are the run's now.
+    out.splice(out.length - (index - joined.start), index - joined.start);
+    const words = entries.slice(joined.start, joined.end);
+    out.push({ typed: words.map((item) => item.typed.trim()).join(" "), joined: joined.listing, words });
+    index = joined.end;
   }
+  return out;
+}
+
+/** The listing a company's name was read as (`named`), resolved as its key is, still saying what it was read as. */
+export async function resolveNamedListing(named: ListingArg, deps: ListingDeps): Promise<CliListing> {
+  // The name chose the listing: its key is never read again on another one.
+  const resolved = await resolveCliListing(named.key, null, deps, { listingAbroad: false });
+  return {
+    ...resolved, readAs: named.readAs, ...named.meant ? { meant: named.meant } : {},
+    ...named.readFromName ? { readFromName: named.readFromName } : {}, ...named.venueFromSearch ? { venueFromSearch: named.venueFromSearch } : {},
+  };
+}
+
+/**
+ * The longest run of `words[first..last]` holding `at`, two words or more,
+ * that names one company, the leftmost of the longest. The runs are searched
+ * at once, the shortest first up to MAX_JOINED_NAME_LOOKUPS, and a run
+ * searched for an earlier word (`tried`) is not searched again.
+ */
+async function joinedRun(
+  words: readonly string[], first: number, last: number, at: number, deps: Pick<ListingDeps, "dataProvider">, tried: Set<string>,
+): Promise<{ start: number; end: number; listing: ListingArg } | null> {
+  const runs: Array<{ start: number; end: number; phrase: string }> = [];
+  for (let size = 2; size <= Math.min(last - first + 1, MAX_JOINED_NAME_WORDS); size += 1) {
+    for (let start = Math.max(first, at - size + 1); start <= Math.min(at, last - size + 1); start += 1) {
+      const phrase = words.slice(start, start + size).join(" ");
+      if (tried.has(phrase) || runs.length >= MAX_JOINED_NAME_LOOKUPS) continue;
+      tried.add(phrase);
+      runs.push({ start, end: start + size, phrase });
+    }
+  }
+  const found = await Promise.all(runs.map(async (run) => {
+    const company = await findCompanyName(run.phrase, deps).catch(busyAsMiss)
+      .catch(logFailure("cli.listing-arg", "Read words as one company's name failed", null));
+    return company && companyNameExtraWords(run.phrase, company.name) != null ? { ...run, company } : null;
+  }));
+  const best = found.filter((run) => run != null)
+    .sort((left, right) => (right.end - right.start) - (left.end - left.start) || left.start - right.start)[0];
+  return best ? { start: best.start, end: best.end, listing: companyListingArg(best.phrase, best.company) } : null;
 }
 
 /** `readBrokerIndexCode` for a `$ROOT` code only: the `ROOT.X` codes are read where the listing is parsed. */
-function readDollarIndexCode(raw: string, deps: Pick<ListingDeps, "dataProvider">): Promise<ListingArg | null> {
-  return brokerIndexCode(stripStrayEdges(raw).text || raw)?.bare ? readBrokerIndexCode(raw, deps) : Promise.resolve(null);
+function readDollarIndexCode(raw: string, deps: Pick<ListingDeps, "dataProvider">, ownQuote: BareQuote): Promise<ListingArg | null> {
+  return brokerIndexCode(stripStrayEdges(raw).text || raw)?.bare ? readBrokerIndexCode(raw, deps, ownQuote) : Promise.resolve(null);
+}
+
+/** The listing a name typed in Japanese reads as, saying so; one that names several companies asks which, with how many. */
+async function japaneseNameListing(
+  typed: string,
+  reading: JapaneseNameReading,
+  deps: ListingDeps,
+  options: Parameters<typeof resolveCliListing>[3],
+): Promise<CliListing> {
+  if (reading.total > 1) throw new ListingArgError(japaneseNameChoice(typed, reading));
+  const listing = await resolveCliListing(reading.listings[0]!.key, null, deps, options);
+  return { ...listing, readAs: japaneseNameReadAs(typed, reading), readFromName: true, typed: typed.trim() };
 }
 
 /**
@@ -1213,9 +2184,16 @@ function readDollarIndexCode(raw: string, deps: Pick<ListingDeps, "dataProvider"
  * symbol, and for a name search finds no listing for, which then fails as a
  * symbol would.
  */
-async function companyNameListingArg(raw: string, deps: ListingDeps): Promise<ListingArg | null> {
+async function companyNameListingArg(raw: string, deps: ListingDeps): Promise<{ listing: ListingArg; found: CompanyNameListing } | null> {
   const typed = stripStrayEdges(raw).text || raw;
-  return isCompanyNameInput(typed) ? readCompanyName(typed, deps) : null;
+  const found = isCompanyNameInput(typed) ? await findCompanyName(typed, deps) : null;
+  return found ? { listing: companyListingArg(typed, found), found } : null;
+}
+
+/** `Read "crude oil" as CL=F (WTI Crude Oil), the benchmark future; Brent is BZ=F.` */
+function commodityFutureReadAs(typed: string, { contract, other }: NonNullable<ReturnType<typeof commodityNameFuture>>): string {
+  const alternative = other ? `; ${other.name} is ${other.contract.symbol}` : "";
+  return `Read "${typed.trim()}" as ${contract.symbol} (${contract.name}), the benchmark future${alternative}.`;
 }
 
 /** One word that can be a company's name: letters first, no venue, pair or index mark (`Apple`, `Petrobras`, `Coca-Cola`). */
@@ -1234,18 +2212,85 @@ const ONE_WORD_NAME = /^\p{L}[\p{L}\p{N}&'’.-]*$/u;
  * hint, the coin's pair (BTC-USD) or the search that says where it is. Null
  * for anything else, and when search names no company or is too busy to say.
  */
+/**
+ * The Tokyo listing a name in kanji alone is the whole name of (中電工 is
+ * 1941:JPX), for `quote` once the service has named no company for it
+ * (`oneWordCompanyName`): never a name it only starts. Null for any other word.
+ */
+export async function tokyoCompanyNameArg(typed: string): Promise<ListingArg | null> {
+  const reading = isKanjiOnlyName(typed) ? await readExactJapaneseName(typed) : null;
+  if (!reading) return null;
+  if (reading.total > 1) throw new ListingArgError(japaneseNameChoice(typed, reading));
+  return { ...parseListingArg(reading.listings[0]!.key), readAs: japaneseNameReadAs(typed, reading), readFromName: true };
+}
+
 export async function oneWordCompanyName(typed: string, deps: Pick<ListingDeps, "dataProvider">): Promise<ListingArg | null> {
+  const found = await findOneWordCompany(typed, deps);
+  return found ? companyListingArg(typed, found) : null;
+}
+
+/**
+ * A word the service marks as a company's name (`searchAliases`), read as
+ * that company's listing as `oneWordCompanyName` reads a word, for a bare
+ * symbol no source quotes, before it is read on the symbol's listings abroad:
+ * "siemens" is SIE on XETRA (Siemens AG), not SIEMENS on NSE (Siemens Ltd.).
+ * Null when the service marks no listing with the word, or marks the word's
+ * own symbol, and when search names no company or is too busy to say.
+ */
+export async function serviceNamedCompany(typed: string, deps: Pick<ListingDeps, "dataProvider">): Promise<ListingArg | null> {
+  // Most symbols are no company's name: one search says so before any listing is weighed or quoted.
+  if (!ONE_WORD_NAME.test(typed.trim()) || !await marksAnotherListing(deps.dataProvider, typed)) return null;
+  const found = await findOneWordCompany(typed, deps);
+  if (!found?.named || found.symbol.toUpperCase() === typed.trim().toUpperCase()) return null;
+  return companyListingArg(typed, found);
+}
+
+/** A word written as a company's name is (`Aeon`, `Panasonic`): a capital, then small letters, never a ticker's capitals. */
+const TITLE_CASE_WORD = /^\p{Lu}\p{Ll}[\p{L}&'’.-]*$/u;
+
+/** Whether a word is written as a company's name is (`Aeon`), never as a ticker is (`AEON`, `aeon`). */
+export function isTitleCaseWord(text: string): boolean {
+  return TITLE_CASE_WORD.test(text.trim());
+}
+
+/**
+ * A word written as a company's name (`Aeon`, not `AEON` or `aeon`) that is
+ * also a ticker, read as the company named exactly that word whose home line
+ * the service marks, when the ticker's company is named more than the word:
+ * "Aeon" in a pasted book is Aeon Co., Ltd. (8267:JPX), not AEON Biopharma,
+ * whose ticker it is ("Read "Aeon" as 8267:JPX (Aeon Co., Ltd.); the ticker
+ * AEON is AEON Biopharma, Inc."). A word in capitals stays the ticker, and
+ * so does one whose ticker's company bears the name (`Snap` is Snap Inc.).
+ * Null otherwise, and when search names no such company or is too busy to say.
+ */
+export async function titleCaseCompanyName(
+  typed: string,
+  ticker: { symbol: string; name: string | null | undefined },
+  deps: Pick<ListingDeps, "dataProvider">,
+): Promise<ListingArg | null> {
+  const word = typed.trim();
+  if (!TITLE_CASE_WORD.test(word) || companyNameExtraWords(word, ticker.name) === 0) return null;
+  const found = await findOneWordCompany(word, deps);
+  if (!found?.home || found.moved || companyNameExtraWords(word, found.name) !== 0) return null;
+  const listing = companyListingArg(word, found);
+  if (listing.key.toUpperCase() === ticker.symbol.toUpperCase()) return null;
+  const owner = ticker.name?.trim().replace(/\.$/, "") || "another company";
+  return { ...listing, readAs: `${listing.readAs!.replace(/\.$/, "")}; the ticker ${ticker.symbol.toUpperCase()} is ${owner}.` };
+}
+
+/** The company `oneWordCompanyName` reads a word as, before it is read as a listing. */
+async function findOneWordCompany(typed: string, deps: Pick<ListingDeps, "dataProvider">): Promise<CompanyNameListing | null> {
   const word = typed.trim();
   if (!ONE_WORD_NAME.test(word) || knownGapMessage(word) || isMajorCoinName(word)) return null;
-  const named = await readCompanyName(word, deps, { oneWord: true }).catch((error: unknown) => {
+  const found = await findCompanyName(word, deps, { oneWord: true }).catch((error: unknown) => {
     if (!isProviderBusy(error)) throw error;
     // Intentional ignore: a busy search says nothing about the name, so the word keeps its own "Not a ticker".
     return null;
   });
-  if (!named) return null;
+  if (!found) return null;
   // The board is read only for a word that names a company, and once for the run (`primeBoardCoins`).
   if (/^[A-Za-z0-9]+$/.test(word)) await primeBoardCoins([`Not a ticker: ${word.toUpperCase()}.`]);
-  return boardCoinFor(word) ? null : named;
+  return boardCoinFor(word) ? null : found;
 }
 
 function isMajorCoinName(word: string): boolean {
@@ -1253,14 +2298,82 @@ function isMajorCoinName(word: string): boolean {
   return [...MAJOR_COIN_NAMES.values()].some((name) => name.toLowerCase() === wanted);
 }
 
-async function readCompanyName(typed: string, deps: Pick<ListingDeps, "dataProvider">, options: { oneWord?: boolean } = {}): Promise<ListingArg | null> {
-  const found = await findListingOfCompanyName(deps.dataProvider, typed, { meant: true, quoted: true, ...options });
-  if (!found) return null;
-  const key = `${found.symbol}:${found.exchange}`;
+function findCompanyName(typed: string, deps: Pick<ListingDeps, "dataProvider">, options: { oneWord?: boolean } = {}): Promise<CompanyNameListing | null> {
+  return findListingOfCompanyName(deps.dataProvider, typed, { meant: true, quoted: true, movedLine: (listing) => movedLineOf(listing, deps), ...options });
+}
+
+/**
+ * Where the company of a US line that stopped trading, or has no quote, trades
+ * now when it moved off the symbol (`loadListingFate`): GETY became GETYQ on
+ * 2026-10-22, so "getty images" is GETYQ rather than its delisted NYSE line or
+ * the Munich line still quoting the old shares. A line that trades is not
+ * looked up.
+ */
+async function movedLineOf(
+  listing: { symbol: string; exchange: string; quote: Quote | null; name: string | null },
+  deps: Pick<ListingDeps, "dataProvider">,
+): Promise<{ symbol: string; note: string } | null> {
+  const { quote, name, ...line } = listing;
+  if (quote && !lineMayHaveMoved(quote)) return null;
+  const fate = await loadListingFate(line, deps.dataProvider, { quote });
+  const moved = fate.moved ?? (quote ? null : movedWithoutQuote(fate.change, name));
+  return moved ? { symbol: moved.tradesAs, note: moved.note } : null;
+}
+
+/**
+ * The move of a line with no quote, when it is the move of the company search
+ * names on the line. With no quote nothing tells the company's change from an
+ * older one's: a reused symbol's change data is the company that held it
+ * before, so it is followed only when that company is this one.
+ */
+function movedWithoutQuote(change: ListingFate["change"], name: string | null): MovedTickerChange | null {
+  const moved = movedAwayChange(change);
+  return moved && sameCompany(name, moved.issuer) ? moved : null;
+}
+
+function companyListingArg(typed: string, found: CompanyNameListing): ListingArg {
+  const key = found.exchange ? `${found.symbol}:${found.exchange}` : found.symbol;
   // A fund or an index carrying the name asks about the company's stock: "Did you mean JPM (JPMorgan Chase & Co.)?".
   const meant = found.meant ? { symbol: found.meant.symbol, name: found.meant.name } : null;
   const question = meant ? ` ${meantQuestion({ meant })}` : "";
-  return { ...parseListingArg(key), readAs: `Read "${typed.trim()}" as ${key} (${found.name}).${question}`, ...meant ? { meant } : {} };
+  // A company that moved off the line search lists says so: "GETY became GETYQ on 2026-10-22."
+  const moved = found.moved ? ` ${found.moved}.` : "";
+  // The company's other own lines, where it is listed twice: "Read "Elbit Systems" as ESLT:NASDAQ (Elbit Systems Ltd.); also ESLT:TASE."
+  const also = found.otherLines?.length ? `; also ${found.otherLines.join(", ")}` : "";
+  return {
+    ...parseListingArg(key), readAs: `Read "${typed.trim()}" as ${key} (${found.name})${also}.${moved}${question}`,
+    ...meant ? { meant } : {}, ...found.exchange ? { venueFromSearch: true as const } : { readFromName: true as const },
+    ...!/\s/.test(typed.trim()) ? { wordAsName: true as const } : {},
+  };
+}
+
+/**
+ * The listing search names for a company's name typed where a ticker goes,
+ * as a sentence offers it: `PLTR (Palantir Technologies Inc.)`, a listing
+ * abroad with its venue (`SIE:XETRA (Siemens AG)`), a fund or an index that
+ * carries the name as the company's stock it means. Null when the words name
+ * no company, search is busy, or the listing found is the word itself: a
+ * real ticker is never a company's name. Never throws.
+ */
+export async function companyNameSuggestion(typed: string, deps: Pick<ListingDeps, "dataProvider">): Promise<{ symbol: string; name: string } | null> {
+  const words = typed.trim().replace(/^\$/, "");
+  if (!words) return null;
+  try {
+    const found = isCompanyNameInput(words) ? await findCompanyName(words, deps).catch(busyAsMiss) : await findOneWordCompany(words, deps);
+    const listing = found?.meant ?? found;
+    if (!listing || listing.symbol.toUpperCase() === words.toUpperCase()) return null;
+    return { symbol: !listing.exchange || isUsListingExchange(listing.exchange) ? listing.symbol : `${listing.symbol}:${listing.exchange}`, name: listing.name };
+  } catch (error) {
+    logFailure("cli.listing-arg", "Search a company name for a suggestion failed")(error);
+    return null;
+  }
+}
+
+/** A search too busy to answer is no company, as a name that matches none. */
+function busyAsMiss(error: unknown): null {
+  if (!isProviderBusy(error)) throw error;
+  // Intentional ignore: a busy search says nothing about the name, so no company is suggested.
+  return null;
 }
 
 /** `resolveCliListing` for a command: a bad exchange fails the command with its message. */
@@ -1269,7 +2382,7 @@ export async function requireCliListing(
   exchangeOption: string | null | undefined,
   deps: ListingDeps,
   ctx: Pick<CliCommandContext, "fail">,
-  options: { ownExchangeWins?: boolean; venueSuffix?: boolean } = {},
+  options: { ownExchangeWins?: boolean; venueSuffix?: boolean; companyWord?: boolean; listingAbroad?: boolean } = {},
 ): Promise<CliListing> {
   try {
     return await resolveCliListing(raw, exchangeOption, deps, options);
@@ -1314,7 +2427,7 @@ export interface ListingIdentity {
 
 export function listingIdentity(
   listing: Pick<CliListing, "symbol" | "exchange" | "saved">,
-  quote?: Pick<Quote, "name" | "listingExchangeName" | "exchangeName"> | null,
+  quote?: Pick<Quote, "name" | "listingExchangeName" | "exchangeName"> & Partial<Pick<Quote, "symbol">> | null,
 ): ListingIdentity {
   const quoteExchange = canonicalExchange(quote?.listingExchangeName || quote?.exchangeName);
   const exchange = listing.exchange || quoteExchange || canonicalExchange(listing.saved?.metadata.exchange);
@@ -1391,8 +2504,9 @@ export function listingFields(saved: Pick<SavedListingName, "key" | "symbol" | "
 
 /** The listing a saved ticker row is, as a collection command names it after adding or removing it. */
 export function savedListingName(ticker: TickerRecord): SavedListingName {
-  const { symbol } = parsePublicTickerKey(ticker.metadata.ticker);
-  const exchange = canonicalExchange(ticker.metadata.exchange);
+  const { symbol, exchange: stored } = parsePublicTickerKey(ticker.metadata.ticker);
+  // A row stored under its venue (ASML:XAMS) with none beside it is that venue's listing.
+  const exchange = canonicalExchange(ticker.metadata.exchange) || stored || "";
   const key = exchange ? `${symbol}:${exchange}` : symbol;
   // A row saved without a company carries its symbol as the name.
   const typed = ticker.metadata.name?.trim();

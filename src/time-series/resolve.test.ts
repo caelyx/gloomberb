@@ -37,7 +37,7 @@ const fredLoad = (
 });
 
 describe("resolveChartSpecData", () => {
-  test("credit stress windows disclose source coverage without clipping buffers or scaling effective yields", async () => {
+  test("credit stress windows disclose source coverage without clipping buffers, the spread in bp and the effective yield in percent", async () => {
     const spec = buildCustomChartPreset("FRED:BAMLC0A0CM,FRED:BAMLC0A0CMEY");
     const requests: string[] = [];
     const sources = {
@@ -60,8 +60,9 @@ describe("resolveChartSpecData", () => {
     const fiveYear = await resolveChartSpecData(spec, sources);
     expect(fiveYear.warnings.filter((warning) => warning.includes("FRED coverage"))).toHaveLength(2);
     expect(fiveYear.warnings.some((warning) => warning.includes("vintage dates"))).toBe(true);
-    expect(fiveYear.series.map((series) => series.points.at(-1)?.value)).toEqual([0.8, 5.68]);
-    expect(fiveYear.series.map((series) => series.unit)).toEqual(["%", "%"]);
+    // FRED serves the OAS in percentage points; it reads in bp, on CDX IG's axis, and the yield stays in percent.
+    expect(fiveYear.series.map((series) => series.points.at(-1)?.value)).toEqual([80, 5.68]);
+    expect(fiveYear.series.map((series) => [series.unit, series.unitGroup])).toEqual([["bp", "series:bp"], ["%", "percent"]]);
     const recent = await resolveChartSpecData({ ...spec, viewport: { ...spec.viewport, range: "1Y" } }, sources);
     expect(requests.at(-1)! < "2023-09-12").toBe(true); // Calculation buffer predates the visible window.
     expect(recent.warnings.some((warning) => warning.includes("FRED coverage"))).toBe(false);
@@ -83,7 +84,7 @@ describe("resolveChartSpecData", () => {
     };
     const sources = { loadFredSeries: async () => fredLoad(data) };
     const before = await resolveChartSpecData(spec, sources);
-    expect(before.series[0]?.points.at(-1)?.value).toBe(0.8);
+    expect(before.series[0]?.points.at(-1)?.value).toBe(80);
     expect(before.series[0]?.points.at(-1)?.date.toISOString()).toBe("2026-09-14T00:00:00.000Z");
     expect(before.warnings.some((warning) => warning.includes("exact coverage dates are unavailable"))).toBe(true);
     expect(before.warnings.some((warning) => warning.includes("2026-09-10"))).toBe(false);
@@ -249,6 +250,89 @@ describe("resolveChartSpecData", () => {
     }
   });
 
+  test("an index's volume keeps its bars as its members' volume without a unit warning, and other types warn only where the unit is unknown", async () => {
+    const volumeOf = async (symbol: string, instrumentType: string | undefined, volume = 1234, exchange?: string) => {
+      const history = [{ date: new Date("2026-01-14"), close: 1, volume }, { date: new Date("2026-01-15"), close: 1, volume }];
+      const quote = { symbol, currency: "USD", price: 1, change: 0, changePercent: 0, lastUpdated: Date.parse("2026-01-15"), instrumentType };
+      const financials = { ...emptyFinancials(), quote, priceHistory: history };
+      const provider = createTestDataProvider({
+        getQuote: async () => quote,
+        getTickerFinancials: async () => financials,
+        getPriceHistory: async () => history,
+        getPriceHistoryForResolution: async () => history,
+      });
+      const instrument = { symbol, ...(exchange ? { exchange } : {}) };
+      const sources = { dataProvider: provider, loadFredSeries: async () => fredLoad(), now: new Date("2026-01-16") };
+      const viewport = { range: "1M" as const, resolution: "1d" as const };
+      // The chart's own volume panel, and a volume series added by hand.
+      const charted = await resolveChartSpecData(chartSpec({
+        viewport,
+        series: [chartSeries({ id: "price", source: { kind: "security", instrument, fieldId: "market.close" } })],
+        studies: [{ id: "volume", kind: "volume", inputSeriesIds: ["price"], parameters: {}, panelId: "main", axis: "left" }],
+      }), sources);
+      const added = await resolveChartSpecData(chartSpec({
+        viewport,
+        series: [chartSeries({ id: "direct", source: { kind: "security", instrument, fieldId: "market.volume" } })],
+      }), sources);
+      const warned = (result: { warnings: string[] }) => result.warnings.some((warning) => warning.includes("Volume unit unknown"));
+      return {
+        direct: added.series.find((entry) => entry.id === "direct"),
+        study: charted.series.find((entry) => entry.id === "volume"),
+        warned: warned(charted) || warned(added),
+      };
+    };
+
+    // A quote typed INDEX, and a listing named like one before any type is known.
+    for (const [instrumentType, exchange] of [["INDEX", "HKSE"], ["IND", undefined], [undefined, "HKSE"]] as const) {
+      const index = await volumeOf("^HSI", instrumentType, 1234, exchange);
+      expect(index.study).toMatchObject({ label: "Members' volume", unit: "" });
+      expect(index.study?.points.map((point) => point.value)).toEqual([1234, 1234]);
+      expect(index.direct).toMatchObject({ unit: "", warning: undefined });
+      expect(index.direct?.label).toMatch(/^\^HSI(:HKSE)? Members' volume$/);
+      expect(index.warned).toBe(false);
+    }
+
+    // Types the display table misses still name shares or contracts.
+    for (const [symbol, instrumentType, unit] of [["O", "REIT", "shares"], ["PDI", "CLOSEDEND", "shares"], ["ES", "CONTFUT", "contracts"], ["GC=F", undefined, "contracts"]] as const) {
+      const known = await volumeOf(symbol, instrumentType);
+      expect([known.study?.unit, known.direct?.unit, known.warned]).toEqual([unit, unit, false]);
+    }
+
+    // The unit is unknown for a coin, a bond or an untyped listing, and says so.
+    for (const [symbol, instrumentType] of [["BTC-USD", "CRYPTOCURRENCY"], ["US912828", "BOND"], ["FOO", undefined]] as const) {
+      const unknown = await volumeOf(symbol, instrumentType);
+      expect(unknown.study).toMatchObject({ label: "Volume", unit: "" });
+      expect(unknown.direct?.warning).toBe("Volume unit unknown.");
+      expect(unknown.warned).toBe(true);
+    }
+
+    // A coin's bars from Gloom Cloud say what their volume counts: the value traded in the price's currency, said as
+    // its unit and never warned about ("Volume unit unknown: USDT-USD:CCC Price." read over the crypto board).
+    {
+      const history = [{ date: new Date("2026-01-14"), close: 1, volume: 5e9, volumeBasis: "aggregate" },
+        { date: new Date("2026-01-15"), close: 1, volume: 6e9, volumeBasis: "aggregate" }];
+      const quote = { symbol: "USDT-USD", currency: "USD", price: 1, change: 0, changePercent: 0, lastUpdated: Date.parse("2026-01-15"), instrumentType: "CRYPTOCURRENCY" };
+      const provider = createTestDataProvider({
+        getQuote: async () => quote,
+        getTickerFinancials: async () => ({ ...emptyFinancials(), quote, priceHistory: history }),
+        getPriceHistory: async () => history,
+        getPriceHistoryForResolution: async () => history,
+      });
+      const result = await resolveChartSpecData(chartSpec({
+        viewport: { range: "1M", resolution: "1d" },
+        series: [chartSeries({ id: "price", source: { kind: "security", instrument: { symbol: "USDT-USD" }, fieldId: "market.ohlcv" } })],
+        studies: [{ id: "volume", kind: "volume", inputSeriesIds: ["price"], parameters: {}, panelId: "main", axis: "left" }],
+      }), { dataProvider: provider, loadFredSeries: async () => fredLoad(), now: new Date("2026-01-16") });
+      expect(result.series.find((entry) => entry.id === "volume")?.unit).toBe("USD");
+      expect(result.warnings.filter((warning) => warning.includes("Volume unit"))).toEqual([]);
+    }
+
+    // A series with no volume to read (spot FX counts none) has no unit to warn about.
+    const flat = await volumeOf("EURUSD=X", "CURRENCY", 0);
+    expect(flat.direct?.warning).toBeUndefined();
+    expect(flat.warned).toBe(false);
+  });
+
   test("cached history honors the visible date range before the network resolves", () => {
     const source = { kind: "security" as const, instrument: { symbol: "TEST", exchange: "NASDAQ" }, fieldId: "market.close" };
     const history = ["2021-01-01", "2026-08-01", "2026-08-15", "2026-09-10"].map((day, i) => ({
@@ -399,7 +483,7 @@ describe("resolveChartSpecData", () => {
     const missing = await resolveChartSpecData(spec, sources);
     expect(missing.series).toHaveLength(1);
     expect(missing.series[0]?.points).toEqual([]);
-    expect(missing.errors[0]).toContain('Chart series capability "charts.test" is unavailable');
+    expect(missing.errors[0]).toContain('CAP:charts.test:one is not covered: no chart series is called "charts.test:one".');
 
     const resolved = await resolveChartSpecData(spec, {
       ...sources,
@@ -871,7 +955,7 @@ describe("resolveChartSpecData", () => {
       cache,
     );
     expect(manual.errors).toEqual([
-      "TEST:XNAS: Requested 1m price history is unavailable for TEST:XNAS.",
+      "TEST:NASDAQ: Requested 1m price history is unavailable for TEST:NASDAQ.",
     ]);
 
     const auto = await resolveChartSpecData(
@@ -1272,6 +1356,37 @@ describe("resolveChartSpecData", () => {
     });
   });
 
+  test("a panned view whose bars ahead reach the present loads its history once across live passes", async () => {
+    // Each live quote resolves again with a later clock. Naming the window by
+    // the clock fetched and kept another full copy of the history every pass.
+    const requests: string[] = [];
+    const provider = createTestDataProvider({
+      getTickerFinancials: async () => emptyFinancials(),
+      getChartResolutionSupport: () => [{ resolution: "15m", maxRange: "1M" }, { resolution: "1d", maxRange: "5Y" }],
+      getDetailedPriceHistory: async (_symbol, _exchange, start, end) => {
+        requests.push(`${start.toISOString()}/${end.toISOString()}`);
+        return [{ date: new Date("2026-10-26T15:00:00.000Z"), close: 100 }];
+      },
+    });
+    const spec = chartSpec({
+      viewport: { range: "3M", resolution: "auto" },
+      series: [chartSeries({ source: { kind: "security", instrument: { symbol: "TEST", exchange: "NASDAQ" }, fieldId: "market.close" } })],
+    });
+    const now = Date.parse("2026-10-27T15:30:00.000Z");
+    // Two hours short of the present: well inside half a four-day view.
+    const view = { start: new Date(now - 4 * 86_400_000), end: new Date(now - 2 * 3_600_000) };
+    const cache = new ChartResolveCache();
+    for (let pass = 0; pass < 4; pass += 1) {
+      const result = await resolveChartSpecData(spec, {
+        dataProvider: provider, now: new Date(now + pass * 700), loadFredSeries: async () => fredLoad(),
+      }, cache, { requestViewport: view, autoViewport: view, targetPointCount: 200 });
+      expect(result.errors).toEqual([]);
+    }
+
+    expect(requests).toEqual(["2026-09-27T15:30:00.000Z/2026-10-27T15:30:00.001Z"]);
+    expect(cache.priceHistoryByRequest.size).toBe(1);
+  });
+
   test("asks for the older part of a panned window a capped source answered short, and stops where the source has nothing older", async () => {
     // Thirty-minute bars on weekdays from FIRST; one answer holds the newest 1,000 of a window.
     const FIRST = Date.parse("2025-03-03T14:30:00.000Z");
@@ -1318,7 +1433,7 @@ describe("resolveChartSpecData", () => {
     });
     expect(requests).toHaveLength(3);
     expect(edge.bufferedSeries?.[0]?.historyStart?.getTime()).toBe(FIRST);
-    expect(edge.warnings).toContain("30m history starts Mar 3, 2025.");
+    expect(edge.warnings).toContain("30m history starts 3 Mar 2025.");
   });
 
   test("accumulates historical windows without replacing the current tail", async () => {
@@ -1584,16 +1699,19 @@ describe("resolveChartSpecData", () => {
     expect(result.errors).toEqual([]);
     expect(result.series).toHaveLength(3);
     const price = result.series.find((entry) => entry.id === "aapl-price")!;
+    expect(price.legendContext).toBe("Close");
     expect(price.points.map((point) => point.value)).toEqual([0, 25]);
     expect(price.axis).toBe("left");
     const bufferedPrice = result.bufferedSeries?.find((entry) => entry.id === "aapl-price");
     expect(bufferedPrice?.points.map((point) => point.value)).toEqual([-20, 0, 25]);
     const revenue = result.series.find((entry) => entry.id === "msft-revenue")!;
+    expect(revenue.legendContext).toBe("Revenue");
     expect(revenue.points[0]?.date.toISOString().slice(0, 10)).toBe("2026-02-15");
     expect(revenue.axis).toBe("right");
     expect(result.series.find((entry) => entry.id === "cpi")?.panelId).toBe("macro");
-    expect(result.warnings[0]).toContain("FRED refresh failed (network unavailable)");
-    expect(result.warnings[0]).toContain("cached data fetched 2026-03-15");
+    // The saved copy a failed refresh left answering is dated in the chart's footer, not noted on the plot.
+    expect(result.savedAt).toBe(Date.parse("2026-03-15T00:00:00Z"));
+    expect(result.warnings.some((warning) => warning.includes("refresh failed"))).toBe(false);
     expect(result.warnings.some((warning) => warning.includes("FRED vintage dates"))).toBe(true);
     expect(result.viewport).toEqual({
       start: new Date("2025-03-31T00:00:00.000Z"),
@@ -1842,6 +1960,28 @@ describe("resolveChartSpecData", () => {
       date: new Date("2025-02-20T00:00:00Z"),
       value: 50,
     });
+  });
+
+  test("converts each fundamental series before tabulation and keeps its native amount and fiscal end", async () => {
+    const provider = createTestDataProvider({
+      getTickerFinancials: async (symbol) => {
+        const usa = symbol === "LMT";
+        return { ...emptyFinancials(), quarterlyStatements: [{ date: usa ? "2026-09-27" : "2026-09-30", currency: usa ? "USD" : "EUR", totalRevenue: 100e6 }] };
+      },
+    });
+    const spec = chartSpec({ viewport: { range: "ALL", resolution: "auto", currency: "SGD" }, series: ["LMT", "RHM"].map((symbol) => chartSeries({
+      id: symbol, source: { kind: "security", instrument: { symbol }, fieldId: "fundamental.totalRevenue", period: "quarterly" },
+    })) });
+    const rateNotice = "Statements in SGD at USD/SGD 1.25 and EUR/SGD 1.5";
+    const result = await resolveChartSpecData(spec, {
+      dataProvider: provider, loadFredSeries: async () => fredLoad(), now: new Date("2026-11-18T00:00:00Z"),
+      loadStatementCurrency: async () => ({ rates: new Map([["USD", 1.25], ["EUR", 1.5]]), note: rateNotice, failures: [] }),
+    });
+    expect(result.coverageNotices).toContain(rateNotice);
+    expect(result.series.map((series) => ({ group: series.unitGroup, point: series.points.at(-1) }))).toMatchObject([
+      { group: "currency-total:SGD", point: { value: 125e6, observedAt: new Date("2026-09-27"), nativeAmount: { value: 100e6, currency: "USD" } } },
+      { group: "currency-total:SGD", point: { value: 150e6, observedAt: new Date("2026-09-30"), nativeAmount: { value: 100e6, currency: "EUR" } } },
+    ]);
   });
 
   test("keeps an explicit viewport when a latest-observation cap is also set", async () => {
@@ -2102,7 +2242,8 @@ describe("resolveChartSpecData", () => {
       expect(price?.points.at(-1)?.date.getTime()).toBe(elapsed ? quoteTime : now - 86_400_000);
       // After the close the daily bar takes the regular close (130), not the 129 after-hours print.
       expect(price?.points.at(-1)?.close).toBe(elapsed ? 130 : 100);
-      expect(price?.latestChangePercent).toBe(elapsed ? 30 : undefined);
+      if (elapsed) expect(price?.latestChangePercent).toBeCloseTo(30, 8);
+      else expect(price?.latestChangePercent).toBeUndefined();
       expect(sma?.points.at(-1)?.date.getTime()).toBe(elapsed ? quoteTime : now - 86_400_000);
     } finally { clock.mockRestore(); }
   });
@@ -2842,7 +2983,7 @@ describe("one-day charts show the latest session", () => {
     expect(served.warnings).toEqual([]);
     const unserved = await resolveExtended("AAPL", "NASDAQ", false);
     expect(unserved.viewport?.start).toEqual(new Date("2026-10-02T14:00:00Z"));
-    expect(unserved.warnings).toContain("AAPL:XNAS: pre-market and after-hours bars are unavailable; the chart shows the regular session.");
+    expect(unserved.warnings).toContain("AAPL:NASDAQ: pre-market and after-hours bars are unavailable; the chart shows the regular session.");
     await resolveExtended("7203.T", "JPX", true);
     expect(requests).toEqual(["extended", "extended", undefined]);
     // A broker's dollar contract routed through SMART asks too; its options do not.
@@ -2851,6 +2992,40 @@ describe("one-day charts show the latest session", () => {
     expect((await resolveExtended("AAPL", "SMART", true, routed)).viewport?.start).toEqual(new Date("2026-10-02T08:00:00Z"));
     await resolveExtended("AAPL261218C00300000", "", true, { ...routed, localSymbol: "AAPL261218C00300000", secType: "OPT", right: "C", strike: 300, lastTradeDateOrContractMonth: "20261218", multiplier: "100" });
     expect(requests).toEqual(["extended", undefined]);
+  });
+
+  /** GP QQQ 1D extended printed $654.41 -0.28%: the last bar's price beside a quote's move read a moment apart, -0.39% from the 656.95 close. */
+  test("the legend moves with the regular session on its bars, and with the latest print on bars that run into extended hours, each its last bar's move", async () => {
+    const bars = [...hourlyBars("2026-10-01T13:30:00Z", "2026-10-01T19:30:00Z", 330), ...hourlyBars("2026-10-02T08:00:00Z", "2026-10-02T12:00:00Z", 333),
+      ...hourlyBars("2026-10-02T13:30:00Z", "2026-10-02T19:30:00Z", 336.6), ...hourlyBars("2026-10-02T20:00:00Z", "2026-10-02T23:00:00Z", 326.7)];
+    const source = { kind: "security" as const, instrument: { symbol: "AAPL", exchange: "NASDAQ" }, fieldId: "market.ohlcv" };
+    // After Friday's session: up 2% to a 336.60 close, then 326.70 after hours, 1% under Thursday's 330 close.
+    let quote = { symbol: "AAPL", currency: "USD", price: 326.7, change: -3.3, changePercent: -1, previousClose: 330,
+      regularClose: 336.6, regularCloseSessionDate: "2026-10-02", changeSessionDate: "2026-10-02", marketState: "POSTPOST" as const,
+      listingExchangeName: "NASDAQ", lastUpdated: Date.parse("2026-10-02T23:59:00Z") };
+    const legend = async (extendedHours: boolean) => (await resolveChartSpecData(chartSpec({
+      viewport: { range: "1D", resolution: "1h", ...(extendedHours ? { extendedHours: true } : {}) },
+      series: [chartSeries({ style: "candles", source })],
+    }), {
+      dataProvider: createTestDataProvider({
+        getPriceHistoryForResolutionWithMetadata: async (_symbol, _exchange, _range, resolution, context) => {
+          const extended = context?.historySession === "extended";
+          return { points: extended ? bars : bars.filter((bar) => bar.date.getUTCHours() >= 13 && bar.date.getUTCHours() < 20), resolution,
+            ...(extended ? { extendedHours: true } : {}) };
+        },
+      }),
+      now: new Date("2026-10-03T12:00:00Z"), loadFredSeries: async () => fredLoad(),
+      quoteOverrides: new Map([[chartQuoteOverrideKeyForSource(source), quote]]),
+    })).series[0]?.latestChangePercent;
+    // As `quote` heads Last: the session's +2%, the after-hours print beside it.
+    expect(await legend(false)).toBeCloseTo(2, 8);
+    expect(await legend(true)).toBeCloseTo(-1, 8);
+    // A quote that has moved on from the last bar (324.06, -1.8%), or whose change lags its price, still prints the
+    // last bar's move from the prior close the chart draws: -1%.
+    quote = { ...quote, price: 324.06, change: -5.94, changePercent: -1.8 };
+    expect(await legend(true)).toBeCloseTo(-1, 8);
+    quote = { ...quote, price: 327.45, change: -3.3, changePercent: -1 };
+    expect(await legend(true)).toBeCloseTo(-1, 8);
   });
 
   test("keeps a rolling day for crypto", async () => {

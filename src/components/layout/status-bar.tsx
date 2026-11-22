@@ -3,7 +3,6 @@ import {
   Text,
   contextMenuDivider,
   useContextMenu,
-  useRendererHost,
   useUiCapabilities,
   useUiHost,
 } from "../../ui";
@@ -17,18 +16,12 @@ import { useAppChromeShown } from "./presentation";
 import { useViewport } from "../../react/input";
 import {
   advertisedChord,
-  formatKeyChord,
-  primaryModifierFor,
+  formatChordForHost,
   useKeybindings,
+  useTerminalReportsControlKeys,
   type KeyChord,
 } from "../../app/keybindings";
-import {
-  detectShortcutPlatform,
-  getShortcutDisplayMode,
-  type ShortcutDisplayMode,
-  type ShortcutPlatform,
-} from "../../utils/shortcut-labels";
-import { getCurrentPluginTarget } from "../../plugins/current-target";
+import { getShortcutDisplayMode, type ShortcutDisplayMode } from "../../utils/shortcut-labels";
 import { getSharedRegistry } from "../../plugins/registry";
 import {
   shouldShowTidyWindows,
@@ -36,7 +29,6 @@ import {
 } from "../../layout/pane-manager";
 import { PluginSlot } from "../../react/plugins/plugin-slot";
 import type { ContextMenuItem } from "../../types/context-menu";
-import { VERSION } from "../../version";
 import { displayWidth } from "../../utils/format";
 import { Button } from "../ui/button";
 import { confirmDialog } from "../ui/confirm-dialog";
@@ -48,23 +40,30 @@ import { teamStore } from "../../team/store";
 import { buildStatusBarTabGroups, groupIdFromMarkerValue, groupMarkerValue } from "./status-bar-groups";
 import { requestFeedbackDialog } from "../feedback-dialog";
 import { openFormModal } from "../form-modal";
+import { getDesktopWindows, layoutMoveTargets } from "../../state/desktop-windows";
+import { fireAndForget } from "../../utils/fire-and-forget";
 import { recordFunctionOpen } from "../../telemetry/usage-counts";
 import {
+  NARROW_STATUS_BAR_COLUMNS,
   STATUS_WIDGET_COLUMNS,
   useClaimedStatusWidgetColumns,
   usePublishStatusWidgetRoom,
 } from "./status-widget-space";
 import { StarPromptStatusLine } from "../../app/star-prompt/status-line";
+import { connectionHealth as sharedConnectionHealth, GLOOM_CLOUD_HTTP_CONNECTION_ID } from "../../core/connection-health";
+import { DATA_SERVICE_UNREACHABLE_MESSAGE } from "../../utils/network-failure";
 
 type StatusBarEvent = { stopPropagation?: () => void; preventDefault?: () => void };
 type HoveredControl = string | null;
 type SetHoveredControl = (updater: (current: HoveredControl) => HoveredControl) => void;
 
 /**
- * Where term.gloom.sh sends people who want the installed app. The route
- * picks the installer for the visitor's OS, so one link serves every platform.
+ * The note while the data service gives no answer at all, and its short form
+ * for a narrow terminal. Every pane's own failure says why; this says once,
+ * for the whole app, that it is the connection, and goes when it answers.
  */
-const DESKTOP_DOWNLOAD_URL = "https://gloom.sh/download/desktop";
+const CONNECTION_NOTE = "Can't reach the data service";
+const CONNECTION_NOTE_SHORT = "Offline";
 
 type LayoutTabItem = {
   label: string;
@@ -85,46 +84,33 @@ type StatusBarViewProps = {
   hoveredControl: HoveredControl;
   layoutTabItems: LayoutTabItem[];
   layoutTabsWidth: number;
-  openChangelog?: (event?: StatusBarEvent) => void;
   openLayoutContextMenu: (index: number, event: any) => void | Promise<unknown>;
-  rightAvailableWidth: number;
+  /** The connection note to show (CONNECTION_NOTE or its short form), or null while the data service answers. */
+  connectionNote: string | null;
+  openConnections: () => void;
   setHoveredControl: SetHoveredControl;
   showTidyWindows: boolean;
 };
 
 /**
- * A chord as short as a tab label allows: `^2`, `^⇧F`, and on the Mac desktop
- * `⌘2` or `⇧⌘F`, in the order its menus write them. A digit chord names the
- * one digit given.
+ * A chord as short as a tab label allows: `^2`, `^⇧F`, and on a Mac `⌘2` or
+ * `⇧⌘F`. A digit chord names the one digit given.
  */
-function compactChordLabel(
-  chord: KeyChord,
-  mode: ShortcutDisplayMode,
-  platform: ShortcutPlatform = detectShortcutPlatform(),
-  digit?: number,
-): string {
-  const mac = mode === "platform" && platform === "darwin";
-  const primaryIsCmd = primaryModifierFor(mode, platform) === "cmd";
-  const ctrl = chord.ctrl || (chord.primary && !primaryIsCmd);
-  const cmd = chord.cmd || (chord.primary && primaryIsCmd);
-  const key = chord.key === "digit" && digit !== undefined
-    ? String(digit)
-    : formatKeyChord({ key: chord.key, ctrl: false, cmd: false, primary: false, alt: false, shift: false }, { primaryModifier: "ctrl" });
-  return [
-    ctrl ? "^" : "",
-    chord.alt ? (mac ? "⌥" : "Alt+") : "",
-    chord.shift ? "⇧" : "",
-    cmd ? (mac ? "⌘" : "Super+") : "",
-    key,
-  ].join("");
+function compactChordLabel(chord: KeyChord, mode: ShortcutDisplayMode, digit?: number): string {
+  const named = chord.key === "digit" && digit !== undefined ? { ...chord, key: String(digit) } : chord;
+  return formatChordForHost(named, mode, undefined, { compact: true });
 }
 
+/** A name cut to `width` keeps its start and ends in an ellipsis: `FX Desk - …`. */
 function truncate(text: string, width: number): string {
   if (width <= 0) return "";
   if (text.length <= width) return text;
-  if (width <= 2) return ".".repeat(width);
-  return `${text.slice(0, width - 2)}..`;
+  return `${text.slice(0, width - 1).trimEnd()}…`;
 }
+
+/** The longest a layout tab's name runs, and the shortest a narrow bar cuts every name to before its tabs scroll. */
+const LAYOUT_NAME_MAX = 14;
+const LAYOUT_NAME_MIN = 8;
 
 const openLayoutWorkflow = (actionId: "new-layout" | "rename-layout") => {
   openFormModal({ kind: "builtin", actionId });
@@ -138,7 +124,7 @@ const openNewLayout = (event?: StatusBarEvent) => {
 
 const TERMINAL_NEW_LAYOUT_LABEL = " + ";
 
-export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: string) => void } = {}) {
+export function StatusBar() {
   const { nativePaneChrome, nativeContextMenu } = useUiCapabilities();
   const { showContextMenu } = useContextMenu();
   const dialog = useDialog();
@@ -159,9 +145,11 @@ export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: str
   };
   // Tabs name the digit that switches to them, as bound on this host. Past
   // nine there is no digit, and a rebinding off the digits has none either.
-  const switchChord = advertisedChord(keybindings, "switch-layout", shortcutMode);
+  // A terminal that cannot send Control with a digit names Alt+1 instead.
+  const legacyTerminal = useTerminalReportsControlKeys() === false;
+  const switchChord = advertisedChord(keybindings, "switch-layout", shortcutMode, { legacyTerminal });
   const tabKey = (index: number): string => (
-    switchChord?.key === "digit" && index < 9 ? `${compactChordLabel(switchChord, shortcutMode, undefined, index + 1)} ` : ""
+    switchChord?.key === "digit" && index < 9 ? `${compactChordLabel(switchChord, shortcutMode, index + 1)} ` : ""
   );
 
   const hasMultipleLayouts = layouts.length > 1 || !!transientLayout;
@@ -180,14 +168,20 @@ export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: str
     () => buildStatusBarTabGroups(layouts, activeLayoutIdx, teamSnapshot.teams, teamSnapshot.focus, teamSnapshot.toggledGroups),
     [activeLayoutIdx, layouts, teamSnapshot.focus, teamSnapshot.teams, teamSnapshot.toggledGroups],
   );
-  const layoutTab = (index: number) => {
+  /** How the tab in front is cut on a strip too narrow for it: its name's length, and whether its key stays. */
+  type ActiveTabCut = { nameWidth: number; key: boolean };
+  // Linked tabs show `*` when edited locally and `↓` when the team is ahead: read once a render, whatever the
+  // passes below try.
+  const layoutMarkers = layouts.map((layout) => (layout.origin && registry
+    ? linkedLayoutMarker(linkedLayoutStatus(layout, registry.panes, remoteRevisions.get(layout.origin.layoutId)))
+    : ""));
+  const layoutTab = (index: number, nameWidth: number, activeCut?: ActiveTabCut) => {
     const layout = layouts[index]!;
-    // Linked tabs show `*` when edited locally and `↓` when the team is ahead.
-    const marker = layout.origin && registry
-      ? linkedLayoutMarker(linkedLayoutStatus(layout, registry.panes, remoteRevisions.get(layout.origin.layoutId)))
-      : "";
+    const cut = index === activeLayoutIdx ? activeCut : undefined;
+    const key = cut?.key === false ? "" : tabKey(index);
     return {
-      label: `${tabKey(index)}${truncate(layout.name, 14)}${marker}`,
+      label: `${key}${truncate(layout.name, cut?.nameWidth ?? nameWidth)}${layoutMarkers[index] ?? ""}`,
+      ...(key ? { keyPrefix: key } : {}),
       value: String(index),
       reorderable: true,
     };
@@ -195,8 +189,8 @@ export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: str
   // Tabs grouped by owner: personal first, then one marker per team in its
   // accent followed by that team's tabs. A collapsed group keeps its marker
   // with the tab count. The digit keys stay positional through the index labels.
-  const savedLayoutTabs = tabGroups.length <= 1
-    ? layouts.map((_, index) => layoutTab(index))
+  const savedLayoutTabsAt = (nameWidth: number, activeCut?: ActiveTabCut) => tabGroups.length <= 1
+    ? layouts.map((_, index) => layoutTab(index, nameWidth, activeCut))
     : tabGroups.flatMap((group) => {
       const marker = group.team
         ? {
@@ -210,22 +204,50 @@ export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: str
           : null;
       return [
         ...(marker ? [marker] : []),
-        ...(group.collapsed ? [] : group.indexes.map(layoutTab)),
+        ...(group.collapsed ? [] : group.indexes.map((index) => layoutTab(index, nameWidth, activeCut))),
       ];
     });
+  const tidyWindowsKey = actionKey("tidy-windows");
+  const controlsWidth = (TERMINAL_NEW_LAYOUT_LABEL.length + 1)
+    + (showTidyWindows ? terminalTidyWindowsLabel(tidyWindowsKey).length + 1 : 0);
+  const feedbackWidth = displayWidth(t("Feedback")) + 1;
+  // In the terminal the tabs get what the row has left once New Layout, Tidy
+  // Windows, Feedback and the widgets' columns are counted, and scroll past
+  // that, so a long list of layouts never pushes those controls off screen.
+  const tabsRoom = Math.max(0, termWidth - 1 - controlsWidth - feedbackWidth - STATUS_WIDGET_COLUMNS);
+  const tabsWidthOf = (tabs: readonly { label: string }[]) => tabs.reduce((sum, tab) => sum + tab.label.length + 2, 0);
+  // On a narrow terminal the names are cut to fit the strip, each keeping
+  // its start, down to a length that still reads; a strip that holds them at
+  // none of those scrolls with the names whole, as every strip on a wider
+  // terminal does. Only the one in front is cut to the strip's width: its
+  // name to a few letters, then without its key. A scrolled strip showed the
+  // end of a name (`CIO` of `FX Desk - CIO`).
+  const overflowsAt = (width: number) => !nativePaneChrome && tabsWidthOf(savedLayoutTabsAt(width)) > tabsRoom;
+  let nameWidth = LAYOUT_NAME_MAX;
+  if (termWidth < NARROW_STATUS_BAR_COLUMNS) {
+    while (overflowsAt(nameWidth) && nameWidth > LAYOUT_NAME_MIN) nameWidth -= 1;
+    if (overflowsAt(nameWidth)) nameWidth = LAYOUT_NAME_MAX;
+  }
+  const activeCut: ActiveTabCut = { nameWidth, key: true };
+  const activeTooWide = () => !nativePaneChrome && !!layouts[activeLayoutIdx]
+    && layoutTab(activeLayoutIdx, nameWidth, activeCut).label.length + 2 > tabsRoom;
+  while (activeTooWide() && activeCut.nameWidth > 3) activeCut.nameWidth -= 1;
+  if (activeTooWide()) Object.assign(activeCut, { key: false, nameWidth });
+  while (activeTooWide() && activeCut.nameWidth > 1) activeCut.nameWidth -= 1;
+  const savedLayoutTabs = savedLayoutTabsAt(nameWidth, activeCut);
+  const transientKey = transientLayout?.shortcutActionId ? actionKey(transientLayout.shortcutActionId) : "";
   const layoutTabs = transientLayout
     ? [
       ...savedLayoutTabs,
       {
-        label: [transientLayout.shortcutActionId ? actionKey(transientLayout.shortcutActionId) : "", transientLayout.label]
-          .filter(Boolean)
-          .join(" "),
+        label: [transientKey, transientLayout.label].filter(Boolean).join(" "),
+        ...(transientKey ? { keyPrefix: `${transientKey} ` } : {}),
         value: transientLayout.id,
         reorderable: false,
       },
     ]
     : savedLayoutTabs;
-  const layoutTabsWidth = layoutTabs.reduce((sum, tab) => sum + tab.label.length + 2, 0);
+  const layoutTabsWidth = tabsWidthOf(layoutTabs);
   const activeLayoutValue = transientLayout?.active ? transientLayout.id : String(activeLayoutIdx);
   const handleLayoutSelect = (value: string) => {
     const groupId = groupIdFromMarkerValue(value);
@@ -276,12 +298,6 @@ export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: str
       notify: registry.notify,
       onRevert: () => dispatch({ type: "UNDO_LAYOUT" }),
     });
-  };
-
-  const openChangelog = (event?: StatusBarEvent) => {
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    onOpenChangelog?.(VERSION);
   };
 
   const requestDeleteLayout = useCallback(async (index: number) => {
@@ -349,6 +365,24 @@ export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: str
         enabled: layouts.length > 1,
         onSelect: () => requestDeleteLayout(index),
       },
+    );
+    // The desktop app's other windows, where the tab can go.
+    const windows = getDesktopWindows();
+    const layoutId = layout.id;
+    if (windows && layoutId) {
+      const moves = layoutMoveTargets(windows, layouts.length);
+      if (moves.length > 0) items.push(contextMenuDivider("layout:window-divider"));
+      for (const move of moves) {
+        items.push({
+          id: `layout:move-to-window:${move.key}`,
+          label: move.label,
+          onSelect: () => {
+            fireAndForget(windows.moveLayout(layoutId, move.target), "desktop.moveLayoutToWindow");
+          },
+        });
+      }
+    }
+    items.push(
       contextMenuDivider("layout:actions-divider"),
       {
         id: "layout:gallery",
@@ -397,21 +431,31 @@ export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: str
     onContextMenu: handleLayoutTabContextMenu,
   }));
 
+  // Unreachable from the first request that got no answer until anything answers again.
+  const health = registry?.connectionHealth ?? sharedConnectionHealth;
+  const subscribeHealth = useCallback((onChange: () => void) => health.subscribe(onChange), [health]);
+  const dataServiceUnreachable = useSyncExternalStore(
+    subscribeHealth,
+    () => health.unreachableSince(GLOOM_CLOUD_HTTP_CONNECTION_ID) != null,
+  );
+  const openConnections = () => {
+    registry?.showPane("connections");
+  };
+
   const claimedWidgetColumns = useClaimedStatusWidgetColumns();
-  const tidyWindowsKey = actionKey("tidy-windows");
-  const controlsWidth = (TERMINAL_NEW_LAYOUT_LABEL.length + 1)
-    + (showTidyWindows ? terminalTidyWindowsLabel(tidyWindowsKey).length + 1 : 0);
-  const feedbackWidth = displayWidth(t("Feedback")) + 1;
-  // In the terminal the tabs get what the row has left once New Layout, Tidy
-  // Windows, Feedback and the widgets' columns are counted, and scroll past
-  // that, so a long list of layouts never pushes those controls off screen.
-  const tabsWidth = nativePaneChrome
-    ? layoutTabsWidth
-    : Math.min(layoutTabsWidth, Math.max(0, termWidth - 1 - controlsWidth - feedbackWidth - STATUS_WIDGET_COLUMNS));
+  const tabsWidth = nativePaneChrome ? layoutTabsWidth : Math.min(layoutTabsWidth, tabsRoom);
   const leftWidth = 1 + (hasMultipleLayouts ? tabsWidth : 0) + controlsWidth;
   usePublishStatusWidgetRoom(statusBarVisible ? Math.max(0, termWidth - leftWidth - feedbackWidth) : 0);
 
   if (!statusBarVisible) return null;
+
+  // Feedback keeps the bottom-right corner; the connection note comes before
+  // the widgets and gives way to a widget that claimed more than the usual
+  // room. A narrow terminal shortens the note.
+  const rightWidth = Math.max(0, termWidth - leftWidth - STATUS_WIDGET_COLUMNS - claimedWidgetColumns - feedbackWidth);
+  const connectionNote = !dataServiceUnreachable ? null
+    : nativePaneChrome || rightWidth >= displayWidth(t(CONNECTION_NOTE)) + 1 ? CONNECTION_NOTE
+      : rightWidth >= displayWidth(t(CONNECTION_NOTE_SHORT)) + 1 ? CONNECTION_NOTE_SHORT : null;
 
   const viewProps: StatusBarViewProps = {
     activeLayoutIdx,
@@ -423,11 +467,9 @@ export function StatusBar({ onOpenChangelog }: { onOpenChangelog?: (version: str
     hoveredControl,
     layoutTabItems,
     layoutTabsWidth: tabsWidth,
-    openChangelog: onOpenChangelog ? openChangelog : undefined,
     openLayoutContextMenu,
-    // Feedback keeps the bottom-right corner; the version chip gives way first,
-    // also to a widget that claimed more than the usual room.
-    rightAvailableWidth: Math.max(0, termWidth - leftWidth - STATUS_WIDGET_COLUMNS - claimedWidgetColumns - feedbackWidth),
+    connectionNote,
+    openConnections,
     setHoveredControl,
     showTidyWindows,
     tidyWindowsKey,
@@ -464,7 +506,7 @@ function NativeStatusBar({
       <NativeNewLayout />
       {showTidyWindows && <NativeTidyWindows {...props} />}
       <Box flexGrow={1} minWidth={0} />
-      <StatusBarSummary nativePaneChrome {...props} />
+      <StatusBarConnectionNote nativePaneChrome {...props} />
       {/* Widgets keep their width; the layout tabs give way instead. */}
       <Box flexShrink={0} flexDirection="row" alignItems="center" data-gloom-role="status-widgets">
         <PluginSlot name="status:widget" />
@@ -496,7 +538,7 @@ function TerminalStatusBar({
       <TerminalNewLayout {...props} />
       {showTidyWindows && <TerminalTidyWindows {...props} />}
       <Box flexGrow={1} minWidth={0} />
-      <StatusBarSummary nativePaneChrome={false} {...props} />
+      <StatusBarConnectionNote nativePaneChrome={false} {...props} />
       <StarPromptStatusLine />
       <PluginSlot name="status:widget" />
       <StatusBarFeedback nativePaneChrome={false} {...props} />
@@ -521,6 +563,7 @@ function StatusBarLayoutControl({
   | "layoutTabItems"
   | "layoutTabsWidth"
 > & { nativePaneChrome: boolean }) {
+  const colors = useThemeColors();
   if (!hasMultipleLayouts) return null;
   // On the desktop and the web the strip is as wide as its tabs, gives way
   // first when the bar runs out of room and scrolls inside, like the
@@ -541,6 +584,7 @@ function StatusBarLayoutControl({
           onReorder={handleLayoutReorder}
           compact
           variant="pill"
+          background={colors.panel}
         />
       </Box>
     </Box>
@@ -548,54 +592,29 @@ function StatusBarLayoutControl({
 }
 
 /**
- * The version chip and, on the hosted web app, a link to the desktop app.
- * The link goes first when the row runs out of room, then the version. Live
- * market status lives at the header's right edge, not here, so nothing in the
- * status bar repeats it.
+ * Says the data service is unreachable while it is, in the warning tone a
+ * pane footer gives a failure; it opens Connections, which has the detail.
  */
-function StatusBarSummary({
+function StatusBarConnectionNote({
+  connectionNote,
   hoveredControl,
   nativePaneChrome,
-  openChangelog,
-  rightAvailableWidth,
+  openConnections,
   setHoveredControl,
-}: Pick<
-  StatusBarViewProps,
-  "hoveredControl" | "openChangelog" | "rightAvailableWidth" | "setHoveredControl"
-> & { nativePaneChrome: boolean }) {
-  const rendererHost = useRendererHost();
-  const versionLabel = `v${VERSION}`;
-  const downloadLabel = t("Download desktop app");
-  const showVersion = rightAvailableWidth >= versionLabel.length + 1;
-  const showDownload = getCurrentPluginTarget() === "web"
-    && rightAvailableWidth >= versionLabel.length + 1 + downloadLabel.length + 1;
-  if (!showVersion) return null;
+}: Pick<StatusBarViewProps, "connectionNote" | "hoveredControl" | "openConnections" | "setHoveredControl"> & { nativePaneChrome: boolean }) {
+  if (!connectionNote) return null;
   return (
-    <>
-      <StatusBarChip
-        hoveredControl={hoveredControl}
-        id="version"
-        label={versionLabel}
-        nativePaneChrome={nativePaneChrome}
-        onPress={openChangelog}
-        role="button"
-        setHoveredControl={setHoveredControl}
-        // CHG opens the same notes from the command bar, where the keyboard can reach them.
-        title={openChangelog ? `${tf("Open changelog for {version}", { version: versionLabel })} (CHG)` : undefined}
-      />
-      {showDownload && (
-        <StatusBarChip
-          hoveredControl={hoveredControl}
-          id="desktop-download"
-          label={downloadLabel}
-          nativePaneChrome={nativePaneChrome}
-          onPress={() => { void rendererHost.openExternal(DESKTOP_DOWNLOAD_URL); }}
-          role="link"
-          setHoveredControl={setHoveredControl}
-          title={t("Get Gloom for Mac or Windows")}
-        />
-      )}
-    </>
+    <StatusBarChip
+      hoveredControl={hoveredControl}
+      id="connection"
+      label={t(connectionNote)}
+      nativePaneChrome={nativePaneChrome}
+      onPress={openConnections}
+      role="button"
+      setHoveredControl={setHoveredControl}
+      title={`${t(DATA_SERVICE_UNREACHABLE_MESSAGE)}. ${t("Open Connections")} (CONN)`}
+      tone="warning"
+    />
   );
 }
 
@@ -619,7 +638,10 @@ function StatusBarFeedback({
   );
 }
 
-/** Dim text at the row's right edge that lights up when it can be pressed. */
+/**
+ * Dim text at the row's right edge that lights up when it can be pressed; a
+ * `warning` one keeps the warning tone, as a footer's failure does.
+ */
 function StatusBarChip({
   hoveredControl,
   id,
@@ -629,20 +651,24 @@ function StatusBarChip({
   role,
   setHoveredControl,
   title,
+  tone,
 }: Pick<StatusBarViewProps, "hoveredControl" | "setHoveredControl"> & {
   id: string;
   label: string;
   nativePaneChrome: boolean;
   onPress?: (event?: StatusBarEvent) => void;
-  role: "button" | "link";
+  role: "button";
   title?: string;
+  tone?: "warning";
 }) {
   const colors = useThemeColors();
   const hovered = hoveredControl === id;
   if (nativePaneChrome && onPress) {
     return (
       <Box paddingRight={1} flexShrink={0}>
-        <Button variant="plain" compact label={title ?? label} displayLabel={label} title={title} onPress={() => onPress()} />
+        <Button variant="plain" compact label={title ?? label} displayLabel={tone ? undefined : label} title={title} onPress={() => onPress()}>
+          {tone ? <Text fg={colors[tone]}>{label}</Text> : undefined}
+        </Button>
       </Box>
     );
   }
@@ -656,7 +682,7 @@ function StatusBarChip({
   return (
     <Box paddingRight={1} flexShrink={0}>
       <Text
-        fg={hovered && press ? colors.text : colors.textDim}
+        fg={tone ? colors[tone] : hovered && press ? colors.text : colors.textDim}
         {...(!nativePaneChrome ? { bg: hovered && press ? hoverBg(colors) : undefined } : {})}
         title={press ? title : undefined}
         aria-label={press ? title : undefined}

@@ -8,6 +8,8 @@ import {
   selectQuoteWarmupRoute,
   selectQuoteWarmupTickers,
   selectStreamTickers,
+  selectVisibleSnapshotBatch,
+  sortTickers,
   VISIBLE_QUOTE_STREAM_MAX_AGE_MS,
 } from "./data";
 import { createTestFinancials } from "../../../../test-support/data-provider";
@@ -77,6 +79,30 @@ describe("selectQuoteWarmupRoute", () => {
     expect(routes.filter((route) => route === "snapshot")).toHaveLength(2);
     expect(routes.filter((route) => route === "quote").length).toBeGreaterThan(30);
     expect(selectQuoteWarmupRoute({ quoteAt: start }, false, start + 5 * 60_000)).toBe("quote");
+  });
+});
+
+describe("selectVisibleSnapshotBatch", () => {
+  const brokerTicker = (symbol: string, conId: number) => createTestTicker(symbol, symbol, {
+    broker_contracts: [{ brokerId: "ibkr", brokerInstanceId: "ibkr-live", symbol, localSymbol: symbol, exchange: "SMART", conId }],
+  });
+
+  test("asks for every visible row in one request up to the service's batch of 100", () => {
+    const rows = Array.from({ length: 160 }, (_, index) => ticker(`T${index}`));
+    expect(selectVisibleSnapshotBatch(rows.slice(0, 60), {})).toHaveLength(60);
+    expect(selectVisibleSnapshotBatch(rows, {}).map((row) => row.metadata.ticker)).toEqual(
+      rows.slice(0, 100).map((row) => row.metadata.ticker),
+    );
+  });
+
+  test("keeps rows read from a broker to a few at a time beside the provider rows", () => {
+    const rows = [
+      ...Array.from({ length: 5 }, (_, index) => brokerTicker(`B${index}`, index + 1)),
+      ...Array.from({ length: 40 }, (_, index) => ticker(`T${index}`)),
+    ];
+    const batch = selectVisibleSnapshotBatch(rows, {}).map((row) => row.metadata.ticker);
+    expect(batch.filter((symbol) => symbol.startsWith("B"))).toEqual(["B0", "B1", "B2"]);
+    expect(batch.filter((symbol) => symbol.startsWith("T"))).toHaveLength(40);
   });
 });
 
@@ -178,4 +204,48 @@ test("CCY shows after LAST once a row is priced in another currency than the tot
   expect(ids(resolveVisibleColumns(["ticker", "price", "change_pct"], true))).toEqual(["ticker", "price", "change_pct"]);
   // A pane that already places CCY keeps it where it is.
   expect(ids(resolveVisibleColumns(["currency", "ticker", "price"], false, { otherCurrencies: true }))).toEqual(["currency", "ticker", "price"]);
+});
+
+describe("sortTickers", () => {
+  const columns = resolveVisibleColumns(["ticker", "price"], false);
+  const context = { activeTab: "watchlist", baseCurrency: "USD", exchangeRates: new Map([["USD", 1]]), now: Date.now() };
+
+  test("says which rows have a figure in the sort column, and lists the rest last in their order", () => {
+    const rows = ["AMD", "NVDA", "MSFT", "AAPL"].map(ticker);
+    const financialsMap = new Map([
+      ["AAPL", financials(quote({ price: 200 }))],
+      ["NVDA", financials(quote({ price: 900 }))],
+      // A price that is not a number is no figure.
+      ["MSFT", financials(quote({ price: Number.NaN }))],
+    ]);
+
+    const sorted = sortTickers(rows, financialsMap, { columnId: "price", direction: "desc" }, context, columns);
+    expect(sorted.tickers.map((row) => row.metadata.ticker)).toEqual(["NVDA", "AAPL", "AMD", "MSFT"]);
+    expect([...sorted.valued].sort()).toEqual(["AAPL", "NVDA"]);
+
+    // Without a sort there is nothing to wait for.
+    expect(sortTickers(rows, financialsMap, { columnId: null, direction: "asc" }, context, columns).valued.size).toBe(0);
+  });
+
+  test("a book with targets leads with WEIGHT, TGT WT, DRIFT, TRADE and TRADE VAL, and DRIFT sorts by size, over and under alike", () => {
+    const ids = (columnIds: string[]) => resolveVisibleColumns(columnIds, true, { targetWeights: true }).map((column) => column.id);
+    expect(ids(["ticker", "price", "change_pct", "mkt_value"])).toEqual(["ticker", "weight", "target_weight", "drift", "trade", "trade_value", "price", "change_pct", "mkt_value"]);
+    // A WEIGHT the pane places keeps its place, the rest after it; columns that already pick a target column stay as they are.
+    expect(ids(["ticker", "price", "weight", "mkt_value"])).toEqual(["ticker", "price", "weight", "target_weight", "drift", "trade", "trade_value", "mkt_value"]);
+    expect(ids(["ticker", "drift", "price"])).toEqual(["ticker", "drift", "price"]);
+
+    // $10,000 book: AAPL 26% against 20% (+6pp), SPY 30% against 40% (-10pp), KO 44% against 42% (+2pp).
+    const held = (symbol: string, shares: number) => createTestTicker(symbol, symbol, {
+      portfolios: ["main"], positions: [{ portfolio: "main", shares, avgCost: 1, currency: "USD", broker: "manual" }],
+    });
+    const rows = [held("AAPL", 26), held("SPY", 30), held("KO", 44)];
+    const priced = new Map(rows.map((row) => [row.metadata.ticker, financials(quote({ symbol: row.metadata.ticker, price: 100 }))]));
+    const book = {
+      activeTab: "main", baseCurrency: "USD", exchangeRates: new Map([["USD", 1]]), now: Date.now(),
+      portfolioWeightBase: 10_000, portfolioWeightBasis: "total" as const, portfolioTargets: { AAPL: 20, SPY: 40, KO: 42 },
+    };
+    const drift = resolveVisibleColumns(["ticker", "drift"], true);
+    expect(sortTickers(rows, priced, { columnId: "drift", direction: "desc" }, book, drift).tickers.map((row) => row.metadata.ticker))
+      .toEqual(["SPY", "AAPL", "KO"]);
+  });
 });

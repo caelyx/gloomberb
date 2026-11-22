@@ -1,16 +1,18 @@
 // Public API: gloomberb/components re-exports getColumnValue, getSortValue and
 // ColumnContext from here, so external plugins depend on their names and shapes.
+import { exportedListingKey, listedSymbol } from "./listed-symbol";
 import { comparablePriceEarnings, formatPriceEarnings } from "../utils/price-earnings";
 import { convertMarketCapitalization, listedMarketCapitalization } from "../utils/market-capitalization";
 import type { ColumnConfig } from "../types/config";
 import type { AnalystResearchData, CorporateActionsData, MarketState, Quote, TickerFinancials } from "../types/financials";
 import type { EarningsEvent } from "../types/data-provider";
 import type { TickerRecord } from "../types/ticker";
+import type { PeriodPnlRow } from "./period-pnl";
 import { colors, priceColor, shownPriceColor } from "../theme/colors";
 import { formatQuoteAgeWithSource, resolveQuoteAgeTimestamp } from "../market-data/quotes/time";
 import { delistingStateLabel } from "../market-data/quotes/delisting";
 import { formatFeedTime, formatShortDate, parseDisplayDate, type ShortDateOptions } from "../utils/datetime-format";
-import { convertCurrency, formatCompact, formatCompactAmount, formatNumber, formatPercentRaw } from "../utils/format";
+import { MISSING_VALUE, convertCurrency, formatCompact, formatCompactAmount, formatNumber, formatPercentRaw } from "../utils/format";
 import {
   formatMarketCost,
   quoteFormatOptions,
@@ -23,6 +25,8 @@ import {
   type MarketFormatOptions,
 } from "../market-data/market/format";
 import {
+  EXTENDED_SESSION_MARKS,
+  extendedPrintSession,
   getActiveQuoteDisplay,
   getCompletedRegularSessionDisplay,
   getExtendedSessionDisplay,
@@ -31,11 +35,13 @@ import {
   marketStateDot,
   quoteDotMarketState,
   type ActiveQuoteDisplay,
+  type SessionPriceDisplay,
 } from "../market-data/market/status";
 import { formatOptionTicker } from "../utils/options";
 import { distributionHistory, forwardYieldMayHaveLapsed, lapsedDividend } from "../utils/forward-dividend";
 import { classifyInstrumentType } from "../tickers/instrument-kind";
-import { isIndexLevel, reportedQuoteVolume } from "../market-data/market/index-level";
+import { isIndexLevel, quoteVolumeCurrency, reportedQuoteVolume } from "../market-data/market/index-level";
+import { futuresQuoteFromSettle } from "../market-data/market/change-basis";
 import { perpetualDisplaySymbol, perpetualListing } from "../tickers/perpetual-listing";
 import { premiumToUnderlying, type PerpetualPremiumRow } from "../market-data/perpetual-premium";
 import { currentListingName } from "../tickers/listing-name";
@@ -65,6 +71,7 @@ import {
 import {
   getPortfolioValuationDisplay,
   getPortfolioValuationTime,
+  valuesAtNominalPrice,
   valuesAtSettlement,
   type PortfolioValuationBasis,
 } from "./valuation-basis";
@@ -81,14 +88,46 @@ import {
   type WeightBasis,
 } from "./allocation";
 
+/**
+ * A position's move on the day in the book's currency: its price's move, and
+ * where the currency's own move is known (`fxDayMoves`) that too, its value
+ * before taken at the previous FX close. A future's contract value is no
+ * money held: its move is the price's alone, at today's rate.
+ */
+function positionDayPnl(
+  position: { units: number; isFuture: boolean },
+  quote: { price: number; change: number },
+  quoteCurrency: string,
+  ctx: Pick<ColumnContext, "baseCurrency" | "fxDayMoves">,
+  toBaseQuote: (value: number) => number,
+): number {
+  const units = position.units;
+  const factor = quoteCurrency === ctx.baseCurrency || position.isFuture ? undefined : ctx.fxDayMoves?.get(quoteCurrency);
+  if (factor == null || !Number.isFinite(factor) || factor <= 0) return toBaseQuote(units * quote.change);
+  return toBaseQuote(units * quote.price) - toBaseQuote(units * (quote.price - quote.change)) / factor;
+}
+
 export interface ColumnContext {
   activeTab?: string;
+  /** The market most of the list's listings trade in (listHomeMarket): a row outside it shows its venue (BA:LSE). */
+  homeMarket?: string;
   /** Money columns convert into this: a portfolio's totals currency, else the base currency. */
   baseCurrency: string;
   exchangeRates: Map<string, number>;
+  /**
+   * Each currency's move on the day against `baseCurrency`, as a factor
+   * (1.001 for +0.1%): DAY holds a holding's currency move with its price's,
+   * as the summary's day and `portfolio show` do. Absent, DAY is the price's.
+   */
+  fxDayMoves?: ReadonlyMap<string, number>;
   /** Clock for quote age (per second while shown) and day-based columns. */
   now: number;
-  /** What market values, P&L, weights and the day's move are priced at; the latest print when absent. */
+  /**
+   * What market values, P&L, weights and the day's move are priced at, and
+   * LAST, CHG and CHG% show with it (rowHeadlineDisplay). Absent, as in a
+   * list that values nothing (a watchlist), the values are at the latest print
+   * and LAST is the regular session's, as `quote` heads it.
+   */
   valuationBasis?: PortfolioValuationBasis;
   /**
    * What a portfolio's weights divide by (allocationWeightBase): its priced
@@ -115,6 +154,41 @@ export interface ColumnContext {
   futuresTerms?: ReadonlyMap<string, PortfolioFuturesTerms>;
   /** Moves whenever `futuresTerms` does. */
   futuresTermsVersion?: number;
+  /**
+   * P&L over a period instead of since cost (the pane's P&L From): P&L shows
+   * each row's P&L between the two closes and P&L% its contribution to the
+   * book. Rows are missing while the closes load (`pending`). `lines` are
+   * the lines under the rows: a book in more than one currency's part in each
+   * (its price P&L, its FX line, its total), so the rows and FX lines add up
+   * to the header's total.
+   */
+  periodPnl?: { rows: ReadonlyMap<string, PeriodPnlRow>; pending: boolean; lines?: readonly PeriodSummaryLine[] | null };
+  /** Moves whenever `periodPnl` does. */
+  periodPnlVersion?: number;
+}
+
+/** A line under a period's rows (`FX HKD`, `HKD total`): its label, P&L and contribution. */
+export interface PeriodSummaryLine {
+  id: string;
+  label: string;
+  /** Null when every holding it covers is left out. */
+  pnl: number | null;
+  contribution: number | null;
+}
+
+/** A row's P&L or contribution over the pane's period: `…` while the closes load, `—` without both. */
+function periodPnlCell(period: NonNullable<ColumnContext["periodPnl"]>, symbol: string, field: "pnl" | "contribution"): { text: string; color?: string } {
+  const row = period.rows.get(symbol);
+  if (!row) return { text: period.pending ? "…" : MISSING_VALUE };
+  return periodPnlFigure(row[field], field);
+}
+
+/** A period's P&L (`pnl`) or contribution figure as the P&L and P&L% cells show it, the FX line's included. */
+export function periodPnlFigure(value: number | null | undefined, field: "pnl" | "contribution"): { text: string; color?: string; value?: number } {
+  if (value == null || !Number.isFinite(value)) return { text: MISSING_VALUE };
+  return field === "pnl"
+    ? { text: formatCompactAmount(value, { signed: true }), color: priceColor(value), value }
+    : { text: formatPercentRaw(value), color: shownPriceColor(value, 2), value };
 }
 
 /** A row's stock perpetual as PERP% and FUND 8H read it; rates are fractions. */
@@ -144,7 +218,13 @@ function perpetualValue(columnId: keyof typeof PERPETUAL_FIELDS, symbol: string,
 }
 
 /** Position and calendar dates as "Jan 5", read in UTC. */
-const MONTH_DAY: ShortDateOptions = { year: false, utc: true, fallback: "\u2014" };
+const MONTH_DAY: ShortDateOptions = { year: false, utc: true, fallback: MISSING_VALUE };
+
+/** A day column: "5 Jan" on screen, the ISO day in an export (an empty cell without one), as AS OF exports its day. */
+function dayCell(date: Date | null): { text: string; value: string | null } {
+  const text = formatShortDate(date, MONTH_DAY);
+  return { text, value: date && Number.isFinite(date.getTime()) ? date.toISOString().slice(0, 10) : null };
+}
 
 function startOfUtcDay(date: Date): number {
   return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
@@ -158,7 +238,7 @@ function daysSince(value: Date | string | number | null | undefined, now: number
 }
 
 function formatHeldDays(days: number | null): string {
-  if (days == null) return "—";
+  if (days == null) return MISSING_VALUE;
   if (days < 365) return `${days}d`;
   return `${formatNumber(days / 365, 1)}y`;
 }
@@ -185,20 +265,24 @@ function positionSideLabel(ticker: TickerRecord, activeTab: string | undefined):
   return "MIX";
 }
 
-/** The currency a row is listed in: its position's, else its quote's; an index's level is in points and has none. */
+/**
+ * The currency a row is listed in: its position's, else its quote's or the one saved with it. An index's level is in
+ * points and has none, and a row whose currency no source gave (a coin pair before its quote) shows none, never the
+ * dollars it is valued in meanwhile: a row not held has no position currency, only that fallback.
+ */
 function listedCurrency(
-  positionCurrency: string | undefined,
-  quoteCurrency: string,
+  metrics: Pick<PortfolioPositionMetrics, "positionCount" | "positionCurrency">,
   ticker: TickerRecord,
   quote: TickerFinancials["quote"],
 ): string {
-  if (!positionCurrency && isIndexLevel(quote?.instrumentType || ticker.metadata.assetCategory)) return "";
-  return (positionCurrency || quoteCurrency || ticker.metadata.currency || "").toUpperCase();
+  const held = metrics.positionCount > 0 ? metrics.positionCurrency : "";
+  if (!held && isIndexLevel(quote?.instrumentType || ticker.metadata.assetCategory)) return "";
+  return (held || quote?.currency || ticker.metadata.currency || "").toUpperCase();
 }
 
 function compactText(value: string | null | undefined): string {
   const trimmed = value?.trim();
-  return trimmed ? trimmed : "—";
+  return trimmed ? trimmed : MISSING_VALUE;
 }
 
 function targetValue(data: AnalystResearchData | null | undefined): number | null {
@@ -284,21 +368,41 @@ function tradedQuoteDisplay(
 }
 
 /**
- * LAST, CHG and CHG% once the regular session is over, and in the pre-market
- * while the quote carries the last session's close and move: that close and its
- * move, frozen, because the EXT% column carries the extended print measured
- * from that close. Until the close, and wherever no close is reported (a
- * pre-market quote without it, venues without extended hours), the traded price
- * as above.
- * Valuation columns (DAY P&L, MKT VAL, weight, P&L) keep the latest print,
- * unless the pane values at the regular close, which is this headline.
- * A watchlist's Avg Day averages this CHG%.
+ * The regular session's price and move, as `quote` heads Last: once the
+ * session is over, and in the pre-market while the quote carries the last
+ * session's close and move, that close and its move, frozen, because the EXT%
+ * column carries the extended print measured from that close. Until the close,
+ * and wherever no close is reported (a pre-market quote without it, venues
+ * without extended hours), the traded price as above. A watchlist's LAST and
+ * CHG% (its Avg Day averages this CHG%), and a book's valued at the regular
+ * close, which is this price; a book valued at the latest print shows that
+ * print instead (rowHeadlineDisplay).
  */
 export function headlineQuoteDisplay(
   traded: ActiveQuoteDisplay | null,
   quote: TickerFinancials["quote"],
 ): ActiveQuoteDisplay | null {
   return traded ? getCompletedRegularSessionDisplay(quote) ?? traded : null;
+}
+
+/**
+ * LAST, CHG and CHG% of a row: the price its figures use, so LAST times the
+ * shares is MKT VAL and CHG times them is DAY. In a book valued at the latest
+ * print, that print and its move from the close DAY measures from, naming its
+ * session when it is a pre-market, after-hours or overnight trade (`AH
+ * 158.78`); an option shows its trade, valued at its mark. A book at the
+ * regular close, and a list that values nothing (no `valuationBasis`, a
+ * watchlist), show the regular session as `quote` heads it
+ * (headlineQuoteDisplay), with the extended print in EXT%.
+ */
+function rowHeadlineDisplay(
+  traded: ActiveQuoteDisplay | null,
+  quote: TickerFinancials["quote"],
+  ctx: Pick<ColumnContext, "valuationBasis">,
+): SessionPriceDisplay | null {
+  if (ctx.valuationBasis !== "latest-print" || !traded) return headlineQuoteDisplay(traded, quote);
+  const session = extendedPrintSession(quote, traded.price);
+  return session ? { ...traded, session } : traded;
 }
 
 /** CHG% as shown: the headline's, else the quote's own when no position price is usable. */
@@ -309,6 +413,9 @@ function headlineChangePercent(
   if (headline) return headline.changePercent;
   return quote ? (getCompletedRegularSessionDisplay(quote) ?? quote).changePercent : undefined;
 }
+
+/** The 52W% cell's muted mark for a range read from the stored daily bars (Quote.yearRangeBasis). */
+export const RANGE_FROM_BARS_NOTE = "bars";
 
 function fiftyTwoWeekPosition(displayQuote: ActiveQuoteDisplay | null, quote: TickerFinancials["quote"]): number | null {
   const range = displayQuote ? liveFiftyTwoWeekRange(quote, displayQuote.price) : null;
@@ -366,7 +473,7 @@ export function resolvePortfolioPriceValue(
   if (brokerMarkPrice != null) {
     return { text: formatMarketPrice(brokerMarkPrice, { ...formatOptions, maxWidth }) };
   }
-  return { text: "—" };
+  return { text: MISSING_VALUE };
 }
 
 /**
@@ -393,29 +500,101 @@ function futuresContractSizeLabel(
   return !metrics.unknownContractSize && multiplier > 1 ? { size: formatMarketQuantity(multiplier) } : null;
 }
 
+interface RowPositionMetrics {
+  quoteCurrency: string;
+  quote: Quote | undefined;
+  /** What the figures were worked out for: a context that disagrees works them out again. */
+  activeTab: string | undefined;
+  baseCurrency: string;
+  exchangeRates: Map<string, number>;
+  /** In the position's own currency. */
+  position: PortfolioPositionMetrics;
+  /** Converted into the pane's currency (`ctx.baseCurrency`). */
+  base: PortfolioPositionMetrics;
+}
+
+/** Each shared context's row figures, by record. */
+const sharedRowMetrics = new WeakMap<ColumnContext, WeakMap<TickerRecord, RowPositionMetrics>>();
+const rowMetricsByOwner = new WeakMap<object, WeakMap<TickerRecord, RowPositionMetrics>>();
+
+/**
+ * Lets the cells and sort keys read with `ctx` work out each row's position
+ * figures once per quote, rather than twice a cell: a pane's rows recompute
+ * every visible cell when a quote ticks. Contexts given the same `owner` share
+ * the figures while they agree on the tab, currency and rates (a context that
+ * disagrees works them out again). Only for records that are replaced when
+ * they change, never edited in place.
+ */
+export function sharePositionMetrics<T extends ColumnContext>(ctx: T, owner: object = ctx): T {
+  let rows = rowMetricsByOwner.get(owner);
+  if (!rows) {
+    rows = new WeakMap();
+    rowMetricsByOwner.set(owner, rows);
+  }
+  sharedRowMetrics.set(ctx, rows);
+  return ctx;
+}
+
+function computeRowPositionMetrics(ticker: TickerRecord, ctx: ColumnContext, quoteCurrency: string, quote: Quote | undefined): RowPositionMetrics {
+  const { activeTab, baseCurrency, exchangeRates } = ctx;
+  return {
+    quoteCurrency,
+    quote,
+    activeTab,
+    baseCurrency,
+    exchangeRates,
+    position: getPortfolioPositionMetrics(ticker, ctx.activeTab, quoteCurrency, undefined, quote),
+    base: getPortfolioPositionMetrics(ticker, ctx.activeTab, quoteCurrency, {
+      currency: baseCurrency,
+      convert: (value, currency) => convertCurrency(value, currency, baseCurrency, exchangeRates),
+    }, quote),
+  };
+}
+
+/** A row's position figures, in its own currency and in the pane's (sharePositionMetrics). */
+function rowPositionMetrics(
+  ticker: TickerRecord,
+  ctx: ColumnContext,
+  quoteCurrency: string,
+  quote: Quote | undefined,
+): RowPositionMetrics {
+  const rows = sharedRowMetrics.get(ctx);
+  if (!rows) return computeRowPositionMetrics(ticker, ctx, quoteCurrency, quote);
+  const cached = rows.get(ticker);
+  if (
+    cached
+    && cached.quote === quote
+    && cached.quoteCurrency === quoteCurrency
+    && cached.activeTab === ctx.activeTab
+    && cached.baseCurrency === ctx.baseCurrency
+    && cached.exchangeRates === ctx.exchangeRates
+  ) return cached;
+  const entry = computeRowPositionMetrics(ticker, ctx, quoteCurrency, quote);
+  rows.set(ticker, entry);
+  return entry;
+}
+
 export function getColumnValue(
   col: ColumnConfig,
   ticker: TickerRecord,
   financials: TickerFinancials | undefined,
   ctx: ColumnContext,
-): { text: string; color?: string; value?: number | null; pnlBasis?: PortfolioPositionPnl["basis"] } {
-  const quote = financials?.quote;
+): { text: string; note?: string; color?: string; value?: number | string | null; valueUnit?: string; pnlBasis?: PortfolioPositionPnl["basis"] } {
+  const sent = financials?.quote;
 
   const fundamentals = financials?.fundamentals;
-  const quoteCurrency = quote?.currency || ticker.metadata.currency || "USD";
+  const quoteCurrency = sent?.currency || ticker.metadata.currency || "USD";
 
-  const positionMetrics = getPortfolioPositionMetrics(ticker, ctx.activeTab, quoteCurrency, undefined, quote);
+  const { position: positionMetrics, base: baseMetrics } = rowPositionMetrics(ticker, ctx, quoteCurrency, sent);
   const futures = positionMetrics.isFuture ? ctx.futuresTerms?.get(ticker.metadata.ticker) : undefined;
+  // A future's move as FUT and `quote` measure it with its terms.
+  const quote = futuresQuoteFromSettle(sent, futures);
   // The latest print, which the quote columns read, and the price the position is valued at.
   const liveQuote = getPortfolioQuoteDisplay(positionMetrics, quote);
   const activeQuote = getPortfolioValuationDisplay(positionMetrics, quote, ctx.valuationBasis, futures?.settlement);
   const displayQuote = tradedQuoteDisplay(positionMetrics, liveQuote, quote);
-  const headlineQuote = settledHeadline(positionMetrics, ctx, futures) ?? headlineQuoteDisplay(displayQuote, quote);
+  const headlineQuote: SessionPriceDisplay | null = settledHeadline(positionMetrics, ctx, futures) ?? rowHeadlineDisplay(displayQuote, quote, ctx);
   const { positionCurrency, totalShares, totalCost, totalCostUnits, totalPriceUnits, multiplierHint, brokerMarkPrice } = positionMetrics;
-  const baseMetrics = getPortfolioPositionMetrics(ticker, ctx.activeTab, quoteCurrency, {
-    currency: ctx.baseCurrency,
-    convert: (value, currency) => convertCurrency(value, currency, ctx.baseCurrency, ctx.exchangeRates),
-  }, quote);
 
   const toBaseQuote = (value: number) =>
     convertCurrency(value, quoteCurrency, ctx.baseCurrency, ctx.exchangeRates);
@@ -439,7 +618,8 @@ export function getColumnValue(
     case "ticker": {
       // A print older than its venue's latest session pictures no session, not the market's current one.
       const statusDot = marketStateDot(quoteDotMarketState(quote));
-      return { text: `${statusDot} ${tickerDisplayName(ticker)}` };
+      // An export names the listing with its venue, without the dot: BA:LSE, never a bare BA read as Boeing.
+      return { text: `${statusDot} ${listedSymbol(ticker, tickerDisplayName(ticker), ctx.homeMarket)}`, value: exportedListingKey(ticker) };
     }
     case "name":
       // The name the listing's quote gives now, as `quote` and `portfolio show` name it, else the saved one.
@@ -458,17 +638,22 @@ export function getColumnValue(
         ),
       };
     case "currency":
-      return { text: compactText(currencyCodeLabel(listedCurrency(positionCurrency, quoteCurrency, ticker, quote))) };
+      return { text: compactText(currencyCodeLabel(listedCurrency(positionMetrics, ticker, quote))) };
     case "sector":
       return { text: compactText(ticker.metadata.sector || financials?.profile?.sector) };
     case "industry":
       return { text: compactText(ticker.metadata.industry || financials?.profile?.industry) };
     case "tags":
-      return { text: ticker.metadata.tags.length > 0 ? ticker.metadata.tags.join(",") : "—" };
-    case "price":
-      return resolvePortfolioPriceValue(headlineQuote, brokerMarkPrice, headlineQuote ? currentQuoteOptions : markOptions, col.width, quote?.marketState);
+      return { text: ticker.metadata.tags.length > 0 ? ticker.metadata.tags.join(",") : MISSING_VALUE };
+    case "price": {
+      const cell = resolvePortfolioPriceValue(headlineQuote, brokerMarkPrice, headlineQuote ? currentQuoteOptions : markOptions, col.width, quote?.marketState);
+      // An extended-hours print says which session it is from, before it so the digits stay aligned: AH 158.78.
+      // The table widens the column to fit; an export keeps the price.
+      const session = headlineQuote?.session;
+      return session ? { ...cell, text: `${EXTENDED_SESSION_MARKS[session]} ${cell.text}`, value: headlineQuote.price } : cell;
+    }
     case "change":
-      if (!headlineQuote) return { text: "—" };
+      if (!headlineQuote) return { text: MISSING_VALUE };
       // A listing that no longer trades has no day's move: its last session's is years old.
       if (quote?.delisting) return { text: delistingStateLabel(quote.delisting), color: colors.warning };
       return {
@@ -476,23 +661,23 @@ export function getColumnValue(
         color: marketChangeColor(headlineQuote.change, quote?.marketState),
       };
     case "bid":
-      return { text: quote?.bid != null ? formatMarketPrice(quote.bid, { ...currentQuoteOptions, maxWidth: col.width }) : "—" };
+      return { text: quote?.bid != null ? formatMarketPrice(quote.bid, { ...currentQuoteOptions, maxWidth: col.width }) : MISSING_VALUE };
     case "ask":
-      return { text: quote?.ask != null ? formatMarketPrice(quote.ask, { ...currentQuoteOptions, maxWidth: col.width }) : "—" };
+      return { text: quote?.ask != null ? formatMarketPrice(quote.ask, { ...currentQuoteOptions, maxWidth: col.width }) : MISSING_VALUE };
     case "spread":
       return {
         text: quote?.bid != null && quote?.ask != null
           ? formatMarketPrice(quote.ask - quote.bid, { ...currentQuoteOptions, maxWidth: col.width })
-          : "—",
+          : MISSING_VALUE,
       };
     case "spread_pct": {
-      if (!isFiniteNumber(quote?.bid) || !isFiniteNumber(quote?.ask)) return { text: "—" };
+      if (!isFiniteNumber(quote?.bid) || !isFiniteNumber(quote?.ask)) return { text: MISSING_VALUE };
       const midpoint = (quote.bid + quote.ask) / 2;
-      if (midpoint === 0) return { text: "—" };
+      if (midpoint === 0) return { text: MISSING_VALUE };
       return { text: formatPercentRaw(((quote.ask - quote.bid) / Math.abs(midpoint)) * 100) };
     }
     case "bid_ask_size": {
-      if (!isFiniteNumber(quote?.bidSize) && !isFiniteNumber(quote?.askSize)) return { text: "—" };
+      if (!isFiniteNumber(quote?.bidSize) && !isFiniteNumber(quote?.askSize)) return { text: MISSING_VALUE };
       return { text: `${formatCompact(quote?.bidSize)}/${formatCompact(quote?.askSize)}` };
     }
     case "change_pct": {
@@ -500,25 +685,28 @@ export function getColumnValue(
       const changePercent = headlineChangePercent(headlineQuote, quote);
       return quote
         ? { text: formatPercentRaw(changePercent), color: marketChangeColor(changePercent, quote.marketState) }
-        : { text: "—" };
+        : { text: MISSING_VALUE };
     }
     case "volume": {
       const volume = reportedQuoteVolume(quote);
-      return { text: volume != null ? formatCompact(volume, { fixedDecimals: true }) : "—" };
+      return { text: volume != null ? formatCompact(volume, { fixedDecimals: true }) : MISSING_VALUE };
     }
     case "dollar_volume": {
-      const volume = reportedQuoteVolume(quote);
-      if (!displayQuote || volume == null) return { text: "—" };
-      return { text: formatCompact(toBaseQuote(displayQuote.price * volume), { fixedDecimals: true }) };
+      const traded = tradedValue(quote, displayQuote, toBaseQuote);
+      return { text: traded == null ? MISSING_VALUE : formatCompact(traded, { fixedDecimals: true }) };
     }
     case "range_52w": {
       const position = fiftyTwoWeekPosition(displayQuote, quote);
-      return { text: position == null ? "—" : formatPercentRaw(Math.max(0, Math.min(100, position))) };
+      if (position == null) return { text: MISSING_VALUE };
+      // A range the service read from the stored daily bars, the source's being no year's, says so as the ticker pane does.
+      return { text: formatPercentRaw(Math.max(0, Math.min(100, position))),
+        ...(quote?.yearRangeBasis === "daily-bars" ? { note: RANGE_FROM_BARS_NOTE } : {}) };
     }
     case "market_cap": {
       const cap = liveMarketCapitalization(quote, fundamentals);
       const value = cap ? listedMarketCapitalization(convertMarketCapitalization(cap.value, cap.currency, ctx.baseCurrency, ctx.exchangeRates)) : null;
-      return { text: value == null ? "—" : formatCompact(value, { fixedDecimals: true }) };
+      // An export writes the whole figure, not the three digits the cell shows (72.27B), in the base currency it names.
+      return { text: value == null ? MISSING_VALUE : formatCompact(value, { fixedDecimals: true }), value, valueUnit: ctx.baseCurrency };
     }
     case "pe":
       return { text: formatPriceEarnings(liveTrailingPE(quote, fundamentals)) };
@@ -527,31 +715,31 @@ export function getColumnValue(
     case "dividend_yield": {
       const dividendYield = currentDividendYield(ticker.metadata.ticker, quote, fundamentals, ctx);
       if (dividendYield.pending) return { text: "…" };
-      return { text: dividendYield.value != null ? `${(dividendYield.value * 100).toFixed(2)}%` : "—" };
+      return { text: dividendYield.value != null ? `${(dividendYield.value * 100).toFixed(2)}%` : MISSING_VALUE };
     }
     case "ext_hours": {
       const changePercent = getExtendedSessionDisplay(quote)?.changePercent;
-      if (!isFiniteNumber(changePercent)) return { text: "—" };
+      if (!isFiniteNumber(changePercent)) return { text: MISSING_VALUE };
       return { text: formatPercentRaw(changePercent), color: shownPriceColor(changePercent, 2) };
     }
     case "side":
-      return { text: positionSideLabel(ticker, ctx.activeTab) ?? "—" };
+      return { text: positionSideLabel(ticker, ctx.activeTab) ?? MISSING_VALUE };
     case "shares":
-      if (positionMetrics.positionCount === 0) return { text: "—" };
+      if (positionMetrics.positionCount === 0) return { text: MISSING_VALUE };
       // A future counts contracts and says what one is: -1,000 × 100 oz. The table widens the column to fit.
       return positionMetrics.isFuture
         ? { text: futuresQuantityText(formatMarketQuantity(totalShares, formatOptions), futuresContractSizeLabel(futures, multiplierHint, positionMetrics)) }
         : { text: formatMarketQuantity(totalShares, { ...formatOptions, maxWidth: col.width }) };
     case "avg_cost":
-      if (totalCostUnits === 0 || !Number.isFinite(totalCost)) return { text: "—" };
+      if (totalCostUnits === 0 || !Number.isFinite(totalCost)) return { text: MISSING_VALUE };
       // A money cost keeps its currency's minor unit, as `portfolio show` prints it: 45.50, not 45.5.
       return { text: formatMarketCost(totalCost / Math.abs(totalCostUnits), { ...withCurrencyMinorDigits(formatOptions, positionCurrency), maxWidth: col.width }) };
     case "cost_basis":
       // Signed, as the value is: a short's cost is what it was sold for, negative.
-      if (baseMetrics.positionCount === 0 || !Number.isFinite(baseMetrics.signedCost)) return { text: "—" };
+      if (baseMetrics.positionCount === 0 || !Number.isFinite(baseMetrics.signedCost)) return { text: MISSING_VALUE };
       return { text: formatCompact(baseMetrics.signedCost) };
     case "mkt_value": {
-      if (baseMetrics.positionCount === 0) return { text: "—" };
+      if (baseMetrics.positionCount === 0) return { text: MISSING_VALUE };
       const marketValue = resolvePortfolioMarketValue(baseMetrics, activeQuote ? toBaseQuote(activeQuote.price) : null)?.net;
       return { text: marketValue == null ? UNPRICED : formatCompactAmount(marketValue) };
     }
@@ -583,27 +771,29 @@ export function getColumnValue(
     case "day_pnl":
       if (quote?.delisting) return { text: delistingStateLabel(quote.delisting), color: colors.warning };
       if (activeQuote && isFiniteNumber(activeQuote.change) && Number.isFinite(positionMetrics.grossPriceUnits) && positionMetrics.grossPriceUnits !== 0) {
-        const dayPnl = toBaseQuote(totalPriceUnits * activeQuote.change);
+        const dayPnl = positionDayPnl({ units: totalPriceUnits, isFuture: positionMetrics.isFuture }, { price: activeQuote.price, change: activeQuote.change }, quoteCurrency, ctx, toBaseQuote);
         return { text: formatCompactAmount(dayPnl, { signed: true }), color: priceColor(dayPnl) };
       }
-      return { text: "—" };
+      return { text: MISSING_VALUE };
     case "pnl": {
+      if (ctx.periodPnl) return periodPnlCell(ctx.periodPnl, ticker.metadata.ticker, "pnl");
       const pnl = positionPnl.value;
-      return pnl === null ? { text: "—", pnlBasis: positionPnl.basis }
+      return pnl === null ? { text: MISSING_VALUE, pnlBasis: positionPnl.basis }
         : { text: formatCompactAmount(pnl, { signed: true }), color: priceColor(pnl), pnlBasis: positionPnl.basis };
     }
     case "pnl_pct": {
+      if (ctx.periodPnl) return periodPnlCell(ctx.periodPnl, ticker.metadata.ticker, "contribution");
       const percent = portfolioPnlPercent(positionPnl.value, baseMetrics.totalCost);
-      return percent === null ? { text: "—" } : { text: formatPercentRaw(percent), color: shownPriceColor(percent, 2) };
+      return percent === null ? { text: MISSING_VALUE } : { text: formatPercentRaw(percent), color: shownPriceColor(percent, 2) };
     }
     case "mark_delta":
-      if (!liveQuote || brokerMarkPrice == null || liveQuote.price === 0 || positionMetrics.priceBasis !== (quote?.priceBasis ?? "per-unit") || positionCurrency !== quoteCurrency) return { text: "—" };
+      if (!liveQuote || brokerMarkPrice == null || liveQuote.price === 0 || positionMetrics.priceBasis !== (quote?.priceBasis ?? "per-unit") || positionCurrency !== quoteCurrency) return { text: MISSING_VALUE };
       {
         const percent = ((brokerMarkPrice - liveQuote.price) / Math.abs(liveQuote.price)) * 100;
         return { text: formatPercentRaw(percent), color: shownPriceColor(percent, 2) };
       }
     case "acq_date": {
-      return { text: formatShortDate(earliestDateAcquired(ticker, ctx.activeTab), MONTH_DAY) };
+      return dayCell(earliestDateAcquired(ticker, ctx.activeTab));
     }
     case "held": {
       return { text: formatHeldDays(daysSince(earliestDateAcquired(ticker, ctx.activeTab), ctx.now)) };
@@ -616,7 +806,7 @@ export function getColumnValue(
       const currency = analystTargetDisplayCurrency(analyst.data, quoteCurrency, displayQuote?.price);
       return {
         text: value == null
-          ? "—"
+          ? MISSING_VALUE
           : formatMarketPriceWithCurrency(value, currency, { ...formatOptions, maxWidth: col.width }),
       };
     }
@@ -625,30 +815,30 @@ export function getColumnValue(
       if (analyst.pending) return { text: "…" };
       const value = targetValue(analyst.data);
       const current = targetReferencePrice(analyst.data, quoteCurrency, displayQuote?.price);
-      if (value == null || !current) return { text: "—" };
+      if (value == null || !current) return { text: MISSING_VALUE };
       const percent = ((value - current) / Math.abs(current)) * 100;
       return { text: formatPercentRaw(percent), color: shownPriceColor(percent, 2) };
     }
     case "rating": {
       const analyst = mapData(ctx.analystResearch, ticker.metadata.ticker);
       if (analyst.pending) return { text: "…" };
-      return { text: analyst.data?.recommendationRating != null ? formatNumber(analyst.data.recommendationRating, 1) : "—" };
+      return { text: analyst.data?.recommendationRating != null ? formatNumber(analyst.data.recommendationRating, 1) : MISSING_VALUE };
     }
     case "ex_div": {
       const result = exDividendDate(ticker.metadata.ticker, ctx);
       if (result.pending) return { text: "…" };
-      return { text: formatShortDate(result.date, MONTH_DAY) };
+      return dayCell(result.date);
     }
     case "next_earn": {
       const result = nextEarningsDate(ticker.metadata.ticker, ctx);
       if (result.pending) return { text: "…" };
-      return { text: formatShortDate(result.date, MONTH_DAY) };
+      return dayCell(result.date);
     }
     case "perp_premium":
     case "perp_funding": {
       const perp = perpetualValue(col.id, ticker.metadata.ticker, ctx, quote);
       if (perp.pending) return { text: "…" };
-      if (perp.value == null) return { text: "—" };
+      if (perp.value == null) return { text: MISSING_VALUE };
       // An old venue reading keeps its figure, dimmed, as PERP shows a stale market.
       return {
         text: formatPerpetualRate(perp.value, col.id === "perp_funding" ? 4 : 2),
@@ -659,15 +849,38 @@ export function getColumnValue(
       return { text: formatQuoteAgeWithSource(quote, ctx.now, { seconds: true }) };
     case "as_of": {
       const time = getPortfolioValuationTime(quote, ctx.valuationBasis, positionMetrics, futures?.settlement);
-      if (!time) return { text: "—" };
+      if (!time) return { text: MISSING_VALUE };
       // In UTC, as the header says; a close the venue's calendar gives no hour for is dated by its day.
-      return { text: time.dateOnly ? formatShortDate(time.time, MONTH_DAY) : formatFeedTime(time.time, ctx.now, "—", { utc: true }) };
+      // An export writes the date with it, as ISO: 16:49 alone says nothing of which day.
+      const iso = new Date(time.time).toISOString();
+      // A price nothing traded at says so; its export keeps the day of the session it is the venue's price for.
+      if (valuesAtNominalPrice(quote, positionMetrics, ctx.valuationBasis)) return { text: "nominal", color: colors.warning, value: iso.slice(0, 10) };
+      return {
+        // Every row names its day: a bare 00:47 beside Fri 21:00 reads as the same evening.
+        text: time.dateOnly ? formatShortDate(time.time, MONTH_DAY) : formatFeedTime(time.time, ctx.now, MISSING_VALUE, { utc: true, dayToday: true }),
+        value: time.dateOnly ? iso.slice(0, 10) : iso,
+      };
     }
     case PRICE_SPARKLINE_COLUMN_ID:
       return { text: "" };
     default:
-      return { text: "—" };
+      return { text: MISSING_VALUE };
   }
+}
+
+/**
+ * The value a row's volume traded, in the base currency: shares or contracts at the price, or a coin's volume
+ * itself, which is already a value in its quote currency (quoteVolumeCurrency), never priced again.
+ */
+function tradedValue(
+  quote: Quote | null | undefined,
+  displayQuote: { price: number } | null | undefined,
+  toBaseQuote: (value: number) => number,
+): number | null {
+  const volume = reportedQuoteVolume(quote);
+  if (volume == null) return null;
+  if (quoteVolumeCurrency(quote)) return toBaseQuote(volume);
+  return displayQuote ? toBaseQuote(displayQuote.price * volume) : null;
 }
 
 export function getSortValue(
@@ -676,22 +889,20 @@ export function getSortValue(
   financials: TickerFinancials | undefined,
   ctx: ColumnContext,
 ): number | string | null {
-  const quote = financials?.quote;
+  const sent = financials?.quote;
 
   const fundamentals = financials?.fundamentals;
-  const quoteCurrency = quote?.currency || ticker.metadata.currency || "USD";
+  const quoteCurrency = sent?.currency || ticker.metadata.currency || "USD";
 
-  const positionMetrics = getPortfolioPositionMetrics(ticker, ctx.activeTab, quoteCurrency, undefined, quote);
+  const { position: positionMetrics, base: baseMetrics } = rowPositionMetrics(ticker, ctx, quoteCurrency, sent);
   const futures = positionMetrics.isFuture ? ctx.futuresTerms?.get(ticker.metadata.ticker) : undefined;
+  // A future's move as FUT and `quote` measure it with its terms.
+  const quote = futuresQuoteFromSettle(sent, futures);
   const liveQuote = getPortfolioQuoteDisplay(positionMetrics, quote);
   const activeQuote = getPortfolioValuationDisplay(positionMetrics, quote, ctx.valuationBasis, futures?.settlement);
   const displayQuote = tradedQuoteDisplay(positionMetrics, liveQuote, quote);
-  const headlineQuote = settledHeadline(positionMetrics, ctx, futures) ?? headlineQuoteDisplay(displayQuote, quote);
+  const headlineQuote = settledHeadline(positionMetrics, ctx, futures) ?? rowHeadlineDisplay(displayQuote, quote, ctx);
   const { positionCurrency, totalShares, totalCost, totalCostUnits, totalPriceUnits, brokerMarkPrice } = positionMetrics;
-  const baseMetrics = getPortfolioPositionMetrics(ticker, ctx.activeTab, quoteCurrency, {
-    currency: ctx.baseCurrency,
-    convert: (value, currency) => convertCurrency(value, currency, ctx.baseCurrency, ctx.exchangeRates),
-  }, quote);
 
   const toBaseQuote = (value: number) =>
     convertCurrency(value, quoteCurrency, ctx.baseCurrency, ctx.exchangeRates);
@@ -713,7 +924,7 @@ export function getSortValue(
         ?? ticker.metadata.exchange
         ?? null;
     case "currency":
-      return listedCurrency(positionCurrency, quoteCurrency, ticker, quote) || null;
+      return listedCurrency(positionMetrics, ticker, quote) || null;
     case "sector":
       return ticker.metadata.sector || financials?.profile?.sector || null;
     case "industry":
@@ -745,10 +956,8 @@ export function getSortValue(
       return quote?.delisting ? null : headlineChangePercent(headlineQuote, quote) ?? null;
     case "volume":
       return reportedQuoteVolume(quote);
-    case "dollar_volume": {
-      const volume = reportedQuoteVolume(quote);
-      return displayQuote && volume != null ? toBaseQuote(displayQuote.price * volume) : null;
-    }
+    case "dollar_volume":
+      return tradedValue(quote, displayQuote, toBaseQuote);
     case "range_52w":
       return fiftyTwoWeekPosition(displayQuote, quote);
     case "market_cap": {
@@ -777,8 +986,11 @@ export function getSortValue(
       return rowAllocation(ticker, activeQuote, baseMetrics, toBaseQuote, ctx).weight;
     case "target_weight":
       return holdingTarget(ctx.portfolioTargets, ticker.metadata.ticker) ?? null;
-    case "drift":
-      return rowAllocation(ticker, activeQuote, baseMetrics, toBaseQuote, ctx).drift;
+    case "drift": {
+      // Drift sorts by its size, an overweight and an underweight alike: the largest is the first to trade.
+      const drift = rowAllocation(ticker, activeQuote, baseMetrics, toBaseQuote, ctx).drift;
+      return drift == null ? null : Math.abs(drift);
+    }
     case "trade":
       return rowAllocation(ticker, activeQuote, baseMetrics, toBaseQuote, ctx).tradeUnits;
     case "trade_value":
@@ -786,13 +998,14 @@ export function getSortValue(
     case "day_pnl":
       if (quote?.delisting) return null;
       if (activeQuote && isFiniteNumber(activeQuote.change) && Number.isFinite(positionMetrics.grossPriceUnits) && positionMetrics.grossPriceUnits !== 0) {
-        return toBaseQuote(totalPriceUnits * activeQuote.change);
+        return positionDayPnl({ units: totalPriceUnits, isFuture: positionMetrics.isFuture }, { price: activeQuote.price, change: activeQuote.change }, quoteCurrency, ctx, toBaseQuote);
       }
       return null;
     case "pnl":
-      return positionPnl.value;
+      return ctx.periodPnl ? ctx.periodPnl.rows.get(ticker.metadata.ticker)?.pnl ?? null : positionPnl.value;
     case "pnl_pct":
-      return portfolioPnlPercent(positionPnl.value, baseMetrics.totalCost);
+      return ctx.periodPnl ? ctx.periodPnl.rows.get(ticker.metadata.ticker)?.contribution ?? null
+        : portfolioPnlPercent(positionPnl.value, baseMetrics.totalCost);
     case "mark_delta":
       return liveQuote && brokerMarkPrice != null && liveQuote.price !== 0 && positionMetrics.priceBasis === (quote?.priceBasis ?? "per-unit") && positionCurrency === quoteCurrency
         ? ((brokerMarkPrice - liveQuote.price) / Math.abs(liveQuote.price)) * 100

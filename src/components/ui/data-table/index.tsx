@@ -1,28 +1,63 @@
-import { type ComponentType, useEffect, useMemo, useRef } from "react";
+import { type ComponentType, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRendererHost, useUiHost } from "../../../ui";
 import { OpenTuiDataTable } from "./opentui";
 import type {
   DataTableColumn,
   DataTableProps,
+  DataTableVisibleRange,
 } from "./types";
 import { useRemoteUiNode } from "../../../remote/semantic-tree";
-import { remoteNumberValue, resolveRemoteItemIndex } from "../../../remote/semantic-helpers";
+import { remoteNumberValue, resolveRemoteRowIndex } from "../../../remote/semantic-helpers";
 import { useOptionalPaneInstanceId } from "../../../state/app/context";
 import { registerPaneTableExporter } from "../../../state/pane-table-export-registry";
 import { createDataTableCsv } from "../../data-table/export";
 import { headerCase } from "../header-case";
+import { figureColumnCells } from "./render-cell";
+import { useDataTableColumnOrder } from "./use-column-order";
+import { dataTableDisplayColumns } from "./display-columns";
+import { sameVisibleRange } from "./visible-range";
 
 export type {
   DataTableCell,
   DataTableColumn,
+  DataTableColumnReorder,
   DataTableProps,
   DataTableSectionHeader,
   DataTableVisibleRange,
 } from "./types";
 
 export function DataTable<T, C extends DataTableColumn = DataTableColumn>(
-  props: DataTableProps<T, C>,
+  ownProps: DataTableProps<T, C>,
 ) {
+  // Every renderer, report and export reads the cells through this, so a column of figures lines up everywhere.
+  const renderCell = useMemo(() => figureColumnCells(ownProps.renderCell), [ownProps.renderCell]);
+  // A caller that already ordered the columns (`DataTableView`) passes the move it resolved.
+  const order = useDataTableColumnOrder(ownProps.columns, ownProps.onColumnMove ? false : ownProps.columnReorder);
+  const props = {
+    ...ownProps,
+    renderCell,
+    // Exports and reports read the columns in the order the reader sees them.
+    columns: order.columns,
+    onColumnMove: ownProps.onColumnMove ?? order.onColumnMove,
+    anchoredColumns: ownProps.onColumnMove ? ownProps.anchoredColumns : order.anchoredColumns,
+  };
+  const [visibleRange, setVisibleRange] = useState<DataTableVisibleRange | null>(null);
+  const onVisibleRangeChange = useCallback((range: DataTableVisibleRange) => {
+    // A viewport not laid out yet reports no rows: it would hide every in-view
+    // column for a frame, so the columns wait for a range with rows in it.
+    if (range.end > range.start) setVisibleRange((previous) => previous && sameVisibleRange(previous, range) ? previous : range);
+    ownProps.onVisibleRangeChange?.(range);
+  }, [ownProps.onVisibleRangeChange]);
+  const displayColumns = useMemo(() => dataTableDisplayColumns(props, visibleRange),
+    [props.columns, props.items, props.renderCell, props.renderSectionHeader, props.isSelected, visibleRange]);
+  const reportProps = {
+    ...props,
+    columns: displayColumns,
+    reportColumns: useMemo(() => [
+      ...props.columns.filter((column) => !displayColumns.includes(column)),
+      ...props.reportColumns ?? [],
+    ], [props.columns, displayColumns, props.reportColumns]),
+  };
   const paneId = useOptionalPaneInstanceId();
   const renderer = useRendererHost();
   const propsRef = useRef(props);
@@ -34,9 +69,11 @@ export function DataTable<T, C extends DataTableColumn = DataTableColumn>(
     if (!paneId || !renderer.saveTextFile) return;
     return registerPaneTableExporter(paneId, (filename) => renderer.saveTextFile!({
       name: filename,
-      text: propsRef.current.exportCsv?.() ?? createDataTableCsv(propsRef.current),
+      text: propsRef.current.exportCsv?.() ?? createDataTableCsv(propsRef.current.exportItems
+        ? { ...propsRef.current, items: propsRef.current.exportItems }
+        : propsRef.current),
       mimeType: "text/csv;charset=utf-8",
-    }));
+    }), () => propsRef.current.exportName);
   }, [paneId, renderer]);
 
   useRemoteUiNode({
@@ -89,28 +126,42 @@ export function DataTable<T, C extends DataTableColumn = DataTableColumn>(
       paneInstanceId: paneId,
       sortColumnId: props.sortColumnId,
       sortDirection: props.sortDirection,
-      columns: props.columns.map((column) => ({ id: column.id, label: column.label })),
+      columns: displayColumns.map((column) => ({ id: column.id, label: column.label, ...(column.mayBeBlank ? { mayBeBlank: true } : {}) })),
       rowCount: props.items.length,
       selectedId: firstSelectedId(props),
-      ...(props.reportEveryRow ? { rows: cachedReportedRows(props, reportedRowsRef) } : {}),
+      ...(props.reportEveryRow ? { rows: cachedReportedRows(reportProps, reportedRowsRef) } : {}),
     }),
+    // Read for this table alone: a confirmation names the row a call would open.
+    getDetail: () => ({ rows: cachedReportedRows(reportProps, reportedRowsRef) }),
   });
   // Header labels read the same in every table whatever case a pane wrote
   // them in. Exports and automation keep the pane's own labels.
   const columns = useMemo(
-    () => props.columns.map((column) => {
+    () => displayColumns.map((column) => {
       const label = headerCase(column.label);
       return label === column.label ? column : { ...column, label };
     }),
-    [props.columns],
+    [displayColumns],
   );
   const HostDataTable = useUiHost().DataTable as
     | ComponentType<DataTableProps<T, C>>
     | undefined;
+  const displayProps = {
+    ...props,
+    columns,
+    anchoredColumns: props.anchoredColumns == null ? undefined
+      : props.columns.slice(0, props.anchoredColumns).filter((column) => displayColumns.includes(column)).length,
+    onColumnMove: props.onColumnMove ? (columnId: string, toIndex: number) => {
+      const target = displayColumns[toIndex];
+      if (target) props.onColumnMove?.(columnId, props.columns.indexOf(target));
+    } : undefined,
+    onVisibleRangeChange: props.columns.some((column) => column.omitWhenEmpty === "visible")
+      ? onVisibleRangeChange : props.onVisibleRangeChange,
+  };
   if (HostDataTable) {
-    return <HostDataTable {...props} columns={columns} />;
+    return <HostDataTable {...displayProps} />;
   }
-  return <OpenTuiDataTable {...props} columns={columns} />;
+  return <OpenTuiDataTable {...displayProps} />;
 }
 
 function resolveTableIndex<T, C extends DataTableColumn>(
@@ -118,8 +169,7 @@ function resolveTableIndex<T, C extends DataTableColumn>(
   props: DataTableProps<T, C>,
 ): number {
   // `id` reads the same key the snapshot publishes as `selectedId`.
-  const key = (item: T, index: number) => props.getItemKey(item, index);
-  return resolveRemoteItemIndex(input, props.items, { id: key, key });
+  return resolveRemoteRowIndex(input, props.items, (item, index) => props.getItemKey(item, index));
 }
 
 /**
@@ -141,7 +191,7 @@ function reportedRows<T, C extends DataTableColumn>(props: DataTableProps<T, C>)
         columnLabel: first?.label ?? "Row",
         text: normalize(section.action ? `${section.text} ${section.action.label}` : section.text),
       }]
-      : props.columns.map((column) => {
+      : [...props.columns, ...props.reportColumns ?? []].map((column, columnIndex) => {
         const cell = props.renderCell(item, column, index, { selected });
         return {
           columnId: column.id,
@@ -149,6 +199,8 @@ function reportedRows<T, C extends DataTableColumn>(props: DataTableProps<T, C>)
           text: normalize(cell.text),
           ...(cell.value instanceof Date && Number.isFinite(cell.value.getTime()) ? { instant: cell.value.toISOString() } : {}),
           ...(typeof cell.value === "number" && Number.isFinite(cell.value) ? { value: cell.value } : {}),
+          // Read by the JSON and CSV, never drawn or printed as text.
+          ...(columnIndex >= props.columns.length ? { reportOnly: true } : {}),
         };
       });
     // A section header (FUT's sector) is marked, so a count of the table's rows can leave it out.
@@ -161,7 +213,7 @@ function cachedReportedRows<T, C extends DataTableColumn>(
   props: DataTableProps<T, C>,
   cache: { current: { source: readonly unknown[]; rows: ReturnType<typeof reportedRows> } | null },
 ) {
-  const source = [props.items, props.columns, props.renderCell, props.isSelected, props.renderSectionHeader];
+  const source = [props.items, props.columns, props.reportColumns, props.renderCell, props.isSelected, props.renderSectionHeader];
   const cached = cache.current;
   if (cached && cached.source.length === source.length && cached.source.every((value, index) => value === source[index])) {
     return cached.rows;

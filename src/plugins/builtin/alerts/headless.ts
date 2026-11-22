@@ -1,4 +1,6 @@
-import { isDailyMetric, metricName } from "./metric-model";
+import { MISSING_VALUE } from "../../../utils/format";
+import { closeBasis, metricReadingText } from "./metric-model";
+import { moveBasisText, movePercentText } from "./move";
 /**
  * `gloom fn ALRT`: the Alerts pane's three tabs as reports. Prices lists
  * the price alerts as the pane's table does, Events the event alerts (earnings,
@@ -10,10 +12,15 @@ import type { HeadlessPaneColumn, HeadlessPaneContext, HeadlessPaneDefinition, H
 import type { PaneLock } from "../../../types/plugin";
 import { refusedLock } from "../shared/cloud-denied";
 import { ALERT_TABS, ALERTS_PLUGIN_ID } from "./constants";
-import { ruleState } from "./event-rows";
+import { eventWhen, needsSignInNote, ruleState } from "./event-rows";
+import { checkedOnlyWithPro, checksProRules, needsProNote } from "./pro-rules";
+import { readerTimeZone } from "../../../utils/utc-time";
 import { eventAlertTarget, type EventAlertRule } from "./events";
 import {
-  conditionLabel,
+  alertListing,
+  isoUtc,
+  measureLabel,
+  triggerLabel,
   formatAlertDistance,
   formatAlertTargetPrice,
   formatCurrentPrice,
@@ -26,6 +33,7 @@ import { ALERT_HISTORY_VIA, mergeAlertHistory, type AlertHistoryRow } from "./hi
 import { IV_LEVEL_CHECKS_KEY, ivLevelCheckText, readIvLevelChecks, type IvLevelCheck } from "./iv-level";
 import { readScheduledRule, scheduledEventName } from "./scheduled";
 import { readAlertStores } from "./storage";
+import { MOVE_CHECKS_KEY, readMoveChecks, withMoveChecks } from "./move-checks";
 import type { AlertRule } from "./types";
 
 type AlertsTab = "prices" | "events" | "history";
@@ -47,29 +55,38 @@ const instant = (value: unknown) => (typeof value === "number" ? firedAlertTime(
  */
 const PRICE_COLUMNS: HeadlessPaneColumn[] = [
   { key: "status", header: "State", format: (value) => (value === "triggered" ? "Triggered" : "Active") },
-  { key: "symbol", header: "Symbol", format: (value, row) => (row.exchange ? `${text(value)}:${text(row.exchange)}` : text(value)) },
-  { key: "metric", header: "Measure", format: (_value, row) => asAlert(row).metric ? metricName(asAlert(row).metric!) : "Price" },
+  // The listing as it was kept: 7203:JPX, never 7203:JPX:JPX for a rule an older version saved with its venue twice.
+  { key: "symbol", header: "Symbol", format: (value, row) => alertListing({ symbol: text(value), exchange: text(row.exchange) || undefined }) },
+  { key: "metric", header: "Measure", format: (_value, row) => measureLabel(asAlert(row)) },
   { key: "lastCheckedPrice", header: "Current", align: "right", textFormat: (_value, row) => formatCurrentPrice(asAlert(row), 14) },
   { key: "targetPrice", header: "Target", align: "right", textFormat: (_value, row) => formatAlertTargetPrice(asAlert(row), 14) },
   { key: "awayPercent", header: "Away", align: "right", format: percent, textFormat: (_value, row) => formatAlertDistance(asAlert(row)) },
-  { key: "condition", header: "Trigger", format: (value, row) => {
-    const metric = asAlert(row).metric;
-    return metric?.kind === "ma_cross" ? `Cross ${metric.direction}` : conditionLabel(value as AlertRule["condition"]);
-  } },
+  { key: "condition", header: "Trigger", format: (value, row) => triggerLabel({ ...asAlert(row), condition: value as AlertRule["condition"] }) },
   { key: "quoteAt", header: "Quote", textFormat: (_value, row) => formatQuoteChecked(asAlert(row)) },
   { key: "quoteSource", header: "Quote source" },
   { key: "lastCheckedAt", header: "Checked", format: instant },
-  { key: "triggeredAt", header: "Alerted", format: instant, textFormat: (value) => (typeof value === "number" ? relativeTime(value) : "-") },
+  { key: "triggeredAt", header: "Alerted", format: instant, textFormat: (value) => (typeof value === "number" ? relativeTime(value) : MISSING_VALUE) },
+  // After the columns exports have always had: when the rule was made, and the currency of its listing.
+  // To the second, as `alerts list` and the pane's detail write it: exports draw a stored millisecond time to the millisecond.
+  { key: "created", header: "Created" },
+  { key: "listing", header: "Listing" },
+  { key: "currency", header: "Currency" },
+  // A measure's last reading in words, last so the columns before it keep their places: an RRG quadrant with the strength and momentum that place it.
+  { key: "reading", header: "Reading" },
 ];
 /** The terminal table keeps the pane's columns: the Quote cell already says the quote's age and feed. */
-const PRICE_TEXT_COLUMNS = PRICE_COLUMNS.filter((column) => column.key !== "quoteSource" && column.key !== "lastCheckedAt");
+const PRICE_TEXT_COLUMNS: HeadlessPaneColumn[] = [
+  ...PRICE_COLUMNS.filter((column) => !["quoteSource", "lastCheckedAt", "created", "listing", "currency", "reading"].includes(column.key)),
+  // The day it was made, as the Events table lists its rules.
+  { key: "createdAt", header: "Since", textFormat: (value) => (typeof value === "number" ? isoUtc(value).slice(0, 10) : "") },
+];
 
 const EVENT_COLUMNS: HeadlessPaneColumn[] = [
   { key: "event", header: "Event" },
   { key: "following", header: "Following" },
   { key: "eventDate", header: "Event date", textFormat: (value, row) => text(value) || (row.leadDays == null ? "" : "not known yet") },
   // A results alert waits for the report instead of a lead time.
-  { key: "leadDays", header: "Days before", align: "right", textFormat: (value, row) => (row.when === "results" ? "results" : value == null ? "-" : String(value)) },
+  { key: "leadDays", header: "Days before", align: "right", textFormat: (value, row) => (row.when === "results" ? "results" : value == null ? MISSING_VALUE : String(value)) },
   { key: "state", header: "State" },
   { key: "since", header: "Since" },
 ];
@@ -98,13 +115,20 @@ const HISTORY_TEXT_COLUMNS = HISTORY_COLUMNS.filter((column) => column.key !== "
 function priceRow(alert: AlertRule): HeadlessPaneRow {
   const { lastQuoteProviderId: _provider, ...stored } = alert;
   const price = alert.lastCheckError ? null : alert.lastCheckedPrice;
-  const away = price == null || !Number.isFinite(price) || price === 0 ? null : (((alert.lastCheckedTarget ?? alert.targetPrice) - price) / price) * 100;
+  const away = price == null || !Number.isFinite(price) || price === 0 || alert.metric?.kind === "rrg" || alert.move ? null : (((alert.lastCheckedTarget ?? alert.targetPrice) - price) / price) * 100;
   const quoted = !alert.lastCheckError;
+  const target = alert.lastCheckedTarget ?? alert.targetPrice;
   return {
     ...stored,
     awayPercent: away != null && Number.isFinite(away) ? Number(away.toFixed(2)) : null,
     quoteAt: quoted ? firedAlertTime(alert.lastQuoteUpdatedAt) : null,
-    quoteSource: quoted ? alert.metric && isDailyMetric(alert.metric) ? "daily close" : quoteSourceWords(alert.lastQuoteSource) : null,
+    quoteSource: quoted ? alert.metric && closeBasis(alert.metric) || quoteSourceWords(alert.lastQuoteSource) : null,
+    created: isoUtc(alert.createdAt) || null,
+    listing: alertListing(alert),
+    currency: alert.lastQuoteCurrency ?? null,
+    reading: alert.metric && price != null && Number.isFinite(price) && Number.isFinite(target) ? metricReadingText(alert.metric, { value: price, target })
+      // A move, with the close it is measured from.
+      : alert.move && price != null && Number.isFinite(price) ? `${movePercentText(price)} ${moveBasisText(alert.lastMoveBasis)}` : null,
   };
 }
 
@@ -112,43 +136,58 @@ function priceRow(alert: AlertRule): HeadlessPaneRow {
 function pricesResult(alerts: readonly AlertRule[], error: string | null, events: number): HeadlessRowsResult {
   const active = alerts.filter((alert) => alert.status === "active");
   const triggered = alerts.filter((alert) => alert.status === "triggered").sort((a, b) => (b.triggeredAt ?? 0) - (a.triggeredAt ?? 0));
+  const notes = [
+    ...events > 0 ? [`${plural(events, "event alert")} not listed here: gloom fn ALRT --tab events`] : [],
+  ];
   return {
     columns: PRICE_COLUMNS,
     textColumns: PRICE_TEXT_COLUMNS,
     rows: [...active, ...triggered].map(priceRow),
-    empty: "No level alerts. Add one with gloom alerts add AAPL above 250.",
+    empty: "No level alerts. Add one with gloom alerts add AAPL above 400.",
     ...(error ? { errors: [error], complete: false } : {}),
-    ...(events > 0 ? { notes: [`${plural(events, "event alert")} not listed here: gloom fn ALRT --tab events`] } : {}),
+    ...(notes.length ? { notes } : {}),
   };
 }
 
 /** An event alert as the Events table lists it: a scheduled one with its event date and lead time apart. */
-function eventRow(rule: EventAlertRule, now: number, checks: Record<string, IvLevelCheck>): HeadlessPaneRow {
+function eventRow(rule: EventAlertRule, now: number, checks: Record<string, IvLevelCheck>, signedIn: boolean, pro: boolean, readerZone: string | null = null): HeadlessPaneRow {
   const scheduled = readScheduledRule(rule);
   return {
     id: rule.id,
     kind: rule.kind,
     event: alertKindLabel(rule.kind),
     following: scheduled ? scheduledEventName(scheduled.target) : eventAlertTarget(rule),
-    eventDate: scheduled ? rule.eventDate ?? null : null,
+    // A release's day with its print time in UTC, and on the reader's clock when they set a zone.
+    eventDate: scheduled && rule.eventDate ? eventWhen(rule, readerZone) : null,
     leadDays: scheduled?.leadDays ?? null,
     ...(scheduled?.trigger === "results" ? { when: "results" } : {}),
-    state: ruleState(rule, now),
+    state: ruleState(rule, now, signedIn, pro),
     since: new Date(rule.createdAt).toISOString().slice(0, 10),
     // An IV level's last reading, or why there was none, on its own row.
     ...rule.kind === "iv_level" ? { lastCheck: ivLevelCheckText(rule, checks[rule.id]) } : {},
   };
 }
 
-function eventsResult(rules: readonly EventAlertRule[], error: string | null, checks: Record<string, IvLevelCheck>): HeadlessRowsResult {
+function eventsResult(
+  rules: readonly EventAlertRule[], error: string | null, checks: Record<string, IvLevelCheck>, signedIn: boolean, pro: boolean,
+  readerZone: string | null = null,
+): HeadlessRowsResult {
   const now = Date.now();
   const checked = rules.some((rule) => rule.kind === "iv_level");
+  const rows = [...rules].sort((a, b) => b.createdAt - a.createdAt).map((rule) => eventRow(rule, now, checks, signedIn, pro, readerZone));
+  // Signed out, the rules only a signed-in account gets checked say so on their rows, and once what to do.
+  const waiting = rows.filter((row) => row.state === "Needs sign-in").length;
+  // Options flow and IV spikes are checked only with Pro, which their rows say without it; the list says it once either way.
+  const proRules = rules.filter(checkedOnlyWithPro);
+  const notes = [...waiting ? [needsSignInNote(waiting)] : [],
+    ...proRules.length ? [needsProNote(proRules, rows.filter((row) => row.state === "Needs Pro").length)] : []];
   return {
     // A Last check column only when an IV level rule has a reading to show.
     columns: checked ? [...EVENT_COLUMNS.slice(0, -2), { key: "lastCheck", header: "Last check" }, ...EVENT_COLUMNS.slice(-2)] : EVENT_COLUMNS,
-    rows: [...rules].sort((a, b) => b.createdAt - a.createdAt).map((rule) => eventRow(rule, now, checks)),
+    rows,
     empty: "No event alerts. Add one with gloom alerts add CRWV earnings --days 3, gloom alerts add CPI --days 1 or gloom alerts add CN PMI.",
     ...(error ? { errors: [error], complete: false } : {}),
+    ...(notes.length ? { notes } : {}),
   };
 }
 
@@ -234,7 +273,7 @@ export const alertsHeadless: HeadlessPaneDefinition<"rows"> = {
   discovery: {
     screenshotReadiness: "live-dom",
     dataRequirements: ["Your saved alerts and this device's log of fired alerts; History adds Gloom Cloud's deliveries when signed in"],
-    limitations: ["Current price and quote time are what the app saved at its last check, blank until it has checked the alert."],
+    limitations: ["Current price and quote time are what the app or `gloom alerts add` saved at the last check; an alert neither has read says not checked yet."],
   },
   describe: (args) => `Alerts | ${String(args.options.tab ?? "prices")}`,
   async load(args, ctx) {
@@ -242,7 +281,9 @@ export const alertsHeadless: HeadlessPaneDefinition<"rows"> = {
     if (tab === "history") return historyResult(ctx);
     const { alerts, alertsError, events } = readAlertStores(ctx.config);
     return tab === "events"
-      ? eventsResult(events.rules, events.error, readIvLevelChecks(ctx.readDeviceState?.(ALERTS_PLUGIN_ID, IV_LEVEL_CHECKS_KEY)))
-      : pricesResult(alerts, alertsError, events.rules.length);
+      ? eventsResult(events.rules, events.error, readIvLevelChecks(ctx.readDeviceState?.(ALERTS_PLUGIN_ID, IV_LEVEL_CHECKS_KEY)), !!ctx.apiClient.getSessionToken?.(),
+        checksProRules(!!ctx.apiClient.getSessionToken?.(), ctx.apiClient.getCurrentUser?.()), readerTimeZone(ctx.config.timezone))
+      // A move rule with this device's last reading of it, and whether it went off this session.
+      : pricesResult(withMoveChecks(alerts, readMoveChecks(ctx.readDeviceState?.(ALERTS_PLUGIN_ID, MOVE_CHECKS_KEY))), alertsError, events.rules.length);
   },
 };

@@ -4,7 +4,7 @@ export { PriceSelectorDialog } from "./price-selector-dialog";
 export { StaticChartSurface } from "./chart/static";
 export { CurveSurface, curveGhostColors, curveSlope, curveStrip, curveSurfaceMinRows, historyStatistics } from "./chart/curve";
 export type { CurveSurfaceProps, CurveSlopeReadout, CurvePoint, CurveSeries, CurveSeriesRole, CurveXScale, HistoryObservation, HistoryStatistics } from "./chart/curve";
-export type { StaticChartOverlay } from "./chart/static/chart-surface";
+export type { StaticChartOverlay, StaticChartXMarker } from "./chart/static/chart-surface";
 // The time-series chart: one or more panels of resolved series with axes,
 // a cursor, and range selection. Ticker overview, polls, econ statistics,
 // and prediction markets all draw with it.
@@ -93,7 +93,7 @@ export type { RowValueCache } from "./ui/row-value-cache";
 export { useRowNotes } from "./ui/row-notes";
 export type { RowNotes } from "./ui/row-notes";
 export { FeedDataTableStackView } from "./feed-data-table/stack-view";
-export type { FeedDataTableItem } from "./feed-data-table/stack-view";
+export type { FeedDataTableItem, FeedDataTableTimeColumn } from "./feed-data-table/stack-view";
 export { activeStackIndex, sortStackItems } from "./feed-stack-controller";
 export type { StackSortPreference } from "./feed-stack-controller";
 export { PaneFooterScope, usePaneFooter, usePaneMenuItems } from "./layout/pane/footer";
@@ -138,7 +138,7 @@ export {
   DetailScrollBody, DialogFrame, DisclosureMarker, Divider, EmptyState, ExternalLink, ExternalLinkText, FieldGrid, FieldLabel,
   fieldFrameStyle, fieldGridColumns, FRAMED_TEXTAREA_DESKTOP_STYLE, fieldGridRows, FigureList, getMessageComposerBlockHeight, GridFieldView, Icon, ICON_GLYPHS,
   IconButton, InlineQuickAddRow, KeyValueRow, ListView, loadingText, Menu, MenuPopover,
-  MessageComposer, MultiSelectDialogButton, MultiSelectDialogContent, Notice, NumberField,
+  MessageComposer, MultiSelectDialogButton, MultiSelectDialogContent, Notice, NumberField, RowNote,
   NumberPromptDialog, openUrl, PageStackView, PaneLinkMenu, PaneStatusBody, Popover, Prose,
   QueryBar, RangeTrack, RatioBar, READING_WIDTH, RemoteImage, Section, SectionHeading, SegmentedControl, SelectButton, ShortcutHint,
   Spinner, StatGrid, statGridColumns, statGridRows, Tabs, TextField, TextPromptDialog, unavailableText,
@@ -147,7 +147,7 @@ export {
 export type {
   ActionRowProps, BadgeProps, BulletListProps, ButtonProps, ButtonVariant, CardProps, CheckboxProps, ChoiceDialogChoice, ColumnGridCell,
   ColumnGridColumn, ColumnGridLink, ColumnGridPairProps, ColumnGridProps, ConfirmDialogOptions, CountryFlagProps,
-  DataTableCell, DataTableColumn, DataTableProps, DataTableVisibleRange, DetailScrollBodyProps, DialogFrameProps,
+  DataTableCell, DataTableColumn, DataTableColumnReorder, DataTableProps, DataTableVisibleRange, DetailScrollBodyProps, DialogFrameProps,
   DisclosureMarkerProps, DividerProps, EmptyStateProps, FieldGridProps, FieldLabelProps, FieldRing, FieldRingOptions,
   FigureListItem, FigureListProps, GridField,
   IconButtonPressEvent, IconButtonProps, IconName, IconProps, InlineQuickAddRowProps,

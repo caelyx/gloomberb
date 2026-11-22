@@ -27,14 +27,21 @@ function normalizeFloatingEntries(layout: LayoutConfig): FloatingPaneEntry[] {
   const dockedIds = new Set(getDockedInstanceIds(layout.dockRoot));
   const detachedIds = new Set((layout.detached ?? []).map((entry) => entry.instanceId));
   const seen = new Set<string>();
-  return layout.floating
+  const kept = layout.floating
     .filter((entry) => !dockedIds.has(entry.instanceId) && !detachedIds.has(entry.instanceId))
     .filter((entry) => {
       if (seen.has(entry.instanceId)) return false;
       seen.add(entry.instanceId);
       return true;
-    })
-    .map((entry) => ({ ...entry }));
+    });
+  // A floating stack left with one tab is a window of its own again.
+  const stackSizes = new Map<string, number>();
+  for (const entry of kept) if (entry.stack) stackSizes.set(entry.stack, (stackSizes.get(entry.stack) ?? 0) + 1);
+  return kept.map((entry) => {
+    if (!entry.stack || (stackSizes.get(entry.stack) ?? 0) > 1) return { ...entry };
+    const { stack: _stack, ...rest } = entry;
+    return rest;
+  });
 }
 
 function normalizeDetachedEntries(layout: LayoutConfig) {
@@ -51,11 +58,28 @@ function normalizeDetachedEntries(layout: LayoutConfig) {
     .map((entry) => ({ ...entry }));
 }
 
-export function captureDockedMemory(dockRoot: DockLayoutNode | null): Map<string, DockedPlacementMemory> {
+/** A tab's way back into its stack: beside the tab it shows, or the first other one. */
+export function stackTabMemory(
+  dockRoot: DockLayoutNode | null,
+  stackPath: Array<0 | 1>,
+  instanceId: string,
+): Pick<DockedPlacementMemory, "anchorInstanceId" | "position"> {
+  const stack = getNodeAtPath(dockRoot, stackPath);
+  const members = stack ? getDockedInstanceIds(stack) : [];
+  const shown = stack ? getRepresentativeLeafId(stack, true) : undefined;
+  const anchorInstanceId = shown && shown !== instanceId ? shown : members.find((id) => id !== instanceId);
+  return { anchorInstanceId, position: "tab" };
+}
+
+function captureDockedMemory(dockRoot: DockLayoutNode | null): Map<string, DockedPlacementMemory> {
   const memory = new Map<string, DockedPlacementMemory>();
   const leaves = collectDockLeafRefs(dockRoot);
 
   for (const leaf of leaves) {
+    if (leaf.stackPath) {
+      memory.set(leaf.instanceId, { path: [...leaf.path], ...stackTabMemory(dockRoot, leaf.stackPath, leaf.instanceId) });
+      continue;
+    }
     if (leaf.path.length === 0) {
       memory.set(leaf.instanceId, { path: [] });
       continue;
@@ -111,11 +135,10 @@ function capturePlacementMemory(layout: LayoutConfig): LayoutConfig {
 
       return {
         ...instance,
-        placementMemory: nextDocked || nextFloating || nextDetached || previous.window ? {
+        placementMemory: nextDocked || nextFloating || nextDetached ? {
           docked: nextDocked,
           floating: nextFloating,
           detached: nextDetached,
-          ...(previous.window ? { window: previous.window } : {}),
         } : undefined,
       };
     }),
@@ -132,26 +155,11 @@ export function finalizeLayout(layout: LayoutConfig): LayoutConfig {
 }
 
 function removeDockedLeaf(layout: LayoutConfig, instanceId: string): LayoutConfig {
-  const dockRoot = removeFromDockTree(layout.dockRoot, instanceId);
-  return dockRoot === layout.dockRoot ? layout : { ...layout, dockRoot };
-}
-
-function removeFromDockTree(root: DockLayoutNode | null, instanceId: string): DockLayoutNode | null {
-  const leaf = collectDockLeafRefs(root).find((entry) => entry.instanceId === instanceId);
-  return leaf ? removeNodeAtPath(root, leaf.path) : root;
-}
-
-/** Takes the pane out of every secondary window, keeping windows it is not in as they are. */
-function removeFromWindows(layout: LayoutConfig, instanceId: string): Pick<LayoutConfig, "windows"> {
-  if (!layout.windows) return {};
+  const leaf = collectDockLeafRefs(layout.dockRoot).find((entry) => entry.instanceId === instanceId);
+  if (!leaf) return layout;
   return {
-    windows: layout.windows.map((window) => {
-      const dockRoot = removeFromDockTree(window.dockRoot, instanceId);
-      const floating = window.floating.filter((entry) => entry.instanceId !== instanceId);
-      return dockRoot === window.dockRoot && floating.length === window.floating.length
-        ? window
-        : { ...window, dockRoot, floating };
-    }),
+    ...layout,
+    dockRoot: removeNodeAtPath(layout.dockRoot, leaf.path),
   };
 }
 
@@ -160,7 +168,6 @@ export function detachPane(layout: LayoutConfig, instanceId: string): LayoutConf
     ...removeDockedLeaf(layout, instanceId),
     floating: layout.floating.filter((entry) => entry.instanceId !== instanceId),
     detached: (layout.detached ?? []).filter((entry) => entry.instanceId !== instanceId),
-    ...removeFromWindows(layout, instanceId),
   };
 }
 

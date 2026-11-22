@@ -1,24 +1,28 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type {
   HeadlessPaneContext,
   HeadlessPaneDefinition,
 } from "../../../types/plugin";
 import {
-  compareDate, curveCutoff, CURVE_OPTIONS, curveIdOf, curveOption, curveSpreadFigures, curveTenorMove, loadComparePoints,
-  loadCurveData, parseCompareInput, parseCurveArgument, type CurveData, type CurveId,
+  compareDate, curveCutoff, curveIdOf, curveOption, curveSpreadFigures, curveSpreadText, curveTenorMove, loadComparePoints,
+  parseCompareInput, parseCurveArgument, unknownCurveMessage, type CurveData, type CurveId,
 } from "./curves";
 import { yieldTenorRows, type YieldLookbackCurves } from "./chart";
 import { curveAsOf, type YieldPoint, yieldCurveErrors } from "./treasury-data";
 import { loadYieldCurveLookbacks, yieldCurveDate } from "./history";
-import { loadWorldRows, type WorldRow } from "./world";
+import type { WorldRow } from "./world";
 import { formatBasisPoints, toBasisPoints } from "../../../utils/basis-points";
 import { DATE_OPTION_EXAMPLES } from "../../../utils/calendar-date";
 import { SWAP_TENORS, type SwapCurvePayload, type SwapTenor } from "../../../api-client/swap-curve";
-import { fetchSwapCurve } from "./client";
+import { fetchSwapCurve, loadSavedCurve, loadSavedWorldRows } from "./client";
+import { savedCopyMark } from "../../../data/saved-copies";
 import { formatSwapBp, selectedSwapTenor } from "./swaps-model";
+import { logFailure } from "../../../utils/log-failure";
+import { usBondMarketClosedNote } from "../../../market-data/us-bond-market";
 
-const percent = (value: unknown) => value == null ? "-" : `${Number(value).toFixed(2)}%`;
+const percent = (value: unknown) => value == null ? MISSING_VALUE : `${Number(value).toFixed(2)}%`;
 /** A move already in basis points: `+3bp`, `-1bp`, `0bp`. */
-const basisPoints = (value: unknown) => value == null ? "-" : formatBasisPoints(Number(value) / 100);
+const basisPoints = (value: unknown) => value == null ? MISSING_VALUE : formatBasisPoints(Number(value) / 100);
 const MATURITY_COLUMNS = [
   { key: "maturity", header: "Maturity" },
   {
@@ -36,7 +40,7 @@ const COLUMNS = [
   { key: "change1dBasisPoints", header: "1D bp", align: "right" as const, format: basisPoints },
   AS_OF_COLUMN,
 ];
-const percentile = (value: unknown) => value == null ? "-" : Number(value).toFixed(0);
+const percentile = (value: unknown) => value == null ? MISSING_VALUE : Number(value).toFixed(0);
 /**
  * With Gloom Cloud's move ranks: each tenor's 1D and 1W move, how big it was
  * against every move of its kind (a percentile), and the year that history
@@ -48,7 +52,7 @@ const RANKED_COLUMNS = [
   { key: "move1dPercentile", header: "1D pctl", align: "right" as const, format: percentile },
   { key: "change1wBasisPoints", header: "1W bp", align: "right" as const, format: basisPoints },
   { key: "move1wPercentile", header: "1W pctl", align: "right" as const, format: percentile },
-  { key: "movesSince", header: "Since", format: (value: unknown) => typeof value === "string" ? value.slice(0, 4) : "-" },
+  { key: "movesSince", header: "Since", format: (value: unknown) => typeof value === "string" ? value.slice(0, 4) : MISSING_VALUE },
   AS_OF_COLUMN,
 ];
 const RANK_NOTE = "pctl is the share of the tenor's 1D (or 1W) moves since the year in Since that were smaller, ties counted half.";
@@ -71,8 +75,8 @@ const WORLD_COLUMNS = [
 const SWAP_COLUMNS = [
   { key: "tenor", header: "Tenor" },
   { key: "rate", header: "Rate %", align: "right" as const, format: percent },
-  { key: "changeBp", header: "1D bp", align: "right" as const, format: (value: unknown) => value == null ? "-" : formatSwapBp(Number(value)) },
-  { key: "spreadBp", header: "Spread bp", align: "right" as const, format: (value: unknown) => value == null ? "-" : formatSwapBp(Number(value)) },
+  { key: "changeBp", header: "1D bp", align: "right" as const, format: (value: unknown) => value == null ? MISSING_VALUE : formatSwapBp(Number(value)) },
+  { key: "spreadBp", header: "Spread bp", align: "right" as const, format: (value: unknown) => value == null ? MISSING_VALUE : formatSwapBp(Number(value)) },
   { key: "tradeCount", header: "Trades", align: "right" as const,
     format: (value: unknown, row: Record<string, unknown>) => `${value}${row.quality === "thin" ? " Thin" : ""}` },
 ];
@@ -87,13 +91,14 @@ export interface YieldCurveHeadlessDependencies {
 }
 
 const defaultDependencies: Required<YieldCurveHeadlessDependencies> = {
-  load: (curve, requestedDate, context) => loadCurveData(curve, requestedDate, context.apiClient),
+  // A curve that cannot be read is the copy an earlier read saved, marked so the report says so.
+  load: async (curve, requestedDate, context) => (await loadSavedCurve(curve, requestedDate, context.apiClient)).data,
   compare: (curve, date, context) => loadComparePoints(curve, date, context.apiClient),
   lookbacks: async (session, context) => Object.fromEntries(
     (await loadYieldCurveLookbacks(session, (id, options) => context.apiClient.getCloudFredSeries(id, options)))
       .map((lookback) => [lookback.id, lookback.points]),
   ),
-  world: (context) => loadWorldRows(context.apiClient),
+  world: async (context) => (await loadSavedWorldRows(context.apiClient)).data,
   swaps: (tenor, context) => fetchSwapCurve(tenor, context.apiClient),
 };
 
@@ -109,6 +114,8 @@ const CURVE_PUBLISHERS: Record<CurveId, string> = {
   gb: "Bank of England",
   jp: "Japan Ministry of Finance",
   ca: "Bank of Canada",
+  mx: "Banxico",
+  br: "Tesouro Nacional",
 };
 
 /** Whose business days each curve's dates are, so a report names the day it means. */
@@ -121,6 +128,8 @@ const CURVE_MARKETS: Record<CurveId, string> = {
   gb: "UK",
   jp: "Japan",
   ca: "Canada",
+  mx: "Mexico",
+  br: "Brazil",
 };
 
 export function createYieldCurveHeadless(
@@ -133,10 +142,10 @@ export function createYieldCurveHeadless(
   return {
     shape: "rows",
     argument: { kind: "free-text", optional: true, placeholder: "[curve] [date]",
-      description: "A curve (ust, tips, breakeven, euro, bund, gilt, jgb, canada) and a historical as-of date; omit for the latest UST curve." },
+      description: "A curve (ust, tips, breakeven, euro, bund, gilt, jgb, canada, mexico, brazil) and a historical as-of date; omit for the latest UST curve." },
     options: [
       { key: "date", type: "string", settingKey: "asOfDate", placeholder: "date", description: `Historical as-of date, as ${DATE_OPTION_EXAMPLES}; uses the latest session on or before it.` },
-      { key: "curve", type: "string", description: "ust (default), tips, breakeven, euro, bund, gilt, jgb or canada." },
+      { key: "curve", type: "string", description: "ust (default), tips, breakeven, euro, bund, gilt, jgb, canada, mexico or brazil." },
       { key: "compare", type: "string", description: `Compare with a date (${DATE_OPTION_EXAMPLES}) or a span back from the curve's session (1D, 1W, 1M, 3M, 1Y).` },
       { key: "view", type: "enum", values: [{ value: "curve" }, { value: "difference", aliases: ["diff"] }],
         description: "With a compare date: both curves, or the bp change by tenor as bars.",
@@ -162,6 +171,7 @@ export function createYieldCurveHeadless(
         const curve = curveIdOf(args.options.curve) ?? parseCurveArgument(args.argument).curve ?? "us";
         return `Yield Curves | ${curveOption(curve).label}`;
       } catch {
+        // Intentional ignore: the load reports a curve it cannot read, so the title stays generic.
         return "Yield Curves";
       }
     },
@@ -184,7 +194,7 @@ export function createYieldCurveHeadless(
         return {
           freshness: { source: "Government bond publishers", status: "not-a-feed", basis: "daily curves" },
           columns: WORLD_COLUMNS,
-          rows: rows.map((row) => ({ market: row.market, twoYear: row.twoYear, tenYear: row.tenYear, thirtyYear: row.thirtyYear,
+          rows: rows.map((row) => ({ ...savedCopyMark(row), market: row.market, twoYear: row.twoYear, tenYear: row.tenYear, thirtyYear: row.thirtyYear,
             twosTensBasisPoints: bp(row.twosTens), tenYearChangeBasisPoints: bp(row.tenYearChange), asOf: row.asOf })),
           metadata: { units: "Percent" },
         };
@@ -192,7 +202,7 @@ export function createYieldCurveHeadless(
       const argument = parseCurveArgument(args.argument);
       const optionCurve = args.options.curve == null || args.options.curve === "" ? null : curveIdOf(args.options.curve);
       if (args.options.curve && !optionCurve) {
-        throw new Error(`Unknown curve ${String(args.options.curve)}; use ${CURVE_OPTIONS.map((option) => option.aliases[0]).join(", ")}.`);
+        throw new Error(unknownCurveMessage(String(args.options.curve)));
       }
       const curve = optionCurve ?? argument.curve ?? "us";
       const requestedDate = args.options.date != null ? yieldCurveDate(args.options.date, new Date(), "--date") : argument.date;
@@ -204,7 +214,7 @@ export function createYieldCurveHeadless(
       const compareAsOf = comparePoints ? curveAsOf(comparePoints) : null;
       const compareAt = (maturity: string) => comparePoints?.find((point) => point.maturity === maturity)?.yield ?? null;
       // The stored curve brings its look-backs; the FRED fallback's load after it, and a failure leaves the move blank.
-      const lookbacks: YieldLookbackCurves = data.lookbacks ?? (session ? await loadLookbacks(session, context).catch(() => ({})) : {});
+      const lookbacks: YieldLookbackCurves = data.lookbacks ?? (session ? await loadLookbacks(session, context).catch(logFailure("yield-curve.headless", "Load yield curve lookbacks failed", {})) : {});
       const tenorRows = new Map(yieldTenorRows(points, lookbacks).map((row) => [row.id, row]));
       const rows = [...points].sort((a, b) => a.maturityYears - b.maturityYears);
       const missing = points.filter((point) => point.yield == null);
@@ -229,6 +239,9 @@ export function createYieldCurveHeadless(
         : data.seriesSource ? data.seriesSource
         : data.seriesSource === null ? "FRED" : CURVE_PUBLISHERS[curve];
       const cutoff = curveCutoff(curve);
+      // A US curve asked for a day the bond market was shut says so, and which day it shows (Veterans Day shows the day before).
+      const closed = requestedDate && session && CURVE_MARKETS[curve] === "US" ? usBondMarketClosedNote(requestedDate, session) : null;
+      const notes = [...(ranked ? [RANK_NOTE] : []), ...(closed ? [closed] : [])];
       return {
         // A stored curve cites its publisher. FRED's fallback cites info.source, not that publisher.
         // A Treasury curve names when in the day it was taken, beside its date.
@@ -236,7 +249,12 @@ export function createYieldCurveHeadless(
           ...(cutoff ? { schedule: cutoff } : {}),
           ...(requestedDate ? { basis: "historical curve" } : { basis: "daily curve", cadence: "daily" }) },
         ...(comparePoints ? { columns: compareColumns(compareAsOf) } : ranked ? { columns: RANKED_COLUMNS } : {}),
-        ...(ranked ? { notes: [RANK_NOTE] } : {}),
+        ...(notes.length ? { notes } : {}),
+        // The spreads the pane shows over its table, each with its day move and where it sits in the last year.
+        ...(spreads.length ? { textSections: [{ title: "Spreads", entries: spreads.map((figure) => {
+          const text = curveSpreadText(figure);
+          return { key: figure.id, label: figure.id, value: bp(figure.value), formatted: `${text.value}  ${text.detail}` };
+        }) }] } : {}),
         rows: rows.map((point) => {
           const compare = compareAt(point.maturity);
           const change = tenorRows.get(point.maturity)?.change1d ?? null;
@@ -244,6 +262,7 @@ export function createYieldCurveHeadless(
           const day = ranked ? curveTenorMove(data, point.maturity, "1D") : null;
           const week = ranked ? curveTenorMove(data, point.maturity, "1W") : null;
           return {
+            ...savedCopyMark(data),
             ...point,
             change1dBasisPoints: change == null ? null : toBasisPoints(change, 1),
             ...(ranked ? {

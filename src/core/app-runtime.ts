@@ -1,5 +1,7 @@
 import { MarketDataCoordinator, getSharedMarketDataCoordinator, setSharedMarketDataCoordinator } from "../market-data/coordinator";
+import { followDataServiceHealth } from "../market-data/connection-follow";
 import { NewsService, type NewsServiceOptions } from "../news/aggregator";
+import { cloudNewsSession } from "../news/cloud-session";
 import { getSharedNewsService, setSharedNewsService } from "../news/hooks";
 import { PluginRegistry } from "../plugins/registry";
 import { releaseSharedRegistry } from "../plugins/registry/shared";
@@ -58,9 +60,12 @@ export function createAppRuntime({
   // Usage counts keep a mnemonic for these; a plugin installed later is not one of them.
   rememberBuiltinPlugins(plugins.filter((plugin) => !externalPlugins?.some((entry) => entry.plugin === plugin)));
   const marketData = new MarketDataCoordinator(dataProvider);
+  // What an outage failed loads again once the data service answers; prices read stale while their stream is down.
+  const stopFollowingHealth = followDataServiceHealth(pluginRegistry.connectionHealth, marketData);
   const newsService = new NewsService({
     connectionHealth: pluginRegistry.connectionHealth,
     pollIntervalMs: () => Math.max(1, config.refreshIntervalMinutes) * 60_000,
+    session: cloudNewsSession,
     ...newsOptions,
   });
   const modules = { pluginRegistry, marketData, newsService };
@@ -93,7 +98,7 @@ export function createAppRuntime({
     if (getSharedMarketDataCoordinator() === marketData) setSharedMarketDataCoordinator(null);
     if (getSharedNewsService() === newsService) setSharedNewsService(null);
     dispose(
-      disposeReady, () => newsService.stop(), () => marketData.destroy(),
+      disposeReady, () => newsService.stop(), stopFollowingHealth, () => marketData.destroy(),
       // An async setup may still use persistence or contribute panes. Dispose it
       // after setup settles, so it cannot write into a closed store or leak late contributions.
       registering ? undefined : disposePlugins,

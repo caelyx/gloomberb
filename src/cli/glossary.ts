@@ -1,7 +1,7 @@
 import { cliStyles, cliTerminalWidth, renderDefinitions, renderSection, wrapText } from "../utils/cli-output";
 
 /**
- * Plain-words meanings of the rates, auction, credit and bond yield, energy, perpetual-futures, portfolio,
+ * Plain-words meanings of the rates, auction, credit and bond yield, energy, perpetual-futures, portfolio, portfolio risk (beta, R², VaR, HHI),
  * fund, bond fund (SEC yield, tax-equivalent yield, muni/Treasury ratio), short interest, quote-board, futures (basis, contango, roll yield), VIX curve (term structure, 3M/30D, VVIX), CFTC positioning (COT trader classes, net % of open interest), depositary receipt (ADR ratio, premium, implied FX, the peso's CCL and MEP rates) and economic-calendar terms the functions
  * show in their rows, headers and footers.
  * `catalog glossary` lists them, `catalog explain <term>` prints one, and
@@ -14,6 +14,12 @@ export interface GlossaryEntry {
   short?: string;
   /** Other names a reader may look it up by: `stop-out` for the high yield. */
   aliases: readonly string[];
+  /**
+   * Other names for what the functions that show it cover, which find those
+   * functions as the term and its abbreviation do (`expected shortfall` for
+   * MARS and PORT); the aliases only look the term up. Looked up as aliases are.
+   */
+  finds?: readonly string[];
   /** The functions that show it, by the token `fn` takes. */
   functions: readonly string[];
   /**
@@ -28,6 +34,11 @@ export interface GlossaryEntry {
    * print in other yields.
    */
   shownBy?: Readonly<Record<string, readonly string[]>>;
+  /**
+   * Terms a reader looking this one up wants beside it, by their `term`:
+   * looking up when-issued prints the tail it is measured against too.
+   */
+  related?: readonly string[];
   /** One or two plain sentences. */
   definition: string;
 }
@@ -66,19 +77,21 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
       + "Every winning bid is filled at it; for TIPS it is a real yield.",
   },
   {
-    term: "Stop-out vs average", aliases: ["stop-out vs avg", "vs avg", "stop-out vs median"], functions: ["AUCT"],
-    shown: ["Stop-out vs avg", "Stop-out vs average"],
-    definition: "The high (stop-out) yield minus the auction's average/median yield, in basis points; bills compare discount rates. "
+    term: "Stop-out vs median", aliases: ["stop-out vs med", "vs med", "stop-out vs average", "stop-out vs avg", "vs avg"], functions: ["AUCT"],
+    shown: ["Stop-out vs median", "Stop-out vs average", "Stop-out vs average/median", "VS MED", "VS AVG", "VS AVG/MED"],
+    definition: "The high (stop-out) yield minus the auction's median yield, in basis points; bills compare discount rates. "
+      + "Treasury has sold at a single price since November 1998 and publishes the median accepted bid; before, most auctions "
+      + "were multiple-price and the figure is the average, so older auctions read stop-out vs average. "
       + "A wider gap means the last accepted bids cleared well above where most of the auction priced.",
   },
   {
     term: "Tail", aliases: ["tailed", "tailing", "auction tail"], functions: ["AUCT"], shown: ["tail"],
     definition: "How far an auction's high yield cleared above the when-issued yield at the 1 pm bid deadline; a tail reads as weak demand. "
-      + "AUCT cannot show one, as its source has no when-issued yields, so it shows stop-out vs average instead.",
+      + "AUCT cannot show one, as its source has no when-issued yields, so it shows stop-out vs median instead.",
   },
   {
     term: "When-issued", short: "WI", aliases: ["when issued", "wi yield", "when-issued yield"], functions: ["AUCT"],
-    shown: ["when-issued", "When-issued"],
+    shown: ["when-issued", "When-issued"], related: ["Tail"],
     definition: "Trading in a Treasury security between its announcement and its issue. The when-issued yield at the auction deadline is what a tail is measured against.",
   },
   {
@@ -86,6 +99,19 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     shown: ["Investment rate", "Bill", "CMB"],
     definition: "A bill's yield at the highest accepted (stop-out) rate, restated as a bond-equivalent yield so it compares with "
       + "note yields. It reads higher than the bill's discount rate.",
+  },
+  {
+    term: "Discount rate", aliases: ["bank discount rate", "high discount rate", "discount yield"], functions: ["AUCT"],
+    shown: ["Discount rate"],
+    definition: "How a bill is bid and quoted: the discount from face value as an annual rate on a 360-day year. "
+      + "The auction's high discount rate is the one its investment rate restates.",
+  },
+  {
+    term: "Auction percentile", aliases: ["b/c percentile", "b/c pctl", "indirect percentile", "dealer percentile", "stop-out percentile", "stop-out pctl"],
+    functions: ["AUCT"],
+    shown: ["Stop-out pctl", "B/C pctl", "Indirect pctl", "Dealer pctl"],
+    definition: "Where an auction's stop-out vs median, bid-to-cover, indirect or dealer share ranks among the previous 24 auctions of the same "
+      + "tenor and type, from 0 (the lowest) to 100 (the highest). Blank with fewer than 12 before it.",
   },
   {
     term: "High discount margin", aliases: ["discount margin", "frn margin"], functions: ["AUCT"],
@@ -106,7 +132,7 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     definition: "The nine-character code that identifies a US security. A reopening repeats the original issue's CUSIP.",
   },
   {
-    term: "Bill", aliases: ["t-bill", "treasury bill", "bills"], functions: ["AUCT", "BTMM"], shown: ["Bill", "bill"],
+    term: "Bill", aliases: ["t-bill", "t-bills", "tbill", "tbills", "treasury bill", "bills"], functions: ["AUCT", "BTMM"], shown: ["Bill", "bill"],
     definition: "Treasury debt of a year or less, sold below face value with no coupon; the climb back to face value is the interest.",
   },
   {
@@ -234,15 +260,15 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   },
   // Central bank rates (CBR), in the order its columns run. Pctl 1Y sits between them, shared with BTMM and WIRP.
   {
-    term: "Last move", aliases: ["latest move"], functions: ["CBR"],
+    term: "Last change", aliases: ["last move", "latest move"], functions: ["CBR"],
     definition: "The latest change in the policy rate, in basis points: up for a hike, down for a cut. The US figure is the move in the midpoint of the target range.",
   },
   {
-    term: "Change observed", aliases: ["last change", "change date"], functions: ["CBR"],
-    definition: "The first date the new rate level appears in the data, not necessarily the announcement or effective date.",
+    term: "Changed", aliases: ["change date", "change observed"], functions: ["CBR"],
+    definition: "The date of the latest change: the decision it came from, or, where no decision is on record, the first date the new rate level appears in the data. The last decision under each row is the bank's latest meeting, a hold included.",
   },
   {
-    term: "Pctl 1Y", aliases: ["percentile", "1y percentile", "1-year percentile", "pctl"], functions: ["BTMM", "WIRP", "CBR", "CDX", "SOVR", "COT"],
+    term: "Pctl 1Y", aliases: ["percentile", "1y percentile", "1-year percentile", "pctl"], functions: ["BTMM", "WIRP", "CBR", "CDX", "SOVR", "COT", "CTM"],
     definition: "Where today's value ranks against the past year of the same series: 100 is the highest, 0 the lowest.",
   },
   {
@@ -369,11 +395,49 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     definition: "How far a perpetual's price sits above or below the reference price it tracks, as a percent. "
       + "Positive means buyers are paying up for the contract; funding pulls it back toward zero.",
   },
+  // Stablecoins (CRYP --list stablecoin).
+  {
+    term: "Off peg", aliases: ["off-peg", "peg", "depeg", "de-peg", "peg deviation", "stablecoin peg"], functions: ["CRYP"],
+    definition: "How far a stablecoin trades from its peg, in basis points: (price ÷ peg − 1) × 10,000, the peg being $1 for a dollar coin "
+      + "and the EUR/USD rate for a euro coin (Peg EUR 1.1194). A coin whose Peg reads USD yield (yield accrues into its price) or USD bond "
+      + "(a bond token priced toward a dollar at maturity) has no par to be off, so it shows none.",
+  },
+  {
+    term: "24h low/high", aliases: ["24h low", "24h high", "24-hour low", "24-hour high", "24h range", "low utc", "high utc"], functions: ["CRYP"],
+    shown: ["24h low", "24h high", "Low UTC", "High UTC"],
+    definition: "A stablecoin's lowest and highest trade over the rolling 24 hours to the board's time, not since midnight, "
+      + "with when each traded in UTC (Low UTC, High UTC). A newer price outside them becomes the low or the high.",
+  },
+  {
+    term: "Supply", aliases: ["stablecoin supply", "total supply", "supply 7d", "supply 30d", "supply change"], functions: ["CRYP"],
+    shown: ["Supply", "Total supply"],
+    definition: "The dollar value of a stablecoin's coins in circulation, from a daily series that ends on the previous day: "
+      + "the line above the table gives its as-of date. Supply 7D and Supply 30D are its change over those days, in dollars and in percent; "
+      + "supply grows as coins are issued and shrinks as they are redeemed.",
+  },
+  // DeFi (CRYP --list defi, fn G CAP:crypto:defi-tvl).
+  {
+    term: "Total value locked", short: "TVL", aliases: ["defi tvl", "value locked", "locked value", "total defi tvl"], functions: ["CRYP"],
+    shown: ["TVL", "TVL USD", "Total DeFi TVL"],
+    definition: "The dollar value of the tokens held in DeFi protocols' contracts (lending, exchange and yield pools) at the day's prices, "
+      + "as DefiLlama counts it. Each deposit counts once: re-deposited receipt or LP tokens, liquid staking, bridges and borrowed amounts "
+      + "are left out, so it is less than the protocols listed added up. Each day is that UTC day's close.",
+  },
+  {
+    term: "Share", aliases: ["supply share", "share of supply", "tvl share"], functions: ["CRYP"],
+    definition: "A stablecoin's part of all stablecoin supply, in percent, on the same previous-day series as Supply. "
+      + "On the DeFi chain list, a chain's part of all value locked.",
+  },
   // Portfolio weights and rebalancing (PF, portfolio show).
   {
     term: "Weight", aliases: ["weights", "portfolio weight", "allocation weight"], functions: ["PF"],
     definition: "A holding's share of the portfolio's total value, cash included, in percent. A holding without a price is left out of the total. "
       + "In a book that holds a short, its signed value's share of gross exposure instead, longs plus shorts at their absolute value, so a short weighs negative and cash has no weight.",
+  },
+  {
+    term: "Contribution", aliases: ["contrib", "period contribution", "contribution to return"], functions: ["PF"], shown: ["Contribution", "CONTRIB"],
+    definition: "Over a period (portfolio show --from, fn PF --from), a position's P&L between the two closes as a share of the book's value at the start, in percent; "
+      + "of its gross exposure instead, longs plus shorts at their absolute value, when the book holds a short. The positions, the FX line and the total add up.",
   },
   {
     term: "Target", aliases: ["target weight", "target weights", "targets", "target allocation"], functions: ["PF"],
@@ -396,6 +460,45 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     definition: "The plain difference between two percentages. A 22% weight against a 20% target is 2pp over it, not 10%, "
       + "and gas storage going from 74.31% to 74.46% full is up 0.15pp.",
   },
+  // Portfolio risk (PORT, and MARS, which opens it on its risk view): the factor table's betas and fits, the tail loss,
+  // the drawdown, the stress scenarios, concentration.
+  {
+    term: "Beta", aliases: ["betas", "factor beta", "market beta", "beta to spy", "exposure", "factor exposure"], functions: ["PORT", "MARS"],
+    shown: ["beta", "Beta"],
+    definition: "How far a basket moves with a factor: a beta of 0.54 to SPY means it rose 0.54% on average for each 1% SPY rose. "
+      + "PORT estimates it from the last 60 daily returns; read it with its R², since a beta from a weak fit says little about an exposure.",
+  },
+  {
+    term: "R²", aliases: ["r-squared", "r squared", "r2", "coefficient of determination", "goodness of fit", "weak fit"], functions: ["PORT", "MARS"],
+    definition: "R-squared: the share of a basket's daily moves a factor explains, from 0 (none) to 1 (all), over the same 60 sessions as its beta. "
+      + "Under 0.1 PORT marks the factor a weak fit: the beta beside it is mostly noise, not an exposure.",
+  },
+  {
+    term: "Value at risk", short: "VaR", aliases: ["var 95%", "1d var", "historical var", "tail loss"],
+    finds: ["value-at-risk", "expected shortfall", "cvar", "conditional var"],
+    functions: ["PORT", "MARS"], shown: ["VaR", "expected shortfall"],
+    definition: "The loss a basket went beyond on only 5% of its last 60 trading days, as a share of its value and in money: a 1-day VaR 95% of 1.19% means "
+      + "about one day in twenty lost more than that. Expected shortfall is the average loss on those worst days. Both read the past, not a limit on the next loss.",
+  },
+  {
+    term: "Max drawdown", aliases: ["drawdowns", "mdd", "peak to trough", "peak-to-trough decline"], finds: ["drawdown", "maximum drawdown"],
+    functions: ["PORT", "MARS"], shown: ["max drawdown"],
+    definition: "The largest fall from a high to a later low over the window, as a share of the high: a 60D max drawdown of -7.2% is the basket's "
+      + "worst drop from any of its last 60 closes to a later one.",
+  },
+  {
+    term: "Stress test", aliases: ["stress", "scenario", "scenarios", "shock", "shocks", "what if", "historical scenarios", "crash replay"],
+    finds: ["stress tests", "stress testing", "scenario analysis"],
+    functions: ["PORT", "MARS"], shown: ["stress", "Stress"],
+    definition: "What the book would move by in a given shock: an index fall, a 10Y yield rise or a VIX jump read through the basket's past moves "
+      + "with each, a currency or holding move repricing the lines it touches, and four past selloffs replayed on today's holdings at today's weights. "
+      + "A measure of exposure, not a forecast.",
+  },
+  {
+    term: "HHI", aliases: ["herfindahl", "herfindahl index", "herfindahl-hirschman index", "concentration index", "effective holdings"], functions: ["PORT", "MARS"],
+    definition: "Herfindahl-Hirschman index: each holding's weight squared and added up, from near 0 for a book spread thin to 1 for a single holding. "
+      + "One over it is the effective number of holdings: 0.20 reads as a book of five equal positions.",
+  },
   // Financial statements and ratios (FA).
   {
     term: "EBITDA", aliases: ["earnings before interest taxes depreciation and amortization", "ebitda ttm"], functions: ["FA"],
@@ -404,7 +507,8 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   },
   {
     term: "Net debt", aliases: ["net debt/ebitda", "net debt to ebitda", "net leverage"], functions: ["FA"], shown: ["Net Debt"],
-    definition: "Total debt less cash and short-term investments. Negative means more cash than debt. "
+    definition: "Total debt less cash and short-term investments, with the balance sheet's lease liabilities under IFRS (\"incl. leases\"); "
+      + "a company reporting under US GAAP (a 10-K, or a 20-F such as Alibaba's) keeps its operating leases out (\"excl. op. leases\"). Negative means more cash than debt. "
       + "Net debt / EBITDA is how many years of EBITDA would repay it; FA divides by a year of EBITDA, the trailing four quarters in a quarterly column.",
   },
   {
@@ -426,9 +530,20 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
       + "It is usually a fraction of a percent, and widens when the fund's holdings are hard to trade or their market is shut.",
   },
   {
-    term: "Tracking error", aliases: ["index tracking error"], functions: ["ETF"], shown: ["Tracking error", "tracking error"],
+    term: "Tracking error", aliases: ["index tracking error", "active risk"], functions: ["ETF", "PORT", "MARS"],
+    shown: ["Tracking error", "tracking error"],
     definition: "How loosely a fund follows its index: how much the gap between the fund's return and the index's swings, usually over a year. "
-      + "Fees, cash and holdings that differ from the index widen it.",
+      + "Fees, cash and holdings that differ from the index widen it. PORT measures a basket's against SPY from 60 daily returns, annualized.",
+  },
+  {
+    term: "Leveraged and inverse ETFs", aliases: ["leveraged", "inverse", "decay", "daily reset", "3x", "2x", "-1x", "-3x",
+      "leveraged etf", "leveraged etfs", "inverse etf", "inverse etfs", "leveraged fund", "inverse fund", "leverage decay", "volatility decay"],
+    functions: ["ETF", "CMP"], shownBy: { ETF: ["Objective"], CMP: ["decay"] },
+    definition: "A fund that seeks a multiple of its index's return each day: 2× or 3× (TQQQ, three times the Nasdaq-100), or -1× to -3× for an inverse "
+      + "fund (SQQQ). It resets every day, so over weeks it compounds away from that multiple: in a market that swings it falls short (decay), in a "
+      + "steady trend it can beat it. ETF shows the objective. CMP draws the daily line from the index fund (3× daily QQQ beside TQQQ) and two decay "
+      + "rows in percentage points: the fund against that line (fees, financing), and the line against the multiple of the index's return over "
+      + "the period (compounding).",
   },
   // A depositary receipt beside its home listing (ADR, DES), and the peso's market dollar rates `fx USD/ARS` lists.
   {
@@ -436,6 +551,12 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     functions: ["ADR", "DES"], shown: ["Ratio", "ADR Ratio", "ADR ratio"],
     definition: "How many ordinary shares one depositary receipt holds: 1 ADR = 10 ordinary shares means one GGAL in New York is ten GGAL.BA shares in Buenos Aires. "
       + "A receipt's price compares with its home price only once the home price is multiplied by the ratio.",
+  },
+  {
+    term: "CEDEAR ratio", aliases: ["cedear", "cedears", "certificado de deposito argentino"],
+    functions: ["DES"], shown: ["CEDEAR ratio", "CEDEAR Ratio"],
+    definition: "How many Buenos Aires CEDEARs make the company's shares they stand for, from BYMA's published list: 20 AAPL:BYMA = 1 Apple Inc. share. "
+      + "A CEDEAR's market cap is its company's, in the currency of the listing it stands for (Apple's in dollars), not the certificate's peso price times a share count.",
   },
   {
     term: "ADR premium", aliases: ["adr discount", "adr vs home", "receipt premium", "adr premium/discount"],
@@ -462,7 +583,8 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
       + "Read as the peso price over the D line's dollar price; it sits near the CCL rate, usually a little under it.",
   },
   // Bond spreads and yields (CRD, the data catalog's ICE BofA yields, TRACE), a fund's SEC yield, which DVD's cash yield is not,
-  // and the bond fund figures and tax-equivalent maths DVD and fundamentals give with --tax-rate.
+  // and the bond fund figures and tax-equivalent maths DVD, ETF, DES and fundamentals give with --tax-rate, and the taxes behind its rates.
+  // An example with numbers carries its date: they move with the market.
   {
     term: "Option-adjusted spread", short: "OAS", aliases: ["spread over treasuries", "corporate spread"], functions: ["CRD"],
     definition: "How much more a corporate bond index yields than Treasuries of the same maturities, once the value of the issuers' right to call their bonds early is taken out. "
@@ -484,7 +606,7 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   },
   {
     term: "Yield to worst", short: "YTW", aliases: ["worst yield", "yield-to-worst"], functions: ["TRACE", "DVD", "ETF"],
-    shown: ["Yield to worst", "Yield to Worst", "Yld to Worst"], shownBy: { TRACE: ["Yield"] },
+    shown: ["Yield to worst", "Yield to Worst", "Yld to Worst", "YTW"], shownBy: { TRACE: ["Yield"] },
     definition: "The lowest yield a bond can pay without its issuer defaulting: the lower of its yield to maturity and its yield to each date it can be called. "
       + "The yield TRACE shows for a sale is this one, worked out from the sale price; a bond fund's is the average over its holdings, as its sponsor publishes it.",
   },
@@ -496,23 +618,38 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   },
   {
     term: "Duration", aliases: ["effective duration", "average duration", "option-adjusted duration", "eff duration", "avg duration"],
-    functions: ["DVD", "ETF"], shown: ["Effective duration", "Average duration", "Effective Duration", "Average Duration", "Eff Duration", "Avg Duration"],
+    functions: ["DVD", "ETF"], shown: ["Effective duration", "Average duration", "Effective Duration", "Average Duration", "Eff Duration", "Avg Duration", "Duration"],
     definition: "How far a bond fund's price moves when rates move: 7 years of duration is about 7% for a 1 percentage point change. "
       + "Effective (option-adjusted) duration allows for calls; Vanguard publishes an average duration as of the month end.",
   },
   {
     term: "Tax-equivalent yield", short: "TEY", aliases: ["tax equivalent yield", "taxable equivalent yield", "taxable-equivalent yield", "tax equivalent"],
-    functions: ["DVD"], shown: ["Tax-equivalent yield", "Tax-Equivalent Yield"],
+    functions: ["DVD", "ETF", "DES"], shown: ["Tax-equivalent yield", "Tax-Equivalent Yield", "TEY", "Tax-Eq Yld"],
     definition: "The yield a taxable bond needs to match a tax-exempt muni fund after tax: yield / (1 - (federal rate + state rate)), on the SEC yield, "
-      + "else the distribution yield. At 40.8% (37% plus the 3.8% net investment income tax), MUB's 4.04% is 6.83%. A state rate counts only for a "
-      + "single-state fund of that state (CMF, VTEC for California). gloom fn DVD and fundamentals take --tax-rate, --state-rate and --state.",
+      + "else the distribution yield. At 40.8% (37% plus the 3.8% NIIT), MUB's SEC yield of 3.7955% on 2026-11-04 was 6.41%. A state rate counts only for a "
+      + "single-state fund of that state (CMF, VTEC for California). gloom fn DVD (one fund or a ranking of several), ETF, DES and fundamentals take "
+      + "--tax-rate, --state-rate and --state.",
   },
   {
     term: "Muni/Treasury ratio", aliases: ["muni treasury ratio", "muni-to-treasury ratio", "muni/ust ratio", "muni ratio", "municipal treasury ratio"],
-    functions: ["DVD"], shown: ["Muni/Treasury ratio"],
+    functions: ["DVD", "ETF", "DES"], shown: ["Muni/Treasury ratio", "Muni/Tsy"],
     definition: "A muni yield over the Treasury yield of the same maturity, both before tax: under 100% munis yield less than Treasuries, as their tax "
-      + "exemption usually makes them. DVD and fundamentals divide a muni fund's SEC yield by the GC Treasury par yield at the tenor nearest its duration "
-      + "(MUB's 7.13 years: the 7Y). Market ratios read the AAA muni curve, MMD or BVAL, which are licensed and not in the terminal.",
+      + "exemption usually makes them. DVD, ETF, DES and fundamentals divide a muni fund's SEC yield by the GC Treasury par yield at the tenor nearest its "
+      + "duration (MUB's 7.15 years on 2026-11-04: the 7Y, FRED's DGS7). Market ratios read the AAA muni curve, MMD or BVAL, which are licensed and not in the terminal.",
+  },
+  {
+    term: "Net investment income tax", short: "NIIT", aliases: ["net investment income tax", "medicare surtax", "unearned income medicare contribution tax", "3.8% tax"],
+    functions: ["DVD", "ETF", "DES"],
+    definition: "A 3.8% US federal tax on investment income (interest, dividends, capital gains) above $200,000 of modified adjusted gross income, "
+      + "$250,000 for a married couple filing jointly. With the 37% top bracket it makes the 40.8% top rate on taxable bond income that --tax-rate "
+      + "examples use; muni bond interest is exempt from it, as from the regular federal income tax.",
+  },
+  {
+    term: "Alternative minimum tax", short: "AMT", aliases: ["alternative minimum tax", "private activity bond", "private activity bonds", "amt-free", "amt free"],
+    functions: ["DVD", "ETF", "DES"],
+    definition: "A parallel US federal income tax, with fewer deductions, that a taxpayer owes when it comes to more than the regular tax. Interest on "
+      + "private activity munis (airports, housing, student loans) counts toward it, so an AMT payer owes tax on part of a fund that holds them; AMT-free "
+      + "muni funds hold none. The tax-equivalent yield treats a muni fund's income as wholly exempt, so for an AMT payer it overstates such a fund.",
   },
   // Index and sovereign CDS (CDX, SOVR), in the order CDX's columns run, then the trade terms behind them.
   {
@@ -598,10 +735,10 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   },
   {
     // SIW's Setup column prints these two words.
-    term: "Crowded", aliases: ["crowded short", "crowded shorts", "crowded trade", "crowded, rising", "crowded rising", "setup"], functions: ["SIW"],
-    shown: ["Crowded", "Crowded, rising"],
+    term: "Crowded", aliases: ["crowded short", "crowded shorts", "crowded trade", "crowded, rising", "crowded rising", "crowded, price rising", "px up", "setup"], functions: ["SIW"],
+    shown: ["Crowded", "Crowded, px up"],
     definition: "SIW's flag for a heavily shorted name: at least 10% of the float short, or five or more days to cover with at least 5% of the float short "
-      + "(days to cover alone when the float is unknown). Crowded, rising adds a price up over the month. A fixed threshold, not a squeeze forecast.",
+      + "(days to cover alone when the float is unknown). Crowded, px up adds a share price up over the month (px is the price, not the short interest, which can be falling). A fixed threshold, not a squeeze forecast.",
   },
   {
     term: "Squeeze", aliases: ["short squeeze", "squeezes", "short covering"], functions: ["SIW"], shown: ["Short squeeze watch"],
@@ -667,7 +804,7 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   {
     term: "Commitments of Traders", short: "COT", aliases: ["cot report", "commitment of traders", "cftc", "cftc report", "cftc positioning", "positioning"],
     functions: ["COT"], shown: ["CFTC", "COT"],
-    definition: "The CFTC's weekly count of who holds each US futures market: open contracts split by type of trader, as of Tuesday and published that Friday. "
+    definition: "Weekly open contracts split by trader type, from the CFTC and ICE Futures Europe. ICE publishes Brent, gasoil and other European markets itself, separately from the CFTC's ICE WTI market. Tuesday positions are released later; ICE's usual release is Friday at 18:30 London time, subject to holidays. "
       + "It shows whether speculators or hedgers are net long or short, and how that moved since the week before.",
   },
   {
@@ -714,7 +851,32 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
   },
   {
     term: "Other reportables", aliases: ["other reportable", "other reportable traders"], functions: ["COT"], shown: ["Other Reportables"],
-    definition: "The disaggregated report's large traders that fit none of its other classes, such as proprietary traders and family offices.",
+    definition: "The disaggregated and TFF reports' large traders that fit none of their other classes, such as proprietary traders and family offices.",
+  },
+  // The Traders in Financial Futures report's classes, and the options it can count.
+  {
+    term: "Traders in Financial Futures", short: "TFF", aliases: ["tff report", "financial futures report", "financial traders report"], functions: ["COT"], shown: ["Financial (TFF)"],
+    definition: "The CFTC's report on financial futures, such as rates, currencies, stock indexes and VIX. "
+      + "It splits large traders into dealers, asset managers, leveraged funds and other reportables.",
+  },
+  {
+    // Named for its report: the leveraged ETFs are "Leveraged and inverse ETFs".
+    term: "Leveraged funds (COT)", aliases: ["leveraged funds", "leveraged money", "lev funds", "tff leveraged funds"], functions: ["COT"],
+    shown: ["Leveraged Funds"],
+    definition: "The TFF report's hedge funds, CTAs and other money managers trading for clients or with borrowed money: the speculators most watched in rates, currencies and indexes.",
+  },
+  {
+    term: "Asset manager/institutional", aliases: ["asset manager", "asset managers", "institutional", "real money"], functions: ["COT"], shown: ["Asset Manager/Institutional"],
+    definition: "The TFF report's pension funds, insurers, mutual funds and endowments, investing for the long run; usually net long stock index futures.",
+  },
+  {
+    term: "Dealer/intermediary", aliases: ["dealer intermediary", "intermediary", "intermediaries"], functions: ["COT"], shown: ["Dealer/Intermediary"],
+    definition: "The TFF report's banks and dealers on the sell side, taking the other side of their clients' trades and hedging it.",
+  },
+  {
+    term: "Futures and options combined", aliases: ["futures + options", "futures and options", "combined report", "combined positions"], functions: ["COT"], shown: ["Futures + options"],
+    definition: "A COT report that adds each group's options to its futures, delta-adjusted: an option counts as the futures it moves like. "
+      + "Futures only, the default, counts futures alone.",
   },
   // Futures basis and curve shape (CTM, FUT, PERP).
   {
@@ -731,11 +893,16 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
       + "(10 bp is about ±5 points at 7 days), so CTM greys it there and Vs Spot is the figure to read.",
   },
   {
-    term: "Crypto composite price", aliases: ["CCC", "crypto composite", "composite price", "composite crypto price"], functions: ["CTM"],
+    term: "Crypto composite price", aliases: ["CCC", "crypto composite", "composite price", "composite crypto price"], functions: ["CTM", "CRYP"],
     shown: ["crypto composite price"],
-    definition: "A coin's dollar price blended from trading on several crypto exchanges rather than taken from one, quoted around the clock; "
-      + "quotes list it under the code CCC. CTM reads CME crypto futures against it, while the futures settle to CME's own reference rate, "
-      + "so a small gap at expiry is expected.",
+    definition: "A coin's dollar price blended from trading on many crypto exchanges, Binance, Coinbase, Kraken and Bitstamp among them, "
+      + "quoted around the clock under the code CCC. "
+      + "Its 5-minute low or high can be one exchange's brief wick: CRYP reads Coinbase's, Kraken's and Bitstamp's own candles "
+      + "around it and says Coinbase only when one alone reached it, other exchange when none of them did. "
+      + "An exchange's price outside the composite's 24-hour range widens it, and the extreme says so (+ Kraken). "
+      + "A price named after an exchange (Coinbase · 15:55 UTC) is that exchange's own price at that time, not the composite. "
+      + "An intraday bar's volume counts the spot venues the bar names (1 spot venue), not every exchange. "
+      + "CTM reads CME crypto futures against the composite, while the futures settle to CME's own reference rate, so a small gap at expiry is expected.",
   },
   {
     term: "Contango", aliases: ["contango curve", "upward curve"], functions: ["CTM", "FUT"], shown: ["contango", "Contango"],
@@ -754,6 +921,13 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
       + "less 1, scaled to a year: (front / next - 1) × 365 / days between the two. It is positive in backwardation and negative in contango.",
   },
   // The VIX curve and the volatility board (VIX, VOLS): spot indices, not futures.
+  {
+    term: "Variance swap", aliases: ["variance swaps", "var swap", "variance strike", "variance swap strike", "variance-swap strike"],
+    functions: ["VIX", "CTM"],
+    definition: "A swap that pays the difference between the variance an index realizes over its term and a strike fixed at the start. VIX is the square root "
+      + "of the 30-day S&P 500 variance-swap strike that SPX options imply, in volatility points: a VIX of 25 is a 30-day variance strike of 25² = 625, "
+      + "25% a year. Variance swaps trade between dealers and their strikes are not published; CTM VX shows where VIX futures price that 30-day figure at each expiry.",
+  },
   {
     term: "Term structure", aliases: ["volatility term structure", "VIX term structure", "VIX curve", "tenor curve", "tenors"],
     functions: ["VIX", "VOLS"], shown: ["Tenor", "tenor curve"],
@@ -800,7 +974,14 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     term: "Risk reversal", short: "RR", aliases: ["25d risk reversal", "25-delta risk reversal", "25 delta risk reversal", "rr25", "risk reversals"],
     functions: ["OVDV"], shown: ["RR"],
     definition: "The 25-delta call's implied volatility minus the 25-delta put's, in vol points, for one expiry. Negative means puts cost more than calls "
-      + "as far from the forward (downside protection is bid), positive that upside calls are. OVDV signs it call minus put.",
+      + "as far from the forward (downside protection is bid), positive that upside calls are. OVDV, VCA and HIVG's rr25d all sign it call minus put.",
+  },
+  {
+    term: "25-delta implied volatility", aliases: ["25d put iv", "25d call iv", "25-delta put iv", "25 delta put iv", "25d put", "25d call", "25 delta iv"],
+    functions: ["OVDV"], shown: ["25D put IV", "25D call IV"],
+    definition: "The implied volatility of the put whose Black-Scholes spot delta is -0.25 (the call's +0.25) for one expiry, with the carry the "
+      + "expiry's parity forward implies and no premium adjustment. The strike is found on the fitted smile, at the volatility the smile gives "
+      + "there, only between the lowest and highest quoted strikes: an expiry whose quotes stop short of it shows none rather than an extrapolation.",
   },
   {
     term: "Butterfly", short: "BF", aliases: ["25d butterfly", "25-delta butterfly", "25 delta butterfly", "bf25", "smile curvature", "fly"],
@@ -844,28 +1025,100 @@ export const GLOSSARY: readonly GlossaryEntry[] = [
     definition: "An estimate of this quarter's GDP growth from the data already out, revised as each release lands until the official figure. "
       + "ECST shows the Atlanta Fed's GDPNow, annualized, against its own history; ECO lists each update as a release.",
   },
+  // Earnings dates (ERN).
+  {
+    term: "Before market open", short: "BMO", aliases: ["before the open", "before open"],
+    functions: ["ERN"], shown: ["BMO"],
+    definition: "The company reports before the US market opens (9:30 a.m. New York time), so its stock first trades on the results at that day's open. "
+      + "With a timezone set, the report also gives that time in yours.",
+  },
+  {
+    term: "During market hours", short: "DMH", aliases: ["during the session", "intraday report"], functions: ["ERN"], shown: ["DMH"],
+    definition: "The company reports while the US market is open (9:30 a.m. to 4:00 p.m. New York time), so its stock trades on the results the same session.",
+  },
+  {
+    term: "After market close", short: "AMC", aliases: ["after the close", "after close"],
+    functions: ["ERN"], shown: ["AMC"],
+    definition: "The company reports after the US market closes (4:00 p.m. New York time), so its stock first trades on the results after hours and at the next "
+      + "day's open. In Asia that is usually the next morning; with a timezone set, the report gives the time in yours.",
+  },
+  // Institutional holdings (13F).
+  {
+    term: "13F", aliases: ["13f filing", "form 13f", "13f-hr", "13f report"], functions: ["13F"], shown: ["13F"],
+    definition: "The quarterly report an investment manager with $100 million or more in US-listed stocks files with the SEC: its long positions on the "
+      + "quarter's last day, filed up to 45 days later. Shorts, cash and most foreign stocks are absent, so it is weeks old and not the whole portfolio.",
+  },
+  {
+    // Headed `13F %`; as an abbreviation it would read as the 13F itself.
+    term: "13F weight", aliases: ["13f percent", "13f share"], functions: ["13F"], shown: ["13F %"],
+    definition: "A position's share of everything the manager reported in its 13F: its value over the filing's total value, not over the whole fund.",
+  },
+  {
+    term: "Quarter over quarter", short: "QoQ", aliases: ["qoq change", "quarter on quarter", "q/q"], functions: ["13F"], shown: ["QoQ"],
+    definition: "The change from the quarter before: in a 13F, the shares held at this quarter's end against those in the previous quarter's filing.",
+  },
+  {
+    term: "Estimated P&L", short: "Est P&L", aliases: ["est pnl", "estimated profit", "estimated pnl", "p&l"], functions: ["13F"],
+    shown: ["Est P&L"],
+    definition: "What a position held through the quarter gained or lost, estimated from the two filings alone: the shares kept, priced at each quarter "
+      + "end from the filings' own values. Trades inside the quarter are not reported, so it is not the fund's real result.",
+  },
 ];
 
 const ANSI = /\x1b\[[0-9;]*m/g;
 
 /** Letters and digits only, lower case: `stop-out`, `Stop Out` and `stopout` are one lookup. */
+// A superscript two is a two: R² is looked up as r2.
+const plainDigits = (text: string) => text.toLowerCase().replace(/²/g, "2");
+
 function lookupKey(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return plainDigits(text).replace(/[^a-z0-9]/g, "");
 }
 
 function words(text: string): string[] {
-  return text.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return plainDigits(text).split(/[^a-z0-9]+/).filter(Boolean);
 }
 
 function names(entry: GlossaryEntry): string[] {
-  return [entry.term, ...(entry.short ? [entry.short] : []), ...entry.aliases];
+  return [entry.term, ...(entry.short ? [entry.short] : []), ...entry.finds ?? [], ...entry.aliases];
+}
+
+/** The names that find the functions showing a term: the term, its abbreviation and its `finds`, never a loose alias. */
+function findingNames(entry: GlossaryEntry): string[] {
+  return [entry.term, ...(entry.short ? [entry.short] : []), ...entry.finds ?? []];
+}
+
+let keysByFunction: ReadonlyMap<string, ReadonlySet<string>> | null = null;
+
+/**
+ * Whether a query is, whole, the name of a term a function shows (its term,
+ * abbreviation or `finds`, in any case and punctuation), by the function's
+ * code: `VaR`, `value at risk` and `expected shortfall` name MARS and PORT
+ * in `catalog`, `fn`'s hint and the command bar. A word of a longer query, or
+ * a loose alias (`close`, `exposure`), names nothing, so common searches list
+ * what they did.
+ */
+export function glossaryNamesFunction(code: string, query: string): boolean {
+  keysByFunction ??= GLOSSARY.reduce((map, entry) => {
+    for (const fn of entry.functions) map.set(fn, new Set([...map.get(fn) ?? [], ...findingNames(entry).map(lookupKey)]));
+    return map;
+  }, new Map<string, Set<string>>());
+  const key = lookupKey(query);
+  return !!key && !!keysByFunction.get(code.toUpperCase())?.has(key);
+}
+
+/** The functions that show the term a query names whole (`VaR`, `value-at-risk`: PORT and MARS), in glossary order. */
+export function glossaryFunctionsNamed(query: string): string[] {
+  const key = lookupKey(query);
+  if (!key) return [];
+  return [...new Set(GLOSSARY.filter((entry) => findingNames(entry).some((name) => lookupKey(name) === key)).flatMap((entry) => entry.functions))];
 }
 
 export interface GlossaryLookup {
   /** The entries the query names: by the term, its abbreviation or an alias. */
   exact: GlossaryEntry[];
   /**
-   * The others whose names hold each word of the query: `stop-out` finds stop-out vs average. Beside a term the
+   * The others whose names hold each word of the query: `stop-out` finds stop-out vs median. Beside a term the
    * query names they hold the words whole; otherwise a word start is enough, and the whole ones come first.
    */
   partial: GlossaryEntry[];
@@ -880,7 +1133,10 @@ const wholeWord = (have: string, word: string) => have === word || have === `${w
 export function lookupGlossary(query: string): GlossaryLookup {
   const key = lookupKey(query);
   if (!key) return { exact: [], partial: [] };
-  const exact = GLOSSARY.filter((entry) => names(entry).some((name) => lookupKey(name) === key));
+  const named = GLOSSARY.filter((entry) => names(entry).some((name) => lookupKey(name) === key));
+  // A term named comes with the ones it is read beside (when-issued with the tail).
+  const exact = [...new Set([...named, ...named.flatMap((entry) => (entry.related ?? [])
+    .flatMap((term) => GLOSSARY.find((other) => other.term === term) ?? []))])];
   const wanted = words(query).filter((word) => word.length >= MIN_PARTIAL_WORD);
   if (wanted.length === 0) return { exact, partial: [] };
   const others = GLOSSARY.filter((entry) => !exact.includes(entry));
@@ -979,7 +1235,7 @@ export function glossaryRecord(entry: GlossaryEntry): Record<string, unknown> {
   return {
     term: entry.term,
     ...(entry.short ? { short: entry.short } : {}),
-    aliases: entry.aliases,
+    aliases: [...entry.finds ?? [], ...entry.aliases],
     functions: entry.functions,
     definition: entry.definition,
   };

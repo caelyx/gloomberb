@@ -1,11 +1,14 @@
 import { logFailure } from "../utils/log-failure";
 import type { DataProvider } from "../types/data-provider";
-import { findListingOfCompanyName, isCompanyNameInput, readTerminalCodeArg } from "../tickers/company-name-listing";
+import { companyNameQueries, findListingOfCompanyName, isCompanyNameInput, readTerminalCodeArg, settledTerminalCode } from "../tickers/company-name-listing";
+import { batchedListLookups } from "../tickers/batched-lookups";
+import { mapWithConcurrency } from "../utils/concurrency";
 import { isNotATickerMessage } from "./not-a-ticker";
 import { splitSymbolWords } from "./symbol-args";
 import { isNumberCell } from "./symbol-cells";
 import { isProviderBusy, type ProviderBusyError } from "../sources/provider-errors";
-import { unknownBloombergMarket } from "../tickers/terminal-codes";
+import { unknownBloombergMarket, unreadBloombergCode } from "../tickers/terminal-codes";
+import { renamedListingFor } from "../tickers/renamed-listings";
 
 /**
  * The entries of a list (`splitSymbolArgs`, or a file's lines) as the symbols
@@ -24,21 +27,42 @@ import { unknownBloombergMarket } from "../tickers/terminal-codes";
  */
 export async function readNameEntries(
   entries: readonly string[],
-  dataProvider: Pick<DataProvider, "search"> & Partial<Pick<DataProvider, "getQuotesBatch" | "getQuote">>,
+  source: Pick<DataProvider, "search"> & Partial<Pick<DataProvider, "getQuotesBatch" | "getQuote">>,
 ): Promise<string[]> {
-  const read = await Promise.all(entries.map(async (entry) => {
+  return (await readNameEntryGroups(entries, source)).flat();
+}
+
+/** `readNameEntries`, entry by entry: what each entry reads as, in the order given, for a reader that keeps each entry's reading. */
+export async function readNameEntryGroups(
+  entries: readonly string[],
+  source: Pick<DataProvider, "search"> & Partial<Pick<DataProvider, "getQuotesBatch" | "getQuote">>,
+): Promise<string[][]> {
+  // A pasted list's names are searched in batches and their quotes asked together, a few entries at a time: a list
+  // of hundreds of names is a few requests, never hundreds at once.
+  // A terminal's code abroad (`VOD LN`) is its listing as written: nothing searches for it as a name.
+  // So is a code no symbol is read from (`GTJPY10Y Govt`): its lookup refuses it, never GTJPY10Y and the GOVT fund.
+  const names = entries.filter((entry) => isCompanyNameInput(entry) && !unknownBloombergMarket(entry) && !unreadBloombergCode(entry)
+    && !settledTerminalCode(entry));
+  const full = source as DataProvider;
+  const dataProvider = names.length > 1 && full.searchBatch
+    ? (await batchedListLookups(full, names.map((name) => ({ searches: companyNameQueries(name), changes: null })))).dataProvider
+    : source;
+  const read = await mapWithConcurrency(entries, NAME_LOOKUPS_AT_ONCE, async (entry) => {
     // A terminal's code for a listing ("JPM US Equity", "VOD LN") is one entry, like a company's name, and so is a
     // line written as one whose market code is unknown ("AAPL GP"): its lookup refuses it, never AAPL and GP.
-    if (unknownBloombergMarket(entry) || await readTerminalCodeArg(dataProvider, entry)) return [entry];
+    if (unknownBloombergMarket(entry) || unreadBloombergCode(entry) || await readTerminalCodeArg(dataProvider, entry)) return [entry];
     if (!isCompanyNameInput(entry)) return splitSymbolWords([entry]);
     const named = await findListingOfCompanyName(dataProvider, entry).catch(busyAsAnswer);
     const busy = isProviderBusy(named);
     if (named && !busy) return [entry];
     const words = splitSymbolWords([entry]);
     return await wordsAreSymbols(words, dataProvider, { quoteEvery: busy }) ? words : [entry];
-  }));
-  return read.flat();
+  });
+  return read;
 }
+
+/** Entries of a list read at once: their quotes still go out together, gathered into batches. */
+const NAME_LOOKUPS_AT_ONCE = 16;
 
 /** A word typed as a ticker is: in capitals (AAPL, 7203.T), with a venue or class mark (brk.b, bf-b, SAN:EPA), or after a $. */
 function writtenAsSymbol(word: string): boolean {
@@ -89,7 +113,8 @@ export type PhraseReading =
 
 /**
  * One quoted argument with spaces: a company's name when search finds the
- * company (`"Whirlpool Corporation"`), else a pasted line of symbols when no
+ * company (`"Whirlpool Corporation"`) or it is a renamed company's former
+ * name (renamed-listings.ts), else a pasted line of symbols when no
  * word is one the source says is not a ticker (`"AAPL MSFT"`), else a phrase
  * (`"10 year yield"`), which is never split into symbols such as YEAR and
  * YIELD. The words are asked in one batch beside the name search, not a
@@ -103,7 +128,11 @@ export async function readPhraseArgument(
   phrase: string,
   dataProvider: Pick<DataProvider, "search" | "getQuotesBatch">,
 ): Promise<PhraseReading> {
-  if (unknownBloombergMarket(phrase) || await readTerminalCodeArg(dataProvider, phrase)) return { kind: "symbols", symbols: [phrase] };
+  if (unknownBloombergMarket(phrase) || unreadBloombergCode(phrase) || await readTerminalCodeArg(dataProvider, phrase)) {
+    return { kind: "symbols", symbols: [phrase] };
+  }
+  // A renamed company's former name ("Centrais Elétricas Brasileiras") is the listing it trades as now.
+  if (renamedListingFor(phrase)) return { kind: "name", name: phrase };
   const words = splitSymbolWords([phrase]);
   const numbered = words.some(isNumberCell);
   const asked = words.filter((word) => !word.includes(":") && !isNumberCell(word)).map((word) => word.replace(/^\$/, "").toUpperCase());

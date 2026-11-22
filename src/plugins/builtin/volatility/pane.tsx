@@ -2,14 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChartTableHeader, CurveSurface, curveGhostColors, DataTableView, formatPercentAxis, PaneStatusBody, useChartTableSelection,
   usePaneFooter, usePaneNoticeFooter, usePaneTabs, type DataTableColumn, type StatItem } from "../../../components";
 import { curveStrip, curveSurfaceMinRows } from "../../../components/chart/curve";
-import { dropColumnsToFit } from "../../../components/ui/table-layout";
+import { savedCopyFooterInfo } from "../../../components/layout/pane/footer";
+import { STALE_SEGMENT } from "../../../components/layout/pane/status-footer";
+import { dropColumnsToFit, hiddenTableColumnRows } from "../../../components/ui/table-layout";
 import { useAsyncResource } from "../../../react/async-resource";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { usePaneSettingValue, usePluginPaneState } from "../../../public/react";
 import { shownPriceColor } from "../../../theme/colors";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
-import { formatPercentileRank } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
 import { Box, Text } from "../../../ui";
 import { nextHeaderSort, type SortPreference } from "../../../utils/sort-values";
 import { getSharedMarketDataCoordinator } from "../../../market-data/coordinator";
@@ -22,7 +24,7 @@ import { useIndexCloseSettled, useLiveSessionRefresh, useThrottledValue } from "
 import { DAY_SO_FAR_TEXT } from "../../../time-series/session-bar";
 import { getCachedVolatilityData, loadVolatilityData, type VolatilityLoadResult } from "./client";
 import { VOLATILITY_CURVE_INDICES, VOLATILITY_INDICES } from "../shared/volatility-indices";
-import { boardOrder, buildVolatilityData, IMPLIED_CORRELATION_ROWS, termStateLabel, volatilityCurveLookbacks, withLiveVolatilityLevels, type VolatilityBoardRow, type VolatilityIndexId, type VolatilityLiveLevel } from "./model";
+import { boardOrder, buildVolatilityData, curvePointWarnings, IMPLIED_CORRELATION_ROWS, termStateLabel, volatilityCurveLookbacks, volatilityPaneWarnings, withLiveVolatilityLevels, type VolatilityBoardRow, type VolatilityIndexId, type VolatilityLiveLevel } from "./model";
 import { VolatilityHistoryChart, VolatilityIndexHistoryChart } from "./charts";
 import { volatilityCurveRows, volatilityCurveSeries, type VolatilityCurveRow } from "./chart-model";
 import { useVolatilityEvidence } from "./evidence";
@@ -59,8 +61,8 @@ const curveRowKey = (row: VolatilityCurveRow) => row.id;
 const curveRowPosition = (row: VolatilityCurveRow) => new Date(row.days * 86_400_000);
 const formatIv = (value: number) => value.toFixed(2);
 const number = (value: number | null | undefined, signed = false) => value == null || !Number.isFinite(value)
-  ? "--" : `${signed && value > 0 ? "+" : ""}${value.toFixed(2)}`;
-const percentile = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? "--" : value.toFixed(0);
+  ? MISSING_VALUE : `${signed && value > 0 ? "+" : ""}${value.toFixed(2)}`;
+const percentile = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? MISSING_VALUE : value.toFixed(0);
 
 export function VolatilityPane({ focused, width, height }: PaneProps) {
   const colors = useThemeColors();
@@ -107,7 +109,7 @@ export function VolatilityPane({ focused, width, height }: PaneProps) {
     await coordinator.loadQuotesBatch(quiet.map((target) => ({ symbol: target.symbol, exchange: "" })), { forceRefresh: true });
   }, [liveTargets]);
   // With streaming off the quote layer already polls every minute.
-  useLiveSessionRefresh(refreshIndexLevels, INDEX_LEVEL_REFRESH_MS, liveStreaming && liveTargets.length > 0);
+  const levelRefresh = useLiveSessionRefresh(refreshIndexLevels, INDEX_LEVEL_REFRESH_MS, liveStreaming && liveTargets.length > 0);
   const liveLevels = useThrottledValue(useMemo(() => {
     const levels = new Map<VolatilityIndexId, VolatilityLiveLevel>();
     for (const definition of VOLATILITY_INDICES) {
@@ -139,8 +141,9 @@ export function VolatilityPane({ focused, width, height }: PaneProps) {
   }, [data?.board, sort, loading]);
   const selected = rows.find((row) => row.id === selectedId) ?? rows[0] ?? null;
   useVolatilityEvidence(result, tab, selected, resource.loading);
-  const notices = [resource.error, ...(result?.errors ?? []), ...(data?.warnings ?? []),
-    ...(selected?.warnings ?? [])].filter((notice): notice is string => !!notice);
+  // The footer's notes are the pane's; a board row's or a curve point's are that row's (rowNote).
+  const notices = [resource.error, levelRefresh.error, ...(result?.errors ?? []), ...(data ? volatilityPaneWarnings(data) : [])]
+    .filter((notice): notice is string => !!notice);
   usePaneNoticeFooter({ registrationId: "volatility-notices", notices, focused });
   // From the tab the press finds, so the footer's hint never holds an old one.
   const cycleTab = useCallback(() => setTab((current) =>
@@ -148,7 +151,7 @@ export function VolatilityPane({ focused, width, height }: PaneProps) {
   // One binding for every tab and for the loading and failed bodies, where no
   // table is mounted; the footer binds the `v` hint.
   usePaneRefreshKey(() => {
-    if (!resource.loading) void resource.reload();
+    if (!resource.loading) resource.reload();
   }, { focused });
   const asOf = tab === "history" ? data?.term.termDate : tab === "board" ? selected?.date : data?.curve.date;
   // A day's level is its close once Cboe settles it (16:15 New York); before
@@ -170,14 +173,20 @@ export function VolatilityPane({ focused, width, height }: PaneProps) {
   const observationBasis = intraday ? "intraday" : sparse ? "observation" : settled ? "close" : DAY_SO_FAR_TEXT;
   usePaneFooter("volatility", () => ({ info: [
     ...(resource.loading ? [{ id: "loading", parts: [{ text: "loading volatility", tone: "muted" as const }] }] : []),
-    ...(result?.stale ? [{ id: "stale", parts: [{ text: "stale", tone: "warning" as const }] }] : []),
-    ...(data ? [{ id: "basis", parts: [{ text: observationBasis, tone: "muted" as const }] }] : []),
-    ...(asOf ? [{ id: "date", parts: [{ text: observationTime ? `${observationTime.slice(0, 16).replace("T", " ")} UTC` : asOf, tone: "muted" as const }] }] : []),
-  ], hints: [{ id: "view", key: "v", label: "iew", onPress: cycleTab }] }), [resource.loading, result?.stale, data, asOf, observationTime, observationBasis, cycleTab]);
+    // A saved copy answering a failed refresh says when it was saved; other stale closes say only that.
+    ...savedCopyFooterInfo([result?.savedAt]),
+    ...(result?.stale && result.savedAt == null ? [STALE_SEGMENT] : []),
+    // One fact, "close 2026-09-25": the basis and its date read as one segment.
+    ...(data || asOf ? [{ id: "basis", parts: [
+      ...(data ? [{ text: observationBasis, tone: "muted" as const }] : []),
+      ...(asOf ? [{ text: observationTime ? `${observationTime.slice(0, 16).replace("T", " ")} UTC` : asOf, tone: "muted" as const }] : []),
+    ] }] : []),
+  ], hints: [{ id: "view", key: "v", label: "iew", onPress: cycleTab }] }), [resource.loading, result?.stale, result?.savedAt, data, asOf, observationTime, observationBasis, cycleTab]);
   const { strip: tabStrip, rows: tabRows } = usePaneTabs({ tabs: TABS, activeValue: tab, onSelect: setTab, focused, dense: true });
   const contentHeight = Math.max(5, height - tabRows);
+  const boardColumns = useMemo(() => dropColumnsToFit(BOARD_COLUMNS, width - 1, BOARD_DROP_ORDER), [width]);
   // The board needs only its rows; the selected index history takes the rest.
-  const boardHeight = Math.max(5, Math.min(rows.length + 2, Math.floor(contentHeight * 0.62)));
+  const boardHeight = Math.max(5, Math.min(rows.length + 2 + hiddenTableColumnRows(boardColumns, rows.length), Math.floor(contentHeight * 0.62)));
   const curve = data?.curve;
   // The week- and month-back curves come from the histories the board already loaded.
   const lookbacks = useMemo(() => data ? volatilityCurveLookbacks(data) : [], [data]);
@@ -193,14 +202,13 @@ export function VolatilityPane({ focused, width, height }: PaneProps) {
   // curve with fewer than two closes has neither, so the tenors take the band.
   const curveBandStrip = curveStrip(curveSeries, formatIv, { caption: "IV %", selectedPointId: curveSelectedId });
   const curveStats: StatItem[] = curve ? [
-    { id: "structure", label: "Structure", value: termStateLabel(curve.termState) ?? "--",
+    { id: "structure", label: "Structure", value: termStateLabel(curve.termState) ?? MISSING_VALUE,
       tone: curve.termState === "backwardation" ? "warning" : curve.termState === "contango" ? "positive" : "neutral" },
     { id: "ratio", label: "3M/30D", value: number(curve.ratio),
       detail: curve.ratio == null ? undefined : formatPercentileRank(curve.ratioPercentile1y, "1Y") },
     { id: "spread", label: "Spread", value: `${number(curve.slope, true)} pts` },
   ] : [];
   const ready = !!data && (data.board.some((row) => row.value != null) || data.fred.metrics.some((metric) => metric.value != null));
-  const boardColumns = useMemo(() => dropColumnsToFit(BOARD_COLUMNS, width - 1, BOARD_DROP_ORDER), [width]);
   return <Box width={width} height={height} flexDirection="column" overflow="hidden">
     {tabStrip}
     <PaneStatusBody subject="volatility" loading={resource.loading && !ready} error={!ready ? resource.error ?? result?.errors[0] ?? null : null} empty={!resource.loading && !ready}>
@@ -209,6 +217,10 @@ export function VolatilityPane({ focused, width, height }: PaneProps) {
         emptyStateTitle="VIX curve unavailable." getItemKey={curveRowKey}
         selection={{ kind: "id", selectedId: curveSelectedId, getId: curveRowKey, onChange: setSelectedId }}
         onActivate={(row) => { setSelectedId(row.id); setTab("board"); }}
+        rowNote={(row) => {
+          const notes = curvePointWarnings(data, row.label);
+          return notes.length ? `${row.label}: ${notes.join("; ")}.` : null;
+        }}
         sortColumnId={null} sortDirection="asc"
         getExportMetadata={() => [["as of", data.curve.date], ["source", data.curve.source === "fred" ? "FRED" : "Cboe"], ["units", "IV percent"], ["warnings", ...notices]]}
         renderCell={(row, column) => {
@@ -230,22 +242,26 @@ export function VolatilityPane({ focused, width, height }: PaneProps) {
         <DataTableView<VolatilityBoardRow> focused={focused} columns={boardColumns} items={rows} rootWidth={width} rootHeight={boardHeight}
           emptyStateTitle="Volatility indices unavailable." getItemKey={(row) => row.id} selection={{ kind: "id", selectedId: selected?.id ?? null, getId: (row) => row.id, onChange: setSelectedId }}
           onActivate={(row) => setSelectedId(row.id)} sortable
+          rowNote={(row) => row.warnings.length ? `${row.label}: ${row.warnings.join("; ")}.` : null}
           sortColumnId={sort.columnId} sortDirection={sort.direction}
           onHeaderClick={(id) => setSort((current) => nextHeaderSort(current, id, { resetTo: { columnId: null, direction: "asc" } }))}
           onSortChange={(columnId, direction) => setSort({ columnId, direction })}
           getExportMetadata={() => [["basis", "daily history; sparse observations retain their timestamp"], ["percentile", "one year, at least 200 observations and 300 calendar days"], ["warnings", ...notices]]}
-          renderCell={(row, column) => ({ text: column.id === "id" ? row.id.toUpperCase()
+          renderCell={(row, column) => column.id === "id" && row.warnings.length
+            // A row with a note under the table when selected says so on its symbol.
+            ? { text: row.id.toUpperCase(), color: colors.warning }
+            : ({ text: column.id === "id" ? row.id.toUpperCase()
             : column.id === "label" ? row.label
             : column.id === "percentile1y" ? percentile(row.percentile1y)
             : ["value", "change1d", "change1dPercent"].includes(column.id)
               ? number(row[column.id as "value" | "change1d" | "change1dPercent"], column.id.startsWith("change"))
-              : String(row.date ?? "--"),
+              : String(row.date ?? MISSING_VALUE),
             // Changes take the sign; vol high for its year is the warning a rise used to carry.
             color: column.id.startsWith("change") && row.change1d != null ? signColor(row.change1d)
               : column.id === "percentile1y" && row.percentile1y != null && Math.round(row.percentile1y) >= 80 ? colors.warning
               : row.value == null ? colors.textMuted : colors.text })} />
         {selected && <>
-          <Box height={1} paddingX={1}><Text fg={colors.textDim}>{`${selected.id.toUpperCase() === selected.label ? selected.label : `${selected.id.toUpperCase()} · ${selected.label}`} · ${selected.unit} · ${selected.date ?? "--"}`}</Text></Box>
+          <Box height={1} paddingX={1}><Text fg={colors.textDim}>{`${selected.id.toUpperCase() === selected.label ? selected.label : `${selected.id.toUpperCase()} · ${selected.label}`} · ${selected.unit} · ${selected.date ?? MISSING_VALUE}`}</Text></Box>
           <VolatilityIndexHistoryChart row={selected} width={width} height={Math.max(3, contentHeight - boardHeight - 1)} focused={focused} />
         </>}
       </>}

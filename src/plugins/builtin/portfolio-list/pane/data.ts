@@ -8,6 +8,7 @@ import type { TickerRecord } from "../../../../types/ticker";
 import { selectMarketCapitalization } from "../../../../utils/market-capitalization";
 import type { CollectionSortPreference } from "../../../../state/app/context";
 import { isQuoteStaleForCurrentSession } from "../../../../market-data/quotes/freshness";
+import { instrumentFromTicker, type TickerInstrumentOptions } from "../../../../market-data/request-types";
 import { resolveQuoteAgeTimestamp } from "../../../../market-data/quotes/time";
 import { compareSortValues } from "../../../../utils/sort-values";
 import { getSortValue, type ColumnContext } from "../metrics";
@@ -20,7 +21,18 @@ export const VISIBLE_QUOTE_STREAM_MAX_AGE_MS = 15_000;
 export const VISIBLE_QUOTE_STREAM_WATCHDOG_MS = 5_000;
 export const VISIBLE_SNAPSHOT_REFRESH_COOLDOWN_MS = 5 * 60_000;
 export const VISIBLE_FINANCIAL_WARMUP_DELAY_MS = 350;
-export const VISIBLE_SNAPSHOT_WARMUP_BATCH_LIMIT = 3;
+/** A warmup batch whose rows keep changing is sent at the latest this long after it was first scheduled. */
+export const VISIBLE_FINANCIAL_WARMUP_MAX_WAIT_MS = 1_000;
+/**
+ * Visible rows whose financials are missing go out as one batch, up to what
+ * the service takes in one request (100 targets). A signed-out reader gets
+ * 300 targets a minute, so one batch is a third of that and the rows past it
+ * follow in the next one. Asked three at a time, a 60-row list took eight
+ * seconds to show its market caps.
+ */
+const VISIBLE_SNAPSHOT_WARMUP_BATCH_LIMIT = 100;
+/** A row on a broker contract is read from the broker one request at a time, so those still trickle in. */
+const VISIBLE_BROKER_SNAPSHOT_WARMUP_BATCH_LIMIT = 3;
 export const SORT_QUOTE_WARMUP_BATCH_LIMIT = 64;
 
 const STREAM_OVERSCAN_ROWS = 6;
@@ -110,6 +122,27 @@ export function needsVisibleSnapshotWarmup(
   return requirements.priceHistory && financials.priceHistory.length === 0;
 }
 
+/** The rows the next visible warmup asks the financials batch for: the batch limit, with broker rows kept to a few. */
+export function selectVisibleSnapshotBatch(
+  queue: readonly TickerRecord[],
+  instrumentOptions: TickerInstrumentOptions,
+): TickerRecord[] {
+  const batch: TickerRecord[] = [];
+  let providerRows = 0;
+  let brokerRows = 0;
+  for (const ticker of queue) {
+    if (instrumentFromTicker(ticker, ticker.metadata.ticker, instrumentOptions)?.brokerId) {
+      if (brokerRows >= VISIBLE_BROKER_SNAPSHOT_WARMUP_BATCH_LIMIT) continue;
+      brokerRows += 1;
+    } else {
+      if (providerRows >= VISIBLE_SNAPSHOT_WARMUP_BATCH_LIMIT) continue;
+      providerRows += 1;
+    }
+    batch.push(ticker);
+  }
+  return batch;
+}
+
 export function selectStreamTickers(
   tickers: TickerRecord[],
   visibleRange: { start: number; end: number },
@@ -159,12 +192,12 @@ export function buildTrackedCurrencies(
   financialsMap: Map<string, TickerFinancials>,
   accountState: ResolvedPortfolioAccountState | null,
   baseCurrency: string,
-  /** The currency of cash entered by hand. */
-  cashCurrency?: string,
+  /** The currencies of cash entered by hand. */
+  cashCurrencies?: readonly (string | null | undefined)[],
 ): string[] {
   const currencies = new Set<string>([baseCurrency]);
   if (accountState?.account.currency) currencies.add(accountState.account.currency);
-  if (cashCurrency) currencies.add(cashCurrency);
+  for (const currency of cashCurrencies ?? []) if (currency) currencies.add(currency);
 
   for (const ticker of tickers) {
     if (ticker.metadata.currency) {
@@ -243,17 +276,24 @@ export function getCollectionTickersFromConfig(
     .sort((left, right) => left.metadata.ticker.localeCompare(right.metadata.ticker));
 }
 
+export interface SortedTickers {
+  tickers: TickerRecord[];
+  /** The rows that have a figure in the sort column; the rest sit last, in their listed order. */
+  valued: Set<string>;
+}
+
 export function sortTickers(
   tickers: TickerRecord[],
   financialsMap: Map<string, TickerFinancials>,
   sortPreference: CollectionSortPreference,
   columnContext: ColumnContext,
   columns: ColumnConfig[],
-) {
-  if (!sortPreference.columnId) return tickers;
+): SortedTickers {
+  const valued = new Set<string>();
+  if (!sortPreference.columnId) return { tickers, valued };
 
   const sortColumn = columns.find((column) => column.id === sortPreference.columnId);
-  if (!sortColumn) return tickers;
+  if (!sortColumn) return { tickers, valued };
   const sortContextVersion = `${sortColumn.id}|${columnContextVersion(sortColumn.id, columnContext)}`;
   const sortValues = new Map<string, ReturnType<typeof getSortValue>>();
   for (const ticker of tickers) {
@@ -261,17 +301,20 @@ export function sortTickers(
     // Ticker records and financials are replaced, never mutated, so their
     // identities version a row without walking its positions on every tick.
     const version = `${sortContextVersion}|${objectVersion(ticker)}|${objectVersion(financials)}`;
-    sortValues.set(ticker.metadata.ticker, sortValueCache.get(
+    const value = sortValueCache.get(
       `${ticker.metadata.ticker}:${sortColumn.id}`,
       version,
       () => getSortValue(sortColumn, ticker, financials, columnContext),
-    ));
+    );
+    sortValues.set(ticker.metadata.ticker, value);
+    if (value != null && !(typeof value === "number" && !Number.isFinite(value))) valued.add(ticker.metadata.ticker);
   }
 
-  return [...tickers].sort((leftTicker, rightTicker) => {
+  const sorted = [...tickers].sort((leftTicker, rightTicker) => {
     const leftValue = sortValues.get(leftTicker.metadata.ticker) ?? null;
     const rightValue = sortValues.get(rightTicker.metadata.ticker) ?? null;
 
     return compareSortValues(leftValue, rightValue, sortPreference.direction);
   });
+  return { tickers: sorted, valued };
 }

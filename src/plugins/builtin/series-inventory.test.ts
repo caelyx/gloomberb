@@ -18,8 +18,13 @@ const NOT_MODULES = new Set(["shared"]);
 // bank policy rates the policy-rate series chart outside the US and the euro area; GIE AGSI+ is the
 // storage operators' transparency platform, which asks to be named as the source of its data; IMF
 // PortWatch publishes the chokepoint transits, and the IMF's terms ask for attribution; TurkStat, Türkiye's
-// statistics institute, compiles the Turkish CPI the central bank republishes.
-const PUBLISHERS = new Set(["FRED", "BIS", "EIA", "CFTC", "FINRA", "Bundesbank", "Bank of England", "Japan Ministry of Finance", "Bank of Canada", "ECB", "U.S. Treasury", "SEC", "Ember", "EEX", "GIE AGSI+", "IMF PortWatch", "TurkStat", "IBGE", "NAHB"]);
+// statistics institute, compiles the Turkish CPI the central bank republishes. DefiLlama publishes the open
+// DeFi TVL data whose measure the total is, which CRYP's DeFi tab already names as its source. TSA, the U.S.
+// Transportation Security Administration, publishes the daily checkpoint travel numbers. DTCC's swap data
+// repository publishes the public CDS trade reports whose daily medians the CDX and sovereign CDS series are,
+// as `fn SOVR` and `fn CDX` name their source.
+const PUBLISHERS = new Set(["FRED", "BIS", "EIA", "CFTC", "FINRA", "Bundesbank", "Bank of England", "Japan Ministry of Finance", "Bank of Canada", "Banxico", "Tesouro Nacional", "ECB", "U.S. Treasury", "SEC", "Ember", "EEX", "GIE AGSI+", "IMF PortWatch", "TurkStat", "IBGE", "NAHB", "MAS", "DefiLlama", "TSA", "DTCC",
+  "ADP Research Institute", "Bureau of Economic Analysis", "Bureau of Economic Analysis and Census Bureau", "Bureau of Labor Statistics", "Cboe", "Census Bureau", "Department of Labor", "European Central Bank", "Federal Reserve Bank of New York", "Federal Reserve Bank of St. Louis", "Federal Reserve Board", "Freddie Mac", "Freddie Mac and Federal Reserve Board", "International Monetary Fund", "National Association of Realtors", "OECD", "U.S. Energy Information Administration", "University of Michigan", "ICE Data Indices", "ICE Futures Europe"]);
 const SAMPLE_INPUTS = { ticker: "AAPL", option: "AAPL260618C00200000", crypto: "BTC-USD" } as const;
 
 function sourceFiles(dir: string): string[] {
@@ -92,5 +97,8 @@ describe("built-in series inventory", () => {
       if (!definition.group) problems.push(`${definition.id} has no group`);
     }
     expect(problems).toEqual([]);
+    // MAS's licence asks for its attribution wherever SORA is shown as MAS's: the catalog lists it beside the series.
+    expect(registry.list().find(({ definition }) => definition.id === "fred:SORA")?.definition)
+      .toMatchObject({ publisher: "MAS", limitation: expect.stringContaining("Singapore Open Data Licence") });
   });
 });

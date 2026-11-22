@@ -7,6 +7,7 @@ import type { Quote } from "../../types/financials";
 import type { TickerRecord } from "../../types/ticker";
 import { getManualPortfolioPosition } from "../../portfolio/mutations";
 import { resolveCurrencyUnit } from "../../utils/currency-units";
+import { convertCurrency } from "../../utils/format";
 
 /**
  * Stages older builds persisted that the wizard no longer renders. A profile
@@ -19,9 +20,65 @@ const LEGACY_STAGES: Partial<Record<OnboardingStage, OnboardingStage>> = {
 };
 
 export function getOnboardingProgress(config: AppConfig): OnboardingProgress {
-  const progress = config.onboardingProgress ?? { version: 1, stage: "portfolio" };
-  const stage = LEGACY_STAGES[progress.stage];
-  return stage ? { ...progress, stage } : progress;
+  const saved = config.onboardingProgress ?? { version: 1, stage: "portfolio" };
+  const legacy = LEGACY_STAGES[saved.stage];
+  const progress = legacy ? { ...saved, stage: legacy } : saved;
+  // Older builds sent Back from Gloom Cloud to the portfolio after the
+  // workspace was built; such a profile resumes on the workspace.
+  return isOnboardingStageFinished(progress, progress.stage) ? { ...progress, stage: "research" } : progress;
+}
+
+/** Stages the wizard reaches only once the workspace is built. */
+const WORKSPACE_STAGES: ReadonlySet<OnboardingStage> = new Set(["research", "account", "upgrade", "ready"]);
+
+/**
+ * Whether the workspace is built around a holding: the portfolio and desk
+ * steps are finished. Older builds saved no desks, so a later stage with a
+ * holding counts too. "Which tickers do you follow?" holds the desks picked
+ * before it, and the workspace is built once it closes.
+ */
+export function isOnboardingWorkspaceBuilt(progress: OnboardingProgress): boolean {
+  if (progress.stage === "tickers") return false;
+  return !!progress.tickerSymbol && (Array.isArray(progress.desks) || WORKSPACE_STAGES.has(progress.stage));
+}
+
+/**
+ * A step that is done for good: the portfolio and desk steps once the
+ * workspace is built (building twice would add every desk twice), and Pro
+ * for an account that has it. The wizard shows them as done and never asks
+ * them again.
+ */
+function isOnboardingStageFinished(progress: OnboardingProgress, stage: OnboardingStage, pro = false): boolean {
+  if (stage === "upgrade") return pro;
+  return (stage === "portfolio" || stage === "desks") && isOnboardingWorkspaceBuilt(progress);
+}
+
+/**
+ * Where Back (and Esc) goes: the step the user came from, passing over any
+ * that is finished for good (`pro`: the account has Pro). With no way back
+ * recorded (the app restarted on this step), the step before it in the
+ * flow. `visited` is the stages the user came through, oldest first; what
+ * comes back is what is left of it. Null when the step has no way back.
+ */
+export function previousOnboardingStage(
+  progress: OnboardingProgress,
+  visited: readonly OnboardingStage[],
+  { pro = false }: { pro?: boolean } = {},
+): { stage: OnboardingStage; visited: OnboardingStage[] } | null {
+  for (let index = visited.length - 1; index >= 0; index -= 1) {
+    const stage = visited[index]!;
+    if (stage !== progress.stage && !isOnboardingStageFinished(progress, stage, pro)) {
+      return { stage, visited: visited.slice(0, index) };
+    }
+  }
+  const stage: OnboardingStage | null = progress.stage === "account"
+    ? isOnboardingWorkspaceBuilt(progress) ? "research" : "portfolio"
+    : progress.stage === "upgrade"
+      ? "account"
+      : progress.stage === "ready"
+        ? progress.accountStatus === "signed-in" && !pro ? "upgrade" : "account"
+        : null;
+  return stage ? { stage, visited: [] } : null;
 }
 
 export function withOnboardingProgress(
@@ -72,9 +129,20 @@ export function getConnectableBrokerOptions(
   return options;
 }
 
-/** The manual portfolio onboarding writes into: the first one without a broker. */
-export function getOnboardingPortfolioId(config: AppConfig): string {
-  return config.portfolios.find((portfolio) => !portfolio.brokerInstanceId && !portfolio.brokerId)?.id ?? "main";
+/**
+ * The manual portfolio onboarding shows and writes into: the first one
+ * without a broker that already holds something, so a profile whose
+ * portfolios were built with the command line opens on its holdings, not on
+ * the empty default; else the first one without a broker.
+ */
+export function getOnboardingPortfolioId(config: AppConfig, tickers: Iterable<TickerRecord> = []): string {
+  const manual = config.portfolios.filter((portfolio) => !portfolio.brokerInstanceId && !portfolio.brokerId);
+  const held = new Set<string>();
+  for (const ticker of tickers) {
+    for (const id of ticker.metadata.portfolios) held.add(id);
+    for (const position of ticker.metadata.positions) if (position.shares !== 0) held.add(position.portfolio);
+  }
+  return (manual.find((portfolio) => held.has(portfolio.id)) ?? manual[0])?.id ?? "main";
 }
 
 export interface OnboardingPositionRow {
@@ -131,14 +199,28 @@ export function listOnboardingPositions(
 /**
  * The company the workspace opens on: the largest holding by value, then the
  * largest by share count when nothing is priced, then the first row added.
+ * Rows valued in more than one currency (US funds beside lira shares) compare
+ * in dollars when `usdPerUnit` holds a rate for every one of them, so 2,000
+ * shares at TRY55 are not taken for more than 20 SPY at $520; otherwise, and
+ * for rows in one currency, the values compare as they are.
  */
-export function pickLargestPosition(rows: readonly OnboardingPositionRow[]): OnboardingPositionRow | null {
+export function pickLargestPosition(
+  rows: readonly OnboardingPositionRow[],
+  usdPerUnit?: ReadonlyMap<string, number>,
+): OnboardingPositionRow | null {
   if (rows.length === 0) return null;
+  const valued = rows.filter((row) => row.value !== null);
+  const inDollars = (row: OnboardingPositionRow) => convertCurrency(row.value!, row.currency, "USD", new Map(usdPerUnit));
+  const dollars = !!usdPerUnit
+    && new Set(valued.map((row) => resolveCurrencyUnit(row.currency).currency)).size > 1
+    && valued.every((row) => Number.isFinite(inDollars(row)));
+  const valueOf = (row: OnboardingPositionRow) => (dollars && row.value !== null ? inDollars(row) : row.value);
   let best = rows[0]!;
   for (const row of rows.slice(1)) {
-    if ((row.value ?? -1) > (best.value ?? -1)) {
+    const [value, bestValue] = [valueOf(row), valueOf(best)];
+    if ((value ?? -1) > (bestValue ?? -1)) {
       best = row;
-    } else if (row.value === null && best.value === null && (row.shares ?? -1) > (best.shares ?? -1)) {
+    } else if (value === null && bestValue === null && (row.shares ?? -1) > (best.shares ?? -1)) {
       best = row;
     }
   }

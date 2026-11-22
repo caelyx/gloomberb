@@ -3,6 +3,7 @@ import { CompanyLogoMark } from "../../../components/company-logo";
 import { PaneStatusBody } from "../../../components";
 import { ClippedText } from "../../../components/ui/display";
 import { FILL_REST } from "../../../components/ui/fill";
+import { useSelectionFill } from "../../../components/ui/selection-fill";
 import { afterLayout, revealInScrollBox } from "../../../components/ui/reveal-in-scroll-box";
 import { useDoubleClickActivation } from "../../../components/use-double-click-activation";
 import { useShortcut } from "../../../react/input";
@@ -88,9 +89,11 @@ function locate(grid: readonly Slot[][][], key: string | null): Position | null 
 /** What hovering a logo says: the company, when it reports and, once out, how it did. */
 function reportTitle(report: BoardReport): string {
   const when = report.timing ? TIMING_LABEL[report.timing] : "time not set";
+  // A listing abroad's figures say their currency (CNY for Tencent), as the table's CCY does.
+  const currency = report.currency && report.currency !== "USD" ? ` ${report.currency}` : "";
   const figures = report.epsActual != null
-    ? `EPS ${epsText(report.epsActual)} vs ${epsText(report.epsEstimate)} est${report.epsSurprise != null ? `, ${signedPercent(report.epsSurprise)}` : ""}`
-    : report.epsEstimate != null ? `EPS est ${epsText(report.epsEstimate)}` : null;
+    ? `EPS ${epsText(report.epsActual)} vs ${epsText(report.epsEstimate)} est${currency}${report.epsSurprise != null ? `, ${signedPercent(report.epsSurprise)}` : ""}`
+    : report.epsEstimate != null ? `EPS est ${epsText(report.epsEstimate)}${currency}` : null;
   return [`${report.symbol} · ${report.name}`, when, figures].filter(Boolean).join(" · ");
 }
 
@@ -267,6 +270,14 @@ const TILE_STYLE = {
 } as const;
 /** The logo of a calendar tile: a square near two cells tall, most of the slot's width. */
 const LOGO_STYLE = { width: "calc(var(--cell-h) * 1.75)", height: "calc(var(--cell-h) * 1.75)", flexShrink: 0 } as const;
+/** The ticker under the logo is never wider than its tile: it ends in an ellipsis instead of running under the next. */
+const LABEL_STYLE = { maxWidth: "100%", minWidth: 0 } as const;
+
+/** A tile's ticker: a listing abroad's code without its venue (0700 for 0700:HKEX), which the tile's title names. */
+function tileLabel(symbol: string): string {
+  const venue = symbol.indexOf(":");
+  return venue > 0 ? symbol.slice(0, venue) : symbol;
+}
 
 function ReportTile({ report, selected, onPress, tileRef }: {
   report: BoardReport;
@@ -275,9 +286,11 @@ function ReportTile({ report, selected, onPress, tileRef }: {
   tileRef: (node: BoxRenderable | null) => void;
 }) {
   const colors = useThemeColors();
+  const selectionFill = useSelectionFill();
   const surprise = report.epsSurprise;
-  const ink = selected ? colors.selectedText
-    : surprise == null || surprise === 0 ? colors.text : surprise > 0 ? colors.positive : colors.negative;
+  // An N/M surprise (against a loss or zero estimate) is no number to colour by.
+  const tone = typeof surprise !== "number" || surprise === 0 ? colors.text : surprise > 0 ? colors.positive : colors.negative;
+  const ink = !selected ? tone : selectionFill.lit ? colors.selectedText : selectionFill.ink(tone);
   return (
     <Box
       ref={tileRef}
@@ -286,7 +299,7 @@ function ReportTile({ report, selected, onPress, tileRef }: {
       minWidth={0}
       flexDirection="column"
       alignItems="center"
-      backgroundColor={selected ? colors.selected : undefined}
+      backgroundColor={selected ? selectionFill.bg : undefined}
       hoverBackgroundColor={selected ? undefined : "var(--gloom-hover-fill)"}
       onMouseDown={onPress}
       title={reportTitle(report)}
@@ -299,7 +312,9 @@ function ReportTile({ report, selected, onPress, tileRef }: {
       <Box style={LOGO_STYLE}>
         <CompanyLogoMark symbol={report.symbol} name={report.name} size="lead" />
       </Box>
-      <ClippedText text={report.symbol} width={CALENDAR_SLOT_CELLS - 1} fg={ink} attributes={TextAttributes.BOLD} />
+      <Box style={LABEL_STYLE}>
+        <ClippedText text={tileLabel(report.symbol)} width={CALENDAR_SLOT_CELLS - 1} fg={ink} attributes={TextAttributes.BOLD} />
+      </Box>
     </Box>
   );
 }
@@ -311,6 +326,8 @@ function MoreTile({ count, selected, onPress, tileRef }: {
   tileRef: (node: BoxRenderable | null) => void;
 }) {
   const colors = useThemeColors();
+  const selectionFill = useSelectionFill();
+  const lit = selected && selectionFill.lit;
   return (
     <Box
       ref={tileRef}
@@ -320,7 +337,7 @@ function MoreTile({ count, selected, onPress, tileRef }: {
       flexDirection="column"
       alignItems="center"
       justifyContent="center"
-      backgroundColor={selected ? colors.selected : undefined}
+      backgroundColor={selected ? selectionFill.bg : undefined}
       hoverBackgroundColor={selected ? undefined : "var(--gloom-hover-fill)"}
       onMouseDown={onPress}
       title={`Show the other ${count}`}
@@ -330,9 +347,9 @@ function MoreTile({ count, selected, onPress, tileRef }: {
       style={TILE_STYLE}
     >
       <Box style={LOGO_STYLE} alignItems="center" justifyContent="center">
-        <Text fg={selected ? colors.selectedText : colors.textDim} attributes={TextAttributes.BOLD}>{`+${count}`}</Text>
+        <Text fg={lit ? colors.selectedText : selected ? selectionFill.ink(colors.textDim) : colors.textDim} attributes={TextAttributes.BOLD}>{`+${count}`}</Text>
       </Box>
-      <Text fg={selected ? colors.selectedText : colors.textMuted}>more</Text>
+      <Text fg={lit ? colors.selectedText : colors.textMuted}>more</Text>
     </Box>
   );
 }

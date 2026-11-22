@@ -15,7 +15,7 @@ import {
   type ManualChartResolution,
 } from "./resolution";
 import { TIME_RANGES, type TimeRange } from "./range";
-import { maxStudyWarmupPoints } from "./studies";
+import { maxStudyWarmupPoints } from "./studies/resolve";
 import type { PriceComparison } from "./price-comparison";
 import { resolutionForExplicitMarketPeriods } from "./market-resolution";
 import { latestSessionStart, latestTradingSessionOpen, priorSessionClose } from "../market-data/market/trading-sessions";
@@ -286,6 +286,37 @@ export function capabilityRequestBounds(view: DateBounds, range: DateBounds, mov
     start: view.start === null || range.start === null ? null : Math.min(view.start, range.start),
     end: view.end === null || range.end === null ? null : Math.max(view.end, range.end),
   };
+}
+
+/** The middle gap between a series' observations, in ms; 0 with fewer than two. */
+function medianStep(times: readonly number[]): number {
+  const steps = times.slice(1).map((time, index) => time - times[index]!).sort((left, right) => left - right);
+  return steps.length ? steps[Math.floor(steps.length / 2)]! : 0;
+}
+
+/**
+ * A chart of published series alone (FRED, capability datasets) opens at its oldest observation when
+ * every series starts well inside the range: the ICE spreads FRED keeps three
+ * years of, on a 5Y chart, would leave two blank years on the left. Well
+ * inside is more than two of the series' own steps after the range's start,
+ * so a quarterly series whose first quarter in the range falls a month in
+ * moves nothing.
+ */
+export function startAtOldestObservation(bounds: DateBounds, series: readonly ResolvedSeries[]): DateBounds {
+  if (bounds.start === null || bounds.end === null) return bounds;
+  let oldest = Number.POSITIVE_INFINITY;
+  let step = 0;
+  for (const entry of series) {
+    const times = entry.points
+      .filter((point) => point.value !== null && Number.isFinite(point.date.getTime()))
+      .map((point) => point.date.getTime())
+      .sort((left, right) => left - right);
+    if (times.length < 2) continue;
+    oldest = Math.min(oldest, times[0]!);
+    step = Math.max(step, medianStep(times));
+  }
+  if (!Number.isFinite(oldest) || oldest >= bounds.end || oldest - bounds.start <= 2 * step) return bounds;
+  return { start: oldest, end: bounds.end };
 }
 
 /**

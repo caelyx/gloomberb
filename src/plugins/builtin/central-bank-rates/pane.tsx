@@ -2,17 +2,23 @@ import { useCallback, useMemo } from "react";
 import { Box } from "../../../ui";
 import { useAsyncResource, useAutoRefresh, usePluginPaneState, useUpdatedAgo } from "../../../public/react";
 import { CompositeChart, MarketBoardStack, PaneStatusBody, usePaneNoticeFooter, usePaneStatusLinkFooter, type StatItem } from "../../../components";
+import { ageFooterSegment } from "../../../components/layout/pane/footer";
 import { colors } from "../../../theme/colors";
 import { isAccessDenied } from "../../../api-client/errors";
 import type { CentralBankRow } from "../../../api-client/central-bank-rates";
 import { staticSeries } from "../../../components/chart/static/series";
 import { StatChartDetail } from "../../../components/market-board";
 import type { PaneProps } from "../../../types/plugin";
-import { formatPercentileRank } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
 import { getCachedCentralBankRates, loadCentralBankRates } from "./client";
-import { hasNoPolicyRate, policyBoardRow, policyChange, policyHistory, policyLevel, policyNotices, policyRate } from "./model";
+import { centralBankRatesHeadless } from "./headless";
+import { reportFooterSegment } from "../shared/source-footer";
+import {
+  hasNoPolicyRate, policyBoardRow, policyChange, policyChangeDate, policyHistory, policyLevel, policyObservations, policyRate, policyRowNote,
+  policySource,
+} from "./model";
 
 const PANELS = [{ id: "main" }];
 
@@ -21,20 +27,26 @@ function PolicyDetail({ row, width, height, focused }: { row: CentralBankRow; wi
   const series = useMemo(() => [staticSeries(history.map((point) => ({ date: new Date(point.date), observedAt: new Date(point.date), value: point.value })),
     { id: row.id, label: row.instrument, color: colors.positive, calendarSpaced: true, style: "step" })], [row, history]);
   const p = row.percentile;
+  // A bank whose terms ask it: the figures computed from its rates say so (the CBE's).
+  const computed = row.computedFrom ? `computed from ${row.computedFrom}` : null;
   // The chart shows the rank window, so the range carries no window or sample
   // count; short details keep the figures several to a row.
   const items: StatItem[] = [
     { id: "level", label: row.range ? "Target range" : "Policy rate", value: policyLevel(row),
-      detail: formatPercentileRank(p.value, "1Y") },
-    { id: "move", label: "Last move", value: policyChange(row), detail: row.lastChangeDate ?? undefined },
+      detail: [formatPercentileRank(p.value, "1Y"), computed].filter(Boolean).join(" · ") },
+    { id: "move", label: "Last change", value: policyChange(row),
+      detail: [policyChangeDate(row), computed].filter(Boolean).join(" · ") || undefined },
     // A target range ranks and charts its midpoint, which the band's range would not say.
     { id: "range", label: "1Y range", value: `${policyRate(p.min)} to ${policyRate(p.max)}`, detail: row.range ? "midpoint" : undefined },
-    { id: "asOf", label: "As of", value: row.asOf ?? "--", tone: row.status === "stale" ? "warning" : undefined,
+    { id: "asOf", label: "As of", value: row.asOf ?? MISSING_VALUE, tone: row.status === "stale" ? "warning" : undefined,
       detail: [row.publicationFrequency, row.lagDays == null ? null : `${row.lagDays}d lag`,
         row.confirmedAt ? `confirmed ${row.confirmedAt.slice(0, 10)}` : null, row.status === "stale" ? "stale" : null]
         .filter(Boolean).join(" · ") || undefined },
-    { id: "meeting", label: row.nextMeeting?.kind === "fixing" ? "Next fixing" : "Next meeting", value: row.nextMeeting?.date ?? "--" },
-    { id: "source", label: "Source", value: row.source?.toUpperCase() ?? "--", detail: row.sourceSeriesIds.join(", ") || undefined },
+    // An older server does not say which meeting was the latest: the field is left out rather than read as none.
+    ...row.latestDecision === undefined ? [] : [{ id: "decided", label: row.latestDecision?.kind === "fixing" ? "Last fixing" : "Last decision",
+      value: row.latestDecision?.date ?? MISSING_VALUE }],
+    { id: "meeting", label: row.nextMeeting?.kind === "fixing" ? "Next fixing" : "Next meeting", value: row.nextMeeting?.date ?? MISSING_VALUE },
+    { id: "source", label: "Source", value: policySource(row) ?? MISSING_VALUE, detail: row.sourceSeriesIds.join(", ") || undefined },
     { id: "instrument", label: "Instrument", value: row.instrument, detail: row.centralBank ?? undefined, wide: true },
   ];
   return <StatChartDetail items={items} width={width} height={height} empty={!history.some((point) => point.value != null)}
@@ -54,20 +66,25 @@ export function CentralBankRatesPane({ width, height, focused }: PaneProps) {
   const selected = rows.find((row) => row.id === openId) ?? rows.find((row) => row.id === selectedId);
   const updatedAgo = useUpdatedAgo(resource.updatedAt);
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => void resource.reload(), { focused });
+  usePaneRefreshKey(() => resource.reload(), { focused });
   usePaneNoticeFooter({ registrationId: "central-bank-rates:notices", focused,
-    notices: [...(data ? policyNotices(data) : []), ...(resource.data?.refreshError ? [resource.data.refreshError] : [])] });
+    // A bank with no rate or an old one says so on its row (`rowNote`); the footer is the board's.
+    notices: resource.data?.refreshError ? [resource.data.refreshError] : [] });
   usePaneStatusLinkFooter({ registrationId: "central-bank-rates", focused, loading: resource.loading, error: resource.error,
     url: selected?.observation.sourceUrl ?? null, showOpenHint: true,
-    info: data && updatedAgo ? [{ id: "updated", parts: [{ text: updatedAgo, tone: "muted" as const }] }] : [],
+    // Its sources and the rows' dates, as `fn CBR` ends; how long ago it loaded goes first on a narrow row.
+    info: data ? [reportFooterSegment(centralBankRatesHeadless, { sections: [], freshness: { observations: policyObservations(data) } }),
+      ...(updatedAgo ? [ageFooterSegment(updatedAgo)] : [])] : [],
     stale: !!data && resource.data?.stale,
   });
   return <Box width={width} height={height} flexDirection="column">
     <PaneStatusBody loading={resource.loading && !data} error={!data ? resource.error : null}
       empty={!resource.loading && !resource.error && !data} subject="central bank rates">
+      {/* The board heads the move's date LAST CHANGE, so the move itself is MOVE. */}
       {data ? <MarketBoardStack rows={rows} width={width} height={height} focused={focused}
         selectedId={selectedId} onSelectedIdChange={setSelectedId} openId={openId} onOpenIdChange={setOpenId}
-        valueWidth={14} changeLabel="LAST MOVE" labelHeader="JURISDICTION" labelWidth={14} labelDetailHeader="INSTRUMENT" renderDetail={(row) => <PolicyDetail row={row.observation} width={width} height={Math.max(5, height - 2)} focused={focused} />} /> : null}
+        valueWidth={14} changeLabel="MOVE" labelHeader="JURISDICTION" labelWidth={14} labelDetailHeader="INSTRUMENT"
+        rowNote={(row) => policyRowNote(row.observation)} renderDetail={(row) => <PolicyDetail row={row.observation} width={width} height={Math.max(5, height - 2)} focused={focused} />} /> : null}
     </PaneStatusBody>
   </Box>;
 }

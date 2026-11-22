@@ -6,7 +6,8 @@ import { instrumentFromTicker } from "../../../market-data/request-types";
 import { useCallback } from "react";
 import { useDebouncedPluginPaneState, usePluginPaneState } from "../../runtime";
 import { EmptyState, PaneStatusBody, QueryBar, usePaneNoticeFooter } from "../../../components";
-import { coinNewsFallbackNotice } from "../../../sources/gloomberb-cloud/news";
+import { useCompanyDataFooter } from "../../../components/layout/pane/status-footer";
+import { newsFallbackNotice } from "../../../sources/gloomberb-cloud/news";
 import { newsMuteSettingsDef, newsMutesApplyToFeed, useNewsMuteFilter } from "./wire/mutes";
 import { newsListEmptyCopy } from "./wire/filter-articles";
 import { NEWS_LIST_SEARCH_PLACEHOLDER, useNewsListSearch, useNewsListSearchHint } from "./wire/news/list-search";
@@ -24,15 +25,16 @@ import { useNewsReadState } from "./wire/read-state";
 import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
 import { tickerNewsHeadless } from "./headless";
 import { usePaneTickerIdentity } from "../../../state/hooks/pane-ticker";
+import { TICKER_NEWS_TAB_ID, TICKER_NEWS_TEMPLATE_ID, tickerNewsQuery, tickerNewsStateKeys } from "./ticker-news";
 
-const NEWS_ITEM_LIMIT = 50;
 const DEFAULT_SORT: NewsSortPreference = { columnId: "time", direction: "desc" };
 
 function TickerNewsView({ width, height, focused }: { width: number; height: number; focused: boolean }) {
   const { ticker } = usePaneTickerIdentity();
   const symbol = ticker?.metadata.ticker ?? "none";
+  const stateKeys = tickerNewsStateKeys(symbol);
   const [selectedArticleId, setSelectedArticleId] = useDebouncedPluginPaneState<string | null>(
-    `selectedArticleId:${symbol}`,
+    stateKeys.selectedArticleId,
     null,
   );
   const [sortPreference, setSortPreference] = usePluginPaneState<NewsSortPreference>(
@@ -40,14 +42,7 @@ function TickerNewsView({ width, height, focused }: { width: number; height: num
     DEFAULT_SORT,
   );
   const instrument = instrumentFromTicker(ticker, ticker?.metadata.ticker ?? null);
-  const newsQuery = instrument ? {
-    feed: "ticker" as const,
-    ticker: instrument.symbol,
-    exchange: instrument.exchange,
-    tickerTier: "primary" as const,
-    limit: NEWS_ITEM_LIMIT,
-    ...(ticker?.metadata.name ? { listingName: ticker.metadata.name } : {}),
-  } : null;
+  const newsQuery = tickerNewsQuery(ticker);
   const newsState = useNewsArticles(newsQuery);
   const loaded = usePersistedNewsArticles(
     `articles:${instrument?.symbol ?? "none"}:${instrument?.exchange ?? ""}`,
@@ -63,7 +58,7 @@ function TickerNewsView({ width, height, focused }: { width: number; height: num
   const { detailArticle, detailLoading, detailError, openArticle, closeDetail } = useNewsArticleDetail(
     visibleArticles,
     loadNewsStory,
-    `openArticleId:${symbol}`,
+    stateKeys.openArticleId,
   );
   const popOutArticle = usePopOutNewsArticle(closeDetail);
   const openListedArticle = useCallback((article: typeof visibleArticles[number]) => {
@@ -93,11 +88,11 @@ function TickerNewsView({ width, height, focused }: { width: number; height: num
   }, [markArticleRead, popOutArticle, readableArticle]);
 
   useNewsListSearchHint("ticker-news", focused && !detailOpen, search.focusSearch);
-  // A coin pair no story is filed under lists the stories that mention the coin; the footer says so.
+  // A coin pair or a future no story is filed under lists the stories that mention the coin or the commodity; the footer says so.
   const searchedFor = loaded[0]?.searchedFor;
   usePaneNoticeFooter({
     registrationId: "ticker-news-notices",
-    notices: searchedFor && instrument ? [coinNewsFallbackNotice(instrument.symbol, searchedFor)] : [],
+    notices: searchedFor && instrument ? [newsFallbackNotice(instrument.symbol, searchedFor)] : [],
     focused,
   });
   useNewsArticleFooter({
@@ -112,7 +107,10 @@ function TickerNewsView({ width, height, focused }: { width: number; height: num
       ? [{ id: "summary", parts: [{ text: "summary loading", tone: "muted" as const }] }]
       : undefined,
     onPopOut: readableArticle ? popOutReadable : undefined,
+    feedAccess: newsState.access,
   });
+  // A receipt's or foreign line's stories are its company's, read from the home line.
+  useCompanyDataFooter(newsState.companyFrom, !detailOpen);
 
   if (!ticker) {
     return (
@@ -195,6 +193,7 @@ export const tickerNewsModule: PluginModule = {
       icon: "C",
       component: TickerNewsView,
       defaultPosition: "right",
+      shareItem: { open: true, ticker: true },
       tickerFollower: true,
       defaultMode: "floating",
       defaultFloatingSize: { width: 100, height: 32 },
@@ -205,7 +204,7 @@ export const tickerNewsModule: PluginModule = {
   paneTemplates: [
     {
       ...createTickerSurfacePaneTemplate({
-        id: "ticker-news-pane",
+        id: TICKER_NEWS_TEMPLATE_ID,
         paneId: "ticker-news",
         label: "Ticker News",
         description: "Company news for the selected ticker.",
@@ -219,7 +218,7 @@ export const tickerNewsModule: PluginModule = {
 
   setup(ctx) {
     ctx.registerTickerResearchTab({
-      id: "news",
+      id: TICKER_NEWS_TAB_ID,
       name: "News",
       order: 40,
       component: TickerNewsView,

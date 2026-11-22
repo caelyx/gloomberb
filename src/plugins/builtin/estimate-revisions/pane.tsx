@@ -35,7 +35,7 @@ import type {
 import { staticSeries } from "../../../components/chart/static/series";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
-import { formatPercentileRank } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
 import { isPlainKey } from "../../../utils/keyboard";
 import { usePaneRefreshKey } from "../../../components/data-table/table-pane";
 import { SignInWall } from "../cloud/auth-actions";
@@ -101,7 +101,7 @@ const historyId = (row: EstimateObservation) => `${row.source}:${row.date}`;
 const historyDate = (row: EstimateObservation) => new Date(`${row.date}T00:00:00Z`);
 const historySource = (row: EstimateObservation) => row.source === "gloom" ? "Recorded" : "Reported lookback";
 /** EPS ticks with the decimals the plotted range needs. */
-const formatEpsAxis = spanAxisFormatter((value, digits) => value.toFixed(digits));
+const formatEpsAxis = spanAxisFormatter((value, digits) => value.toFixed(digits), 2);
 
 /**
  * One fiscal period: its consensus figures, the EPS history as recorded and
@@ -173,7 +173,7 @@ function EstimateDetail({
       label: "Change",
       value: percent(period.change.percent),
       tone: period.change.percent == null || period.change.percent === 0 ? "neutral" : period.change.percent > 0 ? "positive" : "negative",
-      detail: `${period.change.fromDate ?? "--"} to ${period.change.toDate ?? "--"}`,
+      detail: `${period.change.fromDate ?? MISSING_VALUE} to ${period.change.toDate ?? MISSING_VALUE}`,
     },
     {
       id: "range",
@@ -343,7 +343,7 @@ export function EstimateRevisionsPane({ width, height, focused }: PaneProps) {
     pinnedTarget.notice,
   ]);
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => void resource.reload(), { focused });
+  usePaneRefreshKey(() => resource.reload(), { focused });
   usePaneNoticeFooter({
     registrationId: "estimates:notices",
     focused,
@@ -455,7 +455,7 @@ export function EstimateRevisionsPane({ width, height, focused }: PaneProps) {
                   column.id === "period"
                     ? periodLabel(row)
                     : column.id === "currency"
-                      ? (row.currency ?? "--")
+                      ? (row.currency ?? MISSING_VALUE)
                       : column.id === "eps"
                         ? number(current?.average)
                         : column.id === "percentile"
@@ -466,7 +466,7 @@ export function EstimateRevisionsPane({ width, height, focused }: PaneProps) {
                               ? number(current?.range)
                               : column.id === "breadth"
                                 ? `${number(breadth?.up)}/${number(breadth?.down)}`
-                                : (current?.date ?? "--"),
+                                : (current?.date ?? MISSING_VALUE),
                 color: colors.text,
               };
             }}
@@ -500,7 +500,7 @@ export function EstimateRevisionsPane({ width, height, focused }: PaneProps) {
                   : column.id === "dateType"
                     ? row.dateType
                     : column.id === "currency"
-                      ? (row.currency ?? "--")
+                      ? (row.currency ?? MISSING_VALUE)
                       : column.id === "percent"
                         ? percent(row.percent)
                         : number(
@@ -529,7 +529,7 @@ export function EstimateRevisionsPane({ width, height, focused }: PaneProps) {
                   <KeyValueRow
                     labelWidth={16}
                     label="Call"
-                    value={data.guidance.callDate?.slice(0, 10) ?? "--"}
+                    value={data.guidance.callDate?.slice(0, 10) ?? MISSING_VALUE}
                     detail={`FY${data.guidance.fiscalYear} Q${data.guidance.fiscalQuarter} · summary ${data.guidance.publishedAt.replace("T", " ").slice(0, 16)}`}
                   />
                   <Prose
@@ -577,7 +577,7 @@ export function EstimateRevisionsPane({ width, height, focused }: PaneProps) {
                     column.id === "period"
                       ? periodLabel(row)
                       : column.id === "currency"
-                        ? (row.currency ?? "--")
+                        ? (row.currency ?? MISSING_VALUE)
                         : column.id === "eps"
                           ? number(estimateCurrent(row)?.average)
                           : column.id === "percentile"
@@ -586,7 +586,7 @@ export function EstimateRevisionsPane({ width, height, focused }: PaneProps) {
                               ? row.current
                                 ? "Current"
                                 : "Collected"
-                              : (estimateCurrent(row)?.date ?? "--"),
+                              : (estimateCurrent(row)?.date ?? MISSING_VALUE),
                 })}
                 emptyStateTitle="No observed fiscal-period consensus."
               />

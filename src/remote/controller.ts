@@ -17,6 +17,7 @@ import {
   customViewInstanceSettings,
   parseViewSpecOr,
   trialLoadViewSource,
+  UnknownViewKeysError,
   type ViewSpec,
 } from "../plugins/builtin/custom-view";
 import { findPaneInstance, getPlacedPaneInstanceIds, type PaneInstanceConfig, resolvePaneInstance } from "../types/config";
@@ -36,6 +37,7 @@ import type {
 } from "./types";
 import type { RemoteUiRegistry } from "./semantic-tree";
 import { commandBarResultsFromNodes, isCommandBarInputNode } from "./command-bar";
+import { commandBarBlockedBy, coveredByWarning, formNodes, formSnapshot, noDialogToClose } from "./form";
 import { findCommandBarResult, findMatchingUiNode } from "./matching";
 import { REMOTE_AGENT_HELP, REMOTE_OPERATIONS, remoteControlSchema } from "./schema";
 import {
@@ -64,6 +66,7 @@ import {
 import { createRemoteResources } from "./resources";
 import { dismissTopmostDialog, isDialogOpen as isAnyDialogOpen } from "../ui/dialog-stack";
 import { asRecord } from "../utils/guards";
+import { SECURITY_DESCRIPTION_SEARCH } from "../core/state/app/command-bar-launch";
 import { runAutomated } from "../telemetry/usage-counts";
 import {
   applyWatchlistChange,
@@ -98,6 +101,26 @@ interface AppRemoteControllerOptions {
 const PLANNED_OPERATIONS = new Set(["watchlist.add", "watchlist.remove"]);
 /** Reads change nothing, so their answer carries no layout or command-bar state. */
 const READ_OPERATIONS = new Set(REMOTE_OPERATIONS.filter((entry) => entry.sideEffectLevel === "none").map((entry) => entry.id));
+/**
+ * Calls that act on the dialog on top, or on nothing drawn behind it: made
+ * while a form or the setup covers the app, they are not reported as hidden.
+ * `ui.invoke` and `ui.invokeMatching` are, when the node they pressed is in a pane.
+ */
+const NOT_BEHIND_A_DIALOG = new Set([
+  "app.closeDialog",
+  "app.closeCommandBar",
+  "app.notify",
+  // What the pane settings dialog edits, and how an agent edits it while it is open.
+  "pane.setSetting",
+  "pane.setState",
+  "capability.invoke",
+  "watchlist.add",
+  "watchlist.remove",
+  // Another window: nothing in this one covers it.
+  "desktop.popOutPane",
+  "desktop.focusDetachedPane",
+  "desktop.closeDetachedPane",
+]);
 
 // A command with a wizard closes the bar and opens its form, so every call says whether one is open.
 const DEFAULT_MUTATION_INCLUDE: RemoteStateInclude[] = ["app", "layout", "panes", "commandBar", "form"];
@@ -267,17 +290,24 @@ export function createAppRemoteController({
     }
   };
 
+  /** The open form, confirm or setup, as `app://form` reads it. */
+  const currentForm = () => formSnapshot(formNodes(uiRegistry), isDialogOpen());
+
   const openCommandBar = async (input: Record<string, unknown>): Promise<unknown> => {
     const mode = optionalString(input, "mode") ?? "command";
     const query = optionalString(input, "query") ?? "";
     // The bar would open over the dialog without its keys.
     if (isDialogOpen()) throw new Error("A dialog is open. Close it first with app.closeDialog.");
+    // The setup holds the keys a person would open the bar with, and the bar would open behind it.
+    const blocked = commandBarBlockedBy(currentForm());
+    if (blocked) throw new Error(blocked);
     if (getState().commandBarOpen) {
       dispatch({ type: "SET_COMMAND_BAR", open: false });
       await afterMutation();
     }
     if (mode === "ticker") {
-      dispatch({ type: "SET_COMMAND_BAR", open: true, launch: { kind: "ticker-search", query } });
+      // DES's search: a remote pick opens the ticker, it does not change the focused pane's.
+      dispatch({ type: "SET_COMMAND_BAR", open: true, launch: { kind: "ticker-search", query, payload: SECURITY_DESCRIPTION_SEARCH } });
       await afterMutation();
       return mutationSummary(getState(), { commandBar: getResource("app://command-bar") });
     }
@@ -407,13 +437,18 @@ export function createAppRemoteController({
   /**
    * A view's source loads once before the view is kept, so a function that
    * does not exist or cannot read answers with its own error instead of
-   * leaving a pane that never fills. What the load noted comes back as warnings.
+   * leaving a pane that never fills, and a column, filter or sort on a key its
+   * rows never carry is answered with the keys they do carry. What the load
+   * noted comes back as warnings.
    */
   const checkViewSource = async (spec: ViewSpec, action: "create" | "update", signal?: AbortSignal): Promise<string[]> => {
     try {
       return await trialLoadViewSource(spec, getState().config, { registry: pluginRegistry, signal });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
+      if (error instanceof UnknownViewKeysError) {
+        throw new Error(`${action === "create" ? "No view was created" : "The view was left as it was"}. ${reason}`);
+      }
       throw new Error(`The view's source did not load, so ${action === "create" ? "no view was created" : "the view was left as it was"}. ${reason}`);
     }
   };
@@ -430,7 +465,7 @@ export function createAppRemoteController({
         dispatch({ type: "SET_COMMAND_BAR", open: false });
         return getAfterMutationSummary();
       case "app.closeDialog":
-        if (!closeTopmostDialog()) throw new Error("No dialog is open.");
+        if (!closeTopmostDialog()) throw new Error(noDialogToClose(currentForm()));
         return getAfterMutationSummary();
       case "app.setCommandBarQuery":
         await setVisibleCommandBarQuery(stringInput(input, "query"));
@@ -495,7 +530,8 @@ export function createAppRemoteController({
         const name = optionalString(input, "name");
         if (name) layout = updatePaneInstance(layout, instanceId, (entry: PaneInstanceConfig) => ({ ...entry, title: name }));
         pluginRegistry.updateLayout(layout);
-        return getAfterMutationSummary({ affectedPaneIds: [instanceId], ...(loadWarnings.length ? { warnings: loadWarnings } : {}) });
+        const warnings = [...parsed.result.warnings.map((entry) => entry.message), ...loadWarnings];
+        return getAfterMutationSummary({ affectedPaneIds: [instanceId], ...(warnings.length ? { warnings } : {}) });
       }
       case "pane.setState":
         dispatch({
@@ -654,6 +690,32 @@ export function createAppRemoteController({
     }
   };
 
+  /**
+   * Whether a call is made on the app behind an open form or setup rather than
+   * on the form itself: a UI node is behind it when it is drawn in a pane.
+   */
+  const actsBehindDialog = (operation: string, rawInput: unknown): boolean => {
+    if (READ_OPERATIONS.has(operation) || NOT_BEHIND_A_DIALOG.has(operation)) return false;
+    if (operation !== "ui.invoke" && operation !== "ui.invokeMatching") return true;
+    const input = asRecord(rawInput);
+    const nodes = uiRegistry?.snapshot() ?? [];
+    const node = operation === "ui.invoke"
+      ? nodes.find((entry) => entry.id === input.nodeId)
+      : findMatchingUiNode(nodes, input);
+    return !!node?.paneId;
+  };
+
+  /**
+   * Runs a change, and says so when a form or the setup covered the app before
+   * and after it: the change happened behind it, where the person cannot see it.
+   */
+  const withCoverWarning = async (behind: boolean, run: () => Promise<RemoteControlResponse>): Promise<RemoteControlResponse> => {
+    const before = behind ? coveredByWarning(currentForm()) : null;
+    const response = await run();
+    if (!before || !response.ok || !coveredByWarning(currentForm())) return response;
+    return { ...response, warnings: [...response.warnings ?? [], before] };
+  };
+
   /** `context` comes from in-process callers only; the local endpoint never passes one. */
   const handle = async (request: RemoteControlRequest, context: RemoteCallContext = {}): Promise<RemoteControlResponse> => {
     try {
@@ -669,27 +731,31 @@ export function createAppRemoteController({
         case "data":
           return ok(await queryMarketData(request));
         case "call": {
-          const data = await call(request.operation, request.input, request.dryRun, context);
-          const defaults = request.dryRun || READ_OPERATIONS.has(request.operation) ? [] : DEFAULT_MUTATION_INCLUDE;
-          return ok(data, undefined, buildIncludedState(request.include, defaults));
+          const behind = !request.dryRun && actsBehindDialog(request.operation, request.input);
+          return await withCoverWarning(behind, async () => {
+            const data = await call(request.operation, request.input, request.dryRun, context);
+            const defaults = request.dryRun || READ_OPERATIONS.has(request.operation) ? [] : DEFAULT_MUTATION_INCLUDE;
+            return ok(data, undefined, buildIncludedState(request.include, defaults));
+          });
         }
-        case "patch": {
-          const target = patchTarget(request.resource);
-          const currentRev = revisionFor(target.value);
-          if (request.expectRev && request.expectRev !== currentRev) {
-            throw new Error(`Revision mismatch for ${request.resource}: expected ${request.expectRev}, got ${currentRev}.`);
-          }
-          const nextValue = applyJsonPatch(target.value, request.patch as RemoteJsonPatchOperation[]);
-          if (!request.dryRun) {
-            await target.apply(nextValue);
-            await afterMutation();
-          }
-          return ok(
-            nextValue,
-            revisionFor(nextValue),
-            buildIncludedState(request.include, request.dryRun ? [] : DEFAULT_MUTATION_INCLUDE),
-          );
-        }
+        case "patch":
+          return await withCoverWarning(!request.dryRun, async () => {
+            const target = patchTarget(request.resource);
+            const currentRev = revisionFor(target.value);
+            if (request.expectRev && request.expectRev !== currentRev) {
+              throw new Error(`Revision mismatch for ${request.resource}: expected ${request.expectRev}, got ${currentRev}.`);
+            }
+            const nextValue = applyJsonPatch(target.value, request.patch as RemoteJsonPatchOperation[]);
+            if (!request.dryRun) {
+              await target.apply(nextValue);
+              await afterMutation();
+            }
+            return ok(
+              nextValue,
+              revisionFor(nextValue),
+              buildIncludedState(request.include, request.dryRun ? [] : DEFAULT_MUTATION_INCLUDE),
+            );
+          });
         case "batch": {
           const responses = [];
           const haltOnError = request.haltOnError !== false;
@@ -709,11 +775,16 @@ export function createAppRemoteController({
             }
           }
           if (request.settle === "afterBatch") await afterMutation();
-          return ok({
-            ok: responses.every((response) => response.ok),
-            haltedAt,
-            responses,
-          }, undefined, buildIncludedState(request.include, request.dryRun ? [] : DEFAULT_MUTATION_INCLUDE));
+          // Each step's warnings, once each, where a client prints the batch's own.
+          const warnings = [...new Set(responses.flatMap((response) => response.ok ? response.warnings ?? [] : []))];
+          return {
+            ...ok({
+              ok: responses.every((response) => response.ok),
+              haltedAt,
+              responses,
+            }, undefined, buildIncludedState(request.include, request.dryRun ? [] : DEFAULT_MUTATION_INCLUDE)),
+            ...(warnings.length > 0 ? { warnings } : {}),
+          };
         }
         default:
           throw new Error(`Unknown remote request type: ${(request as { type?: unknown }).type}`);

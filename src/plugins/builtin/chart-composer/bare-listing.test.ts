@@ -1,4 +1,8 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, setSystemTime, spyOn, test } from "bun:test";
+import { apiClient } from "../../../api-client";
+import { standaloneSeriesInvoker, standaloneSeriesNamed } from "../../../series/standalone";
+import { BITCOIN_NETWORK_CACHES } from "../crypto-board/bitcoin-network";
+import { bitcoinNetworkFixture } from "../crypto-board/test-fixture";
 import { AppPersistence } from "../../../data/app-persistence";
 import { TickerRepository } from "../../../data/ticker-repository";
 import { getLoadablePlugins } from "../../catalog";
@@ -15,6 +19,10 @@ import { argumentWithListing } from "./headless";
 const quoteCommand = marketDataCliCommands.find((command) => command.name === "quote")!;
 const config = createDefaultConfig("/tmp/gloom-chart-bare-listing-fixture");
 
+// The bars below end on 9 Oct 2026 and the bitcoin network fixture on 30 Oct: read them on a fixed day after both and within
+// a month of the bars, so the bars are not read as a listing that stopped trading.
+beforeAll(() => { setSystemTime(new Date("2026-11-02T12:00:00Z")); });
+afterAll(() => { setSystemTime(); });
 afterEach(() => { process.exitCode = 0; });
 
 // 2222 is Kotobuki Spirits in Tokyo and Saudi Aramco in Riyadh; no source quotes the bare code.
@@ -23,10 +31,18 @@ const QUOTES: Record<string, ReturnType<typeof createTestQuote>> = {
   "2222:JPX": createTestQuote({ symbol: "2222", name: "Kotobuki Spirits Co., Ltd.", currency: "JPY", instrumentType: "EQUITY", listingExchangeName: "JPX" }),
   "2222:TADAWUL": createTestQuote({ symbol: "2222", name: "Saudi Arabian Oil Co.", currency: "SAR", instrumentType: "EQUITY", listingExchangeName: "TADAWUL" }),
   AAPL: createTestQuote({ symbol: "AAPL", name: "Apple Inc.", currency: "USD", instrumentType: "EQUITY", listingExchangeName: "NASDAQ" }),
+  // BDI is Black Diamond Group in Toronto and on Cboe Canada (NEO), a code only the venue names know.
+  "BDI:TSX": createTestQuote({ symbol: "BDI", name: "Black Diamond Group Limited", currency: "CAD", instrumentType: "EQUITY", listingExchangeName: "TSX" }),
+  "BDI:NEO": createTestQuote({ symbol: "BDI", name: "Black Diamond Group Ltd.", currency: "CAD", instrumentType: "EQUITY", listingExchangeName: "NEO" }),
+  // The bare coin ticker is a fund, as the data service answers it.
+  ETH: createTestQuote({ symbol: "ETH", name: "Grayscale Ethereum Mini Trust ETF", currency: "USD", instrumentType: "ETF", listingExchangeName: "ARCA" }),
+  // A commodity's word a company trades as.
+  GOLD: createTestQuote({ symbol: "GOLD", name: "Gold.com, Inc.", currency: "USD", instrumentType: "EQUITY", listingExchangeName: "NYSE" }),
 };
 const VENUES: Record<string, Array<[string, string]>> = {
   "2222": [["JPX", "Kotobuki Spirits Co., Ltd."], ["TADAWUL", "Saudi Arabian Oil Co."]],
   AAPL: [["NASDAQ", "Apple Inc."]],
+  BDI: [["TSX", "Black Diamond Group Limited"], ["NEO", "Black Diamond Group Ltd."], ["BSE", "B. D. Industries (Pune) Limited"]],
 };
 const BARS = Array.from({ length: 5 }, (_, day) => ({
   date: new Date(Date.UTC(2026, 9, 5 + day)), open: 30, high: 30, low: 30, close: 30, volume: 1_000,
@@ -71,9 +87,9 @@ function failing(cli: ReturnType<typeof createTestCliContext>) {
   return failure;
 }
 
-async function run(args: string[], command: "fn" | "quote") {
+async function run(args: string[], command: "fn" | "quote", market: Record<string, unknown> = {}) {
   const persistence = new AppPersistence(":memory:");
-  const cli = createTestCliContext({ config, dataProvider, persistence, store: new TickerRepository(persistence.tickers) });
+  const cli = createTestCliContext({ config, dataProvider, persistence, store: new TickerRepository(persistence.tickers), ...market });
   (cli.context as { plugins?: unknown }).plugins = getLoadablePlugins();
   const failure = failing(cli);
   try {
@@ -95,6 +111,79 @@ test("a chart reads a bare code several companies list as quote does: it asks wh
   expect(charted.failure.details).toContain("2222:TADAWUL Saudi Arabian Oil Co. (try: gloom fn G 2222:TADAWUL)");
   // Each retry keeps the rest of the argument.
   expect((await run(["G", "2222:volume, AAPL"], "fn")).failure.details).toContain("(try: gloom fn G 2222:JPX:volume, AAPL)");
+});
+
+test("fn G charts every listing its exchange question offers, written SYMBOL:EXCH or given --exchange", async () => {
+  expect((await run(["G", "BDI"], "fn")).failure.details).toContain("BDI:NEO Black Diamond Group Ltd. (try: gloom fn G BDI:NEO)");
+  for (const [args, name] of [[["G", "BDI:NEO"], "Black Diamond Group Ltd."], [["G", "BDI", "--exchange", "neo"], "Black Diamond Group Ltd."],
+    [["G", "BDI", "--exchange", "TSX"], "Black Diamond Group Limited"]] as const) {
+    const { failure, printed } = await run([...args], "fn");
+    expect(failure.message, args.join(" ")).toBeUndefined();
+    expect((printed!.result.data as { series: Array<{ name?: string }> }).series.map((series) => series.name)).toEqual([name]);
+  }
+});
+
+test("a chart of a bare coin ticker read as a fund says where the coin is, as quote does", async () => {
+  const { printed } = await run(["G", "ETH, AAPL"], "fn");
+  expect(printed!.result.warnings).toEqual(["ETH is Grayscale Ethereum Mini Trust ETF, not ethereum. For ethereum use ETH-USD."]);
+  expect((await run(["G", "AAPL"], "fn")).printed!.result.warnings ?? []).toEqual([]);
+});
+
+test("a chart of a commodity's word a company trades as names the future, as quote does", async () => {
+  // `fn G gold` drew Gold.com with nothing pointing at GC=F, where `quote gold` said to quote the future.
+  const { printed } = await run(["G", "gold"], "fn");
+  expect(printed!.result.warnings).toEqual(["GOLD is Gold.com, Inc.; for Gold, the future is GC=F (gloom fn G GC=F)."]);
+});
+
+test("a symbol quote reads as no ticker fails its series at once, without asking for its bars", async () => {
+  const asked: string[] = [];
+  const market = {
+    dataProvider: createTestDataProvider({
+      search: async () => [],
+      getQuote: async (symbol) => {
+        asked.push(`quote ${symbol}`);
+        if (symbol.toUpperCase() === "AAPL") return QUOTES.AAPL!;
+        throw new Error(`Not a ticker: ${symbol}.`);
+      },
+      getTickerFinancials: async (symbol) => {
+        asked.push(`financials ${symbol}`);
+        if (symbol.toUpperCase() === "AAPL") return createTestFinancials({ quote: QUOTES.AAPL!, priceHistory: BARS });
+        throw new Error(`Not a ticker: ${symbol}.`);
+      },
+      getPriceHistory: async (symbol) => { asked.push(`history ${symbol}`); return BARS; },
+      getPriceHistoryWithMetadata: async (symbol) => { asked.push(`history ${symbol}`); return { resolution: "1d", points: BARS }; },
+    }),
+  };
+  // `fn G lido` asked for its quote again, its profile twice and its bars twice before saying "Not a ticker": 5 s.
+  const { printed } = await run(["G", "UNISWAP, AAPL"], "fn", market);
+  expect((printed!.result.data as { errors?: string[] }).errors).toEqual(["UNISWAP: Not a ticker: UNISWAP."]);
+  expect(asked.filter((request) => request.endsWith(" UNISWAP"))).toEqual(["quote UNISWAP"]);
+  expect((printed!.result.data as { series: Array<{ name?: string }> }).series.map((series) => series.name)).toContain("Apple Inc.");
+});
+
+test("an index is labelled as quote names it, and charts by its key on its publisher's venue code", async () => {
+  // ^NDX's quote names its venue by its publisher (NASDAQ GIDS), and the service's key for it is ^NDX:NIM.
+  const index = createTestQuote({ symbol: "^NDX", name: "NASDAQ-100", currency: "USD", instrumentType: "INDEX", listingExchangeName: "NASDAQ GIDS" });
+  const market = {
+    dataProvider: createTestDataProvider({
+      search: async (query) => query.trim().toUpperCase().startsWith("^NDX")
+        ? [{ providerId: "test", symbol: "^NDX", name: "NASDAQ-100", exchange: "NIM", type: "INDEX" }] : [],
+      getQuote: async () => index,
+      getTickerFinancials: async () => createTestFinancials({ quote: index, priceHistory: BARS }),
+      getPriceHistory: async () => BARS,
+      getPriceHistoryWithMetadata: async () => ({ resolution: "1d", points: BARS }),
+    }),
+  };
+  const labels = async (argument: string) => {
+    const { failure, printed } = await run(["G", argument], "fn", market);
+    expect(failure.message).toBeUndefined();
+    return (printed!.result.data as { series: Array<{ label: string; name?: string }> }).series.map((series) => [series.label, series.name]);
+  };
+  // Not "^NDX:NASDAQ GIDS Price".
+  expect(await labels("^NDX")).toEqual([["^NDX Price", "NASDAQ-100"]]);
+  // "Invalid chart series" before; a venue the index is not on still says where it is, as quote does.
+  expect(await labels("^NDX:NIM")).toEqual([["^NDX:NIM Price", "NASDAQ-100"]]);
+  expect((await run(["G", "^NDX:XYZ"], "fn", market)).failure.message).toStartWith("Unknown exchange XYZ for ^NDX.");
 });
 
 test("a charted listing names its company and its currency", async () => {
@@ -123,4 +212,40 @@ test("a retry names the listing in place of the bare symbol, wherever the argume
   // A named listing, or an argument that does not spell the series, is left alone.
   expect(argumentWithListing("BDI:NEO, BDI", "BDI", "BDI:TSX")).toBe("BDI:NEO, BDI:TSX");
   expect(argumentWithListing("FUT:CL", "CL=F", "CL=F:NYMEX")).toBe("CL=F:NYMEX");
+});
+
+test("fn G hashrate charts the bitcoin hash rate by the alias the CLI's own catalog finds, and a ticker still charts as the ticker", async () => {
+  const plugins = getLoadablePlugins();
+  // The CLI's wiring without the app: the plugins' series, charted and named as initMarketData builds them.
+  const market = {
+    seriesCapabilities: standaloneSeriesInvoker(plugins, config.dataDir),
+    findCatalogSeriesNamed: standaloneSeriesNamed(plugins),
+    dataProvider: createTestDataProvider({
+      search: async () => [],
+      getQuote: async (symbol) => {
+        if (symbol.toUpperCase() === "AAPL") return QUOTES.AAPL!;
+        throw new Error(`Not a ticker: ${symbol}.`);
+      },
+      getTickerFinancials: async (symbol) => {
+        if (symbol.toUpperCase() === "AAPL") return createTestFinancials({ quote: QUOTES.AAPL!, priceHistory: BARS });
+        throw new Error(`Not a ticker: ${symbol}.`);
+      },
+      getPriceHistory: async () => BARS,
+      getPriceHistoryWithMetadata: async () => ({ resolution: "1d", points: BARS }),
+    }),
+  };
+  const network = spyOn(apiClient, "getCloudBitcoinNetwork").mockImplementation(async () => bitcoinNetworkFixture());
+  try {
+    const { failure, printed } = await run(["G", "hashrate"], "fn", market);
+    expect(failure.message).toBeUndefined();
+    const [series] = (printed!.result.data as { series: Array<{ label?: string; unit?: string; points?: unknown[] }> }).series;
+    expect([series?.label, series?.unit, series?.points?.length]).toEqual(["Bitcoin network hash rate", "EH/s", 2]);
+    expect(network).toHaveBeenCalledTimes(1);
+    // A word no series lists as an alias is still read as a ticker.
+    const ticker = await run(["G", "AAPL"], "fn", market);
+    expect((ticker.printed!.result.data as { series: Array<{ name?: string }> }).series[0]?.name).toBe("Apple Inc.");
+  } finally {
+    network.mockRestore();
+    for (const cache of BITCOIN_NETWORK_CACHES) cache.reset();
+  }
 });

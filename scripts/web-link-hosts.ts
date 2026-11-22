@@ -1,0 +1,110 @@
+/**
+ * Hosts the web build names without fetching them: pages a pane links to,
+ * sources it credits, references inside libraries, and the defaults of
+ * features the browser build leaves out.
+ *
+ * The bundle audit (`scripts/audit-web-bundle.ts`) fails on any other host the
+ * shipped JavaScript names that the page cannot fetch, meaning a host that is
+ * neither in the worker's `connect-src` nor on the plugin proxy's allowlist.
+ * That is how a function calling a host nobody declared gets caught before it
+ * ships as "Failed to fetch"; TheBuildout's API once did.
+ *
+ * Add a host here only when nothing in the web build fetches it. When
+ * something does, declare it in the plugin's `hosts` and run
+ * `bun run web:proxy-hosts`, or list it in `WEB_DIRECT_HOSTS`
+ * (src/utils/plugin-proxy-hosts.ts) when it answers the terminal with CORS.
+ * Matching is exact, so a link to `polymarket.com` says nothing about
+ * `gamma-api.polymarket.com`.
+ */
+export const WEB_LINK_ONLY_HOSTS: ReadonlySet<string> = new Set([
+  // Downstream: named by plugins only the private deployment bundles.
+  // gloom-hackernews links each story's discussion page; its stories come from hacker-news.firebaseio.com.
+  "news.ycombinator.com",
+  // pdf.js, inside gloom-au's unpdf, parses a relative URL against this placeholder base; nothing fetches it.
+  "foo.bar",
+
+  // Gloom's own: the web app reaches the API as same-origin `/api` through the worker.
+  "api.gloom.sh",
+  "term.gloom.sh",
+  "x.com",
+  "github.com",
+
+  // Venue and source pages a pane links to or credits.
+  "agsi.gie.eu",
+  // HKMA's Open API dataset pages, opened from AUCT's Hong Kong tenders; the figures come through Gloom Cloud.
+  "apidocs.hkma.gov.hk",
+  "app.pascal.trade",
+  "crypto.com",
+  "ember-energy.org",
+  "en.wikipedia.org",
+  // MAS's interest rates page, credited as SORA's source; the rate itself comes through Gloom Cloud.
+  "eservices.mas.gov.sg",
+  "exchange.gemini.com",
+  "fred.stlouisfed.org",
+  "invoice.stripe.com",
+  "kalshi.com",
+  "limitless.exchange",
+  "polymarket.com",
+  "polymarket.us",
+  "thebuildout.ai",
+  "www.bls.gov",
+  // The Bank of Japan's meeting schedule, credited for MDAY's and HIVG's BoJ decision days; the figures come through Gloom Cloud.
+  "www.boj.or.jp",
+  "www.cboe.com",
+  "www.cnn.com",
+  "www.deribit.com",
+  "www.ecb.europa.eu",
+  "www.eex.com",
+  "www.eia.gov",
+  "www.federalreserve.gov",
+  "www.finra.org",
+  "www.ibkrguides.com",
+  "www.interactivebrokers.com",
+  // JPX's listed-company file, named as the source of the Japanese names search reads; only the snapshot script fetches it.
+  "www.jpx.co.jp",
+  "www.nahb.org",
+  "www.nasdaq.com",
+  "www.sec.gov",
+  "www.ssga.com",
+  // TSA's checkpoint travel numbers page, the catalog's link for the TSA series; the figures come through Gloom Cloud.
+  "www.tsa.gov",
+
+  // Exchanges' announcement and filing pages, and published session calendars.
+  "dart.fss.or.kr",
+  "ir.theice.com",
+  "live.euronext.com",
+  "mops.twse.com.tw",
+  "www.asx.com.au",
+  "www.bseindia.com",
+  "www.ibge.gov.br",
+  "www.kap.org.tr",
+  "www.londonstockexchange.com",
+  "www.nasdaqomxnordic.com",
+  "www.nseindia.com",
+  "www.nyse.com",
+  "www.nzx.com",
+  "www.release.tdnet.info",
+  // Rheinmetall's investor relations results page, opened from filings; the web app does not fetch it.
+  "www.rheinmetall.com",
+  "www.sedarplus.ca",
+  "www.set.or.th",
+  "www.sgx.com",
+  "www.tcmb.gov.tr",
+  "www.unternehmensregister.de",
+  "www1.hkexnews.hk",
+  "www3.bcb.gov.br",
+
+  // The desktop's default RSS feeds; the web build has no RSS (docs/browser.md).
+  "feeds.a.dj.com",
+  "feeds.bbci.co.uk",
+  "feeds.content.dowjones.io",
+  "search.cnbc.com",
+
+  // Documentation and examples quoted in help text, and references inside libraries.
+  "aomedia.org",
+  "bun.sh",
+  "example.com",
+  "git-scm.com",
+  "modelcontextprotocol.io",
+  "react.dev",
+]);

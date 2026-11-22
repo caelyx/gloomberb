@@ -12,8 +12,9 @@ import type {
   DesktopCoreRequest,
 } from "../../shared/protocol";
 import { encodeRpcValue } from "../../shared/rpc-codec";
+import { logFailure } from "../../../../utils/log-failure";
 import { desktopBootFramePath, removeDesktopBootFrame } from "../window/boot-frame";
-import { paneIdFromDetachedRpcKey } from "../window/focus";
+import { MAIN_WINDOW_RPC_KEY, paneIdFromDetachedRpcKey } from "../window/focus";
 import type { DesktopBackend, DesktopRpc } from "./backend";
 import { createElectrobunDesktopUpdater } from "./update";
 
@@ -29,7 +30,11 @@ function sendUpdateProgress(rpc: DesktopRpc, progress: UpdateProgress): void {
   }
 }
 
-/** Every window loses its popped-out panes, workspace and services before the data they read is replaced. */
+/**
+ * Every window but the main one closes, and the workspace and services go,
+ * before the data they read is replaced. Extra windows open again with the
+ * next session where their tabs are still there.
+ */
 function closeDesktopSession(backend: DesktopBackend): void {
   backend.closeAllWindows();
   backend.workspace = null;
@@ -48,7 +53,12 @@ export async function handleDesktopBackendRequest(
         request.payload.channel === "nightly" ? "nightly" : "stable",
       );
     case "update.start":
-      void desktopUpdater.download(request.payload.release, (progress) => sendUpdateProgress(rpc, progress));
+      // The download reports its failures as progress. One that escapes it ends
+      // the same way, so the window does not wait on a download that stopped.
+      desktopUpdater.download(request.payload.release, (progress) => sendUpdateProgress(rpc, progress)).catch((error: unknown) => {
+        logFailure("desktop-update", "Desktop update download failed")(error);
+        sendUpdateProgress(rpc, { phase: "error", error: "Desktop update failed" });
+      });
       return null;
     case "update.apply":
       // Only the main window offers Restart; a popped-out window never relaunches the app.
@@ -57,6 +67,10 @@ export async function handleDesktopBackendRequest(
       return null;
     case "ticker.loadAll":
       return backend.requireServices().tickerRepository.loadAllTickers();
+    case "ticker.changesElsewhere":
+      return backend.requireServices().tickerRepository.changesElsewhere?.() ?? null;
+    case "ticker.takeDeletedElsewhere":
+      return backend.requireServices().tickerRepository.takeRowsDeletedElsewhere?.() ?? [];
     case "ticker.load":
       return backend.requireServices().tickerRepository.loadTicker(request.payload.symbol);
     case "ticker.save":
@@ -68,11 +82,13 @@ export async function handleDesktopBackendRequest(
     case "config.save": {
       const desktopWorkspace = backend.workspace;
       if (desktopWorkspace) {
-        // Null for the main window; a popped-out window's save counts only for its own pane.
-        const senderDetachedPaneId = paneIdFromDetachedRpcKey(backend.rpcs.getRpcWindowKey(rpc));
+        // A popped-out window's save counts only for its own pane; a full
+        // window's for what it changed, among its own tabs.
+        const senderKey = backend.rpcs.getRpcWindowKey(rpc);
+        const senderDetachedPaneId = paneIdFromDetachedRpcKey(senderKey);
         await backend.commitDesktopSnapshot(senderDetachedPaneId
           ? desktopWorkspace.replaceConfigFromDetachedPane(senderDetachedPaneId, request.payload.config)
-          : desktopWorkspace.replaceConfig(request.payload.config, { layoutChanged: true }));
+          : desktopWorkspace.replaceConfigFromWindow(senderKey ?? MAIN_WINDOW_RPC_KEY, request.payload.config));
         return null;
       }
       backend.setConfig(request.payload.config);
@@ -86,9 +102,14 @@ export async function handleDesktopBackendRequest(
       removeDesktopBootFrame(desktopBootFramePath());
       await resetAllData(request.payload.dataDir);
       return null;
-    case "config.export":
-      await exportConfig(request.payload.config, request.payload.destPath);
+    case "config.export": {
+      // With more than one window, each has only its own tabs: the export is
+      // the whole config, every window's tabs included.
+      const workspace = backend.workspace;
+      const config = workspace && workspace.windowIds().length > 1 ? workspace.getSnapshot().config : request.payload.config;
+      await exportConfig(config, request.payload.destPath);
       return null;
+    }
     case "config.import": {
       closeDesktopSession(backend);
       await backend.startServices(await importConfig(request.payload.dataDir, request.payload.srcPath));

@@ -1,5 +1,8 @@
 import { dateOptionError, isoDateToday, readCalendarDate } from "./calendar-date";
 import { fetchHistoryResult } from "../sources/history-result";
+import { WindowBeforeFirstBarError } from "../sources/history-coverage";
+import { logFailure } from "./log-failure";
+import { isNetworkFailure } from "./network-failure";
 import type { DataProvider, MarketDataRequestContext } from "../types/data-provider";
 import type { PriceHistoryResult } from "../types/price-history";
 import { getPricePointTimestamp } from "./price-history";
@@ -36,7 +39,8 @@ export function isPastPriceWindow(window: PriceWindow, now = new Date()): boolea
   return window.to < isoDateToday(now);
 }
 
-const FORMATS = "a year (2007) or a date (2008-09-15)";
+/** Both date forms a reader types: ISO, or day first with dots as most of Europe writes it. */
+const FORMATS = "a year (2007) or a date (2008-09-15, or day first as 15.9.2008)";
 
 function readBound(value: string, edge: "start" | "end", flag: string, now: Date): string {
   const text = value.trim();
@@ -112,11 +116,19 @@ export function priceWindowBarStart(date: string, interval: string): number {
  */
 export async function loadPriceWindowHistory(
   provider: DataProvider, symbol: string, exchange: string, window: PriceWindow, context?: MarketDataRequestContext,
+  /** The bar size asked for (`history --interval`), in place of the one the window's length picks. */
+  barSize?: "1d" | "1wk" | "1mo",
 ): Promise<PriceHistoryResult> {
-  const interval = priceWindowInterval(window);
+  const interval = barSize ?? priceWindowInterval(window);
   const start = new Date(priceWindowBarStart(window.from, interval));
   const end = new Date(`${window.to}T23:59:59Z`);
-  const result = await fetchHistoryResult(provider, symbol, exchange, { kind: "detail", start, end, interval }, context)
+  const result = await fetchHistoryResult(provider, symbol, exchange, { kind: "detail", start, end, interval }, context).catch(async (error: unknown) => {
+    // A window wholly before the listing's first bar can come back as a failure: it says no bars come before that day,
+    // which asking again would not change. A request that never reached the service is still that.
+    const first = isNetworkFailure(error) ? null : await historyFirstBarDay(provider, symbol, exchange, context);
+    if (first && first > window.to) throw new WindowBeforeFirstBarError(first, symbol);
+    throw error;
+  })
     ?? await fetchHistoryResult(provider, symbol, exchange, { kind: "resolution", range: "ALL", resolution: interval }, context)
     ?? await fetchHistoryResult(provider, symbol, exchange, { kind: "range", range: "ALL" }, context);
   const points = (result?.points ?? []).filter((point) => {
@@ -124,6 +136,31 @@ export async function loadPriceWindowHistory(
     return Number.isFinite(time) && time >= start.getTime() && time <= end.getTime();
   });
   return { ...(result ?? { resolution: null }), points };
+}
+
+/**
+ * The day a listing's bars start, `YYYY-MM-DD`: its first monthly bar of the
+ * whole history, then the first daily bar of that month (BTC-USD's first
+ * month is September 2014, its first day the 17th), or of the month before
+ * when a source left that month's own bar out (one dated 1 Jan 1970). Null
+ * when its history cannot be read.
+ */
+export async function historyFirstBarDay(provider: DataProvider, symbol: string, exchange: string, context?: MarketDataRequestContext): Promise<string | null> {
+  const all = await fetchHistoryResult(provider, symbol, exchange, { kind: "range", range: "ALL" }, context)
+    .catch(logFailure("utils.price-window", "Read a listing's first bar failed", null));
+  const first = all?.points.map(getPricePointTimestamp).filter(Number.isFinite).sort((left, right) => left - right)[0];
+  if (first == null) return null;
+  const month = new Date(first);
+  const monthEnd = Date.UTC(month.getUTCFullYear(), month.getUTCMonth() + 1, 1) - 1;
+  const firstDay = async (from: number) => {
+    const days = await fetchHistoryResult(provider, symbol, exchange, { kind: "detail", start: new Date(from), end: new Date(monthEnd), interval: "1d" }, context)
+      .catch(logFailure("utils.price-window", "Read a listing's first daily bar failed", null));
+    return days?.points.map(getPricePointTimestamp).filter((time) => Number.isFinite(time) && time >= from).sort((left, right) => left - right)[0];
+  };
+  // The month before may fail where nothing trades (the source's coverage starts later): then the first month alone.
+  const day = await firstDay(Date.UTC(month.getUTCFullYear(), month.getUTCMonth() - 1, 1))
+    ?? await firstDay(Date.UTC(month.getUTCFullYear(), month.getUTCMonth(), 1));
+  return new Date(day ?? first).toISOString().slice(0, 10);
 }
 
 /** Shared help text for `--from` and `--to`. */

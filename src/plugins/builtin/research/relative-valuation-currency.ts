@@ -46,6 +46,22 @@ function olderOf(left: string | null, right: string | null): string | null {
 }
 
 /**
+ * The currency RV compares market caps in, the same in the pane and `fn RV`:
+ * the asked one, else the peers' own when they share one (four Xetra names in
+ * euros), else the app's base currency, dollars unless set.
+ */
+export function relativeCapCurrency(
+  asked: string | null | undefined,
+  capCurrencies: ReadonlyArray<string | null | undefined>,
+  baseCurrency: string | null | undefined,
+): string {
+  if (asked) return asked;
+  const shared = new Set(capCurrencies.filter((currency): currency is string => !!currency));
+  if (shared.size === 1) return [...shared][0]!;
+  return baseCurrency || "USD";
+}
+
+/**
  * Every row's market cap in `target`, through each currency's US dollar
  * rate (a pence cap is first made pounds). A row already in `target`, or
  * with no cap, stays as it is. A currency with no usable rate leaves its
@@ -90,6 +106,37 @@ export function convertMarketCaps<Row extends CapRow>(
     rows: converted,
     conversions: [...conversions.values()],
     unconverted: [...unconverted].map(([currency, symbols]) => ({ currency, symbols })),
+  };
+}
+
+/**
+ * Every row's mean analyst target in `target`, at the rates the caps convert
+ * at (convertMarketCaps): `targetMeanNative` and `targetNativeCurrency` keep
+ * the target as served. A currency with no usable rate keeps its targets.
+ */
+export function convertTargets<Row extends { symbol: string; targetMean?: unknown; targetCurrency?: unknown }>(
+  rows: readonly Row[],
+  target: string,
+  rates: ReadonlyMap<string, UsdRate>,
+): { rows: Row[]; conversions: CapConversion[]; unconverted: Array<{ currency: string; symbols: string[] }> } {
+  const amounts = convertMarketCaps(rows.map((row) => ({
+    symbol: row.symbol,
+    marketCap: typeof row.targetMean === "number" && Number.isFinite(row.targetMean) ? row.targetMean : null,
+    marketCapCurrency: typeof row.targetCurrency === "string" && row.targetCurrency ? row.targetCurrency : null,
+  })), target, rates);
+  return {
+    rows: rows.map((row, index) => {
+      const converted = amounts.rows[index]!;
+      return converted.marketCapNative === undefined ? row : {
+        ...row,
+        targetMean: converted.marketCap,
+        targetCurrency: converted.marketCapCurrency,
+        targetMeanNative: converted.marketCapNative,
+        targetNativeCurrency: converted.marketCapNativeCurrency,
+      };
+    }),
+    conversions: amounts.conversions,
+    unconverted: amounts.unconverted,
   };
 }
 
@@ -162,7 +209,7 @@ export function normalizeCapCurrency(value: string): string {
   try {
     known = Intl.supportedValuesOf("currency");
   } catch {
-    // An older runtime lists none; the shape check stands alone.
+    // Intentional ignore: an older runtime lists no currencies, so the shape check stands alone.
   }
   if (!CURRENCY_CODE.test(code) || (known.length > 0 && !known.includes(code))) {
     throw new Error(`Invalid --currency value "${value}". Use a three-letter currency code such as USD or EUR.`);

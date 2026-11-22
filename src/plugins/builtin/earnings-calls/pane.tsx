@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type {
-  CloudEarningsCallPayload,
-  CloudEarningsTranscriptPayload,
-} from "../../../api-client";
+import type { CloudEarningsCallPayload } from "../../../api-client";
 import { recordResearchActivity } from "../../../api-client/research-activity";
 import {
   DataTableStackView,
@@ -19,6 +16,7 @@ import {
   type QueryBarView,
   type StatItem,
 } from "../../../components";
+import { useCompanyDataFooter } from "../../../components/layout/pane/status-footer";
 import { handleRefreshKey } from "../../../components/data-table/table-pane";
 import { AudioPlayer, useCanPlayAudio } from "../../../components/ui";
 import { useShortcut } from "../../../react/input";
@@ -48,9 +46,13 @@ import {
   loadEarningsCalls,
   loadTranscript,
   statusOf,
+  type EarningsTranscriptResult,
 } from "./data";
-import { callTitle, formatCallDate, formatDuration, formatPeriod, formatSentiment } from "./format";
-import { findCallForQuarter, findInLines, MIN_FIND_LENGTH, turnParagraphs } from "./model";
+import { isPermanentClientError } from "../../../api-client/errors";
+import { savedCopyFooterInfo } from "../../../components/layout/pane/footer";
+import { STALE_SEGMENT } from "../../../components/layout/pane/status-footer";
+import { callPeriod, callTitle, eventLabelOf, formatCallDate, formatDuration, formatSentiment, noCallsText } from "./format";
+import { findCallForQuarter, findInLines, MIN_FIND_LENGTH, originalIsMachineTranscript, translatedFrom, turnParagraphs } from "./model";
 import { READER_TABS, TranscriptView, type ReaderTab, type TranscriptPlayback } from "./transcript-view";
 import { PLAYBACK_RATES, SEEK_STEP_SECONDS, useCallPlayback } from "./use-call-playback";
 import { callAway, callCountdown, callStartText, isUpcomingCall, nextCall } from "./upcoming";
@@ -101,7 +103,7 @@ function renderCell(call: CloudEarningsCallPayload, column: CallColumn, now: num
     case "date":
       return { text: formatCallDate(call.callAt), color: colors.textDim };
     case "period":
-      return { text: formatPeriod(call.fiscalYear, call.fiscalQuarter) };
+      return { text: callPeriod(call) };
     case "length":
       return { text: formatDuration(call.durationSeconds), color: colors.textDim };
     case "sentiment": {
@@ -147,6 +149,8 @@ interface TickerLookup {
   calls: CloudEarningsCallPayload[];
   fetchedAt?: number;
   stale?: boolean;
+  /** Its refresh failed and the copy saved at this time (ms) answered instead. */
+  savedAt?: number;
   refreshError?: string;
   refreshRequest?: number;
 }
@@ -274,9 +278,17 @@ function CallsListView({
   });
 
   const [calls, setCalls] = useState<CloudEarningsCallPayload[]>(initialShelf?.calls ?? []);
+  // The binding the shelf was read for. A dual-listed company's calls carry its
+  // home line's ticker (CALLS 1088:HKEX lists 601088:SSE's), so a call on this
+  // binding's shelf is its own whatever ticker it carries.
+  const [shelfTicker, setShelfTicker] = useState(() => symbol ? symbol.toUpperCase() : null);
   const [listStatus, setListStatus] = useState<"idle" | "loading" | "loaded" | "error">(initialShelf ? "loaded" : "idle");
   const [listError, setListError] = useState<{ message: string; status?: number } | null>(null);
   const [stale, setStale] = useState(initialShelf?.stale === true);
+  // The company's home line the shelf is read from, for a receipt or a foreign line.
+  const [companyFrom, setCompanyFrom] = useState(initialShelf?.companyFrom ?? null);
+  // The list's refresh failed and a copy saved at this time (ms) answered instead.
+  const [listSavedAt, setListSavedAt] = useState<number | null>(null);
   const [listFetchedAt, setListFetchedAt] = useState(initialShelf?.fetchedAt ?? 0);
   const listRequestVersion = useRef(0);
   const [listCompletedRequest, setListCompletedRequest] = useState(0);
@@ -289,7 +301,7 @@ function CallsListView({
 
   const [selectedId, setSelectedId] = usePluginPaneState<string | null>(`${stateKey}selectedId`, null);
   const [detailOpen, setDetailOpen] = usePluginPaneState<boolean>(`${stateKey}detailOpen`, false);
-  const [transcript, setTranscript] = useState<CloudEarningsTranscriptPayload | null>(null);
+  const [transcript, setTranscript] = useState<EarningsTranscriptResult | null>(null);
   useEffect(() => {
     if (focused && transcript && detailOpen) recordResearchActivity("pro_feature_used", "transcripts");
   }, [focused, transcript, detailOpen]);
@@ -337,13 +349,17 @@ function CallsListView({
         .then((result) => {
           if (request !== listRequestVersion.current) return;
           setCalls(result.calls);
+          setShelfTicker(ticker);
           setNextOffset(result.calls.length);
           setHasMore(result.sourceLimitReached === true);
           setStale(result.stale);
+          setCompanyFrom(result.companyFrom ?? null);
+          setListSavedAt(result.savedAt ?? null);
           setListFetchedAt(result.fetchedAt);
           setListPending(result.pending === true && result.calls.length === 0);
+          // A saved copy says when it was saved, in the footer, rather than why the refresh failed.
           setListError(
-            result.refreshError ? { message: result.refreshError, status: result.errorStatus } : null,
+            result.refreshError && result.savedAt == null ? { message: result.refreshError, status: result.errorStatus } : null,
           );
           setListStatus("loaded");
           setListCompletedRequest(request);
@@ -353,6 +369,7 @@ function CallsListView({
           setListPending(false);
           setHasMore(false);
           setNextOffset(0);
+          setListSavedAt(null);
           setListError({
             message: error instanceof Error ? error.message : String(error),
             status: statusOf(error),
@@ -404,12 +421,15 @@ function CallsListView({
     firstShelfLoadRef.current = false;
     const held = cachedEarningsCalls(ticker, { limit: CALL_PAGE_SIZE, exchange: listingVenue, name: listingName });
     setCalls(held?.calls ?? []);
+    setShelfTicker(ticker);
     setHasMore(held?.sourceLimitReached === true);
     setLoadingMore(false);
     setNextOffset(held?.calls.length ?? 0);
     setListStatus(held ? "loaded" : "idle");
     setListPending(held?.pending === true && held.calls.length === 0);
     setStale(held?.stale === true);
+    setCompanyFrom(held?.companyFrom ?? null);
+    setListSavedAt(null);
     setListFetchedAt(held?.fetchedAt ?? 0);
     setListError(null);
     setLookup(null);
@@ -477,19 +497,22 @@ function CallsListView({
             calls: result.calls,
             fetchedAt: result.fetchedAt,
             stale: result.stale,
-            refreshError: result.refreshError,
+            savedAt: result.savedAt,
+            refreshError: result.savedAt == null ? result.refreshError : undefined,
             refreshRequest,
           });
         })
         .catch((error: unknown) => {
           if (cancelled) return;
-          const retainRows = ![401, 402, 403].includes(statusOf(error) ?? 0);
+          // A refusal asking again will not change clears the rows; a passing failure keeps them.
+          const retainRows = !isPermanentClientError(error);
           setLookup((current) => ({
             ticker: lookupTicker,
             status: "error",
             calls: retainRows && current?.ticker === lookupTicker ? current.calls : [],
             fetchedAt: retainRows && current?.ticker === lookupTicker ? current.fetchedAt : undefined,
             stale: retainRows && current?.ticker === lookupTicker && current.calls.length > 0,
+            savedAt: retainRows && current?.ticker === lookupTicker ? current.savedAt : undefined,
             refreshError: error instanceof Error ? error.message : String(error),
             refreshRequest,
           }));
@@ -525,7 +548,8 @@ function CallsListView({
           [
             call.ticker,
             call.companyName ?? "",
-            formatPeriod(call.fiscalYear, call.fiscalQuarter),
+            callPeriod(call),
+            eventLabelOf(call) ?? "",
             formatCallDate(call.callAt),
           ]
             .join(" ")
@@ -578,6 +602,9 @@ function CallsListView({
     if (detailOpen && !selected && listStatus === "loaded") setDetailOpen(false);
   }, [detailOpen, listStatus, openQuarter, selected, setDetailOpen]);
   const selectedTranscript = transcript?.id === selectedCallId ? transcript : null;
+  // A section kept from another call shows that call's summary when this one has no original.
+  const hasOriginal = !!selectedTranscript?.originalText?.trim();
+  const shownTab: ReaderTab = readerTab === "original" && selectedTranscript && !hasOriginal ? "summary" : readerTab;
 
   // The desktop and the web play the call beside its transcript, and their
   // find marks every match and steps through them where the terminal's
@@ -599,11 +626,11 @@ function CallsListView({
   );
 
   const findLines = useMemo(() => {
-    if (!stepFind || !selectedTranscript || readerTab === "summary") return [];
+    if (!stepFind || !selectedTranscript || shownTab === "summary" || shownTab === "original") return [];
     return (selectedTranscript.turns ?? []).flatMap((turn, index) => (
-      readerTab === "qa" && !turn.isQa ? [] : turnParagraphs(turn).map((text, paragraph) => ({ turn: index, paragraph, text }))
+      shownTab === "qa" && !turn.isQa ? [] : turnParagraphs(turn).map((text, paragraph) => ({ turn: index, paragraph, text }))
     ));
-  }, [stepFind, selectedTranscript, readerTab]);
+  }, [stepFind, selectedTranscript, shownTab]);
   const findMatches = useMemo(() => findInLines(findLines, searchQuery), [findLines, searchQuery]);
   const [matchIndex, setMatchIndex] = useState(0);
   useEffect(() => setMatchIndex(0), [findMatches]);
@@ -629,7 +656,7 @@ function CallsListView({
   // which is a deliberate act reserved for Enter.
   const prefetchTranscript = useCallback((call: CloudEarningsCallPayload) => {
     if (!call.hasTranscript || !access.emailVerified || !access.hasProAccess) return;
-    void loadTranscript(call.id).catch(() => {});
+    void loadTranscript(call.id).catch(() => { /* Intentional ignore: a warm-up that fails is loaded again, and its failure shown, when the call opens. */ });
   }, [access.emailVerified, access.hasProAccess]);
 
   // A published transcript is immutable, so it loads once per call. Opening
@@ -639,7 +666,7 @@ function CallsListView({
     if (!detailOpen || !selectedCallId || selectedUpcoming || !access.emailVerified || !access.hasProAccess) return;
     // A binding change clears selection in an effect; do not start a request
     // for that previous selection during the same render's effect pass.
-    if (ticker && selected?.ticker.toUpperCase() !== ticker) return;
+    if (ticker && selected?.ticker.toUpperCase() !== ticker && shelfTicker !== ticker) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     setTranscriptError(null);
@@ -684,7 +711,7 @@ function CallsListView({
     };
     // The call's identity is what matters; list refreshes must not restart this.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detailOpen, selectedCallId, selectedUpcoming, ticker, access.emailVerified, access.hasProAccess]);
+  }, [detailOpen, selectedCallId, selectedUpcoming, ticker, shelfTicker, access.emailVerified, access.hasProAccess]);
 
   const scrollTranscriptBy = useCallback((delta: number) => {
     if (transcriptScrollRef.current) scrollByLines(transcriptScrollRef.current, delta);
@@ -791,6 +818,11 @@ function CallsListView({
         setReaderTab("transcript");
         return true;
       }
+      if (hasOriginal && isPlainKey(event, "g")) {
+        stopSearchFocusNavigation(event);
+        setReaderTab("original");
+        return true;
+      }
       if (isPlainKey(event, "o")) {
         stopSearchFocusNavigation(event);
         openSource();
@@ -813,9 +845,11 @@ function CallsListView({
       }
       return false;
     },
-    [focusSearch, scrollTranscriptBy, openSource, playerShown, playback.toggle, playback.seekBy],
+    [focusSearch, scrollTranscriptBy, openSource, playerShown, playback.toggle, playback.seekBy, hasOriginal],
   );
 
+  // A receipt's or foreign line's calls are its company's, read from the home line.
+  useCompanyDataFooter(companyFrom, !readerOpen);
   usePaneFooter(
     footerId,
     () => {
@@ -836,7 +870,20 @@ function CallsListView({
       if (readerOpen && playback.error) {
         info.push({ id: "audio-error", parts: [{ text: "audio unavailable", tone: "warning" }], title: playback.error });
       }
-      if (readerOpen && stepFind && searchQuery.trim().length >= MIN_FIND_LENGTH && readerTab !== "summary") {
+      // A call held in another language is read in English translation.
+      const translatedFromLanguage = readerOpen && selectedTranscript ? translatedFrom(selectedTranscript) : null;
+      if (translatedFromLanguage !== null) {
+        info.push({
+          id: "translated",
+          parts: [{
+            text: shownTab === "original"
+              ? `${selectedTranscript && originalIsMachineTranscript(selectedTranscript) ? "machine transcript, " : ""}${translatedFromLanguage ? `in ${translatedFromLanguage}` : "original language"}`
+              : `translated${translatedFromLanguage ? ` from ${translatedFromLanguage}` : ""}`,
+            tone: "muted",
+          }],
+        });
+      }
+      if (readerOpen && stepFind && searchQuery.trim().length >= MIN_FIND_LENGTH && shownTab !== "summary" && shownTab !== "original") {
         info.push(activeMatch
           ? { id: "find", parts: [{ text: `match ${Math.min(matchIndex, findMatches.length - 1) + 1} of ${findMatches.length}`, tone: "muted" }] }
           : { id: "find", parts: [{ text: "no matches", tone: "warning" }] });
@@ -856,15 +903,14 @@ function CallsListView({
         }
       }
       const visibleLookup = lookup && (lookup.ticker === lookupTicker || (detailOpen && selected?.ticker === lookup.ticker)) ? lookup : null;
-      if (visibleLookup?.stale) {
-        info.push({ id: "lookup-stale", parts: [{ text: `${visibleLookup.ticker} stale cache`, tone: "warning" }] });
-      }
       if (visibleLookup?.refreshError && lookupState !== "error") {
         info.push({ id: "lookup-error", parts: [{ text: `${visibleLookup.ticker}: ${visibleLookup.refreshError}`, tone: "warning" }] });
       }
-      if (stale) {
-        info.push({ id: "stale", parts: [{ text: "stale cache", tone: "warning" }] });
-      }
+      // What a failed refresh left on screen: a saved copy says when it was saved; a list
+      // held from an earlier session, still refreshing, is only stale.
+      const savedCopy = savedCopyFooterInfo([listSavedAt, visibleLookup?.savedAt, readerOpen ? selectedTranscript?.savedAt : null]);
+      info.push(...savedCopy);
+      if (stale && listSavedAt == null) info.push(STALE_SEGMENT);
       if (listError) {
         info.push({ id: "error", parts: [{ text: listError.message, tone: "warning" }] });
       }
@@ -903,6 +949,8 @@ function CallsListView({
       lookupTicker,
       lookup,
       stale,
+      listSavedAt,
+      selectedTranscript,
       listError,
       proRequired,
       transcriptProRequired,
@@ -923,7 +971,7 @@ function CallsListView({
       playback.toggle,
       stepFind,
       searchQuery,
-      readerTab,
+      shownTab,
       activeMatch,
       matchIndex,
       findMatches.length,
@@ -968,12 +1016,9 @@ function CallsListView({
   // for the company, or it has nothing to search for.
   if (ticker && calls.length === 0) {
     return listPending ? (
-      <PaneStatusBody loading align="center" loadingLabel={`Looking for ${ticker}'s earnings calls...`} />
+      <PaneStatusBody empty align="center" emptyTitle={`Looking for ${ticker}'s earnings calls...`} />
     ) : (
-      <EmptyState
-        title={`No earnings calls found for ${ticker}.`}
-        message="Calls appear here once the company's investor site or filings list a webcast."
-      />
+      <EmptyState {...noCallsText(ticker)} />
     );
   }
 
@@ -987,7 +1032,7 @@ function CallsListView({
   ) : selected && selectedUpcoming ? (
     <UpcomingCallState call={selected} now={now} />
   ) : selected && !selectedTranscript && (producing || (!selected.hasTranscript && !transcriptError)) ? (
-    <PaneStatusBody loading loadingLabel="Producing the transcript. This usually takes two to three minutes." />
+    <PaneStatusBody empty emptyTitle="Transcript not ready yet." emptyMessage="Producing the transcript. This usually takes two to three minutes." />
   ) : (
 
     // The reader gets its own find field: a transcript runs to thousands of
@@ -1006,7 +1051,7 @@ function CallsListView({
         transcript={selectedTranscript}
         loading={transcriptLoading}
         error={transcriptError?.message ?? null}
-        tab={readerTab}
+        tab={shownTab}
         onTabChange={setReaderTab}
         tabsFocused={focused && readerOpen && !searchFocused}
         query={stepFind ? undefined : searchQuery}
@@ -1020,7 +1065,7 @@ function CallsListView({
         <AudioPlayer
           src={playback.audio.url}
           sourceKey={selected.id}
-          label={`${callTitle(selected)} call recording`}
+          label={`${callTitle(selected)}${eventLabelOf(selected) ? "" : " call"} recording`}
           durationSeconds={playback.audio.durationSeconds}
           rates={PLAYBACK_RATES}
           rate={playback.rate}

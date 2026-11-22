@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useMemo, useState } from "react";
 import { chartTableChromeRows, ChartTableHeader, CurveSurface, curveGhostColors, DataTableView, formatPercentAxis, PaneStatusBody, useChartTableSelection, usePaneNoticeFooter, usePaneStatusFooter, usePaneTabs, type DataTableCell, type DataTableColumn, type StatItem } from "../../../components";
 import { curveStrip, curveSurfaceMinRows } from "../../../components/chart/curve";
@@ -13,7 +14,7 @@ import { useAutoRefresh } from "../../../react/auto-refresh";
 import { futuresSessionRefreshInterval } from "../shared/futures-session";
 import { useResearchCloudSession } from "../shared/research-cloud-session";
 import { getCachedRatePath, loadRatePath } from "./client";
-import { meetingLabel, meetingMoves, meetingProbability, moveOddsText, movesPriced, movesText, percentileText, probabilityTargets, rateChangeText, ratePathCurves, rateText } from "./model";
+import { meetingLabel, meetingMoves, meetingProbability, moveOddsText, movesPriced, movesText, percentileText, probabilityTargets, rateChangeText, ratePathCurves, rateText, slopeShown } from "./model";
 
 const TABS = [{ value: "path", label: "Path" }, { value: "probabilities", label: "Probabilities" }, { value: "contracts", label: "Contracts" }, { value: "projections", label: "Projections" }];
 // What is priced by and at each meeting leads, as on a rate probability monitor; the implied level follows.
@@ -50,13 +51,13 @@ const meetingDate = (row: RateMeeting) => new Date(row.date);
 
 const DAY_MS = 86_400_000;
 
-function timestamp(value: string | null): string { return value?.replace("T", " ").slice(0, 16) ?? "--"; }
-function percentile(value: number | null): string { return value == null ? "--" : value.toFixed(0); }
+function timestamp(value: string | null): string { return value?.replace("T", " ").slice(0, 16) ?? MISSING_VALUE; }
+function percentile(value: number | null): string { return value == null ? MISSING_VALUE : value.toFixed(0); }
 /** Hikes up, cuts down, by the sign the text shows, so a move that rounds to zero stays neutral. */
 function signColor(value: number | null, digits: number): string {
   return value == null || !Number.isFinite(value) ? colors.textDim : shownPriceColor(value, digits);
 }
-function bpText(value: number | null): string { return value == null ? "--" : rateChangeText(value / 100); }
+function bpText(value: number | null): string { return value == null ? MISSING_VALUE : rateChangeText(value / 100); }
 /** Days to a meeting, counted in UTC dates like the schedule. */
 function daysUntil(date: string, today = new Date().toISOString().slice(0, 10)): string {
   const days = Math.round((Date.parse(date) - Date.parse(today)) / DAY_MS);
@@ -74,7 +75,7 @@ function meetingCell(row: RateMeeting, column: DataTableColumn, moves: ReadonlyM
 }
 function contractCell(row: RateContract, column: DataTableColumn): DataTableCell {
   if (column.id === "symbol") return { text: row.symbol };
-  if (column.id === "price") return { text: row.price?.toFixed(3) ?? "--" };
+  if (column.id === "price") return { text: row.price?.toFixed(3) ?? MISSING_VALUE };
   if (column.id === "rate") return { text: rateText(row.impliedRate) };
   if (column.id === "percentile") return { text: percentile(row.percentile) };
   return { text: timestamp(row.asOf), color: row.stale ? colors.warning : colors.textDim };
@@ -134,10 +135,11 @@ export function RatePathPane({ width, height, focused }: PaneProps) {
       detail: [percentileText(data.current.effr.percentile), ownDate(data.current.effr.asOf)].filter(Boolean).join(" · ") },
     { id: "target", label: "Target range", value: `${rateText(data.current.targetLower.value)} to ${rateText(data.current.targetUpper.value)}`,
       detail: [percentileText(data.current.targetUpper.percentile), ownDate(data.current.targetUpper.asOf)].filter(Boolean).join(" · ") },
-    // How far the path climbs or falls from the next meeting to the last one shown.
-    ...(tab === "path" && data.slope && next && last && next !== last ? [{ id: "slope", label: `${meetingLabel(next.date)} to ${meetingLabel(last.date)}`,
+    // How far the path climbs or falls from the next meeting to the last one shown; nothing while there is no figure.
+    ...(tab === "path" && next && last && next !== last && slopeShown(data.slope) ? [{ id: "slope", label: `${meetingLabel(next.date)} to ${meetingLabel(last.date)}`,
       value: bpText(data.slope.valueBps),
-      detail: [percentileText(data.slope.percentile), ownDate(data.slope.asOf) && timestamp(data.slope.asOf)].filter(Boolean).join(" · ") }] : []),
+      detail: [data.slope.percentile == null ? null : percentileText(data.slope.percentile),
+        ownDate(data.slope.asOf) && timestamp(data.slope.asOf)].filter(Boolean).join(" · ") }] : []),
   ] : [];
   const bodyHeight = Math.max(1, height - tabRows);
   // A rank or quote time every meeting shares says nothing per row; the
@@ -163,7 +165,7 @@ export function RatePathPane({ width, height, focused }: PaneProps) {
   // Delayed contract quotes move all session; the curve follows them once a
   // minute while Globex trades and on the research cadence otherwise.
   useAutoRefresh(resource.updatedAt, resource.load, { intervalMs: futuresSessionRefreshInterval() });
-  usePaneRefreshKey(() => void resource.reload(), { focused });
+  usePaneRefreshKey(() => resource.reload(), { focused });
   usePaneNoticeFooter({ registrationId: "rate-path:notices", focused, notices: [
     ...(data?.gaps ?? []), ...(selectedMeeting?.reason ? [selectedMeeting.reason] : []),
   ] });
@@ -193,13 +195,15 @@ export function RatePathPane({ width, height, focused }: PaneProps) {
           rootBefore={header(meetingColumns, meetings.length, pathChart)} />
         : tab === "probabilities" ? <DataTableView
           columns={probabilityColumns}
+          // Target ranges in rate order.
+          columnReorder={false}
           items={data.meetings} selection={selection} focused={focused} sortColumnId={null} sortDirection="asc"
           getItemKey={meetingKey} rootWidth={width} rootHeight={bodyHeight} emptyStateTitle="Meeting probabilities unavailable"
           rootBefore={header(probabilityColumns, data.meetings.length)}
           renderCell={(row, column) => {
             if (column.id === "date") return { text: row.date };
             const probability = meetingProbability(row, Number(column.id));
-            return { text: probability == null ? "--" : `${(probability * 100).toFixed(1)}%`,
+            return { text: probability == null ? MISSING_VALUE : `${(probability * 100).toFixed(1)}%`,
               backgroundColor: probability == null ? undefined : blendHex(colors.bg, colors.positive, probability * 0.7),
               color: probability != null && probability > 0.65 ? colors.bg : colors.text };
           }} /> : tab === "contracts" ? <DataTableView columns={CONTRACT_COLUMNS} items={contracts}

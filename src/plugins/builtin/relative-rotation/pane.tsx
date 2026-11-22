@@ -27,7 +27,7 @@ import {
 import { useThemeColors } from "../../../theme/theme-context";
 import { isAccessDenied } from "../../../api-client/errors";
 import type { PaneProps } from "../../../types/plugin";
-import { formatPercentileRank } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentileRank } from "../../../utils/format";
 import { ScatterTrailSurface } from "../../../components/chart/static/trail-chart-surface";
 import {
   staticSeries,
@@ -36,6 +36,7 @@ import {
 import { useResearchCloudSession } from "../shared/research-cloud-session";
 import { cachedRotation, loadRotation } from "./client";
 import {
+  DEFAULT_ROTATION_BENCHMARK,
   ROTATION_LIMIT,
   rotationId,
   rotationTrailWeeks,
@@ -72,9 +73,9 @@ const COLUMNS: DataTableColumn[] = [
   { id: "momentumRank", label: "MOM PCTL", width: 8, align: "right" },
 ];
 const number = (value: number | null | undefined) =>
-  value == null ? "--" : value.toFixed(2);
+  value == null ? MISSING_VALUE : value.toFixed(2);
 const rank = (value: number | null) =>
-  value == null ? "--" : value.toFixed(0);
+  value == null ? MISSING_VALUE : value.toFixed(0);
 const PANELS = [{ id: "main" }];
 /** Axis row plus enough plot rows to keep eleven symbols apart. */
 const SCATTER_MIN_ROWS = 9;
@@ -118,7 +119,7 @@ function RotationDetail({
   const stats: StatItem[] = [
     { id: "strength", label: "Strength", value: number(row.strength), detail: rankDetail(row.strengthRank) },
     { id: "momentum", label: "Momentum", value: number(row.momentum), detail: rankDetail(row.momentumRank) },
-    { id: "quadrant", label: "Quadrant", value: row.quadrant ?? "--" },
+    { id: "quadrant", label: "Quadrant", value: row.quadrant ?? MISSING_VALUE },
   ];
   const statRows = statGridRows(stats, width);
   return (
@@ -140,13 +141,13 @@ function RotationDetail({
 export function RelativeRotationPane(props: PaneProps) {
   const [scope] = usePaneSettingValue("scope", "sectors");
   const [symbols] = usePaneSettingValue("symbols", "");
-  const [benchmarkText] = usePaneSettingValue("benchmark", "SPY:NYSEARCA");
+  const [benchmarkText] = usePaneSettingValue("benchmark", DEFAULT_ROTATION_BENCHMARK);
   const [trailText] = usePaneSettingValue("trail", "6");
   const { collectionId } = usePaneCollection();
   const tickers = useTickers();
   const context = useMemo(() => {
     try {
-      const references = rotationInstruments(benchmarkText || "SPY:NYSEARCA");
+      const references = rotationInstruments(benchmarkText || DEFAULT_ROTATION_BENCHMARK);
       if (references.length !== 1)
         throw new Error("Choose one benchmark in pane settings.");
       const instruments =
@@ -275,15 +276,13 @@ function RotationView({
   const selectedRowId = rows.find((row) => row.id === selectedId)?.id ?? rows[0]?.id ?? null;
   usePaneTitle(`RRG vs ${benchmark.symbol}`);
   useAutoRefresh(resource.updatedAt, resource.load);
-  usePaneRefreshKey(() => void resource.reload(), { focused });
+  usePaneRefreshKey(() => resource.reload(), { focused });
   usePaneNoticeFooter({
     registrationId: "relative-rotation:notices",
     focused,
+    // What concerns the whole chart; a symbol's own gaps are its row's (`rowNote`).
     notices: [
       ...(data?.gaps ?? []),
-      ...(data?.rows.flatMap((row) =>
-        row.gaps.map((gap) => `${row.symbol}: ${gap}`),
-      ) ?? []),
       ...(resource.data?.refreshError ? [resource.data.refreshError] : []),
     ],
   });
@@ -297,7 +296,7 @@ function RotationView({
             id: "asof",
             parts: [
               {
-                text: `${data.currency ?? "--"} · week ${data.asOf ?? "unavailable"} · ${trail}W trails`,
+                text: `${data.currency ?? MISSING_VALUE} · week ${data.asOf ?? "unavailable"} · ${trail}W trails`,
                 tone: "muted",
               },
             ],
@@ -349,6 +348,7 @@ function RotationView({
                 onChange: setSelectedId,
               }}
               onActivate={(row) => setOpenId(row.id)}
+              rowNote={(row) => row.gaps.length ? `${row.symbol}: ${row.gaps.join(" ")}` : null}
               detailOpen={!!selected}
               onBack={() => setOpenId(null)}
               detailTitle={selected?.label}
@@ -373,7 +373,7 @@ function RotationView({
                       ? rank(row.momentumRank.percentile)
                       : column.id === "strength" || column.id === "momentum"
                         ? number(row[column.id])
-                        : String(row[column.id as "symbol"] ?? "--"),
+                        : String(row[column.id as "symbol"] ?? MISSING_VALUE),
                 color: column.id === "symbol" ? colorMap.get(row.id) : undefined,
               })}
               emptyStateTitle="No aligned weekly observations."

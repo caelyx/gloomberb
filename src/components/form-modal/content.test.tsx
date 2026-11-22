@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { act } from "react";
 import type { PluginRegistry } from "../../plugins/registry";
+import type { Quote } from "../../types/financials";
 import { formSnapshot } from "../../remote/form";
 import { createRemoteUiRegistry } from "../../remote/semantic-tree";
 import { createTestDataProvider, createTestQuote } from "../../test-support/data-provider";
 import { AmbiguousTickerError } from "../../tickers/search";
 import type { PaneTemplateCreateOptions } from "../../types/plugin";
 import { dismissTopmostDialog, isDialogOpen } from "../../ui/dialog-stack";
+import { readFormRemotely } from "./remote-reads.test-helpers";
 import { CTRL_S, ENTER, ESC, createFormModalTestSession, registerCommand } from "./test-harness";
 
 const session = createFormModalTestSession();
@@ -160,6 +162,38 @@ describe("form modal", () => {
     expect(frame()).toContain("LAST");
   });
 
+  test("a form that fits once the terminal grows shows no scrollbar, its text as wide as the body", async () => {
+    // As wide as the body: beside a scrollbar it would wrap, a row more than the body, and keep the bar.
+    const description = "Target fills from the current price after the symbol resolves.";
+    const fields = ["Kind", "Symbol", "Condition", "Target Price"].map((label, index) => ({
+      id: `f${index + 1}`, label, type: "text" as const, ...(index === 3 ? { description } : {}),
+    }));
+    await renderForm(() => {}, {
+      kind: "route",
+      route: {
+        kind: "workflow",
+        workflowId: "plugin-command:fits",
+        title: "Fits",
+        fields,
+        values: Object.fromEntries(fields.map((field) => [field.id, ""])),
+        activeFieldId: "f1",
+        submitLabel: "Save",
+        pending: false,
+        error: null,
+        payload: { kind: "plugin-command", actionId: "fits" },
+      },
+    }, { size: { width: 90, height: 18 } });
+    await waitForForm("Kind");
+    // Too short for it: the body scrolls, with its bar.
+    expect(frame()).toMatch(/[█▀▄]/);
+    await act(async () => { session.setup.resize(90, 30); });
+    await settle();
+    await settle();
+    const row = frame().split("\n").find((line) => line.includes("Target fills"));
+    expect(row).toContain(description);
+    expect(frame()).not.toMatch(/[█▀▄]/);
+  });
+
   test("while a submit runs the form ignores Enter; a failure stays in the form", async () => {
     let calls = 0;
     let fail: (error: Error) => void = () => {};
@@ -302,9 +336,12 @@ describe("form modal", () => {
   });
 
   test("Add Alert checks its symbol in the form, and a new symbol keeps the target the user typed", async () => {
-    const quotes: Record<string, { price: number; name: string }> = {
+    const quotes: Record<string, Partial<Quote>> = {
       AMD: { price: 201.5, name: "Advanced Micro Devices" },
-      NVDA: { price: 120.25, name: "NVIDIA Corp." },
+      // After 20:00 New York, from a 173.73 close to 158.78 after hours: the alert is judged on that print.
+      NVDA: { price: 158.78, name: "NVIDIA Corp.", change: -10.11, changePercent: -5.9862, previousClose: 168.89,
+        regularClose: 173.73, regularCloseSessionDate: "2026-11-11", changeSessionDate: "2026-11-11", marketState: "POSTPOST",
+        listingExchangeName: "NASDAQ", lastUpdated: Date.parse("2026-11-12T00:59:59Z") },
     };
     const dataProvider = createTestDataProvider({
       getQuote: async (symbol) => {
@@ -334,8 +371,26 @@ describe("form modal", () => {
     await type("NVDA");
 
     await waitForFrameToContain("NVIDIA Corp.");
-    await waitForFrameToContain("Current price 120.25; edit to set the target.");
+    await waitForFrameToContain("Current price 158.78 After-Hours; edit to set the target.");
     expect(frame().split("\n").some((line) => /^\W*180\W*$/.test(line))).toBe(true);
+  });
+
+  // GEX's Alert at this flip: the title of its footer hint was the only place that said the level does not move.
+  test("a pane that fills in Add Alert keeps its target and adds its own line under Target Price", async () => {
+    const dataProvider = createTestDataProvider({ getQuote: async (symbol) => createTestQuote({ symbol, price: 728.02, name: "SPDR S&P 500" }) });
+    await renderForm((registry) => registerCommand(registry, {
+      id: "set-alert",
+      label: "Add Alert",
+      wizard: [
+        { key: "symbol", label: "Symbol", type: "text" },
+        { key: "condition", label: "Condition", type: "select", options: [{ label: "Crosses", value: "crosses" }] },
+        { key: "price", label: "Target Price", type: "number" },
+      ],
+    }), { kind: "plugin-command", commandId: "set-alert",
+      values: { symbol: "SPY", condition: "crosses", price: "757.35", priceNote: "Fixed price: it does not follow the flip." } }, { dataProvider });
+    await waitForForm("Current price 728.02; edit to set the target.");
+    await waitForFrameToContain("Fixed price: it does not follow the flip.");
+    expect(frame().split("\n").some((line) => /^\W*757\.35\W*$/.test(line))).toBe(true);
   });
 
   test("remote control sees each field and sets a select without opening it", async () => {
@@ -405,6 +460,36 @@ describe("form modal", () => {
     "BP:XLON": "BP plc",
   });
 
+
+  // A key named only by its field id, typed as text, and a password: neither
+  // reaches remote control or Ask Gloom, through the form's own nodes or the
+  // controls drawn under them.
+  test("remote control never reads what was typed into a field named for a credential, or a password", async () => {
+    const remoteRegistry = createRemoteUiRegistry();
+    await renderForm((registry) => registerCommand(registry, {
+      id: "connect",
+      label: "Connect Account",
+      wizard: [
+        { key: "apiKey", label: "Key", type: "text", placeholder: "Paste it here" },
+        { key: "login", label: "Sign-in", type: "password" },
+        { key: "account", label: "Account", type: "text" },
+      ],
+    }), { kind: "plugin-command", commandId: "connect" }, { remoteRegistry });
+    await waitForForm("Sign-in");
+
+    await type("sk-live-4f9Qx2");
+    await press(ENTER);
+    await type("hunter2-correct");
+    await press(ENTER);
+    await type("DU1234");
+    await settle();
+
+    const { read, relayed } = readFormRemotely(remoteRegistry);
+    for (const typed of ["sk-live-4f9Qx2", "hunter2-correct", "DU1234"]) expect(read).toContain(typed);
+    expect(relayed).not.toContain("sk-live-4f9Qx2");
+    expect(relayed).not.toContain("hunter2-correct");
+    expect(relayed).toContain("DU1234");
+  });
 
   // The terminal textarea keeps its own buffer, which a value set from outside
   // has to replace, so the field's node is the only way in.

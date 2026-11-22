@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createProxyResponse, type HttpProxyResponseEnvelope } from "../../utils/http-proxy-response";
-import { handleHttpProxy, proxyPolicyFor, validateProxyTarget, type HttpProxyPolicy } from "./http-proxy";
+import { PROXY_ALLOWED_HOSTS } from "../../utils/plugin-proxy-hosts";
+import { handleHttpProxy, proxyPolicyFor, SIGNED_OUT_ROUTES, signedOutRouteAllows, validateProxyTarget, type HttpProxyPolicy } from "./http-proxy";
 import { createProxySessionGate, type ProxySessionGateOptions } from "./proxy-session";
 
 const ORIGIN = "https://term.gloom.sh";
@@ -10,6 +11,7 @@ const SESSION_COOKIE = "__Secure-gloomberb.session_token=abc123.signature";
 // The real allowlist is generated from what bundled plugins declare. These
 // tests are about the guardrails, so they pin one example host.
 const HOSTS = ["substack.com"];
+const SIGNED_OUT = { "substack.com": [{ methods: ["GET", "HEAD", "POST"] as const, path: "/" }] };
 
 type Upstream = (url: URL, init: RequestInit) => Response | Promise<Response>;
 
@@ -44,6 +46,7 @@ function harness(options: {
   api?: (request: Request) => Response | Promise<Response>;
   gate?: Partial<ProxySessionGateOptions>;
   policy?: HttpProxyPolicy;
+  signedOutLimit?: (request: Request) => Promise<boolean>;
 } = {}) {
   let clock = 1_000_000;
   const apiCalls: Request[] = [];
@@ -66,7 +69,15 @@ function harness(options: {
       clock += ms;
     },
     send(request: Request) {
-      return handleHttpProxy(request, { sessions, fetchApi, fetchUpstream, hosts: HOSTS, policy: options.policy });
+      return handleHttpProxy(request, {
+        sessions,
+        fetchApi,
+        fetchUpstream,
+        hosts: HOSTS,
+        signedOutRoutes: SIGNED_OUT,
+        signedOutLimit: options.signedOutLimit,
+        policy: options.policy,
+      });
     },
   };
 }
@@ -177,6 +188,24 @@ describe("proxy request handling", () => {
     expect(proxy.upstreamCalls).toHaveLength(0);
   });
 
+  test("calls the upstream fetch without a receiver, as Workers require", async () => {
+    // Workers throw "Illegal invocation" when their fetch runs with any
+    // `this`, so `options.fetch(url)` failed every proxied request with a 504.
+    const strictFetch = function (this: unknown) {
+      if (this !== undefined) throw new TypeError("Illegal invocation");
+      return Promise.resolve(Response.json({ ok: true }));
+    } as unknown as typeof fetch;
+    const response = await handleHttpProxy(proxyRequest({ url: "https://substack.com/x" }), {
+      sessions: createProxySessionGate({ sessionUrl: SESSION_URL }),
+      fetchApi: async () => LIVE_SESSION(),
+      fetchUpstream: strictFetch,
+      hosts: HOSTS,
+    });
+
+    expect(response.status).toBe(200);
+    expect(JSON.parse((await response.json() as { body: string }).body)).toEqual({ ok: true });
+  });
+
   test("reports an upstream timeout as a gateway error rather than throwing", async () => {
     const proxy = harness({
       upstream: () => {
@@ -208,27 +237,110 @@ describe("proxy request handling", () => {
   });
 });
 
-describe("proxy session check", () => {
-  test("requires a session cookie, without asking the API", async () => {
-    const proxy = harness();
-    const response = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, { cookie: "other=1" }));
+function fromIp(ip: string, cookie = "other=1"): Record<string, string> {
+  return { cookie, "cf-connecting-ip": ip };
+}
 
-    expect(response.status).toBe(401);
+describe("proxy session check", () => {
+  test("serves a signed-out caller on the per-address limit, without asking the API", async () => {
+    const proxy = harness({ gate: { anonymousRequestsPerWindow: 2 } });
+    const statuses: number[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      statuses.push((await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7")))).status);
+    }
+    const otherAddress = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.8")));
+
+    expect(statuses).toEqual([200, 200, 429]);
+    expect(otherAddress.status).toBe(200);
     expect(proxy.apiCalls).toHaveLength(0);
-    expect(proxy.upstreamCalls).toHaveLength(0);
+    expect(proxy.upstreamCalls).toHaveLength(3);
   });
 
-  test("refuses a session cookie the API does not recognize", async () => {
-    // Having a cookie with the right name is not a session.
+  test("lets a signed-out caller read but not change anything upstream", async () => {
+    // The Origin check stops browsers, not scripts, so anonymous use must not
+    // be a way to send writes to the allowlisted hosts from our address.
     const proxy = harness({ api: NO_SESSION });
-    const response = await proxy.send(proxyRequest(
-      { url: "https://substack.com/x" },
-      { cookie: "__Secure-gloomberb.session_token=made-up" },
-    ));
+    const anonymous = (method: string) => proxy.send(proxyRequest({ url: "https://substack.com/x", init: { method, body: method === "GET" ? undefined : "{}" } }, fromIp("198.51.100.7")));
+    const statuses: number[] = [];
+    for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"]) statuses.push((await anonymous(method)).status);
+    const signedIn = await harness().send(proxyRequest({ url: "https://substack.com/x", init: { method: "DELETE" } }));
 
-    expect(response.status).toBe(401);
-    expect(await response.json()).toMatchObject({ error: expect.stringContaining("Sign in") });
-    expect(proxy.upstreamCalls).toHaveLength(0);
+    expect(statuses).toEqual([200, 200, 401, 401, 401]);
+    expect(proxy.upstreamCalls.map((call) => call.init.method)).toEqual(["GET", "POST"]);
+    expect(signedIn.status).toBe(200);
+  });
+
+  test("a signed-out caller reaches only the endpoints the signed-out plugins read", () => {
+    const allows = (url: string, method = "GET") => signedOutRouteAllows(new URL(url), method);
+    expect(allows("https://api.elections.kalshi.com/trade-api/v2/markets?limit=50")).toBe(true);
+    expect(allows("https://api.elections.kalshi.com/trade-api/v2/portfolio/orders", "POST")).toBe(false);
+    expect(allows("https://api.gemini.com/v1/prediction-markets/events")).toBe(true);
+    expect(allows("https://api.gemini.com/v1/mytrades")).toBe(false);
+    expect(allows("https://data.pascal.trade/api/v1/markets/text-search", "POST")).toBe(true);
+    expect(allows("https://data.pascal.trade/api/v1/orders", "POST")).toBe(false);
+    expect(allows("https://services-dynarep.ddwa.finra.org/public/reporting/v2/data/group/FixedIncomeMarket/name/corporateAndAgencySecurities", "POST")).toBe(true);
+    expect(allows("https://services-dynarep.ddwa.finra.org/public/reporting/v2/data/group/FixedIncomeMarket/name/x")).toBe(false);
+    expect(allows("https://www.nasdaqtrader.com/rss.aspx?feed=tradehalts")).toBe(true);
+    expect(allows("https://api.votehub.com/polls?subject=Trump")).toBe(true);
+    expect(allows("https://api.votehub.com/pollsters")).toBe(false);
+    // The URL parser has already folded dot segments away.
+    expect(allows("https://api.crypto.com/dcm/v1/public/../private/create-order")).toBe(false);
+  });
+
+  test("every proxied host says what a signed-out caller may send it", () => {
+    // A new plugin host fails here until someone decides its signed-out endpoints.
+    expect(Object.keys(SIGNED_OUT_ROUTES).sort()).toEqual([...PROXY_ALLOWED_HOSTS].sort());
+  });
+
+  test("a signed-out call also counts against the limit across isolates; a signed-in one does not", async () => {
+    let allowed = true;
+    const asked: string[] = [];
+    const signedOutLimit = async (request: Request) => {
+      asked.push(request.headers.get("cf-connecting-ip") ?? "");
+      return allowed;
+    };
+    const anonymous = harness({ api: NO_SESSION, signedOutLimit });
+    expect((await anonymous.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7")))).status).toBe(200);
+    allowed = false;
+    const refused = await anonymous.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7")));
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get("retry-after")).toBe("60");
+    expect(anonymous.upstreamCalls).toHaveLength(1);
+
+    const signedIn = harness({ signedOutLimit });
+    expect((await signedIn.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.9", SESSION_COOKIE)))).status).toBe(200);
+    expect(asked).toEqual(["198.51.100.7", "198.51.100.7"]);
+  });
+
+  test("counts an IPv6 caller by its /64, so rotating addresses does not reset the window", async () => {
+    const proxy = harness({ gate: { anonymousRequestsPerWindow: 2 } });
+    const statuses: number[] = [];
+    for (const ip of ["2001:db8:1:2::1", "2001:0db8:0001:0002:ffff::9", "2001:db8:1:2:aaaa:bbbb:cccc:dddd"]) {
+      statuses.push((await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp(ip)))).status);
+    }
+    const nextBlock = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("2001:db8:1:3::1")));
+
+    expect(statuses).toEqual([200, 200, 429]);
+    expect(nextBlock.status).toBe(200);
+  });
+
+  test("counts a session cookie the API does not recognize as signed out", async () => {
+    // Having a cookie with the right name is not a session, so it gets the
+    // anonymous window rather than a user's.
+    const proxy = harness({ api: NO_SESSION, gate: { anonymousRequestsPerWindow: 1 } });
+    const made = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7", "__Secure-gloomberb.session_token=made-up")));
+    const again = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7", "__Secure-gloomberb.session_token=other")));
+
+    expect([made.status, again.status]).toEqual([200, 429]);
+  });
+
+  test("keeps a signed-in user's window apart from their address's anonymous one", async () => {
+    const proxy = harness({ gate: { anonymousRequestsPerWindow: 1, requestsPerWindow: 5 } });
+    const anonymous = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7")));
+    const anonymousAgain = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7")));
+    const signedIn = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7", SESSION_COOKIE)));
+
+    expect([anonymous.status, anonymousAgain.status, signedIn.status]).toEqual([200, 429, 200]);
   });
 
   test("does not remember a rejected session, so signing in again works at once", async () => {
@@ -296,14 +408,10 @@ describe("proxy session check", () => {
     const proxy = harness({
       api: (request) => (request.headers.get("cookie") === SESSION_COOKIE ? LIVE_SESSION() : NO_SESSION()),
     });
-    const live = await proxy.send(proxyRequest({ url: "https://substack.com/x" }));
-    const fake = await proxy.send(proxyRequest(
-      { url: "https://substack.com/x" },
-      { cookie: "__Secure-gloomberb.session_token=guessed" },
-    ));
+    await proxy.send(proxyRequest({ url: "https://substack.com/x" }));
+    await proxy.send(proxyRequest({ url: "https://substack.com/x" }, { cookie: "__Secure-gloomberb.session_token=guessed" }));
+    await proxy.send(proxyRequest({ url: "https://substack.com/x" }));
 
-    expect(live.status).toBe(200);
-    expect(fake.status).toBe(401);
     expect(proxy.apiCalls).toHaveLength(2);
   });
 
@@ -313,22 +421,23 @@ describe("proxy session check", () => {
     ["a network failure", () => {
       throw new TypeError("fetch failed");
     }],
-  ])("fails closed with a 503 when the API returns %s", async (_label, api) => {
-    const proxy = harness({ api });
-    const response = await proxy.send(proxyRequest({ url: "https://substack.com/x" }));
+  ])("gives no more than the anonymous limit when the API returns %s", async (_label, api) => {
+    const proxy = harness({ api, gate: { anonymousRequestsPerWindow: 1 } });
+    const first = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7", SESSION_COOKIE)));
+    const second = await proxy.send(proxyRequest({ url: "https://substack.com/x" }, fromIp("198.51.100.7", SESSION_COOKIE)));
 
-    expect(response.status).toBe(503);
-    expect(await response.json()).toMatchObject({ error: expect.stringContaining("confirm your session") });
-    expect(proxy.upstreamCalls).toHaveLength(0);
+    expect([first.status, second.status]).toEqual([200, 429]);
+    expect(proxy.upstreamCalls).toHaveLength(1);
   });
 
   test("does not cache a failed check, so the next request tries again", async () => {
     let down = true;
     const proxy = harness({ api: () => (down ? new Response(null, { status: 500 }) : LIVE_SESSION()) });
-    expect((await proxy.send(proxyRequest({ url: "https://substack.com/x" }))).status).toBe(503);
+    await proxy.send(proxyRequest({ url: "https://substack.com/x" }));
 
     down = false;
-    expect((await proxy.send(proxyRequest({ url: "https://substack.com/x" }))).status).toBe(200);
+    await proxy.send(proxyRequest({ url: "https://substack.com/x" }));
+    await proxy.send(proxyRequest({ url: "https://substack.com/x" }));
     expect(proxy.apiCalls).toHaveLength(2);
   });
 

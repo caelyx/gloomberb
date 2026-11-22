@@ -6,8 +6,17 @@ interface FundFact<T> {
   url?: string;
 }
 
-type FundStructure = "registered" | "trust";
-type ExpenseRatioKind = "net" | "gross" | "sponsor-fee";
+/**
+ * `registered`: a 1940 Act fund (an ETF or UIT). `trust`: an exchange-traded
+ * trust or pool outside the 1940 Act. `closed-end`: a registered closed-end
+ * fund (ECC, OXLC, PDI), found filing N-CEN, N-CSR, N-PORT or N-2. `bdc`: a
+ * business development company (ARCC, MAIN), found filing N-2 or its N-54A
+ * election beside its 10-Q and 10-K. Either's shares trade at their own
+ * premium or discount to NAV. Servers before them say null.
+ */
+export type FundStructure = "registered" | "trust" | "closed-end" | "bdc";
+/** `management-fee`: a Hong Kong fund's management fee, which its issuer states apart from the ongoing charges. */
+type ExpenseRatioKind = "net" | "gross" | "sponsor-fee" | "management-fee";
 /**
  * A bond fund as its sponsor classes it: `municipal` when its interest is
  * exempt from federal income tax, `taxable` otherwise.
@@ -68,11 +77,53 @@ export interface FundMetalHoldings {
 }
 
 /**
- * `not-collected-yet`: a source Gloom reads covers the fund, but it has no
- * figures yet. `not-published`: no source Gloom reads covers it. Servers
- * before statuses leave it out.
+ * The 1M change in an ETF's shares outstanding (creations less redemptions),
+ * from the sponsor's count on `from` to its count on `asOf`. `value` puts a
+ * dollar figure on it, each day's change at that day's NAV; null when a day
+ * in between had none.
  */
-type FundFactsStatus = "covered" | "not-collected-yet" | "not-published" | "not-a-fund";
+export interface FundFlows {
+  period: "1M";
+  shares: number;
+  value: number | null;
+  from: string;
+  asOf: string;
+  source: string;
+  url?: string;
+}
+
+/**
+ * `not-collected-yet`: a source Gloom reads covers the fund, but it has no
+ * figures yet. `not-published`: no source Gloom reads covers it. `etn`: an
+ * exchange-traded note, no fund, with its terms in `note`. Servers before
+ * statuses leave it out.
+ */
+type FundFactsStatus = "covered" | "not-collected-yet" | "not-published" | "not-a-fund" | "etn";
+
+/**
+ * An exchange-traded note (VXX) as its SEC pricing supplement states it: the
+ * bank whose unsecured debt it is, the yearly fee taken from its value
+ * (percent) and the index its return is linked to, each null when the
+ * supplement does not state it in a form the server reads. `filing`: the
+ * supplement's form, filing date and EDGAR document.
+ */
+export interface FundNoteFacts {
+  issuer: string;
+  name: string | null;
+  yearlyFee: number | null;
+  index: string | null;
+  filing: { form: string; filedAt: string; url: string };
+}
+
+/**
+ * What a counter's computed premium is from when its own close is nominal:
+ * another counter's traded close (`3042:HKEX` at HK$9.18) converted at the
+ * rate between the two counters' NAVs, or the nominal close itself when no
+ * counter traded.
+ */
+type FundPremiumPrice =
+  | { kind: "counter"; ticker: string; close: number; currency: string }
+  | { kind: "nominal" };
 
 /** GET /cloud/fund-facts/:ticker. Percent fields are in percent (0.03 is 0.03%). */
 export interface FundFactsPayload {
@@ -86,10 +137,29 @@ export interface FundFactsPayload {
   structure: FundStructure | null;
   /** `document`: read from the fund's prospectus filed with the SEC on `asOf`, not from its sponsor. */
   expenseRatio: (FundFact<number> & { kind: ExpenseRatioKind; document?: "prospectus" }) | null;
-  nav: FundFact<number> | null;
-  closingPrice: FundFact<number> | null;
-  /** `published` by the sponsor, or `computed` from the closing price against the NAV. */
-  premiumDiscount: (FundFact<number> & { basis: "published" | "computed" }) | null;
+  /**
+   * `period`: a `day`'s NAV, or a `month-end`'s (a closed-end fund's monthly
+   * estimate, or the NAV per share its filing states), which is its normal
+   * cadence rather than a lag. `estimate`: the range the sponsor published,
+   * whose midpoint `value` is. Servers before them leave both out.
+   */
+  nav: (FundFact<number> & { period?: "day" | "month-end"; estimate?: { low: number; high: number } }) | null;
+  /** Why a covered fund has no NAV, in one line. Absent when it has one, and from servers before it. */
+  navReason?: string;
+  /**
+   * Dated by its own session: a month end on a weekend is priced at the Friday
+   * before it. `nominal`: nothing traded in that session (a Hong Kong fund's
+   * USD or RMB counter on a quiet day), so the close is the exchange's
+   * nominal price; absent from servers before it.
+   */
+  closingPrice: (FundFact<number> & { nominal?: true }) | null;
+  /**
+   * `published` by the sponsor, or `computed` from the closing price against
+   * the NAV, dated by the NAV. `estimate`: computed against the midpoint of a
+   * NAV estimate, so an estimate too; absent from servers before it. `price`:
+   * what a computed premium is from when not the closing price as traded.
+   */
+  premiumDiscount: (FundFact<number> & { basis: "published" | "computed"; estimate?: true; price?: FundPremiumPrice }) | null;
   /**
    * `period`: a `day`'s figure, or the last `month-end`'s (Vanguard and ARK
    * ETFs, N-PORT), which is not today's. `document`: the fund's N-PORT report
@@ -105,7 +175,34 @@ export interface FundFactsPayload {
   bond?: FundBondFacts | null;
   /** A metal trust's metal in trust; absent for any other fund, until its first read, and from servers before it. */
   metalHoldings?: FundMetalHoldings | null;
+  /** Shares outstanding as the sponsor's file states them, dated. Servers before it leave it out. */
+  sharesOutstanding?: FundFact<number> | null;
+  /** The 1M change in shares outstanding; null until a month of counts is kept. Servers before it leave it out. */
+  flows?: FundFlows | null;
+  /**
+   * The currency the NAV and closing price are in: a Hong Kong counter's own
+   * (HKD for 3046, USD for 9046). Absent for a US fund, whose figures are in
+   * US dollars.
+   */
+  currency?: string;
+  /**
+   * A spot bitcoin or ether fund's coins as its issuer states them, and the
+   * units in issue per coin on the same day (the Hong Kong spot funds).
+   * Absent for any other fund and from servers before it.
+   */
+  coinHoldings?: FundCoinHoldings | null;
+  /** An exchange-traded note's terms (status `etn`); absent for anything else and from servers before it. */
+  note?: FundNoteFacts | null;
   /** The newest NAV is older than a few US trading days: every figure is older than it looks. */
   stale: boolean;
   fetchedAt: string | null;
+}
+
+export interface FundCoinHoldings {
+  asset: "BTC" | "ETH";
+  coins: number;
+  unitsPerCoin: number;
+  asOf: string;
+  source: string;
+  url?: string;
 }

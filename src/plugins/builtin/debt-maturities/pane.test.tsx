@@ -2,8 +2,9 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { act, useState } from "react";
 import { apiClient } from "../../../api-client";
 import type { DebtMaturitiesPayload, DebtMetric } from "../../../api-client/debt-maturities";
-import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
+import { createOpenTuiTestHarness, takeSavedTextFile } from "../../../renderers/opentui/test-utils";
 import { appReducer, createInitialState } from "../../../state/app/context";
+import { exportPaneTable } from "../../../state/pane-table-export-registry";
 import { TestPaneFrame, createTestPaneConfig, createTestTicker } from "../../../test-support/pane";
 import { createTestPluginRuntime } from "../../../test-support/plugin-runtime";
 import { BUCKET_IDS, debtMaturitiesCache } from "./client";
@@ -63,6 +64,30 @@ async function render(width: number, height: number, tab = "maturities"): Promis
 
 const bar = (line: string | undefined) => (line?.match(/[█▏▎▍▌▋▊▉]+/)?.[0] ?? "").length;
 
+test("an incomplete schedule omits shares without a denominator, and a complete schedule restores them", async () => {
+  const incomplete = payload();
+  incomplete.latest!.complete = false;
+  incomplete.latest!.totalPrincipal.value = null;
+  incomplete.latest!.next3Years.value = null;
+  incomplete.latest!.next12MonthsShare.value = null;
+  incomplete.latest!.next3YearsShare.value = null;
+  incomplete.latest!.buckets[2]!.value = null;
+  incomplete.latest!.buckets[2]!.fact = null;
+  Object.assign(incomplete.history.at(-1)!, { complete: false, totalPrincipal: null, next3Years: null,
+    next12MonthsShare: null, next3YearsShare: null });
+  const debtSpy = spyOn(apiClient, "getCloudDebtMaturities").mockResolvedValue(incomplete);
+  spy = debtSpy;
+  const missing = (await render(100, 30)).join("\n");
+  expect(missing).toContain("MATURITY");
+  expect(missing).not.toContain("% TOTAL");
+  await exportPaneTable("ddis", "ddis.csv");
+  expect(takeSavedTextFile()?.text).toContain("% TOTAL");
+  await tui.destroy();
+  debtMaturitiesCache.reset();
+  debtSpy.mockResolvedValue(payload());
+  expect((await render(100, 30)).join("\n")).toContain("% TOTAL");
+});
+
 test("the maturity wall is an inline bar column scaled to the dated years", async () => {
   const lines = await render(94, 29);
   const row = (label: string) => lines.find((line) => line.includes(label));
@@ -89,7 +114,10 @@ test("a short or narrow maturity pane keeps the table's rows, and the chart shri
   expect(lines[2]).toMatch(/^ ● Due next 12 months .*%/);
   expect(lines[3]).toContain("MATURITY");
   expect(lines.filter((line) => /^ In(NextTwelve|Year)/.test(line))).toHaveLength(5);
-  expect(lines[9]).toContain("just now");
+  // The footer keeps which filing and its date; how long ago it loaded goes first, then the source's name, which the
+  // hint and the column between them leave no room for at 40 columns (a wider pane names it, below).
+  expect(lines[9]).toContain("└10-K Mon 30 Jun 2025");
+  expect(lines[9]).not.toContain("just now");
 });
 
 test("the filing history names its bars and puts each year under its own bar", async () => {
@@ -139,13 +167,68 @@ test("a newer 10-Q is a dated figure row of its own, and every filing's year lab
   // Earlier tests left this issuer's annual-only answer in the cache.
   debtMaturitiesCache.reset();
   const lines = await render(94, 30);
-  const row = lines.find((line) => line.includes("Latest 10-Q"));
-  expect(row).toContain("Current 212.00M · Non-current 6.84B USD");
-  expect(row).toContain("2025-12-31 · filed 2026-02-10");
+  // Named by its period; the filed date beside the figures where it fits.
+  const row = lines.find((line) => line.includes("10-Q 2025-12-31"));
+  expect(row).toMatch(/10-Q 2025-12-31 +Current 212\.00M · Non-current 6\.84B USD  filed 2026-02-10/);
   // The schedule's own date is still said once, apart from the 10-Q's.
   expect(lines.find((line) => line.includes("As of"))).toContain("2025-06-30");
   // The idle legend reads the newest filing, and each fiscal year sits under the chart once, in order.
   expect(lines.find((line) => line.includes("Due next 12 months"))).toContain("4.8%");
   const axis = lines.find((line) => /^\s*2022\s/.test(line))!;
   expect(axis.trim().split(/\s+/)).toEqual(["2022", "2023", "2024", "2025"]);
+  // The footer says where the figures are from and which filing the pane's date is, as `fn DDIS` ends.
+  expect(lines.find((line) => line.includes("[o]pen"))).toContain("SEC EDGAR · 10-Q Wed 31 Dec 2025 · not a live feed (filed data) · just now");
+});
+
+/** A ladder in its report's own bands, as a version 2 server sends it: carrying amounts under IFRS, in HKD millions. */
+function bandPayload(): DebtMaturitiesPayload {
+  const base = payload();
+  const pdf = "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0408/2026040800985.pdf";
+  const band = (label: string, fromMonths: number, toMonths: number | null, value: number) =>
+    ({ label, fromMonths, toMonths, value, members: [`Repayable ${label.toLowerCase()}`] });
+  return {
+    ...base, version: 2, cik: null, taxonomy: "ifrs-full", status: "partial", asOf: "2025-12-31",
+    source: { name: "HKEX annual or interim report notes", url: pdf, cadence: "Annual and interim reports" },
+    latest: { ...base.latest!, asOf: "2025-12-31", filed: "2026-04-08", accession: "HKEX-2026040800985", form: "HKEX", currency: "HKD",
+      filingUrl: pdf, taxonomy: "ifrs-full", amountBasis: "carrying", sourceTotal: 88_436e6,
+      source: { url: pdf, concept: "Page 88: The maturity of long-term loans and bonds", scale: 1e6, scaleStated: true, reconciledTo: null },
+      sourceBuckets: [band("Within 1 year", 0, 12, 17_166e6), band("1 to 2 years", 12, 24, 16_227e6),
+        band("2 to 5 years", 24, 60, 43_947e6), band("After 5 years", 60, null, 11_096e6)] },
+    history: [{ ...base.history.at(-1)!, asOf: "2025-12-31", filed: "2026-04-08", accession: "HKEX-2026040800985", currency: "HKD",
+      complete: false, totalPrincipal: null, next12Months: null, next12MonthsShare: null, next3Years: null, next3YearsShare: null }],
+  };
+}
+
+test("a ladder in its report's own bands shows the bands as printed, in their basis, and its filing's standard and scale", async () => {
+  spy = spyOn(apiClient, "getCloudDebtMaturities").mockImplementation(async () => bandPayload());
+  debtMaturitiesCache.reset();
+  const lines = await render(94, 20);
+  const text = lines.join("\n");
+  // No principal history to compare: Maturities and Filing only.
+  expect(lines[0]).toContain("Maturities");
+  expect(lines[0]).not.toContain("History");
+  expect(text).toMatch(/Carrying total +88\.44B HKD +IFRS/);
+  // Within 1 year ends exactly at twelve months; three years falls inside 2 to 5 years, so it has no share.
+  expect(text).toMatch(/Due next 12 months +19\.4%/);
+  expect(text).not.toContain("Due next 3 years");
+  expect(lines.find((line) => line.includes("MATURITY"))).toMatch(/MATURITY.* CARRYING +% TOTAL +WALL/);
+  for (const [label, amount] of [["Within 1 year", "17.17B"], ["1 to 2 years", "16.23B"], ["2 to 5 years", "43.95B"], ["After 5 years", "11.10B"]] as const) {
+    expect(lines.find((line) => line.includes(label))).toContain(amount);
+  }
+  expect(text).not.toMatch(/Year [2-5]|Thereafter/);
+  // The footer names the report and its date.
+  expect(lines.find((line) => line.includes("[o]pen"))).toContain("HKEX annual or interim report notes · Wed 31 Dec 2025");
+
+  await tui.emitKeypress({ name: "return" });
+  await settle();
+  const detail = tui.frame();
+  expect(detail).toMatch(/Carrying amount +17,166,000,000 HKD/);
+  expect(detail).toMatch(/Read from +Repayable within 1 year/);
+
+  const filing = (await render(94, 20, "filing")).join("\n");
+  expect(filing).toMatch(/Standard +IFRS/);
+  expect(filing).toMatch(/Basis +Carrying amounts/);
+  expect(filing).toMatch(/Reported in +HKD millions/);
+  expect(filing).toMatch(/Annual interest +Not reported/);
+  expect(filing).not.toContain("Rank window");
 });

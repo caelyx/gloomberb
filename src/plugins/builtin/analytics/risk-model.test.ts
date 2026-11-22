@@ -1,17 +1,24 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { expect, test } from "bun:test";
 import type { Portfolio, TickerRecord } from "../../../types/ticker";
 import {
   buildPortfolioRisk,
+  riskPaneWarnings,
+  riskRowWarnings,
+  factorFitText,
+  withoutFactorFit,
   portfolioRiskRequests,
   portfolioRiskTickers,
   riskCoverageLine,
+  riskCoverageParts,
+  riskReturnCalendar,
   riskCoverageNotices,
   riskCoverageShortfall,
   riskEvidence,
   riskReturnsCurrency,
   HOLDINGS_SUMMARY_ROW_IDS,
 } from "./risk-model";
-import { FX_NO_PAIR } from "./risk-fx";
+import { bridgedFxClose, FX_NO_PAIR } from "./risk-fx";
 import { parseFxShifts, repriceBook, riskCashLines, type RiskAssetShift, type RiskFxShift } from "./risk-book";
 import { rollingBeta, subtractReturns } from "./risk-math";
 import {
@@ -47,10 +54,21 @@ function holding(symbol: string, quantity = 1): TickerRecord {
     positions: [{ portfolio: "local", shares: quantity, broker: "manual" }],
   });
 }
-function market(staleQuotes: readonly string[] = []): RiskMarketSnapshot {
+/** A holding the equity basket leaves out (a commodity), worth what a share of it would be. */
+function commodity(symbol: string): TickerRecord {
+  return createTestTicker(symbol, symbol, {
+    exchange: "ARCA",
+    assetCategory: "CMDTY",
+    portfolios: ["local"],
+    positions: [{ portfolio: "local", shares: 1, broker: "manual" }],
+  });
+}
+/** `behind`: proxies whose latest close is a day older than the rest's, as a Singapore close is by the US evening. */
+function market(staleQuotes: readonly string[] = [], behind: readonly string[] = []): RiskMarketSnapshot {
   return {
     histories: RISK_FACTOR_INSTRUMENTS.map((instrument) => {
       const history = riskHistory();
+      if (behind.includes(instrument.symbol)) history.data!.pop();
       history.providerMeta!.normalizedSymbol = instrument.symbol;
       history.providerMeta!.normalizedExchange = instrument.exchange;
       const quote = {
@@ -135,6 +153,18 @@ test("foreign listings with daily FX closes enter the basket in USD and the foot
   // Converted returns sit on the basket's calendar, so the estimates still have 60 matched sessions.
   expect(model.metrics.every((row) => row.value != null)).toBe(true);
   expect(model.rows.holdings.find((row) => row.label === "JPY1")?.detail).toContain("from JPY at daily FX");
+  // The returns are on US trading days, each market abroad carrying its last close over the ones it did not trade, and
+  // the tail rows' method says so.
+  expect(model.calendar).toBe("US trading days, other markets at their last close");
+  const tail = model.rows.risk.find((row) => row.id === "var")!;
+  expect(riskEvidence(tail)).toStartWith("historical, 1-day, 95%, 60 daily returns on US trading days, other markets at their last close; basket 453,560 USD");
+  // The pane's footer sets the coverage apart from the conversions, with shorter forms for a narrow row.
+  expect(riskCoverageParts(model.coverage)).toEqual({
+    text: "basket 453,560 USD = 97% of book; left out: UNQ1 2%, UNQ2 1%, UNQ3 under 1%",
+    short: "97% of book; left out: UNQ1 2%, UNQ2 1%, UNQ3 under 1%",
+    shortest: "97% of book; UNQ1, UNQ2, UNQ3 left out",
+    converted: "6 holdings converted from local currency",
+  });
   // Closes at another time than the US session read low against US holdings, and the pane says so.
   expect(model.notes).toContain(
     "Converted holdings are matched to the US close of the same date; where their market closes at another time, correlations and betas to US holdings read lower than they are.",
@@ -183,16 +213,39 @@ test("a TRY account converts each holding's USD returns at its own dates' USD/TR
   const usdReturns = (symbol: string) => market.histories.find((row) => row.instrument.symbol === symbol)!.returns;
   const quality = rollingBeta(model.basket, subtractReturns(usdReturns("QUAL"), usdReturns("SPY")), "", "quality");
   expect(model.factors.find((row) => row.id === "quality")!.value).toBeCloseTo(quality.value!, 12);
+  // The book's beta to the dollar against the lira, from the account's own closes over the basket's sessions; a USD account has none.
+  const close = (date: string) => bridgedFxClose((day) => fx.closes[day], date)?.rate;
+  const dollar = usdReturns("SPY").flatMap((row) => {
+    const start = close(row.startDateKey), end = close(row.dateKey);
+    return start && end ? [{ ...row, value: start / end - 1 }] : [];
+  });
+  const currency = model.factors.find((row) => row.id === "currency")!;
+  expect(currency.label).toBe("Currency (USD/TRY)");
+  expect(currency.value).toBeCloseTo(rollingBeta(model.basket, dollar, "", "currency").value!, 12);
+  expect(usd.factors.some((row) => row.id === "currency")).toBe(false);
+  // Its evidence gives the book's share in each currency; every factor row carries its fit for the pane's R² column.
+  expect(model.rows.factors.find((row) => row.id === "currency")!.detail).toMatch(/^\d+% USD, \d+% JPY(, \d+% SAR)? of book; 60 sessions; R² /);
+  expect(model.rows.factors.every((row) => row.rSquared !== undefined)).toBe(true);
+  // A holding listed outside the US is measured against US factor proxies, and the notes say which.
+  expect(model.notes).toContain("Factors are US ETF proxies; JPY1 trades outside the US and is measured against them.");
 
-  // A missing lira close on a holding's dates leaves that holding out, never bridged; one whose history starts later still converts.
-  const us02 = market.histories.find((row) => row.instrument.symbol === "US02")!;
-  us02.returns = us02.returns.slice(-80);
+  // A missing lira close on a holding's dates converts at the close before it, and the notes say which.
   const gap = held("US01", usd).returns[10]!.dateKey;
   const { [gap]: _missing, ...closes } = fx.closes;
-  const gapped = buildPortfolioRisk(account, tickers, { ...market, accountFx: { ...fx, closes } });
+  const bridged = buildPortfolioRisk(account, tickers, { ...market, accountFx: { ...fx, closes } });
+  expect(bridged.coverage.leftOut.map((row) => [row.symbol, row.reason])).toEqual([["SAR1", FX_NO_PAIR]]);
+  expect(bridged.notes).toContain(`USD/TRY has no daily close on ${gap}; the returns across it use the close before it.`);
+  expect(model.notes.some((note) => note.startsWith("USD/TRY has no daily close"))).toBe(false);
+  // Four FX trading days without one are missing data: those holdings are left out; one whose history starts later still converts.
+  const us02 = market.histories.find((row) => row.instrument.symbol === "US02")!;
+  us02.returns = us02.returns.slice(-80);
+  const dates = Object.keys(fx.closes).sort();
+  const dropped = new Set(dates.slice(dates.indexOf(gap), dates.indexOf(gap) + 4));
+  const longGap = Object.fromEntries(Object.entries(fx.closes).filter(([date]) => !dropped.has(date)));
+  const gapped = buildPortfolioRisk(account, tickers, { ...market, accountFx: { ...fx, closes: longGap } });
   expect(gapped.coverage.leftOut.map((row) => [row.symbol, row.reason])).toEqual([
-    ["JPY1", "USD/TRY daily FX history has gaps on the holding's dates"],
-    ["US01", "USD/TRY daily FX history has gaps on the holding's dates"],
+    ["JPY1", "USD/TRY daily FX history has gaps longer than three days on the holding's dates"],
+    ["US01", "USD/TRY daily FX history has gaps longer than three days on the holding's dates"],
     ["SAR1", FX_NO_PAIR],
   ]);
   expect(gapped.coverage.sufficient).toBe(true);
@@ -294,9 +347,9 @@ test("only held positions marked at a close raise the close-mark warning", () =>
 });
 test("cash counts in the book the coverage is a share of, by currency, but never in the basket, its sufficiency or concentration", () => {
   const snapshot = { ...market(), fxRates: { TRY: 0.025 } };
-  // $330 of SPY in the basket, a $110 short left out, 4,400 lira ($110) and $220 of cash: a $770 book.
+  // $330 of SPY in the basket, a $110 commodity left out, 4,400 lira ($110) and $220 of cash: a $770 book.
   const cash = [{ currency: "TRY", amount: 4_400 }, { currency: "USD", amount: 220 }];
-  const model = buildPortfolioRisk(portfolio, [holding("SPY", 3), holding("IWM", -1)], snapshot, null, undefined, {}, cash);
+  const model = buildPortfolioRisk(portfolio, [holding("SPY", 3), commodity("IWM")], snapshot, null, undefined, {}, cash);
   expect(model.coverage).toMatchObject({ marketValue: 770, holdingsValue: 440, cashValue: 330, coveredValue: 330, sufficient: true });
   // The basket is 43% of the book but 75% of the holdings, so it still estimates.
   expect(model.coverage.holdingsShare).toBe(0.75);
@@ -367,22 +420,61 @@ test("currency and price shocks reprice each line of the book, cash included, an
   expect(lira.lines[1]!.shocks).toEqual(["EUR +5% vs USD", "TRY -20% vs USD"]);
   expect(lira.percent).toBeCloseTo(5_800 / 25_600 * 100, 10);
 });
-test("a short is left out of the basket with its reason and counts in the market value", () => {
-  const model = buildPortfolioRisk(
-    portfolio,
-    [holding("SPY", 3), holding("IWM", -1)],
-    market(),
-  );
-  expect(model.coverage.share).toBe(0.75);
-  expect(model.coverage.leftOut).toEqual([
-    { id: "ARCA:IWM", symbol: "IWM", reason: "Short positions: signed exposure history required", value: 110, share: 0.25 },
+test("cash entered by hand in several currencies is left out one currency at a time, and an FX shift moves each balance in its own currency", () => {
+  // HK$800 ($100 at 8 to the dollar), $220 and 4,400 lira ($110), with $330 of SPY: a $760 book.
+  const book: Portfolio = { ...portfolio, cash: { amount: 800, currency: "HKD" },
+    otherCash: [{ amount: 220, currency: "USD" }, { amount: 4_400, currency: "TRY" }] };
+  expect(riskCashLines(book, null)).toEqual([{ currency: "HKD", amount: 800 }, { currency: "USD", amount: 220 }, { currency: "TRY", amount: 4_400 }]);
+  const snapshot = { ...market(), fxRates: { TRY: 0.025, HKD: 0.125 } };
+  // Left out, the cash comes from the portfolio's own balances.
+  const model = buildPortfolioRisk(book, [holding("SPY", 3)], snapshot, null,
+    { equity: -10, rates: 100, volatility: 10, fx: [{ currency: "TRY", percent: -20 }, { currency: "HKD", percent: 5 }] });
+  expect(model.coverage).toMatchObject({ marketValue: 760, cashValue: 430 });
+  expect(riskCoverageLine(model.coverage)).toBe("basket 330 USD = 43% of book; left out: USD cash 29%, TRY cash 15%, HKD cash 13%");
+  // The lira takes a fifth off its $110 and the Hong Kong dollar adds 5% to its $100; the dollars stay: -$17 on the book.
+  const rows = model.rows.stress.filter((row) => row.id.startsWith("shock:"));
+  expect(rows.map((row) => [row.label, row.value, row.amount])).toEqual([
+    ["TRY cash", expect.closeTo(-20, 10), expect.closeTo(-22, 10)],
+    ["HKD cash", expect.closeTo(5, 10), expect.closeTo(5, 10)],
+    ["Book total", expect.closeTo(-17 / 760 * 100, 10), expect.closeTo(-17, 10)],
   ]);
-  expect(model.holdings.map((row) => row.weight)).toEqual([1, null]);
-  expect(riskCoverageLine(model.coverage)).toBe("basket 330 USD = 75% of book; left out: IWM 25%");
-  // Concentration reads the whole priced book, the short at its gross value; the weights above are the basket's.
-  expect(model.book?.gross).toBe(440);
-  expect(model.book?.top).toBe(0.75);
-  expect(model.metrics[2]!.value).toBeCloseTo(0, 8);
+});
+test("a short enters the basket at its signed weight, not left out", () => {
+  // $330 of SPY long and $110 of IWM short: weights of +75% and -25% of the $440 gross, every dollar covered.
+  const model = buildPortfolioRisk(portfolio, [holding("SPY", 3), holding("IWM", -1)], market());
+  expect(model.coverage).toMatchObject({ coveredValue: 440, share: 1, leftOut: [], sufficient: true });
+  expect(model.holdings.map((row) => row.weight)).toEqual([0.75, -0.25]);
+  expect(model.rows.holdings.find((row) => row.label === "IWM")).toMatchObject({ value: -25 });
+  // Both proxies move alike here, so per the gross $440 the short halves the basket's move; per the net $220, as a
+  // fund states it, the basket moves as SPY does: a 150/50 book of one market reads its volatility and beta as SPY's.
+  const long = buildPortfolioRisk(portfolio, [holding("SPY", 3)], market());
+  const volatility = (risk: typeof model) => risk.metrics.find((row) => row.id === "volatility")!.value!;
+  expect(volatility(model)).toBeCloseTo(volatility(long), 10);
+  expect(model.notes.filter((note) => note.includes("per the book's net value"))).toHaveLength(1);
+  // VaR in money is on the same net $220 its percent is stated per, not on the $440 gross.
+  const tail = model.rows.risk.find((row) => row.id === "var")!;
+  expect(tail.amountBase).toBeCloseTo(220, 8);
+  expect(tail.amount).toBeCloseTo((tail.value! / 100) * 220, 8);
+  // A long-only book is read as before, with nothing said; a market-neutral one per gross exposure, said once.
+  expect(long.notes.some((note) => /per (the book's net value|gross exposure)/.test(note))).toBe(false);
+  const neutral = buildPortfolioRisk(portfolio, [holding("SPY", 3), holding("IWM", -3)], market());
+  expect(neutral.notes.filter((note) => note.includes("per gross exposure"))).toHaveLength(1);
+  expect(volatility(neutral)).toBeCloseTo(0, 10);
+});
+test("a pair whose latest closes are a day apart correlates over the latest 60 returns both have", () => {
+  const model = buildPortfolioRisk(portfolio, [holding("SPY", 3), holding("IWM", 1), holding("IWD", 1)], market([], ["IWM", "IWD"]));
+  const pairs = new Map(model.rows.correlation.map((row) => [row.label, row]));
+  expect(model.correlation.map((row) => row.samples)).toEqual([60, 60, 60]);
+  expect(pairs.get("SPY / IWM")).toMatchObject({ value: expect.any(Number), detail: "60 matched daily returns" });
+  // Both end on the same older day, so neither ever lacked the other's closes.
+  expect(pairs.get("IWM / IWD")?.asOf).toBe(pairs.get("SPY / IWM")?.asOf);
+  // Holdings that share too few days say how many, not that they have none.
+  const apart = market();
+  const iwd = apart.histories.find((entry) => entry.instrument.symbol === "IWD")!;
+  // Two-day returns from the 21st back, as a market that closes every other day would have.
+  iwd.returns = iwd.returns.map((point, index, all) => index >= all.length - 20 || index % 2 ? point : { ...point, startDateKey: all[index - 1]?.startDateKey ?? point.startDateKey });
+  const sparse = buildPortfolioRisk(portfolio, [holding("SPY", 3), holding("IWD", 1)], apart);
+  expect(sparse.rows.correlation[0]).toMatchObject({ value: null, detail: expect.stringMatching(/^only [1-5]\d daily returns on the same dates; 60 needed$/) });
 });
 test("a crypto holding is excluded by name with its reason, not folded into the equity basket", () => {
   const eth = createTestTicker("ETH-USD", "Ethereum USD", {
@@ -419,9 +511,9 @@ test("a depositary receipt is an equity in the basket, and what is still left ou
   // A holding the basket cannot take stays named, up to three, then "N more" with their combined share.
   const one = buildPortfolioRisk(portfolio, [...adr, crypto("ETH-USD")], market());
   expect(riskCoverageLine(one.coverage)).toBe("basket 550 USD = at most 100% of book; left out: ETH-USD value unknown");
-  const three = buildPortfolioRisk(portfolio, [...adr, holding("IEF", -1), holding("HYG", -1), holding("IWD", -1)], market());
+  const three = buildPortfolioRisk(portfolio, [...adr, commodity("IEF"), commodity("HYG"), commodity("IWD")], market());
   expect(riskCoverageLine(three.coverage)).toBe("basket 550 USD = 63% of book; left out: IEF 13%, HYG 12%, IWD 12%");
-  const four = buildPortfolioRisk(portfolio, [...adr, ...["IEF", "HYG", "IWD", "IWF"].map((symbol) => holding(symbol, -1))], market());
+  const four = buildPortfolioRisk(portfolio, [...adr, ...["IEF", "HYG", "IWD", "IWF"].map(commodity)], market());
   expect(riskCoverageLine(four.coverage)).toBe("basket 550 USD = 56% of book; left out: IEF 11%, HYG 11%, 2 more 22%");
 });
 test("imported option snapshots use signed dollar sensitivities, preserve scope and reject stale or mixed currencies", () => {
@@ -597,4 +689,47 @@ test("broker option matching requires one exact conId and source contract, prese
     dependencies,
   );
   expect(ambiguous.warnings[0]).toContain("Exact broker");
+});
+
+test("a factor that explains under a tenth of the basket's moves reads as a weak fit, and a table with an R² column drops it from the evidence", () => {
+  expect(factorFitText(0.28)).toBe("R² 0.28");
+  expect(factorFitText(0.094)).toBe("R² 0.09, weak fit");
+  expect(factorFitText(0.0999)).toBe("R² 0.10");
+  expect(factorFitText(null)).toBe(`R² ${MISSING_VALUE}`);
+  expect(withoutFactorFit("60 sessions; R² 0.01, weak fit; independent ETF proxy")).toBe("60 sessions; independent ETF proxy");
+  expect(withoutFactorFit("76% USD, 24% TRY of book; 60 sessions; R² 0.28; daily USD/TRY closes")).toBe("76% USD, 24% TRY of book; 60 sessions; daily USD/TRY closes");
+});
+
+test("a holding saved under its venue's code (ES3:XSES) is requested and labelled as the listing it is", async () => {
+  const { listedSymbol } = await import("../../../portfolio/listed-symbol");
+  // Saved as ES3:XSES because the bare ES3 was the CME future's: its history is ES3's on SGX, never a symbol the service does not know.
+  const held = createTestTicker("ES3:XSES", "SPDR Straits Times Index ETF", {
+    exchange: "SGX", currency: "SGD", portfolios: ["book"], positions: [{ portfolio: "book", shares: 10_000, broker: "manual" }],
+  });
+  expect(portfolioRiskRequests([held], "book")[0]).toMatchObject({ symbol: "ES3", exchange: "SGX" });
+  // The pane names it by the venue, as D05:SGX beside it.
+  expect(listedSymbol(held, held.metadata.ticker, "US")).toBe("ES3:SGX");
+});
+
+// A book of US funds and two Borsa Istanbul banks read its risk with no word of which days its returns were on.
+test("the days a basket's returns are on are named when it holds a market abroad, which carries its last close over US days", () => {
+  expect(riskReturnCalendar([{ exchange: "ARCA" }, { exchange: "NASDAQ" }, { exchange: "" }, { exchange: "CME" }])).toBeNull();
+  expect(riskReturnCalendar([{ exchange: "ARCA" }, { exchange: "BIST", convertedFrom: "TRY" }, { exchange: "BIST", convertedFrom: "TRY" }]))
+    .toBe("US trading days, BIST at its last close");
+  expect(riskReturnCalendar([{ exchange: "LSE" }, { exchange: "XETR" }])).toBe("US trading days, LSE and XETRA at their last close");
+  expect(riskReturnCalendar([{ exchange: "LSE" }, { exchange: "XETRA" }, { exchange: "JPX" }])).toBe("US trading days, other markets at their last close");
+  // A listing abroad saved without its venue still says the days, without naming one.
+  expect(riskReturnCalendar([{ exchange: "", convertedFrom: "TRY" }])).toBe("US trading days, other markets at their last close");
+});
+
+// A holding's failed mark and an option's failed valuation read as the whole book's in the footer.
+test("a warning that names a holding or an option is its row's; the book's stay the footer's", () => {
+  const model = {
+    warnings: ["AAPL: quote is from another listing", "AAPL261120C00200000: no implied volatility", "Treasury yield: the source did not answer"],
+    holdings: [{ symbol: "AAPL" }, { symbol: "MSFT" }],
+    greeks: { rows: [{ symbol: "AAPL261120C00200000" }] },
+  } as unknown as Parameters<typeof riskPaneWarnings>[0];
+  expect(riskPaneWarnings(model)).toEqual(["Treasury yield: the source did not answer"]);
+  expect(riskRowWarnings(model, "AAPL")).toEqual(["quote is from another listing"]);
+  expect(riskRowWarnings(model, "MSFT")).toEqual([]);
 });

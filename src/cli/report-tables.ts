@@ -11,6 +11,7 @@ import { serializeCsv } from "../utils/csv";
 import {
   BLANK_DISPLAY,
   DISPLAY_PLACEHOLDER,
+  figureAsDrawn,
   labelWithUnit,
   parseDisplayNumber,
   type DisplayNumber,
@@ -20,8 +21,10 @@ import type { ReportFreshness } from "./pane-functions/freshness";
 import {
   EXPORT_DATING_COLUMNS,
   EXPORT_IDENTITY_COLUMNS,
+  EXPORT_RETRIEVAL_COLUMN,
   exportDatingCells,
   exportIdentityCells,
+  exportRetrievalCell,
   exportSourceLines,
   type ExportIdentity,
 } from "./export-source";
@@ -40,6 +43,12 @@ export interface CliReportTable {
   identity?: ExportIdentity;
   /** What each row is of where it differs from the table's: a table of metrics whose rows have different units. */
   rowIdentities?: readonly (ExportIdentity | undefined)[];
+  /**
+   * How many of the last `columns` the export gained after its fixed columns
+   * were set (a chart leg's contract, FUT's group): they follow the fixed
+   * columns and `retrieved_at`, so no column an earlier export had moves.
+   */
+  appendedColumns?: number;
 }
 
 export interface CliReportTables {
@@ -71,6 +80,13 @@ export interface CliReportColumn<Row = Record<string, unknown>> {
    * rows loaded (a market cap in one currency for some peers, in another for others).
    */
   unitColumn?: boolean;
+  /** CSV and NDJSON write the figure to the digits `format` draws (figureAsDrawn); JSON keeps it whole. */
+  exportAsShown?: boolean;
+  /**
+   * A column the export gained after its others were set (RV's `Fwd P/E period`): it closes the row, after the
+   * fixed columns and `retrieved_at` (`appendedColumns`), so no column an earlier export had moves.
+   */
+  exportLast?: boolean;
 }
 
 /** A label/value line of a report. `unit` names the unit of a numeric `value` when `formatted` cannot say it. */
@@ -86,7 +102,8 @@ type Cell =
   /** `unit`: what the column draws a number of this row in, so a missing figure still names its unit. */
   | { kind: "blank"; unit?: string }
   | { kind: "text"; text: string; time?: boolean }
-  | { kind: "number"; value: number; unit: string }
+  /** `drawn`: the value and the number the text drew for it, whose scale the whole column decides (`columnScale`). */
+  | { kind: "number"; value: number; unit: string; drawn?: { value: number; display: DisplayNumber } }
   /** Text that may read as a number, once the whole column is known. */
   | { kind: "textual"; text: string };
 
@@ -99,6 +116,8 @@ interface ResolvedColumn {
   unit?: string;
   /** The unit always has a column of its own (`unitColumn`). */
   unitColumn?: boolean;
+  /** The column closes the row after the fixed columns (`exportLast`). */
+  last?: boolean;
 }
 
 const BLANK = { kind: "blank" } as const;
@@ -112,6 +131,8 @@ const CHANGE_NOTE = /^\(?[+\-\u2212]?[\d.,]+%?\)?$/;
  * fraction, or in thousands, millions or billions named by the header.
  */
 const DISPLAY_SCALES = [1, 100, 0.01, 1e-3, 1e-6, 1e-9, 1e-12, 1e3, 1e6, 1e4];
+/** A figure drawn in thousands, millions, billions or trillions: `1.18M`, `-2.3B`, `$45K`. */
+const COMPACT_FIGURE = /^[+\-\u2212]?[$€£¥]?\d[\d,]*(?:\.\d+)?\s?[KMBT]$/i;
 // "3M" is as often a tenor as three million.
 const BARE_SCALED = /^[+-]?\d+[kKMBT]$/;
 // Beside "1Y" or "6W", "3M" is three months.
@@ -132,14 +153,26 @@ export function float32Shortest(value: number): number | null {
 }
 
 /**
- * A number without binary floating-point noise (47.350000000000364, 0.0615 * 100),
- * as the text view drops it: twelve significant digits, whole numbers and
- * amounts of a billion or more as they are.
+ * A number without binary floating-point noise (47.350000000000364, 0.0615 * 100,
+ * a change of -1.8000000000000114), as the text view drops it and every export
+ * writes it, JSON included: twelve significant digits, and on figures of ten
+ * thousand or more eight decimals (a coin holding to the satoshi) as far as
+ * fifteen significant digits, so an amount in the trillions keeps its cents.
+ * Sub-penny prices, FX rates and yields keep every digit a source quotes.
+ * Whole numbers stay as they are.
  */
 export function exportNumber(value: number): number {
-  if (Number.isInteger(value) || Math.abs(value) >= 1e9) return Object.is(value, -0) ? 0 : value;
-  const rounded = float32Shortest(value) ?? Number(value.toPrecision(12));
+  if (!Number.isFinite(value) || Number.isInteger(value)) return Object.is(value, -0) ? 0 : value;
+  const magnitude = Math.floor(Math.log10(Math.abs(value)));
+  const rounded = float32Shortest(value) ?? (magnitude < 4
+    ? Number(value.toPrecision(12))
+    : Number(value.toFixed(Math.max(0, Math.min(8, 14 - magnitude)))));
   return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+/** `JSON.stringify`'s replacer for what the CLI writes as JSON: every number as `exportNumber` writes it. */
+export function exportJsonValue(_key: string, value: unknown): unknown {
+  return typeof value === "number" ? exportNumber(value) : value;
 }
 
 function isoInstant(time: number): string {
@@ -167,16 +200,50 @@ function readDisplay(value: string): DisplayNumber | typeof BLANK_DISPLAY | null
  * with its sign turned (a short position as a negative amount) exports it as
  * drawn, every digit, not the rounded figure read back.
  */
-function valueAsDrawn(value: number, drawn: DisplayNumber): number | null {
-  const target = Number(drawn.number);
-  const tolerance = drawn.step * (1 + 1e-9) + Number.EPSILON;
-  for (const sign of [1, -1]) {
-    for (const scale of DISPLAY_SCALES) {
-      const scaled = sign * value * scale;
-      if (Math.abs(scaled - target) <= tolerance) return exportNumber(scaled);
-    }
+function valueAsDrawn(value: number, drawn: DisplayNumber, scales: readonly number[] = SIGNED_SCALES): number | null {
+  const scale = scales.find((entry) => fitsDrawn(value, drawn, entry));
+  return scale === undefined ? null : exportNumber(value * scale);
+}
+
+/** Each display scale, then each with the sign turned, in the order a value is read by. */
+const SIGNED_SCALES = [...DISPLAY_SCALES, ...DISPLAY_SCALES.map((scale) => -scale)];
+
+/** Whether a value times a signed scale is the number drawn, to its last digit. */
+function fitsDrawn(value: number, drawn: DisplayNumber, scale: number): boolean {
+  return Math.abs(value * scale - Number(drawn.number)) <= drawn.step * (1 + 1e-9) + Number.EPSILON;
+}
+
+/**
+ * The one scale a column's values are drawn at, decided from all of them,
+ * one row's column too: a value near zero fits several (a spread of 0.0013
+ * drawn "+0.1" is within a step of itself as of 100 times itself), and read
+ * alone it would export at another scale than the rows beside it (0.0013
+ * beside 0.8586). Of the scales most values fit, the one whose values come
+ * closest to the figures drawn, in steps; the earlier in `SIGNED_SCALES` on a
+ * tie. A figure drawn as 0 says nothing of the scale (0.04 drawn "0" is
+ * nearer still at a hundredth of itself), so it is left out of the distance.
+ * Null for a column with no value drawn as a number.
+ */
+function columnScale(cells: readonly Cell[]): number | null {
+  const drawn = cells.flatMap((cell) => cell.kind === "number" && cell.drawn ? [cell.drawn] : []);
+  let best: { scale: number; fits: number; miss: number } | null = null;
+  for (const scale of SIGNED_SCALES) {
+    const fitting = drawn.filter((entry) => fitsDrawn(entry.value, entry.display, scale));
+    if (fitting.length === 0) continue;
+    const scaled = fitting.filter(({ display }) => Number(display.number) !== 0);
+    const miss = scaled.reduce((total, { value, display }) => total + Math.abs(value * scale - Number(display.number)) / display.step, 0) / Math.max(1, scaled.length);
+    if (!best || fitting.length > best.fits || (fitting.length === best.fits && miss < best.miss - 1e-9)) best = { scale, fits: fitting.length, miss };
   }
-  return null;
+  return best?.scale ?? null;
+}
+
+/** The column's cells, each value drawn as a number exported at the column's one scale where it fits it. */
+function atColumnScale(cells: Cell[]): Cell[] {
+  const scale = columnScale(cells);
+  if (scale == null) return cells;
+  return cells.map((cell) => cell.kind === "number" && cell.drawn && fitsDrawn(cell.drawn.value, cell.drawn.display, scale)
+    ? { ...cell, value: exportNumber(cell.drawn.value * scale) }
+    : cell);
 }
 
 function timeCell(instant: number, dateOnly: boolean, shown: string | null, raw?: string): Cell {
@@ -195,13 +262,13 @@ function numberCell(value: number, shown: string | null, key: string | undefined
   if (drawn === BLANK_DISPLAY) return BLANK;
   // "3M" drawn from 3 is a tenor or a code, not three million.
   if (drawn && BARE_SCALED.test(shown) && value === Number(shown.replace(/[kKMBT]$/, ""))) return text(shown);
-  if (drawn) return { kind: "number", value: valueAsDrawn(value, drawn) ?? Number(drawn.number), unit: drawn.unit };
+  if (drawn) return { kind: "number", value: valueAsDrawn(value, drawn) ?? Number(drawn.number), unit: drawn.unit, drawn: { value, display: drawn } };
   // A time drawn as a date or a clock.
   if (isEpochMilliseconds(value)) return timeCell(value, false, shown);
   const [first, ...rest] = shown.split(/\s+/);
   const lead = rest.length > 0 && CHANGE_NOTE.test(rest.join(" ")) ? readDisplay(first!) : null;
   const scaled = lead && lead !== BLANK_DISPLAY ? valueAsDrawn(value, lead) : null;
-  if (lead && lead !== BLANK_DISPLAY && scaled != null) return { kind: "number", value: scaled, unit: lead.unit };
+  if (lead && lead !== BLANK_DISPLAY && scaled != null) return { kind: "number", value: scaled, unit: lead.unit, drawn: { value, display: lead } };
   return text(shown);
 }
 
@@ -263,7 +330,8 @@ function exportCell(raw: unknown, display: string | null, key?: string): Cell {
  * becomes a number only beside other figures, never in a column of tenors
  * ("3M, 6M, 1Y"). Identifier columns keep their text.
  */
-function resolveColumn(header: string, cells: Cell[], parseText: boolean): ResolvedColumn {
+function resolveColumn(header: string, column: Cell[], parseText: boolean): ResolvedColumn {
+  const cells = atColumnScale(column);
   const textual = cells.flatMap((cell) => cell.kind === "textual" ? [cell] : []);
   const read = parseText ? textual.map((cell) => readDisplay(cell.text)) : [];
   const numeric = read.filter((entry): entry is DisplayNumber => entry != null && entry !== BLANK_DISPLAY);
@@ -336,7 +404,8 @@ function assembleTable(title: string, columns: readonly ResolvedColumn[], rowCou
   const units = columns.map((column) => rowCount === 0 && column.unit != null ? new Set([column.unit]) : numberUnits(column.cells));
   const mixed = units.map((columnUnits, index) => columnUnits.size > 1 || columns[index]!.unitColumn === true);
   const byRow = mixed.some(Boolean) ? rowUnits(columns, mixed, rowCount) : null;
-  const layout = columns.flatMap((column, index) => {
+  type LayoutColumn = { header: string; value: (row: number) => CliReportValue };
+  const columnLayout = (column: ResolvedColumn, index: number): LayoutColumn[] => {
     const columnUnits = units[index]!;
     const cell = (row: number) => cellValue(column.cells[row] ?? BLANK);
     if (index === 0 && byRow) {
@@ -357,12 +426,18 @@ function assembleTable(title: string, columns: readonly ResolvedColumn[], rowCou
         },
       },
     ];
-  });
+  };
+  const layoutOf = new Map<ResolvedColumn, LayoutColumn[]>(columns.map((column, index) => [column, columnLayout(column, index)]));
+  const layout = columns.flatMap((column) => layoutOf.get(column)!);
   if (status) layout.push({ header: status.header, value: (row: number) => status.values[row] ?? "" });
+  // A column the export gained later (`exportLast`) closes the row, after the status and the fixed columns.
+  const appended = columns.flatMap((column) => column.last ? layoutOf.get(column) ?? [] : []);
+  const ordered = [...layout.filter((entry) => !appended.includes(entry)), ...appended];
   return {
     title,
-    columns: layout.map((column) => column.header),
-    rows: Array.from({ length: rowCount }, (_, row) => layout.map((column) => column.value(row))),
+    columns: ordered.map((column) => column.header),
+    rows: Array.from({ length: rowCount }, (_, row) => ordered.map((column) => column.value(row))),
+    ...appended.length > 0 ? { appendedColumns: appended.length } : {},
   };
 }
 
@@ -464,7 +539,7 @@ export function exportRowsTable<Row extends Record<string, unknown>>(
   title: string,
   columns: readonly CliReportColumn<Row>[],
   rows: readonly Row[],
-  { status = false, rowUnitKey }: { status?: boolean; rowUnitKey?: string } = {},
+  { status = false, rowUnitKey, appendedColumns = 0 }: { status?: boolean; rowUnitKey?: string; appendedColumns?: number } = {},
 ): CliReportTable {
   const reasons = rows.map((): Array<{ header: string; text: string }> => []);
   const units = columns.map(columnUnit);
@@ -477,9 +552,10 @@ export function exportRowsTable<Row extends Record<string, unknown>>(
     const { header, cells } = resolveColumn(
       column.header,
       rows.map((row, index): Cell => {
-        const value = values[index];
         const unit = column.unitKey ? (row as Record<string, unknown> | undefined)?.[column.unitKey] : undefined;
-        const drawn = column.format ? column.format(value, row) : null;
+        const drawn = column.format ? column.format(values[index], row) : null;
+        const value = column.exportAsShown && drawn != null && typeof values[index] === "number"
+          ? figureAsDrawn(values[index], drawn) : values[index];
         // A figure the text leaves out of this row (another session's print) is not one of its figures.
         const left = drawn != null && readDisplay(drawn) === BLANK_DISPLAY;
         if (!left && typeof value === "number" && Number.isFinite(value) && (inRowUnit || (typeof unit === "string" && unit))) {
@@ -504,13 +580,21 @@ export function exportRowsTable<Row extends Record<string, unknown>>(
     };
     const unit = units[columnIndex];
     const withUnit = unit == null ? table : { ...table, unit };
-    return column.unitColumn && column.unitKey && !inRowUnit ? { ...withUnit, unitColumn: true } : withUnit;
+    const last = column.exportLast ? { ...withUnit, last: true } : withUnit;
+    return column.unitColumn && column.unitKey && !inRowUnit ? { ...last, unitColumn: true } : last;
   });
   const statusColumn = withStatus ? {
     header: columns.some((column) => column.header.trim().toLowerCase() === "status") ? "value_status" : "status",
     values: reasons.map(statusText),
   } : undefined;
-  return assembleTable(title, resolved, rows.length, statusColumn);
+  const table = assembleTable(title, resolved, rows.length, statusColumn);
+  if (appendedColumns && statusColumn) {
+    const before = table.columns.length - 1 - appendedColumns;
+    const reorder = <Value,>(values: Value[]) => [...values.slice(0, before), values.at(-1)!, ...values.slice(before, -1)];
+    table.columns = reorder(table.columns);
+    table.rows = table.rows.map(reorder);
+  }
+  return appendedColumns ? { ...table, appendedColumns } : table;
 }
 
 /** Label/value lines as `Metric,Value`; a number's unit moves into its label. */
@@ -534,14 +618,16 @@ export function exportEntriesTable(title: string, entries: readonly CliReportEnt
 export function exportTextTable(
   title: string,
   headers: readonly string[],
-  rows: ReadonlyArray<ReadonlyArray<{ text: string; instant?: string } | undefined>>,
+  rows: ReadonlyArray<ReadonlyArray<{ text: string; instant?: string; value?: number } | undefined>>,
 ): CliReportTable {
   return assembleTable(title, headers.map((header, index) => resolveColumn(
     header,
     rows.map((row) => {
       const cell = row[index];
       if (!cell) return BLANK;
-      return cell.instant ? exportCell(cell.instant, null) : exportCell(null, cell.text);
+      // The number behind a figure drawn short (a volume of 1.18M) exports as the source gave it.
+      if (cell.instant) return exportCell(cell.instant, null);
+      return exportCell(cell.value != null && COMPACT_FIGURE.test(cell.text.trim()) ? cell.value : null, cell.text);
     }),
     true,
   )), rows.length);
@@ -596,6 +682,27 @@ function sectionByTitle(tables: readonly CliReportTable[], wanted: string): CliR
 }
 
 /**
+ * The report with a row for each listing a list left out (a pair with no options of its own, a listing abroad where
+ * the data covers US listings only), added to its first table that has a Symbol and a status column: the symbol, its
+ * reason in status, the figures empty, so every symbol asked for has a row, as `fn` help says a missing figure's
+ * reason goes in status. A report with no such table is as it was.
+ */
+export function withRefusedRows(report: CliReportTables, refused: ReadonlyArray<{ symbol: string; reason: string }> | undefined): CliReportTables {
+  if (!refused?.length) return report;
+  const at = report.tables.findIndex((table) => table.columns.some((column) => column.toLowerCase() === "symbol")
+    && table.columns.some((column) => column === "status" || column === "value_status"));
+  if (at < 0) return report;
+  const table = report.tables[at]!;
+  const symbolAt = table.columns.findIndex((column) => column.toLowerCase() === "symbol");
+  const statusAt = table.columns.findIndex((column) => column === "status" || column === "value_status");
+  const rows = refused.map(({ symbol, reason }) => table.columns.map((_column, index) => index === symbolAt ? symbol : index === statusAt ? reason : ""));
+  const rowIdentities = [...table.rowIdentities ?? table.rows.map(() => undefined), ...refused.map(({ symbol }) => ({ symbolOrSeries: symbol, asOf: null }))];
+  const tables = [...report.tables];
+  tables[at] = { ...table, rows: [...table.rows, ...rows], rowIdentities };
+  return { ...report, tables };
+}
+
+/**
  * `--section`: one table, by its title or the start of it (any case), or its
  * 1-based position. Without a selector the report keeps every table.
  */
@@ -638,15 +745,22 @@ function identifiedTable(table: CliReportTable, report: CliReportTables, freshne
   const added = EXPORT_IDENTITY_COLUMNS.flatMap((column, index) => table.columns.includes(column) ? [] : [index]);
   const dating = report.dated
     ? EXPORT_DATING_COLUMNS.flatMap((column, index) => table.columns.includes(column) ? [] : [index]) : [];
-  if (added.length === 0 && dating.length === 0) return table;
+  // An undated row says when it was retrieved last; a dated one says it in `retrieved`.
+  const retrieval = !report.dated && !table.columns.includes(EXPORT_RETRIEVAL_COLUMN);
+  if (added.length === 0 && dating.length === 0 && !retrieval) return table;
+  const retrieved = exportRetrievalCell(freshness);
+  // Columns the export gained later close the row, after the fixed ones, so none of those moves.
+  const own = table.columns.length - Math.min(table.columns.length, Math.max(0, table.appendedColumns ?? 0));
   return {
     ...table,
-    columns: [...table.columns, ...added.map((index) => EXPORT_IDENTITY_COLUMNS[index]!), ...dating.map((index) => EXPORT_DATING_COLUMNS[index]!)],
+    columns: [...table.columns.slice(0, own), ...added.map((index) => EXPORT_IDENTITY_COLUMNS[index]!),
+      ...dating.map((index) => EXPORT_DATING_COLUMNS[index]!), ...retrieval ? [EXPORT_RETRIEVAL_COLUMN] : [], ...table.columns.slice(own)],
     rows: table.rows.map((row, index) => {
       const rowIdentity = identityFor(index);
       const identityCells = exportIdentityCells(freshness, rowIdentity);
       const datingCells = exportDatingCells(freshness, rowIdentity);
-      return [...row, ...added.map((column) => identityCells[column]!), ...dating.map((column) => datingCells[column]!)];
+      return [...row.slice(0, own), ...added.map((column) => identityCells[column]!), ...dating.map((column) => datingCells[column]!),
+        ...retrieval ? [retrieved] : [], ...row.slice(own)];
     }),
   };
 }
@@ -655,7 +769,8 @@ function identifiedTable(table: CliReportTable, report: CliReportTables, freshne
  * One table writes as a plain CSV; several write as blocks, each under a
  * `# section: <title>` line, with a blank line between. The footer follows
  * the data as `#` lines after a blank line. With the `freshness` the footer
- * cites, every row ends with the fixed columns of `EXPORT_IDENTITY_COLUMNS`.
+ * cites, every row ends with the fixed columns of `EXPORT_IDENTITY_COLUMNS`
+ * and the retrieval time (`retrieved_at`).
  */
 export function renderReportCsv(report: CliReportTables, freshness?: ReportFreshness): string {
   const marked = report.tables.length > 1;
@@ -664,6 +779,29 @@ export function renderReportCsv(report: CliReportTables, freshness?: ReportFresh
     ...(table.columns.length > 0 ? [[table.columns, ...table.rows].map(csvLine).join("\n")] : []),
   ].join("\n"));
   return withCsvFooter(blocks.join("\n\n"), report.footer);
+}
+
+/**
+ * A CSV as `withCsvFooter` writes it, split into its rows and its closing
+ * lines (without their `# `): what goes to the file or pipe, where a
+ * spreadsheet would read a `#` line as a row of junk, and what goes to
+ * standard error beside the warnings. Every row already names its source and
+ * as-of in its own columns. A section's `# section:` line stays with its rows.
+ */
+export function splitCsvFooter(text: string): { csv: string; footer: string[] } {
+  const isComment = (line: string) => line.startsWith("# ");
+  const blocks = text.split("\n\n");
+  const last = blocks.at(-1) ?? "";
+  const lines = last.split("\n");
+  if (!last || !lines.every(isComment) || lines.some((line) => line.startsWith("# section: "))) return { csv: text, footer: [] };
+  const csv = blocks.slice(0, -1).join("\n\n");
+  let quoted = false;
+  for (let index = 0; index < csv.length; index++) {
+    if (csv[index] !== '"') continue;
+    if (quoted && csv[index + 1] === '"') index++;
+    else quoted = !quoted;
+  }
+  return quoted ? { csv: text, footer: [] } : { csv, footer: lines.map((line) => line.slice(2)) };
 }
 
 /** CSV with its closing `#` lines after a blank line. */
@@ -686,7 +824,7 @@ export function renderReportNdjson(report: CliReportTables, freshness?: ReportFr
         const value = row[index];
         object[column] = value === undefined || value === "" ? null : value;
       });
-      return JSON.stringify(object);
+      return JSON.stringify(object, exportJsonValue);
     });
   }).join("\n");
 }

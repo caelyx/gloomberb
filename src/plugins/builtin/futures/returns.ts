@@ -3,10 +3,16 @@ import { periodReturn } from "../../../market-data/market/period-return";
 import type { FuturesContract } from "../../../market-data/futures-board";
 import { quotedContractMonth } from "./model";
 
-export type FuturesReturnHorizon = "1W" | "1M" | "YTD";
+/** The board draws 1W, 1M and YTD; its JSON and CSV add 3M, 6M and 1Y. */
+export type FuturesReturnHorizon = "1W" | "1M" | "3M" | "6M" | "1Y" | "YTD";
 export type FuturesReturnValues = Readonly<Record<FuturesReturnHorizon, number | null>>;
 
-export const NO_FUTURES_RETURNS: FuturesReturnValues = { "1W": null, "1M": null, YTD: null };
+const HORIZONS: readonly FuturesReturnHorizon[] = ["1W", "1M", "3M", "6M", "1Y", "YTD"];
+
+export const NO_FUTURES_RETURNS: FuturesReturnValues = { "1W": null, "1M": null, "3M": null, "6M": null, "1Y": null, YTD: null };
+
+/** The day of the close each return is measured from (`YYYY-MM-DD`), null where it has none. */
+export type FuturesReturnBases = Readonly<Record<FuturesReturnHorizon, string | null>>;
 
 const MONTH_CODES = "FGHJKMNQUVXZ";
 
@@ -30,6 +36,8 @@ const MONTHLY_FRONT_OFFSETS = [1, 2, 3];
  * picks among them.
  */
 export function frontContractCandidates(contract: FuturesContract, quote: Quote | null | undefined): string[] {
+  // A VIX generic (VX1) names no listed contract the history endpoints read: its row has no returns.
+  if (contract.venue === "CFE") return [];
   const named = quotedContractMonth(contract, quote);
   if (named) return [listedContractSymbol(contract, named.year, named.month)];
   if (!contract.everyMonth || !quote || !Number.isFinite(quote.lastUpdated)) return [];
@@ -83,8 +91,8 @@ export function pickFrontContract(
 
 /**
  * One contract's returns: the latest price against that same contract's close
- * on or before the same date a week and a calendar month earlier, and its
- * last close of the year before (periodReturn). The continuous alias's own
+ * on or before the same date a week and one, three, six and twelve calendar
+ * months earlier, and its last close of the year before (periodReturn). The continuous alias's own
  * series jumps at every roll (LE=F fell 6.3% on a July roll day), so its
  * history is never the baseline. `price` is the live quote, dated `asOf`;
  * without one the contract's last close stands in.
@@ -94,11 +102,27 @@ export function frontContractReturns(
   price: number | null | undefined,
   asOf: number | null | undefined,
 ): FuturesReturnValues {
+  return frontContractPeriodReturns(history, price, asOf).values;
+}
+
+/**
+ * frontContractReturns with the day of each return's base close, which the
+ * board's JSON and CSV carry and its report names: `fn FUT ZC`'s
+ * 1M on Thu 5 Nov runs from Mon 5 Oct's close, as CTM's 1M curve and RETURN do.
+ */
+export function frontContractPeriodReturns(
+  history: readonly PricePoint[],
+  price: number | null | undefined,
+  asOf: number | null | undefined,
+): { values: FuturesReturnValues; bases: FuturesReturnBases } {
   const closes = dailyCloses(history);
   const live = price != null && Number.isFinite(price) && asOf != null && Number.isFinite(asOf);
   const liveDay = live ? utcDay(asOf) : null;
   const latest = live && liveDay ? { day: liveDay, close: price } : closes.at(-1);
-  if (!latest) return NO_FUTURES_RETURNS;
-  const change = (period: FuturesReturnHorizon) => periodReturn(closes, period, latest)?.percent ?? null;
-  return { "1W": change("1W"), "1M": change("1M"), YTD: change("YTD") };
+  if (!latest) return { values: NO_FUTURES_RETURNS, bases: { "1W": null, "1M": null, "3M": null, "6M": null, "1Y": null, YTD: null } };
+  const periods = HORIZONS.map((period) => [period, periodReturn(closes, period, latest)] as const);
+  return {
+    values: Object.fromEntries(periods.map(([period, result]) => [period, result?.percent ?? null])) as FuturesReturnValues,
+    bases: Object.fromEntries(periods.map(([period, result]) => [period, result?.base.day ?? null])) as FuturesReturnBases,
+  };
 }

@@ -24,12 +24,16 @@ import { migrateSavedConfig, type ConfigMigrationHost } from "./migrations";
 import { encodeBuiltinDisabledPluginIds, expandBuiltinPluginGroups } from "../../../plugins/ownership";
 import { sanitizeSavedPaneState } from "./pane-state";
 import { isRecord } from "../../../utils/guards";
+import { normalizeWatchlistGroups } from "../../../portfolio/watchlist-groups";
+import { portfolioCashBalances, withPortfolioCashBalances } from "../../../portfolio/cash-balances";
 import { normalizeStoredBaseCurrency } from "../../../utils/base-currency";
 import { debugLog } from "../../../utils/debug-log";
 import { DEFAULT_THEME, themes } from "../../../theme/themes";
 import { sanitizeStarPrompt } from "../../../app/star-prompt/model";
 import { sanitizeCommandBarOpens } from "../../../app/command-bar-intro";
 import { sanitizeUpdatesConfig } from "../../../updater/channel";
+import { ATTENTION_NOTICE_ACCOUNTS } from "../../../telemetry/attention-setting";
+import { sanitizeHeaderMarketChoice } from "../../../market-data/market/header-market";
 
 const configLog = debugLog.createLogger("config");
 const reportedUnknownThemes = new Set<string>();
@@ -57,7 +61,7 @@ export function normalizeLoadedConfig(
   const defaults = createDefaultConfig(dataDir);
   const migration = migrateSavedConfig(saved, dataDir, host);
   const candidate = migration.config;
-  const directLayout = sanitizeLayout(candidate.layout, defaults.layout);
+  const directLayout = sanitizeLayout(candidate.layout, defaults.layout, {}, savedPaneIds(candidate.layouts));
   const layouts = sanitizeSavedLayouts(candidate.layouts, directLayout);
   const activeLayoutIndex = sanitizeActiveLayoutIndex(candidate.activeLayoutIndex, layouts.length);
   const layout = cloneLayout(layouts[activeLayoutIndex]?.layout ?? directLayout);
@@ -96,7 +100,10 @@ export function normalizeLoadedConfig(
     ...sanitizePluginSeedFailure(candidate.pluginSeedFailure),
     ...(candidate.portfolioCurrenciesAdopted === true ? { portfolioCurrenciesAdopted: true } : {}),
     ...(candidate.presentationMode === true ? { presentationMode: true } : {}),
+    ...(candidate.sinceLastVisit === false ? { sinceLastVisit: false } : {}),
+    ...withHeaderMarket(sanitizeHeaderMarketChoice(candidate.headerMarket)),
     ...(typeof candidate.timezone === "string" && candidate.timezone.trim() ? { timezone: candidate.timezone.trim() } : {}),
+    ...(candidate.csvDecimal === "comma" ? { csvDecimal: "comma" as const } : {}),
     disabledSources: sanitizeUniqueStringList(candidate.disabledSources ?? defaults.disabledSources),
     pluginConfig: sanitizePluginConfig(candidate.pluginConfig),
     theme: sanitizeTheme(candidate.theme, defaults.theme),
@@ -138,7 +145,7 @@ export function normalizeLoadedConfig(
 
 export function normalizeConfigForSave(config: AppConfig): AppConfig {
   const defaults = createDefaultConfig(config.dataDir);
-  const directLayout = sanitizeLayout(config.layout, defaults.layout);
+  const directLayout = sanitizeLayout(config.layout, defaults.layout, {}, savedPaneIds(config.layouts));
   const sanitizedLayouts = sanitizeSavedLayouts(config.layouts, directLayout);
   const activeLayoutIndex = sanitizeActiveLayoutIndex(config.activeLayoutIndex, sanitizedLayouts.length || 1);
   const layout = cloneLayout(sanitizedLayouts[activeLayoutIndex]?.layout ?? directLayout);
@@ -181,8 +188,15 @@ export function normalizeConfigForSave(config: AppConfig): AppConfig {
   Object.assign(persisted, withStarPrompt(sanitizeStarPrompt(config.starPrompt)));
   delete persisted.updates;
   Object.assign(persisted, withUpdates(sanitizeUpdatesConfig(config.updates)));
+  // Only off is saved; on is the default.
+  delete persisted.sinceLastVisit;
+  if (config.sinceLastVisit === false) persisted.sinceLastVisit = false;
 
   return persisted;
+}
+
+function withHeaderMarket(headerMarket: AppConfig["headerMarket"]): Pick<AppConfig, "headerMarket"> {
+  return headerMarket ? { headerMarket } : {};
 }
 
 function withKeybindings(keybindings: KeybindingsConfig | undefined): Pick<AppConfig, "keybindings"> {
@@ -201,15 +215,26 @@ function withUpdates(updates: AppConfig["updates"]): Pick<AppConfig, "updates"> 
   return updates ? { updates } : {};
 }
 
-/** Only the switches that are set survive; an empty object is the same as none. */
+/**
+ * Only the switches that are set survive; an empty object is the same as none.
+ * Attention Counts is on by default, so a value that cannot be read turns it
+ * off instead: a hand-edited "false" or a broken block never counts as on.
+ */
 function sanitizeTelemetry(value: unknown): TelemetryConfig | undefined {
-  if (!isRecord(value)) return undefined;
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) return { attention: false };
   const telemetry: TelemetryConfig = {
     ...(typeof value.crashReports === "boolean" ? { crashReports: value.crashReports } : {}),
     ...(typeof value.usage === "boolean" ? { usage: value.usage } : {}),
-    ...(typeof value.attention === "boolean" ? { attention: value.attention } : {}),
+    ...(value.attention !== undefined ? { attention: value.attention === true } : {}),
+    ...sanitizeAttentionNotice(value.attentionNoticeShownTo),
   };
   return Object.keys(telemetry).length > 0 ? telemetry : undefined;
+}
+
+function sanitizeAttentionNotice(value: unknown): Pick<TelemetryConfig, "attentionNoticeShownTo"> {
+  const accounts = sanitizeUniqueStringList(value).slice(-ATTENTION_NOTICE_ACCOUNTS);
+  return accounts.length > 0 ? { attentionNoticeShownTo: accounts } : {};
 }
 
 /**
@@ -255,6 +280,7 @@ const ONBOARDING_STAGES = new Set<OnboardingProgress["stage"]>([
   "portfolio",
   "add-ticker",
   "desks",
+  "tickers",
   "research",
   "verify",
   "account",
@@ -286,6 +312,8 @@ function sanitizeOnboardingProgress(value: unknown): OnboardingProgress | undefi
     accountStatus,
     checkoutOpenedAt: typeof value.checkoutOpenedAt === "string" ? value.checkoutOpenedAt : undefined,
     desks: Array.isArray(value.desks) ? sanitizeUniqueStringList(value.desks) : undefined,
+    rerun: value.rerun === true ? true : undefined,
+    asksTickers: value.asksTickers === true ? true : undefined,
   };
 }
 
@@ -374,8 +402,9 @@ function sanitizePortfolios(value: unknown, fallback: Portfolio[]): Portfolio[] 
 
 /** Cash, target weights, the import source and a fixed currency the portfolio commands write; a malformed one is dropped. */
 function sanitizePortfolioAllocation(entry: Portfolio): Portfolio {
-  const { cash, targetWeights, importedFrom, fixedCurrency, ...portfolio } = entry;
-  const next: Portfolio = { ...portfolio };
+  const { cash, otherCash, targetWeights, importedFrom, fixedCurrency, ...portfolio } = entry;
+  // Each currency's balance once, the first in `cash` as an older build reads it.
+  const next: Portfolio = withPortfolioCashBalances(portfolio, portfolioCashBalances({ cash, otherCash }));
   if (fixedCurrency === true) next.fixedCurrency = true;
   if (isRecord(importedFrom) && importedFrom.kind === "13f"
     && [importedFrom.cik, importedFrom.name, importedFrom.period, importedFrom.filed].every((value) => typeof value === "string" && value)) {
@@ -386,10 +415,6 @@ function sanitizePortfolioAllocation(entry: Portfolio): Portfolio {
       !!symbol.trim() && typeof weight === "number" && Number.isFinite(weight) && weight > 0 && weight <= 1)) {
       next.importedFrom.weights = Object.fromEntries(weights) as Record<string, number>;
     }
-  }
-  if (isRecord(cash) && typeof cash.amount === "number" && Number.isFinite(cash.amount)
-    && typeof cash.currency === "string" && /^[A-Z]{3}$/.test(cash.currency)) {
-    next.cash = { amount: cash.amount, currency: cash.currency };
   }
   if (isRecord(targetWeights)) {
     const weights = Object.entries(targetWeights).filter((weight): weight is [string, number] =>
@@ -408,7 +433,11 @@ function sanitizeWatchlists(value: unknown, fallback: Watchlist[]): Watchlist[] 
       && typeof (entry as Watchlist).id === "string"
       && typeof (entry as Watchlist).name === "string",
     )
-    .map((entry) => ({ ...entry }));
+    .map(({ groups, ...entry }) => {
+      // Malformed groups are dropped, and a list left with none has no `groups` at all.
+      const kept = normalizeWatchlistGroups(groups);
+      return kept ? { ...entry, groups: kept } : entry;
+    });
 }
 
 function sanitizeBrokerInstances(value: unknown): BrokerInstanceConfig[] {
@@ -456,10 +485,44 @@ function sanitizeLayoutOrigin(value: unknown): LayoutOrigin | undefined {
 const sanitizedLayouts = new WeakMap<object, LayoutConfig>();
 const sanitizedPaneStates = new WeakMap<object, { layout: LayoutConfig; result: ReturnType<typeof sanitizeSavedPaneState> }>();
 
-function sanitizeSavedLayoutOnce(value: unknown, fallbackLayout: LayoutConfig): LayoutConfig {
+/** Every pane id on a saved tab: the panes a link on another tab may follow. */
+function savedPaneIds(value: unknown): ReadonlySet<string> {
+  const ids = new Set<string>();
+  if (!Array.isArray(value)) return ids;
+  for (const entry of value) {
+    const instances = isRecord(entry) && isRecord(entry.layout) ? entry.layout.instances : null;
+    if (!Array.isArray(instances)) continue;
+    for (const instance of instances) {
+      if (isRecord(instance) && typeof instance.instanceId === "string") ids.add(instance.instanceId);
+    }
+  }
+  return ids;
+}
+
+/**
+ * The panes a layout's links reach on other tabs. Links stay within a tab,
+ * except where another desktop window shows the tab a pane was moved to;
+ * those are kept, and every other dangling link is cut as before.
+ */
+function crossTabSources(value: LayoutConfig, paneIds: ReadonlySet<string>): ReadonlySet<string> | undefined {
+  if (!Array.isArray(value.instances)) return undefined;
+  const own = new Set(value.instances.map((instance) => instance?.instanceId));
+  const sources = new Set<string>();
+  for (const instance of value.instances) {
+    const binding = instance?.binding;
+    if (binding?.kind !== "follow" || typeof binding.sourceInstanceId !== "string") continue;
+    if (!own.has(binding.sourceInstanceId) && paneIds.has(binding.sourceInstanceId)) sources.add(binding.sourceInstanceId);
+  }
+  return sources.size > 0 ? sources : undefined;
+}
+
+function sanitizeSavedLayoutOnce(value: unknown, fallbackLayout: LayoutConfig, paneIds: ReadonlySet<string>): LayoutConfig {
   // An invalid value sanitizes to a copy of the fallback, which is not a
   // function of the value alone.
   if (!isLayoutConfig(value)) return sanitizeLayout(value, fallbackLayout);
+  const external = crossTabSources(value, paneIds);
+  // A link to another tab depends on the other tabs too: those are not cached.
+  if (external) return sanitizeLayout(value, fallbackLayout, {}, external);
   const cached = sanitizedLayouts.get(value);
   if (cached) return cached;
   const layout = sanitizeLayout(value, fallbackLayout);
@@ -484,6 +547,7 @@ function sanitizeSavedLayouts(
     return [{ name: "Default", layout: cloneLayout(fallbackLayout) }];
   }
 
+  const paneIds = savedPaneIds(value);
   const layouts = value
     .filter((entry): entry is SavedLayout =>
       !!entry
@@ -491,7 +555,7 @@ function sanitizeSavedLayouts(
       && typeof (entry as SavedLayout).name === "string",
     )
     .map((entry) => {
-      const layout = sanitizeSavedLayoutOnce(entry.layout, fallbackLayout);
+      const layout = sanitizeSavedLayoutOnce(entry.layout, fallbackLayout, paneIds);
       const placedPaneIds = new Set(getPlacedPaneInstanceIds(layout));
       const paneState = sanitizeSavedPaneStateOnce((entry as { paneState?: unknown }).paneState, layout);
       return {

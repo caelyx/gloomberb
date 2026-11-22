@@ -1,8 +1,9 @@
 import { readFile } from "fs/promises";
 import { fstatSync } from "fs";
-import { splitSymbolArgLines, splitSymbolWords, stripStrayEdges, uniqueSymbols } from "./symbol-args";
+import { splitSymbolArgLines, splitSymbolWords, stripStrayEdges, symbolInputKey, uniqueSymbols } from "./symbol-args";
 import { foldTypedText } from "../utils/typed-text";
-import { hasDecimalCommas, isFigure, isJunkCell, isNumberCell, protectFigureCommas, restoreFigureCommas } from "./symbol-cells";
+import { hasDecimalCommas, isFigure, isJunkCell, isNumberCell, isSheetErrorCell, protectFigureCommas, restoreFigureCommas } from "./symbol-cells";
+import { endsInLegalForm, readTerminalListingCode, unknownBloombergMarket, unreadBloombergCode } from "../tickers/terminal-codes";
 
 /** Header cells that name a spreadsheet's symbol column, compared without case, spaces or punctuation. */
 const SYMBOL_HEADERS = new Set(["symbol", "symbols", "ticker", "tickers", "code", "stockcode", "securitycode", "instrument"]);
@@ -16,8 +17,9 @@ function headerKey(cell: string): string {
   return cell.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 }
 
+/** A line starting with # or //, except a sheet's error value (`#REF!`), which is a cell named as not a symbol. */
 function isComment(cell: string): boolean {
-  return cell.startsWith("#") || cell.startsWith("//");
+  return (cell.startsWith("#") && !isSheetErrorCell(cell)) || cell.startsWith("//");
 }
 
 /** Whether a quote mark at `index` closes a quoted cell: it is followed by a separator, a line end or the end. */
@@ -144,6 +146,64 @@ function looksLikeSymbol(cell: string): boolean {
   return SYMBOL_TOKEN.test(cell) && !isNumberCell(cell);
 }
 
+/**
+ * A cell that is a terminal's code for one listing, spaces and all: `CZR US
+ * Equity`, `1128 HK Equity`, `VOD LN`. A company's name before its legal form
+ * (`SAP SE`, `SIEMENS AG`) is a name, though SE and AG are market codes too.
+ */
+function isTerminalCodeCell(cell: string): boolean {
+  return /\s/.test(cell.trim()) && !endsInLegalForm(cell)
+    && (readTerminalListingCode(cell) != null || unknownBloombergMarket(cell) != null || unreadBloombergCode(cell) != null);
+}
+
+/** A numeric exchange code as a grid holds one (`2007`, `0700`, `600519`): Hong Kong, Tokyo, Shanghai. Shorter is a quantity. */
+const NUMERIC_CODE = /^\d{4,6}$/;
+
+/** What a sheet holds beside its symbols that reads like one: a rating, a side, a flag. */
+const VALUE_WORD = /^(?:buy|sell|hold|long|short|neutral|overweight|underweight|outperform|underperform|yes|no|true|false|none|total)$/i;
+
+/** A cell a grid of symbols can hold: a symbol, never a rating or a side (`HOLD`, `BUY`). */
+function isGridSymbol(cell: string): boolean {
+  return looksLikeSymbol(cell) && !VALUE_WORD.test(cell.trim());
+}
+
+/**
+ * The columns after the first that hold a symbol with a letter in it (or a
+ * terminal's code), and nothing that is a value: a whole number there is a
+ * numeric exchange code among tickers (`2007` beside `AAL`), not a value
+ * beside its symbol, whose column holds numbers alone (`ED 2582`) or values
+ * (`HOLD`, `100`).
+ */
+function symbolColumns(rows: readonly string[][]): Set<number> {
+  const columns = new Set<number>();
+  const values = new Set<number>();
+  for (const cells of rows) {
+    cells.forEach((cell, index) => {
+      if (index === 0 || !cell) return;
+      if (VALUE_WORD.test(cell.trim()) || (isFigure(cell) && !NUMERIC_CODE.test(cell.trim()))) values.add(index);
+      else if (isTerminalCodeCell(cell) || (looksLikeSymbol(cell) && /\p{L}/u.test(cell))) columns.add(index);
+    });
+  }
+  for (const index of values) columns.delete(index);
+  return columns;
+}
+
+/**
+ * A cell of symbols split by spaces in a list split by commas (`0700.hk
+ * 9988.HK`, `USDJPY=X USDCHF=X`): every word carries a listing's mark (a dot,
+ * a caret, `=`, `:` or a digit), which a company's name (`Apple Inc`) does not.
+ */
+function isSymbolWords(cell: string): boolean {
+  const words = cell.trim().split(/\s+/);
+  return words.length > 1 && words.every((word) => isGridSymbol(word) && /[.^=:\d]/.test(word));
+}
+
+/** A grid of numeric exchange codes alone, two or more to a row (`0700  9988`): every cell is a listing. */
+function numericCodeGrid(rows: readonly string[][]): boolean {
+  return rows.some((cells) => cells.filter(Boolean).length > 1)
+    && rows.every((cells) => cells.every((cell) => !cell || NUMERIC_CODE.test(cell.trim())));
+}
+
 /** How many cells a table's ignored-cells note names before it counts the rest. */
 const IGNORED_PREVIEW = 8;
 
@@ -159,6 +219,42 @@ interface SymbolText {
    * Group`), or symbols written on one line (`AAPL MSFT`).
    */
   entries?: true;
+  /** A first row read as a header in words no header list knows (`Hisse,Adet,Maliyet`), skipped and named. */
+  header?: string[];
+  /** Each symbol is a line of the text, whole: a list of one entry a line, as a sheet's column pastes. */
+  lines?: true;
+}
+
+/** Words a sheet writes where a value is missing, beside the marks isJunkCell knows (`N/A`, `-`, `—`). */
+const MISSING_WORD = /^(?:na|nan|none|null|nil)$/i;
+
+/**
+ * Whether the first row of a delimited table is a header in any language:
+ * every cell of it a word, none a figure, over columns that turn from a word
+ * there to a number on every later row that fills them (`Hisse,Adet,Maliyet`
+ * over `THYAO,100,280`): two such columns, or one with no column of words
+ * beside it. A row of symbols with a rating or a name beside it (`AAPL,BUY`),
+ * or a grid with a numeric code in it (`AAL,czr us equity,UAL` over
+ * `DAL,2007,ULCC`), is no header. A mark for a missing value (`n/a`, `-`,
+ * `—`, `NA`) is a data row's, never a column's name: a first row with one is
+ * no header, and one on a later row leaves its column's numbers numbers.
+ */
+function isWordHeader(records: readonly string[][]): boolean {
+  const [first, ...rest] = records;
+  if (!first || first.length < 2 || rest.length === 0) return false;
+  const missing = (cell: string) => isJunkCell(cell) || MISSING_WORD.test(cell.trim());
+  const word = (cell: string | undefined) =>
+    !!cell && !missing(cell) && /\p{L}/u.test(cell) && !isFigure(cell) && !isNumberCell(cell);
+  if (!first.every((cell) => !cell || word(cell)) || !word(first[0])) return false;
+  const width = Math.max(...records.map((cells) => cells.length));
+  let numbers = 0, words = 0;
+  for (let index = 1; index < width; index++) {
+    const below = rest.map((cells) => cells[index]).filter((cell): cell is string => !!cell && !missing(cell));
+    if (!below.length) continue;
+    if (word(first[index]) && below.every(isFigure)) numbers += 1;
+    else if (!below.every(isFigure)) words += 1;
+  }
+  return numbers >= 2 || (numbers === 1 && words === 0);
 }
 
 /**
@@ -193,15 +289,26 @@ export function parseSymbolText(text: string): SymbolText {
   // Without one, a delimited export's Name or Company column holds the companies, read as typed names are.
   const nameColumn = delimited ? header.findIndex((cell) => NAME_HEADERS.has(cell)) : -1;
   if (nameColumn >= 0) return { symbols: records.slice(1).map((cells) => cells[nameColumn] ?? "").filter(Boolean), ignored: [], entries: true };
+  // A header in words no list here knows (Turkish `Hisse,Adet,Maliyet`) is skipped, and the table below it read as one.
+  if (delimited && isWordHeader(records)) {
+    const below = records.slice(1).map((cells) => cells.join("\t")).join("\n");
+    return { ...parseSymbolText(below), header: records[0]!.filter(Boolean) };
+  }
   // A separator or quote mark stuck to a cell is dropped (and named) when it is read, so it does not make the list a table.
   const cleaned = records.map((cells) => cells.map((cell) => stripStrayEdges(cell).text));
   const figures = cleaned.some((cells) => cells.some((cell, index) => index > 0 && isFigure(cell)));
   // Lines split by spaces alone are entries, unless figures sit beside the symbols.
-  if (!delimited && !figures) return { symbols: records.map((cells) => cells.join(" ")), ignored: [], entries: true };
-  const grid = cleaned.every((cells) => cells.every((cell, index) => (
-    !cell || isJunkCell(cell) || (looksLikeSymbol(cell) && (index === 0 || !isFigure(cell)))
+  if (!delimited && !figures) return { symbols: records.map((cells) => cells.join(" ")), ignored: [], entries: true, lines: true };
+  // A grid of symbols: a terminal's code is one cell (`CZR US Equity`), and so is a numeric code among tickers (`2007`).
+  const codes = symbolColumns(cleaned);
+  const grid = numericCodeGrid(cleaned) || cleaned.every((cells) => cells.every((cell, index) => (
+    !cell || isJunkCell(cell) || isTerminalCodeCell(cell) || isSymbolWords(cell)
+    || (isGridSymbol(cell) && (index === 0 || !isFigure(cell) || (NUMERIC_CODE.test(cell) && codes.has(index))))
   )));
-  if (grid) return { symbols: records.flat().filter(Boolean), ignored: [] };
+  // A file of lines split by commas or spaces reads as the same list typed would (`lmt, NOC ,` then `^HSI, 0700.hk 9988.HK`):
+  // a cell of words is read as a typed entry is, so its symbols split.
+  const spaced = cleaned.some((cells) => cells.some((cell) => !isTerminalCodeCell(cell) && isSymbolWords(cell)));
+  if (grid) return { symbols: records.flat().filter(Boolean), ignored: [], ...spaced ? { entries: true as const } : {} };
   // Names split by semicolons or commas, with no figures: one pasted line, or one name a line with a separator left
   // on it, is a list. A name beside a sector or any other text is a table, read by its first column below.
   const names = cleaned.some((cells) => /\s/.test(cells[0] ?? ""));
@@ -216,11 +323,18 @@ export function parseSymbolText(text: string): SymbolText {
   };
 }
 
-/** Cells named in a note, split by semicolons when one of them has a comma of its own (`2.582,52; 1.899,21`). */
+/**
+ * Cells named in a note, once each in the order first read, a repeated one
+ * with its count (`2.582,52 (3 times)`), the rest counted. Split by semicolons
+ * when one of them has a comma of its own (`2.582,52; 1.899,21`).
+ */
 function listCells(cells: readonly string[]): string {
-  const named = cells.slice(0, IGNORED_PREVIEW);
-  const more = cells.length - IGNORED_PREVIEW;
-  return `${named.join(named.some((cell) => cell.includes(",")) ? "; " : ", ")}${more > 0 ? ` and ${more} more` : ""}`;
+  const counts = new Map<string, number>();
+  for (const cell of cells) counts.set(cell, (counts.get(cell) ?? 0) + 1);
+  const distinct = [...counts];
+  const named = distinct.slice(0, IGNORED_PREVIEW).map(([cell, count]) => count > 1 ? `${cell} (${count} times)` : cell);
+  const more = distinct.length - IGNORED_PREVIEW;
+  return `${named.join(distinct.some(([cell]) => cell.includes(",")) ? "; " : ", ")}${more > 0 ? ` and ${more} more` : ""}`;
 }
 
 /** "the cell", "the 3 number cells": number when every one is a figure. */
@@ -308,6 +422,8 @@ export interface SymbolListSource {
    * words, each a symbol.
    */
   readEntries?: (entries: string[]) => Promise<string[]>;
+  /** Given, gets each line of the file and standard input as typed (`TypedForm`), for a command whose rows name them. */
+  typedForms?: TypedForm[];
 }
 
 export class SymbolListError extends Error {
@@ -343,7 +459,10 @@ export async function readSymbolList(source: SymbolListSource): Promise<{ symbol
   // A separator left on the end of what was typed: `UPST;`, or a list that ends in a comma.
   const strays = new Set<string>(stripStrayEdges(typedArgs.join(" ")).notes);
   const ignored: string[] = [];
-  const addCells = async ({ symbols, ignored: beside, entries: whole }: SymbolText) => {
+  const headers: string[] = [];
+  const typedForms = source.typedForms ?? [];
+  const addCells = async ({ symbols, ignored: beside, entries: whole, header }: SymbolText) => {
+    if (header) headers.push(`Skipped the first row as a header: ${listCells(header)}.`);
     const cells = symbols.map((cell) => {
       const cleaned = stripStrayEdges(cell);
       cleaned.notes.forEach((note) => strays.add(note));
@@ -362,13 +481,48 @@ export async function readSymbolList(source: SymbolListSource): Promise<{ symbol
       const code = (error as NodeJS.ErrnoException).code;
       throw new SymbolListError(code === "ENOENT" ? `No file at ${source.file}.` : `Could not read ${source.file}: ${error instanceof Error ? error.message : String(error)}`);
     }
-    await addCells(parseSymbolText(foldTypedText(text)));
+    const parsed = parseSymbolText(foldTypedText(text));
+    typedForms.push(...typedLines(text, !!parsed.lines));
+    await addCells(parsed);
   }
   if (wantsStdin || (typed.length === 0 && source.file == null && (source.stdinPiped ?? stdinIsPiped()))) {
-    await addCells(parseSymbolText(foldTypedText(await readStdin())));
+    const text = await readStdin();
+    const parsed = parseSymbolText(foldTypedText(text));
+    typedForms.push(...typedLines(text, !!parsed.lines));
+    await addCells(parsed);
   }
   // A number where a symbol goes (a line of prices, a typed 1.899) is left out with those typed beside a symbol.
   const numbers = [...figures, ...collected.filter(isNumberCell)];
   const notes = [ignoredCellsNote(ignored), ignoredNumbersNote(numbers)].filter((note): note is string => !!note);
-  return { ...uniqueSymbols(collected.filter((symbol) => !isNumberCell(symbol))), notes: [...strays, ...notes] };
+  return { ...uniqueSymbols(collected.filter((symbol) => !isNumberCell(symbol))), notes: [...headers, ...strays, ...notes] };
+}
+
+/** A line of a list as typed, before full-width letters and case were folded, and the entry it reads as. */
+export interface TypedForm {
+  typed: string;
+  /** The entry the line reads as, its repeats' key (`symbolInputKey`): `ＵＳＤＪＰＹ` and `usdjpy` are both `USDJPY`'s. */
+  key: string;
+  /**
+   * A line of a list of one entry a line, which has a row whatever it reads as, so the rows line up with the
+   * sheet's: a blank one (`typed` empty), or one no entry was read from (`N/A`, a number).
+   */
+  ownRow?: true;
+}
+
+/**
+ * Each line of a list's text that is one entry, as typed and in order, an exact repeat too, with the key of the entry
+ * it reads as: so a command can give every line its row and say which line of a sheet each row is, where several
+ * were read as one entry. In a list of one entry a line (`everyLine`), every line up to the last that holds
+ * anything is one, a blank line too; a comment (`# held since 2019`) is none.
+ */
+function typedLines(text: string, everyLine: boolean): TypedForm[] {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/).map((line) => line.trim());
+  const last = lines.findLastIndex(Boolean);
+  return lines.slice(0, last + 1).flatMap((typed) => {
+    // The list reads a line's words with one space between them (`MC  FP Equity` is MC FP Equity), so its key does too.
+    const key = symbolInputKey(stripStrayEdges(foldTypedText(typed)).text.replace(/\s+/g, " "));
+    if (everyLine && !isComment(typed)) return [{ typed, key, ownRow: true as const }];
+    if (!typed || !key) return [];
+    return [{ typed, key }];
+  });
 }

@@ -16,14 +16,22 @@ export const IV_LEVEL_ALERTS_KEY = "ivLevelAlerts";
  * every version reads.
  */
 export const CALENDAR_ALERTS_KEY = "calendarAlerts";
+/**
+ * IPO rules, kept apart for the same reason. Gloom Cloud checks them, so it
+ * reads this list beside `eventAlerts`.
+ */
+export const IPO_ALERTS_KEY = "ipoAlerts";
 export const MAX_EVENT_ALERTS = 40;
 
 /** The config key a rule is kept under. */
 export const eventAlertStoreKey = (rule: Pick<EventAlertRule, "kind">) =>
-  rule.kind === "iv_level" ? IV_LEVEL_ALERTS_KEY : rule.kind === "calendar_event" ? CALENDAR_ALERTS_KEY : EVENT_ALERTS_KEY;
+  rule.kind === "iv_level" ? IV_LEVEL_ALERTS_KEY
+    : rule.kind === "calendar_event" ? CALENDAR_ALERTS_KEY
+      : rule.kind === "ipo" ? IPO_ALERTS_KEY
+        : EVENT_ALERTS_KEY;
 
 /** Every config key event alerts are kept under. */
-export const EVENT_ALERT_STORE_KEYS = [EVENT_ALERTS_KEY, IV_LEVEL_ALERTS_KEY, CALENDAR_ALERTS_KEY] as const;
+export const EVENT_ALERT_STORE_KEYS = [EVENT_ALERTS_KEY, IV_LEVEL_ALERTS_KEY, CALENDAR_ALERTS_KEY, IPO_ALERTS_KEY] as const;
 type EventAlertStoreKey = (typeof EVENT_ALERT_STORE_KEYS)[number];
 
 export interface EventAlertRule {
@@ -42,6 +50,8 @@ export interface EventAlertRule {
   firedFor?: string;
   /** Macro and calendar events: the event date whose figures (actual, forecast, prior) it already sent. */
   printedFor?: string;
+  /** Calendar events: when the release on `eventDate` prints, ISO UTC, when the calendar gives its time. */
+  eventTime?: string;
   /**
    * IV level: when the level was reached. The rule stays Alerted until it is
    * re-armed. Its readings stay on the device (`ivLevelChecks`), so synced
@@ -183,6 +193,7 @@ export function readEventAlerts(json: string): EventAlertList {
         if (isDateKey(value.eventDate)) rule.eventDate = value.eventDate;
         if (isDateKey(value.firedFor)) rule.firedFor = value.firedFor;
         if (isDateKey(value.printedFor)) rule.printedFor = value.printedFor;
+        if (rule.kind === "calendar_event" && releaseTimeOn(value.eventTime, rule.eventDate)) rule.eventTime = value.eventTime;
       }
       if (rule.kind === "iv_level" && Number.isFinite(value.triggeredAt) && value.triggeredAt > 0) rule.triggeredAt = value.triggeredAt;
       rules.push(rule);
@@ -257,4 +268,10 @@ export function eventAlertTarget(rule: EventAlertRule): string {
     : rule.target === "fund"
       ? `CIK ${rule.value}`
       : rule.value;
+}
+
+/** Whether a saved release time is an ISO instant on the rule's event day (UTC); one from another day is stale. */
+export function releaseTimeOn(value: unknown, eventDate: string | undefined): value is string {
+  return typeof value === "string" && !!eventDate && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?Z$/.test(value)
+    && Number.isFinite(Date.parse(value)) && value.slice(0, 10) === eventDate;
 }

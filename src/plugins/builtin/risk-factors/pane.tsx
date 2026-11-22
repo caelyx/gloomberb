@@ -8,6 +8,7 @@ import {
   type PaneFooterSegment,
   type PaneHint,
 } from "../../../components";
+import { savedCopyFooterInfo } from "../../../components/layout/pane/footer";
 import { useAsyncResource } from "../../../react/async-resource";
 import { colors } from "../../../theme/colors";
 import {
@@ -18,6 +19,7 @@ import {
   useUiCapabilities,
 } from "../../../ui";
 import { isPermanentClientError } from "../../../api-client/errors";
+import { formatFilingDate, formatShortDate } from "../../../utils/datetime-format";
 import { usePluginPaneState } from "../../runtime";
 import { useFilingYearReader } from "../shared/filing-year-reader";
 import { useProFeatureWall, type ProFeatureWallCopy, type ReadGuard } from "../shared/pro-feature-wall";
@@ -70,6 +72,8 @@ function RiskLine({
   );
 }
 
+const NO_RISK_FACTORS = "This 10-K lists no risk factors.";
+
 const RISK_WALL: ProFeatureWallCopy = {
   placement: "risk-wall",
   action: "read risk factors",
@@ -119,11 +123,12 @@ function RiskFactorsReader({
   const reportLoader = useCallback((force: boolean) => guard(loadRiskReport(ticker!, year!, { force, listing })), [guard, listing, ticker, year]);
   const detail = useAsyncResource(ticker && year !== null ? reportLoader : null, { clearOnError: isPermanentClientError });
   const report = detail.data;
-  const listError = list.error ?? list.data?.refreshError ?? null;
-  const reportError = detail.error ?? report?.refreshError ?? null;
+  // A copy saved earlier answering a failed refresh says when it was saved, in the footer every pane uses, not as an error.
+  const listError = list.error ?? (list.data?.savedAt == null ? list.data?.refreshError : null) ?? null;
+  const reportError = detail.error ?? (report?.savedAt == null ? report?.refreshError : null) ?? null;
   const refresh = useCallback(() => {
-    void list.reload();
-    if (year !== null) void detail.reload();
+    list.reload();
+    if (year !== null) detail.reload();
   }, [list.reload, detail.reload, year]);
   const openFiling = useCallback(() => {
     if (report?.docUrl) void rendererHost.openExternal(report.docUrl);
@@ -151,12 +156,7 @@ function RiskFactorsReader({
       info.push({ id: "loading", parts: [{ text: "loading", tone: "muted" }] });
     if (listError) info.push({ id: "list-error", parts: [{ text: `Report list: ${listError}`, tone: "warning" }] });
     if (reportError) info.push({ id: "report-error", parts: [{ text: `${year} report: ${reportError}`, tone: "warning" }] });
-    if ((listError || list.data?.stale) && list.data) {
-      info.push({ id: "list-stale", parts: [{ text: `List cached ${new Date(list.data.fetchedAt).toISOString()}`, tone: "muted" }] });
-    }
-    if ((reportError || report?.stale) && report) {
-      info.push({ id: "report-stale", parts: [{ text: `Report cached ${new Date(report.fetchedAt).toISOString()}`, tone: "muted" }] });
-    }
+    info.push(...savedCopyFooterInfo([list.data?.savedAt, report?.savedAt]));
     const hints: PaneHint[] = report?.docUrl
       ? [{ id: "open", key: "o", label: "pen filing", onPress: openFiling }]
       : [];
@@ -173,14 +173,17 @@ function RiskFactorsReader({
   if (year === null) return <EmptyState title={`No 10-K risk factors on file for ${ticker}.`} />;
 
   const diff = report?.diff ?? null;
+  // A smaller reporting company's 10-K need not list risk factors. Its report
+  // has none to read or compare, only the filing to open.
+  const listsNone = report ? report.listsNoRiskFactors === true || report.riskCount === 0 : false;
   // A choice of years names the year in the tabs or the filter; a single
   // report says which one it is here.
   const meta = report
     ? [
         years.length > 1 ? null : `${report.reportYear} 10-K`,
-        `Filed ${report.filedAt?.slice(0, 10) || "unavailable"}`,
-        `updated ${report.updatedAt?.slice(0, 10) || "unavailable"}`,
-        diff ? null : "no prior year on file",
+        `Filed ${formatFilingDate(report.filingDate || report.filedAt?.slice(0, 10), "unavailable")}`,
+        listsNone ? null : `updated ${formatShortDate(report.updatedAt, { day: "2-digit", fallback: "unavailable" })}`,
+        diff || listsNone ? null : "no prior year on file",
       ].filter(Boolean).join(" · ")
     : "";
 
@@ -211,7 +214,9 @@ function RiskFactorsReader({
         scrollY
         paddingX={1}
       >
-        {report ? (
+        {report && listsNone ? (
+          <PaneStatusBody empty emptyTitle={report.overview || NO_RISK_FACTORS} />
+        ) : report ? (
           <Box
             flexDirection="column"
             width={nativePaneChrome ? "100%" : bodyWidth}
@@ -259,7 +264,8 @@ function RiskFactorsReader({
                 {diff.reworded.map((item) => (
                   <RiskLine
                     key={`reworded-${item.index}`}
-                    tag={`${Math.round((1 - item.similarity) * 100)}% REWRITTEN`}
+                    // Named as the count over the list names them.
+                    tag={`${Math.round((1 - item.similarity) * 100)}% REWORDED`}
                     group={report.risks[item.index]?.group ?? null}
                     heading={report.risks[item.index]?.heading ?? ""}
                     note={noteFor(report.notes.reworded, item.index)}

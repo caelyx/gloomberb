@@ -1,5 +1,5 @@
 /** @jsxImportSource react */
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import type { ReactNode } from "react";
 import { MarketDataCoordinator, setSharedMarketDataCoordinator } from "../../../market-data/coordinator";
 import { createIdleEntry, type QueryEntry } from "../../../market-data/result-types";
@@ -36,6 +36,7 @@ function installCoordinator(quotes: Record<string, Partial<Quote>> = {}, snapsho
     getFxEntry: (currency: string) => readyEntry(currency === "USD" ? 1 : 1.08, snapshotAsOf[currency]),
     loadFxRate: async () => {},
     subscribeQuotes: () => () => {},
+    loadQuotesBatch: async () => [],
     getQuoteEntry: ({ symbol }: { symbol: string }) => {
       const quote = quotes[symbol];
       if (!quote) return createIdleEntry();
@@ -45,7 +46,7 @@ function installCoordinator(quotes: Record<string, Partial<Quote>> = {}, snapsho
   } as unknown as MarketDataCoordinator);
 }
 
-function Pane({ currencies }: { currencies?: string[] } = {}) {
+function Pane({ currencies, width = 100 }: { currencies?: string[]; width?: number } = {}) {
   const ui = useUiHost();
   const renderer = useRendererHost();
   const state = createInitialState(currencies
@@ -58,7 +59,7 @@ function Pane({ currencies }: { currencies?: string[] } = {}) {
     <UiHostProvider ui={{ ...ui, DataTable: WebDataTable }} renderer={renderer}>
       <WebInputHostProvider>
         <TestPaneProvider state={state} paneId="fx-matrix" runtime={runtime} pluginId="market-overview">
-          <FxMatrixPane paneId="fx-matrix" paneType="fx-matrix" focused width={100} height={14} />
+          <FxMatrixPane paneId="fx-matrix" paneType="fx-matrix" focused width={width} height={14} />
         </TestPaneProvider>
       </WebInputHostProvider>
     </UiHostProvider>
@@ -85,6 +86,7 @@ test("the desktop and web draw a flag beside each currency code in the row label
   const container = await desktop.render(<Pane />);
 
   const rows = [...container.querySelectorAll('[data-gloom-role="data-table-row"]')];
+  // After the codes: at this width the day's move gives way to the eight currencies.
   const headers = [...container.querySelectorAll('[data-gloom-role="data-table-header-cell"]')].slice(1);
   expect(rows).toHaveLength(8);
   expect(headers).toHaveLength(8);
@@ -108,7 +110,8 @@ test("the desktop and web draw a flag beside each currency code in the row label
 test("every currency the settings offer draws its flag in the rows and the headers, in the saved order", async () => {
   installCoordinator();
   const saved = [...FX_CURRENCIES].reverse();
-  const container = await desktop.render(<Pane currencies={saved} />);
+  // Wide enough for every column: a narrower board drops the ones that do not fit.
+  const container = await desktop.render(<Pane currencies={saved} width={520} />);
   const rows = [...container.querySelectorAll('[data-gloom-role="data-table-row"]')];
   expect(rows.map((row) => row.querySelector('[data-gloom-role="data-table-cell"]')!.textContent)).toEqual(saved);
   // A currency added without artwork would draw a bare code.
@@ -117,6 +120,16 @@ test("every currency the settings offer draws its flag in the rows and the heade
 });
 
 test("a cross is tinted by its move against the pairs' previous closes, whether a leg draws its quote or a newer snapshot", async () => {
+  // A Wednesday, while FX trades: the board's day is the one the quotes print in.
+  setSystemTime(new Date("2026-10-21T14:00:00Z"));
+  try {
+    await tintedCrosses();
+  } finally {
+    setSystemTime();
+  }
+});
+
+async function tintedCrosses() {
   const now = Date.now();
   installCoordinator({
     "EURUSD=X": { price: 1.1, previousClose: 1.08 },
@@ -131,7 +144,7 @@ test("a cross is tinted by its move against the pairs' previous closes, whether 
   const codes = ["USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD"];
   const container = await desktop.render(<Pane currencies={codes} />);
   const background = (row: string, column: string) => {
-    const index = codes.indexOf(column) + 1;
+    const index = codes.indexOf(column) + 2;
     const cell = container.querySelector(`[data-gloom-row-key="${row}"]`)!.querySelectorAll('[data-gloom-role="data-table-cell"]')[index] as HTMLElement;
     return cell.style.backgroundColor;
   };
@@ -150,6 +163,26 @@ test("a cross is tinted by its move against the pairs' previous closes, whether 
   // Stale, previous-close-less and unfetched legs, and the diagonal, stay plain.
   expect(["JPY", "CHF", "CAD"].flatMap((leg) => [tinted(leg, "USD"), tinted("EUR", leg), tinted(leg, "EUR")])).not.toContain(true);
   expect(tinted("EUR", "EUR")).toBe(false);
+  // Each currency's move in dollars, from the same closes; none for the dollar itself, nor for a leg with no close
+  // to read against.
+  const move = (row: string) => container.querySelector(`[data-gloom-row-key="${row}"]`)!.querySelectorAll('[data-gloom-role="data-table-cell"]')[1]!.textContent;
+  expect(["USD", "EUR", "GBP", "JPY", "CHF"].map(move)).toEqual(["—", "+1.85%", "0.00%", "—", "—"]);
+}
+
+// The column is the row currency in dollars: USD/JPY up from 149 to 151 is the yen weaker, so JPY reads negative.
+test("the day's move is the currency's own against the dollar: USD/JPY up is the yen down", async () => {
+  setSystemTime(new Date("2026-10-21T14:00:00Z"));
+  try {
+    installCoordinator({ "JPY=X": { price: 151, previousClose: 149 }, "EURUSD=X": { price: 1.1, previousClose: 1.08 } });
+    const container = await desktop.render(<Pane currencies={["USD", "EUR", "JPY"]} />);
+    const header = container.querySelectorAll('[data-gloom-role="data-table-header-cell"]')[1]!;
+    expect(header.textContent).toBe("1D IN USD");
+    const move = (row: string) => container.querySelector(`[data-gloom-row-key="${row}"]`)!.querySelectorAll('[data-gloom-role="data-table-cell"]')[1]!.textContent;
+    expect(move("JPY")).toBe(`${((149 / 151 - 1) * 100).toFixed(2)}%`);
+    expect(move("EUR")).toBe("+1.85%");
+  } finally {
+    setSystemTime();
+  }
 });
 
 test("without desktop chrome the matrix keeps its plain codes and its original base column", async () => {

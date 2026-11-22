@@ -32,6 +32,8 @@ interface UseCommandBarActionRuntimeOptions {
   dispatch: Dispatch<AppAction>;
   focusedPaneId: string | null;
   onCheckForUpdates?: () => void | Promise<void>;
+  /** Settings' Run Setup Again; absent where setup cannot run. */
+  onRunSetupAgain?: () => Promise<void>;
   persistConfig: (nextConfig: AppState["config"]) => void;
   pluginRegistry: PluginRegistry;
   pushRoute: (route: CommandBarRoute) => void;
@@ -57,6 +59,7 @@ export function useCommandBarActionRuntime({
   dispatch,
   focusedPaneId,
   onCheckForUpdates,
+  onRunSetupAgain,
   persistConfig,
   pluginRegistry,
   pushRoute,
@@ -71,6 +74,7 @@ export function useCommandBarActionRuntime({
   tickers,
 }: UseCommandBarActionRuntimeOptions) {
   const {
+    changePaneTicker,
     duplicatePane,
     focusTicker,
     persistLayoutChange,
@@ -87,6 +91,7 @@ export function useCommandBarActionRuntime({
     readTickerSearchCache,
     writeTickerSearchCache,
   } = useCommandBarTickerSearchActions({
+    changePaneTicker,
     closeAll,
     dispatch,
     focusTicker,
@@ -99,6 +104,7 @@ export function useCommandBarActionRuntime({
     screen: "ticker-search" | "layout",
     initialQuery = "",
     payload?: Record<string, unknown>,
+    options?: { launched?: boolean },
   ) => {
     if (screen === "ticker-search" && initialQuery.trim()) {
       skipTickerSearchDebounceRef.current = true;
@@ -110,6 +116,7 @@ export function useCommandBarActionRuntime({
       selectedIdx: 0,
       hoveredIdx: null,
       payload,
+      ...(options?.launched ? { launched: true } : {}),
     });
   }, [pushRoute, skipTickerSearchDebounceRef]);
 
@@ -222,6 +229,7 @@ export function useCommandBarActionRuntime({
     focusTicker,
     notify,
     onCheckForUpdates,
+    onRunSetupAgain,
     openBuiltInWorkflow,
     openInlineConfirm,
     openModeRoute,

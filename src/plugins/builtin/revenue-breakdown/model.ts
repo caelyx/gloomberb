@@ -1,4 +1,5 @@
 import type { DataTableColumn } from "../../../components";
+import { MISSING_VALUE, pickUnit } from "../../../utils/format";
 import type {
   RevenueBreakdownPayload,
   RevenueBreakdownPeriod,
@@ -75,7 +76,7 @@ export function sharedMaximum(rows: RevenueBreakdownRow[]): number {
 
 /** Three significant figures: 54.3B, 246B, 7.88B, 380M. */
 export function revenueAmount(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) return "--";
+  if (value === null || !Number.isFinite(value)) return MISSING_VALUE;
   const abs = Math.abs(value);
   const [divisor, suffix] = abs >= 1e12 ? [1e12, "T"] : abs >= 1e9 ? [1e9, "B"] : abs >= 1e6 ? [1e6, "M"] : abs >= 1e3 ? [1e3, "K"] : [1, ""];
   const scaled = abs / divisor;
@@ -83,11 +84,33 @@ export function revenueAmount(value: number | null): string {
   return `${value < 0 ? "-" : ""}${scaled.toFixed(digits)}${suffix}`;
 }
 
+const SCALE_WORDS: Record<string, string> = { K: "thousands", M: "millions", B: "billions", T: "trillions" };
+
+/**
+ * One scale for a report table's amounts, its largest one's, so a 0.0 never sits beside a 5.52M: `unit`
+ * names it once ("USD millions") and `format` prints each amount in it, with one count of decimals down the
+ * table (179.3 and 0.0, or 54.32 and 7.88). An amount too small for that many decimals keeps two significant
+ * digits (0.030), so only a true zero reads 0.0. The pane keeps each amount's own suffix (`revenueAmount`).
+ */
+export function revenueScale(values: ReadonlyArray<number | null>, currency: string | null): { unit: string; format: (value: number | null) => string } {
+  const amounts = values.filter((value): value is number => value !== null && Number.isFinite(value));
+  const { suffix, divisor } = pickUnit(amounts);
+  const digits = Math.max(0, ...amounts.map((value) => Math.abs(value) / divisor)) >= 100 ? 1 : 2;
+  const format = (value: number | null) => {
+    if (value === null || !Number.isFinite(value)) return revenueAmount(null);
+    const scaled = value / divisor;
+    if (scaled === 0 || Number(scaled.toFixed(digits)) !== 0) return scaled.toFixed(digits);
+    // Two significant digits: as many decimals as the first one's place, and one more.
+    return scaled.toFixed(Math.min(20, 1 - Math.floor(Math.log10(Math.abs(scaled)))));
+  };
+  return { unit: [currency?.trim(), SCALE_WORDS[suffix]].filter(Boolean).join(" "), format };
+}
+
 export const sharePercent = (value: number | null) =>
-  value === null ? "--" : `${(value * 100).toFixed(1)}%`;
+  value === null ? MISSING_VALUE : `${(value * 100).toFixed(1)}%`;
 
 export const growthPercent = (value: number | null) =>
-  value === null ? "--" : `${value > 0 ? "+" : ""}${(value * 100).toFixed(1)}%`;
+  value === null ? MISSING_VALUE : `${value > 0 ? "+" : ""}${(value * 100).toFixed(1)}%`;
 
 function sortValue(row: RevenueBreakdownRow, column: RevenueSortColumn): number | string | null {
   if (column === "label") return row.label.toLowerCase();

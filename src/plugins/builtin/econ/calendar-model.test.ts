@@ -9,15 +9,22 @@ import {
   loadCalendar,
   lowerImpactHidden,
   countriesWithoutEvents,
+  econEventName,
   eventCountry,
   matchesCountry,
   matchesImpact,
   noScheduledReleasesMessage,
   parseCountryFilter,
   pendingHighImpactPrints,
+  listingEnd,
+  pastReleaseListing,
   resetEconCalendarPersistence,
+  shortCalendarEnd,
   actualColor,
+  actualMayBeBlank,
   valueColumnWidth,
+  matchesEventSearch,
+  policyDecisionsNamed,
 } from "./calendar-model";
 import { colors } from "../../../theme/colors";
 
@@ -169,6 +176,19 @@ describe("calendar rows", () => {
   });
 });
 
+describe("the Fed's policy rate", () => {
+  const rate = (fields: Partial<EconEvent>): EconEvent => ({ ...makeEvent("fed"), event: "Federal Funds Rate", forecast: "4.00%", prior: "4.00%", ...fields });
+
+  test("is named for the upper bound its one-level figures are, under either feed's name", () => {
+    expect(econEventName(rate({}))).toBe("Federal Funds Rate (upper bound)");
+    expect(econEventName(rate({ event: "Fed Interest Rate Decision" }))).toBe("Federal Funds Rate (upper bound)");
+    // A decision figured as the range is the range, under the feed's name; so is another country's rate and any other row.
+    expect(econEventName(rate({ event: "Fed Interest Rate Decision", forecast: null, prior: "3.75-4.00%" }))).toBe("Fed Interest Rate Decision");
+    expect(econEventName(rate({ country: "CA" }))).toBe("Federal Funds Rate");
+    expect(econEventName(makeEvent("pce"))).toBe("Core PCE Price Index");
+  });
+});
+
 describe("country filters", () => {
   test("take regions and ISO country codes in any case, comma or space separated, once each", () => {
     expect(parseCountryFilter("mx")).toEqual({ filter: "MX" });
@@ -206,6 +226,29 @@ describe("country filters", () => {
     expect(noScheduledReleasesMessage(["MX"])).toBe("No scheduled releases for MX in this window.");
     expect(noScheduledReleasesMessage(["ZA", "IN"])).toBe("No scheduled releases for ZA or IN in this window.");
     expect(noScheduledReleasesMessage(["MX", "BR", "ZA", "IN", "KR"])).toBe("No scheduled releases for MX, BR, ZA, IN or KR in this window.");
+    expect(noScheduledReleasesMessage(["TR", "MX"], "2026-11-20")).toBe("No scheduled releases for TR or MX in this window; releases are listed through 2026-11-20.");
+  });
+
+  // Past the feeds' end Gloom Cloud lists each bank's next decision, which must not move where the listing ends.
+  test("the listing ends where Gloom Cloud says, not at a bank's next decision past it", () => {
+    const at = (date: string, extra: Partial<EconEvent> = {}) => ({ ...makeEvent(date), date: new Date(date), ...extra });
+    const today = Date.parse("2026-11-07T00:00:00Z");
+    const releases = [at("2026-11-09T12:00:00Z"), at("2026-11-20T13:30:00Z"), at("2026-11-19T13:00:00Z", { kind: "central-bank-decision" })];
+    const past = { kind: "central-bank-decision" as const, pastListing: true, listedThrough: "2026-11-21" };
+    const decisions = [at("2026-12-10T11:00:00Z", past), at("2027-01-28T13:00:00Z", past)];
+    expect(listingEnd([...releases, ...decisions])).toBe("2026-11-21");
+    // The calendar from a day says it itself; a server that says nothing lists nothing past the end, so its last event is.
+    expect(listingEnd(releases, "2026-11-22")).toBe("2026-11-22");
+    expect(listingEnd(releases)).toBe("2026-11-20");
+    expect(listingEnd([])).toBeNull();
+    // A listing that ends less than a week past the start stops short, whatever decisions follow it.
+    expect(shortCalendarEnd([...releases, ...decisions], today)).toBeNull();
+    expect(shortCalendarEnd([...releases, ...decisions], Date.parse("2026-11-15T00:00:00Z"))).toBe("2026-11-21");
+    expect(shortCalendarEnd(releases, Date.parse("2026-11-14T00:00:00Z"))).toBe("2026-11-20");
+    expect(shortCalendarEnd(releases, Date.parse("2026-11-13T00:00:00Z"))).toBeNull();
+    // Only a row the server marks is past the listing; a decision inside it is not.
+    expect(decisions.every(pastReleaseListing)).toBe(true);
+    expect(releases.some(pastReleaseListing)).toBe(false);
   });
 
   test("a national euro-area release is its member's by the adjective its title starts with, and still the euro area's", () => {
@@ -255,4 +298,54 @@ describe("econ calendar energy units", () => {
     expect(actualColor("-3.061M bbl", "-4.000M bbl")).toBe(colors.positive);
     expect(actualColor("0.034M b/d", "0.034M b/d")).toBe(colors.text);
   });
+});
+
+test("cpi and inflation rate find a CPI change under either feed's title, and an index level only under its own", () => {
+  // `econ --search cpi` listed the index levels alone; the 14 Oct y/y print was "Inflation Rate YoY", the 10 Nov m/m "CPI m/m".
+  const row = (event: string) => ({ country: "US", event, actual: "3.7%", forecast: "3.6%", prior: "3.4%", source: { name: "Bureau of Labor Statistics" } });
+  for (const event of ["Inflation Rate YoY", "Core Inflation Rate MoM", "CPI m/m", "Core CPI y/y"]) {
+    expect(matchesEventSearch(row(event), "cpi")).toBe(true);
+    expect(matchesEventSearch(row(event), "inflation rate")).toBe(true);
+  }
+  expect(matchesEventSearch(row("Core Inflation Rate YoY"), "core cpi")).toBe(true);
+  expect(matchesEventSearch(row("CPI"), "inflation rate")).toBe(false);
+  expect(matchesEventSearch(row("PPI m/m"), "cpi")).toBe(false);
+});
+
+test("a bank's own names find its decision, and an empty search names the decisions they mean", () => {
+  const decision = (country: string, event: string) => ({ country, event, actual: null, forecast: null, prior: "13.75%", source: { name: "Central Bank of Brazil" } });
+  expect(matchesEventSearch(decision("BR", "Copom Interest Rate Decision"), "selic")).toBe(true);
+  expect(matchesEventSearch(decision("MX", "Banxico Interest Rate Decision"), "tasa objetivo")).toBe(true);
+  expect(matchesEventSearch(decision("BR", "Copom Interest Rate Decision"), "policy rate")).toBe(true);
+  // Another bank's name, or another release, is not a match.
+  expect(matchesEventSearch(decision("MX", "Banxico Interest Rate Decision"), "selic")).toBe(false);
+  expect(matchesEventSearch(decision("BR", "IPCA CPI m/m"), "selic")).toBe(false);
+  expect(policyDecisionsNamed("selic")).toEqual([{ country: "BR", event: "Copom Interest Rate Decision" }]);
+  expect(policyDecisionsNamed("banxico")).toEqual([{ country: "MX", event: "Banxico Interest Rate Decision" }]);
+  expect(policyDecisionsNamed("nonfarm")).toEqual([]);
+  // Whole words: "cbr" is the Bank of Russia's, not the CBRT's; "bi" is Bank Indonesia's, not the RBI's; "bank" no bank's.
+  expect(policyDecisionsNamed("cbr")).toEqual([{ country: "RU", event: "Bank of Russia Interest Rate Decision" }]);
+  expect(policyDecisionsNamed("bi")).toEqual([{ country: "ID", event: "BI Interest Rate Decision" }]);
+  expect(policyDecisionsNamed("bank")).toEqual([]);
+  expect(policyDecisionsNamed("Bank of Japan")).toEqual([{ country: "JP", event: "BoJ Interest Rate Decision" }]);
+  expect(policyDecisionsNamed("fedfunds")).toEqual([{ country: "US", event: "Fed Interest Rate Decision" }]);
+  // Only the countries the calendar lists: `--country BR` does not say what Banxico is.
+  expect(policyDecisionsNamed("banxico", "BR")).toEqual([]);
+  expect(policyDecisionsNamed("banxico", "MX,BR")).toEqual([{ country: "MX", event: "Banxico Interest Rate Decision" }]);
+  expect(policyDecisionsNamed("fomc", "G7")).toEqual([{ country: "US", event: "Fed Interest Rate Decision" }]);
+});
+
+// A capture failed ECO's ACTUAL column when every release listed was still to come (17 Nov 2026, 00:07 UTC).
+test("an ACTUAL is blank with nothing missing before the release or with no figure to print, not after a figure is due", () => {
+  const cpi = makeEvent("cpi");
+  const release = cpi.date.getTime();
+  expect(actualMayBeBlank(cpi, release - 60_000)).toBe(true);
+  expect(actualMayBeBlank(cpi, release + 60_000)).toBe(false);
+  expect(actualMayBeBlank({ ...cpi, actual: "0.3%" }, release - 60_000)).toBe(false);
+  // A speech has no figure to wait for, before or after it.
+  expect(actualMayBeBlank({ ...cpi, forecast: null, prior: null }, release + 60_000)).toBe(true);
+  // A bank that states no time has its whole day.
+  const day = { ...cpi, date: new Date("2026-05-24T00:00:00.000Z"), time: "", timeNote: "Time not announced." };
+  expect(actualMayBeBlank(day, Date.parse("2026-05-24T20:00:00Z"))).toBe(true);
+  expect(actualMayBeBlank(day, Date.parse("2026-05-25T01:00:00Z"))).toBe(false);
 });

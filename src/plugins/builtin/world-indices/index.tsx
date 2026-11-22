@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { DataTableView, type DataTableVisibleRange } from "../../../components";
+import { DataTableView, type DataTableColumnReorder, type DataTableVisibleRange } from "../../../components";
 import type { PaneProps } from "../../../types/plugin";
 import type { PluginModule } from "../plugin-module";
 import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
@@ -23,6 +23,7 @@ import {
   createWorldIndexColumns,
   renderWorldIndexCell,
   usesSessionText,
+  worldIndexRowNote,
   type WorldIndexColumn,
 } from "./table";
 
@@ -38,6 +39,8 @@ const isIndexRow = (row: WorldIndexTableRow) => row.type === "row";
 function renderRegionHeader(row: WorldIndexTableRow) {
   return row.type === "header" ? { text: REGION_LABELS[row.region] } : null;
 }
+
+const WORLD_INDEX_COLUMN_REORDER: DataTableColumnReorder = { anchored: 2 };
 
 function WorldIndicesPane({ focused, width, height }: PaneProps) {
   const { pinTicker } = usePluginTickerActions();
@@ -124,6 +127,8 @@ function WorldIndicesPane({ focused, width, height }: PaneProps) {
       rootWidth={width}
       rootHeight={height}
       columns={columns}
+      // The session mark and the index name the row, whether or not the mark has a heading at this width.
+      columnReorder={WORLD_INDEX_COLUMN_REORDER}
       items={dataProvider ? flatRows : []}
       sortable
       sortColumnId={sortPreference.columnId}
@@ -135,6 +140,7 @@ function WorldIndicesPane({ focused, width, height }: PaneProps) {
       onVisibleRangeChange={setVisibleRange}
       renderSectionHeader={renderRegionHeader}
       renderCell={renderCell}
+      rowNote={(row) => worldIndexRowNote(row, quotes)}
       selectedTextOverridesCellColor
       emptyStateTitle="No market data provider connected."
     />
@@ -180,7 +186,9 @@ export const worldIndicesModule: PluginModule = {
       paneId: "world-indices",
       label: "World Equity Indices",
       description: "Monitor global equity indices grouped by region.",
-      keywords: ["world", "indices", "global", "equity", "markets", "international"],
+      // The European indices people search the board by: `catalog dax`, `catalog stoxx`, `catalog european indices`.
+      keywords: ["world", "indices", "global", "equity", "markets", "international", "dax", "xetra", "stoxx", "euro stoxx", "ftse", "cac",
+        "germany", "european indices"],
       shortcut: { prefix: "WEI" },
       headless: worldIndicesHeadless,
       publicShare: createPublicPaneShare("World Equity Indices"),

@@ -6,7 +6,6 @@ import {
   type WindowFrame,
   type WindowMinimumSize,
 } from "./frame";
-import { setWindowFrame } from "./native-frame";
 
 export type WindowMoveEvent = { data?: { x?: number; y?: number } };
 export type WindowResizeEvent = { data?: Partial<WindowFrame> };
@@ -44,7 +43,27 @@ export function applyWindowResizeEvent(
   const rawFrame = normalizeWindowFrame(event.data ?? {}, previousFrame);
   const nextFrame = updateWindowFrameCache(window, rawFrame, minimumSize);
   if (nextFrame && (nextFrame.width !== rawFrame.width || nextFrame.height !== rawFrame.height)) {
-    setWindowFrame(window, nextFrame);
+    window.setFrame(nextFrame.x, nextFrame.y, nextFrame.width, nextFrame.height);
+  }
+  return nextFrame;
+}
+
+type FramedWindow = Pick<BrowserWindow, "frame" | "getFrame" | "isMinimized" | "setFrame">;
+
+/**
+ * Electrobun's Windows events do not carry the window's frame: a resize
+ * reports the client area's size rather than the window's (2.0.5; 1.18 put it
+ * at 0,0 too, and a move gave the client area's corner as unsigned 16-bit
+ * values), and both come while the window is minimized. There the frame is
+ * read from the window itself, and a minimized window keeps the frame it had.
+ */
+export function applyNativeWindowFrame(window: FramedWindow, minimumSize?: WindowMinimumSize): WindowFrame | null {
+  if (window.isMinimized()) return null;
+  const read = window.getFrame();
+  if (!(read.width > 0 && read.height > 0)) return null;
+  const nextFrame = updateWindowFrameCache(window as BrowserWindow, read, minimumSize);
+  if (nextFrame && (nextFrame.width !== read.width || nextFrame.height !== read.height)) {
+    window.setFrame(nextFrame.x, nextFrame.y, nextFrame.width, nextFrame.height);
   }
   return nextFrame;
 }

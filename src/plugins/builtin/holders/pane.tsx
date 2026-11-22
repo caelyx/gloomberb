@@ -3,6 +3,7 @@ import { Box, Text, TextAttributes, useUiCapabilities, type ScrollBoxRenderable 
 import {
   Badge,
   DataTableView,
+  Notice,
   usePagedRows,
   usePaneFooter,
   usePaneTabs,
@@ -12,13 +13,15 @@ import {
   type DataTableKeyEvent,
   type PageRequest,
 } from "../../../components";
+import { useCompanyDataFooter } from "../../../components/layout/pane/status-footer";
 import { handleRefreshKey, loadingErrorFooterInfo } from "../../../components/data-table/table-pane";
 import { useAsyncResource } from "../../../react/async-resource";
 import { useShortcut } from "../../../react/input";
 import { colors, priceColor } from "../../../theme/colors";
 import type { HolderData } from "../../../types/financials";
-import { clipToDisplayWidth, formatCompact } from "../../../utils/format";
+import { clipToDisplayWidth, displayWidth, formatCompact } from "../../../utils/format";
 import { isPlainKey } from "../../../utils/keyboard";
+import { logFailure } from "../../../utils/log-failure";
 import { nextHeaderSort } from "../../../utils/sort-values";
 import { useAssetData, usePluginAppActions, usePluginPaneState } from "../../runtime";
 import { THIRTEENF_TEMPLATE_ID } from "../thirteenf/model";
@@ -33,7 +36,7 @@ import {
   holderValueCurrency,
   resolveHolderOwnershipPercent,
 } from "./format";
-import { holderPeriodsDiffer, holderShareBasisMarker } from "./report-header";
+import { holderPeriodsDiffer, holderShareBasisMarker, isNoHoldersAnswer, nonUsHolderCaveat, noHoldersText } from "./report-header";
 import {
   buildColumns,
   hasHolderChanges,
@@ -64,6 +67,34 @@ function cikMatches(rows: readonly HolderRow[]): Map<string, Holder13FMatch> {
 /** The width of a three-letter badge ("13F", "ADR"): the label and its padding. */
 const BADGE_WIDTH = 5;
 
+/**
+ * A holder's name and its markers. ADR: a position held as receipts on a home line's list. 13F: a fund
+ * whose filing opens on Enter or o. The name gives way first, so the markers survive a narrow column;
+ * the cell says how wide it draws whole (`contentWidth`), so the table fits the column to it.
+ */
+export function holderNameCell(
+  name: string,
+  { receipts, fund }: { receipts: string; fund: boolean },
+  color: string,
+  width: number,
+): DataTableCell {
+  if (!receipts && !fund) return { text: name, color, attributes: TextAttributes.BOLD };
+  const badges = (receipts ? 1 : 0) + (fund ? 1 : 0);
+  return {
+    text: [name, receipts, fund ? "13F" : ""].filter(Boolean).join(" "),
+    contentWidth: displayWidth(name) + badges * (BADGE_WIDTH + 1),
+    content: (
+      <Box flexDirection="row" gap={1} width={width} overflow="hidden">
+        <Text fg={color} attributes={TextAttributes.BOLD}>
+          {clipToDisplayWidth(name, Math.max(1, width - badges * (BADGE_WIDTH + 1)))}
+        </Text>
+        {receipts ? <Badge label={receipts} /> : null}
+        {fund ? <Badge label="13F" tone="accent" /> : null}
+      </Box>
+    ),
+  };
+}
+
 export function HoldersView({ focused, width, height }: { focused: boolean; width: number; height: number }) {
   const { nativePaneChrome } = useUiCapabilities();
   const { symbol, ticker, financials } = usePaneTicker();
@@ -78,11 +109,15 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
   const tableScrollRef = useRef<ScrollBoxRenderable | null>(null);
 
   const exchange = ticker?.metadata.exchange ?? "";
+  const savedCurrency = ticker?.metadata.currency ?? "";
   const issuerListing = useIssuerListing(ticker);
   const loadHolders = useMemo(() => symbol ? async (forceRefresh: boolean) => {
     if (!dataProvider) throw new Error("Holder data unavailable");
-    return loadHolderData(dataProvider, symbol, exchange, forceRefresh ? { cacheMode: "refresh" } : undefined);
-  } : null, [dataProvider, exchange, symbol]);
+    return loadHolderData(dataProvider, symbol, exchange, forceRefresh ? { cacheMode: "refresh" } : undefined).catch((error: unknown) => {
+      // The source has none: the pane says so, and abroad which filings were read, not the source's NO_DATA.
+      throw isNoHoldersAnswer(error) ? new Error(noHoldersText(symbol, exchange, savedCurrency)) : error;
+    });
+  } : null, [dataProvider, exchange, savedCurrency, symbol]);
   // Another ticker's holders stay up until its own answer, and a failed
   // refresh keeps the last holders; the failure goes to the footer.
   const { data, loading, error, reload } = useAsyncResource<HolderData>(loadHolders, {
@@ -119,6 +154,9 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
 
   // The values' own currency: dollars from the 13F filings on a London line, not its pence.
   const currency = holderValueCurrency(listData, ticker?.metadata.currency || "USD")!;
+  // Dollars on a line priced in another currency (Alibaba's 9988) say USD, never a "$" read as Hong Kong dollars.
+  const listingCurrency = listData?.currency?.trim() || ticker?.metadata.currency || currency;
+  const currencyCode = currency !== listingCurrency;
   // A stake without a reported percentage is the holding's value over the
   // market cap, when both are in one currency. The stream keeps the cap
   // current, about once a second; the stakes follow it at most every few
@@ -167,11 +205,13 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
     const controller = new AbortController();
     fundMatchAbortRef.current = controller;
     setFundMatching(true);
-    void loadHolder13FMatches(rows, controller.signal)
+    loadHolder13FMatches(rows, controller.signal)
       .then((matches) => {
         if (fundMatchAbortRef.current !== controller) return;
         setFundMatches(matches);
       })
+      // A holder that cannot be matched is left unmatched; anything else is logged.
+      .catch(logFailure("holders.pane", "Matching holders to 13F filers failed"))
       .finally(() => {
         if (fundMatchAbortRef.current === controller) setFundMatching(false);
       });
@@ -213,7 +253,7 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
 
   const reloadIndex = index.reload;
   const refresh = useCallback(() => {
-    void reload();
+    reload();
     reloadIndex();
   }, [reload, reloadIndex]);
   const loadMoreFromScroll = useTableLoadMore(tableScrollRef, indexed && index.hasMore, index.loadMore);
@@ -277,28 +317,10 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
     switch (column.id) {
       case "holder": {
         const color = rowState.selected ? colors.selectedText : colors.textBright;
-        // ADR: a position held as receipts on a home line's list. 13F: a fund
-        // whose filing opens on Enter or o.
-        const receipts = holderShareBasisMarker(row);
-        const fund = fundMatches.has(row.id);
-        if (!receipts && !fund) return { text: row.name, color, attributes: TextAttributes.BOLD };
-        const badges = (receipts ? 1 : 0) + (fund ? 1 : 0);
-        // The name gives way first, so the markers survive a narrow column.
-        return {
-          text: [row.name, receipts, fund ? "13F" : ""].filter(Boolean).join(" "),
-          content: (
-            <Box flexDirection="row" gap={1} width={column.width} overflow="hidden">
-              <Text fg={color} attributes={TextAttributes.BOLD}>
-                {clipToDisplayWidth(row.name, Math.max(1, column.width - badges * (BADGE_WIDTH + 1)))}
-              </Text>
-              {receipts ? <Badge label={receipts} /> : null}
-              {fund ? <Badge label="13F" tone="accent" /> : null}
-            </Box>
-          ),
-        };
+        return holderNameCell(row.name, { receipts: holderShareBasisMarker(row), fund: fundMatches.has(row.id) }, color, column.width);
       }
       case "value":
-        return { text: formatMoneyCompact(row.value, currency), color: colors.text };
+        return { text: formatMoneyCompact(row.value, currency, { code: currencyCode }), color: colors.text };
       case "shares":
         return { text: formatCompact(row.shares), color: colors.text };
       case "changeShares":
@@ -319,8 +341,10 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
       case "reportDate":
         return { text: displayDate(row.reportDate), color: colors.textDim };
     }
-  }, [currency, fundMatches, marketCap]);
+  }, [currency, currencyCode, fundMatches, marketCap]);
 
+  // Holders read from the company's home line say whose; the SEC index's rows are the listing's own.
+  useCompanyDataFooter(indexed ? null : listData?.companyFrom, viewMode !== "13dg");
   // The 13D/G tab registers its own footer.
   usePaneFooter("holders", () => {
     if (viewMode === "13dg") return null;
@@ -370,6 +394,8 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
       ? "Loading holders..."
       : !listData && error ? error : sortedRows.length === 0 ? "No holders available" : null;
   const chartHeight = Math.max(1, height - tabRows - (nativePaneChrome ? 1 : 0));
+  // A line abroad lists US 13F filers, not its own market's register: the table says so above the holders.
+  const registerCaveat = listData && sortedRows.length > 0 ? nonUsHolderCaveat(exchange || listData.exchange, listData.currency ?? "USD") : null;
 
   // A list shorter than the table cannot scroll to load more, so it pages on
   // until it fills the table, as a scroll would; a failed page waits for one.
@@ -407,6 +433,7 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
           renderCell={renderCell}
           selectedTextOverridesCellColor
           emptyStateTitle={statusTitle ?? "No holders available"}
+          rootBefore={registerCaveat ? <Box paddingX={1}><Notice tone="muted">{registerCaveat}</Notice></Box> : undefined}
         />
       ) : viewMode === "13dg" ? (
         <BeneficialOwnersView
@@ -431,6 +458,7 @@ export function HoldersView({ focused, width, height }: { focused: boolean; widt
           onSelect={(row) => setSelectedId(row.id)}
           onActivate={openFundDetail}
           currency={currency}
+          currencyCode={currencyCode}
           marketCap={marketCap}
         />
       )}

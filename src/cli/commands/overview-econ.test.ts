@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { setCloudApiFetchTransport } from "../../api-client/request";
 import { DEFAULT_CLI_OPTIONS, type CliGlobalOptions } from "../options";
 import { printCliResult, serializeCliResult } from "../result";
+import { setCliPlainOverride } from "../../utils/cli-output";
 import { isCliFailure } from "../errors";
 import { createTestCliContext } from "../../test-support/cli-context";
 import { attachEconCalendarPersistence, resetEconCalendarPersistence } from "../../plugins/builtin/econ/calendar-model";
@@ -37,14 +38,14 @@ const twoWeeks = [
  * events and `storedFrom`; "none" is a server that keeps no past events (404),
  * a number another status and "offline" no network for it.
  */
-async function econText(events: unknown[], args: string[], cliOptions: Partial<CliGlobalOptions> = {}, storedFrom: string | null | "none" | "offline" | number = "none"): Promise<string> {
-  const { result, options } = await econPrinted(events, args, cliOptions, storedFrom);
+async function econText(events: unknown[], args: string[], cliOptions: Partial<CliGlobalOptions> = {}, storedFrom: string | null | "none" | "offline" | number = "none", listedThrough?: string, listedFrom?: string): Promise<string> {
+  const { result, options } = await econPrinted(events, args, cliOptions, storedFrom, listedThrough, listedFrom);
   // Warnings print apart from the table, as `warning: ...` lines.
   return [serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, ...cliOptions, format: "text" }, options),
     ...(result.warnings ?? []).map((warning) => `warning: ${warning}`)].join("\n");
 }
 
-async function econPrinted(events: unknown[], args: string[], cliOptions: Partial<CliGlobalOptions> = {}, storedFrom: string | null | "none" | "offline" | number = "none") {
+async function econPrinted(events: unknown[], args: string[], cliOptions: Partial<CliGlobalOptions> = {}, storedFrom: string | null | "none" | "offline" | number = "none", listedThrough?: string, listedFrom?: string) {
   resetEconCalendarPersistence();
   attachEconCalendarPersistence(new MemoryPluginPersistence());
   setCloudApiFetchTransport(async (url) => {
@@ -56,7 +57,7 @@ async function econPrinted(events: unknown[], args: string[], cliOptions: Partia
       status,
       headers: new Headers(),
       text: async () => status === 422 ? JSON.stringify({ message: "The calendar reaches back 400 days" })
-        : status !== 200 ? JSON.stringify({ message: "Unavailable" }) : JSON.stringify(history ? { events, storedFrom } : events),
+        : status !== 200 ? JSON.stringify({ message: "Unavailable" }) : JSON.stringify(history ? { events, storedFrom, ...listedThrough ? { listedThrough } : {}, ...listedFrom ? { listedFrom } : {} } : events),
     } as Response;
   });
   const cli = createTestCliContext({}, cliOptions);
@@ -95,6 +96,11 @@ test("an earlier --from lists the stored calendar's past events and says where i
   expect(stored).not.toContain("The stored calendar starts");
   const late = await econText(twoWeeks, ["--from", "2026-08-01", "--country", "US"], {}, "2026-09-01");
   expect(late).toContain("The stored calendar starts 2026-09-01; nothing earlier is listed");
+  // Once the calendar reaches back less far than the stored calendar starts, the note names how far it lists.
+  setSystemTime(new Date("2027-03-01T08:00:00.000Z"));
+  expect(await econText(twoWeeks, ["--from", "2025-06-01", "--country", "US"], {}, "2026-01-01", undefined, "2026-01-25"))
+    .toContain("The calendar lists back 400 days, to 2026-01-25; nothing earlier is listed");
+  setSystemTime(new Date("2026-10-18T23:00:00.000Z"));
   // A server that keeps no past events lists what it has and says where that starts.
   const old = await econText(twoWeeks.slice(4), ["--from", "2026-10-12", "--country", "US"]);
   expect(old).toContain("Housing Starts");
@@ -136,16 +142,62 @@ test("--country takes ISO codes, comma lists and regions; a country with nothing
   expect(turkey).toContain("29.73%");
   expect(turkey).not.toContain("Housing Starts");
   // A real country with no rows is a quiet window, never an unknown country; UK is GB's common name.
-  expect(await econText(withTurkey, ["--country", "MX"])).toContain("No scheduled releases for MX in this window.");
-  expect(await econText(withTurkey, ["--country", "UK"])).toContain("No scheduled releases for GB in this window.");
+  expect(await econText(withTurkey, ["--country", "MX"])).toContain("No scheduled releases for MX in this window; releases are listed through 2026-11-03.");
+  expect(await econText(withTurkey, ["--country", "UK"])).toContain("No scheduled releases for GB in this window; releases are listed through 2026-11-03.");
   // A list lists what its countries have, and names the ones with nothing.
   const list = await econText(withTurkey, ["--country", "MX,tr, us"]);
   expect(list).toContain("CPI y/y");
   expect(list).toContain("Housing Starts");
   expect(list).not.toContain("German ZEW");
   expect(list).toContain("No scheduled releases for MX in this window.");
+  // A country the calendar does not cover is not a quiet window: it says so, beside the rows of the ones it does.
+  const frontier = await econText(withTurkey, ["--country", "TR,EG,NG,AR"]);
+  expect(frontier).toContain("CPI y/y");
+  expect(frontier).toContain("EG, NG and AR are not in the calendar.");
+  expect(frontier).not.toContain("No scheduled releases");
+  expect(await econText(withTurkey, ["--country", "EG,MX"])).toContain("EG is not in the calendar. No scheduled releases for MX in this window; releases are listed through 2026-11-03.");
   await expect(econText(withTurkey, ["--country", "TUR"])).rejects.toThrow('Unknown country "TUR".');
   await expect(econText(withTurkey, ["--country", "MX,XQ"])).rejects.toThrow('Unknown country "XQ".');
+});
+
+// `econ --from 2026-12-01 --country TR,MX` said only "No scheduled releases for TR or MX in this window".
+test("the listing's end is said as Gloom Cloud gives it, and each bank's next decision past it is listed as one", async () => {
+  setSystemTime(new Date("2026-11-07T20:06:00.000Z"));
+  const decision = (date: string, country: string, name: string) => ({ ...event(date, country, "high", name), kind: "central-bank-decision" });
+  const listing = [
+    event("2026-11-09T12:00:00.000Z", "MX", "high", "CPI y/y"),
+    event("2026-11-20T13:30:00.000Z", "US", "high", "Housing Starts"),
+    decision("2026-11-19T13:00:00.000Z", "ZA", "SARB Interest Rate Decision"),
+  ];
+  // A filter with nothing in the window names where the releases end: from a server that does not say, its last row.
+  expect(await econText(listing, ["--from", "2026-12-01", "--country", "TR,MX"]))
+    .toContain("No scheduled releases for TR or MX in this window; releases are listed through 2026-11-20.");
+  // The banks' next decisions past it are rows the server marks, each saying where the listing ends.
+  const past = (date: string, country: string, name: string) => ({ ...decision(date, country, name), pastListing: true, listedThrough: "2026-11-21" });
+  const next = [...listing, past("2026-12-10T11:00:00.000Z", "TR", "CBRT Interest Rate Decision"),
+    past("2026-12-17T19:00:00.000Z", "MX", "Banxico Interest Rate Decision"), past("2027-01-28T13:00:00.000Z", "ZA", "SARB Interest Rate Decision")];
+  const later = await econText(next, ["--from", "2026-12-01", "--country", "TR,MX"]);
+  expect(later).toContain("CBRT Interest Rate Decision");
+  expect(later).toContain("Banxico Interest Rate Decision");
+  expect(later).toContain("No releases listed after 2026-11-21; the rows after it are each central bank's next decision");
+  expect(later).not.toContain("No events listed after");
+  const { result } = await econPrinted(next, ["--from", "2026-12-01", "--country", "TR,MX"]);
+  expect(result.metadata).toMatchObject({ listedThrough: "2026-11-21" });
+  // A country with no next decision there names the same end.
+  expect(await econText(next, ["--from", "2026-12-01", "--country", "IN"]))
+    .toContain("No scheduled releases for IN in this window; releases are listed through 2026-11-21.");
+  // Rows within the listing say nothing about its end; from today, the next decision past it says it under them.
+  expect(await econText(next, ["--country", "US"])).not.toContain("listed after");
+  expect(await econText(next, ["--country", "MX"])).toContain("CPI y/y");
+  // Past it too, each country's next CPI as its statistics office schedules it (TurkStat's 3 Dec, 10:00 in Istanbul).
+  const cpi = { ...event("2026-12-03T07:00:00.000Z", "TR", "high", "CPI"), kind: "statistics-release", localTime: "10:00",
+    timeZone: "Europe/Istanbul", referencePeriod: "2026-11", source: { name: "TurkStat" }, pastListing: true, listedThrough: "2026-11-21" };
+  const turkey = await econText([...next, cpi], ["--from", "2026-12-01", "--country", "TR", "--tz", "Europe/Istanbul"]);
+  expect(turkey).toMatch(/2026-12-03\s+07:00 UTC\s+Thu\s+10:00\s+10:00 Istanbul\s+TR\s+high\s+CPI\s.*TurkStat/);
+  expect(turkey).toContain("the rows after it are each central bank's next decision and each country's next CPI release, as its statistics office schedules it");
+  // The calendar from an earlier day says the end itself.
+  const stored = await econText(listing, ["--from", "2026-11-01", "--country", "TR"], {}, "2026-10-01", "2026-11-21");
+  expect(stored).toContain("No scheduled releases for TR in this window; releases are listed through 2026-11-21.");
 });
 
 test("rows a bank or a statistics office times itself show its clock; a bank that states no time leaves the time blank and says why", async () => {
@@ -164,6 +216,36 @@ test("rows a bank or a statistics office times itself show its clock; a bank tha
   expect(row).toMatchObject({ time: "", localTime: null, timeZone: "Europe/Istanbul", priorAsOf: "2026-10-16", prior: 39.5, priorText: "39.50%", actual: null });
   // The feeds' own calendar prints without the publisher's clock column.
   expect(await econText(twoWeeks, ["--country", "US"])).not.toContain("Local");
+});
+
+test("plain output leaves out the Local and Viewer columns when nothing fills them, and the CSV the Local column", async () => {
+  const timed = { ...event("2026-10-22T12:00:00.000Z", "MX", "high", "Mid-Month CPI"), localTime: "06:00", timeZone: "America/Mexico_City" };
+  setCliPlainOverride(true);
+  try {
+    // A calendar of the feeds' own rows has no publisher clock and, without --tz, no viewer clock: no column of dashes for either.
+    const feeds = await econText(twoWeeks, ["--country", "US"]);
+    expect(feeds).toMatch(/Date\s+Day\s+Time\s+Country\s+Impact\s+Event\s+Period\s+Actual\s+Forecast\s+Prior/);
+    expect(feeds).not.toContain("Local");
+    expect(feeds).not.toContain("Viewer");
+    // One row a publisher times itself brings the column back, with the dash on the rows that have none.
+    const mixed = await econText([...twoWeeks, timed], ["--country", "US,MX"]);
+    expect(mixed).toMatch(/Time\s+Local\s+Country/);
+    expect(mixed).toMatch(/12:00 UTC\s+06:00 Mexico City\s+MX\s+high\s+Mid-Month CPI/);
+    expect(mixed).toMatch(/12:30 UTC\s+—\s+US\s+high\s+Housing Starts/);
+    // --tz gives the viewer's clock its column, named for the zone.
+    expect(await econText(twoWeeks, ["--country", "US", "--tz", "America/New_York"])).toMatch(/Time\s+Day\s+New York\s+Country/);
+    // A script's CSV header has Local only when a row has a publisher's clock: `econ --tz Asia/Tokyo --csv` carried it
+    // empty on every row.
+    const header = async (calendar: typeof twoWeeks, args: string[]) => {
+      const { result, options } = await econPrinted(calendar, args);
+      return serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, options).split("\n")[0]!;
+    };
+    expect(await header(twoWeeks, ["--country", "US"])).toContain("Viewer,Country");
+    expect(await header(twoWeeks, ["--country", "US", "--tz", "Asia/Tokyo"])).toStartWith("Date,Time,Day,Tokyo date,Tokyo day,Tokyo time,Country");
+    expect(await header([...twoWeeks, timed], ["--country", "US,MX"])).toContain("Viewer,Local,Country");
+  } finally {
+    setCliPlainOverride(null);
+  }
 });
 
 test("a row names who publishes it, the period it covers and its page, in the table and in every export", async () => {
@@ -186,7 +268,7 @@ test("a row names who publishes it, the period it covers and its page, in the ta
   expect(rows.find((row) => row.event === "Housing Starts")).toMatchObject({ publisher: null, referencePeriod: null, sourceUrl: null });
   const text = await econText(mortgages, ["--country", "US"]);
   expect(text).toMatch(/Publisher/);
-  expect(text).toMatch(/30-Year Mortgage Rate\s+7\.32%\s+7\.40%\s+Freddie Mac/);
+  expect(text).toMatch(/30-Year Mortgage Rate\s+22 Oct 2026\s+7\.32%\s+7\.40%\s+Freddie Mac/);
   // A calendar without publishers prints no empty column for them.
   expect(await econText(twoWeeks, ["--country", "US"])).not.toContain("Publisher");
 });
@@ -201,12 +283,17 @@ test("--tz adds the viewer's clock, with the weekday there in Day", async () => 
   ];
   const text = await econText(brazil, ["--country", "BR", "--tz", "america/new_york"]);
   expect(text).toMatch(/Date\s+Time\s+Day\s+New York\s+Local/);
-  // Wednesday the 14th in UTC is still Tuesday evening in New York.
-  expect(text).toMatch(/2026-10-14\s+01:30 UTC\s+Tue\s+21:30\s+BR\s+medium\s+Night release/);
-  expect(text).toMatch(/2026-10-23\s+12:00 UTC\s+Fri\s+08:00\s+09:00 Sao Paulo\s+BR\s+high\s+IPCA-15 Mid-Month CPI m\/m\s+0\.32%\s+0\.43%\s+0\.70%/);
+  // Wednesday the 14th in UTC is still Tuesday evening in New York, and the clock says its own date.
+  expect(text).toMatch(/2026-10-14\s+01:30 UTC\s+Tue\s+10-13 21:30\s+BR\s+medium\s+Night release/);
+  expect(text).toMatch(/2026-10-23\s+12:00 UTC\s+Fri\s+08:00\s+09:00 Sao Paulo\s+BR\s+high\s+IPCA-15 Mid-Month CPI m\/m\s+2026-10\s+0\.32%\s+0\.43%\s+0\.70%/);
   const printed = await econPrinted(brazil, ["--country", "BR", "--tz", "America/New_York"]);
   expect(printed.result.metadata).toMatchObject({ timeZone: "America/New_York" });
   expect((printed.result.data as Record<string, unknown>[]).at(-1)).toMatchObject({ viewerDate: "2026-10-23", viewerTime: "08:00" });
+  // The CSV keeps the UTC timestamp, its time and its weekday, and the viewer's date, weekday and time in columns of
+  // their own, filled: the viewer's Tue was beside the UTC Wed's date, and its clock had no date.
+  const csv = serializeCliResult(printed.result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, printed.options).split("\n");
+  expect(csv[0]).toStartWith("Date,Time,Day,New York date,New York day,New York time,Local,Country");
+  expect(csv.find((line) => line.includes("Night release"))).toStartWith("2026-10-14T01:30:00.000Z,01:30,Wed,2026-10-13,Tue,21:30,,BR,medium,Night release");
   // Without --tz the rows carry no viewer clock, and Day is the UTC date's.
   const plain = await econText(brazil, ["--country", "BR"]);
   expect(plain).not.toContain("New York");
@@ -228,7 +315,7 @@ test("a day-long event prints All day under its own weekday, never a midnight cl
   // Its day stays its own on another clock, which has no time to show for it.
   const newYork = await econText(china, ["--country", "CN", "--tz", "America/New_York"]);
   expect(newYork).toMatch(/2026-10-12\s+All day\s+Mon\s+CN\s+medium\s+Communist Party Fifth Plenum/);
-  expect(newYork).toMatch(/2026-10-12\s+00:00 UTC\s+Sun\s+20:00\s+CN\s+low\s+Midnight release/);
+  expect(newYork).toMatch(/2026-10-12\s+00:00 UTC\s+Sun\s+10-11 20:00\s+CN\s+low\s+Midnight release/);
   const rows = (await econPrinted(china, ["--country", "CN", "--tz", "America/New_York"])).result.data as Record<string, unknown>[];
   expect(rows.map((row) => [row.event, row.time, row.day, row.viewerTime])).toEqual([
     ["Communist Party Fifth Plenum", "All Day", "Mon", null],
@@ -261,10 +348,12 @@ const exportCalendar = [
   ...twoWeeks,
   // A feed row with every figure drawn as text, and a publisher, period and page.
   { ...event("2026-10-14T06:00:00.000Z", "GB", "low", "Claimant Count Change"), actual: "30.3K", forecast: "19.4K", prior: "-27.8K", referencePeriod: "Sep 2026",
-    source: { name: "Office for National Statistics", url: "https://www.ons.gov.uk/" } },
+    source: { name: "Office for National Statistics", url: "https://www.ons.gov.uk/" },
+    consensus: { source: "release-calendar", readAt: "2026-10-09T08:00:00.000Z" } },
   { ...event("2026-10-14T14:30:00.000Z", "US", "medium", "EIA Crude Oil Stocks Change"), actual: "-4.1M bbl", forecast: "-0.987M bbl", prior: "0.5M bbl", referencePeriod: "9 Oct 2026",
     source: { name: "U.S. Energy Information Administration", url: "https://www.eia.gov/" } },
-  { ...event("2026-10-14T12:30:00.000Z", "US", "high", "Unemployment Rate"), actual: "4.7%", forecast: "4.9%", prior: "4.9%", referencePeriod: "Sep 2026", indicatorId: "us-unemployment-rate" },
+  { ...event("2026-10-14T12:30:00.000Z", "US", "high", "Unemployment Rate"), actual: "4.7%", forecast: "4.9%", prior: "4.9%", referencePeriod: "Sep 2026", indicatorId: "us-unemployment-rate",
+    consensus: { source: "week-feed", readAt: "2026-10-09T08:30:00.000Z" } },
   { ...event("2026-10-15T14:30:00.000Z", "US", "low", "EIA Natural Gas Stocks Change"), forecast: "77 Bcf", prior: "-119 Bcf" },
   // A bound is no single number, and a release with nothing out yet has no release time.
   { ...event("2026-10-30T02:30:00.000Z", "JP", "high", "BOJ Policy Rate"), forecast: "<1.25%", prior: "0.5%" },
@@ -286,9 +375,24 @@ test("an export carries the calendar's figures as numbers with their unit and sc
   expect(by("Housing Starts")).toMatchObject({ actual: null, forecast: null, prior: null, unit: null, scale: null });
   // The text table still draws them as they were.
   const text = await econText(exportCalendar, ["--from", "2026-10-14"]);
-  expect(text).toMatch(/Claimant Count Change\s+30\.3K\s+19\.4K\s+-27\.8K/);
-  expect(text).toMatch(/EIA Crude Oil Stocks Change\s+-4\.1M bbl\s+-0\.987M bbl\s+0\.5M bbl/);
+  expect(text).toMatch(/Claimant Count Change\s+Sep 2026\s+30\.3K\s+19\.4K\s+-27\.8K/);
+  expect(text).toMatch(/EIA Crude Oil Stocks Change\s+9 Oct 2026\s+-4\.1M bbl\s+-0\.987M bbl\s+0\.5M bbl/);
   expect(text).not.toContain("Scale");
+});
+
+test("an amount reads with the currency the server states beside it, and counts it in the exports; an older server's reads as before", async () => {
+  const trade = (currency?: string) => ({ ...event("2026-10-14T23:50:00.000Z", "JP", "low", "Balance of Trade"),
+    actual: "-556.5B", forecast: "-181B", prior: "-1121B", ...(currency ? { currency } : {}) });
+  const inflation = { ...event("2026-10-14T23:30:00.000Z", "JP", "low", "Inflation Rate YoY"), prior: "2.9%", currency: "JPY" };
+  const text = await econText([trade("JPY"), inflation], ["--from", "2026-10-14"]);
+  expect(text).toMatch(/Balance of Trade\s+-556\.5B JPY\s+-181B JPY\s+-1121B JPY/);
+  // A percent is no amount: no currency beside it.
+  expect(text).not.toContain("2.9% JPY");
+  const { result } = await econPrinted([trade("JPY")], ["--from", "2026-10-14"]);
+  expect((result.data as Record<string, unknown>[])[0]).toMatchObject({ actual: -556.5e9, unit: "JPY", actualText: "-556.5B" });
+  const older = await econText([trade()], ["--from", "2026-10-14"]);
+  expect(older).toMatch(/Balance of Trade\s+-556\.5B\s+-181B\s+-1121B/);
+  expect(older).not.toContain("JPY");
 });
 
 test("the CSV, NDJSON and JSON of the same calendar say the same, and the CSV adds nothing the JSON lacks", async () => {
@@ -303,7 +407,7 @@ test("the CSV, NDJSON and JSON of the same calendar say the same, and the CSV ad
     ...json.columns.map((column) => column.header),
     "symbol_or_series", "currency_or_unit", "interval", "source", "as_of", "period", "released", "retrieved",
   ]);
-  expect(csv.header.slice(0, json.columns.length)).toEqual(["Date", "Day", "Time", "Viewer", "Local", "Country", "Impact", "Event", "Actual", "Forecast", "Prior", "Unit", "Scale", "Publisher", "Link", "actual_text", "forecast_text", "prior_text"]);
+  expect(csv.header.slice(0, json.columns.length)).toEqual(["Date", "Day", "Time", "Viewer", "Country", "Impact", "Event", "Actual", "Forecast", "Prior", "Unit", "Scale", "Publisher", "Link", "actual_text", "forecast_text", "prior_text", "consensus_feed", "consensus_read_at", "actual_status"]);
   expect(csv.rows).toHaveLength(json.data.length);
   expect(ndjson).toHaveLength(json.data.length);
   const cell = (value: unknown) => value == null ? "" : String(value);
@@ -334,9 +438,19 @@ test("the CSV, NDJSON and JSON of the same calendar say the same, and the CSV ad
   expect([bojCells.Forecast, bojCells.forecast_text, bojCells.Prior, bojCells.prior_text]).toEqual(["", "<1.25%", "0.5", "0.5%"]);
   expect(ndjson[boj]).toMatchObject({ forecast: null, forecastText: "<1.25%", prior: 0.5, priorText: "0.5%" });
   expect(json.data[boj]).toMatchObject({ forecast: null, forecastText: "<1.25%" });
+  // The feed a forecast was read from and when, in every format; a row with no forecast names none.
+  const claimant = json.data.findIndex((row) => row.event === "Claimant Count Change");
+  expect(json.data[claimant]).toMatchObject({ consensusFeed: "release-calendar", consensusReadAt: "2026-10-09T08:00:00.000Z" });
+  expect(ndjson[claimant]).toMatchObject({ consensusFeed: "release-calendar", consensusReadAt: "2026-10-09T08:00:00.000Z" });
+  const claimantCells = Object.fromEntries(csv.header.map((name, column) => [name, csv.rows[claimant]![column]!]));
+  expect([claimantCells.consensus_feed, claimantCells.consensus_read_at]).toEqual(["release-calendar", "2026-10-09T08:00:00.000Z"]);
+  expect(json.data[unemployment]).toMatchObject({ consensusFeed: "week-feed", consensusReadAt: "2026-10-09T08:30:00.000Z" });
+  expect(csv.rows[unemployment]![csv.header.indexOf("consensus_feed")]).toBe("week-feed");
+  expect(json.data.find((row) => row.event === "Housing Starts")).toMatchObject({ consensusFeed: null, consensusReadAt: null });
+  expect(csv.rows[json.data.findIndex((row) => row.event === "Housing Starts")]!.slice(csv.header.indexOf("consensus_feed"), csv.header.indexOf("consensus_read_at") + 1)).toEqual(["", ""]);
   // A figure is a number in every format, and a missing one is empty in CSV and null in JSON.
   const crude = json.data.findIndex((row) => row.event === "EIA Crude Oil Stocks Change");
-  expect(csv.rows[crude]!.slice(8, 13)).toEqual(["-4100000", "-987000", "500000", "bbl", "1000000"]);
+  expect(csv.rows[crude]!.slice(csv.header.indexOf("Actual"), csv.header.indexOf("Scale") + 1)).toEqual(["-4100000", "-987000", "500000", "bbl", "1000000"]);
   const housing = json.data.findIndex((row) => row.event === "Housing Starts");
   expect(csv.rows[housing]!.slice(8, 13)).toEqual(["", "", "", "", ""]);
   expect(json.data[housing]).toMatchObject({ actual: null, released: null });
@@ -404,4 +518,190 @@ test("the earliest-day error is the same JSON a script reads, with a failing exi
     process.exitCode = 0;
     await rm(home, { recursive: true, force: true });
   }
+});
+
+test("a row with no figures comes out at its own time once that has passed, as released and as_of in every format", async () => {
+  setSystemTime(new Date("2026-10-20T12:00:00.000Z"));
+  const calendar = [
+    ...twoWeeks,
+    event("2026-10-19T09:00:00.000Z", "GB", "medium", "BoE Bailey Speech"),
+    event("2026-10-22T15:00:00.000Z", "GB", "medium", "BoE Pill Speech"),
+    { ...event("2026-10-19T00:00:00.000Z", "EU", "low", "Eurogroup Meeting"), time: "All Day" },
+    { ...event("2026-10-19T12:30:00.000Z", "US", "low", "Housing Starts"), forecast: "1.3M", prior: "1.4M" },
+    { ...event("2026-10-19T14:00:00.000Z", "US", "low", "Existing Home Sales"), actual: "4.1M", forecast: "4.0M", prior: "3.9M" },
+  ];
+  const { result, options } = await econPrinted(calendar, ["--from", "2026-10-19"]);
+  const csv = readCsv(serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, options));
+  const ndjson = serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, format: "ndjson" }, options).split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  const json = (result.data as Array<Record<string, unknown>>);
+  const at = (name: string) => json.findIndex((row) => row.event === name);
+  const cells = (name: string) => Object.fromEntries(csv.header.map((header, column) => [header, csv.rows[at(name)]![column]!]));
+  // The row's released in JSON, in NDJSON beside its as_of, and in CSV beside its as_of.
+  const seen = (name: string) => [json[at(name)]!.released, ndjson[at(name)]!.released, ndjson[at(name)]!.as_of, cells(name).released, cells(name).as_of];
+  // A speech given: its own time. A meeting that takes the day: its day.
+  expect(seen("BoE Bailey Speech")).toEqual(Array(5).fill("2026-10-19T09:00:00.000Z"));
+  expect(seen("Eurogroup Meeting")).toEqual(Array(5).fill("2026-10-19"));
+  // A speech still to come has not come out; nor has a release with a forecast and no actual yet, whatever its time.
+  expect(seen("BoE Pill Speech")).toEqual([null, null, null, "", ""]);
+  expect(seen("Housing Starts")).toEqual([null, null, null, "", ""]);
+  // A release with its actual is unchanged.
+  expect(seen("Existing Home Sales")).toEqual(Array(5).fill("2026-10-19T14:00:00.000Z"));
+});
+
+test("a release past its time with no figure says when it was due and that the figure is awaited, then that the source has none, for a day", async () => {
+  setSystemTime(new Date("2026-11-09T08:18:00.000Z"));
+  const calendar = [
+    // China's CPI at 01:30 and Germany's trade at 07:00 with no actual hours later, as on 9 Nov 2026.
+    { ...event("2026-11-09T01:30:00.000Z", "CN", "low", "CPI y/y"), forecast: "0.8%", prior: "0.9%" },
+    { ...event("2026-11-09T07:00:00.000Z", "EU", "low", "German Trade Balance"), forecast: "19.2B", prior: "19.5B", currency: "EUR" },
+    // A day late is no longer awaited; a release with its figure, one still to come and a speech never are.
+    { ...event("2026-11-08T07:00:00.000Z", "CN", "low", "Foreign Exchange Reserves"), forecast: "3.42T", prior: "3.4T" },
+    { ...event("2026-11-09T01:30:00.000Z", "CN", "low", "PPI y/y"), actual: "5.7%", forecast: "5.3%", prior: "5.0%" },
+    { ...event("2026-11-09T09:03:00.000Z", "CN", "low", "M2 Money Supply y/y"), forecast: "7.3%", prior: "7.2%" },
+    event("2026-11-09T08:00:00.000Z", "EU", "low", "German Buba President Nagel Speaks"),
+    // A time off the five-minute grid is the feed's tentative one (China's New Loans at 09:03): nothing was due at it.
+    { ...event("2026-11-09T02:03:00.000Z", "CN", "low", "New Loans"), forecast: "500B", prior: "1290B" },
+  ];
+  const text = await econText(calendar, ["--from", "2026-11-08"]);
+  const line = (name: string) => text.split("\n").find((row) => row.includes(name))!;
+  // Two hours past its time, the source has no figure to give.
+  expect(line("CPI y/y")).toContain("no figure from the source");
+  expect(line("German Trade Balance")).toContain("due 07:00 UTC, awaiting figure");
+  for (const name of ["Foreign Exchange Reserves", "PPI y/y", "M2 Money Supply y/y", "Nagel Speaks", "New Loans"]) expect(line(name)).not.toContain("awaiting");
+  const { result, options } = await econPrinted(calendar, ["--from", "2026-11-08"]);
+  const json = result.data as Array<Record<string, unknown>>;
+  expect(json.map((row) => [row.event, row.actual, row.actualStatus])).toEqual([
+    ["Foreign Exchange Reserves", null, null],
+    ["CPI y/y", null, "no figure from the source"],
+    ["PPI y/y", 5.7, null],
+    ["New Loans", null, null],
+    ["German Trade Balance", null, "due 07:00 UTC, awaiting figure"],
+    ["German Buba President Nagel Speaks", null, null],
+    ["M2 Money Supply y/y", null, null],
+  ]);
+  const csv = readCsv(serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, options));
+  expect(csv.rows.map((row) => row[csv.header.indexOf("actual_status")])).toEqual(["", "no figure from the source", "", "", "due 07:00 UTC, awaiting figure", "", ""]);
+});
+
+// 11 Nov 2026: five MBA rows read "awaiting figure" all day beside five rows of the same release with theirs.
+test("a release row with no figure while another row of the same release has its own says the source has none, from 15 minutes on", async () => {
+  const mba = { name: "Mortgage Bankers Association" };
+  const at = "2026-11-11T12:00:00.000Z";
+  const calendar = [
+    { ...event(at, "US", "medium", "MBA 30-Year Mortgage Rate"), actual: "7.21%", prior: "7.3%", source: mba },
+    { ...event(at, "US", "medium", "MBA 5/1 ARM Contract Rate"), prior: "6.29%", source: mba },
+    // Another publisher's release at the same time is still awaited, as is one with no publisher named.
+    { ...event(at, "US", "low", "Redbook y/y"), prior: "5.1%", source: { name: "Redbook Research" } },
+    { ...event(at, "US", "low", "Other Index"), prior: "1.0" },
+  ];
+  const statusAt = async (now: string) => {
+    setSystemTime(new Date(now));
+    const { result } = await econPrinted(calendar, ["--from", "2026-11-11"]);
+    return Object.fromEntries((result.data as Array<Record<string, unknown>>).map((row) => [row.event, row.actualStatus]));
+  };
+  // A source fills a release's rows minutes apart: one row in is no answer for the rest yet.
+  expect((await statusAt("2026-11-11T12:14:00.000Z"))["MBA 5/1 ARM Contract Rate"]).toBe("due 12:00 UTC, awaiting figure");
+  expect(await statusAt("2026-11-11T12:15:00.000Z")).toEqual({
+    "MBA 30-Year Mortgage Rate": null,
+    "MBA 5/1 ARM Contract Rate": "no figure from the source",
+    "Redbook y/y": "due 12:00 UTC, awaiting figure",
+    "Other Index": "due 12:00 UTC, awaiting figure",
+  });
+});
+
+test("--search finds an event however its name is spaced or hyphenated, and the Fed's rate reads as its upper bound", async () => {
+  const calendar = [
+    ...twoWeeks,
+    { ...event("2026-10-28T18:00:00.000Z", "US", "high", "Federal Funds Rate"), forecast: "4.00%", prior: "4.00%" },
+    { ...event("2026-11-06T13:30:00.000Z", "US", "high", "Non Farm Payrolls"), prior: "29K" },
+    { ...event("2026-11-06T13:30:00.000Z", "US", "low", "Nonfarm Payrolls Private"), prior: "46K" },
+    { ...event("2026-10-30T07:45:00.000Z", "FR", "low", "French Private Non-Farm Payrolls QoQ Prel"), forecast: "-0.1%", prior: "-0.1%" },
+  ];
+  setSystemTime(new Date("2026-10-28T12:00:00.000Z"));
+  const nonfarm = await econPrinted(calendar, ["--search", "nonfarm"]);
+  expect((nonfarm.result.data as Array<{ event: string }>).map((row) => row.event))
+    .toEqual(["French Private Non-Farm Payrolls QoQ Prel", "Non Farm Payrolls", "Nonfarm Payrolls Private"]);
+  // The payrolls have a prior and no forecast yet: the dash under Forecast is a consensus not in yet.
+  const text = await econText(calendar, ["--search", "non farm payrolls", "--country", "US"]);
+  expect(text).toContain("— forecast = no consensus yet");
+  // The policy rate is the top of the Fed's range, searched by the name it is shown under or the feed's.
+  for (const words of ["fed funds", "upper bound"]) {
+    const rate = await econText(calendar, ["--search", words]);
+    expect(rate).toContain("Federal Funds Rate (upper bound)");
+    expect(rate).not.toContain("Payrolls");
+    // A release with its forecast in leaves the note out.
+    expect(rate).not.toContain("no consensus yet");
+  }
+  expect(await econText(calendar, ["--search", "ism"])).toContain("No matching events");
+});
+
+test("calendar text includes periods and OR combines housing names without requiring every term", async () => {
+  const calendar = [
+    { ...event("2026-10-22T12:30:00Z", "US", "high", "Housing Starts"), referencePeriod: "Sep 2026" },
+    { ...event("2026-10-22T16:00:00Z", "US", "low", "30-Year Mortgage Rate"), referencePeriod: "week ending 2026-10-21" },
+    { ...event("2026-10-23T14:00:00Z", "US", "medium", "NAHB Housing Market Index"), referencePeriod: "Oct 2026" },
+    event("2026-10-23T12:30:00Z", "US", "high", "CPI"),
+  ];
+  setSystemTime(new Date("2026-10-21T12:00:00Z"));
+  const text = await econText(calendar, ["--search", "housing OR mortgage OR NAHB"]);
+  expect(text).toContain("Period");
+  expect(text).toContain("Sep 2026");
+  expect(text).toContain("week ending 2026-10-21");
+  const { result } = await econPrinted(calendar, ["--search", "housing or mortgage OR NAHB"]);
+  expect((result.data as Array<{ event: string }>).map((row) => row.event)).toEqual(["Housing Starts", "30-Year Mortgage Rate", "NAHB Housing Market Index"]);
+});
+
+test("--search also finds an event by its publisher's name, initials or site: usda is the WASDE", async () => {
+  const usda = { name: "U.S. Department of Agriculture", url: "https://www.usda.gov/" };
+  const calendar = [
+    ...twoWeeks,
+    { ...event("2026-11-10T17:00:00.000Z", "US", "medium", "WASDE Report"), source: usda },
+    { ...event("2026-11-06T13:30:00.000Z", "US", "high", "Non Farm Payrolls"), source: { name: "Bureau of Labor Statistics", url: "https://www.bls.gov/" } },
+  ];
+  setSystemTime(new Date("2026-10-28T12:00:00.000Z"));
+  const names = async (words: string) => ((await econPrinted(calendar, ["--search", words])).result.data as Array<{ event: string }>).map((row) => row.event);
+  for (const words of ["USDA", "agriculture", "department of agriculture", "usda wasde"]) expect(await names(words), words).toEqual(["WASDE Report"]);
+  expect(await names("bls")).toEqual(["Non Farm Payrolls"]);
+  // A word in neither the name nor the publisher still finds nothing.
+  expect(await names("usda payrolls")).toEqual([]);
+});
+
+test("--search cpi lists 10 Nov 2026's y/y with its consensus, as not published, and says why", async () => {
+  // `econ --country US --search cpi --from 2026-09-01` listed index levels only; the y/y and its 3.9% consensus were in MDAY alone.
+  setSystemTime(new Date("2026-11-13T23:00:00.000Z"));
+  const bls = { name: "Bureau of Labor Statistics" };
+  const at = "2026-11-10T13:30:00.000Z";
+  const calendar = [
+    { ...event("2026-10-14T12:30:00.000Z", "US", "high", "Inflation Rate YoY"), actual: "3.7%", forecast: "3.6%", prior: "3.4%",
+      indicatorId: "us-inflation-rate-yoy", source: bls },
+    { ...event(at, "US", "high", "CPI m/m"), actual: "0.4%", forecast: "0.3%", prior: "0.6%", indicatorId: "us-inflation-rate-mom", source: bls },
+    { ...event(at, "US", "high", "Inflation Rate YoY"), forecast: "3.9%", prior: "3.7%", indicatorId: "us-inflation-rate-yoy", source: bls },
+    { ...event(at, "US", "high", "Core Inflation Rate YoY"), forecast: "2.8%", prior: "2.6%", indicatorId: "us-core-inflation-rate-yoy", source: bls },
+  ];
+  const { result } = await econPrinted(calendar, ["--country", "US", "--search", "cpi", "--from", "2026-10-01"], {}, "2026-01-01");
+  expect((result.data as Array<Record<string, unknown>>).map((row) => [row.event, row.forecastText, row.actualStatus])).toEqual([
+    ["Inflation Rate YoY", "3.6%", null],
+    ["CPI m/m", "0.3%", null],
+    ["Inflation Rate YoY", "3.9%", "not published"],
+    ["Core Inflation Rate YoY", "2.8%", "not published"],
+  ]);
+  const text = await econText(calendar, ["--country", "US", "--search", "cpi", "--from", "2026-10-01"], {}, "2026-01-01");
+  expect(text).toContain("2026-11-10 Inflation Rate YoY: BLS published no October 2025 index, so no October 2026 y/y.");
+  expect(text).toContain("2026-11-10 Core Inflation Rate YoY: BLS published no October 2025 index, so no October 2026 y/y.");
+});
+
+test("--search finds the jobs report by what ECST calls it: nfp, nonfarm payrolls, jobs report", async () => {
+  const calendar = [
+    ...twoWeeks,
+    event("2026-11-06T13:30:00.000Z", "US", "high", "Non-Farm Employment Change"),
+    event("2026-11-04T13:15:00.000Z", "US", "high", "ADP Non-Farm Employment Change"),
+    event("2026-11-06T13:30:00.000Z", "CA", "high", "Employment Change"),
+  ];
+  setSystemTime(new Date("2026-10-28T12:00:00.000Z"));
+  const names = async (words: string) => ((await econPrinted(calendar, ["--search", words, "--country", "US"])).result.data as Array<{ event: string }>).map((row) => row.event);
+  for (const words of ["nfp", "NFP", "jobs report", "jobsreport", "nonfarm payrolls", "non-farm payrolls"]) {
+    expect(await names(words), words).toEqual(["Non-Farm Employment Change"]);
+  }
+  // Hyphens and spacing aside, the name itself still finds ADP's report too.
+  expect(await names("non farm")).toEqual(["ADP Non-Farm Employment Change", "Non-Farm Employment Change"]);
 });

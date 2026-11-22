@@ -7,6 +7,7 @@ import { createSnapshotScannerClient, ScannerClientContext } from "../../../plug
 import type { TapeSnapshot } from "../../../api-client/tape";
 import { AppProvider, useAppDispatch } from "../../../state/app/context";
 import { createCliPaneShotConnectionHealth } from "./cli-pane-shot-health";
+import { changedThePage, SHOT_MUTATION_OPTIONS } from "./cli-pane-shot-mutations";
 import { ChartSnapshotContext } from "../../../time-series/hooks";
 import { decodeRpcValue } from "../shared/rpc-codec";
 import { createSnapshotDataProvider } from "../../../market-data/snapshot-provider";
@@ -16,10 +17,14 @@ import { JsonTickerRepository } from "../../../data/json-ticker-repository";
 import type { DesktopPaneShotPayload } from "../../../cli/desktop-pane-shot";
 import {
   SHOT_API_PROXY_PREFIX,
+  SHOT_API_SOCKET_PATH,
   SHOT_HTTP_BRIDGE_PATH,
   SHOT_MARKET_BRIDGE_PATH,
+  shotRouteUrl,
 } from "../../../cli/desktop-pane-shot-routes";
+import { openShotApiSocket, type ShotApiSocketSend } from "./cli-pane-shot-socket";
 import { instrumentFromTicker } from "../../../market-data/request-types";
+import { buildQuoteKey, instrumentFromQuoteTarget } from "../../../market-data/selectors";
 import type { RendererHost } from "../../../ui/host";
 import { DomHostProviders } from "../../dom/dom-host-providers";
 import { webUiHost } from "./ui-host";
@@ -65,6 +70,7 @@ import { valuationCache } from "../../../plugins/builtin/market-valuation/cache"
 import { statsCache } from "../../../plugins/builtin/econ-statistics/cache";
 import { apiClient, setCloudApiFetchTransport } from "../../../api-client";
 import { createGloomberbCloudCapabilities, createGloomberbCloudProvider } from "../../../sources/gloomberb-cloud";
+import { logFailure } from "../../../utils/log-failure";
 
 declare global {
   interface Window {
@@ -94,6 +100,12 @@ const TRACKED_RESPONSE_METHODS = new Set<PropertyKey>([
   "json",
   "text",
 ]);
+
+/**
+ * The page's own address, read once before anything can change it: the
+ * server answers only inside the secret folder the page opened at.
+ */
+const SHOT_PAGE_URL = window.location.href;
 
 let pendingShotWork = 0;
 let didInstallShotFetchTracker = false;
@@ -142,22 +154,39 @@ function installShotFetchTracker(): void {
   )) as typeof fetch;
 }
 
+let shotApiSocket: Promise<ShotApiSocketSend | null> | null = null;
+
+/** The page's one socket to the Bun server, opened at its first call; null when it does not open. */
+function shotSocket(): Promise<ShotApiSocketSend | null> {
+  shotApiSocket ??= openShotApiSocket(() => {
+    const url = shotRouteUrl(SHOT_API_SOCKET_PATH, SHOT_PAGE_URL);
+    url.protocol = "ws:";
+    return new WebSocket(url);
+  });
+  return shotApiSocket;
+}
+
 function installShotCloudApiTransport(): void {
   apiClient.setCookieSessionMode(true);
   setCloudApiFetchTransport((url, init = {}) => {
     const upstream = new URL(url);
-    const proxyUrl = new URL(`${SHOT_API_PROXY_PREFIX}${upstream.pathname}`, window.location.origin);
+    const proxyUrl = shotRouteUrl(`${SHOT_API_PROXY_PREFIX}${upstream.pathname}`, SHOT_PAGE_URL);
     proxyUrl.search = upstream.search;
     const headers = new Headers(init.headers);
     // Bun owns the real session cookie. The browser only talks to the local
     // same-origin proxy and never receives or serializes the credential.
     headers.delete("Cookie");
     headers.delete("Origin");
-    return window.fetch(proxyUrl, {
+    const viaFetch = () => window.fetch(proxyUrl, {
       ...init,
       headers,
       credentials: "same-origin",
     });
+    if ((init.method ?? "GET").toUpperCase() !== "GET" || init.body != null) return viaFetch();
+    return trackShotWork((async () => {
+      const send = await shotSocket();
+      return await send?.({ path: `${upstream.pathname}${upstream.search}`, headers: [...headers] }, init.signal) ?? await viaFetch();
+    })());
   });
 }
 
@@ -168,10 +197,12 @@ function installShotCloudApiTransport(): void {
  */
 function installShotHttpFetchTransport(): void {
   setHttpFetchTransport(async (url, init) => {
-    const response = await window.fetch(SHOT_HTTP_BRIDGE_PATH, {
+    const response = await window.fetch(shotRouteUrl(SHOT_HTTP_BRIDGE_PATH, SHOT_PAGE_URL), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(await toRequestEnvelope(url, init)),
+      // A pane's own deadline ends the read here as in the app, not when the Bun side gives up.
+      signal: init?.signal ?? null,
     });
     const result = await response.json() as { ok: boolean; error?: string; data?: HttpProxyResponseEnvelope };
     if (!result.ok || !result.data) throw new Error(result.error ?? `Request failed: ${url}`);
@@ -180,7 +211,7 @@ function installShotHttpFetchTransport(): void {
 }
 
 async function restoreShotCloudSession(): Promise<void> {
-  await apiClient.getSession().catch(() => null);
+  await apiClient.getSession().catch(logFailure("desktop-pane-shot", "Could not restore the session for a pane screenshot", null));
 }
 
 /**
@@ -190,13 +221,18 @@ async function restoreShotCloudSession(): Promise<void> {
  * of the corporate action history come from providers the router merges in.
  */
 async function requestShotMarketData<T>(operation: string, args: unknown[], signal?: AbortSignal): Promise<T> {
-  const response = await window.fetch(SHOT_MARKET_BRIDGE_PATH, {
+  const viaFetch = () => window.fetch(shotRouteUrl(SHOT_MARKET_BRIDGE_PATH, SHOT_PAGE_URL), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ operation, args }),
     // A board that stops waiting for a slow batch drops it, so the capture is not held for it.
     ...(signal ? { signal } : {}),
   });
+  // Over the socket, the quotes a board asks for one at a time do not wait for the page's six connections.
+  const response = await trackShotWork((async () => {
+    const send = await shotSocket();
+    return await send?.({ market: { operation, args } }, signal) ?? await viaFetch();
+  })());
   const result = await response.json() as { ok: boolean; data?: T; error?: string };
   if (!result.ok) throw new Error(result.error ?? `Screenshot data request failed: ${operation}`);
   return result.data as T;
@@ -257,15 +293,10 @@ function waitForShotReadiness(): () => void {
   let mutationVersion = 0;
   let lastSeenMutationVersion = 0;
   let stableFrames = 0;
-  const observer = new MutationObserver(() => {
-    mutationVersion += 1;
+  const observer = new MutationObserver((records) => {
+    if (changedThePage(records)) mutationVersion += 1;
   });
-  observer.observe(document.body, {
-    attributes: true,
-    childList: true,
-    characterData: true,
-    subtree: true,
-  });
+  observer.observe(document.body, SHOT_MUTATION_OPTIONS);
 
   const check = () => {
     if (cancelled || window.__GLOOM_CLI_SHOT_READY__) return;
@@ -300,6 +331,8 @@ function waitForShotReadiness(): () => void {
 
 function createShotDataProvider(payload: DesktopPaneShotPayload): DataProvider {
   const cloudProvider = createGloomberbCloudProvider();
+  // The instruments a stream subscription has had its one frame for.
+  const streamedQuotes = new Set<string>();
   const bridge: Partial<DataProvider> = {
     id: payload.marketDataProviderId ?? cloudProvider.id,
     getQuote: (symbol, exchange, context) => requestShotMarketData<Quote>("getQuote", [symbol, exchange, context]),
@@ -311,7 +344,7 @@ function createShotDataProvider(payload: DesktopPaneShotPayload): DataProvider {
     },
     getOptionsChain: (symbol, exchange, expirationDate, context) => requestShotMarketData<OptionsChain>("getOptionsChain", [symbol, exchange, expirationDate, context]),
     getPriceHistory: (symbol, exchange, range, context) => requestShotMarketData<PricePoint[]>("getPriceHistory", [symbol, exchange, range, context])
-      .then(revivePricePoints).catch(() => []),
+      .then(revivePricePoints).catch(logFailure("desktop-pane-shot", "Could not load price history for a pane screenshot", [])),
     getPriceHistoryForResolution: (symbol, exchange, range, resolution, context) => requestShotMarketData<PricePoint[]>(
       "getPriceHistoryForResolution", [symbol, exchange, range, resolution, context],
     ).then(revivePricePoints),
@@ -343,7 +376,26 @@ function createShotDataProvider(payload: DesktopPaneShotPayload): DataProvider {
     getSecFilingDocuments: (filing) => requestShotMarketData<SecFilingDocument[]>("getSecFilingDocuments", [filing]),
     getSecFilingContent: (filing) => requestShotMarketData<string | null>("getSecFilingContent", [filing]),
     getEarningsCalendar: (symbols) => requestShotMarketData<EarningsEvent[]>("getEarningsCalendar", [symbols]).then(reviveEarningsEvents),
-    subscribeQuotes: () => () => {},
+    subscribeQuotes: (targets, onQuote) => {
+      // A capture has no stream. Each target gets the quote a poll reads, once,
+      // so a pane that streams its rows (Market Movers with live on) shows them
+      // as its user sees them, not as its list alone draws them.
+      const fresh = targets.filter((target) => {
+        const key = buildQuoteKey(instrumentFromQuoteTarget(target));
+        if (streamedQuotes.has(key)) return false;
+        streamedQuotes.add(key);
+        return true;
+      });
+      if (fresh.length > 0) {
+        void requestShotMarketData<QuoteBatchResult[]>("getQuotesBatch", [fresh, {}])
+          .then((results) => results.forEach((result, index) => {
+            const target = fresh[index];
+            if (target && result?.quote) onQuote(target, result.quote);
+          }))
+          .catch(logFailure("desktop-pane-shot", "Could not load the quotes a pane streams for a screenshot"));
+      }
+      return () => {};
+    },
   };
   const fallback = new Proxy(cloudProvider, {
     get(target, property) {
@@ -375,6 +427,8 @@ function createShotAppServices(payload: DesktopPaneShotPayload, externalPlugins:
     registryOptions: {
       enableCapabilityHandlers: false,
       connectionHealth: createCliPaneShotConnectionHealth(),
+      // A capture is a command: it draws the alerts it is given and checks none, so `gloom shot ALRT` sets nothing off.
+      runtime: "command",
     },
     configure({ pluginRegistry, marketData, newsService }) {
       pluginRegistry.bindHost({ getPaneRuntimeState: (paneId) => payload.paneState[paneId] ?? null });
@@ -521,7 +575,8 @@ async function render() {
         <RemoteUiRegistryProvider>
           <CaptureShotSemanticUi />
           <DomHostProviders ui={webUiHost} renderer={rendererHost}>
-            <AppProvider config={payload.config} desktopSnapshot={{
+            {/* The capture shows what the function asked for, a tab only Pro opens included. */}
+            <AppProvider config={payload.config} paneStateChosen desktopSnapshot={{
               config: payload.config,
               paneState: payload.paneState,
               focusedPaneId: payload.paneId,

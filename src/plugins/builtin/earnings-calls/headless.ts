@@ -6,6 +6,7 @@ import type {
   HeadlessPaneContext,
   HeadlessPaneDefinition,
   HeadlessPaneLoadArgs,
+  HeadlessPaneRow,
   HeadlessRowsResult,
 } from "../../../types/plugin";
 import { explainRefusal } from "../shared/cloud-denied";
@@ -23,7 +24,7 @@ import {
   type UpcomingCallsResult,
   type UpcomingDays,
 } from "./data";
-import { formatPeriod } from "./format";
+import { callPeriod, eventLabelOf, fiscalQuarterText, noCallsText } from "./format";
 import type { MarketDay } from "../earnings/board-model";
 import {
   calendarDays,
@@ -42,17 +43,26 @@ import { callsLockNote } from "./lock-note";
 import {
   buildTranscriptSegments,
   findCallForQuarter,
+  originalIsMachineTranscript,
   sortCallsNewest,
+  translatedFrom,
   type TranscriptSection,
 } from "./model";
 import { REPORT_FILTER, REPORT_PAGE, REPORT_ROWS } from "../shared/headless-options";
+import { companyDataNotes } from "../../../types/company-from";
+import { savedCopyMark, unansweredRefreshError } from "../../../data/saved-copies";
+
+const optionalErrors = (error: string | null) => error ? [error] : undefined;
 
 const CALL_COLUMNS = [
   { key: "ticker", header: "Ticker" },
   { key: "company", header: "Company" },
-  { key: "callAt", header: "Call date" },
+  // A call known by its day alone prints the day, never a midnight it was not held at.
+  { key: "callAt", header: "Call date", textFormat: (value: unknown, row: HeadlessPaneRow) => callDateText(value, row.timeKnown !== false) },
   { key: "fiscalYear", header: "FY", align: "right" as const },
-  { key: "fiscalQuarter", header: "FQ", align: "right" as const },
+  // A half year's results read H1, never a blank quarter beside the year's.
+  { key: "fiscalQuarter", header: "FQ", align: "right" as const, textFormat: (value: unknown, row: HeadlessPaneRow) => String(fiscalQuarterText({ fiscalQuarter: value as number | null, fiscalHalf: row.fiscalHalf as number | undefined }) ?? "—") },
+  { key: "event", header: "Event" },
   { key: "status", header: "Status" },
   { key: "durationSeconds", header: "Seconds", align: "right" as const },
   { key: "wordCount", header: "Words", align: "right" as const },
@@ -115,6 +125,14 @@ function explainDenied(ticker: string | null, context: HeadlessPaneContext) {
   return async (error: unknown): Promise<never> => { throw await explainRefusal(error, callsLockNote, { symbol: ticker, context }); };
 }
 
+/** "2026-10-27 07:45 UTC" for a call whose start is known, "2026-09-10" for one known by its day. */
+function callDateText(value: unknown, timeKnown: boolean): string {
+  const at = typeof value === "string" ? Date.parse(value) : Number.NaN;
+  if (!Number.isFinite(at)) return "—";
+  const iso = new Date(at).toISOString();
+  return timeKnown ? `${iso.slice(0, 16).replace("T", " ")} UTC` : iso.slice(0, 10);
+}
+
 function callRow(call: CloudEarningsCallPayload, now: number) {
   const upcoming = isUpcomingCall(call, now);
   return {
@@ -122,8 +140,12 @@ function callRow(call: CloudEarningsCallPayload, now: number) {
     ticker: call.ticker,
     company: call.companyName,
     callAt: call.callAt,
+    timeKnown: callTimeKnown(call),
     fiscalYear: call.fiscalYear,
     fiscalQuarter: call.fiscalQuarter,
+    ...(call.fiscalHalf ? { fiscalHalf: call.fiscalHalf } : {}),
+    // A deal call, a conference, an investor day: not a quarter's earnings call.
+    event: eventLabelOf(call),
     status: call.hasTranscript ? "transcribed" : callStatusLabel(call, now) || call.status,
     upcoming,
     in: upcoming ? callCountdown(call, now) : null,
@@ -161,15 +183,22 @@ function projectEarningsCallsHeadless(
   const ordered = next ? [next, ...matching.filter((call) => call !== next)] : matching;
   const rows = ordered.slice(0, limit).map((call) => callRow(call, now));
   const sourceLimit = result.sourceLimit ?? 200;
+  // A company with no call yet says so, as the pane does; a US symbol the SEC does not know is not one.
+  const ticker = typeof args.argument === "string" ? args.argument : null;
+  const none = ticker && !result.calls.length && !result.pending && !result.unknownTicker ? noCallsText(ticker) : null;
   const sourceLimitReached = result.sourceLimitReached ?? result.calls.length >= sourceLimit;
 
   return {
     columns: CALL_COLUMNS,
     rows,
+    ...(none ? { empty: `${none.title} ${none.message}` } : {}),
     ...(next ? { textRows: rows.filter((row) => row.id !== next.id) } : {}),
-    errors: result.refreshError ? [result.refreshError] : undefined,
+    errors: optionalErrors(unansweredRefreshError(result)),
     ...(sourceLimitReached || result.pending ? { complete: false } : {}),
+    ...(result.companyFrom ? { notes: companyDataNotes(result.companyFrom) } : {}),
     metadata: {
+      // A list served from a saved copy ends with when it was saved, instead of its refresh failure.
+      ...savedCopyMark(result),
       ...(next ? { notices: [nextCallNotice(next, now)], nextCall: { id: next.id, callAt: next.callAt, timeKnown: callTimeKnown(next), in: callCountdown(next, now) } } : {}),
       fetchedAt: result.fetchedAt,
       stale: result.stale,
@@ -204,13 +233,25 @@ function transcriptResult(
   const segments = buildTranscriptSegments(transcript, section, { speaker, search });
   const rows = segments.slice(offset, offset + limit).map((segment) => ({ ...segment }));
   const hasMore = offset + rows.length < segments.length;
+  const language = translatedFrom(transcript);
+  const machine = originalIsMachineTranscript(transcript);
+  const said = language ? ` in ${language}` : "";
+  const translation = language === null ? null
+    : section === "original"
+      ? machine
+        ? `A machine transcript of the call's recording${said}, before translation; it can mishear names and figures.`
+        : `The call as published${said}, before translation.`
+      : `Translated into English${language ? ` from ${language}` : ""}; --section original reads ${machine ? "the machine transcript it was translated from" : "the call as published"}.`;
 
   return {
     columns: TRANSCRIPT_COLUMNS,
     rows,
-    errors: calls.refreshError ? [calls.refreshError] : undefined,
+    errors: optionalErrors(unansweredRefreshError(calls)),
     ...(calls.stale || calls.pending ? { complete: false } : {}),
+    ...(calls.companyFrom ? { notes: companyDataNotes(calls.companyFrom) } : {}),
     metadata: {
+      ...savedCopyMark(calls),
+      ...(translation ? { notices: [translation] } : {}),
       stale: calls.stale,
       callListFetchedAt: calls.fetchedAt,
       callListPending: calls.pending ?? false,
@@ -219,6 +260,10 @@ function transcriptResult(
       company: transcript.companyName,
       fiscalYear: transcript.fiscalYear,
       fiscalQuarter: transcript.fiscalQuarter,
+      ...(transcript.fiscalHalf ? { fiscalHalf: transcript.fiscalHalf } : {}),
+      event: eventLabelOf(transcript),
+      // A call held in another language: the text is an English translation, its original under --section original.
+      translatedFrom: language,
       callAt: transcript.callAt,
       durationSeconds: transcript.durationSeconds,
       wordCount: transcript.wordCount,
@@ -259,9 +304,11 @@ function projectCalendar(
     timeKnown: callTimeKnown(call),
     local: callLocalClock(call),
     newYork: callNewYorkClock(call),
-    period: formatPeriod(call.fiscalYear, call.fiscalQuarter),
+    period: callPeriod(call),
+    event: eventLabelOf(call),
     fiscalYear: call.fiscalYear,
     fiscalQuarter: call.fiscalQuarter,
+    ...(call.fiscalHalf ? { fiscalHalf: call.fiscalHalf } : {}),
     in: calendarAway(call, now),
     status: call.hasTranscript ? "transcribed" : callStatusLabel(call, now) || call.status,
     hasTranscript: call.hasTranscript,
@@ -278,10 +325,11 @@ function projectCalendar(
     columns: CALENDAR_COLUMNS,
     textColumns: sameClock ? CALENDAR_TEXT_COLUMNS.filter((column) => column.key !== "local") : CALENDAR_TEXT_COLUMNS,
     rows,
-    errors: result.refreshError ? [result.refreshError] : undefined,
+    errors: optionalErrors(unansweredRefreshError(result)),
     ...(result.stale || result.truncated ? { complete: false } : {}),
     empty: "No calls on the calendar these days.",
     metadata: {
+      ...savedCopyMark(result),
       view: "upcoming",
       fetchedAt: result.fetchedAt,
       stale: result.stale,
@@ -369,6 +417,7 @@ export function createEarningsCallsHeadless(
           { value: "notable" },
           { value: "analyst-focus", aliases: ["analyst"] },
           { value: "participants", aliases: ["speakers"] },
+          { value: "original" },
         ],
         defaultValue: "",
       },
@@ -432,9 +481,14 @@ export function createEarningsCallsHeadless(
         return projectEarningsCallsHeadless(calls, { ...args, options: { ...args.options, limit: args.options.limit ?? 50 } }, now);
       }
       const quarter = String(args.options.quarter || "latest");
-      const selected = findCallForQuarter(calls.calls, quarter);
+      // A call still to come has no transcript to read, and asking for one would ask the server to produce it before
+      // the call is held: the latest is the latest held, and a quarter whose call is ahead says when it is.
+      const selected = findCallForQuarter(calls.calls.filter((call) => !isUpcomingCall(call, now)), quarter);
       if (!selected) {
+        const ahead = findCallForQuarter(calls.calls, quarter);
+        if (ahead) throw new Error(`${ticker}'s ${quarter} call is still to come. ${nextCallNotice(ahead, now)}`);
         if (calls.unknownTicker) throw new Error(`${ticker} is not a known listed company.`);
+        if (!calls.calls.length && !calls.pending) throw new Error(noCallsText(ticker).title);
         if (calls.pending) throw new Error(`Earnings call discovery for ${ticker} is still pending.`);
         if (calls.sourceLimitReached ?? calls.calls.length >= (calls.sourceLimit ?? 200)) {
           throw new Error(`No ${quarter} earnings call found among the latest ${calls.sourceLimit ?? 200} loaded calls for ${ticker}; earlier calls may exist.`);

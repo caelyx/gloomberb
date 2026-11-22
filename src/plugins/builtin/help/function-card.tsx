@@ -14,6 +14,7 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { usePlanAccess } from "../../../api-client/plan-access";
 import { functionDocsUrl, type FunctionFreshness, type FunctionHelpKey } from "../../../cli/pane-functions/function-help";
+import { keyHintWords } from "../../../components/ui/key-hint-words";
 import { requestFeedbackDialog } from "../../../components/feedback-dialog";
 import { Button } from "../../../components/ui/button";
 import { ExternalLink } from "../../../components/ui/external-link";
@@ -23,10 +24,11 @@ import { ShortcutHint } from "../../../components/ui/shortcut-hint";
 import { t } from "../../../i18n";
 import { useViewport } from "../../../react/input";
 import { useThemeColors } from "../../../theme/theme-context";
-import { Box, Text, TextAttributes, useRendererHost } from "../../../ui";
+import { Box, Text, TextAttributes, useRendererHost, useUiHost } from "../../../ui";
 import { useDialog, useDialogKeyboard, type AlertContext } from "../../../ui/dialog";
 import { getSharedRegistry } from "../../registry";
 import type { HelpFunction } from "./function-index";
+import { logFailure } from "../../../utils/log-failure";
 
 export type FunctionHelpRequest =
   /** `inAppDocs: false` where DOCS cannot open (a popped-out window). */
@@ -75,9 +77,11 @@ function CardRow({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function KeysRow({ keys }: { keys: readonly FunctionHelpKey[] }) {
+  // In the terminal a wrapped line of keys follows the one before it: a gap there is two blank rows.
+  const spacing = useUiHost().KeyHint ? { gap: 2 } : { columnGap: 2, rowGap: 0 };
   return (
-    <Box flexDirection="row" flexWrap="wrap" gap={2}>
-      {keys.map((hint) => <ShortcutHint key={`${hint.key}${hint.label}`} hotkey={hint.key} label={hint.label} />)}
+    <Box flexDirection="row" flexWrap="wrap" {...spacing}>
+      {keys.map((hint) => <ShortcutHint key={`${hint.key}${hint.label}`} hotkey={hint.key} label={hint.label} words={keyHintWords(hint)} />)}
     </Box>
   );
 }
@@ -209,7 +213,7 @@ export function useFunctionHelpHost({ closeCommandBar }: { closeCommandBar: () =
         content: (context: AlertContext) => (
           <FunctionHelpCard {...context} fn={request.fn} width={width} compact={compact} inAppDocs={request.inAppDocs !== false} />
         ),
-      }).catch(() => {}).finally(() => {
+      }).catch(logFailure("help.function-card", "Open function help card failed")).finally(() => {
         openRef.current = false;
       });
     };

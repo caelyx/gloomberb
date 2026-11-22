@@ -1,7 +1,7 @@
 import type { ResolvedSeries } from "../../../time-series/types";
 import { displayWidth } from "../../../utils/format";
 import type { ChartStripSpec } from "../../chart-table/header";
-import { compositeAxisTicks, type CompositeAxisValueFormatter } from "../composite/format";
+import { compositeAxisTagFormatter, compositeAxisTicks, type CompositeAxisValueFormatter } from "../composite/format";
 import { buildCompositeChartScene } from "../composite/scene";
 import { staticSeries } from "../static/series";
 
@@ -221,6 +221,8 @@ function curveScale(coordinates: readonly number[], rowCoordinates: readonly num
 
 export interface CurveChartOptions {
   xScale?: CurveXScale;
+  /** The grid the value axis ticks on, for prices quoted in fractions of a point (`ResolvedSeries.tickGrid`). */
+  valueGrid?: number;
 }
 
 export function buildCurveChart(series: readonly CurveSeries[], width: number, colors: readonly string[], options: CurveChartOptions = {}) {
@@ -238,7 +240,8 @@ export function buildCurveChart(series: readonly CurveSeries[], width: number, c
       value: point.value != null && Number.isFinite(point.value) ? point.value : null,
     })),
     { id: entry.id, label: entry.label, color: entry.color ?? colors[index % Math.max(1, colors.length)] ?? "#ffffff",
-      style: entry.role === "marker" ? "points" : entry.style, calendarSpaced: true, negativeColor: entry.negativeColor },
+      style: entry.role === "marker" ? "points" : entry.style, calendarSpaced: true, negativeColor: entry.negativeColor,
+      tickGrid: options.valueGrid },
   ));
   // References and markers are not maturities of the curve, so they never label the axis.
   const candidates = [...new Map((rowSeries.length ? rowSeries : plotted).flatMap((entry) => entry.points)
@@ -284,7 +287,7 @@ export function curvePlotWidth(series: ResolvedSeries[], width: number, plotHeig
   const labels = compositeAxisTicks(domain, format).flatMap(({ label, value }) => {
     // The gutter also fits the cursor's value, probed at more digits than a round tick.
     const probe = (value < 0 ? -1 : 1) * (Math.floor(Math.abs(value)) + 0.1234);
-    return [label, format ? format(probe, domain) : label];
+    return [label, format ? compositeAxisTagFormatter(format)(probe, domain) : label];
   });
   const labelWidth = Math.max(3, ...labels.map(displayWidth));
   const minimumPlot = Math.min(total, Math.max(12, Math.floor(total / 2)));

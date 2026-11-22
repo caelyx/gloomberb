@@ -39,24 +39,49 @@ export function formatPriceEarnings(value: PriceEarnings | null | undefined, pre
   return value <= 0 ? "N/M" : formatNumber(value, precision);
 }
 
+/**
+ * The fiscal year a forward consensus is for, as a label names it: `FY27`
+ * for a year that ends in 2027, whichever month. Null for a block that does
+ * not say.
+ */
+export function forwardFiscalYear(periodEnd: string | null | undefined): string | null {
+  return typeof periodEnd === "string" && /^\d{4}-\d{2}-\d{2}$/.test(periodEnd) ? `FY${periodEnd.slice(2, 4)}` : null;
+}
+
+/**
+ * Whether a forward P/E line is shown even with no figure: the block read
+ * next year's consensus for a company (one with a trailing EPS) and found
+ * none, or one from before the last split, which reads as a dash.
+ */
+export function forwardPEAsked(fundamentals: Pick<Fundamentals, "forwardEpsPeriodEnd" | "eps"> | undefined): boolean {
+  return fundamentals?.forwardEpsPeriodEnd !== undefined && fundamentals.eps != null;
+}
+
 type PriceEarningsField = "trailingPE" | "forwardPE" | "pegRatio";
 
 /**
  * Why each earnings multiple of a fundamentals block is not meaningful, if it
- * is not: a trailing or forward EPS at or below zero, or a multiple that is
- * itself at or below zero. Forward P/E is judged on its own estimate only, so
- * a trailing loss leaves a positive forward multiple alone.
+ * is not: one withdrawn as no multiple of the share (`notMeaningful`,
+ * utils/share-multiples: a warrant, a receipt with no ratio, an EPS that is
+ * not net income over the shares), a trailing or forward EPS at or below
+ * zero, or a multiple that is itself at or below zero. Forward P/E is judged
+ * on its own estimate only, so a trailing loss leaves a positive forward
+ * multiple alone.
  */
 export function notMeaningfulMultiples(
-  fundamentals: Pick<Fundamentals, PriceEarningsField | "eps" | "forwardEps"> | undefined,
+  fundamentals: Pick<Fundamentals, PriceEarningsField | "eps" | "forwardEps" | "notMeaningful"> | undefined,
 ): Partial<Record<PriceEarningsField, string>> {
-  const reasons: Partial<Record<PriceEarningsField, string>> = {};
+  const reasons: Partial<Record<PriceEarningsField, string>> = { ...fundamentals?.notMeaningful };
   if (!fundamentals) return reasons;
-  if (nonPositive(fundamentals.eps)) reasons.trailingPE = "trailing EPS is not positive";
-  else if (nonPositive(fundamentals.trailingPE)) reasons.trailingPE = "trailing earnings are not positive";
-  if (nonPositive(fundamentals.forwardEps)) reasons.forwardPE = "forward EPS is not positive";
-  else if (nonPositive(fundamentals.forwardPE)) reasons.forwardPE = "forward earnings are not positive";
-  if (nonPositive(fundamentals.pegRatio)) reasons.pegRatio = "P/E or expected growth is not positive";
+  if (!reasons.trailingPE) {
+    if (nonPositive(fundamentals.eps)) reasons.trailingPE = "trailing EPS is not positive";
+    else if (nonPositive(fundamentals.trailingPE)) reasons.trailingPE = "trailing earnings are not positive";
+  }
+  if (!reasons.forwardPE) {
+    if (nonPositive(fundamentals.forwardEps)) reasons.forwardPE = "forward EPS is not positive";
+    else if (nonPositive(fundamentals.forwardPE)) reasons.forwardPE = "forward earnings are not positive";
+  }
+  if (!reasons.pegRatio && nonPositive(fundamentals.pegRatio)) reasons.pegRatio = "P/E or expected growth is not positive";
   return reasons;
 }
 

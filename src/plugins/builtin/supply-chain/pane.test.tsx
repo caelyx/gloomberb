@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { setCloudApiFetchTransport } from "../../../api-client";
 import { PaneFooterBar, PaneFooterKeys, PaneFooterProvider } from "../../../components/layout/pane/footer";
 import { createOpenTuiTestHarness } from "../../../renderers/opentui/test-utils";
+import { createRemoteUiRegistry, RemoteUiRegistryProvider } from "../../../remote/semantic-tree";
 import { appReducer, createInitialState } from "../../../state/app/context";
 import { PaneKeyboardScrollController } from "../../../state/pane-scroll-registry";
 import { createTestPaneConfig, createTestTicker, TestPaneProvider } from "../../../test-support/pane";
@@ -16,13 +17,17 @@ import { graphCache } from "./graph-client";
 import { graphPayload } from "./test-fixture-graph";
 import { SupplyChainPane } from "./pane";
 import { entity, supplyPayload, supplyRow } from "./test-fixture";
+import { displayWidth } from "../../../utils/format";
 
 const tui = createOpenTuiTestHarness();
 let commits = 0;
+/** The mounted pane's semantic tree: what a report or an export of its table reads. */
+let registry = createRemoteUiRegistry();
 const countCommit = () => { if (++commits > 100) throw new Error("Supply chain pane did not settle within 100 React commits"); };
 afterEach(() => { setCloudApiFetchTransport(null); supplyChainCache.reset(); graphCache.reset(); });
 async function mount(width: number, height: number, tab = "table", view = "says", onNavigate: (id: string, symbol: string | undefined) => void = () => {}, settings: Record<string, unknown> | string = {}) {
   commits = 0;
+  registry = createRemoteUiRegistry();
   supplyChainCache.attach(new MemoryPluginPersistence());
   const id = "supply-chain:test";
   const state = createInitialState(createTestPaneConfig(join(homedir(), ".cache/gloom-smoke/supply-chain/focused-tests"), {
@@ -40,7 +45,7 @@ async function mount(width: number, height: number, tab = "table", view = "says"
     <PaneKeyboardScrollController paneId={id} focused />
   </TestPaneProvider>;
   }
-  await act(async () => { await tui.render(<Harness />, { width, height }); });
+  await act(async () => { await tui.render(<RemoteUiRegistryProvider registry={registry}><Harness /></RemoteUiRegistryProvider>, { width, height }); });
 }
 
 test("initial tier fallback and changing the evidence filter settle without a cached loader render loop", async () => {
@@ -71,7 +76,8 @@ test("preview keeps evidence-bearing rows, shows the standard upgrade, and narro
   data.says[0] = supplyRow("Known company", { nativeAmount: 315_813, nativeCurrency: "JPY", nativeScale: 1_000_000 });
   await mount(88, 20);
   const native = await tui.waitForFrameToContain("315,813 JPY million");
-  expect(native).toContain("2026-01-31");
+  // Dated by the newest disclosure shown, as its Published column says.
+  expect(native).toContain("as of 2026-02-25");
   expect(native).toContain("Upgrade to Pro");
   expect(native).toContain("Filing");
 });
@@ -112,6 +118,49 @@ test("reverse table labels the percentage denominator and diagram pages a crowde
 
 
 
+test("a company named only in others' reports opens on them, and a holder of its shares reads as its investor", async () => {
+  const names = [
+    supplyRow("Buyer Motors", { role: "customer", direction: "out", pctOfRevenue: null }),
+    supplyRow("Holder Petro", { role: "investee", direction: "in", pctOfRevenue: null }),
+  ];
+  const data = supplyPayload({ says: [], names, totalRows: names.length });
+  data.counts.says.customer = 0; data.counts.names.customer = 1; data.counts.names.investee = 1;
+  setCloudApiFetchTransport(async () => Response.json(data));
+  await mount(140, 24, "table", "");
+  const frame = await tui.waitForFrameToContain("Holder Petro");
+  expect(frame).toContain("Buyer Motors");
+  expect(frame).toContain("Investor");
+  expect(frame).not.toContain("Investee");
+  expect(frame).toContain("Investors");
+  await tui.destroy();
+  // A direction chosen, even the empty one, stays chosen.
+  await mount(140, 24, "table", "says");
+  expect(await tui.waitForFrameToContain("No relationships")).not.toContain("Holder Petro");
+});
+
+test("a related party says so on its flow card and in the table's report, not only in a tooltip or a chip", async () => {
+  const group = supplyRow("cssc-group", { counterparty: entity("cssc-group", "China State Shipbuilding Group"), relatedParty: true, entityScope: "group",
+    pctOfRevenue: null, pctBasis: null, nativeAmount: 1_042_897_044.18, nativeCurrency: "CNY", nativeScale: 1, quote: "中国船舶集团有限公司及其子公司 销售商品 1,042,897,044.18" });
+  const data = supplyPayload({ says: [group, supplyRow()], totalRows: 2 });
+  data.counts.says.customer = 2;
+  setCloudApiFetchTransport(async () => Response.json(data));
+  await mount(140, 30, "flow");
+  // A narrow card keeps the figure whole beside a shorter label; a wide one names the group.
+  expect(await tui.waitForFrameToContain("related · 1,042,897,044.18 CNY")).not.toContain("1,042,897,0...");
+  await tui.destroy();
+  await mount(220, 30, "flow");
+  await tui.waitForFrameToContain("related group · 1,042,897,044.18 CNY");
+  await tui.destroy();
+  await mount(140, 24);
+  await tui.waitForFrameToContain("China State");
+  await tui.renderFrames(2);
+  const table = registry.snapshot().find((node) => node.role === "table")!;
+  const rows = registry.detail(table.id)!.metadata!.rows as { key: string; cells: { columnId?: string; text: string }[] }[];
+  const role = (key: string) => rows.find((row) => row.key === key)?.cells.find((cell) => cell.columnId === "role")?.text;
+  // A copy or export of the table keeps the label; a plain customer stays a customer.
+  expect([role("cssc-group"), role("customer")]).toEqual(["Related-party customer", "Customer"]);
+});
+
 test("a share never shows without what it is a share of, at any pane width", async () => {
   // A tagged fact's context and a prose denominator are too long for a narrow column; a reverse share names its reporter.
   const says = [
@@ -125,8 +174,8 @@ test("a share never shows without what it is a share of, at any pane width", asy
     await mount(width, 20);
     const frame = await tui.waitForFrameToContain("33%");
     const line = (figure: string) => frame.split("\n").find((entry) => entry.includes(figure)) ?? "";
-    expect(line("47%")).toMatch(/47%\s+receiv/);
-    expect(line("33%")).toMatch(/33%\s+(of\s+)?receiv/);
+    expect(line("47%")).toMatch(/47%\s+(of\s+)?(vendor\s+non-trade\s+)?receiv/);
+    expect(line("33%")).toMatch(/33%\s+(of\s+)?(vendor\s+non-trade\s+)?receiv/);
     await tui.destroy();
   }
 });
@@ -137,9 +186,10 @@ test("narrow evidence wraps original quotes and glosses and scrolls to their end
     quoteGloss: "Samsung's principal customers include Alphabet, Apple, Deutsche Telekom, Hong Kong Techtronics and Supreme Electronics. Together they represented approximately 15% of total revenue." });
   setCloudApiFetchTransport(async () => Response.json(supplyPayload({ says: [row] })));
   await mount(80, 20);
-  await tui.waitForFrameToContain("2026-01-31");
+  // The rows under a short table already show the selected row's quote; the evidence opens with its way back.
+  expect(await tui.waitForFrameToContain("2026-02-25")).toContain("Original quote · Korean");
   await tui.emitKeypress({ name: "e" });
-  await tui.waitForFrameToContain("Original quote");
+  await tui.waitForFrameToContain("← Back");
   await tui.emitKeypress({ name: "end" });
   const frame = await tui.waitForFrameToContain(`Open ${row.form}`);
   expect(frame).toContain("15% 수준입니다.");
@@ -157,7 +207,7 @@ test("evidence preserves the reporting company and scope, then Enter drills into
   for (const width of [88, 160]) {
     await mount(width, 24);
     const table = await tui.waitForFrameToContain("315,813 JPY million");
-    expect(table).toContain("2026-01-31");
+    expect(table).toContain("2026-02-25");
     expect(table).toContain("22%");
     if (width === 160) expect(table).toContain("ORIGINS");
     await tui.destroy();
@@ -199,6 +249,23 @@ test("graph selection collapses a branch and recenters an unlisted company throu
   expect(requests.every(url => url.includes("/graph?") && url.includes("tiers=primary"))).toBe(true);
 });
 
+test("a graph read without the filing cutoff asked for warns in the footer; one that reads it does not", async () => {
+  const requests: string[] = [];
+  // The free preview answers the latest snapshot: its options carry no cutoff, and the fixture raises no other notice.
+  setCloudApiFetchTransport(async (input) => { requests.push(String(input)); return Response.json(graphPayload()); });
+  await mount(120, 24, "graph", "says", () => {}, { asOf: "2025-01-01" });
+  await tui.waitForFrameToContain("Private supplier");
+  expect(await tui.waitForFrameToContain("⚠")).toContain("[!]");
+  expect(requests.some((url) => url.includes("asOf=2025-01-01"))).toBe(true);
+  await tui.destroy();
+  graphCache.reset();
+  setCloudApiFetchTransport(async () => { const data = graphPayload(); return Response.json({ ...data, options: { ...data.options, asOf: "2025-01-01" } }); });
+  await mount(120, 24, "graph", "says", () => {}, { asOf: "2025-01-01" });
+  await tui.waitForFrameToContain("Private supplier");
+  await tui.renderFrames(3);
+  expect(tui.frame()).not.toContain("⚠");
+});
+
 test("path evidence preserves every hop and opens the filter form without losing the route", async () => {
   const data = graphPayload(); data.paths = [data.upstream[1]!.bestPath]; data.target = data.nodes[2]!; data.upstream = [];
   Object.assign(data.links[0]!.evidence[0]!, { pctOfRevenue: 22, pctBasis: "revenue", pctScope: "Compute And Networking Segment" });
@@ -206,7 +273,7 @@ test("path evidence preserves every hop and opens the filter form without losing
   await mount(120, 27, "path", "says", () => {}, { to: "3" });
   await tui.waitForFrameToContain("ROUTE");
   await tui.emitKeypress({ name: "return" });
-  const frame = await tui.waitForFrameToContain("Estimated exposure");
+  const frame = await tui.waitForFrameToContain("Exposure");
   expect(frame).toContain("20% est. of 1 revenue");
   expect(frame).toContain("of 1 Compute & Networking revenue");
   expect(frame).toContain("We depend on this supplier.");
@@ -289,5 +356,30 @@ test("receivables chart keeps earlier shares beside their basis and their eviden
   }
   await act(async () => { await tui.clickFrameText("Previous buyer"); });
   await tui.emitKeypress({ name: "e" });
-  expect(await tui.waitForFrameToContain("Previous buyer")).toContain("2026-01-31");
+  // The earlier share's evidence opens with its own period, not the current row's 31 Jul 2026.
+  const evidence = await tui.waitForFrameToContain("← Back");
+  expect(evidence).toContain("Previous buyer");
+  expect(evidence).toMatch(/Period\s+as of 31 Jan 2026|Period\s+31 Jan 2026/);
+  expect(evidence).not.toContain("31 Jul 2026");
+});
+
+test("a name keeps what tells it apart before a share keeps the words after its basis, at the desktop's default width", async () => {
+  const { tableColumns } = await import("./pane");
+  // NVDA's preview: two undisclosed customers' shares of total revenue from Compute & Networking, one of receivables.
+  const forms = (...texts: string[]) => texts.map(displayWidth);
+  const bases = [forms("of total revenue, from Compute & Networking", "of total revenue", "revenue"),
+    forms("of total revenue, from Compute & Networking", "of total revenue", "revenue"), forms("of receivables (owed to NVIDIA)", "of receivables", "receivables")];
+  // "Hon Hai Precision Industry", and "Customer 1" beside its "undisclosed" chip.
+  const nameCells = displayWidth("Hon Hai Precision Industry");
+  // 170 cells is the desktop's 1280 px default, where the name was cut to 18 so the share kept "…, from Compute & Networking".
+  for (const width of [160, 170]) {
+    const columns = tableColumns(width, true, true, null, bases, displayWidth("quarter to 26 Jul 2026"), nameCells);
+    const name = columns.find((column) => column.id === "name")!;
+    expect(name.width, String(width)).toBeGreaterThanOrEqual(nameCells);
+    expect(columns.map((column) => column.id), String(width)).toEqual(["name", "evidence", "ticker", "role", "pct", "fy", "filed", "publisher", "corroboration"]);
+    // The share keeps its basis, in its shorter form; the selected row's words and its evidence keep the whole.
+    const share = columns.find((column) => column.id === "pct")!;
+    // The bar, a gap, the figure and a gap before the basis.
+    expect(share.width, String(width)).toBeGreaterThanOrEqual(3 + 1 + 5 + 1 + displayWidth("of total revenue"));
+  }
 });

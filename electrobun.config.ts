@@ -7,7 +7,37 @@ import { DESKTOP_APP_IDENTIFIER, DESKTOP_APP_NAME } from "./src/renderers/electr
 // would offer upstream's next release and replace this build with it.
 const LOCAL_BUILD = process.env.GLOOMBERB_DESKTOP_LOCAL === "1";
 const RELEASE_BASE_URL = LOCAL_BUILD ? "" : "https://github.com/gloom-sh/gloomberb/releases/latest/download";
-const GENERATE_RELEASE_PATCH = !LOCAL_BUILD && process.platform !== "win32";
+/** Patches from the previous release ship for macOS only: no release carries a Linux app, and Windows takes the whole archive. */
+const GENERATE_RELEASE_PATCH = !LOCAL_BUILD && process.platform === "darwin";
+/**
+ * A macOS build for a check rather than for users, which has nothing to sign
+ * with: neither signed nor notarized. A release signs, and its checks fail on
+ * a disk image that is not.
+ */
+const MAC_UNSIGNED = LOCAL_BUILD || process.env.GLOOM_DESKTOP_UNSIGNED === "1";
+/**
+ * Windows on x64 draws the app with the Chromium it ships. Windows on Arm
+ * draws it with the system's WebView2 (window/create.ts), so an Arm build
+ * ships no Chromium, and neither does a check of WebView2 on x64
+ * (GLOOM_WINDOWS_RENDERER=native).
+ */
+const WINDOWS_NATIVE_RENDERER = process.env.GLOOM_WINDOWS_RENDERER === "native"
+  || (process.platform === "win32" && process.arch === "arm64");
+/**
+ * Since Chromium 139, on Windows 11, Chromium's own top-level windows have
+ * no redirection bitmap (RemoveRedirectionBitmap): DirectComposition alone
+ * draws them, and Windows shows their backdrop until it does. In this app's
+ * Chromium nothing ever reaches the window a `title` tooltip opens in, so a
+ * tooltip was an empty light box. With the feature off those windows draw as
+ * before and the page keeps DirectComposition. Electrobun passes
+ * `--disable-features=VizDisplayCompositor` itself, as one switch, and a
+ * second `--disable-features` would replace it: that one is taken out and
+ * its feature listed here.
+ */
+const WINDOWS_CHROMIUM_FLAGS = {
+  "disable-features=VizDisplayCompositor": false,
+  "disable-features": "VizDisplayCompositor,RemoveRedirectionBitmap",
+};
 
 const config: ElectrobunConfig = {
   app: {
@@ -21,6 +51,7 @@ const config: ElectrobunConfig = {
     urlSchemes: ["gloomberb"],
   },
   build: {
+    mainProcess: "bun",
     bun: {
       entrypoint: "src/renderers/electrobun/bun/index.ts",
       sourcemap: "external",
@@ -43,15 +74,16 @@ const config: ElectrobunConfig = {
       "node_modules/**",
     ],
     mac: {
-      codesign: !LOCAL_BUILD,
+      codesign: !MAC_UNSIGNED,
       createDmg: !LOCAL_BUILD,
-      notarize: !LOCAL_BUILD,
+      notarize: !MAC_UNSIGNED,
       icons: "icon.iconset",
       defaultRenderer: "native",
     },
     win: {
-      bundleCEF: true,
-      defaultRenderer: "cef",
+      bundleCEF: !WINDOWS_NATIVE_RENDERER,
+      defaultRenderer: WINDOWS_NATIVE_RENDERER ? "native" : "cef",
+      chromiumFlags: WINDOWS_CHROMIUM_FLAGS,
       icon: "src/assets/gloomberb-logo-windows.ico",
     },
   },

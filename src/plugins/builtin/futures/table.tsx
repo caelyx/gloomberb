@@ -2,18 +2,21 @@ import type { DataTableCell, DataTableColumn } from "../../../components";
 import { colors, shownPriceColor } from "../../../theme/colors";
 import type { Quote } from "../../../types/financials";
 import { TextAttributes } from "../../../ui";
-import { formatCompact, formatNumber, formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatNumber, formatPercentRaw } from "../../../utils/format";
 import { minorUnitSign } from "../../../utils/currency-units";
-import { isBoardRowLoading, renderQuoteBoardCell, type BoardQuoteMap } from "../shared/use-quote-board";
-import { tickDecimals, type FuturesContract } from "../../../market-data/futures-board";
-import { FUTURES_RETURN_COLUMNS, futuresContractHeadline, futuresUnitLabel, type FuturesColumnId, type FuturesTableRow } from "./model";
+import { boardHeadlineQuote, isBoardRowLoading, renderQuoteBoardCell, type BoardQuoteMap } from "../shared/use-quote-board";
+import { futuresBoardCode, tickDecimals, type FuturesContract } from "../../../market-data/futures-board";
+import { FUTURES_RETURN_BASE_COLUMNS, FUTURES_RETURN_COLUMNS, futuresContractHeadline, futuresSessionQuote, futuresUnitLabel, type FuturesColumnId, type FuturesTableRow } from "./model";
 import type { FuturesTermsMap } from "./use-board-terms";
 import type { FrontReturnsMap } from "./use-front-returns";
 
 export type FuturesColumn = DataTableColumn & { id: FuturesColumnId };
 
+/** The columns the board can draw; the 3M, 6M and 1Y returns are only the exports' (FUTURES_REPORT_COLUMNS). */
+type DrawnColumnId = Exclude<FuturesColumnId, "return3m" | "return6m" | "return1y" | keyof typeof FUTURES_RETURN_BASE_COLUMNS>;
+
 export interface FuturesColumnDef {
-  id: FuturesColumnId;
+  id: DrawnColumnId;
   label: string;
   description: string;
 }
@@ -34,21 +37,28 @@ export const FUTURES_COLUMN_DEFS: readonly FuturesColumnDef[] = [
   { id: "time", label: "Time", description: "UTC time of the last quote." },
 ];
 
-const DEFAULT_FUTURES_COLUMN_IDS = FUTURES_COLUMN_DEFS.map((column) => column.id);
+export const DEFAULT_FUTURES_COLUMN_IDS = FUTURES_COLUMN_DEFS.map((column) => column.id);
 
 /**
  * Extra columns only earn their width once the board is wide enough to keep a
- * readable contract name (24 cells or more); a narrow pane drops them instead
- * of clipping. The unit a price counts outranks its session change in points,
- * which the change in percent still gives. The previous close (the last price
- * less the change) goes first, then each row's quote time (the status line
- * dates the newest), which leaves a 1280-pixel shot room for "WTI Crude Oil
- * Dec 2026, rolled (Nov expires 20 Oct)".
+ * readable contract name: CONTRACT never gets fewer than 24 cells
+ * once a board can hold that much. Each threshold is the width where the
+ * column fits with CONTRACT still at 24, the session word (from 100 cells)
+ * included. The change in percent always shows, and the week's and month's
+ * returns come next: the unit a price counts goes after them, so a board
+ * fullscreen on an 80-cell terminal (78 cells) reads SYM CONTRACT LAST CHG%
+ * 1W, and a floating one never hides the move behind a scroll (a cent price
+ * still says so on itself, 280.15¢). The unit outranks the session change in
+ * points, which the change in percent still gives. The previous close (the
+ * last price less the change) goes first, then each row's quote time (the
+ * status line dates the newest), which leaves a 1280-pixel shot room for "WTI
+ * Crude Oil Dec 2026, rolled (Nov expires 20 Oct)".
  */
 const COLUMN_MIN_PANE_WIDTH: Partial<Record<FuturesColumnId, number>> = {
-  change: 100,
-  return1w: 108,
-  return1m: 117,
+  return1w: 71,
+  return1m: 80,
+  unit: 106,
+  change: 117,
   returnYtd: 126,
   volume: 136,
   time: 170,
@@ -58,7 +68,7 @@ const COLUMN_MIN_PANE_WIDTH: Partial<Record<FuturesColumnId, number>> = {
 const WIDE_UNIT_MIN_WIDTH = 200;
 const SESSION_TEXT_MIN_WIDTH = 100;
 
-const COLUMN_WIDTHS: Record<Exclude<FuturesColumnId, "name">, number> = {
+const COLUMN_WIDTHS: Record<Exclude<DrawnColumnId, "name">, number> = {
   status: 1,
   code: 5,
   price: 12,
@@ -81,7 +91,7 @@ export function usesSessionText(width: number): boolean {
   return width >= SESSION_TEXT_MIN_WIDTH;
 }
 
-function columnWidth(id: Exclude<FuturesColumnId, "name">, paneWidth: number): number {
+function columnWidth(id: Exclude<DrawnColumnId, "name">, paneWidth: number): number {
   if (id === "status") return usesSessionText(paneWidth) ? 9 : 1;
   if (id === "unit" && paneWidth >= WIDE_UNIT_MIN_WIDTH) return 20;
   return COLUMN_WIDTHS[id];
@@ -91,7 +101,7 @@ export function createFuturesColumns(width: number, visibleIds?: readonly string
   const ids = resolveFuturesColumnIds(visibleIds)
     .filter((id) => width >= (COLUMN_MIN_PANE_WIDTH[id] ?? 0));
   const fixed = ids
-    .filter((id): id is Exclude<FuturesColumnId, "name"> => id !== "name")
+    .filter((id): id is Exclude<DrawnColumnId, "name"> => id !== "name")
     .reduce((total, id) => total + columnWidth(id, width), 0);
   // Leaves room for the pane border and scrollbar gutter; the name column grows
   // back into any slack because it is the flexible one.
@@ -114,7 +124,7 @@ export function createFuturesColumns(width: number, visibleIds?: readonly string
   });
 }
 
-const FUTURES_HEADER_LABELS: Record<FuturesColumnId, string> = {
+const FUTURES_HEADER_LABELS: Record<DrawnColumnId, string> = {
   status: "",
   code: "SYM",
   name: "CONTRACT",
@@ -130,10 +140,23 @@ const FUTURES_HEADER_LABELS: Record<FuturesColumnId, string> = {
   time: "TIME UTC",
 };
 
+/**
+ * Returns a script reads that the board has no room to draw: its JSON and CSV
+ * carry them beside the drawn 1W, 1M and YTD (DataTable `reportColumns`), and
+ * the day each return's base close is from, `1M from 2026-10-05`.
+ */
+export const FUTURES_REPORT_COLUMNS: readonly FuturesColumn[] = [
+  { id: "return3m", label: "3M", width: 8, align: "right" },
+  { id: "return6m", label: "6M", width: 8, align: "right" },
+  { id: "return1y", label: "1Y", width: 8, align: "right" },
+  ...(Object.entries(FUTURES_RETURN_BASE_COLUMNS) as Array<[keyof typeof FUTURES_RETURN_BASE_COLUMNS, string]>)
+    .map(([id, horizon]) => ({ id, label: `${horizon} from`, width: 10, align: "left" as const })),
+];
+
 /** Falls back to the full column set when the saved selection is empty or unknown. */
-export function resolveFuturesColumnIds(visibleIds?: readonly string[]): FuturesColumnId[] {
+export function resolveFuturesColumnIds(visibleIds?: readonly string[]): DrawnColumnId[] {
   const resolved = (visibleIds ?? [])
-    .filter((id): id is FuturesColumnId => DEFAULT_FUTURES_COLUMN_IDS.includes(id as FuturesColumnId));
+    .filter((id): id is DrawnColumnId => DEFAULT_FUTURES_COLUMN_IDS.includes(id as DrawnColumnId));
   return resolved.length > 0 ? resolved : [...DEFAULT_FUTURES_COLUMN_IDS];
 }
 
@@ -192,7 +215,7 @@ function currencyMarks(currency: string | undefined): { prefix: string; suffix: 
  * 1.3544 pound contract beside it, and with its own "+0.0002" change.
  */
 function formatContractPrice(quote: Quote, contract: FuturesContract): string {
-  if (!Number.isFinite(quote.price)) return "—";
+  if (!Number.isFinite(quote.price)) return MISSING_VALUE;
   const text = formatNumber(quote.price, priceDecimals(quote.previousClose ?? quote.price, contract));
   const { prefix, suffix } = currencyMarks(quote.currency);
   return `${prefix}${text}${suffix}`;
@@ -203,12 +226,13 @@ function formatContractPrice(quote: Quote, contract: FuturesContract): string {
  * magnitude, otherwise a four-tick move on an index future renders with six
  * decimals next to a price showing two.
  */
+function changeDecimals(quote: Quote, contract: FuturesContract): number {
+  return contract.tick || Number.isFinite(quote.price) ? priceDecimals(quote.previousClose ?? quote.price, contract) : 2;
+}
+
 function formatContractChange(quote: Quote, contract: FuturesContract): string {
-  if (!Number.isFinite(quote.change)) return "—";
-  const decimals = contract.tick || Number.isFinite(quote.price)
-    ? priceDecimals(quote.previousClose ?? quote.price, contract)
-    : 2;
-  const text = formatNumber(Math.abs(quote.change), decimals);
+  if (!Number.isFinite(quote.change)) return MISSING_VALUE;
+  const text = formatNumber(Math.abs(quote.change), changeDecimals(quote, contract));
   const { prefix, suffix } = currencyMarks(quote.currency);
   return `${quote.change >= 0 ? "+" : "-"}${prefix}${text}${suffix}`;
 }
@@ -217,7 +241,7 @@ export function renderFuturesCell(
   row: FuturesTableRow,
   column: FuturesColumn,
   quotes: BoardQuoteMap,
-  options?: { sessionText?: boolean; returns?: FrontReturnsMap; terms?: FuturesTermsMap },
+  options?: { sessionText?: boolean; returns?: FrontReturnsMap; terms?: FuturesTermsMap; now?: number },
 ): DataTableCell {
   if (row.type === "header") return { text: "" };
 
@@ -228,42 +252,67 @@ export function renderFuturesCell(
   switch (column.id) {
     case "code":
       return {
-        text: contract.code,
+        text: futuresBoardCode(contract),
         color: colors.textBright,
         attributes: TextAttributes.BOLD,
       };
     case "name":
-      return { text: futuresContractHeadline(contract, quote, options?.terms?.get(contract.symbol)?.terms, column.width) };
+      return futuresContractHeadline(contract, quote, options?.terms?.get(contract.symbol)?.terms, column.width);
     case "unit": {
       const terms = options?.terms?.get(contract.symbol);
       const unit = futuresUnitLabel(contract, terms?.terms);
       if (unit) return { text: unit, color: colors.textDim };
-      return terms?.loading ? { text: "…", color: colors.textDim } : { text: "—", color: colors.textDim };
+      return terms?.loading ? { text: "…", color: colors.textDim } : { text: MISSING_VALUE, color: colors.textDim };
     }
     case "volume":
       if (isBoardRowLoading(state)) return { text: "…", color: colors.textDim };
       if (!quote || quote.volume == null || !Number.isFinite(quote.volume)) {
-        return { text: "—", color: colors.textDim };
+        return { text: MISSING_VALUE, color: colors.textDim };
       }
-      return { text: formatCompact(quote.volume, { fixedDecimals: true }), color: colors.textDim };
+      return { text: formatCompact(quote.volume, { fixedDecimals: true }), value: quote.volume, color: colors.textDim };
     case "return1w":
     case "return1m":
-    case "returnYtd": {
+    case "returnYtd":
+    case "return3m":
+    case "return6m":
+    case "return1y": {
       const returns = options?.returns?.get(contract.symbol);
       if (isBoardRowLoading(state) || returns?.loading) return { text: "…", color: colors.textDim };
       const value = returns?.values[FUTURES_RETURN_COLUMNS[column.id]!];
-      if (value == null || !Number.isFinite(value)) return { text: "—", color: colors.textDim };
-      return { text: formatPercentRaw(value), color: shownPriceColor(value, 2) };
+      if (value == null || !Number.isFinite(value)) return { text: MISSING_VALUE, color: colors.textDim };
+      return { text: formatPercentRaw(value), value, color: shownPriceColor(value, 2) };
+    }
+    case "return1wFrom":
+    case "return1mFrom":
+    case "returnYtdFrom":
+    case "return3mFrom":
+    case "return6mFrom":
+    case "return1yFrom": {
+      const base = options?.returns?.get(contract.symbol)?.bases?.[FUTURES_RETURN_BASE_COLUMNS[column.id]];
+      return { text: base ?? MISSING_VALUE, color: colors.textDim };
     }
     case "prevClose":
       if (isBoardRowLoading(state)) return { text: "…", color: colors.textDim };
       if (!quote || quote.previousClose == null || !Number.isFinite(quote.previousClose)) {
-        return { text: "—", color: colors.textDim };
+        return { text: MISSING_VALUE, color: colors.textDim };
       }
       return {
         text: formatContractPrice({ ...quote, price: quote.previousClose }, contract),
+        value: quote.previousClose,
         color: colors.textDim,
       };
+    case "change": {
+      const cell = renderQuoteBoardCell("change", state, { formatPrice: (quoted) => formatContractPrice(quoted, contract),
+        formatChange: (quoted) => formatContractChange(quoted, contract) });
+      // The JSON and CSV carry the move at the precision the cell shows it, never a difference's float noise.
+      const shown = state?.quote && !isBoardRowLoading(state) ? boardHeadlineQuote(state.quote) : null;
+      return shown && Number.isFinite(shown.change) ? { ...cell, value: Number(shown.change.toFixed(changeDecimals(shown, contract))) } : cell;
+    }
+    case "status":
+      // A contract that trades Globex's whole day reads open from the reopen, not from the first print its feed shows.
+      return renderQuoteBoardCell("status", state?.quote ? { ...state, quote: futuresSessionQuote(contract, state.quote, options?.now) ?? null } : state,
+        { sessionText: options?.sessionText, now: options?.now, formatPrice: (quoted) => formatContractPrice(quoted, contract),
+          formatChange: (quoted) => formatContractChange(quoted, contract) });
     default:
       return renderQuoteBoardCell(column.id, state, {
         sessionText: options?.sessionText,

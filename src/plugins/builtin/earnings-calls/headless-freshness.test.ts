@@ -1,14 +1,15 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, setSystemTime, test } from "bun:test";
 import { apiClient, setCloudApiFetchTransport } from "../../../api-client";
-import { MemoryPluginPersistence } from "../../../test-support/plugin-persistence";
+import { MemoryPluginPersistence, SAVED_COPY_TEST_NOW } from "../../../test-support/plugin-persistence";
 import { attachEarningsCallsPersistence, resetEarningsCallsPersistence } from "./data";
 import { earningsCallsHeadless } from "./headless";
 import { buildHeadlessFunctionReport } from "../../../cli/pane-functions/headless";
 import { createDefaultConfig } from "../../../types/config";
+import { collectSavedCopies } from "../../../data/saved-copies";
 const call = {id:"FIRST-q1",ticker:"FIRST",companyName:"First Corp",fiscalYear:2026,fiscalQuarter:1,callAt:"2026-05-01T20:00:00Z",status:"published",durationSeconds:3600,wordCount:50,hasTranscript:true,sentiment:null};
 const transcript = {...call,timing:null,webcastUrl:null,fullText:"Management expects 20% growth.",turns:[],participants:[],summary:null,guidance:"Management expects 20% growth.",riskFactors:null,analystFocus:null,notable:null,sentimentRationale:null,qaStartTurn:null,asrModel:null,updatedAt:"2026-05-02T00:00:00Z"};
 
-afterEach(() => { resetEarningsCallsPersistence(); setCloudApiFetchTransport(null); apiClient.setSessionToken(null); });
+afterEach(() => { resetEarningsCallsPersistence(); setCloudApiFetchTransport(null); apiClient.setSessionToken(null); setSystemTime(); });
 for (const stale of [false, true]) {
   for (const quarter of ["latest", "FQ1-2026"]) {
     test(`${quarter} guidance preserves usable rows and ${stale ? "failed" : "fresh"} discovery provenance`, async () => {
@@ -16,7 +17,7 @@ for (const stale of [false, true]) {
       attachEarningsCallsPersistence(store);
       if (stale) store.seedResource("calls", JSON.stringify(["FIRST", 200]), { calls: [call] },
         { sourceKey: "earnings-calls", schemaVersion: 3, stale: true, expired: true });
-      store.seedResource("transcript", call.id, transcript, { sourceKey: "earnings-calls", schemaVersion: 1 });
+      store.seedResource("transcript", call.id, transcript, { sourceKey: "earnings-calls", schemaVersion: 2 });
       apiClient.setSessionToken("controlled-test-session");
       setCloudApiFetchTransport(async () => stale
         ? Response.json({ error: "Controlled call discovery outage" }, { status: 503 })
@@ -39,3 +40,19 @@ for (const stale of [false, true]) {
     });
   }
 }
+
+test("in a command, a call list answered from its saved copy ends with when it was saved instead of the outage", async () => {
+  setSystemTime(SAVED_COPY_TEST_NOW);
+  const store = new MemoryPluginPersistence();
+  attachEarningsCallsPersistence(store);
+  store.seedResource("calls", JSON.stringify(["FIRST", 200]), { calls: [call] }, { sourceKey: "earnings-calls", schemaVersion: 3, stale: true, expired: true });
+  apiClient.setSessionToken("controlled-test-session");
+  setCloudApiFetchTransport(async () => Response.json({ error: "Controlled call discovery outage" }, { status: 503 }));
+  const report = await collectSavedCopies(() => buildHeadlessFunctionReport({
+    headless: earningsCallsHeadless, token: "CALLS", label: "Earnings Calls",
+    options: { limit: 20 }, instance: { settings: {} }, capability: { id: "transcript" },
+  } as never, { config: createDefaultConfig("/tmp/unused-offline-call-list"), store: { loadTicker: async () => null } } as never, "FIRST"));
+  expect(report.text).toContain("First Corp");
+  expect(report.text).toMatch(/couldn't refresh; saved copy from \d\d:\d\d UTC/);
+  expect(report.text).not.toContain("Controlled call discovery outage");
+});

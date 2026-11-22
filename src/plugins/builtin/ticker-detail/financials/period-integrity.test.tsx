@@ -143,11 +143,11 @@ test("actual financial table and CSV retain the derived TTM window and known fie
     aggregation: { kind: "trailing-four-quarters", periodEnd: "2024-12-31" },
   });
   expect(columns(result)[0]!.aggregation!.sourcePeriods.map((period) => period.date)).toEqual(quarterEnds);
-  expect(csv).toContain("TTM Q4 FY24");
+  expect(csv).toContain("TTM Q4 FY24 2024-12-31");
   expect(csv).toContain("Currency,USD");
-  expect(frame()).toContain("TTM Q4 FY24");
-  expect(frame()).toContain("FY2025");
-  expect(frame()).toContain("USD k · YoY · as of 2025-12-31");
+  expect(frame()).toContain("TTM Q4 FY24 2024-12-31");
+  expect(frame()).toContain("FY2025 2025-12-31");
+  expect(frame()).toMatch(/^ {2}USD K\s/m);
   expect(row(result, "income:revenue").TTM).toBe(400);
 });
 
@@ -187,7 +187,7 @@ test("explicit quarterly headless report fails honestly while interactive tabs i
   expect(result.rows).toEqual([]);
   expect(result.unavailableSymbols).toEqual([SYMBOL]);
   expect(text).toContain("No quarterly financial statement coverage");
-  expect(frame()).toContain("USD · YoY");
+  expect(frame()).toContain("FY2025 2025-12-31");
 
   const unavailable = await cli(financials, "quarterly");
   expect(unavailable.data).toMatchObject({ complete: false, empty: true, unavailableSymbols: [SYMBOL] });
@@ -229,7 +229,7 @@ test("mouse period changes keep active CSV and quarterly values aligned, includi
   const quarterly = await outputs(financials, "quarterly");
   expect(quarterly.csv).toContain("Growth,QoQ");
   expect(quarterly.csv).not.toContain("TTM");
-  expect(frame()).toContain("USD · QoQ");
+  expect(frame()).toContain("Q4 FY25 2025-12-31");
   expect(row(quarterly.result, "eps:1").cells[0]!.value).toBe(0);
 
   await clickPeriod();
@@ -239,7 +239,7 @@ test("mouse period changes keep active CSV and quarterly values aligned, includi
   expect(annual.csv).toContain("FY2025");
   expect(annual.csv).toContain("Currency,USD");
   expect(annual.csv).toContain("Growth,YoY");
-  expect(frame()).toContain("USD · YoY");
+  expect(frame()).toContain("FY2025 2025-12-31");
 });
 
 for (const reportedCurrency of [undefined, "USD"]) {
@@ -257,7 +257,7 @@ for (const reportedCurrency of [undefined, "USD"]) {
     const { result, csv, text } = await outputs(financials);
     const header = columns(result).find((column) => column.date === "2024-12-31")!;
     // Mixed reporting currencies: each column names its own.
-    const expectedHeader = reportedCurrency ? "FY2024 USD" : "FY2024";
+    const expectedHeader = reportedCurrency ? "FY2024 2024-12-31 USD" : "FY2024 2024-12-31";
     expect(header.currency).toBe(reportedCurrency ?? null);
     expect(result.metadata!.currency).toBeNull();
     expect(row(result, "income:revenue").cells[0]!.growth).toBe(reportedCurrency ? 1 : null);
@@ -268,3 +268,57 @@ for (const reportedCurrency of [undefined, "USD"]) {
     expect(financials.annualStatements[0]!.currency).toBe(reportedCurrency);
   });
 }
+
+/** The headless FA report for these financials; `extended` is what GF's extended history holds. */
+async function statementsReport(period: Period, financials: TickerFinancials, extended: Partial<TickerFinancials> = {}) {
+  const args = { symbols: [SYMBOL], argument: [SYMBOL], rawArgument: SYMBOL, options: { period, statement: "income" } };
+  const marketData = createTestDataProvider({
+    getTickerFinancials: async (_symbol, _exchange, context) => context?.statementHistory === "extended" ? { ...financials, ...extended } : financials,
+  });
+  const result = await financialStatementsHeadless.load(args, { marketData } as never) as HeadlessRowsResult;
+  return { result, text: renderHeadlessPaneText(financialStatementsHeadless, result, args, "Financials") };
+}
+
+test("a quarterly report says its growth is vs prior quarter, and a share count of zero or in the wrong unit is missing", async () => {
+  // IAG's Q3 2025 averages: 4,642 (millions read as shares) and none at all for Q4.
+  const financials: TickerFinancials = {
+    annualStatements: [{ date: "2024-12-31", totalRevenue: 32_000, dilutedShares: 4.9e9 }],
+    quarterlyStatements: [
+      { date: "2025-06-30", totalRevenue: 8_860, dilutedShares: 4.67e9 },
+      { date: "2025-09-30", totalRevenue: 9_330, dilutedShares: 4_642 },
+      { date: "2025-12-31", totalRevenue: 7_980, dilutedShares: 0 },
+      { date: "2026-03-31", totalRevenue: 7_180, dilutedShares: 4.96e9 },
+    ],
+    priceHistory: [],
+  };
+  const { result, text } = await statementsReport("quarterly", financials);
+  expect(text).toContain("Growth is vs prior quarter.");
+  const shares = row(result, "dilutedShares:1").cells;
+  expect(shares.map((cell) => cell.value)).toEqual([4.96e9, null, null, 4.67e9]);
+  // No fall of 100% into a missing count, and no rise out of one.
+  expect(shares.map((cell) => cell.growth)).toEqual([null, null, null, null]);
+  expect((await statementsReport("annual", financials)).text).not.toContain("vs prior quarter");
+});
+
+test("a statements report points to GF only when GF holds older periods, and a half-yearly reporter says so", async () => {
+  const years = [{ date: "2024-06-30", totalRevenue: 22_000 }, { date: "2025-06-30", totalRevenue: 23_800 }];
+  const financials: TickerFinancials = {
+    annualStatements: years,
+    quarterlyStatements: [{ date: "2025-12-31", totalAssets: 50_000 }, { date: "2026-06-30", totalAssets: 52_000 }],
+    priceHistory: [],
+  };
+  // GF reads the same years: no pointer to it.
+  const same = await statementsReport("annual", financials);
+  expect(same.text).toContain("annual history from 2024; older years not available for this listing");
+  expect(same.text).not.toContain("fn GF");
+  // GF goes back to 2015: the pointer stays.
+  const deeper = await statementsReport("annual", financials, { annualStatements: [{ date: "2015-06-30", totalRevenue: 15_000 }, ...years] });
+  expect(deeper.text).toContain(`earlier years, one metric at a time: gloom fn GF ${SYMBOL} --period annual --periods 40`);
+  // Statements half a year apart, with no income line: the reason, and the years to read instead.
+  const quarterly = await statementsReport("quarterly", financials);
+  expect(quarterly.result.rows).toEqual([]);
+  expect(quarterly.result.errors).toEqual([`${SYMBOL} reports half-yearly, not quarterly. For its years: gloom fn FA ${SYMBOL} --period annual`]);
+  // A company with a quarter and no full year reported yet: the annual report names its quarters.
+  const firstQuarter = await statementsReport("annual", { annualStatements: [], quarterlyStatements: [{ date: "2026-05-31", netIncome: -671_000 }], priceHistory: [] });
+  expect(firstQuarter.result.errors).toEqual([`${SYMBOL}: No annual financial statement coverage. For its quarters: gloom fn FA ${SYMBOL} --period quarterly`]);
+});

@@ -1,19 +1,20 @@
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
-import { formatCompact, formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatNumber } from "../../../utils/format";
 import { shortInterestFreshness } from "./schedule";
 import { createShortWatchDependencies, loadShortWatch } from "./watch-client";
 import { customUniverse, type ShortWatchSetup, setupLabel, SHORT_WATCH_LIMIT, sortShortWatchRows } from "./watch-model";
 
 const number = (digits: number, suffix = "") => (value: unknown) =>
-  typeof value === "number" && Number.isFinite(value) ? `${formatNumber(value, digits)}${suffix}` : "--";
+  typeof value === "number" && Number.isFinite(value) ? `${formatNumber(value, digits)}${suffix}` : MISSING_VALUE;
 const signedPercent = (value: unknown) =>
-  typeof value === "number" && Number.isFinite(value) ? `${value > 0 ? "+" : ""}${formatNumber(value, 1)}%` : "--";
+  typeof value === "number" && Number.isFinite(value) ? `${value > 0 ? "+" : ""}${formatNumber(value, 1)}%` : MISSING_VALUE;
 
 export const shortWatchHeadless: HeadlessPaneDefinition<"rows"> = {
   shape: "rows",
   freshness: { source: "FINRA", status: "not-a-feed", basis: "twice-monthly settlement", observedKey: "settlementDate", maxAgeMinutes: 30 * 24 * 60 },
   argument: { kind: "symbol-list", maximum: SHORT_WATCH_LIMIT, description: "US tickers; the pane defaults to your portfolios and watchlists." },
   usListingsOnly: "FINRA short interest",
+  usListingsOtc: true,
   failsWithoutData: true,
   options: [],
   describe: "Short squeeze watch",
@@ -27,12 +28,12 @@ export const shortWatchHeadless: HeadlessPaneDefinition<"rows"> = {
   },
   columns: [
     { key: "symbol", header: "Symbol" },
-    { key: "setup", header: "Setup", format: (value) => setupLabel(value as ShortWatchSetup | null) || "--" },
+    { key: "setup", header: "Setup", format: (value) => setupLabel(value as ShortWatchSetup | null) || MISSING_VALUE },
     { key: "percentFloat", header: "% Float", align: "right", format: number(2, "%") },
     { key: "daysToCover", header: "Days to cover", align: "right", format: number(2) },
     { key: "changePercent", header: "SI Chg %", align: "right", format: signedPercent },
     { key: "return1M", header: "1M %", align: "right", format: signedPercent },
-    { key: "sharesShort", header: "Shares Short", align: "right", format: (value) => typeof value === "number" ? formatCompact(value) : "--" },
+    { key: "sharesShort", header: "Shares Short", align: "right", format: (value) => typeof value === "number" ? formatCompact(value) : MISSING_VALUE },
     { key: "settlementDate", header: "Settled" },
     { key: "closeDate", header: "Close date" },
   ],

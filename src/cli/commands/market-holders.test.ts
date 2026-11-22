@@ -8,6 +8,10 @@ import { serializeCliResult } from "../result";
 import { marketDataCliCommands } from "./market";
 import { createHoldersHeadless } from "../../plugins/builtin/holders/headless";
 import { createTestHeadlessContext } from "../../test-support/headless";
+import { createTestDataProvider, createTestQuote } from "../../test-support/data-provider";
+import { createProviderMiss } from "../../sources/provider-errors";
+import { apiClient } from "../../api-client";
+import { isCliFailure } from "../errors";
 
 const holders = marketDataCliCommands.find((command) => command.name === "holders")!;
 const insider = marketDataCliCommands.find((command) => command.name === "insider")!;
@@ -115,10 +119,11 @@ test("holders writes HDS's rows: largest value first, percents in percent, and H
   }, createTestHeadlessContext());
   expect(result.data).toEqual(hds.rows);
   const csv = serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, format: "csv" }, options).split("\n");
+  const retrieved = csv.find((line) => line.startsWith("# Retrieval time: "))!.replace("# Retrieval time: ", "");
   expect(csv.slice(0, 3)).toEqual([
-    "Holder,Type,Mkt value (USD),Amount,Chg,Chg%,Held (%),Period,symbol_or_series,currency_or_unit,interval,source,as_of",
-    '"Chevy Chase Trust Holdings, LLC",institution,188906753,14003466,187825,1.3595,0.09,2026-06-30,SAN,,,SEC EDGAR,2026-06-30',
-    "Northern Trust Corporation,institution,174942026,12968275,-403588,-3.0182,0.09,2026-06-30,SAN,,,SEC EDGAR,2026-06-30",
+    "Holder,Type,Mkt value (USD),Amount,Chg,Chg%,Held (%),Period,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at",
+    `"Chevy Chase Trust Holdings, LLC",institution,188906753,14003466,187825,1.3595,0.09,2026-06-30,SAN,,,SEC EDGAR,2026-06-30,${retrieved}`,
+    `Northern Trust Corporation,institution,174942026,12968275,-403588,-3.0182,0.09,2026-06-30,SAN,,,SEC EDGAR,2026-06-30,${retrieved}`,
   ]);
 });
 
@@ -169,6 +174,62 @@ test("holders on a US line lists the 13F index's filers past the source's few, a
   expect(tailed.warnings).toEqual(["--tail 3 is the last 3 of the largest 25 loaded, not the smallest of all 567 holders."]);
 });
 
+test("a fund or a listing no source has holders of says so, and for a fund what reads it instead, as no data, in holders, 13f and fn HDS", async () => {
+  // The service's covered funds for fn MEMB, trimmed: XLE is one, EWJ is not.
+  setHttpFetchTransport(async (url) => new URL(url).pathname === "/cloud/members"
+    ? Response.json({ funds: [{ ticker: "XLE", name: "Energy", aliases: [], changes: "none", asOf: null }] })
+    : noIndex());
+  const fund = (symbol: string, listingExchangeName: string) => ({
+    getHolders: async () => { throw createProviderMiss("NO_DATA"); },
+    getQuote: async () => createTestQuote({ symbol, instrumentType: "ETF", listingExchangeName }),
+  });
+  const failure = async (command: string, symbol: string, market: Record<string, unknown>) => {
+    const cli = createTestCliContext({ dataProvider: createTestDataProvider(market) });
+    return marketDataCliCommands.find((entry) => entry.name === command)!.execute([symbol], cli.context).then(() => null, (error) => error);
+  };
+  for (const command of ["holders", "13f"]) {
+    const xle = await failure(command, "XLE", fund("XLE", "ARCA"));
+    expect(isCliFailure(xle) && xle.code).toBe("no_data");
+    expect(xle.message).toBe("XLE is a fund: there is no ownership breakdown for funds.");
+    expect(xle.details).toBe("13F filers that hold it: gloom fn 13F XLE\nWhat it holds: gloom fn MEMB XLE\nFund facts: gloom fn ETF XLE");
+  }
+  // fn MEMB is named only for a fund it covers, and none of the US commands for a fund listed abroad.
+  expect((await failure("holders", "EWJ", fund("EWJ", "ARCA"))).details).toBe("13F filers that hold it: gloom fn 13F EWJ\nFund facts: gloom fn ETF EWJ");
+  expect((await failure("holders", "SXR8", fund("SXR8", "XETRA"))).details).toBeUndefined();
+  // A company the source has nothing for says none are on record, as no data, never the source's NO_DATA;
+  // a Shanghai line says which filings were read.
+  const stock = await failure("holders", "ZZZQ", { ...fund("ZZZQ", "NASDAQ"), getQuote: async () => createTestQuote({ symbol: "ZZZQ", instrumentType: "EQUITY" }) });
+  expect(isCliFailure(stock) && stock.code).toBe("no_data");
+  expect(stock.message).toBe("No holders on record for ZZZQ.");
+  const moutai = { ...fund("600519", "SSE"), getQuote: async () => createTestQuote({ symbol: "600519", instrumentType: "EQUITY", listingExchangeName: "SSE", currency: "CNY" }) };
+  for (const command of ["holders", "13f"]) {
+    const none = await failure(command, "600519:SSE", moutai);
+    expect(isCliFailure(none) && none.code).toBe("no_data");
+    expect(none.message).toBe("No holders on record for 600519:SSE: no SEC 13F filing reports it, and the SSE share register is not read.");
+  }
+  // A failure that is no answer stays the failure.
+  const busy = await failure("holders", "ZZZQ", { ...fund("ZZZQ", "NASDAQ"), getHolders: async () => { throw new Error("timed out"); },
+    getQuote: async () => createTestQuote({ symbol: "ZZZQ", instrumentType: "EQUITY" }) });
+  expect(isCliFailure(busy)).toBe(false);
+
+  const hds = await createHoldersHeadless({ loadSnapshot: async () => { throw createProviderMiss("NO_DATA"); } }).load({
+    rawArgument: "XLE", argument: "XLE", symbols: ["XLE"], options: { sort: "value", order: "desc", limit: 25 },
+  }, createTestHeadlessContext({ marketData: createTestDataProvider(fund("XLE", "ARCA")), apiClient }));
+  expect(hds).toMatchObject({
+    rows: [],
+    unavailableSymbols: ["XLE"],
+    empty: "XLE is a fund: there is no ownership breakdown for funds.\n13F filers that hold it: gloom fn 13F XLE\nWhat it holds: gloom fn MEMB XLE\nFund facts: gloom fn ETF XLE",
+  });
+  const moutaiHds = await createHoldersHeadless({ loadSnapshot: async () => { throw createProviderMiss("NO_DATA"); } }).load({
+    rawArgument: "600519:SSE", argument: "600519:SSE", symbols: ["600519:SSE"], options: { sort: "value", order: "desc", limit: 25 },
+  }, createTestHeadlessContext({ marketData: createTestDataProvider(moutai), apiClient }));
+  expect(moutaiHds).toMatchObject({
+    rows: [],
+    unavailableSymbols: ["600519:SSE"],
+    empty: "No holders on record for 600519:SSE: no SEC 13F filing reports it, and the SSE share register is not read.",
+  });
+});
+
 test("insider leads with INS's Form 4 summary, not a 13F list that names no insider, and dates the report by the newest filing", async () => {
   // `insider JNJ` read "none reported" from the 13F list while `fn INS JNJ` summed 42 Form 4 lines.
   const day = (ago: number) => new Date(Date.now() - ago * 86_400_000).toISOString().slice(0, 10);
@@ -191,7 +252,8 @@ test("insider leads with INS's Form 4 summary, not a 13F list that names no insi
   const { result, options } = cli.printed[0]!;
   const text = serializeCliResult(result, { ...DEFAULT_CLI_OPTIONS, format: "text" }, options).replace(/\u001b\[[0-9;]*m/g, "");
   expect(text).not.toContain("none reported");
-  expect(text).toContain("Loaded filings, last 90 days: Common Stock: Sold 1.5k shares ($220,000.00)");
+  // The totals say which trade dates they count, from 90 days back to today, and over how many filings.
+  expect(text).toMatch(/2 loaded filings, trades dated \d{4}-\d{2}-\d{2} to \d{4}-\d{2}-\d{2}: Common Stock: Sold 1\.5k shares \(220,000\.00 USD\)/);
   expect(text).toContain(`2 Form 4 lines in the latest 2 filings, newest filed ${day(3)}: gloom fn INS JNJ`);
   expect(text).toContain("(Form 4 filings)");
   expect(result.metadata).toMatchObject({

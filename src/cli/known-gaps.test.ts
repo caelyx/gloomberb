@@ -3,14 +3,19 @@ import { apiClient } from "../api-client";
 import { getLoadablePlugins } from "../plugins/catalog";
 import { createDefaultConfig } from "../types/config";
 import { paneSchemas } from "../plugins/builtin/chart-composer/headless-schema";
-import { commandPointer, commandPointerLeads, exportCommandPointer, knownGapForTicker, knownGapMessage, MUNI_LINE, subMinuteDataMessage, topicPointer } from "./known-gaps";
+import { commandPointer, commandPointerLeads, exportCommandPointer, knownGapForTicker, knownGapMessage, MUNI_LINE, subMinuteDataMessage, topicPointer, unquotedGapMessage } from "./known-gaps";
 import type { MarketContext } from "./types";
 import { buildSearchReport, searchFunctionsForCli } from "./commands/search";
-import { buildPaneCatalogEntries, filterPaneCatalogEntries, renderPaneCatalogReport } from "./pane-functions/catalog";
+import { buildPaneCatalogEntries, buildPaneFunctionLookup, filterPaneCatalogEntries, renderPaneCatalogReport, selectPaneCatalogMatches } from "./pane-functions/catalog";
 import { createPaneCatalog } from "./pane-functions/discovery";
 import { parsePaneCatalogArgs } from "./pane-functions/options";
 import { lookupGlossary } from "./glossary";
 import { catalogEmptyCopy } from "../plugins/builtin/chart-composer/catalog-inventory";
+import { doeModule } from "../plugins/builtin/doe";
+import { doeGasWord } from "../plugins/builtin/doe/headless";
+import { buildFuturesRows, DEFAULT_FUTURES_SORT } from "../plugins/builtin/futures/model";
+import { getContractsBySector } from "../market-data/futures-board";
+import { findCatalogSeries } from "./series-search";
 
 beforeEach(() => {
   // Catalog discovery starts chat and instantiates the map's chart templates.
@@ -18,6 +23,29 @@ beforeEach(() => {
   spyOn(apiClient, "geo").mockResolvedValue({ series: [] });
 });
 afterEach(() => mock.restore());
+
+/**
+ * Dead ends from 30 Oct 2026: `fn DOE NGS` asked for a petroleum series, `fn FUT natgas` printed every tab and header
+ * then "Clear search.", and `catalog hurricane` found nothing and said nothing else.
+ */
+test("gas words open gas storage, FUT knows natgas and names what to try, and a catalog miss offers the news search", () => {
+  const doe = doeModule.paneTemplates!.find((template) => template.id === "doe-pane")!;
+  for (const word of ["NGS", "natural gas", "natgas"]) {
+    expect(doeGasWord(word)).toBe(true);
+    expect(doe.createInstance!({} as never, { arg: word })).toMatchObject({ settings: { tab: "gas" } });
+  }
+  expect(doeGasWord("cushing")).toBe(false);
+
+  const board = (query: string) => buildFuturesRows(getContractsBySector(), DEFAULT_FUTURES_SORT, new Map(), { query })
+    .flatMap((row) => row.type === "row" ? [row.contract.symbol] : []);
+  expect(board("natgas")).toEqual(["NG=F"]);
+  expect(board("gas")).toContain("NG=F");
+  expect(board("urea")).toEqual([]);
+
+  const miss = (query: string) => renderPaneCatalogReport([], parsePaneCatalogArgs([query]), lookupGlossary(query), null).replace(/\s+/g, " ");
+  expect(miss("hurricane")).toContain(`For stories that mention it: gloom news '"hurricane"'.`);
+  expect(miss("hurricane season")).toContain(`For stories that mention it: gloom news "hurricane season".`);
+});
 
 test("data a name search cannot find is pointed to, with its proxies, by search and catalog, instead of each pointing at the other", () => {
   const gap = "EU carbon (EUA): the auction price is in EPWR, chart CAP:carbon:eua. Traded proxies: CO2:LSE, KRBN.";
@@ -33,6 +61,27 @@ test("data a name search cannot find is pointed to, with its proxies, by search 
   expect(catalog).not.toContain("No functions match");
 });
 
+test("iron ore typed for a quote has no live price and points to the IMF's monthly series, never Kumba's stock", () => {
+  const gap = unquotedGapMessage("iron ore")!;
+  expect(gap).toStartWith("Iron ore: no live price");
+  expect(gap).toContain("gloom fred PIORECRUSDM");
+  for (const query of ["Iron Ore", "iron ore price", "iron ore 62% Fe", "SGX iron ore", "iron ore futures today"]) expect(unquotedGapMessage(query), query).toBe(gap);
+  expect(knownGapMessage("iron ore")).toBe(gap);
+  // Kumba is still its name, and a company that holds the words is not the subject.
+  for (const query of ["kumba", "Kumba Iron Ore", "iron mountain", "iron ore miners"]) expect(unquotedGapMessage(query), query).toBeNull();
+});
+
+// TOPIX read as the data service failing to answer, after five seconds.
+test("an index no source carries says so and names the funds that track it, under each spelling people type", () => {
+  const topix = "TOPIX is not carried: JPX licenses it. Funds that track it: 1306:JPX (NEXT FUNDS TOPIX ETF), 1475:JPX (iShares Core TOPIX ETF).";
+  for (const query of ["TOPIX", "topix", "^TPX", "TPX Index", "998405:JPX", "998405.T", "Tokyo Stock Price Index"]) {
+    expect(unquotedGapMessage(query), query).toBe(topix);
+  }
+  expect(knownGapMessage("topix")).toBe(topix);
+  // A bare TPX is a US ticker, and a TOPIX fund is a listing.
+  for (const query of ["TPX", "topix etf", "1306:JPX"]) expect(unquotedGapMessage(query), query).toBeNull();
+});
+
 test("LME and Shanghai metals are said to be uncovered, pointing at COMEX curves and the monthly world prices, not FUT", () => {
   const gap = knownGapMessage("LME copper")!;
   expect(gap).toStartWith("LME and Shanghai (SHFE) metals futures: not covered");
@@ -42,13 +91,28 @@ test("LME and Shanghai metals are said to be uncovered, pointing at COMEX curves
   expect(knownGapMessage("copper")).toBeNull();
 });
 
+test("jet fuel and kerosene lead to heating oil's price and COT, and the EIA's jet fuel stocks, not POWER", () => {
+  // `catalog "jet fuel"` opened POWER, and `catalog kerosene` found nothing.
+  const gap = knownGapMessage("jet fuel")!;
+  expect(gap).toStartWith("Jet fuel (kerosene): no price series; heating oil (NY Harbor ULSD) is the usual proxy");
+  for (const route of ["gloom quote HO=F", "gloom fn G CAP:doe:jet", "gloom fn COT HO"]) expect(gap).toContain(route);
+  for (const query of ["kerosene", "Jet Fuel", "jet fuel prices", "aviation fuel", "airline jet fuel"]) expect(knownGapMessage(query), query).toBe(gap);
+  for (const query of ["fuel", "jet", "fuel cells"]) expect(knownGapMessage(query), query).toBeNull();
+  // A topic pointer: catalog lists COT in place of the loose matches "fuel" finds (POWER's fuel filter).
+  expect(topicPointer("kerosene")?.codes).toEqual(["COT"]);
+});
+
 test("freight rates and the Baltic indices are said to be uncovered, naming what is; BDI alone is also a ticker", () => {
   const gap = knownGapMessage("freight")!;
   expect(gap).toStartWith("Baltic indices (BDI, Capesize, Panamax, Supramax) and freight forwards (FFA) are not covered.");
   for (const proxy of ["BDRY", "SBLK", "GNK", "DSX", "fn CHOKE", "news \"dry bulk\""]) expect(gap).toContain(proxy);
   for (const query of ["Baltic Dry", "dry-bulk", "Panamax", "freight rates", "FFA", "BDI", "charter rates"]) expect(knownGapMessage(query), query).toBe(gap);
-  // Only the whole query: a company, a sector or a ticker that merely carries the word is not the gap.
-  for (const query of ["baltic sea", "freight forwarder stocks", "BDIX", "BDRY", "ocean freight carriers"]) expect(knownGapMessage(query), query).toBeNull();
+  // A term among words that only qualify it matches on its tokens.
+  for (const query of ["panamax rates", "shipping rates", "bulk freight", "freight cost", "capesize spot rate", "dry bulk shipping rates"]) {
+    expect(knownGapMessage(query), query).toBe(gap);
+  }
+  // A company, a sector or a ticker that merely carries the word is not the gap: another word makes it another question.
+  for (const query of ["baltic sea", "freight forwarder stocks", "BDIX", "BDRY", "ocean freight carriers", "shipping stocks"]) expect(knownGapMessage(query), query).toBeNull();
   expect(knownGapForTicker("BDI")).toBe(gap);
   for (const symbol of ["FFA", "freight", "BDRY", "EUA"]) expect(knownGapForTicker(symbol), symbol).toBeNull();
 
@@ -90,7 +154,7 @@ test("a search no ticker answers lists the functions that carry every word, so a
   // PF's own words say what it does with targets, so the list explains the match.
   expect(functions[0]!.description).toMatch(/target weights.*drift.*rebalance/);
   const report = buildSearchReport({ query: "target weights rebalance", candidates: [], functions }).replace(/\x1b\[[0-9;]*m/g, "");
-  expect(report).toContain("PF  Collection Pane");
+  expect(report).toContain("PF  Portfolio");
   expect(report).not.toContain("No matches found");
   // Some of the words only: no function carries them all, and the search says so as before.
   expect(await searchFunctionsForCli("rebalance xylophone", getLoadablePlugins(), context)).toEqual([]);
@@ -157,6 +221,32 @@ test("NIM, deposits, CRE and bank are pointed at the Bank section of fundamental
   }
 });
 
+// "port throughput" found Portfolio alone: a port's calls are MAP's ports layer, which the catalog lists under PORT's own match.
+test("port words lead with MAP ports, and port compounds that are not about ships do not", () => {
+  for (const query of ["port", "ports", "port calls", "port throughput", "throughput", "shipping"]) {
+    expect(commandPointer(query), query).toContain("gloom fn MAP ports");
+    expect(commandPointerLeads(query), query).toBe(true);
+  }
+  for (const query of ["portfolio", "port returns", "airport", "shipping stocks"]) expect(commandPointer(query) ?? "", query).not.toContain("fn MAP ports");
+});
+
+// "yen hedged" opened FX Cross Rates, which has no hedged view.
+test("a hedged query leads with CMP on hedged and unhedged Japan funds, which the catalog finds by the same words", async () => {
+  const line = "Hedged against unhedged: gloom fn CMP DXJ HEWJ EWJ --total-return true (DXJ and HEWJ hedge the yen, EWJ does not); "
+    + "add --currency <your currency> for each fund's return in it, EWJ then carrying the yen's move and DXJ and HEWJ only the dollar's.";
+  for (const query of ["yen hedged", "hedged", "currency hedged etf", "hedged vs unhedged japan"]) expect(commandPointer(query), query).toBe(line);
+  expect(commandPointerLeads("yen hedged")).toBe(true);
+  for (const query of ["hedge fund", "hedged bond yield"]) expect(commandPointer(query), query).not.toBe(line);
+  const context = { config: createDefaultConfig("/tmp/known-gaps-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const shown = selectPaneCatalogMatches(filterPaneCatalogEntries(await buildPaneCatalogEntries(registry, context), "yen hedged"), "yen hedged", 5).shown;
+    expect(shown[0]?.token).toBe("CMP");
+  } finally {
+    registry.destroy();
+  }
+});
+
 test("an income or reinvestment query names portfolio show --drip; a statement or margin query does not", () => {
   const line = "Portfolio income, yield and DRIP projection: gloom portfolio show <name> --drip";
   for (const query of ["drip", "DRIP projection", "reinvest", "dividend reinvestment", "dividend income", "my portfolio income"]) {
@@ -164,6 +254,15 @@ test("an income or reinvestment query names portfolio show --drip; a statement o
   }
   for (const query of ["income statement", "net income", "fixed income", "dark pool"]) expect(commandPointer(query), query).toBeNull();
   expect(commandPointer("light theme")).toBe("Themes: gloom config themes");
+});
+
+test("a perpetual query names fn PERP for the coin it names, or the board; a perpetual bond or preferred does not", () => {
+  const btc = "BTC perpetuals by venue, with funding, open interest and premium: gloom fn PERP BTC";
+  for (const query of ["btc perpetual", "BTC perp", "btc perpetual futures", "binance btc perp funding rate"]) expect(commandPointer(query), query).toBe(btc);
+  expect(commandPointer("eth perps")).toBe("ETH perpetuals by venue, with funding, open interest and premium: gloom fn PERP ETH");
+  expect(commandPointer("bitcoin perpetual")).toBe("Bitcoin perpetuals by venue, with funding, open interest and premium: gloom fn PERP bitcoin");
+  expect(commandPointer("perpetual funding rates")).toBe("Perpetual markets by venue, with funding, open interest and premium: gloom fn PERP");
+  for (const query of ["perpetual bonds", "hsbc perpetual preferred", "btc", "tesla stock perpetual growth"]) expect(commandPointer(query), query).toBeNull();
 });
 
 test("a stablecoin word names CRYP's stablecoin list, ahead of the FX series its letters start; a PEG ratio does not", () => {
@@ -174,6 +273,64 @@ test("a stablecoin word names CRYP's stablecoin list, ahead of the FX series its
   const catalog = renderPaneCatalogReport([], parsePaneCatalogArgs(["usdt"]), lookupGlossary("usdt"), null, series, commandPointer("usdt"));
   expect(catalog.indexOf(line)).toBe(0);
   expect(catalog).toContain("Taiwan dollar");
+});
+
+test("a currency's code or name finds FXC, its series and fx; safe haven lists FXC ahead of a function with one of its words", async () => {
+  // Before: `catalog yen` listed JGB yields only, `catalog jpy` one FRED series, and "safe haven" opened FDA Reports.
+  for (const query of ["yen", "jpy", "JPY", "Japanese yen"]) {
+    expect(commandPointer(query), query).toBe("The JPY rate: gloom fx JPY; its pair's history: gloom history USDJPY=X");
+  }
+  expect(commandPointer("swiss franc")).toBe("The CHF rate: gloom fx CHF; its pair's history: gloom history USDCHF=X");
+  expect(commandPointer("euro")).toBe("The EUR rate: gloom fx EUR; its pair's history: gloom history EURUSD=X");
+  // The dollar has no pair of its own; a code that is an English word counts only in capitals; a word several share is none.
+  for (const query of ["usd", "try", "cad", "rub", "peso", "yen carry trade"]) expect(commandPointer(query), query).toBeNull();
+  for (const code of ["TRY", "CAD", "RUB"]) expect(commandPointer(code), code).toContain(`gloom fx ${code}`);
+
+  const context = { config: createDefaultConfig("/tmp/known-gaps-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    for (const query of ["yen", "jpy", "CHF", "franc", "swiss franc"]) {
+      expect(filterPaneCatalogEntries(entries, query)[0]?.token, query).toBe("FXC");
+    }
+    // The euro is also the euro area's: FXC is among what it finds.
+    expect(filterPaneCatalogEntries(entries, "euro").map((entry) => entry.token)).toContain("FXC");
+    // The phrase outranks a function that has one of its words (FDA's drug safety).
+    const haven = filterPaneCatalogEntries(entries, "safe haven");
+    expect(haven[0]?.token).toBe("FXC");
+    const catalog = renderPaneCatalogReport(haven, parsePaneCatalogArgs(["safe", "haven"]), lookupGlossary("safe haven"), null,
+      findCatalogSeries(getLoadablePlugins(), "safe haven")).replace(/\x1b\[[0-9;]*m/g, "");
+    expect(catalog).toStartWith('Matches for "safe haven" (1 of 2)\nFunction');
+    expect(catalog).toContain("FUT:GC");
+  } finally {
+    registry.destroy();
+  }
+  // The yen's own series lead the JGB yields its tag finds, and the cut-off names catalog --all.
+  const yen = findCatalogSeries(getLoadablePlugins(), "yen");
+  expect(yen.slice(0, 2).map((match) => match.expression).sort()).toEqual(["FRED:DEXJPUS", "FUT:6J"]);
+  const report = renderPaneCatalogReport([], parsePaneCatalogArgs(["yen"]), lookupGlossary("yen"), null, yen).replace(/\x1b\[[0-9;]*m/g, "");
+  expect(report).toContain(`gloom catalog yen --all lists all ${yen.length}.`);
+});
+
+test("hashrate, hashprice, difficulty, mining and miner lead to the bitcoin network series and THEM crypto, ahead of DIST", async () => {
+  const line = "Bitcoin network: gloom fn G hashrate, difficulty or hashprice; listed miners: gloom fn THEM crypto";
+  for (const query of ["hashrate", "hash rate", "hashprice", "difficulty", "bitcoin difficulty", "mining", "miner", "bitcoin miners", "mining stocks"]) {
+    expect(commandPointer(query), query).toBe(line);
+    expect(commandPointerLeads(query), query).toBe(true);
+  }
+  // Mining of anything else, and data mining, are not the bitcoin network.
+  for (const query of ["gold mining", "data mining", "gold miners"]) expect(commandPointer(query), query).toBeNull();
+  const plugins = getLoadablePlugins();
+  expect(findCatalogSeries(plugins, "hashrate").map((match) => match.expression)).toEqual(["CAP:bitcoin:hashrate"]);
+  expect(findCatalogSeries(plugins, "hashprice")[0]).toMatchObject({ expression: "CAP:bitcoin:hashprice", unit: "USD/PH/s/day" });
+  expect(findCatalogSeries(plugins, "mining").map((match) => match.expression)).toEqual(expect.arrayContaining([
+    "CAP:bitcoin:hashrate", "CAP:bitcoin:difficulty", "CAP:bitcoin:retarget-estimate", "CAP:bitcoin:hashprice",
+  ]));
+  // The line comes first, before the series and before DIST, which "difficulty" finds by its description.
+  const catalog = renderPaneCatalogReport([], parsePaneCatalogArgs(["difficulty"]), lookupGlossary("difficulty"), null,
+    findCatalogSeries(plugins, "difficulty"), commandPointer("difficulty"), true);
+  expect(catalog.indexOf(line)).toBe(0);
+  expect(catalog).toContain("CAP:bitcoin:difficulty");
 });
 
 test("DeFi words find CRYP and name its DeFi list; exchange reserves are said plainly to be uncovered", async () => {
@@ -210,7 +367,7 @@ test("DeFi words find CRYP and name its DeFi list; exchange reserves are said pl
 });
 
 test("export, csv and json name the --csv and --json flags with one example, ahead of what the words find; trade exports do not", async () => {
-  const line = "Export: add --csv or --json to any command to print its result as CSV or JSON, e.g. gloom history LMT --csv > lmt.csv";
+  const line = "Export: add --csv or --json to any command to print its result as CSV or JSON, and --output <file> to write it to a file in UTF-8, e.g. gloom history LMT --csv --output lmt.csv";
   for (const query of ["export", "csv", "JSON", "export data", "export to excel", "save as csv"]) {
     expect(commandPointer(query), query).toBe(line);
     expect(commandPointerLeads(query), query).toBe(true);
@@ -219,7 +376,9 @@ test("export, csv and json name the --csv and --json flags with one example, ahe
   expect(commandPointer("crude exports")).toBeNull();
   // `gloom export LMT` runs the example on the symbol typed; another unknown word gets no export line.
   expect(exportCommandPointer("export", ["LMT"])).toBe(line);
-  expect(exportCommandPointer("export", ["BRK.B", "--json"])).toContain("gloom history BRK.B --csv > brk-b.csv");
+  expect(exportCommandPointer("export", ["BRK.B", "--json"])).toContain("gloom history BRK.B --csv --output brk-b.csv");
+  // A ^ symbol is quoted, which cmd.exe would otherwise drop.
+  expect(exportCommandPointer("export", ["^SPX"])).toContain('gloom history "^SPX" --csv --output spx.csv');
   expect(exportCommandPointer("comps", ["LMT"])).toBeNull();
   const context = { config: createDefaultConfig("/tmp/known-gaps-test") } as MarketContext;
   const registry = await createPaneCatalog(context, getLoadablePlugins());
@@ -234,14 +393,17 @@ test("export, csv and json name the --csv and --json flags with one example, ahe
 });
 
 test("an FX forward query names fx --forward; a forward rate, forward guidance, a forward P/E or a forward curve does not", () => {
-  const line = "FX forwards implied by both currencies' short rates (covered interest parity), with forward points and the hedge cost: gloom fx USD/MXN --forward 30d";
+  const line = "FX forwards implied by both currencies' short rates (covered interest parity), with forward points, the hedge cost and, for an amount, the carry and who earns it: gloom fx 5000000 USD/MXN --forward 30d";
   for (const query of ["forward", "forwards", "fwd", "fx forward", "fx forward rate", "currency forward rates", "USD/MXN forward",
-    "forward points", "currency hedge cost forward", "1m fx fwd", "peso forward", "covered interest parity forward"]) {
+    "forward points", "currency hedge cost forward", "1m fx fwd", "peso forward", "covered interest parity forward",
+    // `catalog hedge` and `catalog carry` found nothing.
+    "hedge", "hedging", "carry", "fx carry", "carry trade", "fx hedge", "rand forward", "lira carry"]) {
     expect(commandPointer(query), query).toBe(line);
   }
-  // A forward rate, its tenor or its cost is a yield curve's as much as a currency's.
+  // A forward rate, its tenor or its cost is a yield curve's as much as a currency's; a hedge fund is a fund.
   for (const query of ["forward rate", "forward rates", "implied forward rate", "1y forward rate", "forward interest rates", "1m fwd",
-    "forward premium", "forward hedge cost", "forward guidance", "forward P/E", "forward curve", "forward inflation", "forward eps"]) {
+    "forward premium", "forward hedge cost", "forward guidance", "forward P/E", "forward curve", "forward inflation", "forward eps",
+    "hedge fund", "hedge funds", "carry cost"]) {
     expect(commandPointer(query), query).toBeNull();
   }
 });
@@ -266,10 +428,13 @@ test("munis point to the muni funds, DVD, fundamentals and --tax-rate, and say p
     for (const query of ["muni", "municipal", "tax-exempt", "tax equivalent"]) {
       const report = renderPaneCatalogReport(filterPaneCatalogEntries(entries, query), parsePaneCatalogArgs([query]), lookupGlossary(query), knownGapMessage(query))
         .replace(/\x1b\[[0-9;]*m/g, "");
+      // Read as one line: where the lead wraps depends on the terminal's width.
+      const flat = report.replace(/\s+/g, " ");
       expect(report, query).toStartWith("Municipal bonds: no AAA muni curve");
-      // DVD is the function, with --tax-rate among its options and examples.
+      // DVD is the function, with --tax-rate among its options and examples, and the lead names the others that take it.
       expect(report, query).toMatch(/^DVD\s+Dividend Yield/m);
-      expect(report, query).toContain("gloom fn DVD MUB --tax-rate 40.8");
+      expect(flat, query).toContain("gloom fn DVD MUB --tax-rate 40.8");
+      expect(flat, query).toContain("fn ETF <fund>");
       expect(report, query).not.toContain("No functions match");
     }
     const tey = renderPaneCatalogReport(filterPaneCatalogEntries(entries, "tax equivalent"), parsePaneCatalogArgs(["tax equivalent"]),
@@ -361,6 +526,58 @@ test("PMI and nowcast words lead to ECO, ECST and alerts add, with the terms exp
       expect(filterPaneCatalogEntries(entries, query).map((entry) => entry.token)[0], query).toBe("ECO");
     }
     for (const query of ["nowcast", "GDPNow"]) expect(filterPaneCatalogEntries(entries, query).map((entry) => entry.token)[0], query).toBe("ECST");
+  } finally {
+    registry.destroy();
+  }
+});
+
+test("USDA's and grain words find the crop balances, PSD and FUT's crops tab", async () => {
+  const context = { config: createDefaultConfig("/tmp/known-gaps-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    // `catalog usda` and the rest answered "No functions match".
+    for (const query of ["usda", "grain", "wasde"]) {
+      const found = filterPaneCatalogEntries(entries, query);
+      expect(found.map((entry) => entry.token), query).toContain("PSD");
+      expect(found.find((entry) => entry.token === "PSD")!.paneId, query).toBe("commodities-energy");
+    }
+  } finally {
+    registry.destroy();
+  }
+});
+
+// `catalog fertiliser` read as PSD's crop balances, which hold no fertiliser, and `catalog urea` found nothing.
+test("fertiliser words say no price series is carried and name the producers, not a function that holds none", async () => {
+  for (const query of ["fertiliser", "fertilizer", "urea", "DAP", "potash", "urea prices"]) {
+    expect(knownGapMessage(query), query).toBe("Fertiliser (urea, DAP, potash): no price series yet. Producers: NTR, CF, MOS, YAR.OL (Yara); "
+      + "news: gloom news fertilizer.");
+  }
+  const context = { config: createDefaultConfig("/tmp/known-gaps-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const entries = await buildPaneCatalogEntries(registry, context);
+    for (const query of ["fertiliser", "potash"]) expect(filterPaneCatalogEntries(entries, query).map((entry) => entry.token), query).not.toContain("PSD");
+  } finally {
+    registry.destroy();
+  }
+});
+
+/** A high-yield desk's asks of 2 Nov 2026: CDSW and CRPR found nothing, and "distressed exchange" led to FX crosses. */
+test("CDSW opens CDS, CRPR says ratings are not carried and points to TRACE's grade, and a distressed exchange leads to DIST", async () => {
+  expect(knownGapMessage("CRPR")).toBe("Agency credit ratings and rating history: not carried (the agencies license them); closest: "
+    + "TRACE (each bond's grade, investment grade or high yield: gloom fn TRACE <ticker>), CRD (spreads by rating)");
+  expect(knownGapMessage("credit rating")).toBeNull();
+  const context = { config: createDefaultConfig("/tmp/known-gaps-test") } as MarketContext;
+  const registry = await createPaneCatalog(context, getLoadablePlugins());
+  try {
+    const cdsw = buildPaneFunctionLookup(registry).get("cdsw");
+    expect(cdsw && "shortcut" in cdsw ? cdsw.shortcut?.prefix : null).toBe("CDS");
+    const entries = await buildPaneCatalogEntries(registry, context);
+    const shown = (query: string) => selectPaneCatalogMatches(filterPaneCatalogEntries(entries, query), query, 5).shown.map((entry) => entry.token);
+    expect(shown("CDSW")).toEqual(["CDS"]);
+    expect(shown("distressed exchange")).toEqual(["DIST"]);
+    expect(shown("covenant waiver")).toEqual(["DIST"]);
   } finally {
     registry.destroy();
   }

@@ -54,6 +54,7 @@ export function readYoutubeEmbedMessage(data: unknown): YoutubeEmbedReport | nul
     try {
       message = JSON.parse(data);
     } catch {
+      // Intentional ignore: other frames post strings that are not JSON; such a message is not a player report.
       return null;
     }
   }

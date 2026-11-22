@@ -1,11 +1,10 @@
 import type { PluginModule } from "../plugin-module";
 import { parseTickerListInput, formatTickerListInput } from "../../../tickers/list";
 import { createTickerSurfacePaneTemplate } from "../shared/ticker-surface";
-import { AnalystResearchView } from "./analyst-pane";
 import { CorporateActionsView } from "./corporate-actions-pane";
-import { EquityDiagnosticView } from "./equity-diagnostic-pane";
-import { RelativeValuationPane } from "./relative-valuation-pane";
 import { relativeValuationHeadless } from "./relative-valuation-headless";
+import { AUTO_PEERS_SETTING, relativeValuationTitle } from "./relative-valuation-peers";
+import { buildRelativeValuationSettingsDef, MAX_RELATIVE_VALUATION_TICKERS } from "./relative-valuation-settings";
 import { analystResearchHeadless } from "./analyst-headless";
 import { eventsHeadless } from "./events-headless";
 import { earningsEstimatesHeadless } from "./headless";
@@ -27,14 +26,14 @@ export const researchModule: PluginModule = {
       id: "analyst-research",
       name: "Analyst",
       order: 32,
-      component: AnalystResearchView,
+      get component(): typeof import("./analyst-pane").AnalystResearchView { const { AnalystResearchView } = require("./analyst-pane"); return AnalystResearchView; },
       instruments: ["equity"],
     });
     ctx.registerTickerResearchTab({
       id: "equity-diagnostic",
       name: "Diagnostic",
       order: 33,
-      component: EquityDiagnosticView,
+      get component(): typeof import("./equity-diagnostic-pane").EquityDiagnosticView { const { EquityDiagnosticView } = require("./equity-diagnostic-pane"); return EquityDiagnosticView; },
       instruments: ["equity"],
     });
     ctx.registerTickerResearchTab({
@@ -51,8 +50,9 @@ export const researchModule: PluginModule = {
       id: "analyst-research",
       name: "Analyst Research",
       icon: "A",
-      component: AnalystResearchView,
+      get component(): typeof import("./analyst-pane").AnalystResearchView { const { AnalystResearchView } = require("./analyst-pane"); return AnalystResearchView; },
       defaultPosition: "right",
+      shareItem: { ticker: true },
       tickerFollower: true,
       instruments: ["equity"],
       defaultMode: "floating",
@@ -66,8 +66,9 @@ export const researchModule: PluginModule = {
       reportRequirements: ["Free Gloom sign-in"],
       name: "Equity Diagnostic",
       icon: "D",
-      component: EquityDiagnosticView,
+      get component(): typeof import("./equity-diagnostic-pane").EquityDiagnosticView { const { EquityDiagnosticView } = require("./equity-diagnostic-pane"); return EquityDiagnosticView; },
       defaultPosition: "right",
+      shareItem: { ticker: true },
       tickerFollower: true,
       instruments: ["equity"],
       defaultMode: "floating",
@@ -79,6 +80,7 @@ export const researchModule: PluginModule = {
       icon: "E",
       component: CorporateActionsView,
       defaultPosition: "right",
+      shareItem: { ticker: true },
       tickerFollower: true,
       defaultMode: "floating",
       defaultFloatingSize: { width: 104, height: 24 },
@@ -89,12 +91,13 @@ export const researchModule: PluginModule = {
       id: "relative-valuation",
       name: "Relative Valuation",
       icon: "R",
-      component: RelativeValuationPane,
+      get component(): typeof import("./relative-valuation-pane").RelativeValuationPane { const { RelativeValuationPane } = require("./relative-valuation-pane"); return RelativeValuationPane; },
       headless: relativeValuationHeadless,
       defaultPosition: "right",
       defaultMode: "floating",
       defaultFloatingSize: { width: 104, height: 24 },
       tableExport: true,
+      settings: buildRelativeValuationSettingsDef,
     },
     {
       id: "earnings-estimates",
@@ -102,6 +105,7 @@ export const researchModule: PluginModule = {
       icon: "E",
       component: EarningsEstimatesPane,
       defaultPosition: "right",
+      shareItem: { ticker: true },
       tickerFollower: true,
       instruments: ["equity"],
       defaultMode: "floating",
@@ -168,14 +172,16 @@ export const researchModule: PluginModule = {
         try {
           symbols = options?.symbols?.length
             ? options.symbols
-            : parseTickerListInput(options?.arg ?? context.activeTicker ?? "", 12);
+            : parseTickerListInput(options?.arg ?? context.activeTicker ?? "", MAX_RELATIVE_VALUATION_TICKERS);
         } catch {
+          // Intentional ignore: a ticker list the parser rejects creates no pane.
           return null;
         }
         return {
-          title: `RV ${formatTickerListInput(symbols)}`,
+          title: relativeValuationTitle(symbols, null),
           placement: "floating",
-          settings: { symbols, symbolsText: formatTickerListInput(symbols) },
+          // One ticker is compared with the peers `--peers` picks, which the pane finds once it opens.
+          settings: { symbols, symbolsText: formatTickerListInput(symbols), ...(symbols.length === 1 ? { [AUTO_PEERS_SETTING]: true } : {}) },
         };
       },
     },

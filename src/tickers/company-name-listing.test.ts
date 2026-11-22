@@ -2,8 +2,21 @@ import { expect, test } from "bun:test";
 import type { InstrumentSearchResult } from "../types/instrument";
 import type { Quote } from "../types/financials";
 import { ProviderBusyError } from "../sources/provider-errors";
-import { findListingOfCompanyName } from "./company-name-listing";
-import { buildTickerSearchCandidates } from "./search";
+import { findListingOfCompanyName, serviceMarkedOtherListing } from "./company-name-listing";
+import { buildTickerSearchCandidates, resolveTickerSearch } from "./search";
+import { search } from "../cli/commands/search";
+import { createTestDataProvider } from "../test-support/data-provider";
+import type { PrintedCliResult } from "../test-support/cli-context";
+import { lineDistance } from "./search/home-listing";
+
+test("typed B3 receipts retain receipt distance ahead of the local share-code rule", () => {
+  for (const symbol of ["AAPL34", "MSFT34"]) {
+    for (const type of ["BDR", "Depositary Receipt"]) expect(lineDistance(type, "B3", symbol)).toBe(2);
+  }
+  expect(lineDistance("Common Stock", "B3", "PETR3")).toBe(0);
+  expect(lineDistance("Preferred Stock", "B3", "PETR4")).toBe(0);
+  expect(lineDistance("Common Stock", "B3", "PETR3F")).toBe(1);
+});
 
 const listing = (symbol: string, name: string, exchange: string, type = "Common Stock"): InstrumentSearchResult =>
   ({ providerId: "test", symbol, name, exchange, type, currency: "USD" });
@@ -78,6 +91,74 @@ test("a European company typed with its legal form is its primary listing, as th
   }
 });
 
+test("a name never lands on a receipt or an odd-lot line over its home line, and a receipt on a fund is never a primary listing", async () => {
+  // 13 Nov 2026: `quote "Tracker Fund"` read HK01, a Thai receipt, and `search` called it the primary listing while
+  // the fund itself, 2800 on HKEX, sat under the funds; `quote Petrobras` read B3's odd-lot PETR3F.
+  const tracker = [
+    "2800 | Tracker Fund of Hong Kong | HKEX | ETF",
+    "82800 | Tracker Fund of Hong Kong | HKEX | ETF",
+    "HK01 | Tracker Fund of Hong Kong | SET | Depositary Receipt",
+    "HK13 | Tracker Fund of Hong Kong | SET | Depositary Receipt",
+    "18302 | DBS Bank Ltd. Warrant on Tracker Fund of Hong Kong | HKEX | Warrant",
+  ];
+  const service = answering({ "TRACKER FUND": tracker, "TRACKER FUND OF HONG KONG": tracker });
+  for (const typed of ["Tracker Fund", "Tracker Fund of Hong Kong"]) {
+    expect(await findListingOfCompanyName(service, typed), typed).toMatchObject({ symbol: "2800", exchange: "HKEX" });
+  }
+  const candidates = buildTickerSearchCandidates({ query: "Tracker Fund of Hong Kong", tickers: new Map(), providerResults: tracker.map(row) });
+  expect(candidates.filter((candidate) => candidate.category === "Primary Listing").map((candidate) => candidate.symbol)).toEqual([]);
+  expect(candidates.find((candidate) => candidate.symbol === "HK01")?.category).toBe("Funds & Derivatives");
+  // Gloom Cloud answers "Petrobras" with the whole line, marked with the word; the odd-lot line and receipts stay behind it.
+  const petrobras = [
+    "PETR3 | Petroleo Brasileiro S.A. | B3 | Common Stock | home | Petrobras",
+    "PETR4 | Petrobras - Petroleo Brasileiro S.A. | B3 | Preferred Stock",
+    "PETR3F | PETROBRAS | B3 | Common Stock",
+    "PBR | Petroleo Brasileiro S.A. Petrobras ADR | NYSE | American Depositary Receipt",
+  ];
+  expect(await findListingOfCompanyName(answering({ PETROBRAS: petrobras }), "Petrobras", { oneWord: true }))
+    .toMatchObject({ symbol: "PETR3", exchange: "B3" });
+  // Unmarked, the odd-lot line under the same name still gives way to its whole line: it quotes the same shares.
+  const unmarked = ["PETR3F | Petroleo Brasileiro S.A. | B3 | Common Stock", "PETR3 | Petroleo Brasileiro S.A. | B3 | Common Stock"];
+  expect(await findListingOfCompanyName(answering({ "PETROLEO BRASILEIRO": unmarked }), "Petroleo Brasileiro"))
+    .toMatchObject({ symbol: "PETR3", exchange: "B3" });
+  // A company listed by receipts alone is still its receipt (PDD, above), and a receipt on shares stays a company's line.
+  const hsbc = ["HSBC | HSBC Holdings plc | NYSE | American Depositary Receipt", "HSBA | HSBC Holdings plc | LSE | Common Stock | home"];
+  expect(buildTickerSearchCandidates({ query: "HSBC", tickers: new Map(), providerResults: hsbc.map(row) })
+    .some((candidate) => candidate.instrumentClass === "fund")).toBe(false);
+});
+
+test("a company's name opens the listing search calls its primary, not a one-off line abroad whose short name matched", async () => {
+  // `search lufthansa` against the service, 2026-10-29: no home line marked, Budapest's LUFTHANSA has no search score.
+  const scored = (line: string, popularity?: number) => ({ ...row(line), ...popularity ? { popularity } : {} });
+  const answer = [
+    scored("DLAKY | Lufthansa Sponsored ADR | OTC | American Depositary Receipt", 20071),
+    scored("LUFTH | LUFTHANSA | BUD | Common Stock"),
+    scored("LHAB | Lufthansa AG Sponsored ADR | FWB2 | American Depositary Receipt"),
+    scored("LHA | Deutsche Lufthansa AG | XETRA | Common Stock", 20989),
+    scored("LHA | Deutsche Lufthansa AG | FWB2 | Common Stock", 20037),
+    scored("DLAKF | Deutsche Lufthansa AG | OTC | Common Stock", 20006),
+    scored("4LHA | DEUTSCHE LUFTHANSA | BIT | Common Stock"),
+  ];
+  const service = { search: async () => answer };
+  const initMarketData = async () => ({
+    store: { loadAllTickers: async () => [] }, dataProvider: createTestDataProvider({ search: service.search }), persistence: { close() {} },
+  }) as never;
+  const printed: PrintedCliResult["result"][] = [];
+  await search("lufthansa", { initMarketData, printResult: (result) => { printed.push(result); } });
+  const primary = (printed[0]!.data as Array<{ category: string; symbol: string; exchange: string }>)
+    .find((item) => item.category === "Primary Listing");
+  expect(primary).toMatchObject({ symbol: "LHA", exchange: "XETRA" });
+  for (const [typed, options] of [["lufthansa", { oneWord: true }], ["Lufthansa", {}], ["Deutsche Lufthansa", {}]] as const) {
+    expect(await findListingOfCompanyName(service, typed, options), typed).toMatchObject({ symbol: "LHA", exchange: "XETRA" });
+  }
+  // The command bar lists it first too, so Enter on the name opens it.
+  const [lead] = buildTickerSearchCandidates({ query: "lufthansa", tickers: new Map(), providerResults: answer });
+  expect({ symbol: lead?.symbol, exchange: lead?.result?.exchange }).toEqual({ symbol: "LHA", exchange: "XETRA" });
+  // A line the service marks with the name keeps the lead over a line searched more: the mark is the company.
+  const marked = [scored("SIEME | SIEMENS AG | BUD | Common Stock | - | SIEMENS AG"), scored("SIE | SIEMENS AG | WSE | Common Stock", 30000)];
+  expect(await findListingOfCompanyName({ search: async () => marked }, "SIEMENS AG")).toMatchObject({ symbol: "SIEME", exchange: "BUD" });
+});
+
 test("with quoted, a listing with no quote gives way to the next of its company's lines that has one, never to another company's home line", async () => {
   const quoting = (answers: Record<string, string[]>, priced: string[], busy = false) => ({
     ...answering(answers),
@@ -100,6 +181,56 @@ test("with quoted, a listing with no quote gives way to the next of its company'
     .toMatchObject({ symbol: "SIE", exchange: "XETRA" });
 });
 
+// "Zions Bancorporation" was stored as ZION:IEX, a line search lists first and no source prices.
+test("with quoted, a US line with no quote is the listing its symbol's own quote prices, as `quote ZION` reads it", async () => {
+  const zions = { "ZIONS BANCORPORATION": ["ZION | Zions Bancorporation N.A. | IEX | Common Stock", "ZB1 | ZIONS BANCORPORATION | XSTU | Common Stock"] };
+  const asked: string[] = [];
+  const source = {
+    ...answering(zions),
+    getQuote: async (symbol: string, exchange = ""): Promise<Quote> => {
+      asked.push(`${symbol}:${exchange}`);
+      if (symbol !== "ZION" || exchange) throw new Error(`No quote provider available for ${symbol}`);
+      return { symbol, price: 67.71, currency: "USD", change: 0, changePercent: 0, lastUpdated: 1, listingExchangeName: "NASDAQ" };
+    },
+  };
+  expect(await findListingOfCompanyName(source, "Zions Bancorporation", { quoted: true })).toMatchObject({ symbol: "ZION", exchange: "NASDAQ" });
+  expect(asked).toEqual(["ZION:IEX", "ZION:"]);
+});
+
+test("with quoted, a company that moved off its US line is followed to the symbol it took before any line abroad, and says so", async () => {
+  // Trimmed from the service's answers on 2026-10-28, after Getty Images' NYSE line became GETYQ.
+  const getty = { "GETTY IMAGES": [
+    "GETY | Getty Images Holdings, Inc. | NYSE | Common Stock | home",
+    "GETY | Getty Images Holdings Inc | PNK | EQUITY",
+    "GETYQ | Getty Images Holdings, Inc. | OTC | Common Stock",
+    "L2S | Getty Images Holdings, Inc. | MUNICH | Common Stock",
+  ] };
+  const asked: string[] = [];
+  const service = {
+    ...answering(getty),
+    // Munich still quotes the old shares; the NYSE line has none.
+    getQuote: async (symbol: string, exchange?: string): Promise<Quote> => {
+      if (`${symbol}:${exchange}` !== "L2S:MUNICH") throw new Error(`No quote provider available for ${symbol}`);
+      return { symbol, price: 0.019, currency: "EUR", change: 0, changePercent: 0, lastUpdated: 1 };
+    },
+  };
+  const movedLine = async ({ symbol, exchange, quote, name }: { symbol: string; exchange: string; quote: Quote | null; name: string | null }) => {
+    asked.push(`${symbol}:${exchange}:${quote ? "quoted" : "none"}:${name}`);
+    return symbol === "GETY" ? { symbol: "GETYQ", note: "GETY became GETYQ on 2026-10-22" } : null;
+  };
+  expect(await findListingOfCompanyName(service, "getty images", { quoted: true, movedLine })).toEqual({
+    symbol: "GETYQ", exchange: "", name: "Getty Images Holdings, Inc.", moved: "GETY became GETYQ on 2026-10-22",
+  });
+  expect(asked).toEqual(["GETY:NYSE:none:Getty Images Holdings, Inc."]);
+  // With no change to follow, the next line with a quote, as before.
+  expect(await findListingOfCompanyName(service, "getty images", { quoted: true, movedLine: async () => null })).toMatchObject({ symbol: "L2S", exchange: "MUNICH" });
+  // A first line abroad is not a US line a company leaves for another symbol: no lookup.
+  asked.length = 0;
+  const volvo = { "VOLVO AB": ["VOLV | Volvo AB (B) | WSE | Common Stock", "VOLV.B | Volvo AB | SFB | Common Stock"] };
+  await findListingOfCompanyName({ ...answering(volvo), getQuote: service.getQuote }, "VOLVO AB", { quoted: true, movedLine });
+  expect(asked).toEqual([]);
+});
+
 test("a company's name is its own common stock on its US line, never a subsidiary sharing the word, a line abroad, or a preferred or note", async () => {
   // Search order puts the subsidiary and the line abroad first.
   const whirlpool = [
@@ -108,7 +239,7 @@ test("a company's name is its own common stock on its US line, never a subsidiar
     listing("WHR", "Whirlpool Corp", "NYSE"),
   ];
   expect(await findListingOfCompanyName({ search: async () => whirlpool }, "Whirlpool Corporation"))
-    .toEqual({ symbol: "WHR", exchange: "NYSE", name: "Whirlpool Corp" });
+    .toEqual({ symbol: "WHR", exchange: "NYSE", name: "Whirlpool Corp", otherLines: ["WHR:XETRA"] });
   // The preferred and the note have the shorter symbols, which would otherwise go first.
   const acme = [
     listing("AC", "Acme Corp", "NYSE", "Preferred Stock"),
@@ -129,4 +260,150 @@ test("a word of the name may be its short form, and the listing whose name says 
   expect(await findListingOfCompanyName({ search: async () => philip }, "philip morris intl"))
     .toEqual({ symbol: "PM", exchange: "NYSE", name: "Philip Morris International Inc." });
   expect(await findListingOfCompanyName({ search: async () => philip }, "phillip morris intl")).toBeNull();
+});
+
+test("a bare symbol read on a minor listing abroad finds the listing the service marks with the word on another venue", async () => {
+  // 6 Nov 2026: `quote NTT` gave NTT System (Warsaw) with no note, though search names 9432 on JPX as NTT, Inc.
+  const ntt = answering({ NTT: ["NTT | NTT System S.A. | WSE | Common Stock", "9432 | NTT, Inc. | JPX | Common Stock | home | NTT"] });
+  expect(await serviceMarkedOtherListing(ntt, "NTT", "WSE")).toEqual({ symbol: "9432", exchange: "JPX", name: "NTT, Inc." });
+  // Read there already, or marked nowhere, there is nothing to add.
+  expect(await serviceMarkedOtherListing(ntt, "NTT", "JPX")).toBeNull();
+  expect(await serviceMarkedOtherListing(answering({ NTT: ["NTT | NTT System S.A. | WSE | Common Stock"] }), "NTT", "WSE")).toBeNull();
+});
+
+test("a name the service answers first with a line it marks as its company's home is that line, though another line is named nearer", async () => {
+  // `search Panasonic` and `search "Nippon Yusen"` against the service, 2026-11-06, trimmed. Before: 3719 on BURSAMY, a
+  // Malaysian subsidiary reached through a Frankfurt line under Panasonic's old name, and an ISIN-coded Stuttgart line
+  // named "Nippon Yusen K.K.", the same legal form spelled short.
+  const answers: Record<string, string[]> = {
+    PANASONIC: [
+      "6752 | Panasonic Holdings Corporation | JPX | Common Stock | home",
+      "PCRHY | Panasonic Holdings Corp | OTC | American Depositary Receipt",
+      "PCRFF | Panasonic Holdings Corporation | OTC | Common Stock",
+      "3719 | Panasonic Manufacturing Malaysia Berhad | BURSAMY | Common Stock",
+      "MAT1 | Panasonic Holdings Corporation | FWB2 | Common Stock",
+      "MATA | Panasonic Corporation | FWB2 | Common Stock",
+    ],
+    "NIPPON YUSEN": [
+      "9101 | Nippon Yusen Kabushiki Kaisha | JPX | Common Stock | home",
+      "NYKA | Nippon Yusen Kabushiki Kaisha | FWB2 | Common Stock",
+      "JP3753000003 | Nippon Yusen K.K. | XSTU | Common Stock",
+    ],
+  };
+  for (const [typed, key, options] of [["Panasonic", "6752:JPX", { oneWord: true }], ["Nippon Yusen", "9101:JPX", {}]] as const) {
+    const found = await findListingOfCompanyName(answering(answers), typed, options);
+    expect(`${found?.symbol}:${found?.exchange}`, typed).toBe(key);
+    const [lead] = buildTickerSearchCandidates({ query: typed, tickers: new Map(), providerResults: answers[typed.toUpperCase()]!.map(row) });
+    expect(`${lead?.symbol}:${lead?.result?.exchange}`, `command bar ${typed}`).toBe(key);
+  }
+});
+
+// Trimmed from the service's answers on 2026-11-06: it spells Turkish names with and without their letters, lists
+// Istanbul home lines under part of the name only, and types an issuer's bonds as common stock.
+const ISTANBUL: Record<string, string[]> = {
+  "SABANCI HOLDING": ["SAHOL.IS | Haci Ömer Sabanci Holding A.S. | BIST | EQUITY"],
+  "TURK HAVA YOLLARI": [
+    "TKHVY | Türk Hava Yollari Anonim Ortakligi | PNK | Depositary Receipt",
+    "TU5A | Turk Hava Yollari A.O. Unsponsored ADR | XDUS | American Depositary Receipt",
+    "TU5A | Türk Hava Yollari Anonim Ortakligi | FWB2 | EQUITY",
+  ],
+  "HAVA YOLLARI": ["THYAO.IS | Türk Hava Yollari Anonim Ortakligi | BIST | EQUITY", "TU5A | Türk Hava Yollari Anonim Ortakligi | FWB2 | EQUITY"],
+  "TURKIYE IS BANKASI": [
+    "XS297014501 | Turkiye Is Bankasi A.S. 9.125% Perpetual Junior Subordinated Notes | MUNICH | Common Stock",
+    "XS317436815 | Turkiye Is Bankasi A.S. 7.375% Notes due 2 April 2036 | MUNICH | Common Stock",
+  ],
+  GARANTI: [
+    "GARFA | Garanti Faktoring A.S. | BIST | Common Stock",
+    "GRNYO | Garanti Yatirim Ortakligi A.S. | BIST | Common Stock",
+    "GARAN | Türkiye Garanti Bankası A.Ş. | BIST | Common Stock",
+    "TKGBY | Turkiye Garanti Bankasi A.S. | OTC | American Depositary Receipt",
+    "GBKB | Turkiye Garanti Bankasi A.S. ADR | FWB2 | American Depositary Receipt",
+    "XS320571561 | Türkiye Garanti Bankası Anonim Şirketi 7.625% Subordinated Notes due 2036 | MUNICH | Common Stock",
+    "TKGBF | Türkiye Garanti Bankasi A.Ş. | OTC | Common Stock",
+  ],
+};
+
+test("a Turkish name, with its letters or without, is its company's Istanbul line, never a line abroad, a receipt or a bond", async () => {
+  const istanbul = answering(ISTANBUL);
+  const read = async (typed: string, options = {}) => (await findListingOfCompanyName(istanbul, typed, options))?.symbol ?? null;
+  // ı does not decompose: "Sabancı" is searched as Sabanci, and GARAN.IS on BIST is GARAN there.
+  expect(await findListingOfCompanyName(istanbul, "Sabancı Holding")).toMatchObject({ symbol: "SAHOL", exchange: "BIST" });
+  // The whole name lists the airline only in Frankfurt, over the counter and by receipt; its later words list THYAO.
+  expect(await read("Turk Hava Yollari")).toBe("THYAO");
+  expect(await read("Türk Hava Yolları")).toBe("THYAO");
+  // Bonds named for their issuer and typed as common stock are no answer to its name.
+  expect(await read("Turkiye Is Bankasi")).toBeNull();
+  // One word that names a factoring company first is the bank listed broadly on the same market.
+  expect(await findListingOfCompanyName(istanbul, "Garanti", { oneWord: true })).toMatchObject({ symbol: "GARAN", exchange: "BIST" });
+});
+
+test("a line of tickers search finds no company for is asked once, and a name it finds nothing for is asked again without its first word", async () => {
+  const asked: string[] = [];
+  const empty = { search: async (query: string) => { asked.push(query.toUpperCase()); return []; } };
+  expect(await findListingOfCompanyName(empty, "V MCO CPRT")).toBeNull();
+  expect(asked).toEqual(["V MCO CPRT"]);
+  // A name of three words whose whole is found nowhere, but whose later words list the home line, still reaches it.
+  for (const typed of ["Turk Hava Yollari", "TURK HAVA YOLLARI"]) {
+    const asking: string[] = [];
+    const home = { search: async (query: string) => { asking.push(query.toUpperCase()); return query.toUpperCase() === "HAVA YOLLARI" ? ISTANBUL["HAVA YOLLARI"]!.map(row) : []; } };
+    expect(await findListingOfCompanyName(home, typed), typed).toMatchObject({ symbol: "THYAO" });
+    expect(asking, typed).toEqual(["TURK HAVA YOLLARI", "HAVA YOLLARI"]);
+  }
+  // Rows that name no company still try the later words, as they do for a name listed only abroad.
+  const asking: string[] = [];
+  const bonds = { search: async (query: string) => { asking.push(query.toUpperCase()); return query.toUpperCase() === "TURKIYE IS BANKASI" ? ISTANBUL["TURKIYE IS BANKASI"]!.map(row) : []; } };
+  expect(await findListingOfCompanyName(bonds, "Turkiye Is Bankasi")).toBeNull();
+  expect(asking).toEqual(["TURKIYE IS BANKASI", "IS BANKASI"]);
+});
+
+// Tue 10 Nov 2026: search sent the BIST 100-30 ahead of the BIST 100, `quote "BIST 100"` read the sub-index, and
+// `quote XU100` was "not a ticker" though search lists the index as XU100.IS.
+test("the BIST 100 is the index named so, not a sub-index whose name adds to it, by name and by its code", async () => {
+  const bist = [
+    "XYUZO.IS | BIST 100-30 | BIST | INDEX",
+    "XU100.IS | BIST 100 | BIST | INDEX",
+    "XYUZO_CFNPTLER.IS | BIST 100-30 (EURO) | BIST | INDEX",
+    "ZPMDL.IS | ZIRAAT P BIST 100 MODEL HSY BYF | BIST | ETF",
+  ];
+  const provider = createTestDataProvider(answering({ "BIST 100": bist, XU100: ["XU100.IS | BIST 100 | BIST | INDEX",
+    "XU100_CFNPTLER.IS | BIST 100 (EURO) | BIST | INDEX"], BIST100: ["XU100.IS | BIST 100 | BIST | INDEX"] }));
+  // The index keeps the symbol its sources quote it by, as ^GSPC does.
+  expect(await findListingOfCompanyName(provider, "BIST 100")).toMatchObject({ symbol: "XU100.IS", exchange: "BIST", name: "BIST 100" });
+  const candidates = buildTickerSearchCandidates({ query: "BIST 100", tickers: new Map(), providerResults: bist.map(row), totalLimit: 10 });
+  expect(candidates.slice(0, 3).map((candidate) => [candidate.symbol, candidate.category]))
+    .toEqual([["XU100.IS", "Primary Listing"], ["XYUZO.IS", "Other Listings"], ["XYUZO_CFNPTLER.IS", "Other Listings"]]);
+  const resolved = await resolveTickerSearch({ query: "XU100", activeTicker: null, tickers: new Map(), dataProvider: provider });
+  expect(resolved).toMatchObject({ kind: "provider", symbol: "XU100.IS" });
+  const spelled = await resolveTickerSearch({ query: "BIST100", activeTicker: null, tickers: new Map(), dataProvider: provider });
+  expect(spelled).toMatchObject({ kind: "provider", symbol: "XU100.IS" });
+  // A share search lists only by its venues' suffixes is no answer to the bare code, as before: BMW is not BMW.DE or BMW.F.
+  const bmw = createTestDataProvider(answering({ BMW: [
+    "BMW.DE | Bayerische Motoren Werke Aktiengesellschaft | XETRA | EQUITY",
+    "BMW.F | Bayerische Motoren Werke Aktiengesellschaft | FWB | EQUITY",
+  ] }));
+  expect(await resolveTickerSearch({ query: "BMW", activeTicker: null, tickers: new Map(), dataProvider: bmw })).toBeNull();
+  // The only line search lists for the code is its listing.
+  const gubrf = createTestDataProvider(answering({ GUBRF: ["GUBRF.IS | Gübre Fabrikalari Türk Anonim Sirketi | BIST | EQUITY"] }));
+  expect(await resolveTickerSearch({ query: "GUBRF", activeTicker: null, tickers: new Map(), dataProvider: gubrf }))
+    .toMatchObject({ kind: "provider", symbol: "GUBRF.IS" });
+});
+
+
+test("a company listed twice under one symbol names its other line, never another venue quoting it or another company's", async () => {
+  // Elbit Systems, as search answered on 11 Nov 2026: its Nasdaq home line, its Tel Aviv line, IEX and Frankfurt quoting them.
+  const elbit = [
+    row("ESLT | Elbit Systems Ltd. | NASDAQ | Common Stock | home"),
+    row("ESLT | Elbit Systems Ltd. | TASE | Common Stock"),
+    row("ESLT | Elbit Systems Ltd. | IEX | Common Stock"),
+    row("EB2 | Elbit Systems Ltd. | FWB2 | Common Stock"),
+  ];
+  expect(await findListingOfCompanyName({ search: async () => elbit }, "Elbit Systems"))
+    .toMatchObject({ symbol: "ESLT", exchange: "NASDAQ", otherLines: ["ESLT:TASE"] });
+  // MTN Group's other lines are over the counter and in Germany: none is named.
+  const mtn = [
+    row("MTN | MTN Group Ltd. | JSE | Common Stock | home"),
+    row("MTNOF | MTN Group Ltd. | OTC | Common Stock"),
+    row("LL6 | MTN Group Ltd. | XDUS | Common Stock"),
+  ];
+  expect((await findListingOfCompanyName({ search: async () => mtn }, "MTN Group"))?.otherLines).toBeUndefined();
 });

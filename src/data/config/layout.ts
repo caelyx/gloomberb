@@ -8,6 +8,7 @@ import type {
   PaneMovedFrom,
   PaneMovedLink,
   PanePlacementMemory,
+  PaneUnlinkedFrom,
 } from "../../types/config";
 import type { BrokerContractRef, TickerListingRef } from "../../types/instrument";
 import {
@@ -19,7 +20,10 @@ import {
   normalizePaneId,
   removeUnreachablePaneInstances,
 } from "../../types/config";
+import { getDockLeafLayouts, type LayoutBounds } from "../../layout/pane-manager/dock-tree";
 import { compactFloatingZ } from "../../layout/pane-manager/floating";
+import { withoutTransientPanes } from "../../layout/pane-manager/transient";
+import { alignFloatingStacks } from "../../layout/pane-manager/floating-stack";
 import {
   migrateChartPaneSettings,
   type LegacyChartMigrationContext,
@@ -106,8 +110,8 @@ function sanitizeDockedPlacementMemory(raw: unknown): DockedPlacementMemory | un
   const anchorInstanceId = typeof (raw as { anchorInstanceId?: unknown }).anchorInstanceId === "string"
     ? (raw as { anchorInstanceId: string }).anchorInstanceId
     : undefined;
-  const position = ["left", "right", "above", "below"].includes(String((raw as { position?: unknown }).position))
-    ? (raw as { position: "left" | "right" | "above" | "below" }).position
+  const position = ["left", "right", "above", "below", "tab"].includes(String((raw as { position?: unknown }).position))
+    ? (raw as { position: NonNullable<DockedPlacementMemory["position"]> }).position
     : undefined;
   if (!path && !anchorInstanceId && !position) return undefined;
   return {
@@ -146,19 +150,25 @@ function sanitizePaneMovedFrom(value: unknown): PaneMovedFrom | undefined {
   };
 }
 
+function sanitizePaneUnlinkedFrom(value: unknown): PaneUnlinkedFrom | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (typeof raw.instanceId !== "string" || !raw.instanceId) return undefined;
+  return {
+    instanceId: raw.instanceId,
+    ...(typeof raw.paneId === "string" && raw.paneId ? { paneId: raw.paneId } : {}),
+    ...(raw.auto === true ? { auto: true as const } : {}),
+  };
+}
+
 function sanitizePlacementMemory(value: unknown): PanePlacementMemory | undefined {
   if (!value || typeof value !== "object") return undefined;
 
   const docked = sanitizeDockedPlacementMemory((value as PanePlacementMemory).docked);
   const floating = sanitizeFloatingPlacementMemory((value as PanePlacementMemory).floating);
   const detached = sanitizeDetachedPlacementMemory((value as PanePlacementMemory).detached);
-  const rawWindow = (value as PanePlacementMemory).window;
-  const windowDocked = rawWindow && typeof rawWindow.windowId === "string" && rawWindow.windowId
-    ? sanitizeDockedPlacementMemory(rawWindow)
-    : undefined;
-  const window = windowDocked ? { ...windowDocked, windowId: rawWindow!.windowId } : undefined;
-  if (!docked && !floating && !detached && !window) return undefined;
-  return { docked, floating, detached, ...(window ? { window } : {}) };
+  if (!docked && !floating && !detached) return undefined;
+  return { docked, floating, detached };
 }
 
 function sanitizePaneSettings(value: unknown): Record<string, unknown> | undefined {
@@ -215,6 +225,7 @@ function sanitizePaneInstances(
       const binding = sanitizePaneBinding(entry.binding);
       const settings = sanitizePaneSettings(entry.settings);
       const movedFrom = sanitizePaneMovedFrom(entry.movedFrom);
+      const unlinkedFrom = sanitizePaneUnlinkedFrom(entry.unlinkedFrom);
       return {
         instanceId,
         paneId,
@@ -229,6 +240,7 @@ function sanitizePaneInstances(
         placementMemory: sanitizePlacementMemory(entry.placementMemory),
         locked: entry.locked === true ? true : undefined,
         ...(movedFrom ? { movedFrom } : {}),
+        ...(unlinkedFrom ? { unlinkedFrom } : {}),
       };
     });
   return instances;
@@ -262,8 +274,10 @@ function sanitizeFloatingEntries(value: unknown, validInstanceIds: Set<string>):
       height: Math.max(1, Math.round(entry.height)),
       zIndex: typeof entry.zIndex === "number" ? Math.round(entry.zIndex) : entry.zIndex,
     }));
-  // A stack raised past the shell's menus and previews in an older session is renumbered in the same order.
-  return compactFloatingZ(entries);
+  // A stack raised past the shell's menus and previews in an older session is
+  // renumbered in the same order. Windows stacked as tabs share the rect of
+  // the one they show, whatever a client that does not know stacks did.
+  return compactFloatingZ(alignFloatingStacks(entries));
 }
 
 function sanitizeDetachedEntries(value: unknown, validInstanceIds: Set<string>): LayoutConfig["detached"] {
@@ -288,23 +302,45 @@ function sanitizeDetachedEntries(value: unknown, validInstanceIds: Set<string>):
     }));
 }
 
-function sanitizeWindows(value: unknown, validInstanceIds: Set<string>): NonNullable<LayoutConfig["windows"]> {
+const LEGACY_WINDOW_BOUNDS: LayoutBounds = { x: 0, y: 0, width: 120, height: 40 };
+
+/**
+ * The panes a layout saved by this fork's own secondary windows held
+ * (`layout.windows`, each `{ dockRoot, floating }`), as floating entries for
+ * the main window: a docked one where its window's grid put it, a floating one
+ * at its own rect. Upstream's desktop windows replaced that model; without
+ * this, those panes would be dropped on load as reachable from nowhere.
+ */
+function legacySecondaryWindowPanes(value: unknown): unknown[] {
   if (!Array.isArray(value)) return [];
-  return value
-    .filter((entry): entry is Record<string, unknown> => !!entry && typeof entry === "object" && !Array.isArray(entry))
-    .filter((entry) => typeof entry.id === "string" && entry.id.length > 0)
-    .map((entry) => ({
-      id: entry.id as string,
-      // Trees are checked by normalizePaneLayout, as the main dock tree is.
-      dockRoot: (entry.dockRoot ?? null) as LayoutConfig["dockRoot"],
-      floating: sanitizeFloatingEntries(entry.floating, validInstanceIds),
-    }));
+  const entries: unknown[] = [];
+  for (const window of value) {
+    if (!window || typeof window !== "object" || Array.isArray(window)) continue;
+    const { dockRoot, floating } = window as { dockRoot?: unknown; floating?: unknown };
+    if (dockRoot && typeof dockRoot === "object") {
+      try {
+        const leaves = getDockLeafLayouts(
+          { dockRoot: dockRoot as LayoutConfig["dockRoot"], instances: [], floating: [], detached: [] },
+          LEGACY_WINDOW_BOUNDS,
+        );
+        for (const leaf of leaves) {
+          for (const instanceId of leaf.stack ?? [leaf.instanceId]) entries.push({ instanceId, ...leaf.rect });
+        }
+      } catch {
+        // Intentional ignore: a malformed legacy window tree loses its grid placement only; its floating panes still come back.
+      }
+    }
+    if (Array.isArray(floating)) entries.push(...floating);
+  }
+  return entries;
 }
 
 export function sanitizeLayout(
   value: unknown,
   fallback: LayoutConfig,
   chartMigration: LegacyChartMigrationContext = {},
+  /** Panes on other tabs a pane here may follow: on another desktop window, a link may cross tabs. */
+  externalSourceIds?: ReadonlySet<string>,
 ): LayoutConfig {
   if (!isLayoutConfig(value)) {
     return cloneLayout(fallback);
@@ -317,21 +353,26 @@ export function sanitizeLayout(
   );
   const validInstanceIds = new Set(instances.map((entry) => entry.instanceId));
   const dockRoot = (value as { dockRoot?: LayoutConfig["dockRoot"] }).dockRoot ?? null;
-  const floating = sanitizeFloatingEntries((value as { floating?: unknown }).floating, validInstanceIds);
+  const savedFloating = (value as { floating?: unknown }).floating;
+  const legacyWindowPanes = legacySecondaryWindowPanes((value as { windows?: unknown }).windows);
+  const floating = sanitizeFloatingEntries(
+    legacyWindowPanes.length > 0 ? [...(Array.isArray(savedFloating) ? savedFloating : []), ...legacyWindowPanes] : savedFloating,
+    validInstanceIds,
+  );
   const detached = sanitizeDetachedEntries((value as { detached?: unknown }).detached, validInstanceIds);
-  const windows = sanitizeWindows((value as { windows?: unknown }).windows, validInstanceIds);
 
   const layout: LayoutConfig = {
     dockRoot,
     instances,
     floating,
     detached,
-    ...(windows.length > 0 ? { windows } : {}),
   };
 
   const normalized = normalizePaneLayout(layout, {
     defaultFollowSourceInstanceId: getDefaultFollowSourceInstanceId(layout),
     resolveOrphanSymbol: () => null,
+    externalSourceIds,
   });
-  return removeUnreachablePaneInstances(normalized);
+  // A layout saved with the Layouts window open over it, before such windows were left out, reopens without it.
+  return withoutTransientPanes(removeUnreachablePaneInstances(normalized));
 }

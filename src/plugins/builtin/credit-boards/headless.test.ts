@@ -5,7 +5,7 @@ import { deriveHeadlessFreshness } from "../../../cli/pane-functions/freshness";
 import { headlessReportTables, renderHeadlessPaneText } from "../../../cli/pane-functions/headless";
 import { renderReportCsv } from "../../../cli/report-tables";
 import { cdxHeadless, sovrHeadless } from "./headless";
-import { cdxDay, findIndex, findSovereign } from "./model";
+import { cdxDay, findIndex, findSovereign, spreadRank } from "./model";
 
 const args: HeadlessPaneLoadArgs = { rawArgument: "", argument: null, symbols: [], options: {} };
 
@@ -85,10 +85,29 @@ test("every exported board row carries its own observation date, series and unit
   const history = renderReportCsv(headlessReportTables(cdxHeadless, named, args, "CDX", freshness, { complete: true, unavailableSymbols: [] }), freshness)
     .split("# section: ")[2]!.split("\n");
   expect(history.slice(1, 4)).toEqual([
-    "Date,Spread (bp),Prints,Contract,Day,status,symbol_or_series,currency_or_unit,interval,source,as_of",
-    "2026-10-19,64.7,38,2031-12-20,\"so far, 38 prints, last 08:09 UTC\",,cdx:main,bp,daily,DTCC,2026-10-19",
-    "2026-10-16,63.28,261,2031-12-20,,,cdx:main,bp,daily,DTCC,2026-10-16",
+    "Date,Spread (bp),Prints,Contract,Day,status,symbol_or_series,currency_or_unit,interval,source,as_of,retrieved_at",
+    `2026-10-19,64.7,38,2031-12-20,"so far, 38 prints, last 08:09 UTC",,cdx:main,bp,daily,DTCC,2026-10-19,${freshness.retrievedAt}`,
+    `2026-10-16,63.28,261,2031-12-20,,,cdx:main,bp,daily,DTCC,2026-10-16,${freshness.retrievedAt}`,
   ]);
+});
+
+test("every credit rank reads high = wide: HY ranks its spread equivalent, not its price, and a price without one ranks upside down", () => {
+  // A year of HY sliding from 110 to 104 while its spread equivalent widens from 300bp to 420bp: today is near the widest.
+  const days = Array.from({ length: 240 }, (_, day) => ({ date: new Date(Date.UTC(2025, 11, 1) + day * 86_400_000).toISOString().slice(0, 10),
+    maturity: day < 120 ? "2030-12-20" : "2031-12-20", prints: 300, level: 110 - day / 40, spreadBp: 300 + day / 2 }));
+  const today = days.at(-1)!;
+  const hy = { quote: "price" as const, points: days, level: today.level, date: today.date, spreadBp: today.spreadBp };
+  expect(spreadRank(hy)).toEqual({ percentile: expect.closeTo(99.8, 1), basis: "spread-eq" });
+  // CMBX quotes a price and nothing else: its lowest price is its widest.
+  const cmbx = { ...hy, points: days.map(({ spreadBp: _, ...point }) => point), spreadBp: undefined };
+  expect(spreadRank(cmbx)).toEqual({ percentile: expect.closeTo(99.8, 1), basis: "price-inverted" });
+  const ig = { quote: "spread" as const, points: days.map((point) => ({ ...point, level: point.spreadBp })), level: 420, date: today.date };
+  expect(spreadRank(ig).percentile).toBeGreaterThan(99);
+  // Fewer than 20 days of spreads in the year rank nothing: a new server's few spread equivalents, or a spread's first weeks.
+  const fresh = { ...hy, points: days.map((point, day) => day < 221 ? { ...point, spreadBp: undefined } : point) };
+  expect(spreadRank(fresh)).toEqual({ percentile: null, basis: "spread-eq" });
+  expect(spreadRank({ ...fresh, points: days.slice(-20) })).toEqual({ percentile: expect.closeTo(97.5, 1), basis: "spread-eq" });
+  expect(spreadRank({ ...ig, points: ig.points.slice(-19) }).percentile).toBeNull();
 });
 
 test("a server that does not flag the day: today's New York trade date is partial and its moves are measured between complete days", () => {
@@ -171,8 +190,30 @@ test("every SOVR export row names its series, unit and own date", async () => {
   const result = await sovrHeadless.load(args, context);
   const freshness = deriveHeadlessFreshness(sovrHeadless, result);
   const csv = renderReportCsv(headlessReportTables(sovrHeadless, result, args, "SOVR", freshness, { complete: true, unavailableSymbols: [] }), freshness).split("\n");
-  expect(csv[1]!.split(",").slice(-5)).toEqual(["sovereign-cds:br", "bp", "daily", "DTCC", "2026-10-09"]);
-  expect(csv[2]!.split(",").slice(-5)).toEqual(["sovereign-cds:eg", "bp", "daily", "DTCC", "2026-10-02"]);
+  expect(csv[1]!.split(",").slice(-6)).toEqual(["sovereign-cds:br", "bp", "daily", "DTCC", "2026-10-09", freshness.retrievedAt]);
+  expect(csv[2]!.split(",").slice(-6)).toEqual(["sovereign-cds:eg", "bp", "daily", "DTCC", "2026-10-02", freshness.retrievedAt]);
+});
+
+test("a level that is the day's settlement price is marked in its own column, which a report without one leaves out", async () => {
+  const context = (board: SovrBoardPayload) => ({
+    apiClient: { getCloudSovrBoard: async () => board },
+    marketData: { getPriceHistory: async () => [] },
+  }) as unknown as HeadlessPaneContext;
+  const csvOf = async (board: SovrBoardPayload) => {
+    const result = await sovrHeadless.load(args, context(board));
+    const freshness = deriveHeadlessFreshness(sovrHeadless, result);
+    return renderReportCsv(headlessReportTables(sovrHeadless, result, args, "SOVR", freshness, { complete: true, unavailableSymbols: [] }), freshness).split("\n");
+  };
+  expect((await csvOf(sovrPayload))[0]).not.toContain("Level");
+
+  const settled = { ...sovrPayload, sovereigns: [{ ...sovereign("AR", "Argentina", "ARS", 640.2), prints: 0, reported: 0, kind: "settlement" as const }, sovereign("BR", "Brazil", "BRL", 119.7)] };
+  const result = await sovrHeadless.load(args, context(settled));
+  expect((result as { rows: HeadlessPaneRow[] }).rows.map((row) => row.kind)).toEqual(["settlement", "traded"]);
+  const csv = await csvOf(settled);
+  const header = cells(csv[0]!);
+  const level = header.indexOf("Level");
+  expect(level).toBeGreaterThan(0);
+  expect([cells(csv[1]!)[level], cells(csv[2]!)[level]]).toEqual(["settlement", ""]);
 });
 
 test("SOVR lists one country's row when a country is named, and says which countries it has when it is not one", async () => {

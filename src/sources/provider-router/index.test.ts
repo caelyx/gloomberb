@@ -24,6 +24,20 @@ afterEach(() => {
 });
 
 describe("AssetDataRouter", () => {
+  test("a source the host passes and a plugin also registers is asked once", async () => {
+    let reads = 0;
+    const cloud = () => createTestDataProvider({
+      id: "gloomberb-cloud",
+      getPriceHistory: async () => { reads += 1; return []; },
+    });
+    const router = new AssetDataRouter(null, [cloud()]);
+    attachTestRegistry(router, {
+      getEnabledCapabilities: ((kind: string) => kind === "asset-data" ? [assetDataProvider(cloud())] : []) as never,
+    });
+    await router.getPriceHistory("XLK", "", "1Y");
+    expect(reads).toBe(1);
+  });
+
   test("a failed batch quote carries its reason as text, which survives a JSON bridge", async () => {
     const router = new AssetDataRouter(null, []);
     const [result] = await router.getQuotesBatch([{ symbol: "ES=F", exchange: "" }]);
@@ -124,6 +138,38 @@ describe("AssetDataRouter", () => {
     } finally {
       persistence.close();
     }
+  });
+
+  test("a stale batch price is asked for alone and kept, flagged stale, when that read fails; deferred, the caller asks", async () => {
+    const asked: string[] = [];
+    const current = createTestQuote({ symbol: "ES=F", providerId: "gloom", price: 6_800 });
+    const dated = createTestQuote({ symbol: "RS1=F", providerId: "gloom", price: 3_710, lastUpdated: Date.now() - 5 * 60 * 60_000, stale: true });
+    const provider: DataProvider = {
+      ...fallbackProvider,
+      id: "gloom",
+      name: "Gloom",
+      async getQuote(symbol) { asked.push(symbol); throw new Error("UPSTREAM_ERROR"); },
+      async getQuotesBatch(targets) {
+        return targets.map((target) => ({ target, quote: target.symbol === "ES=F" ? current : target.symbol === "RS1=F" ? dated : null }));
+      },
+    };
+    const router = new AssetDataRouter(provider, []);
+    const targets = [{ symbol: "ES=F", exchange: "" }, { symbol: "RS1=F", exchange: "" }, { symbol: "SXT=F", exchange: "" }];
+
+    const settled = await router.getQuotesBatch(targets);
+    expect(asked).toEqual(["RS1=F", "SXT=F"]);
+    expect(settled.map((result) => result.quote?.price ?? null)).toEqual([6_800, 3_710, null]);
+    expect(settled[1]!.quote!.stale).toBe(true);
+    expect(settled[1]!.quote!.lastUpdated).toBe(dated.lastUpdated);
+    expect(settled[2]!.error).toBeTruthy();
+
+    asked.length = 0;
+    const deferred = await router.getQuotesBatch(targets, { deferFollowUps: true, forceRefresh: true });
+    expect(asked).toEqual([]);
+    expect(deferred.map((result) => [result.quote?.price ?? null, result.followUp])).toEqual([
+      [6_800, undefined], [3_710, "refresh"], [null, "refresh"],
+    ]);
+    expect(deferred[1]!.quote!.stale).toBe(true);
   });
 
   test("falls through to Gloom quotes and history when Cloud market requests never settle", async () => {

@@ -12,7 +12,7 @@ import { ThesisTickerTab } from "./ticker-tab";
 export const thesisModule: PluginModule = {
   panes: [{
     id: THESIS_PANE_ID,
-    reportFreshness: { source: "Your theses", status: "not-a-feed", basis: "your theses" },
+    reportFreshness: { source: "Your theses", status: "not-a-feed", basis: "your theses", local: true },
     name: "Theses",
     personalData: "holdings",
     icon: "Θ",
@@ -31,11 +31,14 @@ export const thesisModule: PluginModule = {
     description: "Every thesis you and your teams hold, sorted by what needs a ruling",
     keywords: ["thesis", "theses", "conviction", "invalidation", "kill", "pillars", "journal"],
     shortcut: { prefix: "THESIS", argPlaceholder: "tickers (optional)", argKind: "text" },
+    // createInstance starts a thesis in the open board, so catalog discovery must not run it with a sample ticker.
+    catalogSettings: {},
     createInstance: (_context, options) => {
-      // `THESIS NVDA` opens that thesis or starts one; `THESIS NVDA AMD` starts a pair.
+      // `THESIS NVDA` opens that thesis or starts one; `THESIS NVDA AMD` starts a pair. The params name the
+      // ticker to a board that is drawn without the request (a capture), which shows it without starting one.
       const symbol = options?.arg?.trim() || null;
       if (symbol) requestThesisPane({ symbol, start: true });
-      return { placement: "floating", instanceId: "thesis-board" };
+      return { placement: "floating", instanceId: "thesis-board", ...(symbol ? { params: { symbol } } : {}) };
     },
   }],
   setup(ctx) {

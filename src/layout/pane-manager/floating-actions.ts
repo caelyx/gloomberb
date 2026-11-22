@@ -9,6 +9,7 @@ import {
   clampFloatingRect,
   clampFloatingRectWithinBounds,
   defaultFloatingRect,
+  defaultFloatingSize,
   compactFloatingZ,
   maxFloatingZ,
   MIN_FLOAT_HEIGHT,
@@ -19,6 +20,7 @@ import {
 import type { LayoutBounds } from "./dock-tree";
 import type { FloatingResizeCorner } from "./types";
 import { detachPane, ensurePaneInstance, finalizeLayout } from "./layout-state";
+import { avoidStackedRect, placeFloatingRect, type FloatingPlacementOptions } from "./floating-placement";
 
 export function detachPaneToFrame(
   layout: LayoutConfig,
@@ -41,7 +43,24 @@ export function detachPaneToFrame(
   });
 }
 
+/**
+ * `instanceId` floating at `rect`, in front unless `rect` says its z. A tab of
+ * a floating stack keeps its place in the list (the stack's tab order), and
+ * the other tabs move with it.
+ */
 export function floatAtRect(layout: LayoutConfig, instanceId: string, rect: FloatingRect): LayoutConfig {
+  const stack = layout.floating.find((entry) => entry.instanceId === instanceId)?.stack;
+  if (stack) {
+    const placed = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    const zIndex = rect.zIndex ?? maxFloatingZ(layout) + 1;
+    return finalizeLayout({
+      ...layout,
+      floating: compactFloatingZ(layout.floating.map((entry) => {
+        if (entry.instanceId === instanceId) return { ...entry, ...placed, zIndex };
+        return entry.stack === stack ? { ...entry, ...placed } : entry;
+      })),
+    });
+  }
   const base = detachPane(layout, instanceId);
   return finalizeLayout({
     ...base,
@@ -112,19 +131,25 @@ export function resizeFloatingPaneFromCorner(
   }));
 }
 
+/**
+ * Floats a pane where it floated last, or, the first time, where there is
+ * room (`placeFloatingRect`). Either way it never lands exactly on another
+ * window.
+ */
 export function floatPane(
   layout: LayoutConfig,
   instanceId: string,
   termWidth: number,
   termHeight: number,
   def?: PaneDef,
+  options?: FloatingPlacementOptions,
 ): LayoutConfig {
   const instance = findPaneInstance(layout, instanceId);
   if (!instance) return layout;
   const remembered = instance.placementMemory?.floating;
   const rect = remembered
-    ? clampFloatingRect(remembered, termWidth, termHeight)
-    : defaultFloatingRect(termWidth, termHeight, def);
+    ? avoidStackedRect(layout, instanceId, clampFloatingRect(remembered, termWidth, termHeight), termWidth, termHeight)
+    : placeFloatingRect(layout, instanceId, defaultFloatingSize(termWidth, termHeight, def), termWidth, termHeight, options);
   return floatAtRect(layout, instanceId, rect);
 }
 
@@ -134,10 +159,11 @@ export function addPaneFloating(
   termWidth: number,
   termHeight: number,
   def?: PaneDef,
+  options?: FloatingPlacementOptions,
 ): LayoutConfig {
   const resolvedInstance = typeof instance === "string" ? createPaneInstance(instance) : instance;
   const withInstance = ensurePaneInstance(layout, resolvedInstance);
-  return floatPane(withInstance, resolvedInstance.instanceId, termWidth, termHeight, def);
+  return floatPane(withInstance, resolvedInstance.instanceId, termWidth, termHeight, def, options);
 }
 
 export function bringToFront(layout: LayoutConfig, instanceId: string): LayoutConfig {

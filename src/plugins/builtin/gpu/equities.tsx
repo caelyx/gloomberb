@@ -13,8 +13,9 @@ import { TICKER_RESEARCH_PANE_ID } from "../../../types/config";
 import { Box, TextAttributes, useUiCapabilities } from "../../../ui";
 import { ClippedText } from "../../../components/ui/display";
 import { publicTickerKey } from "../../../utils/exchanges";
-import { displayWidth } from "../../../utils/format";
-import { quoteBoardFooterInfo, quoteBoardStatus, renderQuoteBoardCell, useQuoteBoard } from "../shared/use-quote-board";
+import { MISSING_VALUE, displayWidth } from "../../../utils/format";
+import { boardQuotes, quoteBoardFooterInfo, quoteBoardStatus, renderQuoteBoardCell, useQuoteBoard } from "../shared/use-quote-board";
+import { useQuoteDelayFooter } from "../shared/cloud-upgrade";
 import { GpuModelQuery } from "./board";
 import { loadGpuEquityHistory } from "./client";
 import { GPU_EQUITIES, GPU_EQUITY_GROUPS, gpuChange, gpuChangeColor, gpuChangesLocked, gpuEquityGap, gpuEquityRows, gpuPrice, gpuShortSource, gpuVariant, type GpuEquityRow } from "./model";
@@ -56,14 +57,16 @@ export function GpuEquities({ board, models, locked, model, setModel, reloadBoar
   }, [provider]);
   const history = useAsyncResource(loader);
   useAutoRefresh(history.updatedAt, history.load);
-  usePaneRefreshKey(() => { reloadBoard(); refresh(); void history.reload(); }, { focused });
+  usePaneRefreshKey(() => { reloadBoard(); refresh(); history.reload(); }, { focused });
   const rows = useMemo(() => gpuEquityRows(board, model || "H100", locked), [board, model, locked]);
   const items = useMemo(() => buildSectionedRows(GPU_EQUITY_GROUPS.map((group) => ({ label: group.label,
     items: rows.filter((row) => (group.roles as readonly string[]).includes(row.role)) })), (row) => row.symbol), [rows]);
   const historyMap = useMemo(() => new Map(history.data?.map((entry) => [entry.symbol, entry]) ?? []), [history.data]);
   const ends = [...new Set(history.data?.flatMap((entry) => entry.asOf ? [entry.asOf] : []) ?? [])].sort();
+  const quoteDelay = useQuoteDelayFooter(boardQuotes(quotes), "gpu-equities-delay");
   usePaneFooter("gpu:equity-status", () => ({ info: [...quoteBoardFooterInfo(quoteBoardStatus(quotes)),
-    ...(ends.length === 1 ? [{ id: "five-asof", parts: [{ text: `5D closes through ${ends[0]}`, tone: "muted" as const }] }] : [])] }), [quotes, ends.join(",")]);
+    ...(ends.length === 1 ? [{ id: "five-asof", parts: [{ text: `5D closes through ${ends[0]}`, tone: "muted" as const }] }] : []),
+    ...(quoteDelay ? [quoteDelay] : [])] }), [quotes, quoteDelay, ends.join(",")]);
   usePaneNoticeFooter({ registrationId: "gpu:equity-notices", focused,
     notices: [...(history.error ? [history.error] : []), ...(history.data?.flatMap((entry) => entry.error ? [entry.error] : []) ?? [])] });
   const dataRef = useRef({ quotes, historyMap });
@@ -96,7 +99,7 @@ export function GpuEquities({ board, models, locked, model, setModel, reloadBoar
         if (!reference) return gapCell;
         if (gpuChangesLocked(reference)) return lockedCell;
         const value = reference.change7d;
-        return value == null ? { text: "-", value: null, color: colors.textMuted } : { text: gpuChange(value), value, color: gpuChangeColor(value, colors) };
+        return value == null ? { text: MISSING_VALUE, value: null, color: colors.textMuted } : { text: gpuChange(value), value, color: gpuChangeColor(value, colors) };
       }
       case "five": {
         const value = dataRef.current.historyMap.get(row.symbol)?.value;

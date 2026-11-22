@@ -9,6 +9,7 @@ import { getBrowserPlugins } from "../../plugins/catalog-browser";
 import { DomErrorBoundary, DomHostProviders } from "../dom/dom-host-providers";
 import { installFocusScopeRelease } from "../dom/host/focus-scope";
 import { installDomMarketDataFrames } from "../dom/data-frames";
+import { webNativeRenderer } from "../dom/native-renderer";
 import { releaseBootFrameWhenDrawn, startBootFrameRecorder } from "../dom/boot-frame";
 import { BROWSER_STORAGE_KEYS } from "../../data/json-storage";
 import { createBrowserAppServices } from "./app-services";
@@ -19,6 +20,9 @@ import {
 import { loadWebBundledPlugins } from "./bundled-plugins";
 import { BROWSER_DATA_DIR, hasSavedBrowserConfig, installBrowserConfigStore } from "./config-host";
 import { browserRendererHost, browserUiHost } from "./ui-host";
+import { installBrowserAppBadgeHost } from "./app-badge-host";
+import { isBrowserAppActive } from "./activity";
+import { setAppActive } from "../../state/app/activity";
 import { createBrowserDeepLinkBridge } from "./deeplink-bridge";
 import { initializeBrowserResearchActivity, recordResearchActivity } from "../../api-client/research-activity";
 import { flushPendingPersistence } from "../../state/persist-scheduler";
@@ -31,10 +35,11 @@ import {
   readOrCreateBrowserInstallId,
 } from "../../telemetry/crash-reports-dom";
 import { currentTelemetryConfig } from "../../telemetry/live-config";
-import { attentionCountsEnabled, installAttentionCounter } from "../../telemetry/attention-counts";
+import { installAttentionCounter } from "../../telemetry/attention-counts";
 import { installUsageCounter, recordRestoredFunctions, usageCountsEnabled } from "../../telemetry/usage-counts";
 import { installWindowUsageFlush } from "../../telemetry/usage-counts-dom";
 import type { AppConfig } from "../../types/config";
+import { logFailure } from "../../utils/log-failure";
 
 // Declared here rather than sniffed: the desktop view and the hosted browser
 // app are both browser contexts but differ in what plugins may do.
@@ -56,7 +61,8 @@ const BOOT_FRAME_RELEASE_FALLBACK_MS = 4_000;
 async function boot(): Promise<void> {
   // Read before anything can save a workspace.
   const savedLayout = hasSavedBrowserConfig();
-  installBrowserConfigStore();
+  // A first visit's workspace fits the window it opens in.
+  installBrowserConfigStore(() => ({ width: webNativeRenderer.terminalWidth, height: webNativeRenderer.terminalHeight }));
   let loadedConfig: AppConfig | null = null;
   installCrashReporter({
     surface: "web",
@@ -71,7 +77,7 @@ async function boot(): Promise<void> {
     getInstallId: () => readOrCreateBrowserInstallId(),
     officialPluginIds: loadOfficialPluginIds,
   });
-  installAttentionCounter(() => !browserDoNotTrack() && attentionCountsEnabled(currentTelemetryConfig(loadedConfig)));
+  installAttentionCounter({ allowed: () => !browserDoNotTrack(), launchConfig: () => loadedConfig });
   // A document reload does not unmount React. Flush both config and session
   // timers while localStorage is still available, including background tabs.
   window.addEventListener("pagehide", () => { void flushPendingPersistence(); });
@@ -90,7 +96,7 @@ async function boot(): Promise<void> {
   // panes are registered by the time a saved layout asks for one. A failure
   // here must not stop the app: the built-in catalog is enough to run on, and
   // the marketplace reports what broke.
-  const bundledPlugins = loadWebBundledPlugins().catch(() => []);
+  const bundledPlugins = loadWebBundledPlugins().catch(logFailure("web-plugins", "Could not load the bundled plugins", []));
   // A Gloom session is optional here: the workspace opens either way, and an
   // unexpected failure (not "no session" or "API unreachable") is reported.
   await restoreBrowserCloudSession(undefined, (error) => reportCrash(error, { kind: "unhandled-rejection" }));
@@ -100,6 +106,8 @@ async function boot(): Promise<void> {
   applyLanguageFromConfig(config);
   const externalPlugins = await bundledPlugins;
   const deepLinkBridge = createBrowserDeepLinkBridge();
+  installBrowserAppBadgeHost();
+  setAppActive(isBrowserAppActive());
   root.render(
     <DomErrorBoundary label="Browser renderer crashed" fallback={(error) => (
       <div className="gloom-fatal">
@@ -116,6 +124,7 @@ async function boot(): Promise<void> {
           plugins={getBrowserPlugins(externalPlugins)}
           desktopDeepLinkBridge={deepLinkBridge}
           updatesEnabled={false}
+          setupEnabled={false}
         />
       </DomHostProviders>
     </DomErrorBoundary>,

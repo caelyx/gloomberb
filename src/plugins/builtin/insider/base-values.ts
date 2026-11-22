@@ -1,7 +1,7 @@
 import type { HeadlessPaneColumn, HeadlessPaneRow } from "../../../types/headless";
 import { fxCloseOnOrBefore, loadDailyFxCloses, type FxCloses, type FxHistoryClient } from "../../../market-data/fx-closes";
 import { logFailure } from "../../../utils/log-failure";
-import { formatCompact, formatNumber } from "../../../utils/format";
+import { MISSING_VALUE, formatCompact, formatNumber } from "../../../utils/format";
 import { quotedFxPair } from "../../../utils/currency-pair";
 
 /** A Form 4 states its prices and values in US dollars. */
@@ -15,7 +15,7 @@ export interface InsiderBaseValues {
   note: string | null;
 }
 
-const dash = (value: unknown, format: (value: number) => string) => (typeof value === "number" && Number.isFinite(value) ? format(value) : "-");
+const dash = (value: unknown, format: (value: number) => string) => (typeof value === "number" && Number.isFinite(value) ? format(value) : MISSING_VALUE);
 
 /**
  * Every row carries the currency its price and value are in (USD, as a Form 4
@@ -73,4 +73,59 @@ export async function withInsiderBaseValues(
     : closes ? `Value (${base}) is each value at the ${pair} daily close of its transaction day, or of the trading day before it; ${pair} is that rate.`
       : `Daily ${pair} closes are unavailable, so values stay in ${FORM4_CURRENCY}.`;
   return { rows: closes ? converted : labelled, columns, note };
+}
+
+/**
+ * Rows of dollars dated by one day each (a ranking's companies, by their last
+ * trade day), each value under `keys` also in a base currency other than USD
+ * at the daily close of USD against it on that day, or the last close before:
+ * the rate the trades' own table converts the last trade at. `columns` are the
+ * converted values, each headed with its currency, then the rate; null for a
+ * USD base, or when the closes cannot be read (the note then says why).
+ */
+export async function withDayBaseValues(
+  rows: readonly HeadlessPaneRow[],
+  keys: ReadonlyArray<{ key: string; header: string }>,
+  dayKey: string,
+  baseCurrency: string,
+  client: FxHistoryClient,
+  now = new Date(),
+): Promise<InsiderBaseValues> {
+  const base = baseCurrency.trim().toUpperCase();
+  if (!base || base === FORM4_CURRENCY || rows.length === 0) return { rows: [...rows], columns: null, note: null };
+  const pair = quotedFxPair(FORM4_CURRENCY, base, 1).pair;
+  const days = rows.flatMap((row) => typeof row[dayKey] === "string" ? [(row[dayKey] as string).slice(0, 10)] : []).sort();
+  let closes: FxCloses | null = null;
+  if (days.length > 0) {
+    try {
+      closes = await loadDailyFxCloses(base, days[0]!, client, now);
+    } catch (error) {
+      logFailure("insider.base-values", `Daily ${pair} closes failed`)(error);
+    }
+  }
+  if (!closes) return { rows: [...rows], columns: null, note: days.length ? `Daily ${pair} closes are unavailable, so values stay in ${FORM4_CURRENCY}.` : null };
+  const read = closes;
+  const converted = rows.map((row) => {
+    const day = typeof row[dayKey] === "string" ? (row[dayKey] as string).slice(0, 10) : null;
+    const reading = day ? fxCloseOnOrBefore(read, day) : null;
+    const perDollar = reading ? 1 / reading.rate : null;
+    return {
+      ...row,
+      baseCurrency: base,
+      ...Object.fromEntries(keys.map(({ key }) => [`${key}Base`, perDollar != null && typeof row[key] === "number" ? (row[key] as number) * perDollar : null])),
+      fxPair: pair,
+      fxRate: perDollar != null ? quotedFxPair(FORM4_CURRENCY, base, perDollar).rate : null,
+      fxDate: reading?.date ?? null,
+    };
+  });
+  return {
+    rows: converted,
+    columns: [
+      ...keys.map(({ key, header }): HeadlessPaneColumn => ({
+        key: `${key}Base`, header: `${header} (${base})`, align: "right", format: (value) => dash(value, formatCompact),
+      })),
+      { key: "fxRate", header: pair, align: "right", stackPriority: 1, format: (value) => dash(value, (rate) => formatNumber(rate, 4)) },
+    ],
+    note: null,
+  };
 }

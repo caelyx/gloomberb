@@ -1,6 +1,7 @@
 import { mkdir } from "fs/promises";
 import { join } from "path";
-import { cacheDir, evaluate, frames, mouse, type Cdp } from "./browser";
+import { cacheDir, evaluate, frames, mouse, waitFor, type Cdp } from "./browser";
+import { renderAsciiText } from "../../src/ui/ascii-font";
 
 interface Expected { id: string; panel: string; side: string; value: number; label: string; ratio: number; color: string; carried: boolean }
 interface Rect { x: number; y: number; width: number; height: number }
@@ -103,17 +104,39 @@ async function atTwoHeights(cdp: Cdp, plot: Rect, share: number): Promise<Array<
   return reads;
 }
 
+/** `read` until it gives something, a frame apart, for as many frames as a slow machine needs. */
+async function untilRead<T>(cdp: Cdp, read: () => Promise<T | null>, what: string): Promise<T> {
+  for (let frame = 0; frame < 120; frame += 1) {
+    const value = await read();
+    if (value) return value;
+    await frames(cdp, 1);
+  }
+  throw new Error(`${what} did not show`);
+}
+
 async function pressTool(cdp: Cdp, label: string): Promise<void> {
-  const at = await evaluate<{ x: number; y: number } | null>(cdp, `(() => {
+  const chip = (property: string) => `(() => {
     const chip = [...document.querySelectorAll('[data-gloom-role=composite-chart-tool]')].find(node => (node.getAttribute('data-gloom-label') ?? '').startsWith(${JSON.stringify(label)}));
-    const r = chip?.getBoundingClientRect();
-    return r ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null;
-  })()`);
-  if (!at) throw new Error(`No ${label} tool in the chart toolbar`);
+    ${property}
+  })()`;
+  const chipCenter = () => evaluate<{ x: number; y: number } | null>(cdp, chip("const r = chip?.getBoundingClientRect(); return r ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null;"));
+  let at = await chipCenter();
+  if (!at) {
+    // The bar is folded to one button until the pointer is on it.
+    const handle = await evaluate<{ x: number; y: number } | null>(cdp, `(() => {
+      const r = document.querySelector('[data-gloom-role=composite-chart-toolbar-toggle]')?.getBoundingClientRect();
+      return r ? { x: r.x + r.width / 2, y: r.y + r.height / 2 } : null;
+    })()`);
+    if (!handle) throw new Error("No tool bar button in the chart toolbar");
+    await mouse(cdp, "mouseMoved", handle.x, handle.y, false);
+    at = await untilRead(cdp, chipCenter, `The ${label} tool in the chart toolbar`);
+  }
   await mouse(cdp, "mouseMoved", at.x, at.y, false);
   await mouse(cdp, "mousePressed", at.x, at.y, true);
   await mouse(cdp, "mouseReleased", at.x, at.y, false);
-  await frames(cdp, 3);
+  // The press has landed once the tool is the chart's.
+  await untilRead(cdp, async () => await evaluate<boolean>(cdp, chip("return chip?.getAttribute('data-active') === 'true';")) ? true : null, `The ${label} tool arming`);
+  await frames(cdp, 2);
 }
 
 const toolSteps = ["desktop", "browser"].flatMap((host) => [640, 1280].flatMap((width) => ["three", "stacked"].map((kind) => ({
@@ -232,3 +255,64 @@ export const axisSteps = ["desktop", "browser"].flatMap((host) => [640, 1280].fl
 }))))));
 
 axisSteps.push(...toolSteps);
+
+axisSteps.push({
+  name: "chart screenshot watermark: glyph sizing, centering and capture-only visibility",
+  scenario: "cmp",
+  async run(cdp) {
+    if (!await waitFor(cdp, `(() => {
+      const pane = document.querySelector('[data-gloom-pane-id="chart-composer:a"]');
+      return !!pane?.querySelector('[data-gloom-role=composite-chart]')?.dataset.gloomView
+        && !!pane.querySelector('[data-gloom-role=composite-chart-panel] canvas');
+    })()`, 10_000)) throw new Error("The chart did not load its bars before checking the watermark");
+    const lines = renderAsciiText("Gloom", "wordmark");
+    const base = { width: Math.max(...lines.map((line) => [...line].length)) * 8, height: lines.length * 12 };
+    try {
+      for (const [width, height] of [[1400, 900], [480, 500], [300, 240]]) {
+        await cdp.send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+        await frames(cdp, 12);
+        await evaluate(cdp, `(async () => {
+          const pane = document.querySelector('[data-gloom-pane-id="chart-composer:a"]');
+          const mark = pane?.querySelector('[data-gloom-role=chart-watermark]');
+          if (${width} === 300) {
+            if (mark) throw new Error('An illegible watermark was mounted on a tiny plot');
+            return;
+          }
+          const canvas = mark?.querySelector('canvas');
+          if (!canvas) throw new Error('A legible plot has no watermark');
+          const plot = mark.getBoundingClientRect(), word = canvas.getBoundingClientRect();
+          const base = ${JSON.stringify(base)};
+          const scale = Math.round(Math.min(plot.width * 0.5 / base.width, plot.height * 0.4 / base.height, 3) * 4) / 4;
+          if (Math.abs(word.width - base.width * scale) > 1 || Math.abs(word.height - base.height * scale) > 1) {
+            throw new Error('Watermark sizing does not match its drawn glyph grid');
+          }
+          if (Math.abs(word.x + word.width / 2 - plot.x - plot.width / 2) > 0.5
+            || Math.abs(word.y + word.height / 2 - plot.y - plot.height / 2) > 0.5) {
+            throw new Error('Watermark is not centered in the plot');
+          }
+          if (word.x < plot.x || word.y < plot.y || word.right > plot.right || word.bottom > plot.bottom) {
+            throw new Error('Watermark is clipped');
+          }
+          if (getComputedStyle(mark).visibility !== 'hidden') throw new Error('Interactive chart reveals its watermark');
+          let painted = 0;
+          const original = CanvasRenderingContext2D.prototype.drawImage;
+          CanvasRenderingContext2D.prototype.drawImage = function(image, ...args) {
+            if (image === canvas) {
+              if (getComputedStyle(mark).visibility !== 'visible') throw new Error('Capture did not reveal its watermark');
+              painted++;
+            }
+            return original.call(this, image, ...args);
+          };
+          try { await window.__paneChrome.capturePane(pane.dataset.gloomPaneId); }
+          finally { CanvasRenderingContext2D.prototype.drawImage = original; }
+          if (painted !== 1) throw new Error('Capture did not paint the watermark once');
+          if (getComputedStyle(mark).visibility !== 'hidden' || document.documentElement.hasAttribute('data-gloom-screenshot')) {
+            throw new Error('Capture did not restore the hidden watermark');
+          }
+        })()`);
+      }
+    } finally {
+      await cdp.send("Emulation.setDeviceMetricsOverride", { width: 1400, height: 900, deviceScaleFactor: 1, mobile: false });
+    }
+  },
+});

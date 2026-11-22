@@ -74,12 +74,34 @@ test("asset controls survive loading, 503 and empty; r retries, stale rows stay 
 
     mode = "stale";
     await tui.emitKeypress({ name: "r", sequence: "r" });
-    const stale = await tui.waitForFrameToContain("stale");
+    // The frames before the retry lands already say "stale" (the footer dates the flows 2026-10-20 against today)
+    // and, while it loads, draw the table's header with ETHA over no rows: the wait is for the day's flow it brings.
+    const stale = await tui.waitForFrameToContain("123.0");
     expect(stale).toContain("ETHA");
-    expect(stale).toContain("123.0");
+    expect(stale).toContain("stale");
+    // The footer's source line says it once.
+    expect(stale.match(/\bstale\b/g)).toHaveLength(1);
     await tui.clickFrameText("Bitcoin");
     await tui.waitForFrameToContain("IBIT");
     expect(tui.frame()).not.toContain("ETHA");
+  } finally {
+    await tui.destroy();
+    stub.mockRestore();
+  }
+});
+
+test("the funds' price move shows beside the flows once the server sends it, and a day without one reads as none", async () => {
+  const priced = payload("BTC");
+  priced.days = [
+    { ...priced.days[0]!, priceChangePct: 2.15 },
+    { date: "2026-10-19", flows: { IBIT: null }, total: null, pending: [], priceChangePct: null },
+  ];
+  const stub = spyOn(apiClient, "getCloudCryptoEtfFlows").mockImplementation(async () => priced);
+  try {
+    await tui.render(<Harness />);
+    const frame = await tui.waitForFrameToContain("PRICE %");
+    expect(frame).toMatch(/2026-10-20\s+\+123\.0\s+\+2\.15%\s+\+123\.0/);
+    expect(frame).toMatch(/2026-10-19\s+—\s+—\s+—/);
   } finally {
     await tui.destroy();
     stub.mockRestore();

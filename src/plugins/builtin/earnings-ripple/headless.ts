@@ -1,11 +1,12 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
 import { fetchEarningsCalendar } from "../earnings/client";
 import { fetchSupplyChain } from "../supply-chain/client";
 import { fetchSupplyGraph } from "../supply-chain/graph-client";
 import { loadRipple } from "./client";
-import { hopLabel, revenueOwner } from "./model";
+import { hopLabel, revenueOwner, rippleEmptyText } from "./model";
 
-const percent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "--";
+const percent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(1)}%` : MISSING_VALUE;
 
 export const earningsRippleHeadless: HeadlessPaneDefinition<"bundle"> = {
   shape: "bundle",
@@ -25,13 +26,18 @@ export const earningsRippleHeadless: HeadlessPaneDefinition<"bundle"> = {
     }, undefined, { secondHop });
     ctx.signal.throwIfAborted();
     const second = snapshot.secondHop;
+    // Holdings whose disclosures could not be read are reported as failures, never as searched.
+    const searched = args.symbols.map((symbol) => symbol.toUpperCase()).filter((symbol) => !snapshot.failures.some((failure) => failure.symbol === symbol));
+    const empty = (secondHop: boolean) => searched.length
+      ? { empty: rippleEmptyText({ holdings: searched, checked: snapshot.checked, from: snapshot.from, to: snapshot.to, preview: snapshot.truncated.length > 0, secondHop }) }
+      : {};
     return {
-      sections: [{ title: `Customers and suppliers reporting ${snapshot.from} to ${snapshot.to}`, columns: [
+      sections: [{ title: `Customers and suppliers reporting ${snapshot.from} to ${snapshot.to}`, ...empty(false), columns: [
         { key: "date", header: "Date" }, { key: "timing", header: "Time" }, { key: "company", header: "Reports" }, { key: "link", header: "Link" },
         { key: "holding", header: "Holding" }, { key: "pctOfRevenue", header: "Revenue %" }, { key: "revenueOf", header: "Of" }, { key: "averageMove", header: "Avg move", format: percent },
         { key: "holdingDate", header: "Holding reports" }, { key: "period", header: "Filing period" },
       ], rows: snapshot.rows.map((row) => ({ ...row, timing: row.timing?.toUpperCase() ?? null, link: row.link === "customer" ? "customer of" : "supplier to", revenueOf: revenueOwner(row) })) },
-      ...(second && !second.locked ? [{ title: `Two hops away, reporting ${snapshot.from} to ${snapshot.to}`, columns: [
+      ...(second && !second.locked ? [{ title: `Two hops away, reporting ${snapshot.from} to ${snapshot.to}`, ...empty(true), columns: [
         { key: "date", header: "Date" }, { key: "timing", header: "Time" }, { key: "company", header: "Reports" }, { key: "link", header: "Link" },
         { key: "via", header: "Via" }, { key: "holding", header: "Holding" }, { key: "hop1", header: "Holding to via" }, { key: "hop2", header: "Via to company" },
         { key: "exposure", header: "Estimated exposure" }, { key: "averageMove", header: "Avg move", format: percent }, { key: "holdingDate", header: "Holding reports" },

@@ -1,6 +1,9 @@
 import type { SeriesDefinition, SeriesPoint } from "../../../series/types";
-import { cachedSeriesWarning } from "../shared/series-warning";
+import { cachedSeriesNote } from "../shared/series-warning";
 import { loadDefiTvl, loadStablecoinSupply, loadStablecoinSupplyHistory } from "./client";
+import { DEFI_DAY_CONVENTION } from "./defi";
+import { STABLECOIN_SUPPLY_PUBLISHER } from "./supply";
+import { BITCOIN_NETWORK_SERIES } from "./bitcoin-network";
 
 const DAY_MS = 86_400_000;
 
@@ -15,6 +18,11 @@ function stablecoinSymbol(ticker: string): string {
   return ticker.trim().toUpperCase().split(/[-/]/)[0] ?? ticker;
 }
 
+/** What a chart of a supply cites: its publisher, each day dated as the DeFi total's, by the UTC day it closes. */
+const STABLECOIN_SUPPLY_ATTRIBUTION = {
+  source: `${STABLECOIN_SUPPLY_PUBLISHER} stablecoin supply, ${DEFI_DAY_CONVENTION}`, publisher: STABLECOIN_SUPPLY_PUBLISHER,
+} as const;
+
 /** Total stablecoin supply and any listed coin's, as CRYP's stablecoin list shows them. */
 const STABLECOIN_SUPPLY_SERIES: readonly SeriesDefinition[] = [
   {
@@ -25,11 +33,12 @@ const STABLECOIN_SUPPLY_SERIES: readonly SeriesDefinition[] = [
     group: "Crypto",
     tags: ["stablecoin", "stablecoins", "supply", "USDT", "USDC", "liquidity"],
     description: "Total supply of all stablecoins, valued in USD, daily since 2017, as CRYP's stablecoin list totals it.",
+    publisher: STABLECOIN_SUPPLY_PUBLISHER,
     load: async () => {
       const resource = await loadStablecoinSupply();
       const history = resource.payload.history;
       if (!history) throw new Error("Stablecoin supply is not available yet.");
-      return { points: dailyPoints(history.start, history.total), warning: cachedSeriesWarning(resource) };
+      return { points: dailyPoints(history.start, history.total), attribution: STABLECOIN_SUPPLY_ATTRIBUTION, ...cachedSeriesNote(resource) };
     },
   },
   {
@@ -41,14 +50,18 @@ const STABLECOIN_SUPPLY_SERIES: readonly SeriesDefinition[] = [
     tags: ["stablecoin", "stablecoins", "supply", "circulating"],
     description: "One stablecoin's supply across chains, valued in USD, daily, for a coin on CRYP's stablecoin list (USDT-USD).",
     input: "crypto",
+    publisher: STABLECOIN_SUPPLY_PUBLISHER,
     load: async ({ ticker }) => {
       const resource = await loadStablecoinSupplyHistory(stablecoinSymbol(ticker!));
       const history = resource.payload.history;
       if (!history) throw new Error(`${resource.payload.symbol} supply history is not available yet.`);
-      return { points: dailyPoints(history.start, history.values), warning: cachedSeriesWarning(resource) };
+      return { points: dailyPoints(history.start, history.values), attribution: STABLECOIN_SUPPLY_ATTRIBUTION, ...cachedSeriesNote(resource) };
     },
   },
 ];
+
+/** What a chart of the total cites: DefiLlama's measure, each day dated by the UTC day it closes. */
+const DEFI_TVL_ATTRIBUTION = { source: `DefiLlama total DeFi TVL, ${DEFI_DAY_CONVENTION}`, publisher: "DefiLlama" } as const;
 
 /** Total value locked in DeFi, as CRYP's DeFi tab charts it. */
 const DEFI_TVL_SERIES: SeriesDefinition = {
@@ -59,11 +72,13 @@ const DEFI_TVL_SERIES: SeriesDefinition = {
   group: "Crypto",
   tags: ["defi", "tvl", "total value locked", "on-chain", "protocols", "chains"],
   description: "Total value locked in DeFi protocols across every chain, valued in USD, daily since 2018, as DefiLlama measures it and CRYP's DeFi tab charts it.",
+  publisher: "DefiLlama",
   load: async () => {
     const resource = await loadDefiTvl();
     const history = resource.payload.history;
     if (!history) throw new Error("DeFi TVL is not available yet.");
-    return { points: dailyPoints(history.start, history.total), warning: cachedSeriesWarning(resource) };
+    // Each day is that UTC day's close, which DefiLlama stamps 00:00 UTC the day after: the source line says which.
+    return { points: dailyPoints(history.start, history.total), attribution: DEFI_TVL_ATTRIBUTION, ...cachedSeriesNote(resource) };
   },
 };
 
@@ -114,4 +129,5 @@ export const CRYPTO_SERIES: readonly SeriesDefinition[] = [
   },
   ...STABLECOIN_SUPPLY_SERIES,
   DEFI_TVL_SERIES,
+  ...BITCOIN_NETWORK_SERIES,
 ];

@@ -24,6 +24,7 @@ import { getSharedRegistry } from "../plugins/registry";
 import { useViewport } from "../react/input";
 import { useAppStateRef } from "../state/app/context";
 import { useThemeColors } from "../theme/theme-context";
+import { placeholderText } from "../theme/colors";
 import {
   Box,
   Text,
@@ -40,6 +41,7 @@ import { Checkbox } from "./ui/checkbox";
 import { FRAMED_TEXTAREA_DESKTOP_STYLE } from "./ui/fields";
 import { DialogFrame } from "./ui/frame";
 import { TERMINAL_MESSAGE_KEYS } from "./textarea-keys";
+import { logFailure } from "../utils/log-failure";
 
 /** What the person typed, kept when the dialog closes without sending. */
 const draft = { message: "" };
@@ -213,7 +215,7 @@ function FeedbackDialog({
             placeholder={t("What happened, or what would you like to see?")}
             focused
             textColor={colors.text}
-            placeholderColor={colors.textDim}
+            placeholderColor={placeholderText(colors)}
             backgroundColor={colors.panel}
             flexGrow={1}
             wrapText
@@ -294,7 +296,8 @@ export function FeedbackDialogHost() {
         try {
           const frame = nativeRenderer.captureFrame?.();
           if (frame) terminalScreenshot = terminalFrameScreenshot(frame);
-        } catch {
+        } catch (error) {
+          logFailure("feedback-dialog", "Capture terminal screenshot for feedback failed")(error);
           terminalScreenshot = null;
         }
         const buildReport = ({ message, screenshot }: { message: string; screenshot: FeedbackScreenshot | null }): FeedbackSubmitRequest => ({

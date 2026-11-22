@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { MarketDataCoordinator } from "../../../market-data/coordinator";
 import type { HeadlessPaneDefinition } from "../../../types/plugin";
 import { resolveHeadlessInstrument } from "../shared/headless-market-data";
@@ -5,16 +6,16 @@ import { loadPeBandInputs } from "./client";
 import { formatPerShare, fxPairQuote, projectPeBand } from "./model";
 import { DAILY_CLOSES } from "../shared/report-freshness";
 
-const multiple = (value: unknown) => typeof value === "number" ? `${value.toFixed(1)}x` : "--";
-const amount = (value: unknown) => typeof value === "number" ? formatPerShare(value) : "--";
-const percent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(1)}%` : "--";
+const multiple = (value: unknown) => typeof value === "number" ? `${value.toFixed(1)}x` : MISSING_VALUE;
+const amount = (value: unknown) => typeof value === "number" ? formatPerShare(value) : MISSING_VALUE;
+const percent = (value: unknown) => typeof value === "number" ? `${(value * 100).toFixed(1)}%` : MISSING_VALUE;
 
 export const peBandHeadless: HeadlessPaneDefinition<"bundle"> = {
   shape: "bundle", argument: { kind: "ticker", description: "Ticker" },
   freshness: { ...DAILY_CLOSES, basis: "daily closes and reported EPS" },
   describe: (args) => `PEB ${args.symbols[0] ?? ""}`,
   discovery: { screenshotReadiness: "live-dom", limitations: [
-    "Weekly closes. EPS reported in another currency than the price is converted at daily FX closes, through the dollar when neither is USD.",
+    "Weekly closes; each EPS figure is priced at the close of the day it became known where daily closes reach. EPS reported in another currency than the price is converted at daily FX closes, through the dollar when neither is USD.",
   ] },
   options: [
     { key: "lookbackYears", type: "integer", minimum: 0, maximum: 30, defaultValue: 10, description: "Years of history; 0 for all on record" },
@@ -25,7 +26,7 @@ export const peBandHeadless: HeadlessPaneDefinition<"bundle"> = {
     ctx.signal.throwIfAborted();
     const lookbackYears = Number(args.options.lookbackYears ?? 10);
     const model = projectPeBand(inputs.financials, inputs.history, { symbol: instrument.symbol, lookbackYears, reports: inputs.reports,
-      fx: inputs.fx, fxError: inputs.fxError });
+      fx: inputs.fx, fxError: inputs.fxError, daily: inputs.daily });
     const current = model.current;
     const conversion = model.conversion;
     const pairQuote = (close: { from: string; to: string; rate: number }) => {
@@ -38,12 +39,12 @@ export const peBandHeadless: HeadlessPaneDefinition<"bundle"> = {
       sections: [
         { title: "P/E band", columns: [{ key: "label", header: "" }, { key: "value", header: "Value" }], rows: [
           { label: "Trailing P/E", value: multiple(current?.pe) },
-          { label: "Percentile of own history", value: current?.percentile == null ? "--" : `${current.percentile.toFixed(0)}` },
-          { label: "Ranked over", value: model.sample ? `${model.sample.weeks} weeks since ${model.sample.start.toISOString().slice(0, 10)}` : "--" },
-          { label: "P/E low, median, high", value: model.range ? `${multiple(model.range.min)}, ${multiple(model.range.median)}, ${multiple(model.range.max)}` : "--" },
+          { label: "Percentile of own history", value: current?.percentile == null ? MISSING_VALUE : `${current.percentile.toFixed(0)}` },
+          { label: "Ranked over", value: model.sample ? `${model.sample.weeks} weeks since ${model.sample.start.toISOString().slice(0, 10)}` : MISSING_VALUE },
+          { label: "P/E low, median, high", value: model.range ? `${multiple(model.range.min)}, ${multiple(model.range.median)}, ${multiple(model.range.max)}` : MISSING_VALUE },
           { label: "Price", value: `${amount(current?.price)} ${model.currency ?? ""}`.trim() },
           { label: "Trailing EPS", value: current?.step
-            ? `${amount(current.eps)} (${current.step.basis === "annual" ? "FY" : "TTM"} ${current.step.periodEnd})${reported}` : "--" },
+            ? `${amount(current.eps)} (${current.step.basis === "annual" ? "FY" : "TTM"} ${current.step.periodEnd})${reported}` : MISSING_VALUE },
         ] },
         { title: "Price at each multiple", columns: [{ key: "multiple", header: "Multiple", format: multiple }, { key: "price", header: "Price", format: amount }],
           rows: model.multiples.map((value) => ({ multiple: value, price: current?.eps != null && current.eps > 0 ? value * current.eps : null })) },
@@ -53,7 +54,7 @@ export const peBandHeadless: HeadlessPaneDefinition<"bundle"> = {
           { key: "yoy", header: "YoY", format: percent }, { key: "price", header: "Price", format: amount }, { key: "pe", header: "P/E", format: multiple }],
         rows: model.rows.map((row) => ({ periodEnd: row.periodEnd, basis: row.basis === "annual" ? "FY" : "TTM",
           knownAt: row.dated ? row.knownAt.toISOString().slice(0, 10) : "period end", eps: row.eps,
-          ...(conversion ? { currency: row.currency, fx: row.fx ? `${pairQuote(row.fx)} (${row.fx.date})` : row.currency === model.currency ? "" : "--" } : {}),
+          ...(conversion ? { currency: row.currency, fx: row.fx ? `${pairQuote(row.fx)} (${row.fx.date})` : row.currency === model.currency ? "" : MISSING_VALUE } : {}),
           yoy: row.yoy, price: row.price, pe: row.pe })) },
       ],
       complete: !inputs.stale && !inputs.error && !inputs.historyError && !model.error,

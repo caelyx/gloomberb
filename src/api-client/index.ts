@@ -1,3 +1,4 @@
+import { getLanguage } from "../i18n";
 import { logFailure } from "../utils/log-failure";
 import {
   isMarketplaceLayoutId,
@@ -15,6 +16,7 @@ import {
 } from "../layout-marketplace/cloud";
 import { SyncRevisionConflictError, type SyncSnapshot } from "../sync/types";
 import { withDeadline } from "../utils/async-deadline";
+import { sliceWholeCharacters } from "../utils/untrusted-text";
 import { CloudASKGApi } from "./askg";
 import { CloudAuthApi } from "./auth";
 import { CloudChatApi } from "./chat";
@@ -24,17 +26,27 @@ import { CloudApiRequestTransport, putWithRevision } from "./request";
 import { CloudApiSocket } from "./socket";
 import { CloudCollectionsApi } from "./collections";
 import { CloudFeedbackApi } from "./feedback";
+import { CloudRoadmapApi } from "./roadmap";
+import { CloudWaitlistApi } from "./product-waitlist";
+import { CloudHeardFromApi } from "./heard-from";
 import { CloudNotesApi } from "./notes";
 import { CloudTeamsApi } from "./teams";
 import { CloudTelemetryApi } from "./telemetry";
 import { CloudThesesApi } from "./theses";
 import { CloudViewsApi } from "./views";
+import { readYearlyPlanStatus, readYearlyResult, readYearlyReview } from "./yearly-plan";
 import type { CommandSearchReport } from "./telemetry";
 import type {
   AssistCommandDescriptor,
   AssistCommandResponse,
   AuthUser,
+  CloudCancelFeedback,
+  CloudRetentionOffer,
+  CloudRetentionOfferAnswer,
   CloudSyncPushResponse,
+  CloudYearlyPlanStatus,
+  CloudYearlyResult,
+  CloudYearlyReview,
   CloudSyncSnapshotResponse,
   PersistedAuthUser
 } from "./types";
@@ -45,6 +57,7 @@ export type { ChatPaneLink } from "./chat-pane-link";
 export { NoteConflictError } from "./notes";
 export { ThesisConflictError, ThesisGoalpostError } from "./theses";
 export { TeamRevisionConflictError } from "./views";
+export { yearlyRefusalCode } from "./yearly-plan";
 export type * from "./types";
 export type {
   CommandSearchChoice,
@@ -54,6 +67,8 @@ export type {
   CrashReportSurface,
   CrashReportsPayload,
   FunctionUsageCount,
+  InstallExperimentAnswer,
+  InstallExperimentReport,
   UpdateFailureReport,
   UsageCountsPayload,
   UsageCountsSurface,
@@ -64,6 +79,17 @@ const ASSIST_QUERY_MAX_LENGTH = 200;
 const ASSIST_COMMAND_LIMIT = 150;
 /** The futures curve's root list is the longest a command sends: 76. */
 export const ASSIST_ARG_OPTION_LIMIT = 128;
+/** The longest cancel note the server keeps, in UTF-16 units as its schema counts them. */
+export const CLOUD_CANCEL_COMMENT_MAX = 500;
+
+/** The reason and note a cancel step sends, the note trimmed to what the server keeps. */
+function cancelFeedbackBody(feedback: CloudCancelFeedback): CloudCancelFeedback {
+  const comment = feedback.comment === undefined ? undefined : sliceWholeCharacters(feedback.comment.trim(), CLOUD_CANCEL_COMMENT_MAX);
+  return {
+    ...(feedback.reason ? { reason: feedback.reason } : {}),
+    ...(comment ? { comment } : {}),
+  };
+}
 const ASSIST_ARG_OPTION_VALUE_MAX_LENGTH = 40;
 const ASSIST_ARG_OPTION_LABEL_MAX_LENGTH = 60;
 const ASSIST_REQUEST_TIMEOUT_MS = 6_000;
@@ -86,6 +112,17 @@ function capAssistArgOptions(command: AssistCommandDescriptor): AssistCommandDes
   return { ...command, arg: fits ? { ...arg, options: capped } : arg };
 }
 
+/** Whether a socket's account fields differ from the user held now; a field it leaves out changes nothing. */
+function changesUser(current: AuthUser, update: Partial<AuthUser>): boolean {
+  const held = current as unknown as Record<string, unknown>;
+  return Object.entries(update).some(([key, value]) => {
+    const before = held[key];
+    if (Object.is(before, value)) return false;
+    if (!before || !value || typeof before !== "object" || typeof value !== "object") return true;
+    return JSON.stringify(before) !== JSON.stringify(value);
+  });
+}
+
 interface PendingSessionRequest {
   promise: Promise<AuthUser | null>;
   consumers: Array<() => boolean>;
@@ -106,6 +143,8 @@ class GloomApiClient {
   private sessionRevalidationGeneration = 0;
   private sessionRevalidationTimer: ReturnType<typeof setTimeout> | null = null;
   private sessionChecked = false;
+  /** When a session check last answered for the credential in place (`recentSession`). */
+  private sessionCheckedAt: number | null = null;
   /** Last few session transitions, content-free, for app://auth. */
   private authTrace: Array<{ at: number; event: string; token: boolean; user: string }> = [];
   private sessionRequest: PendingSessionRequest | null = null;
@@ -135,12 +174,19 @@ class GloomApiClient {
         this.emitCurrentUserChange();
       }
     },
-    updateCurrentUserFromSocket: (user) => {
+    updateCurrentUserFromSocket: (user, { resync }) => {
+      // Every connection's hello repeats the account. A reconnect that changes
+      // nothing must not tell every listener the user changed: each would load
+      // its data again (teams, theses, sync), and after a server restart every
+      // client reconnects at once. After a long silence they do load again, for
+      // what changed while nothing arrived.
+      if (!this.currentUser || (!resync && !changesUser(this.currentUser, user))) return;
       this.updateCurrentUser((currentUser) => ({
         ...currentUser,
         ...user,
       }));
     },
+    onServiceAnswered: () => this.transport.noteServiceAnswered(),
   });
   private readonly chat: CloudChatApi = new CloudChatApi({
     request: (path, options) => this.request(path, options),
@@ -154,6 +200,9 @@ class GloomApiClient {
   private readonly data: CloudDataApi = new CloudDataApi((path, options) => this.request(path, options));
   private readonly notes: CloudNotesApi = new CloudNotesApi((path, options) => this.request(path, options));
   private readonly feedback: CloudFeedbackApi = new CloudFeedbackApi((path, options) => this.request(path, options));
+  private readonly roadmap: CloudRoadmapApi = new CloudRoadmapApi((path, options) => this.request(path, options));
+  private readonly waitlist: CloudWaitlistApi = new CloudWaitlistApi((path, options) => this.request(path, options));
+  private readonly heardFrom: CloudHeardFromApi = new CloudHeardFromApi((path, options) => this.request(path, options));
   private readonly telemetry: CloudTelemetryApi = new CloudTelemetryApi((path, options) => this.request(path, options));
   private readonly theses: CloudThesesApi = new CloudThesesApi((path, options) => this.request(path, options));
   private readonly collections: CloudCollectionsApi = new CloudCollectionsApi((path, options) => this.request(path, options));
@@ -223,6 +272,14 @@ class GloomApiClient {
    */
   isSignedIn(): boolean {
     return !!this.transport.getSessionToken() || !!this.currentUser;
+  }
+
+  /**
+   * Whether a request sent now carries a session: the token this client
+   * holds, or, in the browser, the cookie it cannot see and assumes is there.
+   */
+  hasSessionCredential(): boolean {
+    return this.transport.hasSessionCredential();
   }
 
   /** Notifies when the user or credential changes, including plan and trial entitlement. */
@@ -302,6 +359,8 @@ class GloomApiClient {
     const changed = this.socketEntitlementKey(this.currentUser) !== this.socketEntitlementKey(user);
     this.traceAuth("setCurrentUser", user);
     this.currentUser = user;
+    // Another account, or a plan that changed, reads other answers: no later read joins one sent before.
+    if (changed) this.transport.forgetSharedReads();
     if (confirmSession) {
       this.clearSessionRevalidationTimer();
       this.verifiedSessionIdentity = user ? {} : null;
@@ -360,6 +419,9 @@ class GloomApiClient {
     this.withSessionTransition((isCurrent) => this.auth.signUp(email, username, name, password, isCurrent));
   signIn = (email: string, password: string) =>
     this.withSessionTransition((isCurrent) => this.auth.signIn(email, password, isCurrent));
+  signInWithGoogle = (idToken: string) =>
+    this.withSessionTransition((isCurrent) => this.auth.signInWithGoogle(idToken, isCurrent));
+  getOneTapConfig = this.auth.getOneTapConfig.bind(this.auth);
   startDeviceSignIn = this.auth.startDeviceSignIn.bind(this.auth);
   pollDeviceSignIn = this.auth.pollDeviceSignIn.bind(this.auth);
   signOut = () => this.withSessionTransition((isCurrent) => this.auth.signOut(isCurrent), false);
@@ -474,6 +536,17 @@ class GloomApiClient {
     }
   }
 
+  /**
+   * What a session check made within `maxAgeMs` found for the credential in
+   * place, or undefined when none did and the server has to be asked. Lets a
+   * view that opens right after the app checked its session use that answer.
+   */
+  recentSession(maxAgeMs: number): { user: AuthUser | null } | undefined {
+    if (!this.sessionChecked || this.sessionCheckedAt === null || this.sessionTransitions > 0 || this.sessionRequest) return undefined;
+    if (Date.now() - this.sessionCheckedAt > maxAgeMs) return undefined;
+    return { user: this.currentUser };
+  }
+
   async getSession(isCurrent: () => boolean = () => true): Promise<AuthUser | null> {
     if (!isCurrent()) return this.currentUser;
     const existing = this.sessionRequest;
@@ -497,6 +570,7 @@ class GloomApiClient {
         .then(({ user, validated }) => {
           if (validated && canApply()) {
             this.sessionChecked = true;
+            this.sessionCheckedAt = Date.now();
             this.clearSessionRevalidationTimer();
           }
           this.traceAuth(validated ? "getSession:done" : "getSession:retained", user);
@@ -521,10 +595,14 @@ class GloomApiClient {
   /**
    * Creates a Stripe checkout session for Cloud Pro; the URL opens in a browser.
    * `link` is a short link to the same checkout, to read or scan on another
-   * device. Older servers send none.
+   * device. Older servers send none. `lang` is the app's language, for the
+   * text the server adds to the checkout page.
    */
   async createCloudCheckout(returnTo?: string, interval: "month" | "year" = "month"): Promise<{ url: string; link?: string }> {
-    return this.request<{ url: string; link?: string }>("/stripe/checkout", { method: "POST", body: JSON.stringify({ returnTo, interval }) });
+    return this.request<{ url: string; link?: string }>("/stripe/checkout", {
+      method: "POST",
+      body: JSON.stringify({ returnTo, interval, lang: getLanguage() }),
+    });
   }
 
   async recordResearchActivity(payload: {
@@ -532,7 +610,7 @@ class GloomApiClient {
     surface: "web" | "desktop" | "tui" | "cli"; anonymousId?: string;
     attribution?: Record<string, string>; feature?: import("./research-activity").ResearchFeature;
     tab?: string; desks?: readonly string[]; placement?: string; teaser_kind?: "summary" | "sample" | "none";
-    cta?: "login" | "signup";
+    cta?: "login" | "signup"; reason?: string;
   }): Promise<void> {
     await this.request("/activity/research", { method: "POST", body: JSON.stringify(payload) });
   }
@@ -571,17 +649,107 @@ class GloomApiClient {
     return this.request<{ url: string }>("/stripe/portal", { method: "POST", body: JSON.stringify({}) });
   }
 
+  async createInvoicePayment(): Promise<{ url: string }> {
+    const result = await this.request<{ url: string }>("/stripe/pay-invoice", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    const url = new URL(result.url);
+    if (url.origin !== "https://invoice.stripe.com" || url.username || url.password) {
+      throw new Error("Could not open invoice payment.");
+    }
+    return { url: url.href };
+  }
+
+  /** Whether this account's monthly Pro can move to yearly billing; reads only. */
+  async getCloudYearlyPlan(): Promise<CloudYearlyPlanStatus> {
+    return readYearlyPlanStatus(await this.request<unknown>("/stripe/subscription/yearly", { method: "GET" }));
+  }
+
+  /** The exact charge of switching to yearly now. Charges nothing. */
+  async previewCloudYearlyPlan(): Promise<CloudYearlyReview> {
+    const body = await this.request<{ review?: unknown }>("/stripe/subscription/yearly/preview", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    const review = readYearlyReview(body?.review);
+    if (!review) throw new Error("Couldn't work out the yearly total. Try again in a minute.");
+    return review;
+  }
+
+  /**
+   * Switches to yearly billing for exactly what `token`'s review showed. Call it
+   * only after the person confirmed that review. Refusals (a total that moved,
+   * a switch already going through) are ApiRequestErrors; `yearlyRefusalCode`
+   * names them.
+   */
+  async confirmCloudYearlyPlan(token: string): Promise<CloudYearlyResult> {
+    const body = await this.request<unknown>("/stripe/subscription/yearly/confirm", {
+      method: "POST",
+      body: JSON.stringify({ token }),
+    });
+    const result = readYearlyResult(body);
+    if (!result) throw new Error("We couldn't confirm the switch. Refresh your account before trying again.");
+    return result;
+  }
+
   /**
    * Ends the Pro trial and Pro now, unbilled. Call it only once the person
    * confirmed a warning that says so. `endedNow` is false when the server
    * scheduled the cancel at the period end instead: the subscription was no
-   * longer in its trial, or the server predates ending a trial early.
+   * longer in its trial, or the server predates ending a trial early. The
+   * reason and note, when given, go to the billing provider with the cancel.
    */
-  async endCloudTrial(): Promise<{ canceled: boolean; endedNow?: boolean }> {
+  async endCloudTrial(feedback: CloudCancelFeedback = {}): Promise<{ canceled: boolean; endedNow?: boolean }> {
     return this.request<{ canceled: boolean; endedNow?: boolean }>("/stripe/subscription/cancel", {
       method: "POST",
-      body: JSON.stringify({ endTrialNow: true }),
+      body: JSON.stringify({ ...cancelFeedbackBody(feedback), endTrialNow: true }),
     });
+  }
+
+  /**
+   * Stops a paid Pro plan from renewing: it keeps Pro to the end of the period
+   * it paid for. The same request gloom.sh's cancel window sends, the reason
+   * and note with it when given. Call it only once the person confirmed.
+   */
+  async cancelCloudSubscription(feedback: CloudCancelFeedback = {}): Promise<{ canceled: boolean; endedNow?: boolean }> {
+    return this.request<{ canceled: boolean; endedNow?: boolean }>("/stripe/subscription/cancel", {
+      method: "POST",
+      body: JSON.stringify(cancelFeedbackBody(feedback)),
+    });
+  }
+
+  /**
+   * The save offer and the kept price the cancel flow shows, read as it opens.
+   * The server counts this as the cancel flow starting.
+   */
+  async getCloudRetentionOffer(options?: { signal?: AbortSignal }): Promise<CloudRetentionOfferAnswer> {
+    const body = await this.request<Partial<CloudRetentionOfferAnswer> | null>("/stripe/subscription/retention-offer", {
+      method: "GET",
+      ...(options?.signal ? { signal: options.signal } : {}),
+    });
+    const offer = body?.offer === "discount" || body?.offer === "trial_extension" ? body.offer : null;
+    const kept = body?.keptPrice;
+    return {
+      offer,
+      extendedTrialEndsAt: typeof body?.extendedTrialEndsAt === "string" ? body.extendedTrialEndsAt : null,
+      keptPrice: kept && Number.isFinite(kept.amount) && Number.isFinite(kept.listAmount)
+        && (kept.interval === "month" || kept.interval === "year")
+        ? { amount: kept.amount, listAmount: kept.listAmount, interval: kept.interval }
+        : null,
+    };
+  }
+
+  /** Takes the save offer the cancel flow showed, with the reason and note picked. */
+  async acceptCloudRetentionOffer(feedback: CloudCancelFeedback = {}): Promise<{ offer: CloudRetentionOffer | null; extendedTrialEndsAt: string | null }> {
+    const body = await this.request<{ offer?: unknown; extendedTrialEndsAt?: unknown } | null>("/stripe/subscription/retention-offer", {
+      method: "POST",
+      body: JSON.stringify(cancelFeedbackBody(feedback)),
+    });
+    return {
+      offer: body?.offer === "discount" || body?.offer === "trial_extension" ? body.offer : null,
+      extendedTrialEndsAt: typeof body?.extendedTrialEndsAt === "string" ? body.extendedTrialEndsAt : null,
+    };
   }
 
   /**
@@ -591,8 +759,6 @@ class GloomApiClient {
   async recordExperimentExposure(payload: {
     eventId: string; surface: "web" | "desktop" | "tui" | "cli"; anonymousId?: string;
     attribution?: Record<string, string>; experiment: string; variant?: string;
-    /** Where the experiment showed, by a content-free id like an upgrade placement. */
-    placement?: string;
   }, signal?: AbortSignal): Promise<import("./web-experiments").ExperimentAnswer> {
     return this.request("/activity/research", {
       method: "POST",
@@ -606,6 +772,7 @@ class GloomApiClient {
   getBuildoutAccount = this.auth.getBuildoutAccount.bind(this.auth);
   getBuildoutToken = this.auth.getBuildoutToken.bind(this.auth);
   updateAccountProfile = this.auth.updateAccountProfile.bind(this.auth);
+  getReferralInvite = this.auth.getReferralInvite.bind(this.auth);
   getCalendarFeed = this.auth.getCalendarFeed.bind(this.auth);
   ensureCalendarFeed = this.auth.ensureCalendarFeed.bind(this.auth);
   rotateCalendarFeed = this.auth.rotateCalendarFeed.bind(this.auth);
@@ -866,8 +1033,18 @@ class GloomApiClient {
   putCloudNote = this.notes.putNote.bind(this.notes);
   submitFeedback = this.feedback.submitFeedback.bind(this.feedback);
   listFeedback = this.feedback.listFeedback.bind(this.feedback);
+  getRoadmap = this.roadmap.getRoadmap.bind(this.roadmap);
+  setRoadmapVote = this.roadmap.setRoadmapVote.bind(this.roadmap);
+  getWaitlist = this.waitlist.getWaitlist.bind(this.waitlist);
+  joinWaitlist = this.waitlist.joinWaitlist.bind(this.waitlist);
+  leaveWaitlist = this.waitlist.leaveWaitlist.bind(this.waitlist);
+  getHeardFrom = this.heardFrom.getHeardFrom.bind(this.heardFrom);
+  reportHeardFromShown = this.heardFrom.reportHeardFromShown.bind(this.heardFrom);
+  answerHeardFrom = this.heardFrom.answerHeardFrom.bind(this.heardFrom);
+  skipHeardFrom = this.heardFrom.skipHeardFrom.bind(this.heardFrom);
   reportCrashErrors = this.telemetry.reportCrashErrors.bind(this.telemetry);
   reportUsageCounts = this.telemetry.reportUsageCounts.bind(this.telemetry);
+  reportInstallExperiment = this.telemetry.reportInstallExperiment.bind(this.telemetry);
   reportAttentionCounts = this.telemetry.reportAttentionCounts.bind(this.telemetry);
   deleteCloudNote = this.notes.deleteNote.bind(this.notes);
   listTheses = this.theses.listTheses.bind(this.theses);
@@ -903,6 +1080,7 @@ class GloomApiClient {
     this.sessionRequestGeneration += 1;
     this.sessionRequest = null;
     this.socket.dispose();
+    this.transport.dispose();
   }
 
   searchInstruments = this.data.searchInstruments.bind(this.data);
@@ -943,15 +1121,21 @@ class GloomApiClient {
   getCloudStablecoinSupply = this.data.getCloudStablecoinSupply.bind(this.data);
   getCloudStablecoinSupplyHistory = this.data.getCloudStablecoinSupplyHistory.bind(this.data);
   getCloudDefiTvl = this.data.getCloudDefiTvl.bind(this.data);
+  getCloudBitcoinNetwork = this.data.getCloudBitcoinNetwork.bind(this.data);
   getCloudCentralBankRates = this.data.getCloudCentralBankRates.bind(this.data);
+  getCloudFxInterventions = this.data.getCloudFxInterventions.bind(this.data);
+  getCloudHkTenders = this.data.getCloudHkTenders.bind(this.data);
   getMobileAlertHistory = this.data.getMobileAlertHistory.bind(this.data);
   getScannerFlowHistory = this.data.getScannerFlowHistory.bind(this.data);
+  getScannerFlowSession = this.data.getScannerFlowSession.bind(this.data);
   getLiveScan = this.data.getLiveScan.bind(this.data);
   getCloudEstimateRevisions = this.data.getCloudEstimateRevisions.bind(this.data);
   getCloudMoneyMarkets = this.data.getCloudMoneyMarkets.bind(this.data);
+  getCloudHongKongMoneyMarkets = this.data.getCloudHongKongMoneyMarkets.bind(this.data);
   equityScreener = this.data.equityScreener.bind(this.data);
   getMemberFunds = this.data.getMemberFunds.bind(this.data);
   getFundMembers = this.data.getFundMembers.bind(this.data);
+  getStockFunds = this.data.getStockFunds.bind(this.data);
   getFundBreadth = this.data.getFundBreadth.bind(this.data);
   getFundChanges = this.data.getFundChanges.bind(this.data);
   getFundFacts = this.data.getFundFacts.bind(this.data);
@@ -962,6 +1146,9 @@ class GloomApiClient {
   optionsPositioning = this.data.optionsPositioning.bind(this.data);
   getCloudBankFigures = this.data.getCloudBankFigures.bind(this.data);
   getCloudDebtMaturities = this.data.getCloudDebtMaturities.bind(this.data);
+  getCloudStoredBond = this.data.getCloudStoredBond.bind(this.data);
+  getCloudStoredIssuerBonds = this.data.getCloudStoredIssuerBonds.bind(this.data);
+  getCloudIssuerBondIssues = this.data.getCloudIssuerBondIssues.bind(this.data);
   getCloudRevenueBreakdown = this.data.getCloudRevenueBreakdown.bind(this.data);
   getCloudMnaDeals = this.data.getCloudMnaDeals.bind(this.data);
   getCloudMnaDeal = this.data.getCloudMnaDeal.bind(this.data);
@@ -977,9 +1164,12 @@ class GloomApiClient {
   getCloudCryptoEtfFlows = this.data.getCloudCryptoEtfFlows.bind(this.data);
   getCloudSocialMentions = this.data.getCloudSocialMentions.bind(this.data);
   getCloudSocialMentionPosts = this.data.getCloudSocialMentionPosts.bind(this.data);
+  getCloudSocialOutliers = this.data.getCloudSocialOutliers.bind(this.data);
   getCloudFuturesCurve = this.data.getCloudFuturesCurve.bind(this.data);
   getCloudFuturesCurveAsOf = this.data.getCloudFuturesCurveAsOf.bind(this.data);
   getCloudFuturesContract = this.data.getCloudFuturesContract.bind(this.data);
+  getCloudFuturesContracts = this.data.getCloudFuturesContracts.bind(this.data);
+  batchesReads = this.data.batchesReads.bind(this.data);
   getCloudRatePath = this.data.getCloudRatePath.bind(this.data);
   getCloudShiller = this.data.getCloudShiller.bind(this.data);
   getCloudCotBoard = this.data.getCloudCotBoard.bind(this.data);
@@ -1004,12 +1194,16 @@ class GloomApiClient {
   getCloudPerpsHistory = this.data.getCloudPerpsHistory.bind(this.data);
   getCloudPerpsRankings = this.data.getCloudPerpsRankings.bind(this.data);
   getCloudPerpsCompare = this.data.getCloudPerpsCompare.bind(this.data);
+  getCloudPerpsLiquidations = this.data.getCloudPerpsLiquidations.bind(this.data);
+  getCloudPerpsDepth = this.data.getCloudPerpsDepth.bind(this.data);
   getCloudPerpsEquity = this.data.getCloudPerpsEquity.bind(this.data);
   getCloudPerpsEquities = this.data.getCloudPerpsEquities.bind(this.data);
   getCloudPerpsMarket = this.data.getCloudPerpsMarket.bind(this.data);
   analyzeCloudExposure = this.data.analyzeCloudExposure.bind(this.data);
   getCloudExposureScenarios = this.data.getCloudExposureScenarios.bind(this.data);
   getCloudSupplyGraph = this.data.getCloudSupplyGraph.bind(this.data);
+  getCloudSupplyChains = this.data.getCloudSupplyChains.bind(this.data);
+  getCloudSupplyGraphs = this.data.getCloudSupplyGraphs.bind(this.data);
   getCloudSupplyPaths = this.data.getCloudSupplyPaths.bind(this.data);
   getCloudSupplyChain = this.data.getCloudSupplyChain.bind(this.data);
   getCloudAwards = this.data.getCloudAwards.bind(this.data);
@@ -1072,6 +1266,7 @@ class GloomApiClient {
   getCloudNews = this.data.getCloudNews.bind(this.data);
   searchCloudNews = this.data.searchCloudNews.bind(this.data);
   getCloudNewsStory = this.data.getCloudNewsStory.bind(this.data);
+  getCloudInsiderFilingStories = this.data.getCloudInsiderFilingStories.bind(this.data);
   getCloudTickerTweets = this.data.getCloudTickerTweets.bind(this.data);
   searchCloudTweets = this.data.searchCloudTweets.bind(this.data);
 }

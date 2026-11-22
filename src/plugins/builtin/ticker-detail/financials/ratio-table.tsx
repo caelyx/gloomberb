@@ -8,11 +8,12 @@ import {
 } from "../../../../components";
 import { useAssetData } from "../../../runtime";
 import { colors, priceColor } from "../../../../theme/colors";
+import { notMeaningfulColor } from "../../../../components/ui/not-meaningful";
 import type { PricePoint } from "../../../../types/financials";
-import { padTo } from "../../../../utils/format";
+import { displayWidth, padTo } from "../../../../utils/format";
 import { useBoundTicker, useTickerRequest } from "../../shared/ticker-request";
 import type { FinancialTableStatement } from "./aggregation";
-import { FINANCIAL_COL_W, FINANCIAL_LABEL_W } from "./model";
+import { FINANCIAL_COL_W, financialLabelWidth } from "./model";
 import { loadPeriodEndHistory } from "./period-end-history";
 import {
   formatRatioInput,
@@ -28,6 +29,28 @@ export type RatioTableColumn = DataTableColumn & (
 );
 
 const ratioRowKey = (row: RatioTableRow) => row.id;
+
+/**
+ * A ratio's name in the metric column, after its disclosure, a cell apart: as wide as it says
+ * (`contentWidth`), so the table fits the column to it whole. The desktop draws the disclosure as a
+ * path, not a glyph.
+ */
+export function ratioNameCell(
+  row: Extract<RatioTableRow, { kind: "ratio" }>,
+  color: string,
+): Pick<DataTableCell, "text" | "contentWidth" | "content"> {
+  const text = `${row.expanded ? "▾" : "▸"} ${row.label}`;
+  return {
+    text,
+    contentWidth: displayWidth(text),
+    content: (
+      <Box flexDirection="row" alignItems="center" gap={1}>
+        <DisclosureMarker expanded={row.expanded} color={color} />
+        <Text fg={color}>{row.label}</Text>
+      </Box>
+    ),
+  };
+}
 
 export interface PeriodEndHistoryState {
   data: PricePoint[] | undefined;
@@ -56,8 +79,9 @@ export function PeriodEndHistoryLoader({ oldestPeriodEnd, onChange }: {
   return null;
 }
 
+/** A figure in its colour; N/M as every pane draws it; any other gap muted. */
 function amountColor(amount: RatioAmount, color: string): string {
-  return typeof amount === "number" ? color : colors.textMuted;
+  return typeof amount === "number" ? color : amount === "not-meaningful" ? notMeaningfulColor() : colors.textMuted;
 }
 
 export function RatioTable({
@@ -102,15 +126,8 @@ export function RatioTable({
         return { text: `    ${row.unitLabel}`, color: colors.textDim };
       }
       return {
-        text: `${row.expanded ? "▾" : "▸"} ${row.label}`,
+        ...ratioNameCell(row, colors.text),
         color: colors.text,
-        // The desktop draws the disclosure as a path, not a glyph.
-        content: (
-          <Box flexDirection="row" alignItems="center" gap={1}>
-            <DisclosureMarker expanded={row.expanded} color={colors.text} />
-            <Text fg={colors.text}>{row.label}</Text>
-          </Box>
-        ),
         onMouseDown: (event) => {
           event.preventDefault?.();
           event.stopPropagation?.();
@@ -146,6 +163,8 @@ export function RatioTable({
       headerScrollId={headerScrollId}
       bodyScrollId={bodyScrollId}
       columns={columns}
+      // The statements' fiscal periods: an axis, not columns to arrange.
+      columnReorder={false}
       items={rows}
       selection={{
         kind: "id",
@@ -170,6 +189,6 @@ export function RatioTable({
   );
 }
 
-export function ratioMetricColumn(): RatioTableColumn {
-  return { id: "metric", kind: "metric", label: "Ratio", width: FINANCIAL_LABEL_W, align: "left" };
+export function ratioMetricColumn(width: number): RatioTableColumn {
+  return { id: "metric", kind: "metric", label: "Ratio", width: financialLabelWidth(width), align: "left" };
 }

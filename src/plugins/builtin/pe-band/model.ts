@@ -1,39 +1,21 @@
 import { fxLegForCurrency } from "../../../market-data/coordinator/fx-legs";
 import { regularSessionValuationPrice } from "../../../market-data/quotes/regular-session-valuation";
 import { fxCloseOnOrBefore, type FxCloses } from "../../../market-data/fx-closes";
-import { extractFundamentalSeries, knownWhenFiled } from "../../../time-series/fundamentals";
-import type { SecuritySeriesSource, TimeSeriesPoint } from "../../../time-series/types";
+import { knownWhenFiled } from "../../../time-series/fundamentals";
+import { STALE_TRAILING_EPS_MS, trailingEpsSteps as sharedTrailingEpsSteps, type EpsStep } from "../../../time-series/filed-trailing-eps";
 import { createValuationCurrencyContext } from "../../../time-series/valuation-currency";
 import type { FinancialStatement, PricePoint, TickerFinancials } from "../../../types/financials";
 import { resolveCurrencyUnit, type CurrencyUnitInfo } from "../../../utils/currency-units";
-import { areNearbyFinancialPeriodEnds } from "../../../utils/financial-statements";
+import { notTheShare } from "../../../utils/share-multiples";
 import { datedByReport, type ReportDate } from "./report-dates";
+
+export type { EpsStep };
 
 const DAY_MS = 86_400_000;
 const YEAR_MS = 365.25 * DAY_MS;
-/**
- * A figure stops pricing weeks this long after its period end. Sixteen months
- * covers a fiscal year plus its filing, so a year of unavailable quarterly
- * sums falls back on the last annual figure but never on one long overdue.
- */
-const STALE_EPS_MS = 487 * DAY_MS;
 /** Spacing between band multiples, finest first; the first that needs four lines or fewer wins. */
 const MULTIPLE_STEPS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000];
 const MAX_BANDS = 4, MIN_BANDS = 3;
-
-/** One trailing-twelve-month EPS figure and when it became known. */
-export interface EpsStep {
-  /** ISO period end. */
-  periodEnd: string;
-  /** Four reported quarters summed, or a reported fiscal year. */
-  basis: "ttm" | "annual";
-  knownAt: Date;
-  /** False when no publication date or report is on record and `knownAt` is the period end. */
-  dated: boolean;
-  /** Statement currency units; null when unavailable (a declared gap or an incomplete run of quarters). */
-  eps: number | null;
-  currency: string | null;
-}
 
 interface PeBandWeek {
   date: Date;
@@ -44,7 +26,11 @@ interface PeBandWeek {
 }
 
 export interface PeBandRow extends EpsStep {
-  /** The close of the week the figure became known, in price units. */
+  /**
+   * The close of the day the figure became known (the last session on or
+   * before it), in price units; before the daily closes on record, the close
+   * of the weekly bar dated on or before it.
+   */
   price: number | null;
   pe: number | null;
   /** Change from the figure a year earlier in the same currency, when both are positive. */
@@ -74,7 +60,18 @@ export interface PeBandModel {
   symbol: string;
   /** Price currency. */
   currency: string | null;
+  /**
+   * The weekly closes the percentile and range rank over, each dated by the
+   * session it closed on where the daily closes cover its week (a bar is
+   * dated by its first day, its close by its last).
+   */
   weeks: PeBandWeek[];
+  /**
+   * What the chart draws: the weeks, and the close of each day a figure in
+   * the table became known, so selecting its row puts the chart's cursor on
+   * that day and the price the row reads.
+   */
+  points: PeBandWeek[];
   /** Newest first. */
   rows: PeBandRow[];
   multiples: number[];
@@ -100,34 +97,14 @@ export interface PeBandModel {
   notice: string | null;
 }
 
-function epsSeries(financials: TickerFinancials, period: "ttm" | "annual"): TimeSeriesPoint[] {
-  const source: SecuritySeriesSource = { kind: "security", instrument: { symbol: "" }, fieldId: "fundamental.eps", period, timestampMode: "available-at" };
-  return extractFundamentalSeries(financials, source);
-}
-
 /**
- * Trailing EPS through time, oldest first. Four reported quarters are summed
- * by the shared statement series, which keeps declared gaps and broken runs
- * of quarters unavailable. A reported fiscal year is itself a trailing
- * twelve-month figure; at a fiscal year end it replaces the quarterly sum.
- * A figure is known no later than the company's report of that quarter, when
- * `reports` has it, including one with no publication date of its own.
+ * Trailing EPS through time, oldest first, as the headline EPS (TTM) reads it
+ * (time-series/filed-trailing-eps). A figure is known no later than the
+ * company's report of that quarter, when `reports` has it, including one with
+ * no publication date of its own.
  */
 export function trailingEpsSteps(financials: TickerFinancials, reports: readonly ReportDate[] = []): EpsStep[] {
-  const known = (row: FinancialStatement) => datedByReport(knownWhenFiled(row), reports);
-  const adjusted = { ...financials, quarterlyStatements: financials.quarterlyStatements.map(known),
-    annualStatements: financials.annualStatements.map(known) };
-  const toStep = (basis: EpsStep["basis"]) => (point: TimeSeriesPoint): EpsStep => ({
-    periodEnd: point.observedAt.toISOString().slice(0, 10), basis, knownAt: point.date, dated: point.availableAt !== undefined,
-    eps: point.value != null && Number.isFinite(point.value) ? point.value : null, currency: point.provenance?.currency ?? null,
-  });
-  const steps = epsSeries(adjusted, "annual").map(toStep("annual"));
-  for (const step of epsSeries(adjusted, "ttm").map(toStep("ttm"))) {
-    const index = steps.findIndex((other) => areNearbyFinancialPeriodEnds(other.periodEnd, step.periodEnd));
-    if (index < 0) steps.push(step);
-    else if (steps[index]!.eps == null && step.eps != null) steps[index] = step;
-  }
-  return steps.sort((a, b) => a.knownAt.getTime() - b.knownAt.getTime() || a.periodEnd.localeCompare(b.periodEnd));
+  return sharedTrailingEpsSteps(financials, (row: FinancialStatement) => datedByReport(knownWhenFiled(row), reports));
 }
 
 /**
@@ -230,6 +207,32 @@ export function chooseMultiples(pes: readonly number[], current?: number | null)
   return [];
 }
 
+/** Positive closes in time order; cached history can carry ISO strings for dates. */
+function closesOf(history: readonly PricePoint[]): Array<{ date: Date; close: number }> {
+  return history.map((point) => ({ date: new Date(point.date), close: point.close }))
+    .filter((point) => Number.isFinite(point.date.getTime()) && Number.isFinite(point.close) && point.close > 0)
+    .sort((a, b) => a.date.getTime() - b.date.getTime());
+}
+
+/**
+ * Weekly bars dated by the session their close is from. A bar is dated by
+ * its week's first day, so DWSN's week of 9 Nov 2026 read 9 Nov with the
+ * close of Friday the 13th. Where the daily closes cover a week, the bar
+ * takes the date of the last daily close before the next bar; elsewhere it
+ * keeps its own.
+ */
+function closingSessions<T extends { date: Date }>(weekly: readonly T[], daily: readonly { date: Date }[]): T[] {
+  let at = 0;
+  return weekly.map((bar, index) => {
+    const from = bar.date.getTime();
+    const until = weekly[index + 1]?.date.getTime() ?? Number.POSITIVE_INFINITY;
+    while (at < daily.length && daily[at]!.date.getTime() < from) at += 1;
+    let last: { date: Date } | null = null;
+    while (at < daily.length && daily[at]!.date.getTime() < until) last = daily[at++]!;
+    return last ? { ...bar, date: last.date } : bar;
+  });
+}
+
 /** Percent of `values` at or below `value`. */
 function percentileRank(values: readonly number[], value: number): number | null {
   return values.length ? 100 * values.filter((other) => other <= value).length / values.length : null;
@@ -246,7 +249,7 @@ export function stepAt(steps: readonly EpsStep[], time: number): EpsStep | null 
     if (candidate.eps == null || candidate.knownAt.getTime() > time) continue;
     if (!step || candidate.periodEnd > step.periodEnd) step = candidate;
   }
-  return step && time - Date.parse(step.periodEnd) <= STALE_EPS_MS ? step : null;
+  return step && time - Date.parse(step.periodEnd) <= STALE_TRAILING_EPS_MS ? step : null;
 }
 
 export function projectPeBand(
@@ -258,12 +261,17 @@ export function projectPeBand(
     fx?: ReadonlyMap<string, FxCloses>;
     /** Why a needed FX history is missing, said when it leaves today's EPS unconverted. */
     fxError?: string | null;
+    /** Daily closes for the recent years they are served for (see `weeks` and `PeBandRow.price`). */
+    daily?: readonly PricePoint[];
   },
 ): PeBandModel {
   const currency = financials?.quote?.currency ?? null;
-  const empty: PeBandModel = { symbol: options.symbol, currency, weeks: [], rows: [], multiples: [], current: null, range: null, sample: null, bandCeiling: null,
+  const empty: PeBandModel = { symbol: options.symbol, currency, weeks: [], points: [], rows: [], multiples: [], current: null, range: null, sample: null, bandCeiling: null,
     undated: 0, unavailable: 0, conversion: null, error: null, notice: null };
   if (!financials) return { ...empty, error: "Fundamentals unavailable." };
+  // A warrant's, a right's, a unit's or an unratioed receipt's price over its company's EPS is no P/E at any date.
+  const share = notTheShare(financials);
+  if (share) return { ...empty, error: `No P/E: ${share}.` };
   const allSteps = trailingEpsSteps(financials, options.reports);
   const latest = allSteps.findLast((step) => step.eps != null);
   if (!latest) return { ...empty, error: "No trailing EPS on record." };
@@ -310,22 +318,25 @@ export function projectPeBand(
 
   const firstKnown = allSteps.find((step) => step.eps != null)!.knownAt.getTime();
   const start = Math.max(firstKnown, options.lookbackYears > 0 ? now - options.lookbackYears * YEAR_MS : firstKnown);
-  // Cached history can carry ISO strings for dates.
-  const sorted = history.map((point) => ({ date: new Date(point.date), close: point.close }))
-    .filter((point) => Number.isFinite(point.date.getTime()) && Number.isFinite(point.close) && point.close > 0)
-    .sort((a, b) => a.date.getTime() - b.date.getTime());
-  const weeks = sorted.filter((point) => point.date.getTime() >= start).map((point): PeBandWeek => {
+  const sorted = closesOf(history);
+  const daily = closesOf(options.daily ?? []);
+  const dailyStart = daily[0]?.date.getTime() ?? Number.POSITIVE_INFINITY;
+  /** A close as the chart reads it: with the EPS in force on its day, and the P/E they make. */
+  const reading = (point: { date: Date; close: number }): PeBandWeek => {
     // Converted at the FX close of the bar's date, the same date that picks the EPS in force, so each week's multiple
     // moves with the price and the currency together rather than with the rate of an old publication date.
     const eps = priced(stepAt(allSteps, point.date.getTime()), day(point.date))?.eps ?? null;
     const positive = eps != null && eps > 0 ? eps : null;
     return { date: point.date, close: point.close, eps: positive, pe: positive ? point.close / positive : null };
-  });
+  };
+  const weeks = closingSessions(sorted, daily).filter((point) => point.date.getTime() >= start).map(reading);
 
+  /** The close of the day `time` falls on, or the last session before it, where the daily closes reach. */
+  const dayClose = (time: number) => time >= dailyStart ? daily.findLast((point) => point.date.getTime() <= time) ?? null : null;
   const steps = allSteps.filter((step) => step.knownAt.getTime() >= start);
   const rows = steps.filter((step) => step.eps != null).map((step): PeBandRow => {
     const time = step.knownAt.getTime();
-    const price = sorted.findLast((point) => point.date.getTime() <= time)?.close ?? null;
+    const price = (dayClose(time) ?? sorted.findLast((point) => point.date.getTime() <= time))?.close ?? null;
     // Converted at the FX close of the day it became known.
     const converted = priced(step, day(step.knownAt));
     const eps = converted?.eps ?? null;
@@ -340,6 +351,8 @@ export function projectPeBand(
   const ordered = [...pes].sort((a, b) => a - b);
   // The regular session's price, as the quote headlines it: after the close, the close rather than an after-hours print.
   const price = regularSessionValuationPrice(financials.quote) ?? sorted.at(-1)?.close ?? null;
+  // Today's figure reads like every week's: one whose newest quarter has no EPS keeps the last figure, dated in the
+  // table, where the headline EPS (TTM) needs that quarter's own (filed-trailing-eps) and shows Gloom Cloud's, labelled.
   const currentStep = stepAt(allSteps, now);
   // Today's EPS at the latest completed FX close.
   const currentEps = priced(currentStep, day(now))?.eps ?? null;
@@ -348,8 +361,15 @@ export function projectPeBand(
   const multiples = chooseMultiples(pes, currentPe);
   const above = currentPe == null ? undefined : multiples.find((multiple) => multiple >= currentPe);
   const highestClose = weeks.reduce((max, week) => Math.max(max, week.close), 0);
+  // Each dated row's day on the chart, the close it reads: its cursor lands there, not on the week around it.
+  const rowDays = rows.flatMap((row) => {
+    const close = row.dated ? dayClose(row.knownAt.getTime()) : null;
+    return close && close.date.getTime() >= start ? [reading(close)] : [];
+  });
+  const byTime = new Map([...weeks, ...rowDays].map((point) => [point.date.getTime(), point]));
+  const points = [...byTime.values()].sort((a, b) => a.date.getTime() - b.date.getTime());
   return {
-    ...empty, weeks, rows, multiples,
+    ...empty, weeks, points, rows, multiples,
     conversion: latestFx ? { currency: latestFx.from, latest: latestFx } : null,
     sample: ranked.length ? { start: ranked[0]!.date, weeks: ranked.length } : null,
     bandCeiling: highestClose > 0 ? Math.max(highestClose * 1.5, above != null && currentEps != null ? above * currentEps : 0) : null,

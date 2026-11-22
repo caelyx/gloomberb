@@ -1,3 +1,4 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useMemo } from "react";
 import {
   DELAYED_SEGMENT,
@@ -18,12 +19,12 @@ import { useAutoRefresh } from "../../../react/auto-refresh";
 import { colors } from "../../../theme/colors";
 import { useThemeColors } from "../../../theme/theme-context";
 import type { PaneProps } from "../../../types/plugin";
-import { formatPercentileRank } from "../../../utils/format";
 import { usePluginPaneState } from "../../runtime";
-import { formatAsOf } from "../cds/model";
 import { FIXED_INCOME_PANE_ID } from "../fixed-income/model";
 import { useCommandValue } from "../shared/command-tab";
+import { reportFooterSegment } from "../shared/source-footer";
 import { getCachedCdxBoard, loadCdxBoard } from "./client";
+import { cdxHeadless } from "./headless";
 import {
   axisFormatter,
   cdxRows,
@@ -31,7 +32,9 @@ import {
   formatContract,
   formatLevel,
   formatMove,
+  formatSpreadRank,
   partialDayText,
+  SETTLEMENT_TEXT,
   type CdxRow,
 } from "./model";
 
@@ -64,20 +67,24 @@ function HistoryChart({ row, width, height, focused }: { row: CdxRow; width: num
 }
 
 function IndexDetail({ row, width, height, focused }: { row: CdxRow; width: number; height: number; focused: boolean }) {
-  const { index, year, day } = row;
+  const { index, year, day, rank } = row;
   // While today trades the moves run to the last complete day, which the 1D says.
   const through = day.partial && day.changeDate ? `to ${day.changeDate}` : undefined;
+  // The rank sits beside what it ranks: HY and EM's spread equivalent, not their price.
+  const rankOnSpreadEq = rank.basis === "spread-eq";
+  const spreadDetail = [...(rankOnSpreadEq ? [formatSpreadRank(rank)] : []),
+    ...(index.recovery != null ? [`${Math.round(index.recovery * 100)}% recovery`] : [])].join(" · ");
   const items: StatItem[] = [
     { id: "level", label: index.quote === "spread" ? "5Y spread" : "5Y price", value: formatLevel(index.quote, index.level),
-      detail: `${formatPercentileRank(year.percentile, "1Y")} · ${index.date ?? "--"}` },
+      detail: [...(rankOnSpreadEq ? [] : [formatSpreadRank(rank)]), index.date ?? MISSING_VALUE, ...(index.kind === "settlement" ? [SETTLEMENT_TEXT] : [])].join(" · ") },
     ...(index.quote === "price" && index.spreadBp !== undefined ? [{ id: "spread", label: "Spread eq", value: formatLevel("spread", index.spreadBp ?? null),
-      ...(index.recovery != null ? { detail: `${Math.round(index.recovery * 100)}% recovery` } : {}) }] : []),
+      ...(spreadDetail ? { detail: spreadDetail } : {}) }] : []),
     { id: "1d", label: "1D", value: formatMove(index.quote, day.change1D), ...(through ? { detail: through } : {}) },
     { id: "1w", label: "1W", value: formatMove(index.quote, day.change1W) },
     { id: "1m", label: "1M", value: formatMove(index.quote, day.change1M) },
     { id: "range", label: "1Y range", value: `${formatLevel(index.quote, year.low)} to ${formatLevel(index.quote, year.high)}` },
     { id: "contract", label: "Contract", value: formatContract(index.maturity), detail: `${index.couponBp}bp coupon` },
-    { id: "prints", label: "Prints", value: index.prints == null ? "--" : String(index.prints),
+    { id: "prints", label: "Prints", value: index.prints == null ? MISSING_VALUE : String(index.prints),
       // The value is the count already: the detail says only that the day is still trading, and its last print.
       ...(day.partial ? { detail: partialDayText(null, day.lastPrintAt) } : {}) },
   ];
@@ -105,12 +112,24 @@ export function CdxPane({ focused, width, height }: PaneProps) {
   useAutoRefresh(resource.updatedAt, refresh);
   usePaneRefreshKey(reload, { focused, enabled: !loading });
 
-  const asOf = formatAsOf(payload?.asOf ?? null);
+  // Its source and the newest day the rows carry, not when the response was put together, as `fn CDX` ends.
+  // The clock says the prints are delayed, so the line does not again.
+  const sourceLine = useMemo(() => payload
+    ? reportFooterSegment(cdxHeadless, { sections: [{ title: "", columns: [], rows: payload.indexes.map((index) => ({ date: index.date })) }] }, { feed: false })
+    : null, [payload]);
+  // PCTL 1Y ranks spreads; the rows quoted in price (HY, EM) rank their spread equivalent, which a picture keeps.
+  const spreadEqRanked = useMemo(() => rows.filter((row) => row.rank.basis === "spread-eq")
+    .map((row) => row.index.name.replace(/^CDX\s+/i, "")).join(", "), [rows]);
   const info = useMemo<PaneFooterSegment[]>(() => [
-    ...(asOf ? [{ id: "as-of", parts: [{ text: `as of ${asOf}`, tone: "muted" as const }] }] : []),
+    ...(sourceLine ? [sourceLine] : []),
     ...(payload ? [DELAYED_SEGMENT] : []),
     ...(resource.data?.stale ? [{ id: "stale", parts: [{ text: "STALE", tone: "warning" as const }] }] : []),
-  ], [asOf, payload, resource.data?.stale]);
+    ...(spreadEqRanked ? [{
+      id: "rank-basis", capture: true,
+      parts: [{ text: `${spreadEqRanked} pctl on spread eq`, tone: "muted" as const }],
+      variants: [[{ text: "pctl on spread eq", tone: "muted" as const }]],
+    }] : []),
+  ], [payload, sourceLine, resource.data?.stale, spreadEqRanked]);
   usePaneStatusFooter({
     registrationId: "cdx",
     loading,
@@ -142,7 +161,7 @@ export function CdxPane({ focused, width, height }: PaneProps) {
       column: { id: "spread", label: "SPREAD EQ", width: 9, align: "right" as const },
       sortValue: (row: CdxRow) => row.index.quote === "price" ? row.index.spreadBp ?? null : null,
       renderCell: (row: CdxRow) => ({
-        text: row.index.quote === "price" ? formatLevel("spread", row.index.spreadBp ?? null) : "--",
+        text: row.index.quote === "price" ? formatLevel("spread", row.index.spreadBp ?? null) : MISSING_VALUE,
         color: theme.textMuted,
       }),
     }] : []),
@@ -150,7 +169,7 @@ export function CdxPane({ focused, width, height }: PaneProps) {
       column: { id: "prints", label: "PRINTS", width: 7, align: "right" as const },
       sortValue: (row: CdxRow) => row.index.prints,
       renderCell: (row: CdxRow) => ({
-        text: row.index.prints == null ? "--" : String(row.index.prints),
+        text: row.index.prints == null ? MISSING_VALUE : String(row.index.prints),
         color: theme.textMuted,
       }),
     },

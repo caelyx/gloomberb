@@ -1,4 +1,7 @@
 import { classifyInstrumentType, isCryptoVenuePerpetual } from "../../tickers/instrument-kind";
+import type { PriceBasis } from "../../types/instrument";
+import type { MarketState, Quote } from "../../types/financials";
+import { isRoundTheClockCoin } from "../../utils/crypto-pair";
 
 /**
  * The unit an index level is in, as a chart's axis and series name it. A
@@ -6,11 +9,20 @@ import { classifyInstrumentType, isCryptoVenuePerpetual } from "../../tickers/in
  */
 export const INDEX_POINTS_UNIT = "points";
 
+/**
+ * What a chart calls an index's volume: the combined volume of its members,
+ * which no source gives a unit of its own.
+ */
+export const INDEX_MEMBERS_VOLUME_LABEL = "Members' volume";
+
 /** How a report line names that unit: `history` heads an index's bars with it, `ticker` its quote. */
 export const INDEX_POINTS_LABEL = "Index points";
 
 /** How an export names it, in `currency_or_unit` and a `unit` field. */
 export const INDEX_POINTS_EXPORT_UNIT = "index points";
+
+/** How an export names a Cboe yield index's unit (^TNX at 4.859 is a yield in percent), in `quote` and `history` alike. */
+export const YIELD_INDEX_EXPORT_UNIT = "pct";
 
 /**
  * An index level is points, not money: ^GSPC at 7,805.45 or ^VIX at 19.99 has
@@ -21,6 +33,31 @@ export function isIndexLevel(instrumentType: string | null | undefined): boolean
   return classifyInstrumentType(instrumentType) === "index";
 }
 
+/**
+ * A bar's volume as an index level reports it. An index's 0 is a volume its
+ * source does not count (^HSI's hourly bars, a day built from its quote),
+ * never a session without trades: none, as `quote` leaves it blank. An index
+ * whose source sums its members' volume (^GSPC) keeps it, as any other bar does.
+ */
+export function indexBarVolume(volume: number | null | undefined, instrumentType: string | null | undefined): number | null {
+  if (volume == null || !Number.isFinite(volume)) return null;
+  return volume === 0 && isIndexLevel(instrumentType) ? null : volume;
+}
+
+/**
+ * The market state an index level's quote is read in. An index is computed in
+ * its regular session only: a source's POST beside no after-hours print is that
+ * session's final close (^VIX and ^TNX after Cboe's close), so it reads CLOSED,
+ * as the status cell and the source line say it. Any other quote keeps its state.
+ */
+export function indexLevelMarketState(quote: Pick<Quote, "marketState" | "instrumentType" | "postMarketPrice">): MarketState | undefined {
+  const state = quote.marketState;
+  if ((state === "POST" || state === "POSTPOST") && isIndexLevel(quote.instrumentType) && !(quote.postMarketPrice != null && quote.postMarketPrice > 0)) {
+    return "CLOSED";
+  }
+  return state;
+}
+
 /** The currency a quote's price is in: none for an index level, nor for a quote that names none. */
 export function quotePriceCurrency(quote: { currency?: string | null; instrumentType?: string | null } | null | undefined): string | null {
   if (!quote || isIndexLevel(quote.instrumentType)) return null;
@@ -28,24 +65,46 @@ export function quotePriceCurrency(quote: { currency?: string | null; instrument
 }
 
 /**
- * What a price chart of the instrument reads in: points for an index level,
- * otherwise its currency, so an axis never puts a dollar sign on ^VIX.
+ * What a price chart reads in: the quote's price basis, points for an index
+ * level, otherwise its currency.
  */
-export function priceSeriesUnit(currency: string, instrumentType: string | null | undefined): string {
-  return isIndexLevel(instrumentType) ? INDEX_POINTS_UNIT : currency;
+export function priceSeriesUnit(currency: string, instrumentType: string | null | undefined, priceBasis?: PriceBasis): string {
+  if (priceBasis === "thirty-seconds") return "32nds";
+  return priceBasis === "points" || isIndexLevel(instrumentType) ? INDEX_POINTS_UNIT : currency;
 }
 
 /**
  * A quote's volume where it counts one. An index and a crypto venue's
  * perpetual price carry 0 for a volume nobody counts, which is not a session
  * without trades: null for those, as for a quote with no volume. A broad
- * index whose source sums its members' volume (^GSPC) keeps it.
+ * index whose source sums its members' volume (^GSPC) keeps it. A currency
+ * pair trades over the counter, where no one counts a volume: null whatever
+ * its quote carries.
  */
 export function reportedQuoteVolume(
   quote: { volume?: number | null; instrumentType?: string | null; name?: string | null } | null | undefined,
 ): number | null {
   const volume = quote?.volume;
   if (volume == null || !Number.isFinite(volume)) return null;
+  if (classifyInstrumentType(quote!.instrumentType) === "currency") return null;
   if (volume === 0 && (isIndexLevel(quote!.instrumentType) || isCryptoVenuePerpetual(quote!.instrumentType, quote!.name))) return null;
   return volume;
+}
+
+/**
+ * The currency a quote's volume is a value in, where it is one: a coin's is
+ * the value traded in its quote currency (BTC-USD's in US dollars), whether it
+ * is the composite's or one exchange's day, as its bars' and the crypto
+ * board's are, never a count of coins. Null for a listing that counts shares
+ * or contracts, and for a quote that names no currency. `symbol` and
+ * `exchange` stand in for a quote that names no listing.
+ */
+export function quoteVolumeCurrency(
+  quote: { symbol?: string | null; exchangeName?: string | null; currency?: string | null } | null | undefined,
+  symbol?: string,
+  exchange?: string,
+): string | null {
+  const currency = quote?.currency?.trim();
+  if (!currency) return null;
+  return isRoundTheClockCoin(quote?.symbol || symbol, quote?.exchangeName || exchange) ? currency : null;
 }

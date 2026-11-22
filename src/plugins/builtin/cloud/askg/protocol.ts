@@ -39,10 +39,22 @@ export interface ASKGCapabilities {
    * repeats it, and a reopened conversation says it on its own response.
    */
   feedback?: 1;
+  /**
+   * 1: every read gets a source number (`ref` on its `tool-call` and
+   * `tool-executed` frames and in the stored transcript), and the answer cites
+   * it after each figure as `[n]`. Numbers run on across a conversation.
+   */
+  sources?: 1;
+  /**
+   * 1: a finished answer is followed by a `follow-ups` frame with one to three
+   * questions to ask next. The model writes them after its answer; the server
+   * takes them out of the answer's text, so no client ever reads them there.
+   */
+  followUps?: 1;
 }
 
 /** What this build offers at session start. */
-export const ASKG_CLIENT_CAPABILITIES: ASKGCapabilities = { scripts: 1, feedback: 1 };
+export const ASKG_CLIENT_CAPABILITIES: ASKGCapabilities = { scripts: 1, feedback: 1, sources: 1, followUps: 1 };
 
 /** A thumbs up or down on one answer. */
 export type ASKGFeedbackRating = "up" | "down";
@@ -262,6 +274,8 @@ export interface ASKGToolCallEvent extends ASKGEventBase {
   preview: JsonValue;
   timeoutMs: number;
   expiresAt: string;
+  /** The number the answer cites this read by; absent on a write and from an older server. */
+  ref?: number;
 }
 
 /** Compact result information suitable for the tool timeline. */
@@ -301,6 +315,8 @@ interface ASKGToolExecutedEvent extends ASKGEventBase {
    * arguments were empty or too large to send.
    */
   args?: Record<string, JsonValue>;
+  /** The number the answer cites this read by, as on its `tool-call` frame. */
+  ref?: number;
 }
 
 /** Confirms that one client tool result was accepted by the turn loop. */
@@ -341,6 +357,14 @@ interface ASKGUsageEvent extends ASKGEventBase {
   estimated: boolean;
 }
 
+/** Questions to ask next, sent once an answer is finished, before `done`. */
+interface ASKGFollowUpsEvent extends ASKGEventBase {
+  type: "follow-ups";
+  turnId: string;
+  /** One to three, in the order to offer them. */
+  questions: string[];
+}
+
 /** Reason a turn stream stopped. */
 export type ASKGDoneReason = "complete" | "cancelled" | "error" | "timeout";
 
@@ -360,6 +384,7 @@ export type ASKGSseEvent =
   | ASKGToolResultAckEvent
   | ASKGErrorEvent
   | ASKGUsageEvent
+  | ASKGFollowUpsEvent
   | ASKGDoneEvent;
 
 /** Client result posted for one delegated tool call. */

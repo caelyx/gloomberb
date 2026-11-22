@@ -1,20 +1,21 @@
 import type { CloudExecutiveRowPayload } from "../../../api-client";
 import { formatShortDate } from "../../../utils/datetime-format";
-import { formatPercentRaw } from "../../../utils/format";
+import { MISSING_VALUE, formatPercentRaw } from "../../../utils/format";
 
-/** "$36.3M", "$282K", "$50,000". */
-export function formatPay(value: number | null | undefined): string {
+/** "$36.3M", "$282K", "$50,000"; a table column keeps the decimals (`fixedDecimals`), so $12.0M lines up under $36.3M. */
+export function formatPay(value: number | null | undefined, { fixedDecimals = false }: { fixedDecimals?: boolean } = {}): string {
   if (value === null || value === undefined || !Number.isFinite(value))
-    return "—";
+    return MISSING_VALUE;
   const abs = Math.abs(value);
-  if (abs >= 1e9) return `$${(value / 1e9).toFixed(2).replace(/\.?0+$/, "")}B`;
-  if (abs >= 1e6) return `$${(value / 1e6).toFixed(1).replace(/\.0$/, "")}M`;
+  const trim = (text: string, zeros: RegExp) => fixedDecimals ? text : text.replace(zeros, "");
+  if (abs >= 1e9) return `$${trim((value / 1e9).toFixed(2), /\.?0+$/)}B`;
+  if (abs >= 1e6) return `$${trim((value / 1e6).toFixed(1), /\.0$/)}M`;
   if (abs >= 1e5) return `$${Math.round(value / 1e3)}K`;
   return `$${Math.round(value).toLocaleString("en-US")}`;
 }
 
 export function formatRatio(value: number | null | undefined): string {
-  if (value === null || value === undefined) return "—";
+  if (value === null || value === undefined) return MISSING_VALUE;
   return `${Math.round(value)}:1`;
 }
 
@@ -32,7 +33,7 @@ export function formatChange(
 
 export function formatFiled(value: string | null): string {
   // Filing and meeting dates are calendar labels, not local event times.
-  return formatShortDate(value, { day: "2-digit", utc: true, fallback: "\u2014" });
+  return formatShortDate(value, { day: "2-digit", utc: true, fallback: MISSING_VALUE });
 }
 
 /** Share of a row's total that was stock and option awards, as "82%". */

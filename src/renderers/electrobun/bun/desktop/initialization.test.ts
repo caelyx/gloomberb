@@ -1,16 +1,9 @@
 import { expect, test } from "bun:test";
 import { CapabilityRegistry } from "../../../../capabilities";
 import type { AppConfig } from "../../../../types/config";
+import type { PluginSeedRecord } from "../../../../plugins/seed-progress";
 import type { DesktopBackend } from "./backend";
-import { desktopRendererCapabilityManifests, joinDesktopBackendLaunch, normalizeInitWindowTarget, startDesktopBackend, type DesktopLaunchSteps } from "./initialization";
-
-test("a view opened on a secondary window's channel is that window, whatever it claims", () => {
-  expect(normalizeInitWindowTarget("window:w2", { kind: "main" })).toEqual({ kind: "window", windowId: "w2" });
-  expect(normalizeInitWindowTarget("main", { kind: "detached", paneId: "chat" })).toEqual({ kind: "main" });
-  expect(normalizeInitWindowTarget("detached:chat", {})).toEqual({ kind: "detached", paneId: "chat" });
-  // An empty id is no window; with no channel to go on, a view is the main window unless it says it is popped out.
-  expect(normalizeInitWindowTarget("window:", {})).toEqual({ kind: "main", paneId: undefined });
-});
+import { desktopRendererCapabilityManifests, joinDesktopBackendLaunch, startDesktopBackend, type DesktopLaunchSteps } from "./initialization";
 
 test("desktop init includes disabled renderer-safe manifests while invocation stays disabled", async () => {
   let enabled = false;
@@ -53,9 +46,16 @@ function fakeLaunch() {
       calls.push("readConfig");
       return { dataDir: "/data", layout: "saved" } as unknown as AppConfig;
     },
-    restorePlugins: async () => {
-      calls.push("restorePlugins");
-      return { plugins: "seeded" } as unknown as Partial<AppConfig>;
+    planPluginRestore: async () => {
+      calls.push("planPluginRestore");
+      return {
+        record: { plugins: "seeded" } as unknown as PluginSeedRecord,
+        start: () => {
+          calls.push("installPlugins");
+          // A clone that never finishes.
+          return new Promise<never>(() => {});
+        },
+      };
     },
     startServices: async (config) => {
       calls.push(`startServices:${(config as unknown as { layout: string }).layout}:${(config as unknown as { plugins: string }).plugins}`);
@@ -67,15 +67,16 @@ function fakeLaunch() {
   return { backend, calls, steps, services: () => services, resetServices: () => { services = deferred<void>(); } };
 }
 
-test("desktop launch restores plugins before the services start, then compiles the view's plugins", async () => {
+test("desktop launch starts the services on the restore's record, and installs the plugins after without waiting for them", async () => {
   const launch = fakeLaunch();
   const started = startDesktopBackend(launch.backend, launch.steps);
   await Bun.sleep(0);
   // The view's bundles wait for the services, which import every plugin first.
-  expect(launch.calls).toEqual(["readConfig", "restorePlugins", "startServices:saved:seeded"]);
+  expect(launch.calls).toEqual(["readConfig", "planPluginRestore", "startServices:saved:seeded"]);
   launch.services().resolve();
+  // The launch is done while the installs still run, so the window draws.
   await started;
-  expect(launch.calls).toEqual(["readConfig", "restorePlugins", "startServices:saved:seeded", "prefetchPluginBundles"]);
+  expect(launch.calls).toEqual(["readConfig", "planPluginRestore", "startServices:saved:seeded", "prefetchPluginBundles", "installPlugins"]);
 });
 
 test("the window's init shares the launch in flight and skips it once the services are up", async () => {

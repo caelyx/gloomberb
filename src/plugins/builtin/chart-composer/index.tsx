@@ -7,12 +7,10 @@ import type {
 import { CHART_COMPOSER_PANE_ID, type PaneInstanceConfig } from "../../../types/config";
 import type { TickerRecord } from "../../../types/ticker";
 import { parseTickerListInput } from "../../../tickers/list";
-import { canonicalExchange, parsePublicTickerKey, publicTickerKey } from "../../../utils/exchanges";
+import { canonicalExchange, canonicalTickerKey, parsePublicTickerKey, publicTickerKey } from "../../../utils/exchanges";
 import { tickerInstrumentLabel } from "../../../tickers/instrument-label";
 import type { ChartSpec } from "../../../time-series/types";
-import { isPriceOnlyMarketFieldId } from "../../../time-series/field-catalog";
 import { ChartComposerPane, ChartComposerResearchTab } from "./pane";
-import { DataCatalogPane } from "./data-catalog-pane";
 import { listFieldSeries } from "./field-series";
 import { registeredSeriesName } from "./series-expression";
 import {
@@ -32,6 +30,8 @@ import {
 import {
   CHART_DRAWINGS_SETTING_KEY,
   parseChartDrawings,
+  parseSharedChartDrawings,
+  shareableChartDrawings,
   type ChartDrawing,
 } from "../../../components/chart/composite/tools";
 import {
@@ -43,6 +43,7 @@ import {
   buildValuationChartPreset,
 } from "./presets";
 import { buildChartComposerPaneSettingsDef } from "./settings";
+import { rebindResearchChartSpec } from "./chart-spec-edit";
 import type { PluginModule } from "../plugin-module";
 import {
   LIVE_STREAMING_QUICK_SETTING,
@@ -142,12 +143,15 @@ function capabilityTitlePart(
 
 function chartTitle(spec: ChartSpec, prefix = "G"): string {
   const pricedTickers = new Set(spec.series.flatMap((series) => series.source.kind === "security"
-    ? [publicTickerKey(series.source.instrument.symbol, series.source.instrument.exchange).toUpperCase(), series.source.instrument.symbol.toUpperCase()]
+    ? [publicTickerKey(series.source.instrument.symbol, series.source.instrument.exchange).toUpperCase(),
+      canonicalTickerKey(series.source.instrument.symbol, series.source.instrument.exchange).toUpperCase(),
+      series.source.instrument.symbol.toUpperCase()]
     : []));
   const groups = new Set<string>();
   const parts = spec.series.flatMap((series) => {
     if (series.source.kind === "security") {
-      return [tickerInstrumentLabel(publicTickerKey(series.source.instrument.symbol, series.source.instrument.exchange), series.source.instrument.instrument)];
+      // The venue's own code (9992:HKEX), as the series' legend names it, never the saved key (9992:XHKG).
+      return [tickerInstrumentLabel(canonicalTickerKey(series.source.instrument.symbol, series.source.instrument.exchange), series.source.instrument.instrument)];
     }
     if (series.source.kind === "economic") return [`FRED:${series.source.seriesId}`];
     const label = series.label?.trim() || registeredSeriesName(series.source) || series.source.seriesId;
@@ -189,10 +193,20 @@ function pinChartSpecListings(spec: ChartSpec, tickers: ReadonlyMap<string, Tick
   return changed ? { ...spec, series } : spec;
 }
 
+/** The pane with only the drawings a link carries: the newest that fit, none this build cannot read. */
+function withShareableDrawings(pane: PaneInstanceConfig): PaneInstanceConfig {
+  const saved = pane.settings?.[CHART_DRAWINGS_SETTING_KEY];
+  if (saved === undefined) return pane;
+  const { [CHART_DRAWINGS_SETTING_KEY]: _saved, ...settings } = pane.settings!;
+  const drawings = shareableChartDrawings(parseChartDrawings(saved));
+  return { ...pane, settings: drawings.length > 0 ? { ...settings, [CHART_DRAWINGS_SETTING_KEY]: drawings } : settings };
+}
+
 function prepareChartPaneForShare(
-  pane: PaneInstanceConfig,
+  saved: PaneInstanceConfig,
   { tickers, pinnedTime }: { tickers: ReadonlyMap<string, TickerRecord>; pinnedTime?: number },
 ): PaneInstanceConfig {
+  const pane = withShareableDrawings(saved);
   // A crosshair pinned in the sender's tab travels with the link, so it opens
   // on that moment. A moment the pane still holds from a link it was opened
   // from is never passed on, whatever else the pane holds.
@@ -331,7 +345,7 @@ const chartComposerTemplates: PaneTemplateDef[] = [
       const sharedData = isRecord(options?.shareData) ? options.shareData : null;
       const sharedSpec = parseChartSpec(sharedData?.chartSpec ?? options?.shareData);
       if (sharedSpec) {
-        const drawings = parseChartDrawings(sharedData?.chartDrawings);
+        const drawings = parseSharedChartDrawings(sharedData?.chartDrawings) ?? [];
         const viewport = parseChartInteractionViewport(sharedData?.chartInteractionViewport);
         return instanceFor(sharedSpec, "G", {
           ...(drawings.length > 0 ? { drawings } : {}),
@@ -347,7 +361,7 @@ const chartComposerTemplates: PaneTemplateDef[] = [
         if (!spec) return null;
         if (spec.series.some((series) => series.source.kind === "security"
           && (series.source.instrument.instrument || series.source.instrument.brokerId || series.source.instrument.brokerInstanceId))) return null;
-        const drawings = parseChartDrawings(pane.settings?.[CHART_DRAWINGS_SETTING_KEY]);
+        const drawings = shareableChartDrawings(parseChartDrawings(pane.settings?.[CHART_DRAWINGS_SETTING_KEY]));
         const viewport = parseChartInteractionViewport(
           pane.settings?.[CHART_INTERACTION_VIEWPORT_SETTING_KEY],
         );
@@ -368,8 +382,8 @@ const chartComposerTemplates: PaneTemplateDef[] = [
         ].includes(key))) return null;
         const spec = parseChartSpec(data.chartSpec);
         if (!spec) return null;
-        const drawings = parseChartDrawings(data.chartDrawings);
-        if (data.chartDrawings !== undefined && (!Array.isArray(data.chartDrawings) || (data.chartDrawings.length > 0 && drawings.length === 0))) return null;
+        const drawings = data.chartDrawings === undefined ? [] : parseSharedChartDrawings(data.chartDrawings);
+        if (!drawings) return null;
         const viewport = data.chartInteractionViewport === undefined
           ? null
           : parseChartInteractionViewport(data.chartInteractionViewport);
@@ -405,7 +419,7 @@ const chartComposerTemplates: PaneTemplateDef[] = [
       "positioning",
     ],
     shortcut: { prefix: "CAT", argPlaceholder: "query", argKind: "text", argOptional: true },
-    reportFreshness: { status: "not-a-feed", basis: "series catalog" },
+    reportFreshness: { status: "not-a-feed", basis: "series catalog", local: true },
     canCreate: () => true,
     createInstance: (_context, options) => {
       const query = options?.arg?.trim() ?? options?.values?.query?.trim() ?? "";
@@ -453,9 +467,11 @@ const chartComposerTemplates: PaneTemplateDef[] = [
     prefix: "CMP",
     aliases: ["COMP", "TRA"],
     label: "Comparison Chart",
-    description: "Compare price returns over shared observation dates for two or more tickers. A leveraged or inverse fund gets its daily objective drawn from its index fund (3× daily QQQ beside TQQQ) and its decay against it.",
-    // Leveraged and inverse funds: the daily line and the decay come with the comparison.
-    keywords: ["leveraged", "inverse", "decay", "daily-reset", "daily reset", "volatility decay"],
+    description: "Compare price returns over shared observation dates for two or more tickers, or total returns with distributions reinvested. A leveraged or inverse fund gets its daily objective drawn from its index fund (3× daily QQQ beside TQQQ) and its decay against it.",
+    // Leveraged and inverse funds: the daily line and the decay come with the comparison. An index against its members
+    // (the DAX beside SIE and VOW3) is the morning's other comparison.
+    keywords: ["leveraged", "inverse", "decay", "daily-reset", "daily reset", "volatility decay", "dax", "xetra", "stoxx", "germany",
+      "european indices"],
     argKind: "ticker-list",
     minimumSymbols: 2,
     build: buildComparisonChartPreset,
@@ -484,9 +500,10 @@ const chartComposerTemplates: PaneTemplateDef[] = [
 ];
 
 /**
- * A price chart of one security (GP, GIP, a custom price chart of one ticker) can follow a list.
- * A comparison would move only its first ticker, a FRED-only chart has no ticker to follow, and
- * fundamental and valuation graphs (GF, GE) stay out even for one ticker.
+ * A chart whose securities are all one ticker can follow a list: GP, GIP, and GF or GE of one
+ * ticker, whatever fields it shows (revenue beside total debt). Every series of that ticker moves
+ * to the selected one and keeps its field; FRED and other series stay as they are. A comparison
+ * of several tickers would move only one of them, and a FRED-only chart has no ticker to follow.
  */
 function chartShowsOneSecurity(pane: PaneInstanceConfig): boolean {
   const spec = parseChartSpec(pane.settings?.[CHART_SPEC_SETTING_KEY]);
@@ -495,10 +512,20 @@ function chartShowsOneSecurity(pane: PaneInstanceConfig): boolean {
   const symbols = new Set<string>();
   for (const series of spec.series) {
     if (series.source.kind !== "security") continue;
-    if (!isPriceOnlyMarketFieldId(series.source.fieldId)) return false;
     symbols.add(parsePublicTickerKey(series.source.instrument.symbol).symbol.toUpperCase());
   }
   return symbols.size === 1;
+}
+
+/**
+ * Ticker search moves a chart of one security to another ticker: its series of that ticker move
+ * and keep their fields, as the research tab's chart does when its ticker changes.
+ */
+function retargetChartTicker(pane: PaneInstanceConfig, symbol: string, previous: string | null): PaneInstanceConfig {
+  const spec = parseChartSpec(pane.settings?.[CHART_SPEC_SETTING_KEY]);
+  if (!spec) return pane;
+  const rebound = rebindResearchChartSpec(spec, previous, symbol);
+  return rebound === spec ? pane : { ...pane, settings: { ...pane.settings, [CHART_SPEC_SETTING_KEY]: rebound } };
 }
 
 export const chartComposerModule: PluginModule = {
@@ -510,7 +537,9 @@ export const chartComposerModule: PluginModule = {
     icon: "G",
     component: ChartComposerPane,
     defaultPosition: "right",
+    shareItem: { ticker: true },
     tickerFollower: chartShowsOneSecurity,
+    retargetTicker: retargetChartTicker,
     defaultMode: "floating",
     defaultFloatingSize: { width: 100, height: 32 },
     portableShare: { prepare: prepareChartPaneForShare },
@@ -526,7 +555,7 @@ export const chartComposerModule: PluginModule = {
     id: DATA_CATALOG_PANE_ID,
     name: "Data Catalog",
     icon: "C",
-    component: DataCatalogPane,
+    get component(): typeof import("./data-catalog-pane").DataCatalogPane { const { DataCatalogPane } = require("./data-catalog-pane"); return DataCatalogPane; },
     defaultPosition: "right",
     defaultMode: "floating",
     defaultFloatingSize: { width: 110, height: 32 },

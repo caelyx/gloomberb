@@ -1,7 +1,7 @@
 {
  "format": 1,
  "site": "https://gloom.sh",
- "updatedAt": "2026-10-25",
+ "updatedAt": "2026-11-12",
  "categories": [
   {
    "id": "research",
@@ -38,20 +38,10 @@
  ],
  "functions": [
   {
-   "code": "ATTN",
-   "name": "Research attention",
-   "description": "What Gloom users are researching",
-   "detail": "Which tickers opted-in Gloom users are researching, by hour, day and week, with sector and country totals and abnormal attention. Delayed at least an hour. Pro shows the full board; Free shows three rows per section.",
-   "category": "research",
-   "arg": "NVDA",
-   "access": "pro",
-   "lesson": "/academy/compare-screen-follow-money/filings-and-attention/attention"
-  },
-  {
    "code": "DES",
    "name": "Security overview",
    "description": "Quote, chart, and research tabs",
-   "detail": "The starting point for any ticker: live quote, day and 52-week range, price chart, fundamentals, and tabs into every other research pane. T is the same pane; search Ticker Research to open a second one.",
+   "detail": "The starting point for any ticker: live quote, day and 52-week range, price chart, fundamentals, and tabs into every other research pane. A bond fund shows its SEC yield, yield to worst and duration beside its distribution yield, and --tax-rate 40.8 adds a muni fund's tax-equivalent yield and muni/Treasury ratio. T is the same pane; search Ticker Research to open a second one.",
    "category": "research",
    "arg": "NVDA",
    "shot": "https://gloom.sh/screenshots/fn/DES.png",
@@ -123,7 +113,8 @@
    "description": "Browse chartable series",
    "detail": "Searches every series the chart composer knows: securities, options, crypto, FRED, treasuries, and futures. Pick one to chart it.",
    "category": "research",
-   "arg": "fed funds"
+   "arg": "fed funds",
+   "shot": "https://gloom.sh/screenshots/fn/CAT.png"
   },
   {
    "code": "FA",
@@ -143,6 +134,7 @@
    "category": "research",
    "arg": "FICO",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/CRDOC.png",
    "lesson": "/academy/rates-bonds-credit/credit/debt-and-covenants"
   },
   {
@@ -179,7 +171,7 @@
    "code": "CMP",
    "name": "Compare performance",
    "description": "Indexed returns for a group",
-   "detail": "Price returns rebased to a shared start date for two or more tickers, so relative performance is readable at a glance.",
+   "detail": "Price returns rebased to a shared start date for two or more tickers, so relative performance is readable at a glance. A leveraged or inverse fund also gets the k× daily line of its index fund (3× daily QQQ beside TQQQ) and its decay against it, in percentage points.",
    "category": "research",
    "arg": "NVDA, AMD, AVGO",
    "shot": "https://gloom.sh/screenshots/fn/CMP.png",
@@ -251,8 +243,7 @@
    "description": "Screen stocks by criteria",
    "detail": "Filter covered stocks on valuation, growth, margins, liquidity, short interest, insider activity, and 13F holders, then rank the matches by any metric. Exports to CSV; saving a screen needs a verified email.",
    "category": "research",
-   "shot": "https://gloom.sh/screenshots/fn/EQS.png",
-   "lesson": "/academy/compare-screen-follow-money/compare-and-screen/screener"
+   "shot": "https://gloom.sh/screenshots/fn/EQS.png"
   },
   {
    "code": "OMON",
@@ -271,8 +262,7 @@
    "detail": "Open interest by strike with max pain, each expiry's put/call ratio and net dealer gamma, and dealer gamma by strike with its flip level and call and put walls. Open interest is about two sessions old; the footer names its date. GEX and MAXPAIN open it too.",
    "category": "research",
    "arg": "SPY",
-   "shot": "https://gloom.sh/screenshots/fn/OPX.png",
-   "lesson": "/academy/options-and-volatility/positioning-and-flow/open-interest-max-pain"
+   "shot": "https://gloom.sh/screenshots/fn/OPX.png"
   },
   {
    "code": "OVME",
@@ -295,11 +285,13 @@
   },
   {
    "code": "CSP",
-   "name": "Cash-secured put screen",
-   "description": "Put-selling yield across a list",
-   "detail": "For each ticker, the put nearest a delta (0.30) on the expiry about 30 days out, ranked by annualised yield on cash at the bid, with distance out of the money, delta, IV rank, the bid/ask spread (wide ones flagged, never dropped), and whether earnings fall before expiry. Enter opens the put in OSA.",
+   "name": "Options strategy screen",
+   "description": "Puts, covered calls, spreads, condors, straddles and calendars across a list",
+   "detail": "One tab per strategy: cash-secured put, covered call, vertical, iron condor, straddle, strangle and calendar. For each ticker it picks the legs by delta and expiry, then shows credit or debit, max gain and loss, break-evens, probability of profit, IV rank, wide spreads and earnings before expiry. Income trades rank by yearly return, debit trades by reward to risk.",
    "category": "research",
-   "arg": "JPM, GS, KO"
+   "arg": "JPM, GS, KO",
+   "shot": "https://gloom.sh/screenshots/fn/CSP.png",
+   "lesson": "/academy/options-and-volatility/chain-and-strategies/screening-option-trades"
   },
   {
    "code": "OVDV",
@@ -308,8 +300,7 @@
    "detail": "The implied volatility surface fitted from option quotes: 3D sheet, table, smiles, ATM term structure, 25-delta skew, and forwards. Steps back through stored daily closes; live is real-time on Pro, 15-minute delayed on Free.",
    "category": "research",
    "arg": "NVDA",
-   "shot": "https://gloom.sh/screenshots/fn/OVDV.png",
-   "lesson": "/academy/options-and-volatility/reading-volatility/surface-and-skew"
+   "shot": "https://gloom.sh/screenshots/fn/OVDV.png"
   },
   {
    "code": "HIVG",
@@ -389,6 +380,7 @@
    "category": "research",
    "arg": "MSFT",
    "access": "cloud",
+   "shot": "https://gloom.sh/screenshots/fn/EM.png",
    "lesson": "/academy/fundamentals-and-earnings/earnings/estimates-and-revisions"
   },
   {
@@ -399,6 +391,7 @@
    "category": "research",
    "arg": "NVDA",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/KPIS.png",
    "lesson": "/academy/fundamentals-and-earnings/the-statements/segments-and-kpis"
   },
   {
@@ -409,6 +402,7 @@
    "category": "research",
    "arg": "NVDA",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/GUIDE.png",
    "lesson": "/academy/fundamentals-and-earnings/earnings/guidance"
   },
   {
@@ -436,7 +430,7 @@
    "code": "DVD",
    "name": "Dividend yield",
    "description": "Payout history and yield",
-   "detail": "Cash distributions, trailing yield, indicated rate when available, and payout growth. Future payments are not forecast.",
+   "detail": "Cash distributions, trailing yield, indicated rate when available, and payout growth. A bond fund's distribution yield is labelled as not its SEC yield, which follows it dated with yield to worst and duration; --tax-rate 40.8 adds a muni fund's tax-equivalent yield and muni/Treasury ratio. Several tickers rank in one table, with those columns too under --tax-rate. Future payments are not forecast.",
    "category": "research",
    "arg": "KO",
    "shot": "https://gloom.sh/screenshots/fn/DVD.png",
@@ -468,7 +462,8 @@
    "description": "Outstanding settlement fails",
    "detail": "The Short Interest pane on Fails to deliver: SEC outstanding fail shares by settlement date and CUSIP, with reported prices. Each date is a separate snapshot; never add fails across dates. Published twice monthly with a delay. Missing records do not establish zero fails.",
    "category": "research",
-   "arg": "AAPL"
+   "arg": "AAPL",
+   "shot": "https://gloom.sh/screenshots/fn/FTD.png"
   },
   {
    "code": "ATS",
@@ -476,7 +471,8 @@
    "description": "Weekly off-exchange shares and trades",
    "detail": "The Short Interest pane on Weekly ATS/OTC: FINRA ATS and non-ATS shares and trades, including dark-pool activity. ATS % divides ATS shares by published off-exchange shares, not total market volume or short volume. Missing categories stay blank. Published weekly with a two- or four-week delay depending on the security tier.",
    "category": "research",
-   "arg": "AAPL"
+   "arg": "AAPL",
+   "shot": "https://gloom.sh/screenshots/fn/ATS.png"
   },
   {
    "code": "DIAG",
@@ -541,6 +537,7 @@
    "category": "research",
    "arg": "NET",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/HIRE.png",
    "lesson": "/academy/special-datasets/hiring"
   },
   {
@@ -551,6 +548,7 @@
    "category": "research",
    "arg": "META",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/APPS.png",
    "lesson": "/academy/special-datasets/app-attention"
   },
   {
@@ -676,6 +674,7 @@
    "category": "news",
    "arg": "TSLA",
    "access": "cloud",
+   "shot": "https://gloom.sh/screenshots/fn/BUZZ.png",
    "lesson": "/academy/compare-screen-follow-money/filings-and-attention/attention"
   },
   {
@@ -789,27 +788,41 @@
    "lesson": "/academy/crypto-and-prediction-markets/crypto-from-zero"
   },
   {
+   "code": "GTP",
+   "name": "Layer 2 metrics",
+   "description": "Ethereum and its layer 2 chains",
+   "detail": "Ethereum and its layer 2 chains side by side: transactions, active addresses, fees, transaction cost, stablecoin supply and value secured, with 30-day changes and a daily history chart. Data from growthepie.",
+   "category": "markets",
+   "plugin": {
+    "id": "growthepie",
+    "name": "growthepie"
+   },
+   "shot": "https://gloom.sh/screenshots/fn/GTP.png"
+  },
+  {
    "code": "ETFF",
    "name": "Crypto ETF flows",
    "description": "Daily spot bitcoin and ether ETF flows",
    "detail": "Daily net flows of the US spot bitcoin and ether ETFs, fund by fund in US$ millions, as Farside Investors publishes them: the last 5 and 20 days, the running total since launch, and the funds the newest day still waits on.",
-   "category": "markets"
+   "category": "markets",
+   "shot": "https://gloom.sh/screenshots/fn/ETFF.png"
   },
   {
    "code": "PERP",
-   "name": "Perpetual history",
-   "description": "Funding, open interest and premium history",
-   "detail": "Funding, open interest and premium history for one perpetual on Hyperliquid, Binance, Bybit or OKX, with each reading's source. Pro shows the history; Free a limited preview. Live board and trading are in the Hyperliquid plugin.",
+   "name": "Perpetuals",
+   "description": "Perpetual funding, open interest and premium",
+   "detail": "A board and rankings of perpetuals on Hyperliquid, Binance, Bybit and OKX, one asset across the venues, and one perpetual's funding, open interest and premium history with each reading's source. Pro shows the history; Free a limited preview. Trading is in the Hyperliquid plugin.",
    "category": "markets",
    "arg": "BTC",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/PERP.png",
    "lesson": "/academy/crypto-and-prediction-markets/perpetuals"
   },
   {
    "code": "FUT",
    "name": "Futures board",
    "description": "Front-month futures",
-   "detail": "Each root's front contract until its stated roll date across equity index, rates, energy, metals, agriculture, and FX with last price, unit and session change, grouped by sector, naming the day's most active month by volume when it is another one.",
+   "detail": "Each root's front contract until its stated roll date across equity index, volatility (VIX futures, at Cboe's daily settlement), rates, energy, metals, agriculture, and FX with last price, unit and session change, grouped by sector, naming the day's most active month by volume when it is another one.",
    "category": "markets",
    "shot": "https://gloom.sh/screenshots/fn/FUT.png",
    "lesson": "/academy/futures-commodities-energy/futures-from-zero"
@@ -818,7 +831,7 @@
    "code": "CTM",
    "name": "Futures curve",
    "description": "Futures term structure",
-   "detail": "A futures root's listed contracts as a curve against a week and a month ago, with roll yield, contango or backwardation, and each contract's price, open interest, and volume.",
+   "detail": "A futures root's listed contracts as a curve against a week and a month ago, with roll yield, contango or backwardation, and each contract's price, open interest, and volume. CTM VIX is the VIX futures curve from Cboe's daily settlements, with spot VIX and the front month's premium to it. Ann. roll yield is what a long position earns or pays rolling from the front contract into the next, scaled to a year: (front / next - 1) × 365 / days between the two, positive in backwardation and negative in contango. PCTL ranks a figure against its own daily values over the past year, 100 the highest and 0 the lowest: the roll yield and the front spread against theirs, and in the table each contract's price against its own.",
    "category": "markets",
    "arg": "GC",
    "shot": "https://gloom.sh/screenshots/fn/CTM.png",
@@ -832,6 +845,18 @@
    "category": "markets",
    "shot": "https://gloom.sh/screenshots/fn/FNG.png",
    "lesson": "/academy/macro-markets-and-news/markets/sentiment-and-valuation"
+  },
+  {
+   "code": "CFNG",
+   "name": "Crypto fear and greed",
+   "description": "Crypto sentiment gauge",
+   "detail": "The crypto Fear and Greed Index from Alternative.me: today's reading, yesterday, last week and last month, and its history.",
+   "category": "markets",
+   "plugin": {
+    "id": "crypto-fear-greed",
+    "name": "Crypto Fear & Greed"
+   },
+   "shot": "https://gloom.sh/screenshots/fn/CFNG.png"
   },
   {
    "code": "COT",
@@ -851,6 +876,7 @@
    "category": "markets",
    "arg": "NEE",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/POWER.png",
    "lesson": "/academy/futures-commodities-energy/power-and-grid"
   },
   {
@@ -861,6 +887,7 @@
    "category": "research",
    "arg": "AAPL",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/EXPO.png",
    "lesson": "/academy/special-datasets/supply-chain-and-exposure"
   },
   {
@@ -882,6 +909,7 @@
    "category": "research",
    "arg": "LMT",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/AWARDS.png",
    "lesson": "/academy/special-datasets/government-awards"
   },
   {
@@ -892,6 +920,7 @@
    "category": "research",
    "arg": "AAPL",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/SEG.png",
    "lesson": "/academy/fundamentals-and-earnings/the-statements/segments-and-kpis"
   },
   {
@@ -901,6 +930,7 @@
    "detail": "The yearly free cash flow growth over ten years that makes a DCF equal today's enterprise value, next to the growth the company actually delivered.",
    "category": "research",
    "arg": "AAPL",
+   "shot": "https://gloom.sh/screenshots/fn/RDCF.png",
    "lesson": "/academy/fundamentals-and-earnings/the-statements/reverse-dcf"
   },
   {
@@ -910,6 +940,7 @@
    "detail": "Weekly price against round multiples of trailing EPS, stepping when each EPS figure became known, with today's P/E ranked in the stock's own history.",
    "category": "research",
    "arg": "AAPL",
+   "shot": "https://gloom.sh/screenshots/fn/PEB.png",
    "lesson": "/academy/compare-screen-follow-money/compare-and-screen/valuation-graphs"
   },
   {
@@ -919,6 +950,7 @@
    "detail": "Interval and cumulative price returns in a scrollable table, for a range and granularity you pick.",
    "category": "research",
    "arg": "AAPL",
+   "shot": "https://gloom.sh/screenshots/fn/RETURN.png",
    "lesson": "/academy/company-and-price/history-and-returns/returns-table"
   },
   {
@@ -928,6 +960,7 @@
    "detail": "A name's average move on CPI, jobs report and FOMC days against a normal day, with the share of up days and the move on every release day.",
    "category": "research",
    "arg": "SPY",
+   "shot": "https://gloom.sh/screenshots/fn/MDAY.png",
    "lesson": "/academy/futures-commodities-energy/macro-days"
   },
   {
@@ -937,6 +970,7 @@
    "detail": "Short interest as a share of float, days to cover, the change since the prior settlement and the month's price move across your portfolios and watchlists, or the tickers you give. Updates twice a month.",
    "category": "research",
    "arg": "GME, AMC, CVNA",
+   "shot": "https://gloom.sh/screenshots/fn/SIW.png",
    "lesson": "/academy/compare-screen-follow-money/who-owns-it/short-interest"
   },
   {
@@ -946,6 +980,7 @@
    "detail": "Customers your holdings name in their filings, and suppliers whose filings name your holdings, with the disclosed revenue share, by report date.",
    "category": "research",
    "arg": "CRUS QRVO",
+   "shot": "https://gloom.sh/screenshots/fn/RIPL.png",
    "lesson": "/academy/company-and-price/company-at-a-glance/earnings-ripple"
   },
   {
@@ -967,6 +1002,7 @@
    "category": "research",
    "arg": "PFE",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/CATL.png",
    "lesson": "/academy/fundamentals-and-earnings/events-and-deals/catalysts"
   },
   {
@@ -977,6 +1013,7 @@
    "category": "research",
    "arg": "AAPL",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/LITI.png",
    "lesson": "/academy/special-datasets/litigation-and-comment-letters"
   },
   {
@@ -986,6 +1023,7 @@
    "detail": "Clinical studies by condition, drug or sponsor, with status, phase and enrollment. Open a study for its full record.",
    "category": "research",
    "arg": "semaglutide",
+   "shot": "https://gloom.sh/screenshots/fn/TRIAL.png",
    "lesson": "/academy/special-datasets/fda-and-trials"
   },
   {
@@ -995,6 +1033,7 @@
    "detail": "FDA drug and device adverse event reports and drug recalls, by drug, device or firm name. A report is what someone observed, not proof the product caused it.",
    "category": "research",
    "arg": "metformin",
+   "shot": "https://gloom.sh/screenshots/fn/FDA.png",
    "lesson": "/academy/special-datasets/fda-and-trials"
   },
   {
@@ -1010,7 +1049,7 @@
    "code": "VIX",
    "name": "VIX term structure",
    "description": "30-day vs 3-month VIX",
-   "detail": "Daily 30-day and three-month VIX closes from FRED, so you can see whether the curve is in contango or inverted.",
+   "detail": "Daily Cboe VIX closes from 9 days to a year out, with the three-month to 30-day ratio and its history, so you can see whether the term structure is in contango or inverted. The VIX futures curve, with spot VIX and the front month's premium to it, is CTM VIX.",
    "category": "markets",
    "shot": "https://gloom.sh/screenshots/fn/VIX.png",
    "lesson": "/academy/options-and-volatility/reading-volatility/vix-and-vol-indices"
@@ -1030,6 +1069,7 @@
    "description": "Session highs and lows",
    "detail": "A live count of stocks printing new session highs and lows over 30-second, one-minute, and five-minute windows. Real-time on Pro, 15-minute delayed on Free.",
    "category": "markets",
+   "shot": "https://gloom.sh/screenshots/fn/HILO.png",
    "lesson": "/academy/macro-markets-and-news/markets/movers-highs-halts"
   },
   {
@@ -1037,15 +1077,19 @@
    "name": "Live scanner",
    "description": "Your own intraday stock scan",
    "detail": "Scan all US stocks, an index, a sector or a watchlist for your own conditions: a move over the last minutes, volume against its usual pace, a new session high or low, a VWAP cross or a gap, above price, market cap and volume floors. Matches refresh through the session and new ones can alert. Real-time on Pro, 15-minute delayed on Free.",
-   "category": "markets"
+   "category": "markets",
+   "shot": "https://gloom.sh/screenshots/fn/SCAN.png",
+   "lesson": "/academy/compare-screen-follow-money/compare-and-screen/live-scanner"
   },
   {
    "code": "FLOW",
    "name": "Options flow",
    "description": "Unusual options activity",
-   "detail": "Sweeps, blocks, and large premium prints as they hit the tape, with ticker, strike, expiry, and premium.",
+   "detail": "Sweeps, blocks, and large premium prints, plus the session's net premium tide.",
    "category": "markets",
+   "arg": "NVDA",
    "access": "pro",
+   "shot": "https://gloom.sh/screenshots/fn/FLOW.png",
    "lesson": "/academy/options-and-volatility/positioning-and-flow/options-flow"
   },
   {
@@ -1074,6 +1118,7 @@
    "detail": "Curated themes with equal-weight returns and breadth. Open a theme for its members, leaders and laggards. The Themes tab of BI.",
    "category": "markets",
    "arg": "nuclear",
+   "shot": "https://gloom.sh/screenshots/fn/THEM.png",
    "lesson": "/academy/macro-markets-and-news/markets/sectors-themes-rotation"
   },
   {
@@ -1083,6 +1128,7 @@
    "detail": "Pending, rumored and closed mergers and acquisitions, with arbitrage spreads on listed targets. Free is delayed 7 days; Pro is live.",
    "category": "markets",
    "arg": "NVDA",
+   "shot": "https://gloom.sh/screenshots/fn/MA.png",
    "lesson": "/academy/fundamentals-and-earnings/events-and-deals/mergers"
   },
   {
@@ -1090,7 +1136,8 @@
    "name": "Distress",
    "description": "Bankruptcy and delisting records",
    "detail": "Dated public records about companies in difficulty: 8-K bankruptcy, obligation and listing filings, SEC going-concern disclosures, Taiwan exchange listing designations, and French and UK insolvency notices. The Distress tab of MA.",
-   "category": "markets"
+   "category": "markets",
+   "shot": "https://gloom.sh/screenshots/fn/DIST.png"
   },
   {
    "code": "MAP",
@@ -1116,6 +1163,18 @@
    "lesson": "/academy/crypto-and-prediction-markets/prediction-markets"
   },
   {
+   "code": "ADJ",
+   "name": "Adjacent indices",
+   "description": "Prediction-market indices",
+   "detail": "Adjacent's indices built on prediction markets, with each one's level and 1D and 7D moves, its chart and constituents, plus reference rates and CFTC filings.",
+   "category": "markets",
+   "plugin": {
+    "id": "adjacent-indices",
+    "name": "Adjacent"
+   },
+   "shot": "https://gloom.sh/screenshots/fn/ADJ.png"
+  },
+  {
    "code": "POLL",
    "name": "Polls",
    "description": "Political polling",
@@ -1134,7 +1193,8 @@
    "description": "Ships through Suez, Hormuz, Panama",
    "detail": "Daily vessel transits through the main shipping chokepoints, charted together or one by name. Use it to see a disruption in trade before it shows up in prices; each transit series also charts in G next to oil or a shipper.",
    "category": "markets",
-   "arg": "SUEZ"
+   "arg": "SUEZ",
+   "shot": "https://gloom.sh/screenshots/fn/CHOKE.png"
   },
   {
    "code": "ECO",
@@ -1178,7 +1238,7 @@
    "code": "GC",
    "name": "Yield curves",
    "description": "Government bond curves",
-   "detail": "Government yield curves: US Treasury, TIPS real yields and breakevens, euro AAA, Bund, Gilt, JGB and Canada, with spreads like 2s10s and their one-year percentiles, a two-date difference and a World tab. GC JGB opens a curve directly.",
+   "detail": "Government yield curves: US Treasury, TIPS real yields and breakevens, euro AAA, Bund, Gilt, JGB and Canada, with spreads like 2s10s and their one-year percentiles, a two-date difference and a World tab that adds Mexico's and Brazil's 2- and 10-year yields. GC JGB opens a curve directly.",
    "category": "macro",
    "shot": "https://gloom.sh/screenshots/fn/GC.png",
    "lesson": "/academy/rates-bonds-credit/rates/yield-curve"
@@ -1205,7 +1265,7 @@
    "code": "AUCT",
    "name": "Treasury auctions",
    "description": "Auction results",
-   "detail": "Bill, note, bond, and TIPS auction results from the US Treasury: high rate, bid-to-cover, indirect share, and size.",
+   "detail": "US Treasury bill, note, bond, and TIPS auction results since 1979: rate, stop-out versus median, bid-to-cover, bidder takedown, and size. An after view ranks each auction against its tenor's last 24 and shows the Treasury yield's move 1, 5, and 20 sessions later. Hong Kong's Exchange Fund Bills and Notes and Government Bond tenders too.",
    "category": "macro",
    "arg": "10-year",
    "shot": "https://gloom.sh/screenshots/fn/AUCT.png",
@@ -1233,8 +1293,8 @@
   {
    "code": "CDX",
    "name": "Index CDS",
-   "description": "CDX and iTraxx on the run",
-   "detail": "CDX IG, HY and EM with iTraxx Main and Crossover on the run: the 5Y level, 1D and 1W moves, 1Y percentile and the day's print count. IG and iTraxx in spread, HY and EM in price.",
+   "description": "CDX, iTraxx and CMBX",
+   "detail": "CDX IG, HY and EM with iTraxx Main and Crossover on the run, and CMBX A, BBB- and BB on the newest series: the level, 1D and 1W moves, 1Y percentile and the day's print count. IG and iTraxx in spread, HY, EM and CMBX in price.",
    "category": "macro",
    "shot": "https://gloom.sh/screenshots/fn/CDX.png",
    "lesson": "/academy/rates-bonds-credit/credit/cds"
@@ -1262,7 +1322,8 @@
    "name": "Fixed Income",
    "description": "Credit, bonds, and Treasuries",
    "detail": "One workspace for credit markets, issuer debt, corporate bond sales, Treasury auctions, Treasury cash and debt, and primary dealer positions. FI opens it; the older shortcuts still land on their own section.",
-   "category": "macro"
+   "category": "macro",
+   "shot": "https://gloom.sh/screenshots/fn/FI.png"
   },
   {
    "code": "TRACE",
@@ -1270,21 +1331,24 @@
    "description": "Corporate and agency sales by issuer or CUSIP",
    "detail": "Latest corporate and agency bond sales: issuer, CUSIP, coupon, maturity, price, yield, and grade. TRACE alone lists the tape; TRACE with an issuer name, a bond symbol root, a stock ticker, or a CUSIP finds that issuer's outstanding bonds. It opens the Bonds section of Fixed Income.",
    "category": "macro",
-   "arg": "issuer"
+   "arg": "issuer",
+   "shot": "https://gloom.sh/screenshots/fn/TRACE.png"
   },
   {
    "code": "DTS",
    "name": "Treasury cash and debt",
    "description": "Operating cash and debt held by the public",
    "detail": "Treasury operating cash for the latest day, and debt held by the public for the last 20 business days. It opens the Treasury section of Fixed Income.",
-   "category": "macro"
+   "category": "macro",
+   "shot": "https://gloom.sh/screenshots/fn/DTS.png"
   },
   {
    "code": "PDLR",
    "name": "Primary dealer positions",
    "description": "Weekly dealer positions and fails",
    "detail": "Weekly net positions and settlement fails in Treasuries and mortgage-backed securities, from the primary dealers. It opens the Treasury section of Fixed Income.",
-   "category": "macro"
+   "category": "macro",
+   "shot": "https://gloom.sh/screenshots/fn/PDLR.png"
   },
   {
    "code": "VAL",
@@ -1293,6 +1357,7 @@
    "detail": "Market-wide valuation ratios against their own history, with zones and trend deviation.",
    "category": "macro",
    "arg": "buffett",
+   "shot": "https://gloom.sh/screenshots/fn/VAL.png",
    "lesson": "/academy/macro-markets-and-news/markets/sentiment-and-valuation"
   },
   {
@@ -1357,11 +1422,12 @@
   },
   {
    "code": "ETF",
-   "name": "ETF filings",
-   "description": "A fund's SEC filings",
-   "detail": "A US-listed fund's SEC filings: registration statements, prospectus updates, shareholder reports, N-CEN and N-PORT reports. Open any of them inline.",
+   "name": "ETF facts and filings",
+   "description": "A fund's facts and SEC filings",
+   "detail": "A US-listed fund's facts from its sponsor (fee, NAV, premium, net assets, and a bond fund's SEC yield, yield to worst and duration), then its SEC filings: registration statements, prospectus updates, shareholder reports, N-CEN and N-PORT reports. Open any of them inline. --tax-rate 40.8 adds a muni fund's tax-equivalent yield and muni/Treasury ratio.",
    "category": "ownership",
    "arg": "SPY",
+   "shot": "https://gloom.sh/screenshots/fn/ETF.png",
    "lesson": "/academy/company-and-price/company-at-a-glance/fund-filings"
   },
   {
@@ -1371,6 +1437,7 @@
    "detail": "SEC staff comment letters and company responses, newest first. Search their text, or type a ticker for one company's letters.",
    "category": "ownership",
    "arg": "revenue recognition",
+   "shot": "https://gloom.sh/screenshots/fn/CLTR.png",
    "lesson": "/academy/special-datasets/litigation-and-comment-letters"
   },
   {
@@ -1526,11 +1593,19 @@
    "code": "TBO",
    "name": "TheBuildout",
    "description": "Infrastructure intelligence",
-   "detail": "Data center and semiconductor supply chain intelligence from TheBuildout: company lists, sites, and intel. Limited free data; full access with a TheBuildout subscription.",
+   "detail": "Data center and semiconductor supply chain intelligence from TheBuildout: a board of AI buildout themes sized by market cap and coloured by median 1Y return, each theme's companies, sites, and intel. Limited free data; full access with Buildout.",
    "category": "cloud",
    "access": "cloud",
    "shot": "https://gloom.sh/screenshots/fn/TBO.png",
    "lesson": "/academy/special-datasets/infrastructure"
+  },
+  {
+   "code": "TBOC",
+   "name": "TheBuildout company",
+   "description": "A company's deals, sites and hiring",
+   "detail": "One company in TheBuildout: its power and hosting deals, suppliers and customers as a flow, its sites, hiring by site, and the signals that name it. Linked to TBO, it follows the company under the cursor. Signals are 72 hours delayed and hiring by site needs Buildout.",
+   "category": "cloud",
+   "access": "cloud"
   },
   {
    "code": "ACM",
@@ -1589,7 +1664,7 @@
    "code": "DESK",
    "name": "Trading desks",
    "description": "Add a ready-made desk",
-   "detail": "Adds a ready-made desk as a new layout tab: equities, options, futures and commodities, rates and credit, FX and macro, or active trading. Also offered on first run, as 'What do you trade?'.",
+   "detail": "Adds a ready-made desk as a new layout tab: equities, options, futures and commodities, rates and credit, FX and macro, or active trading. Also asked on first run: 'What do you trade most?'.",
    "category": "app",
    "arg": "options",
    "lesson": "/academy/terminal-and-workspace/how-the-terminal-works/layouts-and-desks"
@@ -1694,6 +1769,13 @@
    "lesson": "/academy/terminal-and-workspace/how-the-terminal-works/help-cards"
   },
   {
+   "code": "ROADMAP",
+   "name": "Roadmap",
+   "description": "What is coming next",
+   "detail": "What is being built, what is planned and what shipped, with each item's votes. Pro members vote on what is building or planned, once per item, and can take the vote back.",
+   "category": "app"
+  },
+  {
    "code": "HELP",
    "name": "Help",
    "description": "Shortcuts and reference",
@@ -1727,10 +1809,11 @@
    "category": "Start here",
    "tags": [
     "install",
+    "uninstall",
     "desktop",
     "tui"
    ],
-   "updatedAt": "2026-10-25",
+   "updatedAt": "2026-11-09",
    "blocks": [
     {
      "type": "heading",
@@ -1743,15 +1826,15 @@
     },
     {
      "type": "code",
-     "code": "brew install --cask gloomberb\n# or\ncurl -fsSL gloom.sh/install | bash"
+     "code": "brew install --cask gloom\n# or\ncurl -fsSL gloom.sh/install | bash"
     },
     {
      "type": "paragraph",
-     "text": "Or use the [direct download](/download/desktop)."
+     "text": "Or use the [direct download](/download/desktop). The desktop app and the Homebrew cask (`brew install --cask gloom`) need Apple Silicon; on an Intel Mac use the [browser version](#browser), or look for a terminal binary in the [release assets](https://github.com/gloom-sh/gloomberb/releases/latest)."
     },
     {
      "type": "paragraph",
-     "text": "The desktop app and Homebrew cask require Apple Silicon. Intel Macs can use the [browser version](#browser); check [release assets](https://github.com/gloom-sh/gloomberb/releases/latest) for terminal binary availability."
+     "text": "The script downloads the latest GitHub release, checks its SHA-256, and installs the app to `/Applications` and `gloom` to `~/.local/bin`, using sudo only for a folder you can't write. It prints a PATH line and edits no shell file. Source: [scripts/install.sh](https://github.com/gloom-sh/gloomberb/blob/main/scripts/install.sh) in gloom-sh/gloomberb."
     },
     {
      "type": "paragraph",
@@ -1764,11 +1847,15 @@
     },
     {
      "type": "paragraph",
-     "text": "Terminal UI only; Ghostty, Kitty, or WezTerm render charts best. Installs `gloom` into `~/.local/bin`."
+     "text": "Terminal UI only; Ghostty, Kitty, or WezTerm render charts best."
     },
     {
      "type": "code",
      "code": "curl -fsSL gloom.sh/install | bash"
+    },
+    {
+     "type": "paragraph",
+     "text": "The script downloads the latest GitHub release, checks its SHA-256, and installs `gloom` to `~/.local/bin`, using sudo only for a folder you can't write. It prints a PATH line and edits no shell file. Source: [scripts/install.sh](https://github.com/gloom-sh/gloomberb/blob/main/scripts/install.sh) in gloom-sh/gloomberb."
     },
     {
      "type": "heading",
@@ -1777,7 +1864,7 @@
     },
     {
      "type": "paragraph",
-     "text": "The [desktop installer](/download/desktop), about 280 MB, installs the app and the `gloom` command for your user, with no admin rights. It is not code-signed yet, so SmartScreen may stop it:"
+     "text": "The [desktop installer](/download/desktop) installs the app and the `gloom` command, with no admin rights. It is not code-signed yet, so SmartScreen may stop it:"
     },
     {
      "type": "list",
@@ -1790,25 +1877,35 @@
     },
     {
      "type": "paragraph",
-     "text": "To check the file first, compare `Get-FileHash` on it with the SHA-256 on the [release page](https://github.com/gloom-sh/gloomberb/releases/latest)."
-    },
-    {
-     "type": "list",
-     "items": [
-      "**Terminal:** the installer adds `gloom` to your PATH, so open a new terminal window. PowerShell works.",
-      "**Charts:** Windows Terminal has no Kitty graphics, so terminal charts draw as text. The desktop app draws them in full.",
-      "**Data:** `%USERPROFILE%\\.gloomberb`, printed by `gloom version`. `GLOOMBERB_HOME` moves it.",
-      "**Git and Bun:** Bun ships with the app; Git does not. Some official plugins (TV, Substack, Interactive Brokers, IBKR Gateway, Public, Robinhood, SimpleFIN, Polls, Prediction Markets, BYOK AI) install from GitHub and need [Git for Windows](https://git-scm.com/download/win). Without it Gloom starts without them, says so, and `gloom doctor` names them.",
-      "**Versions:** Windows 11 x64. Windows 10 and ARM PCs (x64 emulation) are untested."
-     ]
-    },
-    {
-     "type": "paragraph",
-     "text": "Terminal only, with [Bun](https://bun.sh), in PowerShell:"
+     "text": "Terminal only, in PowerShell:"
     },
     {
      "type": "code",
-     "code": "bun install -g gloomberb"
+     "code": "irm https://gloom.sh/install.ps1 | iex"
+    },
+    {
+     "type": "paragraph",
+     "text": "Then open a new terminal window."
+    },
+    {
+     "type": "details",
+     "summary": "Windows notes",
+     "blocks": [
+      {
+       "type": "list",
+       "items": [
+        "**Checksum:** the installer is about 280 MB. Compare `Get-FileHash` on it with the SHA-256 on the [release page](https://github.com/gloom-sh/gloomberb/releases/latest).",
+        "**Terminal:** the installer adds `gloom` to your PATH, so open a new terminal window. PowerShell works.",
+        "**PowerShell line:** installs `gloom.exe` from the latest release into `%USERPROFILE%\\.local\\bin`, checks its SHA-256 and adds the folder to your PATH, with no admin rights. Under Git Bash the bash line points here. With [Bun](https://bun.sh), `bun install -g @gloom-sh/terminal` works too.",
+        "**Charts:** Windows Terminal has no Kitty graphics, so terminal charts draw as text. The desktop app draws them in full.",
+        "**cmd.exe:** run `chcp 65001` so long dashes, `€` and `·` show, and quote an index symbol (`gloom quote \"^SPX\"`): cmd drops a bare `^`. See [CLI](/docs/cli-functions).",
+        "**Data:** `%USERPROFILE%\\.gloomberb`, printed by `gloom version`. `GLOOMBERB_HOME` moves it.",
+        "**Exports:** save an export with `--output` (`gloom fn RV NVDA,AMD,ASML:AMS --csv --output rv.csv`), which writes UTF-8 without a byte-order mark; a `>` redirect in Windows PowerShell 5.1 writes UTF-16. See [CLI](/docs/cli-functions).",
+        "**Git and Bun:** Bun ships with the app; Git does not. Some official plugins (TV, Substack, Interactive Brokers, IBKR Gateway, Public, Robinhood, SimpleFIN, Polls, Prediction Markets, BYOK AI) install from GitHub and need [Git for Windows](https://git-scm.com/download/win). Without it Gloom starts without them, says so, and `gloom doctor` names them.",
+        "**Versions:** Windows 11 x64 is tested. ARM PCs run the x64 build through Windows' emulation: the desktop app is checked to open and stay open on Windows 11 on Arm, nothing more. Windows 10 is untested."
+       ]
+      }
+     ]
     },
     {
      "type": "heading",
@@ -1817,11 +1914,11 @@
     },
     {
      "type": "paragraph",
-     "text": "[Open term.gloom.sh](https://term.gloom.sh) without an account: search, delayed quotes, charts, delayed news and most panes work in a one-pane workspace. Layouts stay in your browser."
+     "text": "[Open term.gloom.sh](https://term.gloom.sh). No account needed: search, charts, most panes, quotes 15 minutes delayed and news 12 hours delayed, in a one-pane workspace. Layouts stay in your browser."
     },
     {
      "type": "paragraph",
-     "text": "A free sign-in unlocks account-backed panes such as filings, analysts, supply chain and scanners, plus sync and sharing. Some research panes and real-time data require Pro. Browser builds cannot connect brokers or install local plugins."
+     "text": "A free sign-in adds filings, analysts, supply chain, scanners, sync and sharing. Real-time data and some research panes need Pro. The browser cannot connect brokers or install local plugins."
     },
     {
      "type": "heading",
@@ -1858,34 +1955,131 @@
       ],
       [
        "Homebrew",
-       "`brew upgrade --cask gloomberb`"
+       "`brew upgrade --cask gloom`"
       ],
       [
        "Bun",
-       "`bun install -g gloomberb@latest`"
+       "`bun install -g @gloom-sh/terminal@latest`"
       ]
      ]
     },
     {
-     "type": "paragraph",
-     "text": "Installed before 0.18.4, when the command was `gloomberb`? Updating adds `gloom` beside it and `gloomberb` keeps working, with nothing to reinstall."
+     "type": "details",
+     "summary": "Older installs",
+     "blocks": [
+      {
+       "type": "paragraph",
+       "text": "An existing `gloomberb` install keeps updating as it is."
+      },
+      {
+       "type": "paragraph",
+       "text": "Installed before 0.18.4, when the command was `gloomberb`? Updating adds `gloom` beside it and `gloomberb` keeps working, with nothing to reinstall."
+      },
+      {
+       "type": "paragraph",
+       "text": "Had `Gloomberb.app`? Its next update renames it to `Gloom.app`; settings and data stay."
+      }
+     ]
+    },
+    {
+     "type": "details",
+     "summary": "Release channels: stable and nightly",
+     "blocks": [
+      {
+       "type": "paragraph",
+       "text": "The app updates from **stable** releases, the ones on the [changelog](/changelog). **Nightly** is a daily build of main that gets fixes first and can break. To switch, run **Release Channel** from the command bar (on the Mac, also **Release Channel...** in the app menu), or in a terminal:"
+      },
+      {
+       "type": "code",
+       "code": "gloom config set updates.channel nightly"
+      },
+      {
+       "type": "paragraph",
+       "text": "Switching back to stable never installs an older version: your nightly build stays until a newer stable release is out. Nightly applies to the desktop app and the terminal app; Homebrew, Bun and the install script always get stable."
+      }
+     ]
     },
     {
      "type": "heading",
-     "level": 3,
-     "text": "Release channels"
+     "level": 2,
+     "text": "Uninstall"
     },
     {
      "type": "paragraph",
-     "text": "The app updates from **stable** releases, the ones on the [changelog](/changelog). **Nightly** is a daily build of main that gets fixes first and can break. To switch, run **Release Channel** from the command bar (on the Mac, also **Release Channel...** in the app menu), or in a terminal:"
+     "text": "Quit Gloom, then remove it the way you installed it:"
     },
     {
-     "type": "code",
-     "code": "gloom config set updates.channel nightly"
+     "type": "list",
+     "items": [
+      "**Homebrew:** `brew uninstall --cask gloom` removes the app and its commands. Add `--zap` to delete your data too.",
+      "**macOS install script:** `rm -rf /Applications/Gloom.app ~/.local/bin/gloom ~/.local/bin/gloomberb`",
+      "**macOS disk image:** drag `Gloom.app` from Applications to the Trash.",
+      "**Linux:** `rm ~/.local/bin/gloom ~/.local/bin/gloomberb`",
+      "**Windows installer:** **Settings > Apps**, Gloom, **Uninstall**.",
+      "**Windows PowerShell line:** delete `%USERPROFILE%\\.local\\bin\\gloom.exe`, then that folder's entry in your user PATH.",
+      "**Bun:** `bun remove -g @gloom-sh/terminal`"
+     ]
     },
     {
      "type": "paragraph",
-     "text": "Switching back to stable never installs an older version: your nightly build stays until a newer stable release is out. Nightly applies to the desktop app and the terminal app; Homebrew, Bun and the install script always get stable."
+     "text": "Your data stays unless you use `--zap` or delete it yourself."
+    },
+    {
+     "type": "details",
+     "summary": "Where Gloom keeps its data, and the small print",
+     "blocks": [
+      {
+       "type": "paragraph",
+       "text": "`gloom version` prints the data folder in use."
+      },
+      {
+       "type": "list",
+       "items": [
+        "**macOS and Windows:** `~/.gloomberb` (`%USERPROFILE%\\.gloomberb` on Windows). It holds settings, the database, plugins and logs. `config.json` there can hold broker credentials.",
+        "**Linux:** `~/.gloomberb` if you have it. A new install without it uses `~/.config/gloomberb`, `~/.local/share/gloomberb` and `~/.cache/gloomberb`, or the folders `$XDG_CONFIG_HOME`, `$XDG_DATA_HOME` and `$XDG_CACHE_HOME` name when set.",
+        "**`GLOOMBERB_HOME`:** if you set it, everything above lives in that folder instead."
+       ]
+      },
+      {
+       "type": "paragraph",
+       "text": "The Mac desktop app also keeps these three. With `--zap`, Homebrew deletes them and `~/.gloomberb`:"
+      },
+      {
+       "type": "code",
+       "code": "~/Library/Application Support/com.vincelwt.gloomberb\n~/Library/Preferences/com.vincelwt.gloomberb.plist\n~/Library/WebKit/com.vincelwt.gloomberb"
+      },
+      {
+       "type": "paragraph",
+       "text": "The Windows desktop app keeps this folder, if uninstalling left it:"
+      },
+      {
+       "type": "code",
+       "code": "%LOCALAPPDATA%\\com.vincelwt.gloomberb"
+      },
+      {
+       "type": "paragraph",
+       "text": "Those folders are named after the desktop app's identifier, `com.vincelwt.gloomberb`. If a newer build has moved to `sh.gloom.desktop`, delete that name too."
+      },
+      {
+       "type": "paragraph",
+       "text": "The small print:"
+      },
+      {
+       "type": "list",
+       "items": [
+        "**Shell files:** the macOS and Linux script edits none. If you added the PATH line it printed, delete that line.",
+        "**sudo:** use it for a folder the script needed it for.",
+        "**Before 0.18.4:** an install from then that has not updated since has `Gloomberb.app`, not `Gloom.app`.",
+        "**Intel Mac:** the script installs the terminal command only, so there is no app to delete.",
+        "**Windows installer:** its entry is listed once the app has started; before that, delete the folder above. If the app folder's `bin` is still on your user PATH afterwards, remove it.",
+        "**Windows PATH:** to edit your user PATH, search for \"Edit environment variables for your account\"."
+       ]
+      },
+      {
+       "type": "paragraph",
+       "text": "Your Gloom account and what it synced stay until you delete the account in the app's account settings."
+      }
+     ]
     },
     {
      "type": "paragraph",
@@ -2206,7 +2400,7 @@
   {
    "slug": "workflows",
    "title": "Goal-based workflows",
-   "lead": "Short recipes for a market check, company research, peer comparison, earnings, macro and the AI buildout.",
+   "lead": "Short recipes for a market check, company research, peer comparison, earnings, macro, the AI buildout and dry-bulk freight.",
    "category": "Start here",
    "tags": [
     "beginner",
@@ -2214,7 +2408,7 @@
     "research",
     "markets"
    ],
-   "updatedAt": "2026-10-07",
+   "updatedAt": "2026-10-31",
    "blocks": [
     {
      "type": "heading",
@@ -2434,6 +2628,40 @@
     {
      "type": "paragraph",
      "text": "All five are Pro. Free shows a preview of each except `JOBS`. See [All functions](/docs/functions) for the rest."
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Follow dry-bulk freight"
+    },
+    {
+     "type": "paragraph",
+     "text": "Gloom has no Baltic indices (BDI, Capesize, Panamax, Supramax), freight forwards (FFA), time-charter equivalents or route rates: they are licensed data. These traded proxies are covered:"
+    },
+    {
+     "type": "table",
+     "headers": [
+      "Command",
+      "For"
+     ],
+     "rows": [
+      [
+       "`GP BDRY`",
+       "A freight futures ETF, the closest traded read of dry-bulk rates."
+      ],
+      [
+       "`CMP SBLK, GNK, DSX`",
+       "Dry-bulk shipowners, whose shares move with rates."
+      ],
+      [
+       "`CHOKE`",
+       "Daily vessel transits through Suez, Panama, Hormuz and the other main straits."
+      ]
+     ]
+    },
+    {
+     "type": "paragraph",
+     "text": "`gloom search \"baltic dry\"` prints the same list in a shell, and `gloom news \"dry bulk\"` the latest stories."
     }
    ]
   },
@@ -2445,6 +2673,11 @@
    "tags": [
     "PF",
     "portfolio",
+    "currency",
+    "TRY",
+    "cost FX",
+    "real return",
+    "inflation",
     "target weights",
     "drift",
     "rebalance",
@@ -2454,9 +2687,16 @@
     "yield",
     "DRIP",
     "reinvest",
-    "DVD"
+    "DVD",
+    "import positions",
+    "broker CSV",
+    "Fidelity",
+    "Schwab",
+    "Vanguard",
+    "E*TRADE",
+    "Merrill"
    ],
-   "updatedAt": "2026-10-25",
+   "updatedAt": "2026-11-07",
    "blocks": [
     {
      "type": "heading",
@@ -2470,6 +2710,59 @@
     {
      "type": "code",
      "code": "gloom portfolio create Core\ngloom portfolio position set Core VTI 40 280\ngloom portfolio position set Core BND 60 72\ngloom portfolio cash set Core 2000 USD"
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "A portfolio in another currency"
+    },
+    {
+     "type": "paragraph",
+     "text": "A portfolio totals in your base currency unless you give it its own. Holdings in other currencies are converted into it:"
+    },
+    {
+     "type": "code",
+     "code": "gloom portfolio create Lira --currency TRY\ngloom portfolio position set Lira THYAO 100 280                     # a BIST stock, cost in TRY\ngloom portfolio position set Lira BRK-B 10 20310 TRY                # a US stock at what it cost in lira\ngloom portfolio position set Lira BRK-B 10 410 USD --date 2024-03-01   # or in dollars, converted at that day's FX close\ngloom portfolio position set Lira KO 40 62.50 USD --cost-fx 32.15      # or at the rate you paid, TRY per USD\ngloom portfolio show Lira --from 2025-11-06                          # P&L since a date, with the currency's move on its own line\ngloom portfolio show Lira --from 2025-11-06 --real                   # and the return after Turkish consumer prices"
+    },
+    {
+     "type": "paragraph",
+     "text": "A cost in the holding's own currency without `--date` or `--cost-fx` converts at today's rate, and `portfolio show` names the holdings it does that for. Use the date or the rate so P&L carries the currency's move since you bought. A name whose last word is a currency code in capitals (`Baht THB`) creates the portfolio in that currency too."
+    },
+    {
+     "type": "paragraph",
+     "text": "`--real` deflates the period's total by the consumer prices of the portfolio's currency, from the CPI month before the start's month to the one before the end's (or the latest month published), and names both months:"
+    },
+    {
+     "type": "list",
+     "items": [
+      "**USD**: the ratio of the BLS index at those two months, not seasonally adjusted (FRED's `CPIAUCNS`), as a period's inflation is quoted. A month the BLS did not publish reads the month before it.",
+      "**TRY**: the central bank's table gives TurkStat's changes rather than the index, so the figure is chained from the end month back. Each whole year takes TurkStat's year-on-year change, and each month left over takes its monthly change. Every change is applied as one plus the change, and the factors are multiplied. A twelve-month period is TurkStat's published annual rate: October 2025 to October 2026 reads 29.77%. A month without its change leaves the period without a real return."
+     ]
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Import positions from a broker CSV"
+    },
+    {
+     "type": "paragraph",
+     "text": "A broker Gloom does not sync can still fill a portfolio. Download its positions or holdings page as a CSV. Then in PF open the pane menu (`.`, or `...` in the title bar) and choose **Import Positions…**, or in a shell:"
+    },
+    {
+     "type": "code",
+     "code": "gloom portfolio import ~/Downloads/Portfolio_Positions.csv --dry-run   # the preview, nothing saved\ngloom portfolio import ~/Downloads/Portfolio_Positions.csv             # creates \"Fidelity\"\ngloom portfolio import positions.csv --name Fidelity --merge           # update a portfolio that holds tickers"
+    },
+    {
+     "type": "paragraph",
+     "text": "Fidelity, Schwab (one account or all of them), Vanguard, E*TRADE and Merrill exports are read as they come, and so is any table with a symbol and a quantity column. Each symbol becomes a position with its shares and, where the file has them, cost, purchase date and currency."
+    },
+    {
+     "type": "paragraph",
+     "text": "A preview comes first. The app saves nothing until you choose **Import**, and in a shell `--dry-run` prints the same preview. Cash, options, bonds and pending rows are listed as skipped, each with the reason. A trade history is refused."
+    },
+    {
+     "type": "paragraph",
+     "text": "Into a portfolio that already holds tickers, choose **Merge** (`--merge`: the file's positions are set over the same holdings, the rest stay) or **Replace** (`--replace`: holdings the file does not list are removed too). The app asks you to confirm a replace. A replace never removes a holding the file lists, and is refused while any stock row failed to import."
     },
     {
      "type": "heading",
@@ -2580,6 +2873,9 @@
         "Income uses trailing dividends, not announced ones. DRIP holds dividends, prices and exchange rates where they are today and reinvests once a year; it is an illustration, not a forecast.",
         "Trades use the current price and leave out fees, taxes and lot sizes.",
         "A broker portfolio uses the cash its account reports.",
+        "Several rows of one symbol (lots, or one holding in several accounts) become one position: the shares added up, the cost averaged, dated by the earliest lot.",
+        "Vanguard's export has no cost. Its positions come in without one, unless the portfolio already holds the ticker and keeps that cost; set it with `gloom portfolio position set`.",
+        "A file takes at most 1,000 positions and 5 MB. A portfolio synced from a broker is never imported into.",
         "In the PF pane the columns read `WEIGHT`, `TGT WT`, `DRIFT` and `TRADE`."
        ]
       }
@@ -2639,7 +2935,7 @@
       ],
       [
        "[Interactive Brokers](/plugins/ibkr-gateway)",
-       "The IBKR Gateway plugin's own Trade tab, with Gateway or TWS running"
+       "The IBKR Gateway plugin's own Trade tab, with Gateway or TWS running ([keeping Gateway logged in](/answers/ib-gateway-daily-restart-sunday-login))"
       ]
      ]
     },
@@ -2812,6 +3108,160 @@
    ]
   },
   {
+   "slug": "alerts",
+   "title": "Alerts",
+   "lead": "Every alert Gloom sets, and where each one is checked: in the app while it runs, and in Gloom Cloud when you are signed in.",
+   "category": "Start here",
+   "tags": [
+    "ALRT",
+    "SA",
+    "alerts",
+    "price alert",
+    "IV alert",
+    "risk reversal",
+    "news alert",
+    "earnings alert",
+    "options flow",
+    "push",
+    "email",
+    "gloom alerts add"
+   ],
+   "updatedAt": "2026-11-11",
+   "blocks": [
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Open it"
+    },
+    {
+     "type": "table",
+     "headers": [
+      "Command",
+      "Does"
+     ],
+     "rows": [
+      [
+       "`ALRT`",
+       "Your alerts: **Levels**, **Events** and **History**"
+      ],
+      [
+       "`SA AAPL above 250`",
+       "Adds a price alert from the command bar"
+      ],
+      [
+       "`gloom alerts add ...`",
+       "Adds any alert from the shell; `gloom help alerts` lists every form"
+      ]
+     ]
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Who checks what"
+    },
+    {
+     "type": "paragraph",
+     "text": "The running app checks price, move, valuation, technical and ratio alerts. Signed in with Cloud sync, Gloom Cloud checks them too while the app is closed. A few others are checked only by the running app, and the news, filing and market rules only by Gloom Cloud, for a signed-in account."
+    },
+    {
+     "type": "table",
+     "headers": [
+      "Alert",
+      "Checked by",
+      "Reaches you"
+     ],
+     "rows": [
+      [
+       "Price: above, below, crosses",
+       "The running app, as quotes arrive. With Cloud sync, Gloom Cloud while the app is closed",
+       "In the app. With the app closed, on your phone and by email"
+      ],
+      [
+       "Move from the previous close",
+       "The running app, once a session. With Cloud sync, Gloom Cloud while the app is closed",
+       "In the app. With the app closed, on your phone and in that day's market email"
+      ],
+      [
+       "P/E, P/S, ratio to a benchmark",
+       "The running app. With Cloud sync, Gloom Cloud while the app is closed",
+       "As price alerts"
+      ],
+      [
+       "RSI and moving averages, RRG",
+       "The running app, on the daily close (RRG on the weekly close). With Cloud sync, Gloom Cloud while the app is closed",
+       "As price alerts"
+      ],
+      [
+       "IV level: 30-day ATM IV or 25-delta risk reversal",
+       "The running app, every 15 minutes",
+       "In the app only"
+      ],
+      [
+       "Earnings date, CPI, FOMC, an economic release",
+       "The running app, every 15 minutes",
+       "In the app, on the day the lead time is reached, and with the actual figures once out. Earnings alerts also reach your phone, once per report and never on the day itself"
+      ],
+      [
+       "[Catalysts](/docs/catalysts) (trial readouts, FDA dates)",
+       "The running app, signed in, on Gloom Pro, every five minutes",
+       "In the app"
+      ],
+      [
+       "News keyword, SEC filing, analyst change, 52-week high or low, unusual volume, short interest, insider trade, hiring, a perpetual's funding or open interest",
+       "Gloom Cloud, signed in",
+       "On your phone"
+      ],
+      [
+       "IV spike on one option contract, options flow",
+       "Gloom Cloud, signed in, on Gloom Pro",
+       "On your phone"
+      ],
+      [
+       "IPO, Congress trades, 13F filings",
+       "Gloom Cloud, signed in",
+       "On your phone"
+      ]
+     ]
+    },
+    {
+     "type": "paragraph",
+     "text": "A Cloud alert added while signed out is kept, and reads **Needs sign-in** in `ALRT` and `gloom alerts list` until you sign in. Commands such as `gloom doctor` or `gloom fn` never check alerts: only the app does."
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Add one"
+    },
+    {
+     "type": "code",
+     "code": "gloom alerts add AAPL above 250\ngloom alerts add GBPUSD=X moves 0.5%\ngloom alerts add BTC-USD iv above 50        # bitcoin's 30-day ATM IV, from Deribit's options\ngloom alerts add SPY rr below -6            # 30-day 25-delta risk reversal, in vol points\ngloom alerts add CRWV earnings --days 3\ngloom alerts add news bitcoin               # any story that mentions it\ngloom alerts add NVDA flow 5m calls sweeps\ngloom alerts add AAPL271217C00300000 iv spike 5"
+    },
+    {
+     "type": "list",
+     "items": [
+      "A symbol is read as `gloom quote` reads it. A target more than 10 times the last price, or under a tenth of it, is refused.",
+      "An IV level reads the 1M row of `OVDV`'s Table: US listings, and `BTC-USD` and `ETH-USD` from Deribit's options.",
+      "News, flow and the other Cloud rules follow US listings. A coin's news is a keyword alert, on the words you typed when they name the coin, else on its name: `gloom alerts add news bitcoin`.",
+      "A ticker that is also a series name says which listing the alert follows. `DVOL` is a US fund; Deribit's bitcoin volatility index is `gloom fn G CAP:volatility:dvol-btc`, and an alert on bitcoin's implied volatility is `gloom alerts add BTC-USD iv above 60`.",
+      "An IV spike needs a live contract: one past its expiry is refused."
+     ]
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "After it goes off"
+    },
+    {
+     "type": "paragraph",
+     "text": "A price or IV level alert goes off once, then reads **Triggered** or **Alerted** until you re-arm it (`m` in `ALRT`, or `gloom alerts rearm <id>`). A move alert arms itself again for the next session."
+    },
+    {
+     "type": "paragraph",
+     "text": "**History** in `ALRT`, and `gloom fn ALRT --tab history`, lists the alerts that went off on this device, newest first, with the figure and the quote behind each, beside the alerts you created, re-armed or deleted."
+    }
+   ]
+  },
+  {
    "slug": "ai-workflows",
    "title": "AI workflows",
    "lead": "Natural-language command help, Ask Gloom, AI screeners, ticker questions, and persistent local agent threads.",
@@ -2845,7 +3295,7 @@
       [
        "Ask Gloom",
        "`ASKG <question>`, or the `Ask Gloom` row in the command bar",
-       "Cloud assistant that reads your panes and runs tools. Verified accounts get the standard model, paid Pro the Pro model."
+       "Cloud assistant that reads your panes and runs tools. Verified accounts get 20 questions a day, paid Pro 300; the count resets at midnight UTC."
       ],
       [
        "AI screener",
@@ -2930,7 +3380,7 @@
     "troubleshooting",
     "diagnostics"
    ],
-   "updatedAt": "2026-10-07",
+   "updatedAt": "2026-11-09",
    "blocks": [
     {
      "type": "heading",
@@ -2980,7 +3430,7 @@
     {
      "type": "list",
      "items": [
-      "`Bad CPU type in executable` on macOS: an Intel Mac running the Apple Silicon app. Delete `/Applications/Gloomberb.app` and rerun `curl -fsSL gloom.sh/install | bash` for the Intel terminal build.",
+      "`Bad CPU type in executable` on macOS: an Intel Mac running the Apple Silicon app. [Delete](/docs/getting-started#uninstall) `/Applications/Gloom.app` (`Gloomberb.app` before the app was renamed) and rerun `curl -fsSL gloom.sh/install | bash` for the Intel terminal build.",
       "`gloom doctor` shows runtime errors.",
       "Update with the same method you installed with. See [Install and update](/docs/getting-started)."
      ]
@@ -3086,6 +3536,7 @@
      "type": "list",
      "items": [
       "`BR` checks the connection before `IBKR`.",
+      "Interactive Brokers: Flex errors are listed in [IBKR Flex Query setup](/answers/ibkr-flex-query-setup); a Gateway that logs out is covered in [the daily restart and the Sunday login](/answers/ib-gateway-daily-restart-sunday-login).",
       "Cloud login and broker authorization are separate.",
       "Market data, account sync, and order authorization can fail independently.",
       "Review the account and the order preview before submitting. Never test with a real order."
@@ -3306,7 +3757,7 @@
     },
     {
      "type": "paragraph",
-     "text": "When signed in, searches you finish in the command bar are saved to improve search, shown to no one, and deleted with your account. [Research attention](/docs/attention) is a separate opt-in, off by default."
+     "text": "When signed in, searches you finish in the command bar are saved to improve search, shown to no one, and deleted with your account. Attention Counts, the research attention contribution, is a separate setting, on by default after a one-time notice; turn it off by running `Attention Counts` in the command bar, and while signed in the off reaches your other devices when they next sync."
     },
     {
      "type": "paragraph",
@@ -3731,7 +4182,7 @@
     "government",
     "SPLC"
    ],
-   "updatedAt": "2026-10-07",
+   "updatedAt": "2026-11-12",
    "blocks": [
     {
      "type": "heading",
@@ -3831,7 +4282,8 @@
     {
      "type": "list",
      "items": [
-      "A contract is evidence of a government customer, not recognised revenue. Prime awards, subawards and modifications overlap, so do not add them, and currencies are never combined."
+      "A contract is evidence of a government customer, not recognised revenue. Prime awards, subawards and modifications overlap, so do not add them, and currencies are never combined.",
+      "Singapore's GeBIZ amounts are as printed. For a tender awarded by items, a panel or a framework, an amount can be a ceiling, a rate or an estimate, not the supplier's revenue. An amount under S$6,000, or the same amount printed for several suppliers of one tender, shows as no amount."
      ]
     },
     {
@@ -4048,115 +4500,7 @@
     },
     {
      "type": "paragraph",
-     "text": "CLI `gloom fn JOBS NVDA`. MCP `company.hiring`, `market.hiring_movers`, `hiring.momentum`, `apps.attention`, `apps.rank_history`. Related: [Research attention](/docs/attention)."
-    }
-   ]
-  },
-  {
-   "slug": "attention",
-   "title": "Research attention",
-   "lead": "ATTN shows which tickers other Gloom users are researching, and which are getting unusual attention",
-   "category": "Understand the data",
-   "tags": [
-    "ATTN",
-    "attention",
-    "research",
-    "privacy"
-   ],
-   "updatedAt": "2026-10-07",
-   "blocks": [
-    {
-     "type": "heading",
-     "level": 2,
-     "text": "Open it"
-    },
-    {
-     "type": "table",
-     "headers": [
-      "Command",
-      "Opens"
-     ],
-     "rows": [
-      [
-       "`ATTN`",
-       "The board"
-      ],
-      [
-       "`ATTN NVDA`",
-       "One ticker"
-      ],
-      [
-       "`ATTN 6758:JPX`",
-       "An international listing"
-      ]
-     ]
-    },
-    {
-     "type": "heading",
-     "level": 2,
-     "text": "What you see"
-    },
-    {
-     "type": "table",
-     "headers": [
-      "Tab",
-      "Shows"
-     ],
-     "rows": [
-      [
-       "Ranking",
-       "Tickers by research hours, with share, price move and relative volume"
-      ],
-      [
-       "Abnormal",
-       "Tickers well above their own usual level"
-      ],
-      [
-       "Sectors, Countries",
-       "Totals by sector and country"
-      ],
-      [
-       "History",
-       "Hourly research hours for one ticker"
-      ],
-      [
-       "Evidence",
-       "The window and rules behind each figure"
-      ]
-     ]
-    },
-    {
-     "type": "paragraph",
-     "text": "Switch the window between Now, Today and Week. Enter opens a ticker, `e` shows evidence."
-    },
-    {
-     "type": "heading",
-     "level": 2,
-     "text": "Free and Pro"
-    },
-    {
-     "type": "paragraph",
-     "text": "Pro shows the full board and 29 days of hourly history. Free shows three rows per section and the latest point. Data lags by at least an hour."
-    },
-    {
-     "type": "heading",
-     "level": 2,
-     "text": "Keep in mind"
-    },
-    {
-     "type": "list",
-     "items": [
-      "Counts come only from users who opted in, so they are a sample, not the market. A ticker appears only when enough people looked at it, and hidden hours are unavailable, not zero."
-     ]
-    },
-    {
-     "type": "heading",
-     "level": 2,
-     "text": "Your choice"
-    },
-    {
-     "type": "paragraph",
-     "text": "Contributing is a separate opt-in setting, off by default. Toggle **Attention Counts** in Settings or with `gloom config set telemetry.attention true`. See the [Privacy Policy](/privacy). MCP `market.attention`."
+     "text": "CLI `gloom fn JOBS NVDA`. MCP `company.hiring`, `market.hiring_movers`, `hiring.momentum`, `apps.attention`, `apps.rank_history`."
     }
    ]
   },
@@ -4376,7 +4720,7 @@
   {
    "slug": "perpetuals",
    "title": "Perpetual history",
-   "lead": "PERP shows funding, open interest and premium history for one perpetual on Hyperliquid, Binance, Bybit or OKX",
+   "lead": "PERP shows a board and rankings of perpetuals on Hyperliquid, Binance, Bybit and OKX, and one perpetual's funding, open interest and premium history",
    "category": "Understand the data",
    "tags": [
     "PERP",
@@ -4385,7 +4729,7 @@
     "perpetuals",
     "history"
    ],
-   "updatedAt": "2026-10-09",
+   "updatedAt": "2026-11-09",
    "blocks": [
     {
      "type": "heading",
@@ -4401,11 +4745,11 @@
      "rows": [
       [
        "`PERP`",
-       "A market search"
+       "The Board of every market"
       ],
       [
        "`PERP BTC`",
-       "Bitcoin perpetuals"
+       "Bitcoin on the venue with the most open interest"
       ],
       [
        "`PERP hyperliquid:xyz:TSLA`",
@@ -4425,6 +4769,26 @@
       "Shows"
      ],
      "rows": [
+      [
+       "Board",
+       "Every market by venue: mark, funding, premium, open interest and its 24-hour change, long share and APR, filtered by asset class and venue"
+      ],
+      [
+       "Rankings",
+       "The highest and lowest funding, open-interest surges and premium dislocations, across every asset class or within one"
+      ],
+      [
+       "Compare",
+       "One asset's contracts across the venues: mark, funding, premium and when each was observed"
+      ],
+      [
+       "Liquidations",
+       "One asset's liquidated longs and shorts across the venues: 24-hour and 7-day totals, the hourly series and the largest prints"
+      ],
+      [
+       "Depth",
+       "One asset's resting bids and asks within 0.5%, 1% and 2% of mid on each venue, from each venue's order book every hour"
+      ],
       [
        "History",
        "Funding, open interest and mark premium, with price candles and settled funding where available"
@@ -4451,6 +4815,37 @@
     {
      "type": "heading",
      "level": 2,
+     "text": "Liquidations"
+    },
+    {
+     "type": "paragraph",
+     "text": "Each venue's public liquidation stream, kept event by event with the time it arrived. A long liquidated is a forced sell, a short a forced buy, valued at the price the venue reports: the average fill on Binance and Hyperliquid, the bankruptcy price on Bybit and OKX. What the streams leave out:"
+    },
+    {
+     "type": "list",
+     "items": [
+      "Binance and OKX send at most one liquidation per contract each second, so a burst on one contract is undercounted.",
+      "Bybit sends every liquidation.",
+      "Hyperliquid publishes only the positions its liquidity vault takes over (backstop liquidations). Liquidations closed on the order book are not published venue-wide and are missing.",
+      "Venues publish no liquidation history, so time the collector was not connected is missing, not zero, and history starts at first collection."
+     ]
+    },
+    {
+     "type": "paragraph",
+     "text": "Free shows each contract's 24-hour and 7-day totals and the three largest prints; Pro adds the hourly series and the twenty largest prints."
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Order book depth"
+    },
+    {
+     "type": "paragraph",
+     "text": "The quote notional resting within 0.5%, 1% and 2% of mid, read once an hour from each venue's public order book for its 50 largest markets by open interest. Binance and Bybit return the nearest 1,000 price levels a side and OKX 5,000; on the deepest markets the book ends inside a band, which then shows at least (≥) what it holds. Hyperliquid returns 20 levels a side, so wider bands are read from its grouped book and a band's edge falls within one price group. A book not read for 2.5 hours (it left its venue's 50 largest, or the venue is failing) is marked stale and left out of the band totals; after a week it is no longer listed. Free shows the latest reading; Pro the hourly history."
+    },
+    {
+     "type": "heading",
+     "level": 2,
      "text": "Long/short ratio"
     },
     {
@@ -4465,7 +4860,8 @@
     {
      "type": "list",
      "items": [
-      "Stored readings cover Hyperliquid, Binance, Bybit and OKX.",
+      "Stored readings cover Hyperliquid, Binance, Bybit and OKX. Compare shows each venue's leading contract free; Pro lists every contract.",
+      "A contract's asset class is the one its venue gives it: OKX's instrument category, Binance's underlying type and Bybit's symbol type, so a venue's stock, commodity or FX perpetual is never counted as crypto. Hyperliquid's builder-deployed markets are classed from a checked list and stay Other until checked.",
       "Positive funding means longs pay shorts. Open interest in contracts and in USD differ, because a price rise adds USD open interest without new contracts.",
       "A stock perpetual's premium is blank while the stock market is closed. The live board and trading are in the Hyperliquid plugin."
      ]
@@ -4489,7 +4885,7 @@
     "compute",
     "rental"
    ],
-   "updatedAt": "2026-10-10",
+   "updatedAt": "2026-10-31",
    "blocks": [
     {
      "type": "heading",
@@ -4527,7 +4923,7 @@
      "rows": [
       [
        "Board",
-       "One row per provider and variant: USD per GPU-hour, 1, 7 and 30-day change, availability. Enter opens its history. The Hyperscaler and Neocloud rows are list indexes."
+       "One row per provider and variant: USD per GPU-hour, 1, 7 and 30-day change, availability. Enter opens its history. The Gloom settled row on top is the official daily price. The Hyperscaler and Neocloud rows are list indexes."
       ],
       [
        "History",
@@ -4580,6 +4976,19 @@
     {
      "type": "heading",
      "level": 2,
+     "text": "Gloom daily settle"
+    },
+    {
+     "type": "paragraph",
+     "text": "One official Gloom price per GPU and form factor (SXM and PCIe apart), set every day at 20:00 UTC and never revised. A day with too few prices to set one shows \"No settle\". In the rare case a settle is corrected, the correction is a new entry marked Corrected, and the original stays on record."
+    },
+    {
+     "type": "paragraph",
+     "text": "The latest settle and the last 30 days are free for everyone, on the board and the [GPU price pages](/gpu-prices). The full history is in the Datasets API."
+    },
+    {
+     "type": "heading",
+     "level": 2,
      "text": "Free and Pro"
     },
     {
@@ -4609,7 +5018,7 @@
     },
     {
      "type": "paragraph",
-     "text": "CLI `gloom fn GPU H100`. MCP `gpu.board`, `gpu.history`, `gpu.changes`. Related: [Power and grid](/docs/power)."
+     "text": "CLI `gloom fn GPU H100`. MCP `gpu.board`, `gpu.history`, `gpu.changes`, `gpu.settles`. Datasets API `gpu.settles` for the latest settle and its full history. Related: [Power and grid](/docs/power)."
     }
    ]
   },
@@ -4736,7 +5145,7 @@
     "call wall",
     "put wall"
    ],
-   "updatedAt": "2026-10-23",
+   "updatedAt": "2026-10-28",
    "blocks": [
     {
      "type": "heading",
@@ -4855,7 +5264,7 @@
       {
        "type": "list",
        "items": [
-        "Gamma per contract is Black-Scholes gamma with the forward at spot, times the 100-share multiplier. Time runs to 16:00 New York on the expiry date, at least one hour.",
+        "Gamma per contract is Black-Scholes gamma with the forward at spot, times the 100-share multiplier. Time runs to 16:00 New York on the expiry date, at least one hour, from now, or outside the session from the spot's time: before the open, a same-day expiry has the hours from the pre-market print to the close, with the volatility the last session's quotes imply. A cash index (SPX, XSP) outside its session is spot at that session's close.",
         "Each strike's volatility comes from its expiry's out-of-the-money quotes, linear between quoted strikes and flat beyond. An expiry without usable quotes is left out and named.",
         "GEX at a strike is gamma × 100 × spot × 1% of spot × open interest.",
         "The flip reprices net GEX from 15% below to 15% above spot in 0.25% steps, each strike keeping its volatility, and takes the sign change nearest spot.",
@@ -4953,7 +5362,7 @@
     },
     {
      "type": "paragraph",
-     "text": "`gloom fn GEX SPY --csv` opens with a summary: spot and quote times, the open interest session, the unit, net GEX, the dealer range, the flip and both walls. Puts export negative, so call and put GEX add up to net. `--json` has the same under `metadata.gamma`."
+     "text": "`gloom fn GEX SPY --csv` opens with a summary: spot, when gamma is evaluated and when its quotes were taken (`Gamma at ..., vols from ...`), the open interest session, the unit, net GEX, the dealer range, the flip and both walls. Puts export negative, so call and put GEX add up to net. `--json` has the same under `metadata.gamma`."
     },
     {
      "type": "heading",
@@ -5539,19 +5948,24 @@
     "functions",
     "screenshots"
    ],
-   "updatedAt": "2026-10-12",
+   "updatedAt": "2026-11-08",
    "blocks": [
     {
      "type": "paragraph",
-     "text": "`gloom` alone, or `gloom launch-ui` from a script, opens the terminal UI. Every other command runs headless and prints a result."
+     "text": "`gloom` opens the terminal UI (`gloom launch-ui` from a script). Every other command runs headless and prints text, or `--json`, `--csv` or `--ndjson`."
+    },
+    {
+     "type": "code",
+     "code": "gloom quote AAPL MSFT\ngloom fn GP NVDA\ngloom financials MSFT --csv --output msft.csv\ngloom shot QQ AAPL,MSFT,NVDA --output quotes.png"
     },
     {
      "type": "paragraph",
-     "text": "`gloom help <command>` shows usage and examples. Plugins add commands of their own, such as `ai ask` from BYOK AI."
+     "text": "`gloom help <command>` shows usage and examples. Plugins add commands, such as `ai ask` from BYOK AI."
     },
     {
-     "type": "paragraph",
-     "text": "Output is readable text by default. Global flags:"
+     "type": "heading",
+     "level": 2,
+     "text": "Global flags"
     },
     {
      "type": "table",
@@ -5562,7 +5976,11 @@
      "rows": [
       [
        "`--json`, `--csv`, `--ndjson`",
-       "Machine-readable output. `--json` is the richest."
+       "Machine-readable output; `--json` is the richest"
+      ],
+      [
+       "`--output file`, `--out file`",
+       "Write that output to a file ([more](#files-and-windows))"
       ],
       [
        "`--limit n`",
@@ -5574,13 +5992,25 @@
       ],
       [
        "`--dry-run`",
-       "Preview a change without saving. Applies to `config`, `cache`, `notes`, `alerts`, `plugin enable` and `disable`, and `remote`."
+       "Preview a change without saving: `config`, `cache`, `notes`, `alerts`, `plugin enable` and `disable`, `remote`"
       ],
       [
        "`-q`, `--quiet`, `--no-color`",
        "Less output, no colour"
+      ],
+      [
+       "`--plain`, `--no-plain`",
+       "Text for a screen reader or very large text ([more](#plain-output))"
+      ],
+      [
+       "`--width n`",
+       "Fit tables, help and notes to n columns, in a terminal or piped"
       ]
      ]
+    },
+    {
+     "type": "paragraph",
+     "text": "Exit codes: 0 when it worked, 1 when it failed (bad input, no data found, a failed check). `gloom help` ends with the list."
     },
     {
      "type": "heading",
@@ -5615,8 +6045,12 @@
        "Revenue and EPS, profile, multiples, dividends and splits, ratings and targets"
       ],
       [
+       "`fn CMP <symbols> [--from <date>] [--to <date>] [--total-return] [--currency <code>]`",
+       "Returns side by side"
+      ],
+      [
        "`fn DVD <symbols>`",
-       "Dividend yield and history; several symbols rank in one table by yield, with payout, growth, last ex-date and pay date"
+       "Dividend yield and history; several rank by yield, with payout, growth, last ex-date and pay date"
       ],
       [
        "`holders`, `insider`, `13f`, `filings` `<symbol>`",
@@ -5630,6 +6064,13 @@
        "`correlation <a> <b>`",
        "Daily-return correlation over the past year"
       ]
+     ]
+    },
+    {
+     "type": "list",
+     "items": [
+      "`fn CMP` gives price returns in each listing's currency. `--total-return` reinvests each distribution at its ex-date close.",
+      "`--currency USD` converts every close at that day's FX close, so a lira stock's return carries the lira's move."
      ]
     },
     {
@@ -5649,11 +6090,23 @@
        "Market overview"
       ],
       [
-       "`earnings <symbols>`, `fx <currency>`",
-       "Earnings dates; a currency into your base currency"
+       "`earnings <symbols>`",
+       "Earnings dates"
       ],
       [
-       "`econ [--country US|G7|EU|all] [--impact high|medium|low|all]`",
+       "`fx <currency>`, `fx <base>/<quote>`, `fx <amount> <from>/<to>`",
+       "A currency into your base currency, a pair as markets quote it with its move on the day (`fx USD/MXN`), or an amount converted (`fx 5000000 USD/EUR`)"
+      ],
+      [
+       "`fx <pair> --date <day>`",
+       "The rate at that day's daily FX close (`fx USD/MXN --date 2026-11-06`)"
+      ],
+      [
+       "`fx [amount] <pair> --forward <tenor>`",
+       "The forward implied by both currencies' short rates, with forward points (`fx 5000000 USD/MXN --forward 30d`)"
+      ],
+      [
+       "`econ [--country all|US|G7|EU|<codes>] [--impact high|medium|low|all] [--search <words>] [--from <date>] [--tz <zone>]`",
        "Economic calendar"
       ],
       [
@@ -5664,6 +6117,16 @@
        "`provider-search <query>`",
        "Search instruments at your connected data providers"
       ]
+     ]
+    },
+    {
+     "type": "list",
+     "items": [
+      "Gold, silver, platinum and palladium have no spot quote: `fx XAU/TRY` uses the front-month future (GC=F) and the dollar pair, and says so.",
+      "A weekend or holiday `--date` reads the trading day before, and says so.",
+      "`--forward` is covered interest parity, not a dealer quote. With an amount it adds the carry in your base currency, and which side earns it.",
+      "Short rates cover USD, EUR, GBP, MXN, BRL, SGD and ZAR, and for TRY the CBRT policy rate, named so.",
+      "`econ --country` takes two-letter codes, comma separated (`TR`, `MX,BR,ZA`). An earlier `--from` lists past events with their actuals."
      ]
     },
     {
@@ -5680,27 +6143,39 @@
      "rows": [
       [
        "`portfolio list|show|create|delete <name>`",
-       "Manual portfolios; `show` lists value, weight, a year of dividend income and its yield, target, drift and the trade to rebalance; `show --explain` adds what those terms mean, and `show --drip [--years 1-5] [--withholding <pct>]` projects reinvested dividends"
+       "Manual portfolios"
+      ],
+      [
+       "`portfolio create <name> --currency <code>`",
+       "A portfolio that totals in another currency (`--currency TRY`)"
       ],
       [
        "`portfolio add|remove <portfolio> <symbols...> [--file <csv|txt>]`",
-       "Add or remove tickers: several at once (commas, spaces or lines), a CSV or text file, or piped input (`-`); one line per symbol and a summary of what was not found"
+       "Several tickers at once, from a file, or piped (`-`)"
       ],
       [
-       "`portfolio position set <portfolio> <symbol> <shares> <avg-cost> [currency]`",
+       "`portfolio position set <portfolio> <symbol> <shares> <avg-cost> [currency] [--date <purchase date> | --cost-fx <rate>]`",
        "Set a position"
       ],
       [
-       "`portfolio cash set <portfolio> <amount> [currency]`, `portfolio cash clear <portfolio>`",
-       "Record or clear the cash line; it counts in the total and the weights"
+       "`portfolio import <file> [--name <portfolio>] [--merge|--replace] [--dry-run]`",
+       "From a broker's positions CSV (`-` reads standard input)"
       ],
       [
-       "`portfolio target set <portfolio> <symbol|CASH> <weight%>`, `portfolio target clear <portfolio> [symbol|CASH]`, `portfolio target show <portfolio>`",
-       "Target weights; drift and the trade to reach them then show in `portfolio show` and `PF`"
+       "`portfolio cash set <portfolio> <amount> [currency]`, `portfolio cash clear <portfolio>`",
+       "The cash line, counted in the total and the weights"
+      ],
+      [
+       "`portfolio target set <portfolio> <symbol|CASH> <weight%>`",
+       "A target weight; `portfolio show` and `PF` then add drift and the trade to reach it"
+      ],
+      [
+       "`portfolio target clear <portfolio> [symbol|CASH]`, `portfolio target show <portfolio>`",
+       "Clear or list targets"
       ],
       [
        "`watchlist list|show|create|delete|add|remove`",
-       "The same verbs for watchlists, with the same multi-symbol and `--file` add; `watchlist show <name> --csv` or `--json` prints one row per ticker, market cap included"
+       "The same for watchlists, with the same multi-symbol and `--file` add"
       ],
       [
        "`broker list [--type ibkr]`",
@@ -5711,14 +6186,73 @@
        "Ticker and quick notes"
       ],
       [
-       "`alerts list`, `alerts add <symbol> <above|below|crosses> <price>`, `alerts delete|rearm <id>`",
-       "Price alerts"
+       "`alerts list`, `alerts add ...`, `alerts delete|rearm <id>`",
+       "Price, valuation, daily technical and event alerts ([forms](#alerts))"
       ]
      ]
     },
     {
      "type": "paragraph",
-     "text": "[Portfolios and rebalancing](/docs/portfolio) walks through targets and the drift table. `CASH` in `portfolio target` is the cash line; `portfolio add` and `position set` refuse a bare `CASH` (the stock is `CASH:NASDAQ`). `portfolio` and `watchlist` write immediately and ignore `--dry-run`. Sign-in, account management and chat are app-only."
+     "text": "[Portfolios and rebalancing](/docs/portfolio) covers what `portfolio show` lists and its options, other currencies, cost, broker CSV imports and targets."
+    },
+    {
+     "type": "list",
+     "items": [
+      "`portfolio show --from <date> --to <date>` gives the P&L between two closes, with the FX move.",
+      "`portfolio add` takes symbols split by commas, spaces or lines, and prints one line per symbol and what was not found.",
+      "`watchlist show <name> --csv` or `--json` prints one row per ticker, market cap included.",
+      "`CASH` in `portfolio target` is the cash line. `portfolio add` and `position set` refuse a bare `CASH` (the stock is `CASH:NASDAQ`).",
+      "`portfolio` and `watchlist` write immediately. `--dry-run` previews `add` and `portfolio import <file>`; other changes refuse it.",
+      "Sign-in, account management and chat are app-only."
+     ]
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Functions: `catalog`, `fn`, `shot`"
+    },
+    {
+     "type": "paragraph",
+     "text": "Every [function](/docs/functions) can run headless. `gloom catalog <function>` lists a function's options, and `shot` draws them as the pane does."
+    },
+    {
+     "type": "table",
+     "headers": [
+      "Command",
+      "Use"
+     ],
+     "rows": [
+      [
+       "`catalog [query] [--all] [--bot-safe]`",
+       "Find functions and their options"
+      ],
+      [
+       "`catalog glossary [term]`, `catalog explain <term>`",
+       "What a term means, such as `stop-out`, `B/C`, `drift`, `NAV`, `beta`, `R²` or `VaR`"
+      ],
+      [
+       "`fn <function> [argument] [--option value] [--explain]`",
+       "Print a function's report; `--explain` adds the meaning of its terms"
+      ],
+      [
+       "`shot <function> [argument] [--output file] [--width px] [--height px] [--theme id] [--tab id] [--no-status] [--strict]`",
+       "Save a PNG of the function as it looks on the desktop"
+      ]
+     ]
+    },
+    {
+     "type": "code",
+     "code": "gloom catalog chart\ngloom fn GP NVDA\ngloom fn 13F AAPL --view=ticker-holdings --json\ngloom shot QQ AAPL,MSFT,NVDA --output quotes.png\ngloom shot FA ASML --statement income --width 1400 --height 900\ngloom shot 13F 0001067983 --compare SPY   # overlap with SPY"
+    },
+    {
+     "type": "list",
+     "items": [
+      "An option only the text report reads, such as `--limit`, fails `shot` with exit 1 and names the `fn` command that reads it.",
+      "`shot` saves its PNG, prints a Reason line and exits 0 when the pane drew an error, was empty, still loading or behind an access gate.",
+      "`shot --strict` exits 2 in those cases instead, still saving the PNG and printing the Reason.",
+      "A name nothing opens (`fn volsurf SPY`) lists up to five functions closest by name, keyword and description, and how to search the catalog.",
+      "`shot` lays out 720 to 2400 wide and 360 to 1800 tall, drawing the PNG at twice that. Other sizes are clamped, with a warning."
+     ]
     },
     {
      "type": "heading",
@@ -5761,73 +6295,101 @@
     {
      "type": "heading",
      "level": 2,
-     "text": "Functions: `catalog`, `fn`, `shot`"
-    },
-    {
-     "type": "paragraph",
-     "text": "Every [function](/docs/functions) can run headless."
-    },
-    {
-     "type": "table",
-     "headers": [
-      "Command",
-      "Use"
-     ],
-     "rows": [
-      [
-       "`catalog [query] [--all] [--bot-safe]`",
-       "Find functions and their options"
-      ],
-      [
-       "`catalog glossary [term]`, `catalog explain <term>`",
-       "What a term means, such as `stop-out`, `B/C`, `drift` or `NAV`"
-      ],
-      [
-       "`fn <function> [argument] [--option value] [--explain]`",
-       "Print a function's report; `--explain` adds the meaning of the terms it shows"
-      ],
-      [
-       "`shot <function> [argument] [--output file] [--width px] [--height px] [--theme id] [--no-status] [--strict]`",
-       "Save a PNG of the function as it looks on the desktop; `--strict` exits 2 when the pane has no usable data"
-      ]
-     ]
-    },
-    {
-     "type": "code",
-     "code": "gloom catalog chart\ngloom fn GP NVDA\ngloom fn 13F AAPL --view=ticker-holdings --json\ngloom shot QQ AAPL,MSFT,NVDA --output quotes.png\ngloom shot FA ASML --statement income --width 1400 --height 900"
-    },
-    {
-     "type": "paragraph",
-     "text": "`gloom catalog <function>` lists a function's options. `shot` also takes `--tab <id>`. `shot` draws a function's options as its pane does: `gloom shot 13F 0001067983 --compare SPY` opens the fund's overlap with SPY. An option only the text report reads, such as `--limit`, fails `shot` with exit 1 and names the `fn` command that reads it, instead of saving the pane without it."
-    },
-    {
-     "type": "paragraph",
-     "text": "A command exits 0 when it worked and 1 when it failed (bad input, no data found, a failed check); `gloom help` ends with the list. `shot` saves its PNG, prints the Reason line and still exits 0 when the pane drew an error, was empty, was still loading or was behind an access gate, so a script cannot tell that from a good capture. `shot --strict` exits 2 in those cases instead, with the PNG still saved and the Reason still printed."
-    },
-    {
-     "type": "paragraph",
-     "text": "A function name nothing opens (`fn volsurf SPY`) fails with the functions closest to it by name, keyword and description, at most five, and `Search the catalog: gloom catalog volsurf`."
-    },
-    {
-     "type": "paragraph",
-     "text": "`shot` sizes the layout from 720 to 2400 wide and 360 to 1800 tall, and the PNG is drawn at twice that. A size outside the limits is clamped, and a warning says what was used."
-    },
-    {
-     "type": "paragraph",
-     "text": "Reports end with their source and a dated status line, such as `Source: Gloom Cloud · US trading day Fri 9 Oct 2026 close · 15 min delayed · markets closed until Mon`: when the data is from (UTC, or the close of a market's trading day, always with the year), how far it is held back, and when its market reopens. Screenshots draw the same line, without the source, in the pane footer, inside the requested size; `--no-status` leaves it out."
-    },
-    {
-     "type": "paragraph",
-     "text": "Times print in UTC. To see your own clock beside them, run `gloom config set timezone Asia/Tokyo` (any `Region/City` name; `none` turns it off): `Sat 10 Oct 2026 16:56 UTC (Sun 11 Oct 01:56 Asia/Tokyo)`. A trading day keeps its market's date in every zone, and `--json` and `--csv` keep the raw values."
-    },
-    {
-     "type": "heading",
-     "level": 2,
      "text": "Plugin capabilities"
     },
     {
      "type": "code",
      "code": "gloom api list --json\ngloom api get <capability-id>\ngloom api invoke asset-data.gloomberb-cloud.getQuote '{\"ticker\":\"AAPL\",\"exchange\":\"NASDAQ\"}' --json\ngloom api subscribe <capability.operation> [json] --limit 10"
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Alerts"
+    },
+    {
+     "type": "paragraph",
+     "text": "Every kind the `ALRT` pane offers, as `gloom help alerts` lists them:"
+    },
+    {
+     "type": "code",
+     "code": "gloom alerts list\ngloom alerts add <symbol> <above|below|crosses> <price>\ngloom alerts add <symbol> <pe|ps|rsi(14)> <above|below> <level>\ngloom alerts add <symbol> ma(50) crosses <above|below> ma(200)\ngloom alerts add <symbol> closes <above|below> ma(200)\ngloom alerts add <symbol>/<benchmark> <above|below|crosses> <ratio>\ngloom alerts add <symbol> rrg <leading|weakening|lagging|improving> [--benchmark <symbol>]\ngloom alerts add <symbol> earnings [--days <n> | results]\ngloom alerts add <calendar event> [--country <code>] [--days <n>]\ngloom alerts add [symbol] news <keyword>\ngloom alerts add [symbol] flow [premium] [calls|puts] [sweeps|blocks]\ngloom alerts add <symbol> <iv|rr> <above|below> <level>\ngloom alerts add <OCC contract> iv spike <points>\ngloom alerts add <symbol> 52-week <high|low>\ngloom alerts add <symbol> unusual volume [<multiple>x]\ngloom alerts add <symbol> filing [8-K|10-K|10-Q|S-1|13D|13D/A|13G|13G/A|6-K|20-F]\ngloom alerts add <symbol> insider [buy|sell]\ngloom alerts add <symbol> short interest [increase|decrease] [<percent>%]\ngloom alerts add <symbol> analyst [upgrade|downgrade]\ngloom alerts add <symbol> hiring [accelerating|slowing]\ngloom alerts add perps <market> <funding|oi|premium|closed-premium> <above|below> <percent>\ngloom alerts add catalyst [type <type> | agency <agency> | country <code>]\ngloom alerts add <symbol> catalyst\ngloom alerts add congress [member name]\ngloom alerts add 13f <fund CIK>\ngloom alerts delete <id>\ngloom alerts rearm <id>"
+    },
+    {
+     "type": "list",
+     "items": [
+      "Words none of these forms read are refused with the list of kinds.",
+      "Adding a rule that exists names its ID and adds nothing. `rearm` on an alert that has not gone off says it is already active.",
+      "RSI and moving-average alerts are always saved. They read the daily closes `history` shows as final, and say when they are first checked.",
+      "`alerts list` shows each alert's listing and currency, its last reading and when (or `not checked yet`), and when it was created, in ISO 8601 UTC.",
+      "Creating, re-arming and deleting an alert go in the app's alert log beside fired alerts (`gloom fn ALRT --tab history`)."
+     ]
+    },
+    {
+     "type": "paragraph",
+     "text": "`alerts list --csv` keeps its first eight columns in their original order, and adds five after them:"
+    },
+    {
+     "type": "code",
+     "code": "id,kind,target,trigger,eventDate,status,lastCheckedPrice,triggeredAt,createdAt,listing,currency,lastReading,lastReadingAt"
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Status line and times"
+    },
+    {
+     "type": "paragraph",
+     "text": "Reports end with their source and a dated status line:"
+    },
+    {
+     "type": "code",
+     "code": "Source: Gloom Cloud · US trading day Fri 9 Oct 2026 close · 15 min delayed · markets closed until Mon"
+    },
+    {
+     "type": "list",
+     "items": [
+      "It says when the data is from (UTC, or a market's trading-day close, always with the year), how far it is held back, and when its market reopens.",
+      "Screenshots draw the same line, without the source, in the pane footer inside the requested size. `--no-status` leaves it out.",
+      "Times print in UTC. `gloom config set timezone Asia/Tokyo` (any `Region/City`; `none` turns it off) adds your clock beside them:"
+     ]
+    },
+    {
+     "type": "code",
+     "code": "Sat 10 Oct 2026 16:56 UTC (Sun 11 Oct 01:56 Asia/Tokyo)"
+    },
+    {
+     "type": "paragraph",
+     "text": "A trading day keeps its market's date in every zone, and `--json` and `--csv` keep the raw values."
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Files and Windows"
+    },
+    {
+     "type": "list",
+     "items": [
+      "`--output` writes the export in UTF-8 without a byte-order mark, and prints `Saved` or `Replaced` with its full path.",
+      "Without `--csv`, `--json` or `--ndjson` it is refused, except on a command with an `--output` of its own.",
+      "Those keep theirs: `fn` writes its report in the format asked for, text included; `shot` writes a PNG; a plugin command what its help says.",
+      "On Windows, use `--output` rather than a `>` redirect: Windows PowerShell 5.1 writes UTF-16, which a spreadsheet misreads.",
+      "Output uses UTF-8 (long dashes, `€`, `·`). Windows Terminal and PowerShell show it; in an older cmd.exe console, run `chcp 65001` first.",
+      "cmd.exe drops a bare `^`, so quote an index symbol: `gloom quote \"^SPX\"`."
+     ]
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Plain output"
+    },
+    {
+     "type": "list",
+     "items": [
+      "`--plain` drops rule lines, writes arrows as words and keeps every table column, with a dash in an empty cell.",
+      "A narrow table moves columns under each row instead of dropping them.",
+      "It is on without the flag when output is piped or redirected, or `NO_COLOR` is non-empty, which also turns colour off. `--no-plain` turns it off.",
+      "Without `--width`, the terminal's width applies; piped output fits `COLUMNS` when set."
+     ]
     }
    ]
   },
@@ -5840,22 +6402,22 @@
     "agents",
     "remote",
     "cli",
-    "automation"
+    "automation",
+    "setup"
    ],
-   "updatedAt": "2026-10-09",
+   "updatedAt": "2026-11-08",
    "blocks": [
     {
-     "type": "heading",
-     "level": 2,
-     "text": "What this is"
+     "type": "paragraph",
+     "text": "`gloom remote` drives a Gloom app running on this machine, terminal (TUI) or desktop. Scripts and local agents read the screen, open panes, pick tickers and arrange layouts by name."
+    },
+    {
+     "type": "code",
+     "code": "gloom                                   # one terminal: the app\ngloom remote help                       # another: the agent guide\ngloom remote get app://snapshot --json  # what is on screen"
     },
     {
      "type": "paragraph",
-     "text": "The remote API drives a running Gloom app. Agents and scripts read semantic state, open panes, navigate tickers, arrange layouts, and call plugin capabilities, with no screen coordinates."
-    },
-    {
-     "type": "paragraph",
-     "text": "Use it to operate the live desktop or TUI, and to capture a pane of the desktop app as it looks right now (`pane.screenshot`). Use the [CLI](/docs/cli-functions) for headless data, reports, and screenshots of a function with no app open."
+     "text": "Leave `--app` out when one app runs. Pass `--app tui` or `--app desktop` when both do."
     },
     {
      "type": "table",
@@ -5866,60 +6428,26 @@
      "rows": [
       [
        "A script or local agent on the same machine as the app",
-       "This remote API: no account, no network, nothing asks"
+       "`gloom remote`: no account, no network"
       ],
       [
        "Claude Code, Codex or another assistant connected to Gloom Cloud",
        "The [MCP server](/docs/mcp) with [Terminal control](/docs/mcp#terminal-control): the same operations, one MCP for data and the terminal, and the app asks you before an assistant takes over and before anything leaves the app"
       ],
       [
-       "Anything that needs Cloud data with no terminal open",
+       "Anything that needs Cloud data with no app open",
        "The [MCP server](/docs/mcp) without Terminal control"
       ]
      ]
     },
     {
      "type": "paragraph",
-     "text": "Launch the app first. Pass `--app desktop` or `--app tui` when both may be running. No endpoint found? Check the session is still open and rerun `remote help`."
+     "text": "For headless data, reports and a screenshot of a function with no app open, use the [CLI](/docs/cli-functions)."
     },
     {
      "type": "heading",
      "level": 2,
-     "text": "Core concepts"
-    },
-    {
-     "type": "table",
-     "headers": [
-      "Concept",
-      "Meaning"
-     ],
-     "rows": [
-      [
-       "App kind",
-       "`desktop` and `tui` are separate surfaces. `--app` picks one."
-      ],
-      [
-       "Resources",
-       "Read-only state: `app://snapshot`, `app://panes`, `app://pane-templates`, `app://commands`, `app://capabilities`, `ui://tree`."
-      ],
-      [
-       "Operations",
-       "Mutations: `app.search`, `commandBar.activateResult`, `pane.createFromTemplate`, `pane.focus`, `ticker.navigate`, `layout.setGrid`, `ui.invokeMatching`."
-      ],
-      [
-       "Capabilities",
-       "Plugin service operations. Use app operations for UI, capabilities for plugin-owned data and side effects."
-      ]
-     ]
-    },
-    {
-     "type": "paragraph",
-     "text": "Every operation changes only the local app, except `capability.invoke`, which runs a plugin capability and can reach external services. Nothing asks for confirmation."
-    },
-    {
-     "type": "heading",
-     "level": 2,
-     "text": "CLI quick reference"
+     "text": "Commands"
     },
     {
      "type": "table",
@@ -5930,58 +6458,212 @@
      "rows": [
       [
        "`gloom remote help`",
-       "Agent-focused usage from the running app."
+       "Agent-focused usage from the running app"
       ],
       [
        "`gloom remote schema`",
-       "Resource URIs, operations, request and response shapes."
+       "Resource URIs, operations, request and response shapes"
       ],
       [
        "`gloom remote get <resource>`",
-       "Read one resource."
+       "Read one resource"
       ],
       [
        "`gloom remote call <operation> [json] [--dry-run]`",
-       "Invoke one operation."
+       "Invoke one operation"
       ],
       [
        "`gloom remote patch <resource> <json-patch> [--expect-rev rev] [--dry-run]`",
-       "JSON Patch a mutable resource."
+       "JSON Patch a mutable resource"
       ],
       [
        "`gloom remote batch <json> [--dry-run]`",
-       "Run a multi-step workflow."
+       "Run a multi-step workflow"
       ],
       [
        "`gloom remote watch <resource> [--interval ms] [--limit n]`",
-       "Poll for changes."
+       "Poll for changes"
       ]
      ]
     },
     {
      "type": "paragraph",
-     "text": "All take `--app desktop|tui` and `--json`. `--dry-run` on `call` only echoes the payload, with no check of the operation or its fields; on `patch` it returns the patched result without saving."
+     "text": "All take `--app tui|desktop` and `--json`. `--dry-run` on `call` only echoes the payload, with no check of the operation or its fields; on `patch` it returns the patched result without saving."
     },
     {
      "type": "heading",
      "level": 2,
-     "text": "Read before acting"
+     "text": "When no app answers"
     },
     {
      "type": "paragraph",
-     "text": "The snapshot has the config and layout, focused pane, panes, command-bar state, UI tree, and schema. Plugin capabilities are in `app://capabilities`."
+     "text": "With `--json` the reason is in `error.code`, with `message` and `details` (what to do), and the command exits 1:"
     },
     {
-     "type": "code",
-     "code": "gloom remote get app://snapshot --app desktop --json\ngloom remote get app://pane-templates --app desktop --json\ngloom remote get ui://tree --app desktop --json"
+     "type": "table",
+     "headers": [
+      "`error.code`",
+      "Means, and what to do"
+     ],
+     "rows": [
+      [
+       "`app_not_running`",
+       "No app of this profile runs. Start `gloom` in another terminal, or open the desktop app"
+      ],
+      [
+       "`app_ambiguous`",
+       "The terminal and desktop apps both run, and neither is the one started last. Pass `--app tui` or `--app desktop`"
+      ],
+      [
+       "`app_unreachable`",
+       "The app's port does not answer from here, but nothing proves it gone: usually a sandbox that blocks localhost. Run the command where it can reach 127.0.0.1, or start Gloom again"
+      ]
+     ]
     },
     {
      "type": "paragraph",
-     "text": "To see a pane as drawn, `pane.screenshot` returns it as a PNG (base64 in `image.data`, with its pixel size), the focused pane when `paneId` is left out. Desktop only; the TUI has no pixels."
+     "text": "An endpoint file left by an app that exited without quitting is removed once its process is gone and its port refuses. An unreachable app's file is kept."
+    },
+    {
+     "type": "paragraph",
+     "text": "Asked for the desktop app while only the terminal app runs:"
     },
     {
      "type": "code",
-     "code": "gloom remote call pane.screenshot '{ \"paneId\": \"chart:main\" }' --app desktop --json"
+     "code": "{ \"ok\": false, \"error\": { \"code\": \"app_not_running\", \"message\": \"The Gloom desktop app is not running.\", \"details\": \"The terminal app is: pass --app tui, or leave --app out.\" } }"
+    },
+    {
+     "type": "paragraph",
+     "text": "Anything else that fails, such as an operation the app refuses, is `cli_error`."
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Read the screen"
+    },
+    {
+     "type": "paragraph",
+     "text": "`app://snapshot` is what is on screen in one read:"
+    },
+    {
+     "type": "table",
+     "headers": [
+      "Key",
+      "Holds"
+     ],
+     "rows": [
+      [
+       "`app`",
+       "Focus and command bar. Read `app.focusedPaneId`; `app.activePanel` is deprecated and always `left`"
+      ],
+      [
+       "`config`",
+       "Settings and the layouts"
+      ],
+      [
+       "`panes`",
+       "Each pane, where it is, and whether it has focus"
+      ],
+      [
+       "`commandBar`, `form`",
+       "The command bar, and an open form or the setup dialog"
+      ],
+      [
+       "`ui`",
+       "The labelled UI controls"
+      ],
+      [
+       "`references`",
+       "Where to read what the snapshot leaves out"
+      ]
+     ]
+    },
+    {
+     "type": "paragraph",
+     "text": "It leaves out what an agent reads once or rarely:"
+    },
+    {
+     "type": "table",
+     "headers": [
+      "Left out",
+      "Read it from"
+     ],
+     "rows": [
+      [
+       "Every resource and operation with its input",
+       "`gloom remote schema`, once"
+      ],
+      [
+       "Recipes and caveats",
+       "`gloom remote help` (`app://remote/help`)"
+      ],
+      [
+       "What each pane loaded (`runtimeState`, a saved layout's `paneState`)",
+       "`app://pane-state/{paneId}`, `app://panes`, `app://config`"
+      ],
+      [
+       "Unlabelled UI nodes",
+       "`ui://tree`"
+      ]
+     ]
+    },
+    {
+     "type": "paragraph",
+     "text": "`app://snapshot/full` has all of it inline, the shape the snapshot had before 0.20.5. It is often several times the size: 413 KB against 73 KB with nine panes open."
+    },
+    {
+     "type": "code",
+     "code": "gloom remote get app://pane-templates --json\ngloom remote get ui://tree --json"
+    },
+    {
+     "type": "paragraph",
+     "text": "`pane.screenshot` returns a pane as a PNG (base64 in `image.data`, with its pixel size): the focused pane, or `paneId` from `app://panes`. Desktop only: the terminal app draws text."
+    },
+    {
+     "type": "code",
+     "code": "gloom remote call pane.screenshot '{}' --app desktop --json"
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "First-run setup"
+    },
+    {
+     "type": "paragraph",
+     "text": "On a new profile the setup dialog covers the app. `app://form` (and the snapshot's `form`) reads `\"open\": true, \"kind\": \"setup\"`, with its `step`, `title`, `fields` by `id` and `buttons`:"
+    },
+    {
+     "type": "code",
+     "code": "{ \"open\": true, \"kind\": \"setup\", \"step\": \"PORTFOLIO\", \"title\": \"What do you hold?\",\n  \"fields\": [{ \"id\": \"ticker\", \"label\": \"Ticker\", \"value\": \"\" }, { \"id\": \"shares\" }, { \"id\": \"avgCost\" }, { \"id\": \"currency\" }],\n  \"buttons\": [{ \"label\": \"Skip\" }, { \"label\": \"Continue\", \"disabled\": true, \"shortcut\": \"Enter\" }] }"
+    },
+    {
+     "type": "paragraph",
+     "text": "While it is open:"
+    },
+    {
+     "type": "list",
+     "items": [
+      "`app.search` and `app.openCommandBar` refuse, and `app.closeDialog` does not close it.",
+      "A change made behind it still runs, and its answer carries `warnings` saying the setup dialog covers it.",
+      "Its own controls match first in `ui.invokeMatching`."
+     ]
+    },
+    {
+     "type": "paragraph",
+     "text": "Add a ticker and continue, or skip a step:"
+    },
+    {
+     "type": "code",
+     "code": "gloom remote batch '{ \"type\": \"batch\", \"requests\": [\n  { \"type\": \"call\", \"operation\": \"ui.invokeMatching\", \"input\": { \"role\": \"form-field\", \"metadata\": { \"fieldId\": \"ticker\" }, \"action\": \"setValue\", \"input\": \"NVDA\" } },\n  { \"type\": \"call\", \"operation\": \"ui.invokeMatching\", \"input\": { \"role\": \"form-field\", \"metadata\": { \"fieldId\": \"ticker\" }, \"action\": \"submit\" } },\n  { \"type\": \"call\", \"operation\": \"ui.invokeMatching\", \"input\": { \"role\": \"form\", \"action\": \"submit\" } }\n] }' --json\ngloom remote call ui.invokeMatching '{ \"role\": \"button\", \"label\": \"Skip\", \"action\": \"press\" }' --json"
+    },
+    {
+     "type": "list",
+     "items": [
+      "Submit on the Ticker field adds the position; `{ \"role\": \"form\", \"action\": \"submit\" }` presses the button Enter would.",
+      "Skip leaves one step unfilled. A new profile has two steps, Portfolio and Desks.",
+      "A step can change after the call answers, so read `app://form` again before the next call.",
+      "When setup is run again, `form.actions` includes `cancel`, which skips all of it."
+     ]
     },
     {
      "type": "heading",
@@ -5994,7 +6676,7 @@
     },
     {
      "type": "code",
-     "code": "gloom remote call pane.createFromTemplate '{ \"templateId\": \"market-heatmap-pane\" }' --app desktop --json\ngloom remote call ticker.pin '{ \"symbol\": \"NVDA\", \"forceNewPane\": true }' --app desktop --json"
+     "code": "gloom remote call pane.createFromTemplate '{ \"templateId\": \"market-heatmap-pane\" }' --json\ngloom remote call ticker.pin '{ \"symbol\": \"NVDA\", \"forceNewPane\": true }' --json"
     },
     {
      "type": "paragraph",
@@ -6002,7 +6684,7 @@
     },
     {
      "type": "code",
-     "code": "gloom remote batch '{\n  \"type\": \"batch\",\n  \"include\": [\"panes\", \"commandBar\"],\n  \"requests\": [\n    { \"type\": \"call\", \"operation\": \"app.search\", \"input\": { \"mode\": \"ticker\", \"query\": \"NVDA\" } },\n    { \"type\": \"call\", \"operation\": \"commandBar.activateResult\", \"input\": { \"index\": 0 } }\n  ]\n}' --app desktop --json"
+     "code": "gloom remote batch '{\n  \"type\": \"batch\",\n  \"include\": [\"panes\", \"commandBar\"],\n  \"requests\": [\n    { \"type\": \"call\", \"operation\": \"app.search\", \"input\": { \"mode\": \"ticker\", \"query\": \"NVDA\" } },\n    { \"type\": \"call\", \"operation\": \"commandBar.activateResult\", \"input\": { \"index\": 0 } }\n  ]\n}' --json"
     },
     {
      "type": "heading",
@@ -6011,19 +6693,15 @@
     },
     {
      "type": "code",
-     "code": "gloom remote call layout.setGrid '{ \"columns\": 2 }' --app desktop --json\ngloom remote call layout.focusRegion '{ \"region\": \"right\" }' --app desktop --json\ngloom remote call layout.closeFloating '{}' --app desktop --json"
+     "code": "gloom remote call layout.setGrid '{ \"columns\": 2 }' --json\ngloom remote call layout.focusRegion '{ \"region\": \"right\" }' --json\ngloom remote call layout.closeFloating '{}' --json\ngloom remote call app.switchPanel '{ \"panel\": \"right\" }' --json"
     },
     {
      "type": "paragraph",
-     "text": "Switch panels without touching layout internals:"
-    },
-    {
-     "type": "code",
-     "code": "gloom remote call app.switchPanel '{ \"panel\": \"right\" }' --app desktop --json"
+     "text": "`remote patch` works on what `remote schema` marks patchable: `app://config`, `app://layout/current`, `app://pane-state/{paneId}` and `app://pane-settings/{paneId}`."
     },
     {
      "type": "paragraph",
-     "text": "`remote patch` works on the resources `remote schema` marks patchable: `app://config`, `app://layout/current`, `app://pane-state/{paneId}`, `app://pane-settings/{paneId}`. Read the resource and its `rev` first, then pass `--expect-rev` so a stale edit fails instead of overwriting."
+     "text": "Read the resource and its `rev` first, then pass `--expect-rev`, so a stale edit fails instead of overwriting."
     },
     {
      "type": "heading",
@@ -6036,11 +6714,48 @@
     },
     {
      "type": "code",
-     "code": "gloom remote get ui://tree --app desktop --json\ngloom remote call ui.invokeMatching '{ \"role\": \"button\", \"label\": \"Done\", \"action\": \"press\" }' --app desktop --json"
+     "code": "gloom remote call ui.invokeMatching '{ \"role\": \"button\", \"label\": \"Open Help\", \"action\": \"press\" }' --json"
     },
     {
      "type": "paragraph",
      "text": "Use it sparingly; higher-level operations survive UI changes."
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Concepts"
+    },
+    {
+     "type": "table",
+     "headers": [
+      "Concept",
+      "Meaning"
+     ],
+     "rows": [
+      [
+       "App kind",
+       "`tui` and `desktop` are separate apps; `--app` picks one"
+      ],
+      [
+       "Resources",
+       "State to read: `app://snapshot`, `app://form`, `app://panes`, `app://pane-templates`, `app://commands`, `app://capabilities`, `ui://tree`"
+      ],
+      [
+       "Operations",
+       "Changes: `app.search`, `commandBar.activateResult`, `pane.createFromTemplate`, `pane.focus`, `ticker.navigate`, `layout.setGrid`, `ui.invokeMatching`"
+      ],
+      [
+       "Capabilities",
+       "Plugin service operations, for plugin-owned data and side effects. The UI goes through app operations"
+      ]
+     ]
+    },
+    {
+     "type": "list",
+     "items": [
+      "Every operation changes only the local app, except `capability.invoke`, which runs a plugin capability and can reach external services.",
+      "`watchlist.add` and `watchlist.remove` ask in the app first and answer with what happened. Nothing else asks."
+     ]
     }
    ]
   },
@@ -6058,15 +6773,15 @@
     "terminal",
     "remote control"
    ],
-   "updatedAt": "2026-10-09",
+   "updatedAt": "2026-11-08",
    "blocks": [
     {
      "type": "paragraph",
-     "text": "Gloom Cloud hosts a [Model Context Protocol](https://modelcontextprotocol.io) server at `https://api.gloom.sh/mcp`. It gives an agent the research tools Gloom's own assistant uses, and with the right access your notes, [teams](/docs/teams) and connected brokers. Part of [Gloom Pro](/cloud)."
+     "text": "Gloom Cloud's [MCP](https://modelcontextprotocol.io) server at `https://api.gloom.sh/mcp` has the research tools Gloom's own assistant uses, and with access your notes, [teams](/docs/teams) and brokers."
     },
     {
      "type": "paragraph",
-     "text": "The same keys work for the [REST API](/docs/rest-api) and [Google Sheets](/docs/google-sheets). With [Terminal control](#terminal-control) the same server also drives your open desktop or TUI; for one-off reports, use the [CLI](/docs/cli-functions)."
+     "text": "Part of [Gloom Pro](/cloud). The same keys work for the [REST API](/docs/rest-api) and [Google Sheets](/docs/google-sheets). [Terminal control](#terminal-control) also drives your open app; for one-off reports, use the [CLI](/docs/cli-functions)."
     },
     {
      "type": "heading",
@@ -6075,7 +6790,7 @@
     },
     {
      "type": "paragraph",
-     "text": "**Sign in from the client.** OAuth clients (Claude Code, claude.ai, Cursor and most recent clients) only need the endpoint. The first call opens a browser tab where you choose what the client may reach."
+     "text": "**Sign in from the client.** OAuth clients (Claude Code, claude.ai, Cursor and most recent ones) need only the endpoint. The first call opens a browser tab to choose what the client may reach."
     },
     {
      "type": "code",
@@ -6083,7 +6798,11 @@
     },
     {
      "type": "paragraph",
-     "text": "**Use a key.** For scripts and clients without a browser, create a key in [Cloud settings, Agents](/cloud/account?view=agents) and send it as a bearer token (`x-api-key` also works). Keys are shown once; you can hold up to 10."
+     "text": "**Use a key** for scripts and clients without a browser. Create one in [Cloud settings, Agents](/cloud/account?view=agents) and send it as a bearer token (`x-api-key` also works)."
+    },
+    {
+     "type": "paragraph",
+     "text": "Keys are shown once; you can hold up to 10."
     },
     {
      "type": "code",
@@ -6132,8 +6851,27 @@
      ]
     },
     {
-     "type": "paragraph",
-     "text": "A key's access, Terminal control and optional team pin are fixed at creation. Signed-in clients get the same levels through the `mcp:read`, `mcp:write` and `mcp:terminal` scopes; the consent page leaves Terminal control unticked. `tools/list` returns only what the caller may call."
+     "type": "list",
+     "items": [
+      "A key's access, Terminal control and optional team pin are fixed at creation.",
+      "Signed-in clients get the same levels through the `mcp:read`, `mcp:write` and `mcp:terminal` scopes; the consent page leaves Terminal control unticked.",
+      "`tools/list` returns only what the caller may call."
+     ]
+    },
+    {
+     "type": "heading",
+     "level": 2,
+     "text": "Plans and limits"
+    },
+    {
+     "type": "list",
+     "items": [
+      "Creating keys needs Pro. Any valid key can `initialize` and `tools/list`, but tool calls need Pro, except `portfolio.*`.",
+      "Tool calls get real-time quotes and the live news wire.",
+      "Keys allow 120 requests a minute and 5,000 a day; over the limit returns `429` with `Retry-After`.",
+      "If Pro lapses, keys stay but tool calls are refused.",
+      "Revoking a key applies on the next request. A disconnected client's token expires within two hours; its terminal calls stop at once."
+     ]
     },
     {
      "type": "heading",
@@ -6142,7 +6880,7 @@
     },
     {
      "type": "paragraph",
-     "text": "Read-only unless marked write. Most take `limit`; `?` marks an optional argument. `tools/list` has the full schema. Start with `market.search` when a ticker is ambiguous."
+     "text": "Read-only unless marked write. Most take `limit`; `?` marks an optional argument, and `tools/list` has the full schema. Start with `market.search` when a ticker is ambiguous."
     },
     {
      "type": "heading",
@@ -6182,9 +6920,13 @@
       ],
       [
        "`market.options_flow`",
-       "`symbol?`, `days?`, `minPremium?` (a filter searches recorded prints, not the live tape)"
+       "`symbol?`, `days?`, `minPremium?`"
       ]
      ]
+    },
+    {
+     "type": "paragraph",
+     "text": "`market.options_flow` with a filter searches recorded prints, not the live tape."
     },
     {
      "type": "heading",
@@ -6230,7 +6972,7 @@
       ],
       [
        "`sec.insider_transactions`",
-       "`ticker`"
+       "`ticker`, `since?`, `until?`, `offset?`"
       ],
       [
        "`sec.thirteenf_holders`",
@@ -6245,6 +6987,10 @@
        "`year?`, `member?`, `ticker?`, `side?`, `owner?`, `assetType?`, `minAmount?`"
       ]
      ]
+    },
+    {
+     "type": "paragraph",
+     "text": "`sec.insider_transactions` takes trade dates (`YYYY-MM-DD`) for `since` and `until`, returns every Form 4 of the window, and says which days it covers."
     },
     {
      "type": "heading",
@@ -6535,48 +7281,19 @@
     {
      "type": "heading",
      "level": 2,
-     "text": "Brokers"
-    },
-    {
-     "type": "paragraph",
-     "text": "Connect a broker in Gloom and every client with read access reaches it through Gloom. The `portfolio.*` tools cover every connected broker in one call and need no Pro."
-    },
-    {
-     "type": "paragraph",
-     "text": "With no connection they return no rows and a note; a broker that fails adds an `error` row and the result is `partial`. They read brokerage accounts, not team portfolios (use `collections.get`)."
-    },
-    {
-     "type": "table",
-     "headers": [
-      "Broker",
-      "Tools",
-      "Writes (read and write access)"
-     ],
-     "rows": [
-      [
-       "Interactive Brokers",
-       "`ibkr.*`: positions, balances, trades, orders, contract search, prices, alerts, watchlists",
-       "Order instructions, alerts and watchlists, when trading instructions are enabled"
-      ],
-      [
-       "Robinhood",
-       "`robinhood.*`: accounts and equity positions",
-       "None"
-      ]
-     ]
-    },
-    {
-     "type": "paragraph",
-     "text": "An IBKR order instruction is not an order: IBKR returns a link where you review and submit it yourself."
-    },
-    {
-     "type": "heading",
-     "level": 2,
      "text": "Terminal control"
     },
     {
      "type": "paragraph",
-     "text": "Terminal control reaches everything the [remote API](/docs/agents) does in your open, signed-in desktop or TUI: read the screen, open and arrange panes, navigate tickers, switch and edit layouts, semantic UI actions and plugin capabilities. The app asks once before an assistant takes over; plugin capabilities, button presses, commands and anything that reaches an outside service (orders, transfers, messages) ask you in the app on every call, and an unanswered one is denied after 60 seconds."
+     "text": "Terminal control reaches everything the [remote API](/docs/agents) does in your open, signed-in desktop or TUI: the screen, panes, tickers, layouts, UI actions and plugin capabilities."
+    },
+    {
+     "type": "list",
+     "items": [
+      "The app asks once before an assistant takes over.",
+      "Plugin capabilities, button presses, commands and anything that reaches an outside service (orders, transfers, messages) ask you in the app on every call.",
+      "An unanswered one is denied after 60 seconds."
+     ]
     },
     {
      "type": "code",
@@ -6603,7 +7320,7 @@
       ],
       [
        "`terminal.pane.screenshot`",
-       "One pane of the desktop app as a PNG image, as it looks on screen (`paneId?`, `width?`). A read: it runs once you approved the assistant, without asking each call. Up to 1600 px on the long side and 512 KB; the TUI answers `unsupported`"
+       "One pane of the desktop app as a PNG image, as it looks on screen (`paneId?`, `width?`)"
       ],
       [
        "`terminal.get_resource`, `terminal.patch_resource`",
@@ -6620,25 +7337,72 @@
      ]
     },
     {
-     "type": "paragraph",
-     "text": "Each tool takes `device?` (an id or name from `terminal.devices`). Descriptions carry the operation's tier and whether you confirm each call. A call that waits on you longer than 45 seconds answers `pending` with a `callId`; read the outcome with `terminal.call_result`. With no app open, tools answer `no_terminal`. Revoke an assistant in the app (Account Management, Agents), or revoke its key or disconnect it here, and its next call stops."
+     "type": "list",
+     "items": [
+      "Each tool takes `device?`, an id or name from `terminal.devices`. Its description gives the operation's tier and whether you confirm each call.",
+      "A call that waits on you over 45 seconds answers `pending` with a `callId`; `terminal.call_result` reads the outcome.",
+      "With no app open, tools answer `no_terminal`.",
+      "`terminal.pane.screenshot` is a read: once you approved the assistant it runs without asking. Up to 1600 px on the long side and 512 KB; the TUI answers `unsupported`.",
+      "Revoke an assistant in the app (Account Management, Agents), or revoke its key or disconnect it here, and its next call stops."
+     ]
     },
     {
      "type": "heading",
      "level": 2,
-     "text": "Results and limits"
+     "text": "Brokers"
     },
     {
      "type": "paragraph",
-     "text": "Each call returns text plus `structuredContent` with `status` (`ok`, `partial` when a limit removed rows, or `error`), `rowCount`, `truncated`, `asOf` and `data`. Results are capped at 256 KB. A failed source returns `status: \"error\"` with `data.error = { code, source, reason }`. `terminal.pane.screenshot` returns the same JSON as text plus an image block, and no `structuredContent`, since some clients read only that and would drop the image."
+     "text": "Connect a broker in Gloom and every client with read access reaches it through Gloom. The `portfolio.*` tools cover every connected broker in one call and need no Pro."
+    },
+    {
+     "type": "table",
+     "headers": [
+      "Broker",
+      "Tools",
+      "Writes (read and write access)"
+     ],
+     "rows": [
+      [
+       "Interactive Brokers",
+       "`ibkr.*`: positions, balances, trades, orders, contract search, prices, alerts, watchlists",
+       "Order instructions, alerts and watchlists, when trading instructions are enabled"
+      ],
+      [
+       "Robinhood",
+       "`robinhood.*`: accounts and equity positions",
+       "None"
+      ]
+     ]
+    },
+    {
+     "type": "list",
+     "items": [
+      "With no connection, `portfolio.*` returns no rows and a note. A broker that fails adds an `error` row, and the result is `partial`.",
+      "They read brokerage accounts, not team portfolios (use `collections.get`).",
+      "An IBKR order instruction is not an order: IBKR returns a link where you review and submit it yourself.",
+      "IBKR allows one AI connection per user, and Gloom holds it: connecting IBKR in Gloom disconnects it from other AI apps, so reach it through Gloom.",
+      "The IBKR sign-in ends seven days after you consent, however often it is used; only signing in again brings it back. Signing in before it ends starts a new seven days.",
+      "The Brokers pane shows when it ends. Two days before, Gloom emails you once with a link to renew. IBKR then asks to replace your existing Gloom connection: choose replace.",
+      "Connecting another AI app to the same IBKR account disconnects Gloom. Connect IBKR in Gloom again to get it back."
+     ]
     },
     {
      "type": "paragraph",
-     "text": "Creating keys needs Pro. Any valid key can `initialize` and `tools/list`; tool calls need Pro, except `portfolio.*`, and get real-time quotes and the live news wire."
+     "text": "Background: [IBKR in Claude or ChatGPT](/answers/ibkr-claude-chatgpt-connector)."
     },
     {
-     "type": "paragraph",
-     "text": "Keys allow 120 requests a minute and 5,000 a day; over the limit returns `429` with `Retry-After`. If Pro lapses, keys stay but tool calls are refused. Revoking a key applies on the next request; a disconnected client's token expires within two hours, and its terminal calls stop at once."
+     "type": "heading",
+     "level": 2,
+     "text": "Results"
+    },
+    {
+     "type": "list",
+     "items": [
+      "Each call returns text plus `structuredContent` with `status`, `rowCount`, `truncated`, `asOf` and `data`. Results are capped at 256 KB.",
+      "`status` is `ok`, `partial` when a limit removed rows, or `error`. A failed source returns `status: \"error\"` with `data.error = { code, source, reason }`.",
+      "`terminal.pane.screenshot` returns the same JSON as text plus an image block, and no `structuredContent`: some clients read only that and would drop the image."
+     ]
     }
    ]
   },
@@ -6913,7 +7677,7 @@
     "developer api",
     "market news"
    ],
-   "updatedAt": "2026-10-14",
+   "updatedAt": "2026-11-03",
    "blocks": [
     {
      "type": "heading",
@@ -6930,36 +7694,24 @@
     },
     {
      "type": "paragraph",
+     "text": "Comparing news APIs? See [the best financial news APIs](/alternatives/financial-news-apis), or Gloom side by side with [NewsAPI.org](/alternatives/newsapi-org) and [newsfilter.io](/alternatives/newsfilter-io)."
+    },
+    {
+     "type": "paragraph",
      "text": "See also: [Gloom Datasets](/docs/datasets), a separate paid API for alternative signals, filings, macro, news and market data, with its own `gds_` keys."
     },
     {
      "type": "heading",
      "level": 2,
-     "text": "Access levels"
-    },
-    {
-     "type": "table",
-     "headers": [
-      "Plan",
-      "Price",
-      "News"
-     ],
-     "rows": [
-      [
-       "Free key",
-       "Free",
-       "Delayed 12 hours. Real-time with a paid [Gloom Datasets](/docs/datasets) plan."
-      ],
-      [
-       "Unlimited",
-       "$99/mo or $999/yr",
-       "Real-time."
-      ]
-     ]
+     "text": "Access"
     },
     {
      "type": "paragraph",
-     "text": "Both get the same v1 response, including ticker links and source clusters, and neither is metered. Create or rotate a key from [News API account](/news/account)."
+     "text": "The free key reads news delayed 12 hours, with the full v1 response: ticker links and source clusters, no metering. Create or rotate it from [News API account](/news/account)."
+    },
+    {
+     "type": "paragraph",
+     "text": "Real-time news: from $199 a month with the [News and our own data plan](/datasets/pricing#news). Unlimited is no longer sold; existing Unlimited subscriptions keep real-time access."
     },
     {
      "type": "heading",
@@ -7183,7 +7935,7 @@
     "cftc",
     "cot"
    ],
-   "updatedAt": "2026-10-14",
+   "updatedAt": "2026-11-03",
    "blocks": [
     {
      "type": "heading",
@@ -7206,7 +7958,7 @@
     {
      "type": "list",
      "items": [
-      "**Alternative data:** GPU rental prices, supply chain, hiring postings and momentum, social mentions, app attention, power and grid, perpetuals, catalysts and litigation, research attention, congressional trades, operating exposure.",
+      "**Alternative data:** GPU rental prices, supply chain, hiring postings and momentum, social mentions, app attention, power and grid, perpetuals, catalysts and litigation, congressional trades, operating exposure.",
       "**Filings and company text:** KPIs and guidance, executive pay, risk factors, 8-K events, transcripts, credit documents, debt maturities, revenue breakdown, SEC filings, insiders and 13F, document search.",
       "**News:** Real-time stories, sources and topics.",
       "**Macro and positioning:** CPI, EIA inventories, COT, yield curves and macro series, central bank rates, short volume and interest, CDS, government awards.",
@@ -7228,11 +7980,11 @@
     },
     {
      "type": "paragraph",
-     "text": "Gloom Datasets keys start with `gds_`. They come with a plan and are created in the [console](/datasets/console). Send one as `Authorization: Bearer gds_...` or `x-api-key`."
+     "text": "Gloom Datasets keys start with `gds_`. They come with a plan, Free included, and are created in the [console](/datasets/console). Send one as `Authorization: Bearer gds_...` or `x-api-key`."
     },
     {
      "type": "paragraph",
-     "text": "They are different keys from the Gloom API's. A Gloom Pro key (`gloom_mcp_`) or a News API key (`gloom_news_`) gets `401 wrong_key` on a dataset route, and a `gds_` key gets `401` on the Gloom API's own routes, such as the [REST API](/docs/rest-api), but reads the [News API](/docs/news-api) at no credit cost."
+     "text": "They are different keys from the Gloom API's. A Gloom Pro key (`gloom_mcp_`) or a News API key (`gloom_news_`) gets `401 wrong_key` on a dataset route, and a `gds_` key gets `401` on the Gloom API's own routes, such as the [REST API](/docs/rest-api), but a paid plan's key reads the [News API](/docs/news-api) at no credit cost."
     },
     {
      "type": "heading",
@@ -7241,32 +7993,41 @@
     },
     {
      "type": "paragraph",
-     "text": "Paid plans only: an account without a plan has no key."
+     "text": "Free reads every dataset on 10 popular tickers (AAPL, MSFT, NVDA, AMZN, GOOGL, META, TSLA, AMD, NFLX and JPM), the last 30 days, with Gloom's own data 7 days behind: 100 calls a day and one key, started in the [console](/datasets/console) with no card. A paid plan reads one band of datasets, or all of them, for personal or company use."
     },
     {
      "type": "table",
      "headers": [
       "Plan",
-      "Price"
+      "Personal use",
+      "Company use"
      ],
      "rows": [
       [
-       "Basic",
-       "$200/month"
+       "Reference: prices, fundamentals, calendars, macro, futures, crypto",
+       "$49/month",
+       "$149/month"
       ],
       [
-       "Desk",
-       "$800/month"
+       "Filings and research: SEC and insiders, transcripts, congress, M&A, KPIs, estimates",
+       "$99/month",
+       "$299/month"
       ],
       [
-       "Enterprise",
-       "From $2,000/month"
+       "News and our own data: news, options flow, GPU, supply chain, hiring, power",
+       "$199/month",
+       "$799/month"
+      ],
+      [
+       "Everything",
+       "$299/month",
+       "$1,199/month"
       ]
      ]
     },
     {
      "type": "paragraph",
-     "text": "Enterprise is an annual contract. Basic and Desk are also sold yearly at ten months' price."
+     "text": "Personal use is one person's own research and trading; company use is internal use across a business. Every plan is also sold yearly at ten months' price. Showing the data on your own site or app starts at $1,000/month, and Enterprise (display at scale, redistribution, SLA) at $5,000/month on an annual contract."
     },
     {
      "type": "paragraph",
@@ -7274,7 +8035,7 @@
     },
     {
      "type": "paragraph",
-     "text": "Credits, rate limits, usage rights and the founding offer (40% off Basic and Desk for 12 months, for the first 100 paid accounts until December 4, 2026) are on [Pricing](/datasets/pricing)."
+     "text": "A key reads its plan's datasets; any other answers `402 dataset_not_included`, naming the plan that has it. Launch pricing: a subscription keeps the price it started at. Credits, rate limits and the founding offer (25% off every plan for 12 months, for the first 100 paid accounts until December 4, 2026) are on [Pricing](/datasets/pricing). Gloom's own datasets (GPU prices, supply chain, hiring, attention, social mentions, options flow, power and exposure) are in early access."
     },
     {
      "type": "heading",
@@ -7298,7 +8059,7 @@
    "title": "What a stock is",
    "summary": "A share is a small slice of a company, so owning one means owning a tiny piece of everything the company has and earns.",
    "chapter": "Markets from zero",
-   "minutes": 6
+   "minutes": 5
   },
   {
    "url": "/academy/markets-from-zero/stocks-funds-and-quotes/funds-etfs-and-indices",
@@ -7408,9 +8169,9 @@
   {
    "url": "/academy/terminal-and-workspace/how-the-terminal-works/panes-and-linking",
    "title": "Panes, focus and linking (WIN, GL, PS, LMA)",
-   "summary": "Every function opens in a pane, one pane at a time has the focus and receives your keys, and panes can be moved, tidied and linked so they follow a list.",
+   "summary": "Every function opens in a pane, one pane at a time has the focus and receives your keys, and panes can be moved, stacked as tabs, tidied, given a new ticker and linked so they follow a list.",
    "chapter": "The terminal and your workspace",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/terminal-and-workspace/how-the-terminal-works/layouts-and-desks",
@@ -7424,7 +8185,7 @@
    "title": "Getting help (HELP, F1, CHG, FB)",
    "summary": "HELP opens the guide and every function, and F1 opens the help card of the pane in front of you, including how fresh its data is on your plan.",
    "chapter": "The terminal and your workspace",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/terminal-and-workspace/how-the-terminal-works/free-pro-and-freshness",
@@ -7457,7 +8218,7 @@
   {
    "url": "/academy/terminal-and-workspace/your-workspace/portfolio-risk",
    "title": "Portfolio risk (PORT, MARS)",
-   "summary": "PORT (also MARS) measures your portfolio's risk against a benchmark: how much it swings, its worst fall, a bad-day loss estimate, and what a crash or a rate jump would do to it.",
+   "summary": "PORT (also MARS) measures your portfolio's risk against a benchmark: how much it swings, its worst fall, a bad-day loss estimate, which holdings move together, and what a crash or a rate jump would do to it.",
    "chapter": "The terminal and your workspace",
    "minutes": 5
   },
@@ -7471,9 +8232,9 @@
   {
    "url": "/academy/terminal-and-workspace/your-workspace/alerts",
    "title": "Alerts (ALRT, SA)",
-   "summary": "An alert watches the market for you, firing on a price level or an event such as an earnings date, a filing or an insider trade, and ALRT lists them all.",
+   "summary": "An alert watches the market for you, firing on a price level, a day's move, a valuation or technical level, or an event such as an earnings date, a filing or an insider trade, and ALRT lists them all.",
    "chapter": "The terminal and your workspace",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/terminal-and-workspace/your-workspace/notes-and-theses",
@@ -7494,7 +8255,7 @@
    "title": "Your account and your broker (ACM, BR, IBKR)",
    "summary": "ACM manages your Gloom account, and BR connects a brokerage account so your real positions appear in a portfolio and stay in sync.",
    "chapter": "The terminal and your workspace",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/terminal-and-workspace/your-workspace/ai-helpers",
@@ -7519,10 +8280,10 @@
   },
   {
    "url": "/academy/company-and-price/company-at-a-glance/fund-filings",
-   "title": "A fund's official documents (ETF)",
-   "summary": "ETF lists a US fund's filings with the SEC (prospectus, holdings reports, shareholder reports) and opens any of them.",
+   "title": "A fund's facts and official documents (ETF)",
+   "summary": "ETF shows a US fund's facts (fee, NAV, premium or discount, net assets), then lists its filings with the SEC (prospectus, holdings reports, shareholder reports) and opens any of them.",
    "chapter": "One company and its price",
-   "minutes": 4
+   "minutes": 6
   },
   {
    "url": "/academy/company-and-price/company-at-a-glance/earnings-ripple",
@@ -7536,7 +8297,7 @@
    "title": "Reading a price chart (GP)",
    "summary": "GP is the price chart: candles on top, volume below, a multi-year range by default.",
    "chapter": "One company and its price",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/company-and-price/charts/intraday-chart",
@@ -7557,7 +8318,7 @@
    "title": "VWAP, bands, ATR and price levels (chart tools)",
    "summary": "VWAP, Bollinger Bands, ATR, volume profile and your own price levels are different ways of asking whether today's price is normal, and a level can become an alert.",
    "chapter": "One company and its price",
-   "minutes": 5
+   "minutes": 6
   },
   {
    "url": "/academy/company-and-price/charts/chart-anything",
@@ -7641,7 +8402,7 @@
    "title": "What growth is priced in? (RDCF)",
    "summary": "RDCF runs a discounted cash flow model backwards, finding the yearly growth today's value assumes and setting it next to the growth the company actually delivered.",
    "chapter": "Fundamentals and earnings",
-   "minutes": 5
+   "minutes": 4
   },
   {
    "url": "/academy/fundamentals-and-earnings/earnings/earnings-calendar",
@@ -7676,14 +8437,14 @@
    "title": "Analyst ratings and price targets (ANR)",
    "summary": "ANR shows sell-side ratings and 12-month price targets: the average target and its history, the upside to it, and every recent action by firm.",
    "chapter": "Fundamentals and earnings",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/fundamentals-and-earnings/events-and-deals/dividends-and-corporate-actions",
    "title": "Dividends and corporate actions (DVD, EVT)",
    "summary": "DVD shows a stock's dividend history, yield, payout ratio and growth, and EVT puts dividends, splits, earnings dates and estimates on one timeline.",
    "chapter": "Fundamentals and earnings",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/fundamentals-and-earnings/events-and-deals/catalysts",
@@ -7732,7 +8493,35 @@
    "title": "Screening the market (EQS)",
    "summary": "EQS keeps only the stocks in its stored universe that meet all your rules (valuation, growth, margins, liquidity, ownership and more) and ranks the matches.",
    "chapter": "Compare, screen and follow the money",
-   "minutes": 4
+   "minutes": 5
+  },
+  {
+   "url": "/academy/compare-screen-follow-money/compare-and-screen/value-quality-garp",
+   "title": "Value, quality and GARP screens (EQS)",
+   "summary": "Three of the ready screens in EQS write three styles of stock picking as rules: Value looks for cash bought cheaply, Quality for businesses that earn a high return on their capital, and GARP for steady growth at a price the growth can carry.",
+   "chapter": "Compare, screen and follow the money",
+   "minutes": 5
+  },
+  {
+   "url": "/academy/compare-screen-follow-money/compare-and-screen/classic-scores",
+   "title": "Classic value and quality scores (EQS)",
+   "summary": "Four classic scores each turn the statements into one number: Piotroski's F-score (getting stronger?), Altman's Z (how far from distress?), the Graham number (the most a careful buyer pays) and the Magic Formula (good businesses at cheap prices).",
+   "chapter": "Compare, screen and follow the money",
+   "minutes": 5
+  },
+  {
+   "url": "/academy/compare-screen-follow-money/compare-and-screen/sector-grades",
+   "title": "Grades within a sector (EQS)",
+   "summary": "EQS grades every covered company from F to A+ on Value, Growth, Profitability, Momentum and Revisions against the other companies in its sector, and blends the five into a composite from Bottom to Top.",
+   "chapter": "Compare, screen and follow the money",
+   "minutes": 5
+  },
+  {
+   "url": "/academy/compare-screen-follow-money/compare-and-screen/live-scanner",
+   "title": "Your own intraday scan (SCAN)",
+   "summary": "SCAN watches US stocks through the trading day and lists the ones that match your intraday conditions right now (a fast move, a burst of volume, a new high or low, a VWAP cross, a gap), and can alert you when a new one appears.",
+   "chapter": "Compare, screen and follow the money",
+   "minutes": 5
   },
   {
    "url": "/academy/compare-screen-follow-money/who-owns-it/holders-and-13f",
@@ -7753,7 +8542,7 @@
    "title": "Congress trades (CG)",
    "summary": "CG lists the trades members of Congress must disclose within 45 days, with the member, the asset, buy or sell, the amount band, the owner and how late it was reported.",
    "chapter": "Compare, screen and follow the money",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/compare-screen-follow-money/who-owns-it/short-interest",
@@ -7774,7 +8563,7 @@
    "title": "Risk factors (RISK)",
    "summary": "RISK groups the risk factors in a company's 10-K by theme and shows what was added, dropped or reworded since the previous year.",
    "chapter": "Compare, screen and follow the money",
-   "minutes": 3
+   "minutes": 4
   },
   {
    "url": "/academy/compare-screen-follow-money/filings-and-attention/executive-pay",
@@ -7785,8 +8574,8 @@
   },
   {
    "url": "/academy/compare-screen-follow-money/filings-and-attention/attention",
-   "title": "Attention: research and social buzz (ATTN, BUZZ)",
-   "summary": "ATTN ranks the tickers Gloom users are researching against each ticker's usual level, and BUZZ counts the day's posts on X naming a ticker, with the top posts and their stance.",
+   "title": "Social buzz (BUZZ)",
+   "summary": "BUZZ counts the day's posts on X naming a ticker against its usual level, with the top posts and their stance, and alone ranks the tickers whose posts jump most above their own usual level.",
    "chapter": "Compare, screen and follow the money",
    "minutes": 4
   },
@@ -7840,6 +8629,13 @@
    "minutes": 5
   },
   {
+   "url": "/academy/options-and-volatility/chain-and-strategies/screening-option-trades",
+   "title": "Screening option trades (CSP)",
+   "summary": "CSP builds the same option trade on a list of stocks at once (a cash-secured put, a covered call, a spread, a condor, a straddle, a strangle or a calendar) and ranks them, so you can see which name pays most for the risk.",
+   "chapter": "Options and the volatility desk",
+   "minutes": 6
+  },
+  {
    "url": "/academy/options-and-volatility/reading-volatility/surface-and-skew",
    "title": "The volatility surface and skew (OVDV)",
    "summary": "Implied volatility changes with the strike (the skew) and with the expiry (the term structure), and OVDV fits the whole surface from option quotes.",
@@ -7884,30 +8680,30 @@
   {
    "url": "/academy/options-and-volatility/positioning-and-flow/options-flow",
    "title": "Options flow (FLOW)",
-   "summary": "FLOW is a live tape of large option trades on the busiest US contracts (sweeps, blocks and big-premium prints) with ticker, contract, size, premium and implied volatility.",
+   "summary": "FLOW is a live tape of large option trades on the busiest US contracts (sweeps, blocks and big-premium prints) with ticker, contract, size, premium and implied volatility, plus the session's net premium tide.",
    "chapter": "Options and the volatility desk",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/futures-commodities-energy/futures-from-zero",
    "title": "Futures from zero (FUT)",
    "summary": "A futures contract is a standard, exchange-traded promise to buy or sell a set quantity on a set month at a price agreed today, settled with daily margin, and FUT shows each market's front month.",
    "chapter": "Futures, commodities and energy",
-   "minutes": 5
+   "minutes": 6
   },
   {
    "url": "/academy/futures-commodities-energy/curves-and-rolling",
    "title": "Futures curves and rolling (CTM)",
    "summary": "A futures curve lines up every contract month of one commodity, rising (contango) when storing costs money and falling (backwardation) when it is scarce now, and CTM shows it with the cost of rolling.",
    "chapter": "Futures, commodities and energy",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/futures-commodities-energy/positioning-cot",
    "title": "Who holds the futures (COT)",
    "summary": "The CFTC's weekly Commitments of Traders shows how many futures contracts speculators, hedgers and small traders hold long and short, and COT shows it per market with history and percentiles.",
    "chapter": "Futures, commodities and energy",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/futures-commodities-energy/oil-and-gas-inventories",
@@ -7926,14 +8722,14 @@
   {
    "url": "/academy/futures-commodities-energy/gpu-prices",
    "title": "GPU rental prices (GPU)",
-   "summary": "GPU collects published hourly rental prices for AI chips by model and price basis, with list indexes, medians and history, so compute can be tracked like a commodity.",
+   "summary": "GPU collects published hourly rental prices for AI chips by model and price basis, with list indexes, medians, history and a daily settle, so compute can be tracked like a commodity.",
    "chapter": "Futures, commodities and energy",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/futures-commodities-energy/macro-days",
    "title": "How a stock reacts on macro days (MDAY)",
-   "summary": "MDAY compares how a US listing moves on CPI, jobs and Fed decision days with a normal day, over up to five years, and lists every release day with its move.",
+   "summary": "MDAY compares how a US listing moves on CPI, jobs and central bank decision days with a normal day, over up to five years, and lists every release day with its figures and move.",
    "chapter": "Futures, commodities and energy",
    "minutes": 4
   },
@@ -7968,9 +8764,9 @@
   {
    "url": "/academy/rates-bonds-credit/rates/auctions",
    "title": "Treasury auctions (AUCT)",
-   "summary": "AUCT lists upcoming and recent US Treasury auctions with the rate each cleared at, how well it was covered and who bought.",
+   "summary": "AUCT lists upcoming and recent US Treasury auctions with the rate each cleared at, how well it was covered and who bought, and Hong Kong's government paper tenders.",
    "chapter": "Rates, bonds and credit",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/rates-bonds-credit/rates/bond-calculator",
@@ -7998,7 +8794,7 @@
    "title": "Debt maturities and covenants (DDIS, CRDOC, COVN)",
    "summary": "DDIS shows how much of a company's debt comes due each year, and CRDOC and COVN read its loan and bond documents into a capital structure and covenant headroom.",
    "chapter": "Rates, bonds and credit",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/macro-markets-and-news/the-economy/economic-calendar",
@@ -8019,14 +8815,14 @@
    "title": "Inflation by component (CPI)",
    "summary": "CPI breaks US consumer prices into their components with each one's weight, its monthly, annualized and yearly change, and its contribution to the headline.",
    "chapter": "The big picture: macro, markets and news",
-   "minutes": 4
+   "minutes": 3
   },
   {
    "url": "/academy/macro-markets-and-news/the-economy/currencies",
    "title": "Currencies and cross rates (FXC)",
    "summary": "FXC is a matrix of exchange rates between the major currencies, each cell saying how many units of the column currency one unit of the row currency buys.",
    "chapter": "The big picture: macro, markets and news",
-   "minutes": 3
+   "minutes": 5
   },
   {
    "url": "/academy/macro-markets-and-news/markets/world-indices-and-venues",
@@ -8040,7 +8836,7 @@
    "title": "Sectors, themes and rotation (BI, THEM, RRG)",
    "summary": "BI shows sector and industry performance, THEM curated themes as equal-weight baskets with breadth, and RRG plots each sector's strength and momentum against the market.",
    "chapter": "The big picture: macro, markets and news",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/macro-markets-and-news/markets/heatmap",
@@ -8054,14 +8850,14 @@
    "title": "Movers, new highs and lows, halts (MOST, HILO, HALT)",
    "summary": "MOST lists today's biggest gainers, losers and most active stocks, HILO counts new session highs and lows live, and HALT lists trading halts.",
    "chapter": "The big picture: macro, markets and news",
-   "minutes": 4
+   "minutes": 5
   },
   {
    "url": "/academy/macro-markets-and-news/markets/ipos",
    "title": "IPOs (IPO)",
    "summary": "IPO lists upcoming, priced and recent initial public offerings on the main US, Asia-Pacific and European venues, with size, price range and first-day performance.",
    "chapter": "The big picture: macro, markets and news",
-   "minutes": 3
+   "minutes": 4
   },
   {
    "url": "/academy/macro-markets-and-news/markets/sentiment-and-valuation",
@@ -8095,6 +8891,13 @@
    "url": "/academy/crypto-and-prediction-markets/perpetuals",
    "title": "Perpetual futures, funding and open interest (PERP)",
    "summary": "A perpetual future never expires and is kept close to its underlying by a periodic funding payment, and PERP shows a market's funding, open interest and premium over time.",
+   "chapter": "Crypto and prediction markets",
+   "minutes": 5
+  },
+  {
+   "url": "/academy/crypto-and-prediction-markets/crypto-options",
+   "title": "Bitcoin and ether options (OPX, OVDV)",
+   "summary": "Bitcoin and ether have listed options of their own, and OPX BTC-USD and OVDV BTC-USD read them like a stock's: open interest, max pain, the volatility surface, and DVOL, the 30-day implied volatility index of the coin.",
    "chapter": "Crypto and prediction markets",
    "minutes": 4
   },
@@ -8157,9 +8960,9 @@
   {
    "url": "/academy/special-datasets/infrastructure",
    "title": "The AI infrastructure map (TBO)",
-   "summary": "TBO opens a partner's research database on the physical build-out of AI and semiconductors: curated lists of companies by niche, physical sites, and dated research notes.",
+   "summary": "TBO opens a partner's research database on the physical build-out of AI and semiconductors: a board of themes, the companies in each, physical sites and dated research notes. TBOC follows one company's power deals, suppliers, customers and sites.",
    "chapter": "Special datasets",
-   "minutes": 3
+   "minutes": 6
   },
   {
    "url": "/academy/special-datasets/research-search",

@@ -1,11 +1,15 @@
 import { Box, Text, useActionShortcut, useNativeRenderer, useRendererHost, useUiCapabilities } from "../../../ui";
-import { useCallback, useRef, type ReactNode } from "react";
+import { useCallback, useMemo, useRef, type ReactNode } from "react";
 import { colors, floatingPaneTitleBg, paneTitleBg, paneTitleText } from "../../../theme/colors";
+import { paneTitleTone } from "../../../theme/tone-contrast";
 import { WEB_CELL_WIDTH } from "../../../theme/font-scale";
 import { displayWidth, truncateToDisplayWidth } from "../../../utils/format";
 import { capturePointerDrag } from "../../../ui/pointer-drag";
 import { Tabs } from "../../ui/tabs";
+import { Divider } from "../../ui/display";
 import { ICON_GLYPHS, Icon, IconButton } from "../../ui/icon";
+import { Button } from "../../ui/button";
+import { t } from "../../../i18n";
 import type { PaneHeaderTabsRegistration } from "./header-tabs";
 import { nativePaneHeaderRows } from "./sizing";
 
@@ -25,9 +29,200 @@ export const PANE_HEADER_ASK_MIN_WIDTH = 32;
 export const PANE_HEADER_RESTORE = " - ";
 const PANE_HEADER_LOCK = " 🔒 ";
 const HIDDEN_HEADER_BUTTON = { visibility: "hidden" } as const;
+/**
+ * Desktop and web: how far the active title-bar tab reaches past the header's
+ * bottom rule into the pane. A strip wider than its pane scrolls, and WebKit
+ * (the macOS app, Safari) draws a scrolling box as a layer of its own that it
+ * places on a whole device pixel: in a title bar that sits a fraction of a
+ * pixel off the grid (a pane moved or split to a fraction of a cell), the tab
+ * then ends a device pixel above the rule and the rule's last row shows under
+ * it. Reaching a pixel past the rule, the tab still covers it, and the part
+ * in the pane is the colour of what is under it.
+ */
+const HEADER_TAB_OVERHANG_PX = 1;
+/** Terminal: between two tabs of a stack, and the most of a title one tab shows. */
+const STACK_TAB_SEPARATOR = " │ ";
+const STACK_TAB_MAX_WIDTH = 16;
+
+/**
+ * Panes stacked in one spot of the dock: the header names each as a tab in
+ * place of the title, the one shown first among equals.
+ */
+export interface PaneHeaderStack {
+  /** In tab order. */
+  tabs: ReadonlyArray<{ id: string; title: string }>;
+  /** The pane shown. */
+  active: string;
+  /** A click on a tab: show that pane. */
+  onSelect: (id: string) => void;
+  /** A press on a tab, in place of the header's: a drag moves that pane out of the stack. */
+  onTabMouseDown?: (id: string, event: any) => void;
+}
+
+/** Terminal: the least a tab that is not shown keeps when a stack is cut to fit: a letter and the ellipsis. */
+const STACK_TAB_MIN_WIDTH = 4;
+/** Terminal: between the last tab named and the count of those left out. */
+const STACK_TAB_MORE_GAP = " ";
+
+/** Terminal: one tab of a stack as its header lays it out (`stackTabSpans`). */
+export interface StackTabSpan {
+  /** The tab's place in the stack; for the `more` count, the tab a press on it shows. */
+  index: number;
+  /** Cells from where the title starts (after the grip). */
+  start: number;
+  text: string;
+  /** The count of the tabs left out (`+2`), which a press steps through. */
+  more?: true;
+}
+
+/**
+ * Terminal: the tabs of a stack its header shows in `width` cells, as text
+ * and where each starts, in cells from where the title starts (after the
+ * grip); `index` is the tab's place in the stack. Every tab shows when they
+ * fit. When they do not, the tab shown (`activeIndex`) keeps its name, as
+ * many others as keep a letter each share what is left, in tab order, and a
+ * dim `+n` after them counts the rest. A press on the count shows the first
+ * tab left out after the one shown, so pressing it again steps through them.
+ * The header always names what the pane shows; the count goes first when
+ * there is no room for it beside a letter of that name. The pointer runtime
+ * finds the tab under a press with the same spans.
+ */
+export function stackTabSpans(
+  titles: readonly string[],
+  activeIndex = -1,
+  width = Number.POSITIVE_INFINITY,
+): StackTabSpan[] {
+  const labels = titles.map((title) => truncateToDisplayWidth(title, STACK_TAB_MAX_WIDTH));
+  const separator = STACK_TAB_SEPARATOR.length;
+  const natural = labels.reduce((sum, label) => sum + displayWidth(label), 0) + separator * Math.max(0, labels.length - 1);
+  let texts: Array<string | null> = labels;
+  let more: { index: number; text: string } | null = null;
+  if (natural > width && activeIndex >= 0 && activeIndex < labels.length) {
+    const shownLabel = labels[activeIndex]!;
+    const others = labels.map((_, index) => index).filter((index) => index !== activeIndex);
+    const moreWidth = (count: number) => (count > 0 ? STACK_TAB_MORE_GAP.length + `+${count}`.length : 0);
+    let kept: number[] = [];
+    let share = 0;
+    for (let keep = others.length; keep >= 1; keep -= 1) {
+      const room = width - displayWidth(shownLabel) - separator * keep - moreWidth(others.length - keep);
+      if (Math.floor(room / keep) >= STACK_TAB_MIN_WIDTH) {
+        kept = others.slice(0, keep);
+        share = Math.floor(room / keep);
+        break;
+      }
+    }
+    const left = others.filter((index) => !kept.includes(index));
+    const count = left.length > 0 ? `+${left.length}` : null;
+    let shown = shownLabel;
+    if (kept.length === 0) {
+      const room = width - moreWidth(left.length);
+      shown = truncateToDisplayWidth(shownLabel, room >= Math.min(STACK_TAB_MIN_WIDTH, displayWidth(shownLabel)) ? room : width);
+    }
+    texts = labels.map((label, index) => (
+      index === activeIndex ? shown : kept.includes(index) ? truncateToDisplayWidth(label, share) : null
+    ));
+    const used = texts.reduce<number>((sum, text) => sum + (text === null ? 0 : displayWidth(text)), 0)
+      + separator * kept.length;
+    if (count && used + moreWidth(left.length) <= width) {
+      more = { index: left.find((index) => index > activeIndex) ?? left[0]!, text: count };
+    }
+  }
+  let start = 0;
+  const spans: StackTabSpan[] = [];
+  texts.forEach((text, index) => {
+    if (text === null) return;
+    spans.push({ index, start, text });
+    start += displayWidth(text) + separator;
+  });
+  if (more) {
+    const last = spans.at(-1);
+    spans.push({ index: more.index, start: last ? last.start + displayWidth(last.text) + STACK_TAB_MORE_GAP.length : 0, text: more.text, more: true });
+  }
+  return spans;
+}
+
+/** Terminal: the cells before a header's title: the grip, after the corner a focused or floating pane draws. */
+export function paneHeaderTitleStart(framed: boolean): number {
+  return (framed ? 2 : 0) + PANE_HEADER_GRIP.length;
+}
+
+/** Terminal: what a header's quick settings, lock and `?` take after its title. */
+export function terminalHeaderTrailingWidth(
+  quickSettings: ReadonlyArray<Pick<PaneHeaderQuickSetting, "icon">>,
+  locked: boolean,
+  help: boolean,
+): number {
+  return quickSettings.reduce((total, setting) => total + displayWidth(quickSettingText(setting)), 0)
+    + (locked ? displayWidth(PANE_HEADER_LOCK) : 0)
+    + (help ? PANE_HEADER_HELP.length : 0);
+}
+
+/**
+ * Terminal: the cells a header leaves its title (or a stack's tabs): its
+ * width less the frame a focused, floating or fullscreen pane draws, the
+ * grip, what follows the title (`trailing`), the menu and the corner mark a
+ * floating or fullscreen pane has.
+ */
+export function terminalHeaderTitleWidth(
+  width: number,
+  { framed, corner, trailing }: { framed: boolean; corner: boolean; trailing: number },
+): number {
+  const frame = framed ? 4 : 0;
+  const cornerWidth = corner ? PANE_HEADER_CLOSE.length : 0;
+  return Math.max(0, width - frame - PANE_HEADER_GRIP.length - trailing - PANE_HEADER_ACTION.length - cornerWidth);
+}
+
+/** Terminal: a stack's tabs as `stackTabSpans` lays them out, the shown one in `activeFg`, the rest dim, padded to `width` with `pad`. */
+function TerminalStackTabs({ stack, spans, width, activeFg, pad }: {
+  stack: PaneHeaderStack;
+  spans: ReturnType<typeof stackTabSpans>;
+  width: number;
+  activeFg: string;
+  pad: boolean;
+}) {
+  let left = width;
+  const parts: Array<{ key: string; text: string; fg: string }> = [];
+  spans.forEach((span, position) => {
+    if (span.more) {
+      parts.push({ key: "more-gap", text: STACK_TAB_MORE_GAP, fg: colors.textDim });
+      parts.push({ key: "more", text: span.text, fg: colors.textDim });
+      return;
+    }
+    const tab = stack.tabs[span.index]!;
+    if (position > 0) parts.push({ key: `sep:${tab.id}`, text: STACK_TAB_SEPARATOR, fg: colors.border });
+    parts.push({ key: tab.id, text: span.text, fg: tab.id === stack.active ? activeFg : colors.textDim });
+  });
+  return (
+    <>
+      {parts.map((part) => {
+        const text = truncateToDisplayWidth(part.text, Math.max(0, left));
+        left -= displayWidth(text);
+        return text ? <Text key={part.key} fg={part.fg} selectable={false}>{text}</Text> : null;
+      })}
+      {pad && left > 0 && <Text fg={activeFg} selectable={false}>{" ".repeat(left)}</Text>}
+    </>
+  );
+}
+
+/** The place of the tab a stack shows among its tabs. */
+function stackActiveIndex(stack: PaneHeaderStack): number {
+  return stack.tabs.findIndex((tab) => tab.id === stack.active);
+}
+
+/** Terminal: how wide a stack's tabs are as laid out. */
+function stackSpansWidth(spans: ReturnType<typeof stackTabSpans>): number {
+  const last = spans.at(-1);
+  return last ? last.start + displayWidth(last.text) : 0;
+}
 
 interface PaneHeaderProps {
   title: string;
+  /**
+   * Desktop and web: the ticker of a single-ticker pane, drawn where its title names it as a
+   * control that opens ticker search for the pane (`onTitleTickerPress`).
+   */
+  titleTicker?: string | null;
+  onTitleTickerPress?: () => void;
   width: number;
   focused: boolean;
   windowModeSelected?: boolean;
@@ -37,6 +232,8 @@ interface PaneHeaderProps {
   quickSettings?: PaneHeaderQuickSetting[];
   /** Desktop only: the pane's primary tab strip, drawn as title-bar tabs. */
   tabs?: PaneHeaderTabsRegistration | null;
+  /** Panes stacked in this spot: their tabs replace the title. */
+  stack?: PaneHeaderStack | null;
   /** The body colour the active title-bar tab opens into. */
   bodyBackground?: string;
   /**
@@ -122,8 +319,64 @@ function TerminalPaneButton({
   );
 }
 
+/**
+ * Where `symbol` stands in a pane's title as a word of its own ("OMON SPY", "Chart: NVDA  \u29c9
+ * Linked to DES"), so the header can draw it as a control. Null when the title does not name it.
+ */
+export function findTitleTicker(title: string, symbol: string): { start: number; end: number } | null {
+  if (!symbol) return null;
+  for (let start = title.indexOf(symbol); start >= 0; start = title.indexOf(symbol, start + 1)) {
+    const end = start + symbol.length;
+    if ((start === 0 || /\s/.test(title[start - 1]!)) && (end === title.length || /[\s,]/.test(title[end]!))) {
+      return { start, end };
+    }
+  }
+  return null;
+}
+
+/**
+ * The ticker in a single-ticker pane's title: a ghost button in the title's own type, marked
+ * with the chevron a query bar's choices carry, that opens ticker search for the pane. It sits
+ * where the title's text put the ticker, so only the chevron and the hover fill tell it apart.
+ */
+function PaneTitleTicker({ symbol, color, onPress }: {
+  symbol: string;
+  color: string;
+  onPress: () => void;
+}) {
+  const searchShortcut = useActionShortcut("ticker-search");
+  const label = "Change ticker";
+  // A span in the title's line, so the title still ends in one ellipsis. The button's inset goes
+  // into the space before it, so the ticker's letters stay where the title's text put them. On the
+  // title's baseline: the title's line is trimmed to its capitals (styles.css), and WebKit puts a
+  // box aligned to the line's top at the trimmed edge, which dropped the ticker by the trim and
+  // cut its letters at the bottom.
+  return (
+    <Text
+      data-gloom-role="pane-title-ticker"
+      style={{ display: "inline-flex", verticalAlign: "baseline", marginLeft: "calc(-1 * var(--gloom-space-xs))" }}
+    >
+      <Button
+        label={label}
+        title={searchShortcut ? `${t(label)} (${searchShortcut})` : t(label)}
+        variant="plain"
+        compact
+        stopPropagation
+        onPress={onPress}
+      >
+        <Text fg={color} selectable={false} style={{ fontWeight: "var(--gloom-weight-bold)" }}>{symbol}</Text>
+        <Text style={{ display: "inline-flex", marginLeft: "var(--gloom-space-xs)" }}>
+          <Icon name="chevron-down" size={9} color={colors.textMuted} />
+        </Text>
+      </Button>
+    </Text>
+  );
+}
+
 export function PaneHeader({
   title,
+  titleTicker = null,
+  onTitleTickerPress,
   width,
   focused,
   windowModeSelected = false,
@@ -132,6 +385,7 @@ export function PaneHeader({
   showActions = false,
   quickSettings = [],
   tabs = null,
+  stack = null,
   bodyBackground,
   topRule = false,
   titleBar = null,
@@ -162,9 +416,9 @@ export function PaneHeader({
   const closeText = fullscreen ? PANE_HEADER_RESTORE : floating ? PANE_HEADER_CLOSE : "";
   const onCornerMouseDown = fullscreen ? onRestoreMouseDown : onCloseMouseDown;
   const lockText = locked ? PANE_HEADER_LOCK : "";
-  const terminalQuickSettingsWidth = quickSettings.reduce((total, setting) => total + displayWidth(quickSettingText(setting)), 0)
-    + displayWidth(lockText) + helpText.length;
+  const terminalQuickSettingsWidth = terminalHeaderTrailingWidth(quickSettings, locked, !!onHelpMouseDown);
   const textColor = paneTitleText(visuallyFocused, floating);
+  const tickerAt = titleTicker ? findTitleTicker(title, titleTicker) : null;
   const topInset = topRule ? 1 : 0;
   const handleTerminalHeaderMouseDown = useCallback((event: any) => {
     capturePointerDrag(nativeRenderer, terminalHeaderRef.current);
@@ -174,17 +428,27 @@ export function PaneHeader({
   // padding. Tabs and buttons stop the press before it gets here. A fullscreen
   // pane cannot move, so there the bar moves the desktop window instead.
   const windowDrag = Boolean(titleBar) || (fullscreen && titleBarOverlay === true && nativeWindowChrome === true);
-  const beginPaneDrag = (event: { stopPropagation?: () => void }) => {
+  const beginPaneDrag = (event: { stopPropagation?: () => void; target?: unknown }) => {
     event.stopPropagation?.();
+    // A press on one of a stack's tabs moves that pane, not the one shown.
+    const tabId = stack?.onTabMouseDown ? stackTabOfTarget(event.target) : null;
+    if (tabId && stack?.onTabMouseDown) {
+      stack.onTabMouseDown(tabId, event);
+      return;
+    }
     onHeaderMouseDown?.(event);
   };
-  const beginWindowDrag = (event?: { stopPropagation?: () => void }) => {
+  const stackTabItems = useMemo(
+    () => stack?.tabs.map((tab) => ({ label: tab.title, value: tab.id })) ?? null,
+    [stack?.tabs],
+  );
+  const beginWindowDrag = (event?: { stopPropagation?: () => void; detail?: number }) => {
     event?.stopPropagation?.();
     if (titleBar) {
       onHeaderMouseDown?.(event);
       return;
     }
-    void rendererHost.startWindowDrag?.();
+    void rendererHost.startWindowDrag?.(event);
   };
   const barHandlers = windowDrag
     ? { onMouseDown: beginWindowDrag }
@@ -193,6 +457,27 @@ export function PaneHeader({
   if (nativePaneChrome) {
     // Focused, the rule is the accent; otherwise the one hairline.
     const ruleColor = visuallyFocused ? colors.borderFocused : "var(--gloom-hairline)";
+    // Title-bar tabs, the pane's own and a stack's alike: the strip hangs over
+    // the header's rules, and past the bottom one into the pane, so the active
+    // tab's box opens into the pane (styles.css).
+    const headerTabStripStyle = {
+      alignSelf: "stretch",
+      marginTop: -topInset,
+      marginBottom: -(1 + HEADER_TAB_OVERHANG_PX),
+      // Undoes the negative top margin for what is centred in the strip:
+      // the overflow chevron, and the tab labels (styles.css).
+      "--pane-tab-top-inset": `${topInset}px`,
+      // How far the active tab reaches past the rule into the pane.
+      "--pane-tab-overhang": `${HEADER_TAB_OVERHANG_PX}px`,
+      // The active tab's box opens into the pane over the bottom rule
+      // (styles.css), drawn in the rule's colour so the two are one line.
+      "--pane-tab-border": ruleColor,
+      // Until the strip has measured the surface under the tab (top-surface.ts).
+      "--pane-tab-active-bg": bodyBackground ?? colors.bg,
+      // The active tab reads as active whenever the pane is focused, even
+      // while a detail or field inside the pane owns the keyboard.
+      "--pane-tab-active-fg": visuallyFocused ? colors.textBright : colors.text,
+    } as const;
     // No width of its own: it stretches across its pane, so it follows a
     // frame a resize sizes outside React.
     return (
@@ -231,25 +516,65 @@ export function PaneHeader({
             <Icon name="grip" size={12} color={visuallyFocused ? colors.borderFocused : colors.textMuted} />
           </Box>
         )}
-        {/* Full header height, so trimming the title to its capitals never lets
-            this clip cut descenders. */}
-        <Box data-gloom-role="pane-header-chrome" minWidth={0} flexShrink={tabs ? 0 : 1} overflow="hidden" flexDirection="row" alignItems="center" style={{ alignSelf: "stretch", ...(tabs ? { maxWidth: "40%" } : {}) }}>
-          <Text
-            fg={textColor}
-            selectable={false}
-            data-gloom-role="pane-title"
-            style={{
-              // Focus changes the colour, never the weight: a bold title would
-              // change width as the pane takes and loses focus.
-              fontWeight: 700,
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-            }}
+        {stack && stackTabItems ? (
+          // The panes stacked here, in place of the title: the same title-bar
+          // tabs as a pane's own strip. A press on one moves that pane
+          // (beginPaneDrag), so the strip lets it through to the header.
+          <Box
+            data-gloom-role="pane-stack-tabs"
+            flexShrink={1}
+            minWidth={0}
+            style={{ ...headerTabStripStyle, ...(tabs ? { maxWidth: "40%" } : {}) }}
           >
-            {title}
-          </Text>
-        </Box>
+            <Tabs
+              tabs={stackTabItems}
+              activeValue={stack.active}
+              onSelect={stack.onSelect}
+              variant="header"
+              background={backgroundColor}
+              focused={visuallyFocused}
+              keyboardNavigation={false}
+              paneMenu={false}
+            />
+          </Box>
+        ) : (
+          /* Full header height, so trimming the title to its capitals never lets
+             this clip cut descenders. */
+          <Box data-gloom-role="pane-header-chrome" minWidth={0} flexShrink={tabs ? 0 : 1} overflow="hidden" flexDirection="row" alignItems="center" style={{ alignSelf: "stretch", ...(tabs ? { maxWidth: "40%" } : {}) }}>
+            <Text
+              fg={textColor}
+              selectable={false}
+              data-gloom-role="pane-title"
+              style={{
+                // Focus changes the colour, never the weight: a bold title would
+                // change width as the pane takes and loses focus.
+                fontWeight: 700,
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {tickerAt && onTitleTickerPress ? (
+                <>
+                  {title.slice(0, tickerAt.start)}
+                  <PaneTitleTicker
+                    symbol={title.slice(tickerAt.start, tickerAt.end)}
+                    color={textColor}
+                    onPress={onTitleTickerPress}
+                  />
+                  {title.slice(tickerAt.end)}
+                </>
+              ) : title}
+            </Text>
+          </Box>
+        )}
+        {stack && tabs && (
+          // Two strips, two roles: the panes stacked here, then the views of
+          // the one shown. The rule keeps them from reading as one strip.
+          <Box flexDirection="row" flexShrink={0} style={{ alignSelf: "stretch", marginLeft: "var(--gloom-space-sm)", paddingBlock: "var(--gloom-space-xs)" }}>
+            <Divider orientation="vertical" />
+          </Box>
+        )}
         {tabs && (
           <Box
             data-gloom-role="pane-header-tabs"
@@ -259,29 +584,14 @@ export function PaneHeader({
               // Tabs select on click; the header must not start a pane drag.
               event.stopPropagation?.();
             }}
-            style={{
-              alignSelf: "stretch",
-              marginTop: -topInset,
-              marginBottom: -1,
-              marginLeft: "var(--gloom-space-sm)",
-              // Undoes the negative top margin for what is centred in the strip:
-              // the overflow chevron, and the tab labels (styles.css).
-              "--pane-tab-top-inset": `${topInset}px`,
-              // The active tab's box opens into the pane over the bottom rule
-              // (styles.css), drawn in the rule's colour so the two are one line.
-              "--pane-tab-border": ruleColor,
-              // Until the strip has measured the surface under the tab (top-surface.ts).
-              "--pane-tab-active-bg": bodyBackground ?? colors.bg,
-              // The active tab reads as active whenever the pane is focused, even
-              // while a detail or field inside the pane owns the keyboard.
-              "--pane-tab-active-fg": visuallyFocused ? colors.textBright : colors.text,
-            }}
+            style={{ ...headerTabStripStyle, marginLeft: "var(--gloom-space-sm)" }}
           >
             <Tabs
               tabs={tabs.tabs}
               activeValue={tabs.activeValue}
               onSelect={tabs.onSelect}
               variant="header"
+              background={backgroundColor}
               focused={tabs.focused}
               keyboardNavigation={tabs.keyboardNavigation}
               onAdd={tabs.onAdd}
@@ -363,10 +673,10 @@ export function PaneHeader({
     // Fullscreen draws "-" in that corner. Reserve 2 for the frame.
     const borderColor = visuallyFocused ? colors.borderFocused : colors.border;
     const innerWidth = Math.max(0, width - 4);
-    const contentWidth = PANE_HEADER_GRIP.length + terminalQuickSettingsWidth + closeText.length + actionText.length;
-    const titleWidth = Math.max(0, innerWidth - contentWidth);
+    const titleWidth = terminalHeaderTitleWidth(width, { framed: true, corner: closeText.length > 0, trailing: terminalQuickSettingsWidth });
     const clippedTitle = truncateToDisplayWidth(title, titleWidth);
-    const fillLen = Math.max(0, innerWidth - PANE_HEADER_GRIP.length - displayWidth(clippedTitle) - terminalQuickSettingsWidth - actionText.length - closeText.length);
+    const spans = stack ? stackTabSpans(stack.tabs.map((tab) => tab.title), stackActiveIndex(stack), titleWidth) : null;
+    const fillLen = Math.max(0, innerWidth - PANE_HEADER_GRIP.length - (spans ? Math.min(titleWidth, stackSpansWidth(spans)) : displayWidth(clippedTitle)) - terminalQuickSettingsWidth - actionText.length - closeText.length);
     const fill = "─".repeat(fillLen);
 
     return (
@@ -382,17 +692,24 @@ export function PaneHeader({
         onMouseDragEnd={onHeaderMouseDragEnd}
       >
         <Text fg={borderColor} selectable={false}>{"┌─"}</Text>
-        <Text fg={textColor} selectable={false}>{`${PANE_HEADER_GRIP}${clippedTitle}`}</Text>
+        {stack && spans ? (
+          <>
+            <Text fg={textColor} selectable={false}>{PANE_HEADER_GRIP}</Text>
+            <TerminalStackTabs stack={stack} spans={spans} width={titleWidth} activeFg={textColor} pad={false} />
+          </>
+        ) : (
+          <Text fg={textColor} selectable={false}>{`${PANE_HEADER_GRIP}${clippedTitle}`}</Text>
+        )}
         {quickSettings.map((setting) => (
           <TerminalPaneButton
             key={setting.key}
             text={quickSettingText(setting)}
-            fg={setting.active ? colors.warning : colors.textDim}
+            fg={setting.active ? paneTitleTone(colors.warning, visuallyFocused, floating) : colors.textDim}
             role="pane-quick-setting"
             onMouseDown={setting.onMouseDown}
           />
         ))}
-        <Text fg={borderColor} selectable={false}>{fill}</Text>
+        {fill && <Text fg={borderColor} selectable={false}>{fill}</Text>}
         {locked && (
           <TerminalPaneButton text={lockText} fg={colors.textMuted} role="pane-lock" />
         )}
@@ -418,8 +735,9 @@ export function PaneHeader({
     );
   }
 
-  const titleWidth = Math.max(0, width - PANE_HEADER_GRIP.length - terminalQuickSettingsWidth - actionText.length - closeText.length);
+  const titleWidth = terminalHeaderTitleWidth(width, { framed: false, corner: closeText.length > 0, trailing: terminalQuickSettingsWidth });
   const clippedTitle = truncateToDisplayWidth(title, titleWidth);
+  const spans = stack ? stackTabSpans(stack.tabs.map((tab) => tab.title), stackActiveIndex(stack), titleWidth) : null;
   const padding = " ".repeat(Math.max(0, titleWidth - displayWidth(clippedTitle)));
 
   return (
@@ -434,14 +752,21 @@ export function PaneHeader({
       onMouseDrag={onHeaderMouseDrag}
       onMouseDragEnd={onHeaderMouseDragEnd}
     >
-      <Text fg={textColor} selectable={false}>
-        {`${PANE_HEADER_GRIP}${clippedTitle}${padding}`}
-      </Text>
+      {stack && spans ? (
+        <>
+          <Text fg={textColor} selectable={false}>{PANE_HEADER_GRIP}</Text>
+          <TerminalStackTabs stack={stack} spans={spans} width={titleWidth} activeFg={textColor} pad />
+        </>
+      ) : (
+        <Text fg={textColor} selectable={false}>
+          {`${PANE_HEADER_GRIP}${clippedTitle}${padding}`}
+        </Text>
+      )}
       {quickSettings.map((setting) => (
         <TerminalPaneButton
           key={setting.key}
           text={quickSettingText(setting)}
-          fg={setting.active ? colors.warning : colors.textDim}
+          fg={setting.active ? paneTitleTone(colors.warning, visuallyFocused, floating) : colors.textDim}
           role="pane-quick-setting"
           onMouseDown={setting.onMouseDown}
         />
@@ -468,4 +793,10 @@ export function PaneHeader({
       )}
     </Box>
   );
+}
+
+/** Desktop: the stack tab a press landed on, by the tab button it hit. */
+function stackTabOfTarget(target: unknown): string | null {
+  const element = target as { closest?: (selector: string) => { getAttribute(name: string): string | null } | null } | null;
+  return element?.closest?.('[data-gloom-role="pane-stack-tabs"] [data-tab-value]')?.getAttribute("data-tab-value") ?? null;
 }

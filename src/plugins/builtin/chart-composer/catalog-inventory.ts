@@ -5,7 +5,7 @@ import {
 } from "../../../time-series/field-catalog";
 import type { SeriesCatalogEntry, SeriesFrequency, SeriesInput, SeriesPlacement } from "../../../series/types";
 import { parseOptionSymbol } from "../../../utils/options";
-import type { SeriesCatalogInstrument } from "./series-catalog";
+import { hasCompanyFields, type SeriesCatalogInstrument } from "./series-catalog";
 import { macroReleaseTopic } from "../shared/macro-releases";
 
 export const CHART_COMPOSER_TEMPLATE_ID = "chart-composer-pane";
@@ -31,6 +31,8 @@ export interface CatalogSeriesRow {
   /** The registered expression, `{ticker}` where a symbol goes. */
   template: string;
   url?: string;
+  /** A limit the publisher sets on the series' data, such as how far back its history goes. */
+  limitation?: string;
   /** Asks for a symbol before charting. */
   input?: SeriesInput;
   /** The symbol a row filled in for a typed ticker charts. */
@@ -120,6 +122,7 @@ function rowFromEntry(entry: SeriesCatalogEntry): Omit<CatalogSeriesRow, "order"
     expression,
     template: entry.expression,
     ...(entry.url ? { url: entry.url } : {}),
+    ...(entry.limitation ? { limitation: entry.limitation } : {}),
     ...(entry.input ? { input: entry.input } : {}),
     ...(entry.placement || entry.lines?.length ? {
       seriesName: entry.name,
@@ -259,7 +262,10 @@ export function catalogRowsForResolvedInstruments(
     const symbol = catalogTickerFromInput(instrument.symbol);
     if (!symbol) return [];
     const input = instrumentInput(instrument);
-    return templates.filter((row) => row.input === input).map((row): CatalogSeriesRow => {
+    // An index or a currency pair has prices, not a company's revenue or EPS.
+    const companyFields = hasCompanyFields(instrument);
+    return templates.filter((row) => row.input === input
+      && (companyFields || !row.id.startsWith("field:") || row.id.startsWith("field:market."))).map((row): CatalogSeriesRow => {
       const expression = fillTemplate(row.template, symbol);
       return {
         ...row,

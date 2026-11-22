@@ -1,9 +1,11 @@
+import { MISSING_VALUE } from "../../../utils/format";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { splitDelayedStatus, DataTableView, EmptyState, PaneStatusBody, QueryBar, StatGrid, statGridRows, usePaneFooter, usePaneMenuItems,
   usePaneNoticeFooter, usePaneTabs, usePaneTicker, type DataTableColumn, type DataTableKeyEvent, type StatItem } from "../../../components";
 import { useTableLoadMore } from "../../../components/table-view-shared";
 import { useStaticChartBitmapSize } from "../../../components/chart/composite/bitmap";
 import { useAsyncResource } from "../../../react/async-resource";
+import { apiClient } from "../../../api-client";
 import { useTickerFinancials } from "../../../market-data/hooks";
 import { quoteSubscriptionTargetFromTicker } from "../../../market-data/request-types";
 import { useQuoteUpdates } from "../../../state/hooks/quote-streaming";
@@ -11,10 +13,13 @@ import { useShortcut } from "../../../react/input";
 import { usePaneSettingValue, usePluginAppActions, usePluginPaneState } from "../../../public/react";
 import { blendHex } from "../../../theme/color-utils";
 import { useThemeColors } from "../../../theme/theme-context";
+import { useSelectionFill } from "../../../components/ui/selection-fill";
 import type { PaneProps } from "../../../types/plugin";
 import { Box, useUiCapabilities, type ScrollBoxRenderable } from "../../../ui";
 import { FILL_REST } from "../../../components/ui/fill";
 import { chromeBarRows } from "../../../components/layout/pane/sizing";
+import { savedCopyFooterSegment } from "../../../components/layout/pane/footer";
+import type { CloudResource } from "../shared/cloud-resource";
 import { formatStrikeLabel, resolveOptionsTarget } from "../../../utils/options";
 import { nextHeaderSort, type SortDirection } from "../../../utils/sort-values";
 import { buildOptionCalcParams, OPTIONS_CALCULATOR_TEMPLATE_ID } from "../options-calculator/model";
@@ -22,7 +27,7 @@ import { formatModelSpotPrice } from "../options/model-spot";
 import { useAutoRefresh } from "../../../react/auto-refresh";
 import { useLiveStreamingSetting } from "../../../state/hooks/live-streaming";
 import { CLOUD_QUOTE_DELAY_MINUTES } from "../../../api-client/plan-access";
-import { useLiveSessionRefresh } from "../shared/volatility/live-session";
+import { optionsClosedNotice, useLiveSessionRefresh, useOptionsSessionOpen, usOptionsReopen } from "../shared/volatility/live-session";
 import { getSharedMarketDataCoordinator } from "../../../market-data/coordinator";
 import { hasFreshReadyEntry } from "../../../market-data/coordinator/entries";
 import { createSurfaceDependencies, loadVolatilitySurface, withReusedYieldCurve, type SurfaceLoadRequest } from "./client";
@@ -38,12 +43,13 @@ import {
 } from "../../../components/chart/surface3d/model";
 import { VolatilitySurface } from "./surface";
 import { SmileChart, TermChart } from "./charts";
+import { loadSurfaceEvents, releaseSearchDay, surfaceEventReadings } from "./events";
 import { surfaceCoordinateLabel } from "./headless";
 import { expiryLabel, formatIv, formatPrice, formatVolPoints, HIDDEN_SLOPE_TEXT, HIDDEN_YIELD_TEXT, selectSurfaceExpiry, surfaceForwardRow,
   surfaceSkewRow, surfaceSpotBasisLabel } from "./tables";
 import { findListedExpiry, unlistedExpiryText } from "../../../utils/option-expiry";
 import { dvolCurrency, dvolGap, loadDvol, type DvolPayload } from "../volatility/dvol";
-import { COIN_OPTIONS_HINT, isCoinWithoutOptions, optionsUnavailableTitle } from "../../../market-data/options-alternatives";
+import { COIN_OPTIONS_HINT, fxVolatilityNote, isCoinWithoutOptions, optionsUnavailableTitle } from "../../../market-data/options-alternatives";
 import { parsePublicTickerKey } from "../../../utils/exchanges";
 import { surfaceThirtyDayAtm } from "./tables";
 
@@ -65,8 +71,8 @@ export function dvolStats(dvol: DvolPayload | null | undefined, atm: number | nu
   return [
     { id: "dvol", label: "DVOL", value: latest.value.toFixed(2), detail: `${latest.at.slice(11, 16)} UTC`,
       detailVariants: [`${latest.at.slice(11, 16)} UTC`, ""] },
-    { id: "dvol-change", label: "DVOL 1D", value: change == null ? "--" : signed(change), detail: "vol pts" },
-    { id: "atm30", label: "30D ATM", value: atmPoints == null ? "--" : atmPoints.toFixed(2),
+    { id: "dvol-change", label: "DVOL 1D", value: change == null ? MISSING_VALUE : signed(change), detail: "vol pts" },
+    { id: "atm30", label: "30D ATM", value: atmPoints == null ? MISSING_VALUE : atmPoints.toFixed(2),
       ...(gap == null ? {} : { detail: `${signed(gap)} vs DVOL`, detailVariants: [`${signed(gap)} vs DVOL`, ""] }) },
   ];
 }
@@ -80,6 +86,8 @@ type Axis = "spot" | "forward" | "delta" | "strike";
 
 export function VolSurfacePane({ focused, width, height }: PaneProps) {
   const colors = useThemeColors();
+  // The chosen cell is the table's cursor: quieter while the pane does not have the keys.
+  const selectionFill = useSelectionFill();
   const { symbol, ticker, financials } = usePaneTicker();
   const { createPaneFromTemplate } = usePluginAppActions();
   const target = resolveOptionsTarget(ticker);
@@ -126,7 +134,17 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
   spotAsOfRef.current = quote?.lastUpdated ?? null;
   const quoteRef = useRef(quote ?? null);
   quoteRef.current = quote ?? null;
-  const requestKey = JSON.stringify([target?.cacheKey, symbol, axis, tenors, ivSource, priceSide, spread, age, limit, spotAvailable, requestedExpiration]);
+  // Once the Term tab opens, the next FOMC and CPI add the expiries either side of each to the surface.
+  const [eventsWanted, setEventsWanted] = useState(activeTab === "term");
+  useEffect(() => { if (activeTab === "term") setEventsWanted(true); }, [activeTab]);
+  const eventSymbol = target?.effectiveTicker ?? symbol ?? null;
+  const eventExchange = target?.effectiveExchange ?? "";
+  const eventsLoader = useCallback(async () => loadSurfaceEvents({ symbol: eventSymbol!, exchange: eventExchange }, { apiClient }),
+    [eventSymbol, eventExchange]);
+  const surfaceEvents = useAsyncResource(eventsWanted && eventSymbol && !dvolCurrency(eventSymbol.toUpperCase()) ? eventsLoader : null);
+  const eventDates = surfaceEvents.data?.events.map((event) => event.date) ?? [];
+  const requestKey = JSON.stringify([target?.cacheKey, symbol, axis, tenors, ivSource, priceSide, spread, age, limit, spotAvailable, requestedExpiration,
+    eventDates]);
   // Every load reads the spot at the moment it starts; a reload in session
   // therefore uses the current stream price, not the one from the first load.
   // A chain from a closed session is priced at that session's close, which
@@ -137,7 +155,7 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
       instrument: { symbol: target?.effectiveTicker ?? symbol!, exchange: target?.effectiveExchange ?? "",
         brokerId: instrument?.brokerId, brokerInstanceId: instrument?.brokerInstanceId, instrument },
       spot: quoteRef.current?.price ?? 0, spotAsOf: spotAsOfRef.current, quote: quoteRef.current, limit, forceRefresh: force, signal,
-      requiredExpiries: expirationRef.current == null ? [] : [expirationRef.current],
+      requiredExpiries: expirationRef.current == null ? [] : [expirationRef.current], eventDates,
       settings: { ...DEFAULT_SURFACE_SETTINGS, ivSource, priceSide, maxRelativeSpread: Number(spread), maxStaleSessions: Number(age) },
     };
   // Stable quote reference prevents every streaming tick from restarting all expiry requests.
@@ -191,15 +209,16 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
   const fateExchange = target?.effectiveExchange ?? "";
   const fateLoader = useCallback(async () => (await getSharedMarketDataCoordinator()
     ?.loadListingFate({ symbol: underlying, exchange: fateExchange }))?.note ?? null, [underlying, fateExchange]);
-  // A coin nothing lists options on (SOL-USD) says which coins have them.
+  // A coin nothing lists options on (SOL-USD) says which coins have them, and an FX pair which funds stand in.
   const coinNote = underlying && isCoinWithoutOptions(underlying)
-    ? `${optionsUnavailableTitle(parsePublicTickerKey(underlying).symbol)} ${COIN_OPTIONS_HINT}` : null;
+    ? `${optionsUnavailableTitle(parsePublicTickerKey(underlying).symbol)} ${COIN_OPTIONS_HINT}`
+    : underlying ? fxVolatilityNote(underlying, target?.effectiveExchange) : null;
   const fateNote = useAsyncResource(underlying && noChain && !coinNote ? fateLoader : null).data ?? coinNote;
   const ivRank = useIvRank(underlying || null);
   // A coin's options (BTC-USD, ETH-USD) come with Deribit's volatility index.
   const coin = dvolCurrency(underlying);
   const dvolLoader = useCallback(async () => loadDvol(coin!), [coin]);
-  const dvol = useAsyncResource<DvolPayload>(coin ? dvolLoader : null);
+  const dvol = useAsyncResource<CloudResource<DvolPayload>>(coin ? dvolLoader : null);
   useAutoRefresh(dvol.updatedAt, dvol.load, { intervalMs: coin ? DVOL_REFRESH_MS : null });
   useEffect(() => () => controller.current?.abort(), [request]);
   const incremental = partial?.key === requestKey ? partial.snapshot : null;
@@ -208,8 +227,13 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
   // Judged on the last complete load, so a refresh in progress does not flip the view.
   const liveQuotes = liveQuoteCoverage(settledSnapshot);
   const liveEmpty = liveQuotes.empty && liveQuoteCoverage(liveSnapshot).points === 0;
+  // Outside the US options session a chain with no expiry fitted is the hour, not the symbol (FXE before the open):
+  // it waits for the open, beside IV30 at the last close. A coin's options trade around the clock.
+  const optionsOpen = useOptionsSessionOpen(!!symbol && !historyDate && !coin);
+  const closedUnfitted = !coin && !optionsOpen && liveQuotes.settled && liveQuotes.expiries > 0 && !liveQuotes.fitted;
+  const noLiveSurface = liveEmpty || closedUnfitted;
   // With no clean live quote, the latest stored close stands in until the chain reopens.
-  const fallbackDate = !historyDate && liveEmpty ? dates.data?.[0] ?? null : null;
+  const fallbackDate = !historyDate && noLiveSurface ? dates.data?.[0] ?? null : null;
   // The underlying streams even when no other pane watches it, so each
   // reload is fitted at the current price. The spot is only sampled at each
   // reload, so the slow off-screen cadence is enough and spares re-renders.
@@ -224,9 +248,10 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
   // visible; the upstream chain cache dedupes the requests across users. A
   // delayed surface keeps the configured refresh.
   const realtimeSurface = !!settledSnapshot?.expiries.some((entry) => entry.dataSource === "live" || entry.realtimeEligible === true);
-  const liveActive = useLiveSessionRefresh(reloadLive, SURFACE_LIVE_RELOAD_MS,
+  const liveRefresh = useLiveSessionRefresh(reloadLive, SURFACE_LIVE_RELOAD_MS,
     !!symbol && spotAvailable && !historyDate && !fallbackDate && liveStreaming && realtimeSurface && !resource.loading,
     resource.updatedAt);
+  const liveActive = liveRefresh.live;
   useAutoRefresh(resource.updatedAt, liveActive ? noRefresh : resource.load);
   const shownDate = historyDate ?? fallbackDate;
   const storedLoader = useCallback(async () => storedSurfaceSnapshot(await loadStoredSurface(underlying, shownDate!)), [underlying, shownDate]);
@@ -238,7 +263,12 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
     { id: "iv30", label: "IV30", value: `${(ivRank.value * 100).toFixed(1)}%`, detail: `${ivRank.date.slice(5)} close` },
     { id: "ivr", label: "IV rank", value: wholeNumber(ivRank.rank) },
     { id: "ivp", label: "IV pctl", value: wholeNumber(ivRank.percentile) },
-  ] : coin && snapshot && !snapshot.stored ? dvolStats(dvol.data, surfaceThirtyDayAtm(snapshot)) : [];
+  ] : coin && snapshot && !snapshot.stored ? dvolStats(dvol.data?.payload, surfaceThirtyDayAtm(snapshot)) : [];
+  // A stored close is read on its own day, not around the releases still to come.
+  // A release that has come out since the dates were read drops at the next surface it is read against.
+  const eventReadings = useMemo(() => surfaceEvents.data && snapshot && !snapshot.stored
+    ? surfaceEventReadings(snapshot.expiries, snapshot.catalogue,
+      surfaceEvents.data.events.filter((event) => event.date >= releaseSearchDay(event.kind, Date.now()))) : [], [surfaceEvents.data, snapshot]);
   const tableHeight = Math.max(3, height - chromeBarRows(nativePaneChrome) - tabRows - statGridRows(ivStats, width));
   const bitmapAvailable = !!useStaticChartBitmapSize(width, tableHeight);
   // A typed date (`--expiration 2027-01-15`) is that day's UTC midnight; the
@@ -357,7 +387,7 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
     const key = event.name;
     // History steps with < and > (footer hints); "." stays the pane menu.
     if (surface3d && event.shift && (key === "left" || key === "right")) stepSurfacePoint(key === "left" ? -1 : 1);
-    else if (key === "r") { void active.reload(); void dates.reload(); }
+    else if (key === "r") { active.reload(); dates.reload(); }
     else if (key === "v") cycleTab();
     else if (key === "t") toggleHistory();
     else if (key === "p") openPricer();
@@ -392,11 +422,14 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
       ? "All expiries" : expirations.map(expiryLabel).join(", ")}: ${warning}`),
     ...(!spotAvailable && symbol && !historyDate ? ["Underlying price unavailable or stale"] : []),
     ...(historyDate && !stored.loading && !stored.data && !stored.error ? [`No stored ${underlying} surface for ${historyDate}`] : []),
-    ...(fallbackDate ? [`Live chain has no two-sided quotes; showing the ${fallbackDate} close`] : []),
+    // Outside the session the stored close stands in for the hour, and the live surface fills at the open.
+    ...(fallbackDate ? [closedUnfitted
+      ? `${optionsClosedNotice(usOptionsReopen(Date.now()) ?? { at: null }).title} Showing the ${fallbackDate} close; the live surface fills at the open.`
+      : `Live chain has no two-sided quotes; showing the ${fallbackDate} close`] : []),
     ...(pinned != null && snapshot && !resource.loading && !snapshot.catalogue.includes(pinned)
       && !snapshot.failures.some((failure) => failure.expiration === pinned)
       ? [`${expiryLabel(pinned)}: ${unlistedExpiryText(pinned, snapshot.catalogue)}`] : []),
-    ...(active.error ? [active.error] : [])];
+    ...(active.error ? [active.error] : []), ...(liveRefresh.error ? [liveRefresh.error] : [])];
   const spotBasis = snapshot && !snapshot.stored ? surfaceSpotBasisLabel(snapshot) : null;
   // What the quotes are and when they were observed; a reload moves the time.
   const freshness = !snapshot ? null : snapshot.stored ? `stored close ${snapshot.stored.sessionDate}`
@@ -404,17 +437,22 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
   // The cell under the cursor on the views that have one: the quoted contract it came from, or the fitted value.
   const selectionStatus = !snapshot || !["surface", "table", "smile"].includes(activeTab) ? null
     : selectedCell?.point
-      ? `nearest ${selectedCell.point.contract.contractSymbol} · mid ${formatPrice(selectedCell.point.mid)} · spread ${formatPrice(selectedCell.point.spread)} · OI ${selectedCell.point.openInterest ?? "--"} · residual ${formatIv(selectedCell.fitResidual)}`
+      ? `nearest ${selectedCell.point.contract.contractSymbol} · mid ${formatPrice(selectedCell.point.mid)} · spread ${formatPrice(selectedCell.point.spread)} · OI ${selectedCell.point.openInterest ?? MISSING_VALUE} · residual ${formatIv(selectedCell.fitResidual)}`
       : selectedCell?.volatility != null
-        ? `${selectedRow?.label} · K ${selectedCell.strike == null ? "--" : formatStrikeLabel(selectedCell.strike)} · fitted IV ${formatIv(selectedCell.volatility)}`
+        ? `${selectedRow?.label} · K ${selectedCell.strike == null ? MISSING_VALUE : formatStrikeLabel(selectedCell.strike)} · fitted IV ${formatIv(selectedCell.volatility)}`
         : "no clean quote at this cell";
   usePaneNoticeFooter({ registrationId: "ovdv-notices", notices: [...new Set(notices)], focused });
+  const savedAts = [snapshot && !snapshot.stored ? snapshot.savedAt : undefined, ivStats.length && coin ? dvol.data?.savedAt : undefined]
+    .filter((at): at is number => at != null);
+  const savedAt = savedAts.length ? Math.min(...savedAts) : null;
   usePaneFooter("ovdv", () => ({
     info: [
       ...(active.loading ? [{ id: "loading", parts: [{ text: snapshot && snapshot.loaded < snapshot.requested
         ? `loading ${snapshot.loaded}/${snapshot.requested} expiries` : "loading", tone: "muted" as const }] }] : []),
       ...(freshness ? splitDelayedStatus({ id: "source", parts: [{ text: freshness, tone: "muted" }] }) : []),
-      ...(snapshot?.expiries.some((entry) => entry.stale) ? [{ id: "stale", parts: [{ text: "stale", tone: "warning" as const }] }] : []),
+      // Chains (and a coin's DVOL) kept from an earlier load say when they were saved; anything else old says stale.
+      ...(savedAt != null ? [savedCopyFooterSegment("saved-copy", savedAt)]
+        : snapshot?.expiries.some((entry) => entry.stale) ? [{ id: "stale", parts: [{ text: "stale", tone: "warning" as const }] }] : []),
       ...(selectedExpiry?.fit && activeTab === "smile" ? [{ id: "fit", parts: [{ text: `${selectedExpiry.fit.method} · RMSE ${(selectedExpiry.fit.residual * 100).toFixed(3)} vol pts`, tone: "muted" as const }] }] : []),
       ...(selectionStatus ? [{ id: "selection", parts: [{ text: selectionStatus, tone: "muted" as const }] }] : []),
     ],
@@ -432,7 +470,7 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
         { id: "older", key: "<", label: "older", title: "Older Stored Date", onPress: () => stepHistory(1) },
         { id: "newer", key: ">", label: "newer", title: "Newer Stored Date", onPress: () => stepHistory(-1) }] : []),
     ],
-  }), [snapshot, freshness, active.loading, historyDate, storedDates, selectedExpiry, activeTab, selectedCell, canLoadMore, camera, bitmapAvailable, selectionStatus, openChain, deltaSurface]);
+  }), [snapshot, freshness, active.loading, historyDate, storedDates, selectedExpiry, activeTab, selectedCell, canLoadMore, camera, bitmapAvailable, selectionStatus, openChain, deltaSurface, savedAt]);
   // Keys that move the selection without a footer hint of their own, listed in
   // the pane menu with their keys.
   const menuActions = useRef({ nextExpiry, stepSurfacePoint, zoomCamera });
@@ -454,27 +492,36 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
     ["underlying", snapshot?.symbol, snapshot?.spot], ["rate source", "Treasury", snapshot?.rateAsOf],
     ["warnings", ...notices], ...(snapshot?.expiries.map((expiry) => ["expiry", expiryLabel(expiry.expiration), expiry.asOf,
       expiry.fit?.method, expiry.fit?.residual, expiry.rateMethod, JSON.stringify(expiry.filterCounts)]) ?? [])];
-  const columns: DataTableColumn[] = [{ id: "tenor", label: "Expiry / tenor", width: 18, align: "left" },
-    ...(grid?.rows[0]?.cells.map((cell, index) => ({ id: String(index), width: 10, align: "right" as const,
+  // Sized to the labels and IVs they hold (the table keeps each header whole), so a narrow pane shows more of the smile.
+  const tenorLabel = (row: SurfaceGridRow) => `${row.label}${row.extrapolated ? " E" : row.interpolated ? " I" : ""}`;
+  const cellWidth = Math.max(1, ...(grid?.rows ?? []).flatMap((row) => row.cells.map((cell) => formatIv(cell.volatility).length)));
+  const columns: DataTableColumn[] = [{ id: "tenor", label: "Expiry / tenor", align: "left",
+    width: Math.max(1, ...(grid?.rows ?? []).map((row) => tenorLabel(row).length)) },
+    ...(grid?.rows[0]?.cells.map((cell, index) => ({ id: String(index), width: cellWidth, align: "right" as const,
       label: surfaceCoordinateLabel(axis, cell.coordinate, index) })) ?? [])];
   const sortedRows = [...(grid?.rows ?? [])].sort((a, b) => {
     const delta = sort.columnId === "tenor" ? a.years - b.years : (a.cells[Number(sort.columnId)]?.volatility ?? -1) - (b.cells[Number(sort.columnId)]?.volatility ?? -1);
     return sort.direction === "asc" ? delta : -delta;
   });
   const table = <DataTableView<SurfaceGridRow> focused={focused} rootWidth={width} rootHeight={tableHeight}
-    columns={columns} items={sortedRows} getItemKey={(row) => row.label} scrollRef={scrollRef} onBodyScrollActivity={onScroll}
+    // Moneyness or delta in order across the tenors: the surface's axis.
+    columns={columns} columnReorder={false} items={sortedRows} getItemKey={(row) => row.label} scrollRef={scrollRef} onBodyScrollActivity={onScroll}
     sortColumnId={sort.columnId} sortDirection={sort.direction} onHeaderClick={(id) => setSort((current) => nextHeaderSort(current, id))}
     selection={{ kind: "id", selectedId: tableSelectedRow?.label ?? null, getId: (row) => row.label, onChange: (_id, row) => onSelectRow(row) }}
     onActivate={onSelectRow} onRootKeyDown={handleKey} getExportMetadata={exportMetadata} freezeFirstColumn
+    // The selected strike's column (ATM until one is picked) sits mid-table, where a narrow pane would otherwise show 80% to 95%.
+    revealColumnId={String(tableCellIndex)}
     renderCell={(row, column) => {
-      if (column.id === "tenor") return { text: `${row.label}${row.extrapolated ? " E" : row.interpolated ? " I" : ""}`, color: colors.textDim };
+      if (column.id === "tenor") return { text: tenorLabel(row), color: colors.textDim };
       const index = Number(column.id), cell = row.cells[index]!;
       const chosen = row.label === tableSelectedRow?.label && index === tableCellIndex;
-      return { text: formatIv(cell.volatility), color: chosen ? colors.selectedText : colors.textBright,
-        backgroundColor: chosen ? colors.selected : cell.volatility == null ? colors.bg : blendHex(colors.bg, cell.volatility > 0.5 ? colors.warning : colors.positive, Math.min(0.48, 0.08 + cell.volatility * 0.5)),
+      return { text: formatIv(cell.volatility), color: chosen ? (selectionFill.lit ? colors.selectedText : selectionFill.ink(colors.textBright)) : colors.textBright,
+        backgroundColor: chosen ? selectionFill.bg : cell.volatility == null ? colors.bg : blendHex(colors.bg, cell.volatility > 0.5 ? colors.warning : colors.positive, Math.min(0.48, 0.08 + cell.volatility * 0.5)),
         onMouseDown: () => { onSelectRow(row); setCoordinate(cell.coordinate); } };
     }} emptyStateTitle="No volatility observations." />;
-  const content = !shownDate && liveEmpty ? <EmptyState title="No two-sided option quotes"
+  const reopen = !shownDate && closedUnfitted ? usOptionsReopen(Date.now()) : null;
+  const content = reopen ? <EmptyState {...optionsClosedNotice(reopen)} />
+    : !shownDate && liveEmpty ? <EmptyState title="No two-sided option quotes"
     message={liveQuotes.zeroBid === liveQuotes.contracts
       ? `All ${liveQuotes.contracts.toLocaleString()} contracts across ${liveQuotes.expiries} expiries have a zero bid. ${ZERO_BID_HOURS}`
       : `None of the ${liveQuotes.contracts.toLocaleString()} contracts across ${liveQuotes.expiries} expiries passes the quote filters${
@@ -492,11 +539,11 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
       setSurfaceCoordinate(denseGrid.moneyness[selection.moneynessIndex] ?? (deltaSurface ? 0 : 1));
     }} fallback={table} loading={active.loading} meshAvailable={bitmapAvailable} /> : activeTab === "smile" && snapshot ? <SmileChart snapshot={snapshot} expiry={selectedExpiry}
       overlay={overlaySmiles} axis={axis} width={width} height={tableHeight} focused={focused} />
-      : activeTab === "term" && snapshot ? <TermChart snapshot={snapshot} width={width} height={tableHeight} focused={focused} />
+      : activeTab === "term" && snapshot ? <TermChart snapshot={snapshot} width={width} height={tableHeight} focused={focused} events={eventReadings} />
       : ["skew", "forwards"].includes(activeTab) && snapshot ? <ExpiryTable snapshot={snapshot} selected={selectedExpiry}
         onSelect={(entry) => setExpiration(entry.expiration)} forwards={activeTab === "forwards"} width={width} height={tableHeight}
         focused={focused} onKey={handleKey} metadata={exportMetadata} /> : table;
-  const tableShown = activeTab === "table" && !!symbol && !!snapshot && !(!shownDate && liveEmpty);
+  const tableShown = activeTab === "table" && !!symbol && !!snapshot && !(!shownDate && noLiveSurface);
   useEffect(() => setTableOnScreen(tableShown), [tableShown]);
   return <Box flexDirection="column" width={width} overflow="hidden" {...(nativePaneChrome ? FILL_REST : { height })}>
     {tabStrip}
@@ -512,9 +559,13 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
         ]}
         meta={!snapshot ? undefined : snapshot.stored
           ? `Stored close · spot ${formatModelSpotPrice(snapshot.spot)} · captured ${formatCaptureTime(snapshot.stored.capturedAt)} New York`
-          : [`Spot ${formatModelSpotPrice(snapshot.spot)}${quote?.currency ? ` ${quote.currency}` : ""}`,
+          : fitMetaParts([`Spot ${formatModelSpotPrice(snapshot.spot)}${quote?.currency ? ` ${quote.currency}` : ""}`,
             // The close a closed session's chain is priced at dates the chain too.
-            spotBasis, snapshot.spotBasis?.basis === "close" ? null : selectedExpiry?.asOf?.slice(0, 10)].filter(Boolean).join(" · ")} /> : null}
+            spotBasis, snapshot.spotBasis?.basis === "close" ? null : selectedExpiry?.asOf?.slice(0, 10)],
+          // A narrow terminal row keeps the spot whole and leaves out what follows it; the desktop clips in CSS.
+          nativePaneChrome ? null : width - 2 - QUERY_BAR_GAP
+            - ("Expiry ".length + expiryLabel(pinned ?? barExpiry?.expiration ?? 0).length + QUERY_BAR_GAP)
+            - (storedDates.length ? "Date ".length + (shownDate ?? "Live").length + QUERY_BAR_GAP : 0))} /> : null}
       <PaneStatusBody loading={active.loading && !snapshot && !fateNote}
       error={!snapshot && !fateNote ? active.error : null} empty={!!fateNote || !snapshot && !active.loading}
       emptyTitle={fateNote ?? undefined} subject="volatility surface">
@@ -527,7 +578,24 @@ export function VolSurfacePane({ focused, width, height }: PaneProps) {
 
 function noRefresh(): void {}
 
-const wholeNumber = (value: number | null) => value == null ? "--" : String(Math.round(value));
+/** The terminal query bar's gap between its controls and before its meta. */
+const QUERY_BAR_GAP = 2;
+/**
+ * The meta's parts, most important first, joined with " · " as far as they
+ * fit in `room` cells; the first always, whole. Without a room, all of them.
+ */
+function fitMetaParts(parts: ReadonlyArray<string | null | undefined>, room: number | null): string {
+  const present = parts.filter((part): part is string => !!part);
+  let text = present[0] ?? "";
+  for (const part of present.slice(1)) {
+    const next = `${text} · ${part}`;
+    if (room != null && next.length > room) break;
+    text = next;
+  }
+  return text;
+}
+
+const wholeNumber = (value: number | null) => value == null ? MISSING_VALUE : String(Math.round(value));
 /** Whether a settled live chain produced any clean quote, with the filter counts that explain why not. */
 function liveQuoteCoverage(snapshot: SurfaceSnapshot | null | undefined) {
   const expiries = snapshot?.expiries.filter((entry) => entry.state !== "loading") ?? [];
@@ -537,7 +605,8 @@ function liveQuoteCoverage(snapshot: SurfaceSnapshot | null | undefined) {
   const zeroBid = counts["zero-bid"];
   const settled = !!snapshot && snapshot.loaded >= snapshot.requested;
   return { empty: settled && expiries.length > 0 && points === 0 && contracts > 0, points, expiries: expiries.length, contracts, zeroBid,
-    removed: surfaceFilterSummary(counts), zeroBidMost: Object.values(counts).every((count) => count <= zeroBid) };
+    removed: surfaceFilterSummary(counts), zeroBidMost: Object.values(counts).every((count) => count <= zeroBid),
+    settled, fitted: expiries.some((entry) => entry.fit) };
 }
 const ZERO_BID_HOURS = "The delayed feed publishes zero bids outside regular hours (09:30 to 16:00 New York); the surface fills in when quotes return.";
 
@@ -561,20 +630,30 @@ function ExpiryTable({ snapshot, selected, onSelect, forwards, width, height, fo
   };
   const missing = (entry: SurfaceExpiry, id: string) => {
     const { skew, forward } = rowsByExpiry.get(entry.expiration)!;
-    if (forwards) return id === "2" && forward.dividendYieldHidden ? HIDDEN_YIELD_TEXT : "--";
-    return (id === "2" || id === "3" ? skew.gap : id === "4" ? skew.moneynessGap : id === "5" && skew.termSlopeHidden ? HIDDEN_SLOPE_TEXT : null) ?? "--";
+    if (forwards) return id === "2" && forward.dividendYieldHidden ? HIDDEN_YIELD_TEXT : MISSING_VALUE;
+    return (id === "2" || id === "3" ? skew.gap : id === "4" ? skew.moneynessGap : id === "5" && skew.termSlopeHidden ? HIDDEN_SLOPE_TEXT : null) ?? MISSING_VALUE;
   };
   const rows = [...snapshot.expiries].sort((a, b) => {
     const x = value(a, sort.columnId), y = value(b, sort.columnId);
     const difference = typeof x === "number" && typeof y === "number" ? x - y : String(x ?? "").localeCompare(String(y ?? ""));
     return sort.direction === "asc" ? difference : -difference;
   });
+  const cellText = (entry: SurfaceExpiry, id: string) => {
+    const raw = value(entry, id);
+    return id === "expiry" ? expiryLabel(entry.expiration)
+      : raw == null ? missing(entry, id) : typeof raw === "string" ? raw : id === integerColumn ? String(raw)
+        : forwards ? (id === "0" ? formatModelSpotPrice(raw) : id === "1" && raw > 0 ? `+${formatPrice(raw)}` : formatPrice(raw)) : formatVolPoints(raw);
+  };
+  // Each column as wide as its widest cell (the table keeps its header and sort arrow whole), so a narrow pane
+  // shows the 25D put and call IVs and the risk reversal beside them before it scrolls.
+  const columns = [{ id: "expiry", label: "Expiry" }, ...fields.map((label, i) => ({ id: String(i), label }))].map((column): DataTableColumn => ({
+    ...column, align: column.id === "expiry" ? "left" : "right",
+    width: Math.max(1, ...rows.map((entry) => cellText(entry, column.id).length)),
+  }));
   return <DataTableView<SurfaceExpiry> focused={focused} rootWidth={width} rootHeight={height} items={rows}
-    columns={[{ id: "expiry", label: "Expiry", width: 13, align: "left" }, ...fields.map((label, i) => ({ id: String(i), label, width: 14, align: "right" as const }))]}
+    columns={columns}
     getItemKey={(entry) => String(entry.expiration)} selection={{ kind: "id", selectedId: String(selected?.expiration), getId: (entry) => String(entry.expiration), onChange: (_id, entry) => onSelect(entry) }}
     onActivate={onSelect} onRootKeyDown={onKey} getExportMetadata={metadata} freezeFirstColumn
     sortColumnId={sort.columnId} sortDirection={sort.direction} onHeaderClick={(id) => setSort((current) => nextHeaderSort(current, id))}
-    renderCell={(entry, column) => { const raw = value(entry, column.id); return { text: column.id === "expiry" ? expiryLabel(entry.expiration)
-      : raw == null ? missing(entry, column.id) : typeof raw === "string" ? raw : column.id === integerColumn ? String(raw)
-        : forwards ? (column.id === "0" ? formatModelSpotPrice(raw) : column.id === "1" && raw > 0 ? `+${formatPrice(raw)}` : formatPrice(raw)) : formatVolPoints(raw) }; }} emptyStateTitle="No expiry observations." />;
+    renderCell={(entry, column) => ({ text: cellText(entry, column.id) })} emptyStateTitle="No expiry observations." />;
 }
